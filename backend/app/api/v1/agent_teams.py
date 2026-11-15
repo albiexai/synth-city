@@ -462,7 +462,9 @@ def _scope_auth_configured(scope: TeamGithubScope) -> bool:
     )
 
 
-def _scope_response(scope: TeamGithubScope) -> TeamGithubScopeResponse:
+def _scope_response(
+    scope: TeamGithubScope, auto_merges_last_24h: int | None = None
+) -> TeamGithubScopeResponse:
     return TeamGithubScopeResponse(
         id=scope.id,
         preset_id=scope.preset_id,
@@ -482,6 +484,7 @@ def _scope_response(scope: TeamGithubScope) -> TeamGithubScopeResponse:
         max_concurrent_dispatched=scope.max_concurrent_dispatched,
         max_verification_retries=scope.max_verification_retries,
         max_auto_merges_per_day=scope.max_auto_merges_per_day,
+        auto_merges_last_24h=auto_merges_last_24h,
         base_ref=scope.base_ref,
         builds_out_of_tree=scope.builds_out_of_tree,
         build_dir_template=scope.build_dir_template,
@@ -2526,7 +2529,10 @@ async def list_github_scopes(preset_id: int, db: AsyncSession = Depends(get_db))
             .order_by(TeamGithubScope.repo_owner, TeamGithubScope.repo_name, TeamGithubScope.id)
         )
     ).scalars().all()
-    return TeamGithubScopeListResponse(scopes=[_scope_response(scope) for scope in scopes])
+    return TeamGithubScopeListResponse(scopes=[
+        _scope_response(scope, await github_verification_service.auto_merges_last_24h(db, scope.id))
+        for scope in scopes
+    ])
 
 
 @router.post(
@@ -2562,7 +2568,8 @@ async def create_github_scope(
     except ValueError as exc:
         raise _bad_request(exc) from exc
     await _sync_github_jobs(db)
-    return _scope_response(scope)
+    return _scope_response(
+        scope, await github_verification_service.auto_merges_last_24h(db, scope.id))
 
 
 @router.patch("/github-scopes/{scope_id}", response_model=TeamGithubScopeResponse)
@@ -2674,7 +2681,8 @@ async def update_github_scope(
     except ValueError as exc:
         raise _bad_request(exc) from exc
     await _sync_github_jobs(db)
-    return _scope_response(scope)
+    return _scope_response(
+        scope, await github_verification_service.auto_merges_last_24h(db, scope.id))
 
 
 @router.patch(
@@ -2721,7 +2729,8 @@ async def update_github_scope_continuation_policy(
     )
     await db.commit()
     await db.refresh(scope)
-    return _scope_response(scope)
+    return _scope_response(
+        scope, await github_verification_service.auto_merges_last_24h(db, scope.id))
 
 
 @router.get("/github-recovery-gate/active")

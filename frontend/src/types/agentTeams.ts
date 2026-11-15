@@ -340,6 +340,7 @@ export interface TeamGithubScope {
   max_concurrent_dispatched: number
   max_verification_retries: number
   max_auto_merges_per_day: number
+  auto_merges_last_24h?: number | null
   base_ref: string
   builds_out_of_tree: boolean
   build_dir_template?: string | null

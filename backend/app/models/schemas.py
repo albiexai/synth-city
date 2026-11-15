@@ -2752,6 +2752,7 @@ class TeamGithubScopeResponse(BaseModel):
     max_concurrent_dispatched: int
     max_verification_retries: int
     max_auto_merges_per_day: int
+    auto_merges_last_24h: Optional[int] = None
     base_ref: str
     builds_out_of_tree: bool
     build_dir_template: Optional[str] = None
