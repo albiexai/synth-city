@@ -203,6 +203,41 @@ External broadcasts require `audience_type` and `audience_id`. Supported scoped 
 
 Receipt recipients are snapshotted when the message is stored. A keyed replay uses those receipts, not current membership. Existing messages retain their historical receipts and have no inferred audience.
 
+## Check a request before submitting it
+
+`POST /api/v1/agent-mail/preflight-request` (MCP tool `synth_city_preflight_request`) reports every mechanical problem of a plan, scope amendment or continuation request. It is read-only: it creates no request, Mail, nudge or audit row. It needs the owner's member session, and only the item's owner may ask (`403 not_item_owner` otherwise).
+
+```json
+{
+  "kind": "continuation",
+  "work_item_id": 193,
+  "dispatch_nonce": "...",
+  "summary": "Apply the approved bounded fix",
+  "phase": "implementation",
+  "execution_target": "workspace",
+  "allowed_paths": ["src/a.py"],
+  "allowed_actions": ["push_pr_head", "request_verification"],
+  "allowed_commands": ["pytest -q"],
+  "prohibited_actions": [],
+  "max_failed_heads": 1,
+  "tool_fallbacks": {},
+  "estimate_active_minutes": {"low": 20, "high": 40}
+}
+```
+
+`kind` is `initial_plan` (send `summary` and `plan_metadata`), `scope_amendment` or `continuation`. `lease_token` is optional and is checked, never echoed. The answer is `{"passed": bool, "problems": [...], "warnings": [...]}`. Each entry has a `code`, a `field` and a `message`. All problems are listed at once, so one call replaces a round trip per rejection.
+
+Rules, each with a code the server also uses:
+
+- **Phase and actions:** `continuation_phase_invalid`; an amendment must be implementation (`amendment_diagnostic_restoration_required`); `execution_target_invalid`; unknown actions (`allowed_actions_invalid`); an implementation needs `push_pr_head` and `request_verification` (`implementation_completion_actions_required`); a diagnostic needs `revert_diagnostic_changes` (`diagnostic_revert_required`) and, when hosted-only, no local build command; `install_hosted_ci_tool` and `tool_fallbacks` go together (`hosted_tool_fallback_required`, `tool_fallbacks_invalid`, `hosted_tool_target_required`).
+- **Paths:** repo-relative, no `..`, no absolute or backslash form, no glob characters (`allowed_paths_invalid`, `allowed_paths_required`); an amendment names closed files (`amendment_closed_file_paths_required`). Companion paths from the checked-in map that the request omits are listed as a warning (`companion_paths_added`), and the path limit is checked with them counted.
+- **Limits:** paths, commands and failed heads per revision, from the scope (`continuation_path_limit_exceeded`, `continuation_command_limit_exceeded`, `continuation_failed_head_limit_exceeded`); an empty summary or the reserved companion trailer in a summary.
+- **Initial plan:** `plan_metadata.allowed_paths` must be a non-empty list of closed file paths (`plan_allowed_paths_missing`); later amendments read it. Reserved keys are refused.
+- **Stale authority:** unread stop, hold or decision Mail for the owner (`unread_authority_mail`, which names only the message id).
+- **Estimate:** an optional `estimate_active_minutes` (a number, or an object with `high` and optionally `low`) is compared with the current authority window. Today that window is the one fixed expiry every revision gets (`github_continuation_proposal_expiry_seconds`, 60 minutes). An upper bound above it is `estimate_exceeds_window`; within 10 minutes of it is a warning, `estimate_near_window`; an unusable value is `estimate_invalid`. The estimate is never stored. The item ceiling, a scope maximum window and an estimate-derived window are not part of this check yet (#938).
+
+The continuation and amendment submit routes run the same checks and refuse with the same first code and status as before, so a request that passes preflight is not refused for these rules. Rules that need stored state, such as budgets, a pending request or the repository head, are still checked only when you submit.
+
 ## Healthy scope amendments and submitted review settlement
 
 These routes use the `/api/v1/agent-teams` prefix and current member session authentication.

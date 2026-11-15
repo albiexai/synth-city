@@ -574,6 +574,50 @@ def synth_city_request_work_item_approval(
 
 
 @mcp.tool()
+def synth_city_preflight_request(
+    kind: str,
+    work_item_id: int,
+    dispatch_nonce: str,
+    summary: str = "",
+    plan_metadata: Optional[dict[str, Any]] = None,
+    phase: Optional[str] = None,
+    execution_target: Optional[str] = None,
+    allowed_paths: Optional[list[str]] = None,
+    allowed_actions: Optional[list[str]] = None,
+    allowed_commands: Optional[list[str]] = None,
+    prohibited_actions: Optional[list[str]] = None,
+    max_failed_heads: Optional[int] = None,
+    tool_fallbacks: Optional[dict[str, Any]] = None,
+    estimate_active_minutes: Optional[Any] = None,
+    lease_token: Optional[str] = None,
+) -> dict:
+    """Check a request before you submit it. Nothing is created, sent or changed.
+
+    kind is initial_plan (summary and plan_metadata), scope_amendment or continuation (the same
+    fields as synth_city_request_scope_amendment and synth_city_request_continuation). Returns
+    passed, problems and warnings. Each problem has a code, a field and a message; every problem
+    is listed at once. estimate_active_minutes is optional: a number of minutes, or an object
+    with high and optionally low. It is checked against the current authority window and is not
+    stored. Only the item's owner may ask. A request that passes is not refused for these rules.
+    """
+    err = _guard()
+    if err:
+        return err
+    body: dict[str, Any] = {
+        "kind": kind, "work_item_id": work_item_id, "dispatch_nonce": dispatch_nonce, "summary": summary,
+        "plan_metadata": plan_metadata or {}, "phase": phase, "execution_target": execution_target,
+        "allowed_paths": allowed_paths or [], "allowed_actions": allowed_actions or [],
+        "allowed_commands": allowed_commands or [], "prohibited_actions": prohibited_actions or [],
+        "max_failed_heads": max_failed_heads, "tool_fallbacks": tool_fallbacks or {},
+        "estimate_active_minutes": estimate_active_minutes, "lease_token": lease_token,
+    }
+    result = _request("POST", "/preflight-request", json=body)
+    if not result["ok"]:
+        return result
+    return {"ok": True, **result["data"]}
+
+
+@mcp.tool()
 def synth_city_approve_work_item(
     work_item_id: int,
     dispatch_nonce: str,

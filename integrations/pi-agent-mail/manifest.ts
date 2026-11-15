@@ -565,6 +565,182 @@ export const manifest = [
     }
   },
   {
+    "name": "synth_city_preflight_request",
+    "description": "Check a request before you submit it. Nothing is created, sent or changed.\n\n    kind is initial_plan (summary and plan_metadata), scope_amendment or continuation (the same\n    fields as synth_city_request_scope_amendment and synth_city_request_continuation). Returns\n    passed, problems and warnings. Each problem has a code, a field and a message; every problem\n    is listed at once. estimate_active_minutes is optional: a number of minutes, or an object\n    with high and optionally low. It is checked against the current authority window and is not\n    stored. Only the item's owner may ask. A request that passes is not refused for these rules.\n    ",
+    "inputSchema": {
+      "properties": {
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "work_item_id": {
+          "title": "Work Item Id",
+          "type": "integer"
+        },
+        "dispatch_nonce": {
+          "title": "Dispatch Nonce",
+          "type": "string"
+        },
+        "summary": {
+          "default": "",
+          "title": "Summary",
+          "type": "string"
+        },
+        "plan_metadata": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Plan Metadata"
+        },
+        "phase": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Phase"
+        },
+        "execution_target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Execution Target"
+        },
+        "allowed_paths": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allowed Paths"
+        },
+        "allowed_actions": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allowed Actions"
+        },
+        "allowed_commands": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allowed Commands"
+        },
+        "prohibited_actions": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prohibited Actions"
+        },
+        "max_failed_heads": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Failed Heads"
+        },
+        "tool_fallbacks": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool Fallbacks"
+        },
+        "estimate_active_minutes": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Estimate Active Minutes"
+        },
+        "lease_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lease Token"
+        }
+      },
+      "required": [
+        "kind",
+        "work_item_id",
+        "dispatch_nonce"
+      ],
+      "title": "synth_city_preflight_requestArguments",
+      "type": "object"
+    }
+  },
+  {
     "name": "synth_city_prepare_operator_action_contexts",
     "description": "Prepare issue records for the current Leader's intended human requests.\n\n    Entries use the backlog assessment schema. Supply only the assigned issues\n    that have intended human_actions. Use required_actor operator. Up to sixteen\n    unique actions and eight PRs are allowed. PRs need their full expected head.\n    Inspection actions require a current stopped attempt.\n\n    Publish the completed templates in the main issue body before requesting\n    input. Preserve other issue facts and other scopes. Clear or supersede old\n    records when the request changes. A PR record must include its target and\n    reviewed head. Do not leave instructions only in Mail or comments.\n    After publication, read fresh backlog coordination and pass its private\n    snapshot_token to the normal assessment tool. This preparation is read-only\n    and grants no approval, lease, retry, merge or milestone authority.\n    ",
     "inputSchema": {
