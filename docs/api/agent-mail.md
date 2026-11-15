@@ -146,12 +146,14 @@ Use the MCP tools from agent sessions instead of calling these directly unless y
 
 ### Pre-tool-use edit guard
 
-`POST /api/v1/agent-mail/hooks/pre-tool-use` backs the Claude Code edit guard. The managed hook sends `tool_name`, `session_id`, `provider` and `team_slot_id`. The route answers `{}` to allow the call, or a `hookSpecificOutput` with `permissionDecision: "deny"` to refuse it.
+`POST /api/v1/agent-mail/hooks/pre-tool-use` backs the Claude Code edit guard. The managed hook sends `tool_name`, `session_id`, `provider` and `team_slot_id`. The route answers one of three things: `{"guard": "allow"}`, a `hookSpecificOutput` with `permissionDecision: "deny"`, or `{"guard": "unavailable"}`. The hook accepts only those; any other answer is treated as unavailable.
+
+The member is the one whose slot owns the tmux pane that the loopback request came from. That is the same kernel-verified pane binding that registration uses. The route never selects a member from a session key or from the claimed slot alone, because native hooks, MCP registration and this hook name sessions differently. A claimed slot that the pane does not confirm, or a pane with no binding, answers `unavailable`.
 
 - It refuses only `Edit`, `Write`, `MultiEdit`, `NotebookEdit` and Mail tools that change state. `synth_city_check_inbox`, `synth_city_whoami` and the `get_`, `list_`, `render_` and `prepare_` tools are never refused.
 - It refuses only while the calling member has an unread message that counts as a stop (see [Edit guard](../features/agent-mail.md#edit-guard-for-unread-stop-and-hold-mail)). Reading the message with `synth_city_check_inbox` lifts the refusal on the next call.
 - Like the other native hooks it is unauthenticated, so the refusal reason names only the message id. It never carries the subject or body.
-- Any lookup failure, unknown session or non-team event answers `{}`.
+- A non-team event, an unguarded tool, or a slot that has not registered yet answers `allow`. A lookup failure or an unverifiable pane answers `unavailable`.
 
 ## Install Endpoints
 

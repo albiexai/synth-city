@@ -57,15 +57,30 @@ def _question_denial() -> dict:
 
 
 def _guard_warning() -> dict:
-    # No detail from the failure is echoed: it can carry a URL or a server message.
+    # Fixed text only: nothing from the failure or from the server is echoed.
     return {"systemMessage": (
-        "Agent Mail edit guard: Synth City did not answer, so unread stop or hold Mail was "
-        "not checked for this tool call. Read your inbox before you continue."
+        "Agent Mail edit guard: Synth City could not answer the check, so unread stop or hold "
+        "Mail was not checked for this tool call. Read your inbox before you continue."
     )}
 
 
+def _validated_answer(answer) -> dict:
+    """Map Synth City's answer onto allow ({}), deny, or the fixed warning; nothing else passes."""
+    if not isinstance(answer, dict):
+        return _guard_warning()
+    if answer == {"guard": "allow"}:
+        return {}
+    output = answer.get("hookSpecificOutput")
+    if isinstance(output, dict):
+        reason = output.get("permissionDecisionReason")
+        if (output.get("hookEventName") == "PreToolUse" and output.get("permissionDecision") == "deny"
+                and isinstance(reason, str) and reason.strip()):
+            return _deny(reason[:_REASON_LIMIT])
+    return _guard_warning()
+
+
 def _ask_synth_city(url: str, payload: dict, tool_name: str, slot_id: int) -> dict:
-    """Return the hook output Synth City chose, or raise when it cannot answer."""
+    """Return the hook output to print, or raise when Synth City cannot answer."""
     body = {
         "provider": "claude-code",
         "session_id": str(payload.get("session_id") or os.getppid()),
@@ -79,13 +94,7 @@ def _ask_synth_city(url: str, payload: dict, tool_name: str, slot_id: int) -> di
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=_GUARD_TIMEOUT_SECONDS) as response:  # noqa: S310
-        answer = json.loads(response.read())
-    if not isinstance(answer, dict):
-        raise ValueError("unexpected answer")
-    output = answer.get("hookSpecificOutput")
-    if isinstance(output, dict) and output.get("permissionDecision") == "deny":
-        return _deny(str(output.get("permissionDecisionReason") or "")[:_REASON_LIMIT])
-    return {}
+        return _validated_answer(json.loads(response.read()))
 
 
 def main() -> int:
