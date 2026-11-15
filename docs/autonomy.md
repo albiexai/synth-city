@@ -12,6 +12,16 @@ This guide is for the operator of an Albiex Synth City team. Autonomy is off unt
 
 Synth City polls GitHub every 60 seconds by default. The Activity table refreshes every five seconds while open; it does not trigger another GitHub poll. Issues move through queued, dispatched, verifying, and ready for human review or merged. An escalated issue has stopped and needs attention.
 
+### When automatic merge does not fire
+
+With Auto policy, an accepted code PR can still wait for a human. Synth City now says why, instead of leaving the PR unmerged without a reason.
+
+- **Daily cap reached.** The work item note ends with `[auto_merge_cap_reached: n of N automatic merges in the last 24 hours]`. The Leader side gets the existing "Code PR ready for review" notice with the reason in its payload, and the Supervisor gets one notice. Repeated polls send nothing more. The cap is the per-scope setting **Max auto-merges per day**; the repository settings page shows "n of N in the last 24 hours" next to it.
+- **Escalated item.** An accepted, ready, unheld PR on an escalated item records `[item_not_eligible: escalated: <reason>]` and sends the same two notices once.
+- **Settled diagnostic escalation.** An item that is escalated only because of a completed diagnostic revision, whose PR head is unchanged since it was verified and was accepted by the reviewer, goes back to ready for review once for that head. The normal automatic merge path then applies every gate: hold label, reviewer acceptance of the exact head, Leader approval, the daily cap and green checks. Any other escalation stays with a human.
+
+These notices grant no merge authority.
+
 ### Dispatch priority and queue order
 
 The Director can order ready issues with GitHub labels `priority:1` through

@@ -23,6 +23,7 @@ from app.models.database import (
     GithubOwnerObservationPause,
     GithubWorkItem,
     GithubWorkspace,
+    MailMessage,
     TeamGithubScope,
 )
 from app.services.github_app_auth_service import github_app_auth_service
@@ -1249,6 +1250,13 @@ class GithubVerificationService:
                 lease_snapshot = (workspace.id, workspace.lease_token, workspace.leased_at)
         pull = await client.get_pull(scope.repo_owner, scope.repo_name, expected["pr_number"])
         verdict = self._classify_pull(pull)
+        if verdict == "open":
+            if notify and revision is None and expected["active_scope_revision"] == 0:
+                await self._consider_escalated_auto_merge(
+                    db, scope, item, client, pull, expected=expected,
+                    guards=(enabled_scope, ~pending_approval),
+                )
+            return
         closed_submitted = verdict == "closed_unmerged" and revision is not None
         if not closed_submitted and (verdict != "merged" or pull.get("merged") is not True):
             return
@@ -1337,6 +1345,184 @@ class GithubVerificationService:
         await db.commit()
         if notify:
             await self._notify_blocker_merged(db, scope, item)
+
+    async def _settled_diagnostic_revision(
+        self, db: AsyncSession, item: GithubWorkItem
+    ) -> GithubAttemptScopeRevision | None:
+        """The newest revision of this attempt when it is a completed diagnostic one that produced the item's escalation."""
+        newest = await db.scalar(
+            select(GithubAttemptScopeRevision).where(
+                GithubAttemptScopeRevision.work_item_id == item.id,
+                GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce,
+            ).order_by(GithubAttemptScopeRevision.revision.desc()).limit(1)
+            .execution_options(populate_existing=True)
+        )
+        if (
+            newest is None or newest.phase != "diagnostic" or newest.status != "completed"
+            or not item.escalation_reason
+            or newest.originating_escalation_reason != item.escalation_reason
+            or not isinstance(newest.evidence, dict)
+            or not isinstance(newest.evidence.get("diagnostic_completion"), dict)
+        ):
+            return None
+        return newest
+
+    async def _consider_escalated_auto_merge(
+        self,
+        db: AsyncSession,
+        scope: TeamGithubScope,
+        item: GithubWorkItem,
+        client: GithubClient,
+        pull: dict,
+        *,
+        expected: dict,
+        guards: tuple,
+    ) -> None:
+        """An accepted, ready, unheld, unchanged PR on an escalated item: say why it is not merged, or reopen it.
+
+        Only an item that is escalated because of a settled diagnostic revision can return to ``ready_for_review``,
+        and only through a conditional update. The unchanged auto-merge path then applies every gate: the hold label,
+        the reviewer's acceptance of the exact head, the Leader approval, the daily cap and the green checks.
+        """
+        if scope.merge_policy != "auto" or item.issue_type != "code":
+            return
+        if self._pull_number(pull) != expected["pr_number"]:
+            return
+        expected_base = await self.normalize_base_ref(
+            scope, client, token=None, base_ref=expected["dispatch_base_ref"])
+        try:
+            self._verify_pull_identity(pull, scope, item, expected_base=expected_base)
+        except ValueError:
+            return  # not this attempt's PR: nothing here is offered for automatic merge
+        head = self._head_sha(pull)
+        if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None:
+            return
+        if self._draft_readiness_note(item, pull) is not None:
+            return
+        identity = (item.pr_number, item.dispatch_nonce, item.scope_id)
+        if await self._acceptance_note(db, scope, item, pull, identity) is not None:
+            return
+        if await self._review_hold_note(scope, item, client, pull) is not None:
+            return
+        reason = item.escalation_reason or "unknown"
+        settled = await self._settled_diagnostic_revision(db, item)
+        if settled is None:
+            await self._record_escalated_not_fired(
+                db, scope, item, expected, guards,
+                self._not_fired("item_not_eligible", f"escalated: {reason}", head),
+                f"Auto-merge not available: the item is escalated ({reason}); a human merges this PR. "
+                f"[item_not_eligible: escalated: {reason}]",
+            )
+            return
+        reopened = settled.evidence.get("auto_merge_reopened")
+        if head != item.last_verified_sha or (
+            isinstance(reopened, dict) and reopened.get("head_sha") == head
+        ):
+            return  # changed since it was verified, or already given back once at this head
+        if await self._approval_gate_reason(db, scope, item, identity) is not None:
+            return
+        used, cap = await self._auto_merge_usage(db, scope)
+        if used >= cap:
+            detail = f"{used} of {cap} automatic merges in the last 24 hours"
+            await self._record_escalated_not_fired(
+                db, scope, item, expected, guards,
+                self._not_fired("auto_merge_cap_reached", detail, head),
+                f"Auto-merge budget exhausted; PR is ready for human merge. [auto_merge_cap_reached: {detail}]",
+            )
+            return
+        from app.services.github_coordination_service import hold_code
+        if hold_code():
+            return
+        no_pause = ~exists(select(GithubOwnerObservationPause.id).where(
+            GithubOwnerObservationPause.work_item_id == expected["id"],
+            GithubOwnerObservationPause.status.in_(("waiting", "paused"))))
+        still_settled = exists(select(GithubAttemptScopeRevision.id).where(
+            GithubAttemptScopeRevision.id == settled.id,
+            GithubAttemptScopeRevision.status == "completed",
+            GithubAttemptScopeRevision.phase == "diagnostic",
+        ))
+        evidence = dict(settled.evidence)
+        evidence["auto_merge_reopened"] = {"head_sha": head}
+        # The final conditional write: every identity field is unchanged, and so is the head the checks read.
+        claim = await db.execute(update(GithubWorkItem).where(
+            *(getattr(GithubWorkItem, key) == value for key, value in expected.items()),
+            GithubWorkItem.last_verified_sha == head,
+            *guards, no_pause, still_settled,
+        ).values(
+            dispatch_status="ready_for_review",
+            escalation_reason=None,
+            status_note=(
+                f"Settled diagnostic escalation given back to automatic merge at {head[:8]}; "
+                "every merge gate still applies."
+            ),
+            updated_at=datetime.utcnow(),
+        ).execution_options(synchronize_session=False))
+        if claim.rowcount != 1 or hold_code():
+            await db.rollback()
+            await db.refresh(scope)
+            await db.refresh(item)
+            return
+        marker = await db.execute(update(GithubAttemptScopeRevision).where(
+            GithubAttemptScopeRevision.id == settled.id,
+            GithubAttemptScopeRevision.status == "completed",
+        ).values(evidence=evidence).execution_options(synchronize_session=False))
+        if marker.rowcount != 1:
+            await db.rollback()
+            await db.refresh(scope)
+            await db.refresh(item)
+            return
+        await db.commit()
+        await db.refresh(item)
+
+    async def _record_escalated_not_fired(
+        self,
+        db: AsyncSession,
+        scope: TeamGithubScope,
+        item: GithubWorkItem,
+        expected: dict,
+        guards: tuple,
+        not_fired: dict,
+        note: str,
+    ) -> None:
+        """Record the reason on an escalated item and send one Leader notice and one operator notice."""
+        if item.status_note == note:
+            return  # already recorded for this state; later polls stay silent
+        try:
+            claim = await db.execute(update(GithubWorkItem).where(
+                *(getattr(GithubWorkItem, key) == value for key, value in expected.items()),
+                *guards,
+            ).values(status_note=note).execution_options(synchronize_session=False))
+            if claim.rowcount != 1:
+                await db.rollback()
+                await db.refresh(scope)
+                await db.refresh(item)
+                return
+            await self._add_operator_not_fired(db, scope, item, not_fired)
+            # The Leader's notice commits last, so the note and both notices persist together or not at all.
+            await agent_mail_service.send_broadcast(
+                db,
+                audience_type="work_item",
+                audience_id=str(item.id),
+                subject=f"Auto-merge did not fire: issue #{item.issue_number}",
+                body_markdown=(
+                    f"PR #{item.pr_number} for issue #{item.issue_number} is accepted but was not merged "
+                    f"automatically: {not_fired['code']} ({not_fired['detail']}). "
+                    "It needs a manual merge under the configured policy."
+                ),
+                payload={
+                    "kind": "github_auto_merge_not_fired", "work_item_id": item.id,
+                    "pr_number": item.pr_number, "reason": not_fired["code"], "detail": not_fired["detail"],
+                    "head_sha": not_fired["head_sha"],
+                },
+                delivery_key=(
+                    f"auto-merge-not-fired:{item.id}:{item.pr_number}:{not_fired['head_sha']}:"
+                    f"{not_fired['code']}:{not_fired['detail']}:leader"
+                ),
+            )
+        except BaseException:
+            await db.rollback()
+            raise
+        await db.refresh(item)
 
     async def _settle_merged_while_round_stopped(
         self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, client: GithubClient
@@ -2429,11 +2615,16 @@ class GithubVerificationService:
                 f"required ({approval_reason}).",
             )
             return
-        if await self._auto_merge_budget_exhausted(db, scope):
+        used, cap = await self._auto_merge_usage(db, scope)
+        if used >= cap:
+            detail = f"{used} of {cap} automatic merges in the last 24 hours"
+            not_fired = self._not_fired("auto_merge_cap_reached", detail, self._head_sha(pull))
             await self._fallback_to_human_merge(
                 db,
                 item,
-                "Auto-merge budget exhausted; PR is ready for human merge.",
+                f"Auto-merge budget exhausted; PR is ready for human merge. [auto_merge_cap_reached: {detail}]",
+                not_fired=not_fired,
+                scope=scope,
             )
             return
         current_head = self._head_sha(pull)
@@ -3007,20 +3198,70 @@ class GithubVerificationService:
         await db.commit()
         return False
 
+    async def _auto_merge_usage(
+        self, db: AsyncSession, scope: TeamGithubScope
+    ) -> tuple[int, int]:
+        """Automatic merges in the last 24 hours and the scope's daily cap."""
+        return await self.auto_merges_last_24h(db, scope.id), scope.max_auto_merges_per_day
+
+    @staticmethod
+    async def auto_merges_last_24h(db: AsyncSession, scope_id: int) -> int:
+        since = datetime.utcnow() - timedelta(days=1)
+        return int(await db.scalar(
+            select(func.count(GithubWorkItem.id)).where(
+                GithubWorkItem.scope_id == scope_id,
+                GithubWorkItem.auto_merged_at.is_not(None),
+                GithubWorkItem.auto_merged_at >= since,
+            )
+        ) or 0)
+
     async def _auto_merge_budget_exhausted(
         self, db: AsyncSession, scope: TeamGithubScope
     ) -> bool:
-        since = datetime.utcnow() - timedelta(days=1)
-        count = (
-            await db.execute(
-                select(GithubWorkItem.id).where(
-                    GithubWorkItem.scope_id == scope.id,
-                    GithubWorkItem.auto_merged_at.is_not(None),
-                    GithubWorkItem.auto_merged_at >= since,
-                )
-            )
-        ).all()
-        return len(count) >= scope.max_auto_merges_per_day
+        used, cap = await self._auto_merge_usage(db, scope)
+        return used >= cap
+
+    @staticmethod
+    def _not_fired(code: str, detail: str, head_sha: str | None) -> dict:
+        """Why an accepted, ready, unheld PR was not merged automatically (a stable code and the facts)."""
+        return {"code": code, "detail": detail, "head_sha": head_sha}
+
+    async def _add_operator_not_fired(
+        self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, not_fired: dict,
+    ) -> None:
+        """Add (never commit) the Supervisor's notice: a system row that only the bound Supervisor's inbox shows.
+
+        It is built like the "Leader approval waiting" notice: no member receipts, and a payload shape that
+        ``agent_team_supervisor_service`` recognizes. The caller commits it together with the item's note and the
+        Leader's notice, so a failure anywhere leaves none of them and the next poll retries the whole set.
+        """
+        preset = await db.get(AgentTeamPreset, scope.preset_id)
+        if preset is None or preset.supervisor_actor_id is None:
+            return
+        key = (
+            f"auto-merge-not-fired:{item.id}:{item.pr_number}:{not_fired['head_sha']}:"
+            f"{not_fired['code']}:{not_fired['detail']}:operator"
+        )
+        if await db.scalar(select(MailMessage.id).where(MailMessage.delivery_key == key)) is not None:
+            return
+        db.add(MailMessage(
+            kind="message",
+            sender_type="system",
+            audience_type="team_preset",
+            audience_id=str(preset.id),
+            subject="Auto-merge did not fire",
+            body_markdown=(
+                f"PR #{item.pr_number} for issue #{item.issue_number} is accepted but was not merged "
+                f"automatically: {not_fired['code']} ({not_fired['detail']}). "
+                "It needs a manual merge under the configured policy. This notice grants no merge authority."
+            ),
+            payload={
+                "notice": "auto_merge_not_fired", "work_item_id": item.id, "pr_number": item.pr_number,
+                "reason": not_fired["code"], "detail": not_fired["detail"], "head_sha": not_fired["head_sha"],
+                "supervisor_actor_id": preset.supervisor_actor_id,
+            },
+            delivery_key=key,
+        ))
 
     def _mark_merged(self, item: GithubWorkItem) -> None:
         item.dispatch_status = "merged"
@@ -3058,13 +3299,24 @@ class GithubVerificationService:
         db: AsyncSession,
         item: GithubWorkItem,
         note: str,
+        *,
+        not_fired: dict | None = None,
+        scope: TeamGithubScope | None = None,
     ) -> None:
         item.dispatch_status = "ready_for_review"
         item.escalation_reason = None
         item.status_note = note
         item.updated_at = datetime.utcnow()
-        await self._notify_code_pr_ready_for_review(db, item, fallback_note=note)
-        await db.commit()
+        try:
+            if not_fired is not None and scope is not None:
+                await self._add_operator_not_fired(db, scope, item, not_fired)
+            # The Leader's notice commits last: the note, the operator notice and this notice persist together.
+            await self._notify_code_pr_ready_for_review(
+                db, item, fallback_note=note, not_fired=not_fired)
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
 
     async def _notify_code_pr_ready_for_review(
         self,
@@ -3072,6 +3324,7 @@ class GithubVerificationService:
         item: GithubWorkItem,
         *,
         fallback_note: str | None = None,
+        not_fired: dict | None = None,
     ) -> None:
         body = (
             f"Code PR #{item.pr_number} is ready for human review for "
@@ -3091,6 +3344,8 @@ class GithubVerificationService:
             body = f"{body}\n\nAuto-merge fell back to human merge: {fallback_note}"
             payload["auto_merge_fallback"] = True
             payload["fallback_note"] = fallback_note
+            if not_fired is not None:
+                payload["auto_merge_not_fired"] = not_fired
         completion_id = await github_ci_watch_service.completion_id(db, item)
         if completion_id is not None and fallback_note is None:
             # The durable completion already notified the Leader and reviewer.
