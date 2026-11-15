@@ -23,6 +23,7 @@ from app.models.database import (
     GithubOwnerObservationPause,
     GithubWorkItem,
     GithubWorkspace,
+    MailMessage,
     TeamGithubScope,
 )
 from app.services.github_app_auth_service import github_app_auth_service
@@ -1486,39 +1487,42 @@ class GithubVerificationService:
         """Record the reason on an escalated item and send one Leader notice and one operator notice."""
         if item.status_note == note:
             return  # already recorded for this state; later polls stay silent
-        claim = await db.execute(update(GithubWorkItem).where(
-            *(getattr(GithubWorkItem, key) == value for key, value in expected.items()),
-            *guards,
-        ).values(status_note=note).execution_options(synchronize_session=False))
-        if claim.rowcount != 1:
+        try:
+            claim = await db.execute(update(GithubWorkItem).where(
+                *(getattr(GithubWorkItem, key) == value for key, value in expected.items()),
+                *guards,
+            ).values(status_note=note).execution_options(synchronize_session=False))
+            if claim.rowcount != 1:
+                await db.rollback()
+                await db.refresh(scope)
+                await db.refresh(item)
+                return
+            await self._add_operator_not_fired(db, scope, item, not_fired)
+            # The Leader's notice commits last, so the note and both notices persist together or not at all.
+            await agent_mail_service.send_broadcast(
+                db,
+                audience_type="work_item",
+                audience_id=str(item.id),
+                subject=f"Auto-merge did not fire: issue #{item.issue_number}",
+                body_markdown=(
+                    f"PR #{item.pr_number} for issue #{item.issue_number} is accepted but was not merged "
+                    f"automatically: {not_fired['code']} ({not_fired['detail']}). "
+                    "It needs a manual merge under the configured policy."
+                ),
+                payload={
+                    "kind": "github_auto_merge_not_fired", "work_item_id": item.id,
+                    "pr_number": item.pr_number, "reason": not_fired["code"], "detail": not_fired["detail"],
+                    "head_sha": not_fired["head_sha"],
+                },
+                delivery_key=(
+                    f"auto-merge-not-fired:{item.id}:{item.pr_number}:{not_fired['head_sha']}:"
+                    f"{not_fired['code']}:{not_fired['detail']}:leader"
+                ),
+            )
+        except BaseException:
             await db.rollback()
-            await db.refresh(scope)
-            await db.refresh(item)
-            return
-        await db.commit()
+            raise
         await db.refresh(item)
-        key = (
-            f"auto-merge-not-fired:{item.id}:{item.pr_number}:{not_fired['head_sha']}:"
-            f"{not_fired['code']}:{not_fired['detail']}"
-        )
-        await agent_mail_service.send_broadcast(
-            db,
-            audience_type="work_item",
-            audience_id=str(item.id),
-            subject=f"Auto-merge did not fire: issue #{item.issue_number}",
-            body_markdown=(
-                f"PR #{item.pr_number} for issue #{item.issue_number} is accepted but was not merged "
-                f"automatically: {not_fired['code']} ({not_fired['detail']}). "
-                "It needs a manual merge under the configured policy."
-            ),
-            payload={
-                "kind": "github_auto_merge_not_fired", "work_item_id": item.id,
-                "pr_number": item.pr_number, "reason": not_fired["code"], "detail": not_fired["detail"],
-                "head_sha": not_fired["head_sha"],
-            },
-            delivery_key=key + ":leader",
-        )
-        await self._notify_operator_not_fired(db, scope, item, not_fired)
 
     async def _settle_merged_while_round_stopped(
         self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, client: GithubClient
@@ -2620,8 +2624,8 @@ class GithubVerificationService:
                 item,
                 f"Auto-merge budget exhausted; PR is ready for human merge. [auto_merge_cap_reached: {detail}]",
                 not_fired=not_fired,
+                scope=scope,
             )
-            await self._notify_operator_not_fired(db, scope, item, not_fired)
             return
         current_head = self._head_sha(pull)
         if not current_head or current_head != item.last_verified_sha:
@@ -3222,33 +3226,42 @@ class GithubVerificationService:
         """Why an accepted, ready, unheld PR was not merged automatically (a stable code and the facts)."""
         return {"code": code, "detail": detail, "head_sha": head_sha}
 
-    async def _notify_operator_not_fired(
+    async def _add_operator_not_fired(
         self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, not_fired: dict,
     ) -> None:
-        """One notice per (item, head, code, detail) to the preset's Supervisor; the delivery key makes repeats no-ops."""
+        """Add (never commit) the Supervisor's notice: a system row that only the bound Supervisor's inbox shows.
+
+        It is built like the "Leader approval waiting" notice: no member receipts, and a payload shape that
+        ``agent_team_supervisor_service`` recognizes. The caller commits it together with the item's note and the
+        Leader's notice, so a failure anywhere leaves none of them and the next poll retries the whole set.
+        """
         preset = await db.get(AgentTeamPreset, scope.preset_id)
         if preset is None or preset.supervisor_actor_id is None:
             return
-        await agent_mail_service.send_broadcast(
-            db,
+        key = (
+            f"auto-merge-not-fired:{item.id}:{item.pr_number}:{not_fired['head_sha']}:"
+            f"{not_fired['code']}:{not_fired['detail']}:operator"
+        )
+        if await db.scalar(select(MailMessage.id).where(MailMessage.delivery_key == key)) is not None:
+            return
+        db.add(MailMessage(
+            kind="message",
+            sender_type="system",
             audience_type="team_preset",
             audience_id=str(preset.id),
-            subject=f"Auto-merge did not fire: issue #{item.issue_number}",
+            subject="Auto-merge did not fire",
             body_markdown=(
                 f"PR #{item.pr_number} for issue #{item.issue_number} is accepted but was not merged "
                 f"automatically: {not_fired['code']} ({not_fired['detail']}). "
                 "It needs a manual merge under the configured policy. This notice grants no merge authority."
             ),
             payload={
-                "kind": "github_auto_merge_not_fired", "work_item_id": item.id,
-                "pr_number": item.pr_number, "reason": not_fired["code"], "detail": not_fired["detail"],
-                "head_sha": not_fired["head_sha"], "supervisor_actor_id": preset.supervisor_actor_id,
+                "notice": "auto_merge_not_fired", "work_item_id": item.id, "pr_number": item.pr_number,
+                "reason": not_fired["code"], "detail": not_fired["detail"], "head_sha": not_fired["head_sha"],
+                "supervisor_actor_id": preset.supervisor_actor_id,
             },
-            delivery_key=(
-                f"auto-merge-not-fired:{item.id}:{item.pr_number}:{not_fired['head_sha']}:"
-                f"{not_fired['code']}:{not_fired['detail']}:operator"
-            ),
-        )
+            delivery_key=key,
+        ))
 
     def _mark_merged(self, item: GithubWorkItem) -> None:
         item.dispatch_status = "merged"
@@ -3288,14 +3301,22 @@ class GithubVerificationService:
         note: str,
         *,
         not_fired: dict | None = None,
+        scope: TeamGithubScope | None = None,
     ) -> None:
         item.dispatch_status = "ready_for_review"
         item.escalation_reason = None
         item.status_note = note
         item.updated_at = datetime.utcnow()
-        await self._notify_code_pr_ready_for_review(
-            db, item, fallback_note=note, not_fired=not_fired)
-        await db.commit()
+        try:
+            if not_fired is not None and scope is not None:
+                await self._add_operator_not_fired(db, scope, item, not_fired)
+            # The Leader's notice commits last: the note, the operator notice and this notice persist together.
+            await self._notify_code_pr_ready_for_review(
+                db, item, fallback_note=note, not_fired=not_fired)
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
 
     async def _notify_code_pr_ready_for_review(
         self,

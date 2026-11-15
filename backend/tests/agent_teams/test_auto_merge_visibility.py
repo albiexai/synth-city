@@ -7,6 +7,7 @@ the usage figure and the fenced return from 'escalated'.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -14,9 +15,12 @@ from sqlalchemy import select, update
 
 from app.api.v1.agent_teams import _scope_response, list_github_scopes
 from app.models.database import (
-    AgentTeamPreset, AgentTeamSlot, GithubApprovalRequest, GithubAttemptScopeRevision, GithubWorkItem, MailMessage, MailTeamMember,
+    AgentTeamPreset, AgentTeamSlot, GithubApprovalRequest, GithubAttemptScopeRevision, GithubWorkItem, MailMessage,
+    MailReceipt, MailTeamMember,
 )
 from app.services import github_head_acceptance_service as acceptance
+from app.services.agent_mail_service import agent_mail_service
+from app.services.agent_team_supervisor_service import is_supervisor_message, supervisor_inbox
 from app.services.github_verification_service import github_verification_service as service
 from tests.agent_teams.test_github_verification_service import (  # noqa: F401  (fixtures and helpers)
     _HoldClient, _diagnostic_revision, _item, _scope, capability_enforcement, db,
@@ -73,8 +77,10 @@ async def _escalated(db, *, settled=True, cap=10, reason="retry_count_exhausted"
 
 
 async def _notices(db):
+    """Every not-fired notice, whichever side it is for: the Leader's carries payload kind, the Supervisor's notice."""
     rows = (await db.execute(select(MailMessage))).scalars().all()
-    return [m for m in rows if (m.payload or {}).get("kind") == "github_auto_merge_not_fired"]
+    return [m for m in rows if (m.payload or {}).get("kind") == "github_auto_merge_not_fired"
+            or (m.payload or {}).get("notice") == "auto_merge_not_fired"]
 
 
 def _to_operator(messages):
@@ -319,3 +325,161 @@ async def test_an_item_merged_outside_is_still_recorded_as_before(db):
     await db.refresh(item)
     assert item.dispatch_status == "merged"
     assert await _notices(db) == []
+
+
+# ---- review of PR #953: real Supervisor delivery, receipts, and one transaction ----
+
+async def _leader_member(db, scope):
+    preset = await db.get(AgentTeamPreset, scope.preset_id)
+    return await db.scalar(select(MailTeamMember).where(MailTeamMember.team_slot_id == preset.leader_slot_id))
+
+
+async def _leader_receipts(db, scope, *, with_payload_key):
+    leader = await _leader_member(db, scope)
+    rows = (await db.execute(select(MailMessage).join(MailReceipt, MailReceipt.message_id == MailMessage.id)
+        .where(MailReceipt.member_id == leader.id))).scalars().all()
+    return [m for m in rows if with_payload_key in (m.payload or {}) or (m.payload or {}).get("kind") == with_payload_key]
+
+
+async def _not_fired_state(db, state, **kwargs):
+    """The two places a notice arises: an escalated item that is not eligible, and a ready item at the cap."""
+    scope, item, _revision, client = await _escalated(db, settled=False, cap=0, **kwargs)
+    if state == "ready":
+        item.dispatch_status = "ready_for_review"
+        item.escalation_reason = None
+        item.last_verified_sha = HEAD
+        await db.commit()
+    return scope, item, client
+
+
+def _leader_side(notices, state):
+    """The Leader-side notice: the new one for an escalated item, the existing ready notice for a ready one."""
+    return [m for m in notices if (m.payload or {}).get("kind") == "github_auto_merge_not_fired"]
+
+
+async def _ready_notices(db):
+    rows = (await db.execute(select(MailMessage))).scalars().all()
+    return [m for m in rows if m.subject == "Code PR ready for review" and "auto_merge_not_fired" in (m.payload or {})]
+
+
+async def _note(db, item_id):
+    return await db.scalar(select(GithubWorkItem.status_note).where(GithubWorkItem.id == item_id))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["escalated", "ready"])
+async def test_the_bound_supervisor_sees_exactly_one_notice_and_nobody_else_does(db, state):
+    scope, item, client = await _not_fired_state(db, state)
+    await _poll(db, scope, client, times=3)
+
+    seen = await supervisor_inbox(db, SimpleNamespace(id=6))
+    assert len(seen) == 1
+    assert seen[0].payload["notice"] == "auto_merge_not_fired" and seen[0].payload["work_item_id"] == item.id
+    with pytest.raises(PermissionError):
+        await supervisor_inbox(db, SimpleNamespace(id=9))  # an actor bound to no team
+    other = AgentTeamPreset(name="Other", description="", created_by="t", supervisor_actor_id=7)
+    db.add(other)
+    await db.commit()
+    assert await supervisor_inbox(db, SimpleNamespace(id=7)) == []  # another team's Supervisor sees nothing of it
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["escalated", "ready"])
+async def test_the_leader_receives_the_notice_once_and_never_the_operator_row(db, state):
+    scope, _item, client = await _not_fired_state(db, state)
+    await _poll(db, scope, client, times=3)
+    assert len(await _leader_receipts(db, scope, with_payload_key="auto_merge_not_fired" if state == "ready" else "github_auto_merge_not_fired")) == 1
+    assert await _leader_receipts(db, scope, with_payload_key="notice") == []  # the operator row has no member receipts
+    operator = _to_operator(await _notices(db))
+    assert len(operator) == 1 and (await db.execute(select(MailReceipt).where(MailReceipt.message_id == operator[0].id))).first() is None
+
+
+def _row(**overrides):
+    base = dict(
+        kind="message", audience_type="team_preset", audience_id="1", thread_root_id=None, sender_type="system",
+        sender_member_id=None, sender_actor_id=None, recipient_member_id=None, subject="Auto-merge did not fire",
+        payload={"notice": "auto_merge_not_fired", "work_item_id": 3, "pr_number": 5, "reason": "auto_merge_cap_reached",
+                 "detail": "1 of 1 automatic merges in the last 24 hours", "head_sha": HEAD, "supervisor_actor_id": 6})
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_the_supervisor_recognizer_accepts_only_the_exact_notice_shape():
+    assert is_supervisor_message(_row()) is True
+    good = _row().payload
+    assert is_supervisor_message(_row(payload={**good, "head_sha": None})) is True
+    for bad in (
+        _row(payload={**good, "extra": 1}),
+        _row(payload={k: v for k, v in good.items() if k != "detail"}),
+        _row(payload={**good, "reason": "anything_else"}),
+        _row(payload={**good, "work_item_id": "3"}),
+        _row(payload={**good, "pr_number": 0}),
+        _row(payload={**good, "supervisor_actor_id": True}),
+        _row(payload={**good, "detail": ""}),
+        _row(subject="Something else"),
+        _row(sender_type="member"),
+        _row(sender_actor_id=6),
+        _row(recipient_member_id=4),
+        _row(thread_root_id=2),
+        _row(audience_type="work_item"),
+        _row(kind="broadcast"),
+    ):
+        assert is_supervisor_message(bad) is False, bad.payload
+
+
+class _Boom(RuntimeError):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["escalated", "ready"])
+@pytest.mark.parametrize("boundary", ["operator_row", "before_leader_send", "after_leader_commit"])
+async def test_a_failure_at_any_boundary_leaves_nothing_half_done_and_the_next_poll_completes_it(
+        db, monkeypatch, state, boundary):
+    scope, item, client = await _not_fired_state(db, state)
+    item_id = item.id  # a rollback expires the objects; keep plain values
+    original_send = agent_mail_service.send_broadcast
+    original_add = service._add_operator_not_fired
+    armed = {"add": boundary == "operator_row", "send": boundary != "operator_row"}
+
+    async def send(*args, **kwargs):
+        if kwargs.get("audience_type") == "work_item" and armed["send"]:
+            armed["send"] = False
+            if boundary == "before_leader_send":
+                raise _Boom("leader notice not sent")
+            result = await original_send(*args, **kwargs)
+            raise _Boom("failed after the commit")
+        return await original_send(*args, **kwargs)
+
+    async def add(*args, **kwargs):
+        if armed["add"]:
+            armed["add"] = False
+            raise _Boom("operator row not added")
+        return await original_add(*args, **kwargs)
+
+    monkeypatch.setattr(agent_mail_service, "send_broadcast", send)
+    monkeypatch.setattr(service, "_add_operator_not_fired", add)
+
+    with pytest.raises(_Boom) as raised:
+        await _poll(db, scope, client)
+    assert raised.traceback[-1].name in {"add", "send"}  # it failed at the boundary under test, not earlier
+    await db.rollback()
+    await db.refresh(scope)
+
+    note = await _note(db, item_id)
+    code = "item_not_eligible" if state == "escalated" else "auto_merge_cap_reached"
+    if boundary == "after_leader_commit":
+        assert code in note  # the single commit already took the note and both notices
+    else:
+        assert "auto_merge" not in (note or "")  # no note without its notices: a sticky note cannot hide a lost one
+        assert await _notices(db) == [] and await _ready_notices(db) == []
+
+    await _poll(db, scope, client, times=3)  # the recovery polls, and repeats
+
+    assert code in await _note(db, item_id)
+    notices = await _notices(db)
+    assert len(_to_operator(notices)) == 1  # exactly one for the Supervisor, however many attempts
+    if state == "escalated":
+        assert len(_leader_side(notices, state)) == 1
+    else:
+        assert len(await _ready_notices(db)) == 1
