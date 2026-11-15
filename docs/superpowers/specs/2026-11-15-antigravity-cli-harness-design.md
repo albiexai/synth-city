@@ -33,7 +33,12 @@ Live observation from a member in tmux, which #734's "Done when" requires, is **
 
 ### What the terms say (official)
 
-- Google Antigravity Additional Terms of Service, section 6 (<https://antigravity.google/terms>; the page shows no
+- Google Antigravity Additional Terms of Service, opening clause, before section 1 (<https://antigravity.google/terms>):
+  > "If you are accessing the Service through Gemini Enterprise (Google Cloud), Gemini Enterprise for Business or a
+  > Google Workspace subscription on the Google Cloud Pre-GA Offering Terms, or with an API Key in Gemini for business,
+  > then you are subject to the terms of use accepted or signed by your administrator applicable to such service
+  > (including its applicable terms for downloadable software)."
+- The same terms, section 6 (<https://antigravity.google/terms>; the page shows no
   effective date):
   > "You must not abuse, harm, interfere with, or disrupt the Service. This includes, but is not limited to, using the
   > Service in connection with products not provided by us. Using third party software, tools, or services to access
@@ -44,7 +49,8 @@ Live observation from a member in tmux, which #734's "Done when" requires, is **
   > severely degrades the experience for legitimate product users."
 
   The FAQ names Claude Code, OpenClaw and OpenCode as examples, and says that such use "can result in suspension or
-  termination of your account."
+  termination of your account." For using a third-party coding agent with Gemini, the same answer recommends "a Gemini
+  Enterprise or Google AI Studio API key" ([FAQ answer](https://antigravity.google/docs/faq#why-cant-i-use-third-party-software-such-as-claude-code-openclaw-or-opencode-with-my-antigravity-login)).
 - The same FAQ, on headless mode:
   > "Antigravity CLI headless mode (`agy -p`) is intended for direct scripting and CI workflows. Wrapping `agy` inside
   > third-party coding agents or applications, or automating account rotation, is not supported under consumer plans."
@@ -62,9 +68,20 @@ Live observation from a member in tmux, which #734's "Done when" requires, is **
 - So running a Deck member on the **Director's consumer subscription** (Google AI Pro or Ultra sign-in) carries a real
   risk of the account being suspended or terminated. This is unlike Muse Code, whose terms permit use "with Muse Code
   only" and so allow Deck to launch Muse Code itself.
-- The FAQ limits its "not supported" statement to consumer plans. That suggests, but does not state, that a Gemini API
-  key, Gemini Enterprise or Vertex AI route may be treated differently. Those routes are governed by their own terms,
-  which this checkpoint has **not** reviewed. Section 6 is not limited to consumer plans.
+- Google itself names alternatives: the FAQ recommends a Gemini Enterprise or Google AI Studio API key for
+  third-party coding agents. The terms' opening clause puts access through Gemini Enterprise (Google Cloud), Gemini
+  Enterprise for Business, a Google Workspace subscription on the Pre-GA Offering Terms, or "an API Key in Gemini for
+  business" under the terms the administrator accepted for that service. So section 6 is the governing text for
+  consumer sign-ins; for those enterprise and business routes, the administrator's terms govern.
+- The routes are distinct, and each has its own governing terms:
+  - consumer sign-in (Free, Pro, Ultra): these Additional Terms, section 6 and the FAQ apply;
+  - Google AI Studio API key (`modelProvider` `gemini` and `GEMINI_API_KEY`): recommended by the FAQ; its governing terms
+    (the Gemini API terms) are **not reviewed here**;
+  - API key in Gemini for business, Gemini Enterprise, Workspace: the administrator's accepted terms, **not reviewed
+    here**;
+  - Vertex AI with `AGY_ADC_AUTH`: Google Cloud terms, **not reviewed here**.
+- The FAQ recommendation does not establish that every enterprise or API-key deployment of a Deck member is permitted.
+  That depends on the chosen route's own terms.
 - Deck does not extract or proxy the credential: `agy` keeps its own sign-in in the operating system keyring
   (official, install page). The terms quoted above do not make that distinction for "wrapping".
 
@@ -81,8 +98,8 @@ Before any live member runs, the Director decides:
 
 1. Whether Deck may run `agy` on a consumer subscription sign-in at all, given section 6 and the FAQ. The author's
    recommendation is **no**.
-2. If not, which route the spike and the provider use: a Gemini API key (pay as you go), Gemini Enterprise, or Vertex
-   AI. The chosen route's own terms must then be reviewed and quoted here.
+2. If not, which route the spike and the provider use: a Google AI Studio API key, an API key in Gemini for business,
+   Gemini Enterprise, or Vertex AI. The chosen route's own terms must then be reviewed and quoted here.
 3. Who signs in. The sign-in is interactive (browser, or a device code over SSH: official, install page). An agent never
    handles the credential.
 
@@ -111,10 +128,11 @@ None of these has live evidence. Each row states the source of every claim.
 
 | Point | Finding | Label |
 |---|---|---|
-| Tool | `ask_question`, multiple-choice questions to the user | issue, unofficial |
-| Name seen by `PreToolUse` | unknown. A hook can only deny it if `PreToolUse` fires for it; Muse's `PreToolUse` does not fire for its question tool. | unknown |
+| Tool | `ask_question`, "Ask multiple-choice questions", with argument `questions` (each with `question`, `options`, `is_multi_select`). The Hooks page lists it among the tools that hook matchers can name ([Supported tools, Interaction and media](https://antigravity.google/docs/hooks#interaction-and-media)). | official, issue |
+| Name seen by `PreToolUse` | Documented as `ask_question` (above). Whether `PreToolUse` actually fires for it in the CLI, and whether a `deny` decision then blocks the question, is unknown. Muse's `PreToolUse` does not fire for its question tool. | official (documented name); firing and denial unknown |
 | `permissions.deny` | The documented rule actions are `read_file`, `write_file`, `read_url`, `execute_url`, `command`, `unsandboxed` and `mcp` (<https://antigravity.google/docs/permissions?tab=cli>). No action covers a question tool. | official; blocking it is unknown |
-| `--dangerously-skip-permissions` | The permissions page says it overrides the permission rules and bypasses approvals (paraphrase). It does not say whether it suppresses `ask_question`. | official; effect on questions unknown |
+| Rule precedence | "Your fine-grained `allow`, `ask`, and `deny` rules always take precedence (`Deny > Ask > Allow`)." ([Execution modes and the terminal sandbox](https://antigravity.google/docs/permissions?tab=cli#execution-modes-and-the-terminal-sandbox)) | official |
+| `--dangerously-skip-permissions` | A separate behaviour: it sets the `toolPermission` setting to `always-proceed`, and "`strict` and `always-proceed` (`--dangerously-skip-permissions`) take precedence over `auto` mode." On the page as fetched on 2026-11-15, it does not override explicit `deny` rules. The page names no version, and it can change. Whether the flag suppresses `ask_question`, or affects a hook's `deny`, is not stated. A permission override is not evidence that the question screen is suppressed. | official; effect on questions and hooks unknown |
 | Open question in the transcript, the summaries database and on screen | unknown | unknown |
 
 ### Q4: identity and resume
@@ -164,11 +182,19 @@ in it is approved by this checkpoint.
   root, never an agent user's home or factory configuration. The version and the binary's sha256 are recorded. The
   installer edits shell profiles unless `--skip-aliases` and `--skip-path` are given. Whether it supports a custom
   directory is unofficial (a third-party guide shows `--dir`).
-- **G3, network:** the probe rules from #729 apply. Some third-party guides describe a `GOOGLE_GEMINI_BASE_URL` variable
-  for a Gemini-compatible endpoint; it is not in the official pages read here (unofficial). If it works with an API
-  key provider and no sign-in, hook, identity and process questions can be observed against a local stub inside a
-  loopback-only namespace, as in the OpenCode spike. Question behaviour (Q3) and an expired login (Q6) need the real
-  service, so they need an explicit, separately approved network route.
+- **G3, network:** the probe rules from #729 apply.
+  - The installation and auth page documents a custom endpoint under the Gemini API key route: "To send model
+    requests to a different Gemini-compatible endpoint, set the `GOOGLE_GEMINI_BASE_URL` environment variable"
+    ([Point the CLI to a custom endpoint](https://antigravity.google/docs/install?tab=cli#point-the-cli-to-a-custom-endpoint),
+    official). The same page says that with an API key, model requests go directly to the Gemini API without an
+    account session, and "The CLI skips the sign-in screen and opens the main interface directly."
+  - Untested: whether the pinned `agy` binary honours the variable, and whether a local stub is compatible enough.
+    That is a concrete candidate for an approved probe inside a loopback-only namespace, as in the OpenCode spike. It
+    needs no account sign-in.
+  - Whether question behaviour (Q3) needs the real service is **unknown**. A stub that emits an `ask_question` tool
+    call may exercise the question screen and the hooks; that is a test-plan decision, not yet observed.
+  - An expired account login (Q6) is a distinct case. It needs a real account session by definition.
+  - Any case that does need external access needs its own, separately approved network route.
 - **G4, isolated Synth City:** the e2e instance for hook and Agent Mail observations, never the live instance.
 - **Runtime support:** the isolated runtime kit (`scripts/isolated-runtime-kit.sh`) has no `antigravity-cli` provider.
   Adding one is a Deck code change and is outside #734.
