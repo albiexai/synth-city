@@ -3,6 +3,7 @@ import pytest
 from app.services.agent_mail_service import TMUX_WAKE_PROVIDERS
 from app.services.providers import get_provider
 from app.services.providers.base import ProviderLaunchError, SpawnCommandOptions
+from app.services.providers.antigravity_cli import exact_resumed_conversation, is_agy_executable
 from app.services.providers.capabilities import capability_flags, normalize_capability_matrix
 from app.services.providers.launch_contract import (
     MODEL_EXAMPLES,
@@ -116,3 +117,44 @@ def test_neutral_platform_values_are_accepted(platform):
 ])
 def test_process_match(command, match):
     assert get_provider("antigravity-cli").is_process_match(command, "1") is match
+
+
+@pytest.mark.parametrize("argv0,exact", [
+    ("agy", True), ("/home/u/.local/bin/agy", True),
+    ("agy arbitrary-file", False), ("/tmp/agy arbitrary-file", False), ("agyx", False), ("agy-old", False),
+    ("antigravity-cli", False), ("", False), ("/tmp/agy/", False),
+])
+def test_agy_executable_is_the_exact_basename(argv0, exact):
+    assert is_agy_executable(argv0) is exact
+
+
+@pytest.mark.parametrize("model", [None, "m-1"])
+@pytest.mark.parametrize("effort", [None, "low", "max"])
+@pytest.mark.parametrize("skip", [False, True])
+def test_every_built_resume_command_is_recognized_with_its_id(model, effort, skip):
+    command = build(mode="resume", session_id=CID, model=model, reasoning_effort=effort, skip_permissions=skip)
+    assert exact_resumed_conversation(command) == CID
+    assert exact_resumed_conversation(["/home/u/.local/bin/agy", *command[1:]]) == CID
+
+
+@pytest.mark.parametrize("argv", [
+    [], ["agy"], ["agy", "--conversation"], ["agy", "-i", "hi"],
+    ["agy", "--conversation", CID, "--conversation", CID],
+    ["agy", "--", "--conversation", CID],
+    ["agy", "-i", "--conversation", CID],
+    ["agy", "--model", "--conversation", CID],
+    ["agy", f"--conversation={CID}"],
+    ["agy", "--conversation", CID, "extra"],
+    ["agy", "--conversation", "last"],
+    ["agy", "--dangerously-skip-permissions", "--model", "m-1", "--conversation", CID],
+    ["agy", "--effort", "high", "--model", "m-1", "--conversation", CID],
+    ["agy", "--model", "m-1", "--model", "m-2", "--conversation", CID],
+    ["agy", "--dangerously-skip-permissions", "--dangerously-skip-permissions", "--conversation", CID],
+    ["agy", "--effort", "ultra", "--conversation", CID],
+    ["agy", "--model", "-x", "--conversation", CID],
+    ["agy", "--model", "two words", "--conversation", CID],
+    ["/tmp/agy arbitrary-file", "--conversation", CID],
+    ["antigravity-cli", "--conversation", CID],
+])
+def test_anything_but_the_built_resume_form_is_not_a_resumed_conversation(argv):
+    assert exact_resumed_conversation(argv) is None

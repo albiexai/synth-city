@@ -79,11 +79,27 @@ AGY_CONVERSATION='6f1c2b8e-4d3a-4b7f-9c2e-1a2b3c4d5e6f'
 @pytest.mark.parametrize('argv,accepted',[
     ([b'/home/u/.local/bin/agy',b'--model',b'm-1',b'--conversation',AGY_CONVERSATION.encode()],True),
     ([b'agy',b'--conversation',AGY_CONVERSATION.encode()],True),
+    ([b'agy',b'--effort',b'max',b'--dangerously-skip-permissions',b'--conversation',AGY_CONVERSATION.encode()],True),
+    ([b'agy',b'--conversation',AGY_CONVERSATION.upper().encode()],True),
     ([b'agy',b'--conversation',b'6f1c2b8e-0000-4000-8000-000000000000'],False),
     ([b'agy',b'-i',AGY_CONVERSATION.encode()],False),
     ([b'agy'],False),
     ([b'agy',b'--conversation'],False),
     ([b'/usr/bin/yes',b'--conversation',AGY_CONVERSATION.encode()],False),
+    # Only the builder's own resume form identifies the member (V1 review 5913411113).
+    ([b'agy',b'--conversation',AGY_CONVERSATION.encode(),b'--conversation',b'6f1c2b8e-0000-4000-8000-000000000000'],False),
+    ([b'agy',b'--conversation',AGY_CONVERSATION.encode(),b'--conversation',AGY_CONVERSATION.encode()],False),
+    ([b'agy',b'--',b'--conversation',AGY_CONVERSATION.encode()],False),
+    ([b'agy',b'-i',b'--conversation',AGY_CONVERSATION.encode()],False),
+    ([b'agy',b'--model',b'--conversation',AGY_CONVERSATION.encode()],False),
+    ([b'/tmp/agy arbitrary-file',b'--conversation',AGY_CONVERSATION.encode()],False),
+    ([b'agy',b'--conversation='+AGY_CONVERSATION.encode()],False),
+    ([b'agy',b'--conversation',AGY_CONVERSATION.encode(),b'extra'],False),
+    ([b'agy',b'--dangerously-skip-permissions',b'--model',b'm-1',b'--conversation',AGY_CONVERSATION.encode()],False),
+    ([b'agy',b'--model',b'm-1',b'--model',b'm-2',b'--conversation',AGY_CONVERSATION.encode()],False),
+    ([b'agy',b'--effort',b'ultra',b'--conversation',AGY_CONVERSATION.encode()],False),
+    ([b'agy-old',b'--conversation',AGY_CONVERSATION.encode()],False),
+    ([b'antigravity-cli',b'--conversation',AGY_CONVERSATION.encode()],False),
 ])
 def test_antigravity_owner_identity_needs_its_executable_and_exact_conversation(monkeypatch,argv,accepted):
     from datetime import datetime,timedelta,timezone

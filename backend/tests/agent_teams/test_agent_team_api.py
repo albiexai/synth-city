@@ -3505,6 +3505,10 @@ async def test_readiness_confirms_muse_identity_by_its_registered_executable(
     (["agyx"], False),
     (["/usr/bin/yes", "agy"], False),
     (["gemini"], False),
+    # The provider id is not the executable, and argv[0] is never split on whitespace.
+    (["antigravity-cli"], False),
+    (["/tmp/agy arbitrary-file"], False),
+    (["agy-old"], False),
 ])
 async def test_readiness_confirms_antigravity_identity_by_its_registered_executable(
     client, db, monkeypatch, tmp_path, argv, confirmed

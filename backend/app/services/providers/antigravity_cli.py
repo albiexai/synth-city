@@ -7,6 +7,7 @@ not observed yet (#952), so anything unproven is refused rather than guessed.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from pathlib import Path
 
 from app.services.providers.base import AgentProvider, ProviderLaunchError, SpawnCommandOptions, argv0_name
@@ -22,6 +23,39 @@ def antigravity_home() -> Path:
 
 def is_antigravity_command(command: str) -> bool:
     return argv0_name(command) == "agy"
+
+
+def is_agy_executable(argv0: str) -> bool:
+    """argv[0] names the agy binary itself; it is never split on whitespace."""
+    return argv0.rsplit("/", 1)[-1] == "agy"
+
+
+def _valid_model(model: str) -> bool:
+    return bool(model) and not model.startswith("-") and not any(character in model for character in "\n\r\x00 ")
+
+
+def exact_resumed_conversation(argv: Sequence[str]) -> str | None:
+    """The conversation id of an argv that is exactly this provider's resume command, else None.
+
+    Only the form built below is accepted, in its order:
+    ``agy [--model <m>] [--effort <tier>] [--dangerously-skip-permissions] --conversation <uuid>``.
+    """
+    if len(argv) < 3 or not is_agy_executable(argv[0]) or argv[-2] != "--conversation":
+        return None
+    options, conversation = list(argv[1:-2]), argv[-1]
+    if not _UUID.fullmatch(conversation):
+        return None
+    if options[:1] == ["--model"]:
+        if len(options) < 2 or not _valid_model(options[1]):
+            return None
+        options = options[2:]
+    if options[:1] == ["--effort"]:
+        if len(options) < 2 or options[1] not in ANTIGRAVITY_EFFORTS:
+            return None
+        options = options[2:]
+    if options[:1] == ["--dangerously-skip-permissions"]:
+        options = options[1:]
+    return conversation if not options else None
 
 
 class AntigravityCliProvider(AgentProvider):
@@ -55,7 +89,7 @@ class AntigravityCliProvider(AgentProvider):
         command = ["agy"]
         if options.model is not None:
             model = options.model.strip()
-            if not model or model.startswith("-") or any(character in model for character in "\n\r\x00 "):
+            if not _valid_model(model):
                 raise ProviderLaunchError("Invalid Antigravity model", "invalid_model")
             command += ["--model", model]
         if options.reasoning_effort:

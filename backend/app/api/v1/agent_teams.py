@@ -3428,7 +3428,6 @@ async def read_activation_readiness(
                 "copilot-cli": "copilot",
                 "opencode-cli": "opencode",
                 "pi-cli": "pi",
-                "antigravity-cli": "agy",
             }.get(slot.provider, slot.provider)
             if argv0 in {"bash", "sh", "zsh", "fish", "dash", "ksh"}:
                 return False, "native_identity", member.id, None, None
@@ -3449,6 +3448,12 @@ async def read_activation_readiness(
                 # (app/services/providers/muse_cli.py::is_muse_command).
                 from app.services.providers.muse_cli import is_muse_command
                 if not is_muse_command(argv[0]):
+                    return False, "native_identity", member.id, None, None
+            elif slot.provider == "antigravity-cli":
+                # The agy binary itself; the provider id is not an executable name
+                # (app/services/providers/antigravity_cli.py::is_agy_executable).
+                from app.services.providers.antigravity_cli import is_agy_executable
+                if not is_agy_executable(argv[0]):
                     return False, "native_identity", member.id, None, None
             elif not (argv0 == marker or argv0 == slot.provider):
                 return False, "native_identity", member.id, None, None

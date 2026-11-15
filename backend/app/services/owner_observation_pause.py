@@ -69,13 +69,11 @@ def _process_identity(slot, session, workspace):
         if not native_id or not argv or not is_muse_command(argv[0]) or not resumed:
             raise ValueError("owner_native_identity_changed")
     elif slot.provider == "antigravity-cli":
-        from app.services.providers.antigravity_cli import is_antigravity_command
-        # Only the exact `agy ... --conversation <saved id>` member; discovery comes with #737.
+        from app.services.providers.antigravity_cli import exact_resumed_conversation
+        # Only this provider's exact resume command for the saved conversation; discovery comes with #737.
         native_id = activity._canonical_session_id(options.get("session_id"))
         argv = [os.fsdecode(part) for part in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if part]
-        resumed = ("--conversation" in argv and argv.index("--conversation") + 1 < len(argv)
-                   and argv[argv.index("--conversation") + 1] == native_id)
-        if not native_id or not argv or not is_antigravity_command(argv[0]) or not resumed:
+        if not native_id or activity._canonical_session_id(exact_resumed_conversation(argv)) != native_id:
             raise ValueError("owner_native_identity_changed")
     elif slot.provider == "pi-cli":
         from app.services.pi_activity_service import _native_process
