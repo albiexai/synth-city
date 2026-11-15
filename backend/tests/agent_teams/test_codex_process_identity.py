@@ -127,3 +127,37 @@ def test_antigravity_owner_identity_needs_a_saved_conversation(monkeypatch):
     session=SimpleNamespace(pid=12,created_at=datetime.utcnow(),cwd='/tmp/fixture')
     workspace=SimpleNamespace(leased_owner_pid=11,leased_owner_proc_start='fixture-start')
     with pytest.raises(ValueError,match='owner_native_identity_changed'): pause._process_identity(slot,session,workspace)
+
+
+@pytest.mark.parametrize('cmdline',[
+    b'\0agy\0--conversation\0'+AGY_CONVERSATION.encode()+b'\0',
+    b'agy\0\0--conversation\0'+AGY_CONVERSATION.encode()+b'\0',
+    b'agy\0--conversation\0\0'+AGY_CONVERSATION.encode()+b'\0',
+    b'agy\0--conversation\0'+AGY_CONVERSATION.encode()+b'\0\0',
+])
+def test_antigravity_owner_identity_keeps_empty_argv_fields(monkeypatch,cmdline):
+    # Only the final NUL terminator is removed, so an empty argument reaches the exact parser (V1 review 5913494242).
+    from datetime import datetime,timedelta,timezone
+    from types import SimpleNamespace
+    from app.services import owner_observation_pause as pause
+    monkeypatch.setattr(pause.activity,'_process',lambda _pid: ('S','fixture-start'))
+    monkeypatch.setattr(pause.activity,'_process_started_at',lambda _start: datetime.now(timezone.utc)-timedelta(minutes=2))
+    monkeypatch.setattr(pause,'Path',lambda _path: SimpleNamespace(read_bytes=lambda:cmdline))
+    slot=SimpleNamespace(provider='antigravity-cli',launch_options={'session_id':AGY_CONVERSATION})
+    session=SimpleNamespace(pid=12,created_at=datetime.utcnow(),cwd='/tmp/fixture')
+    workspace=SimpleNamespace(leased_owner_pid=11,leased_owner_proc_start='fixture-start')
+    with pytest.raises(ValueError,match='owner_native_identity_changed'): pause._process_identity(slot,session,workspace)
+
+
+def test_antigravity_owner_identity_accepts_its_terminated_cmdline(monkeypatch):
+    from datetime import datetime,timedelta,timezone
+    from types import SimpleNamespace
+    from app.services import owner_observation_pause as pause
+    monkeypatch.setattr(pause.activity,'_process',lambda _pid: ('S','fixture-start'))
+    monkeypatch.setattr(pause.activity,'_process_started_at',lambda _start: datetime.now(timezone.utc)-timedelta(minutes=2))
+    cmdline=b'agy\0--conversation\0'+AGY_CONVERSATION.encode()+b'\0'
+    monkeypatch.setattr(pause,'Path',lambda _path: SimpleNamespace(read_bytes=lambda:cmdline))
+    slot=SimpleNamespace(provider='antigravity-cli',launch_options={'session_id':AGY_CONVERSATION})
+    session=SimpleNamespace(pid=12,created_at=datetime.utcnow(),cwd='/tmp/fixture')
+    workspace=SimpleNamespace(leased_owner_pid=11,leased_owner_proc_start='fixture-start')
+    assert pause._process_identity(slot,session,workspace)=='fixture-start'

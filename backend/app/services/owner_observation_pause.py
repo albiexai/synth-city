@@ -72,7 +72,12 @@ def _process_identity(slot, session, workspace):
         from app.services.providers.antigravity_cli import exact_resumed_conversation
         # Only this provider's exact resume command for the saved conversation; discovery comes with #737.
         native_id = activity._canonical_session_id(options.get("session_id"))
-        argv = [os.fsdecode(part) for part in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if part]
+        # Keep every argument position; only the final NUL terminator is removed, so an
+        # empty argument reaches the exact parser and is refused.
+        fields = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        if fields and fields[-1] == b"":
+            fields.pop()
+        argv = [os.fsdecode(field) for field in fields]
         if not native_id or activity._canonical_session_id(exact_resumed_conversation(argv)) != native_id:
             raise ValueError("owner_native_identity_changed")
     elif slot.provider == "pi-cli":
