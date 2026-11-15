@@ -71,6 +71,20 @@ Claude Code gets both MCP tools and command hooks:
 - The MCP server exposes `synth_city_whoami`, `synth_city_list_team`, `synth_city_check_inbox`, `synth_city_send_message`, `synth_city_reply`, `synth_city_ack_message`, `synth_city_request_context`, and `synth_city_create_handoff`.
 - Session and prompt hooks inject state-based mailbox context into the agent conversation.
 - Hook failures are soft, so a Synth City outage should not break an agent session.
+- In team sessions a `PreToolUse` hook also guards edits while unread stop or hold Mail waits (see below).
+
+### Edit guard for unread stop and hold Mail
+
+Builders have edited, run experiments and sent requests before reading a newer Leader message that said stop or hold. The prompt hook cannot prevent that, because it runs only when a prompt is submitted, not between tool calls in a long turn.
+
+The managed Claude Code `PreToolUse` hook now asks Synth City, before each guarded tool call, whether the member has unread authority Mail. If it does, the call is refused with a short reason such as `unread stop or hold message 14745: read your inbox (synth_city_check_inbox) first`. The reason names only the message id.
+
+- **Guarded tools:** `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, and Mail tools that change state (send, reply, report, request, approve and similar). Read-only tools are never refused: file reads, search, shell, `synth_city_check_inbox`, `synth_city_whoami` and the `get_`, `list_`, `render_` and `prepare_` Mail tools. A blocked member can always read its inbox, and reading clears the block.
+- **What counts as a stop:** an unread message addressed to this member, sent by its team Leader, its bound Supervisor or Synth City itself, that is any of: a message whose subject contains stop, hold, pause, halt, cancel, revoke or defer; a message that carries an approval decision; or a message whose payload sets `block_edits` to true. The subject rule applies to system notices too, so a routine notice such as a label removal does not block unless it says so. A message that names a work item counts only when that item belongs to this member's slot. Plain chat, peer messages and messages for other members never block.
+- **Install:** the guard ships in the existing Agent Mail install for Claude Code. Install again to upgrade an older hook; the new matcher replaces it. Only team sessions (`SYNTH_CITY_TEAM_SLOT_ID`) are checked.
+- **Which member:** the guard finds the member from the tmux pane the hook runs in, using the same verified pane-to-slot binding as registration. It does not depend on how the native hook or the MCP server named the session, and it works with capability tokens required.
+- **Failure mode: fail open, visibly.** If Synth City is unreachable, answers with an HTTP error, times out (about one second), cannot verify which slot the pane belongs to, hits an internal lookup error, or returns anything other than a plain allow or a well-formed refusal, the call is allowed and the hook prints one fixed warning that unread stop or hold Mail was not checked. Details of the failure and any text the server sent are never echoed. The trade-off: a dead or confused backend never freezes every agent, but while the check cannot run the guard is off, so agents must read their inbox themselves. The hook records the Synth City URL at install time; after a port change, install again.
+- **Limit:** Claude Code only. Codex, Copilot, OpenCode, Muse and Pi have different hook models and are not guarded yet.
 
 Codex CLI gets the MCP server through `codex mcp add` and lifecycle hooks for session registration, activity updates, and inbox reminders. Codex agents should still check their inbox through the MCP tools when starting and finishing work because hook delivery is a reminder path, not a replacement for agent action.
 

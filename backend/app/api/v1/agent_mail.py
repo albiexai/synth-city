@@ -27,6 +27,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.api_model import format_utc_time
 from app.utils import peer_process
+from mcp_shim.team_question_hook import is_guarded_tool
 from app.models.database import (
     GithubApprovalRequest,
     GithubWorkItem,
@@ -1374,6 +1375,61 @@ async def hook_input_wait(
     except Exception as exc:
         logger.warning("input-wait hook failed: %s", exc)
     return {}
+
+
+_GUARD_ALLOW = {"guard": "allow"}
+_GUARD_UNAVAILABLE = {"guard": "unavailable"}
+
+
+@router.post("/hooks/pre-tool-use")
+async def hook_pre_tool_use(
+    http_request: Request,
+    payload: dict[str, Any] = Body(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Refuse edit and state-changing Mail tools while the member has unread stop Mail (#930).
+
+    The answer is one of three: `{"guard": "allow"}`, a PreToolUse deny, or
+    `{"guard": "unavailable"}`, which the hook shows as a fixed warning and then allows. The
+    member is the one whose slot owns the pane this loopback request came from, the same
+    kernel-verified binding registration uses. A session key or a claimed slot alone never
+    selects the member, because native hooks, MCP registration and this hook name sessions
+    differently. The route is unauthenticated like the other native hooks, so a refusal names
+    only the message id.
+    """
+    try:
+        claimed_slot = _payload_int(payload, "team_slot_id")
+        if claimed_slot is None or not is_guarded_tool(payload.get("tool_name")):
+            return _GUARD_ALLOW
+        pane = resolve_request_pane(http_request)
+        binding = await agent_mail_service.resolve_pane_binding(db, pane) if pane is not None else None
+        if binding is None or binding.slot_id is None or binding.slot_id != claimed_slot:
+            return _GUARD_UNAVAILABLE
+        member_id = (
+            await db.execute(
+                select(MailTeamMember.id)
+                .where(MailTeamMember.team_slot_id == binding.slot_id)
+                .order_by(MailTeamMember.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if member_id is None:
+            # The slot has not registered with Agent Mail yet, so no Mail can be waiting for it.
+            return _GUARD_ALLOW
+        blocking = await agent_mail_service.blocking_unread_authority(db, member_id)
+        if blocking is None:
+            return _GUARD_ALLOW
+        return {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                f"unread stop or hold message {blocking.id}: read your inbox "
+                "(synth_city_check_inbox) first"
+            ),
+        }}
+    except Exception as exc:
+        logger.warning("pre-tool-use hook failed: %s", exc)
+        return _GUARD_UNAVAILABLE
 
 
 @router.post("/hooks/post-tool-use")
