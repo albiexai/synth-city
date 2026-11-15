@@ -9,7 +9,7 @@ This playbook rebuilds the public documentation at <https://albiex.org/docs/> fr
 | `synth-city` | Markdown content in `docs/`, VitePress configuration and assets, and the build/copy scripts |
 | `synth-city-website` | Landing page plus the generated static documentation under its tracked `docs/` directory |
 
-The source documents are maintained Markdown files. “Generate” means VitePress renders those files into static HTML, JavaScript, CSS, and assets; there is no source-code scraper that writes the documentation content. The public build excludes `docs/plans/**`, `docs/superpowers/**`, and `docs/deploy/**` through `docs/.vitepress/config.ts`.
+The source documents are maintained Markdown files. “Generate” means VitePress renders those files into static HTML, JavaScript, CSS, and assets; there is no source-code scraper that writes the documentation content. The changelog page `docs/changelog.md` is the one generated exception: `python3 scripts/sync-docs-changelog.py` copies the root `CHANGELOG.md` into it, `npm run build` in `docs/` runs that script first, and the pull-request check `python scripts/sync-docs-changelog.py --check` fails when the committed page differs. Edit `CHANGELOG.md`, never the docs copy. The public build excludes `docs/plans/**`, `docs/superpowers/**`, and `docs/deploy/**` through `docs/.vitepress/config.ts`.
 
 The normal publish path is:
 
