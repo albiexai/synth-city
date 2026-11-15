@@ -27,6 +27,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.api_model import format_utc_time
 from app.utils import peer_process
+from mcp_shim.team_question_hook import is_guarded_tool
 from app.models.database import (
     GithubApprovalRequest,
     GithubWorkItem,
@@ -1374,6 +1375,48 @@ async def hook_input_wait(
     except Exception as exc:
         logger.warning("input-wait hook failed: %s", exc)
     return {}
+
+
+@router.post("/hooks/pre-tool-use")
+async def hook_pre_tool_use(
+    payload: dict[str, Any] = Body(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Refuse edit and state-changing Mail tools while the member has unread stop Mail (#930).
+
+    Unauthenticated like the other native hooks, so it names only the message id. Every
+    failure allows: a dead or confused backend must not freeze an agent.
+    """
+    try:
+        if _payload_int(payload, "team_slot_id") is None or not is_guarded_tool(payload.get("tool_name")):
+            return {}
+        session_key = _hook_session_key(payload)
+        if session_key is None:
+            return {}
+        member_id = (
+            await db.execute(
+                select(MailAgentSession.member_id).where(
+                    MailAgentSession.session_key == session_key,
+                    MailAgentSession.closed_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if member_id is None:
+            return {}
+        blocking = await agent_mail_service.blocking_unread_authority(db, member_id)
+        if blocking is None:
+            return {}
+        return {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                f"unread stop or hold message {blocking.id}: read your inbox "
+                "(synth_city_check_inbox) first"
+            ),
+        }}
+    except Exception as exc:
+        logger.warning("pre-tool-use hook failed: %s", exc)
+        return {}
 
 
 @router.post("/hooks/post-tool-use")

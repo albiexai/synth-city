@@ -137,11 +137,21 @@ GET /api/v1/agent-mail/agent/inbox?member_id={member_id}&unread_only=false
 POST /api/v1/agent-mail/hooks/session-start
 POST /api/v1/agent-mail/hooks/user-prompt-submit
 POST /api/v1/agent-mail/hooks/post-tool-use
+POST /api/v1/agent-mail/hooks/pre-tool-use
 POST /api/v1/agent-mail/hooks/session-end
 POST /api/v1/agent-mail/hooks/activity
 ```
 
 Use the MCP tools from agent sessions instead of calling these directly unless you are debugging the integration.
+
+### Pre-tool-use edit guard
+
+`POST /api/v1/agent-mail/hooks/pre-tool-use` backs the Claude Code edit guard. The managed hook sends `tool_name`, `session_id`, `provider` and `team_slot_id`. The route answers `{}` to allow the call, or a `hookSpecificOutput` with `permissionDecision: "deny"` to refuse it.
+
+- It refuses only `Edit`, `Write`, `MultiEdit`, `NotebookEdit` and Mail tools that change state. `synth_city_check_inbox`, `synth_city_whoami` and the `get_`, `list_`, `render_` and `prepare_` tools are never refused.
+- It refuses only while the calling member has an unread message that counts as a stop (see [Edit guard](../features/agent-mail.md#edit-guard-for-unread-stop-and-hold-mail)). Reading the message with `synth_city_check_inbox` lifts the refusal on the next call.
+- Like the other native hooks it is unauthenticated, so the refusal reason names only the message id. It never carries the subject or body.
+- Any lookup failure, unknown session or non-team event answers `{}`.
 
 ## Install Endpoints
 

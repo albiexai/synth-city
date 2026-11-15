@@ -33,6 +33,9 @@ mcp_service = MCPService()
 
 MCP_SERVER_NAME = "albiex-synth-city-mail"
 POST_TOOL_USE_MATCHER = "Edit|Write|MultiEdit|NotebookEdit"
+# The managed PreToolUse hook refuses questions and, while unread stop Mail waits, edits (#930).
+# The shim passes read-only Mail tools without asking Synth City.
+PRE_TOOL_USE_MATCHER = "AskUserQuestion|" + POST_TOOL_USE_MATCHER + "|mcp__albiex-synth-city-mail__.*"
 
 MAIL_HOOK_EVENTS = {
     "SessionStart": "session-start",
@@ -91,7 +94,10 @@ def hook_shim_path() -> str:
 def hook_command(slug: str) -> str:
     if slug == "team-question":
         script = Path(__file__).resolve().parents[2] / "mcp_shim" / _QUESTION_HOOK_MARKER
-        return f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
+        return (
+            f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} "
+            f"--synth-city-url {shlex.quote(synth_city_base_url())}"
+        )
     return (
         f"curl -s -f --connect-timeout 0.25 -m 1 "
         f"-X POST {synth_city_base_url()}/api/v1/agent-mail/hooks/{slug} "
@@ -171,9 +177,11 @@ def _managed_question_command(command: str) -> bool:
         parts = shlex.split(command)
     except ValueError:
         return False
-    return (len(parts) == 2 and Path(parts[0]).name.startswith("python")
+    # Older installs wrote only the interpreter and the script; newer ones add the Synth City URL.
+    return (len(parts) in (2, 4) and Path(parts[0]).name.startswith("python")
             and Path(parts[1]).name == _QUESTION_HOOK_MARKER
-            and Path(parts[1]).parent.name == "mcp_shim")
+            and Path(parts[1]).parent.name == "mcp_shim"
+            and (len(parts) == 2 or parts[2] == "--synth-city-url"))
 
 
 def _hook_is_current(hook, event: str, slug: str) -> bool:
@@ -189,7 +197,7 @@ def _hook_is_current(hook, event: str, slug: str) -> bool:
 
 def _claude_matcher(event: str) -> str | None:
     if event == "PreToolUse":
-        return "AskUserQuestion"
+        return PRE_TOOL_USE_MATCHER
     return POST_TOOL_USE_MATCHER if event == "PostToolUse" else None
 
 
