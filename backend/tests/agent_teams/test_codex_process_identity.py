@@ -71,3 +71,43 @@ def test_muse_owner_identity_needs_its_executable_and_exact_resume(monkeypatch,a
     if accepted: assert pause._process_identity(slot,session,workspace)=='fixture-start'
     else:
         with pytest.raises(ValueError,match='owner_native_identity_changed'): pause._process_identity(slot,session,workspace)
+
+
+AGY_CONVERSATION='6f1c2b8e-4d3a-4b7f-9c2e-1a2b3c4d5e6f'
+
+
+@pytest.mark.parametrize('argv,accepted',[
+    ([b'/home/u/.local/bin/agy',b'--model',b'm-1',b'--conversation',AGY_CONVERSATION.encode()],True),
+    ([b'agy',b'--conversation',AGY_CONVERSATION.encode()],True),
+    ([b'agy',b'--conversation',b'6f1c2b8e-0000-4000-8000-000000000000'],False),
+    ([b'agy',b'-i',AGY_CONVERSATION.encode()],False),
+    ([b'agy'],False),
+    ([b'agy',b'--conversation'],False),
+    ([b'/usr/bin/yes',b'--conversation',AGY_CONVERSATION.encode()],False),
+])
+def test_antigravity_owner_identity_needs_its_executable_and_exact_conversation(monkeypatch,argv,accepted):
+    from datetime import datetime,timedelta,timezone
+    from types import SimpleNamespace
+    from app.services import owner_observation_pause as pause
+    monkeypatch.setattr(pause.activity,'_process',lambda _pid: ('S','fixture-start'))
+    monkeypatch.setattr(pause.activity,'_process_started_at',lambda _start: datetime.now(timezone.utc)-timedelta(minutes=2))
+    monkeypatch.setattr(pause,'Path',lambda _path: SimpleNamespace(read_bytes=lambda:b'\0'.join([*argv,b''])))
+    slot=SimpleNamespace(provider='antigravity-cli',launch_options={'session_id':AGY_CONVERSATION})
+    session=SimpleNamespace(pid=12,created_at=datetime.utcnow(),cwd='/tmp/fixture')
+    workspace=SimpleNamespace(leased_owner_pid=11,leased_owner_proc_start='fixture-start')
+    if accepted: assert pause._process_identity(slot,session,workspace)=='fixture-start'
+    else:
+        with pytest.raises(ValueError,match='owner_native_identity_changed'): pause._process_identity(slot,session,workspace)
+
+
+def test_antigravity_owner_identity_needs_a_saved_conversation(monkeypatch):
+    from datetime import datetime,timedelta,timezone
+    from types import SimpleNamespace
+    from app.services import owner_observation_pause as pause
+    monkeypatch.setattr(pause.activity,'_process',lambda _pid: ('S','fixture-start'))
+    monkeypatch.setattr(pause.activity,'_process_started_at',lambda _start: datetime.now(timezone.utc)-timedelta(minutes=2))
+    monkeypatch.setattr(pause,'Path',lambda _path: SimpleNamespace(read_bytes=lambda:b'agy\0'))
+    slot=SimpleNamespace(provider='antigravity-cli',launch_options={})
+    session=SimpleNamespace(pid=12,created_at=datetime.utcnow(),cwd='/tmp/fixture')
+    workspace=SimpleNamespace(leased_owner_pid=11,leased_owner_proc_start='fixture-start')
+    with pytest.raises(ValueError,match='owner_native_identity_changed'): pause._process_identity(slot,session,workspace)

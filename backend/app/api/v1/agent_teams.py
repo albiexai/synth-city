@@ -3428,6 +3428,7 @@ async def read_activation_readiness(
                 "copilot-cli": "copilot",
                 "opencode-cli": "opencode",
                 "pi-cli": "pi",
+                "antigravity-cli": "agy",
             }.get(slot.provider, slot.provider)
             if argv0 in {"bash", "sh", "zsh", "fish", "dash", "ksh"}:
                 return False, "native_identity", member.id, None, None

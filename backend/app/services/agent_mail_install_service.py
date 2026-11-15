@@ -906,6 +906,10 @@ def muse_cli_available() -> bool:
     return shutil.which("muse") is not None
 
 
+def antigravity_cli_available() -> bool:
+    return shutil.which("agy") is not None
+
+
 def muse_hook_command(slug: str) -> str:
     return provider_hook_command("muse-cli", slug)
 
@@ -1016,6 +1020,7 @@ async def get_install_status() -> AgentMailInstallStatus:
         muse_hooks=muse_hook_events,
         muse_hooks_missing=muse_missing,
         muse_settings_path=str(muse_settings_path()),
+        antigravity_cli_available=antigravity_cli_available(),
         copilot_cli_available=copilot_cli_available(),
         copilot_mcp_installed=copilot_mcp_installed(),
         copilot_hooks=copilot_hook_events,

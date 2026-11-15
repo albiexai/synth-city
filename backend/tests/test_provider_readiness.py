@@ -23,6 +23,7 @@ def configured(**changes):
         opencode_version_ready=True,
         pi_mail_ready=True, pi_mail_reason=None,
         muse_cli_available=True, muse_mcp_installed=True, muse_hooks_missing=[],
+        antigravity_cli_available=True,
     )
     values.update(changes)
     return SimpleNamespace(**values)
@@ -33,8 +34,10 @@ def configured(**changes):
 def test_binary_and_shared_mail_agreement(provider, installed):
     status = configured()
     readiness = configuration_readiness(provider.id, provider.display_name, installed, status)
-    assert (readiness.state == "ready") == (installed is True and agent_mail_ready_reason(provider.id, status) is None)
-    assert readiness.state == ("ready" if installed else "blocked" if installed is False else "unknown")
+    reason = agent_mail_ready_reason(provider.id, status)
+    assert (readiness.state == "ready") == (installed is True and reason is None)
+    # Antigravity CLI has no Agent Mail install yet (#736), so a complete snapshot still blocks it.
+    assert readiness.state == ("blocked" if installed is False or reason else "ready" if installed else "unknown")
 
 
 @pytest.mark.parametrize("provider,key", [
@@ -306,3 +309,17 @@ def test_launch_plan_refuses_opencode_v1_with_its_own_block_code(monkeypatch):
     assert launch.block_code == BLOCK_CODE
     assert launch.reasons.count(REASON_REQUIRED) == 1
     assert service._blocked_result_status(BLOCK_CODE) == "blocked_opencode_version_unsupported"
+
+
+def test_antigravity_readiness_fails_closed_until_agent_mail_is_installed():
+    assert agent_mail_ready_reason("antigravity-cli", configured(antigravity_cli_available=False)) == (
+        "Antigravity CLI is not available on this machine")
+    assert agent_mail_ready_reason("antigravity-cli", configured()) == (
+        "Agent Mail for Antigravity CLI is not installed yet")
+    # A snapshot from before this provider existed has no field: the binary is not proven.
+    legacy = SimpleNamespace(**{k: v for k, v in vars(configured()).items() if k != "antigravity_cli_available"})
+    assert agent_mail_ready_reason("antigravity-cli", legacy) == "Antigravity CLI is not available on this machine"
+    readiness = configuration_readiness("antigravity-cli", "Antigravity CLI", True, configured())
+    assert readiness.state == "blocked"
+    assert [check.code for check in readiness.checks] == ["binary_installed", "agent_mail_not_configured"]
+    assert configuration_readiness("antigravity-cli", "Antigravity CLI", True, legacy).state == "unknown"

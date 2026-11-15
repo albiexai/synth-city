@@ -39,6 +39,16 @@ def capability(state: str, label: str, reason: str | None = None) -> dict[str, s
 
 
 PROVIDER_CAPABILITY_MATRIX: dict[str, dict[str, dict[str, str]]] = {
+    # Only launch is implemented. The rest waits for live evidence (#952) and later issues (#736, #737).
+    "antigravity-cli": {
+        "spawn": capability("write_capable", "Spawn Sessions", "Albiex Synth City can launch the Antigravity CLI (agy)."),
+        "resume": capability("write_capable", "Resume Sessions", "agy --conversation resumes a conversation by its UUID."),
+        "sessions": capability("unknown", "Agent Bridge Sessions", "Antigravity CLI session discovery is not implemented yet."),
+        "mcp": capability("unknown", "MCP Servers", "Agent Mail for Antigravity CLI is not installed yet."),
+        "hooks": capability("unknown", "Hooks", "Antigravity CLI hooks are documented but not observed or installed yet."),
+        "permissions": capability("unknown", "Permissions", "Whether a hook or permission rule can block questions is not observed yet."),
+        "config": capability("unknown", "Configuration", "Antigravity CLI settings, including workspace trust, are not managed yet."),
+    },
     "muse-cli": {
         "spawn": capability("write_capable", "Spawn Sessions", "Albiex Synth City can launch Muse Code on a Muse subscription or API key."),
         "resume": capability("write_capable", "Resume Sessions", "Exact Muse Code sessions can be resumed by UUID."),
