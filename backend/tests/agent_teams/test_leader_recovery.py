@@ -1285,3 +1285,77 @@ async def test_a_clean_attempt_never_reverts_a_marker_that_another_attempt_adopt
     assert isinstance(refused, lr.LeaderRecoveryError) and state["fence"] == 2, (refused, state)
     outcome = await _claim_outcome(db)
     assert outcome is not None and outcome.startswith("executing:") and outcome.endswith(":u")   # B's binding survives A
+
+
+async def _stale_replay_across_a_free_and_a_reuse(db, a, monkeypatch, *, corrected_reason):
+    """B is admitted as A's replay and pauses before its reload; A is refused cleanly and frees the id; C reuses it."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.models.database import GithubWorkItem
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", AsyncMock())
+    workspace_id, leased_at, item_id, session_id = a.workspace.id, a.workspace_leased_at, a.item.id, a.leader_session.id
+    real_mark, real_reload, real_fence = lr._mark_executing, lr._reload, lr._assert_authority
+    a_marking, b_reloading = asyncio.Event(), asyncio.Event()
+    gate_a, gate_b = asyncio.Event(), asyncio.Event()
+    state = {"mark": 0, "fence": 0}
+    other = async_sessionmaker(db.bind, expire_on_commit=False)()
+
+    async def mark(*args, **kwargs):
+        state["mark"] += 1
+        if state["mark"] == 1:              # A claimed the id and stops before its marker
+            a_marking.set()
+            await gate_a.wait()
+        return await real_mark(*args, **kwargs)
+
+    async def reload(session, *rows):
+        if session is other:                # B, the replay, stops before it reads the lease again
+            b_reloading.set()
+            await gate_b.wait()
+        return await real_reload(session, *rows)
+
+    async def fence(*args, **kwargs):
+        state["fence"] += 1
+        if state["fence"] == 1:             # A's fence refuses before its revoker: a clean, no-effect refusal
+            raise lr.LeaderRecoveryError("operator_hold")
+        return await real_fence(*args, **kwargs)
+    monkeypatch.setattr(lr, "_mark_executing", mark)
+    monkeypatch.setattr(lr, "_reload", reload)
+    monkeypatch.setattr(lr, "_assert_authority", fence)
+    try:
+        item2 = await other.get(GithubWorkItem, item_id)
+        session2 = await other.get(MailAgentSession, session_id)
+        call = lambda d, i, s, reason: lr.release_workspace(d, i, s, workspace_id=workspace_id,
+            expected_leased_at=leased_at, operation_id="rel-1", reason=reason)
+        first = asyncio.ensure_future(call(db, a.item, a.leader_session, REASON))
+        await asyncio.wait_for(a_marking.wait(), 10)
+        second = asyncio.ensure_future(call(other, item2, session2, REASON))     # admitted as A's replay
+        await asyncio.wait_for(b_reloading.wait(), 10)
+        gate_a.set()
+        assert isinstance((await asyncio.gather(first, return_exceptions=True))[0], lr.LeaderRecoveryError)   # A: clean refusal
+        assert await _claim_outcome(db) is None                                  # the id was freed
+        await db.refresh(a.item)
+        await db.refresh(a.leader_session)
+        reused = await lr.release_workspace(db, a.item, a.leader_session, workspace_id=workspace_id,
+            expected_leased_at=leased_at, operation_id="rel-1", reason=corrected_reason)   # C reuses the id and releases
+        assert reused["status"] == "released"
+        gate_b.set()
+        return (await asyncio.gather(second, return_exceptions=True))[0]
+    finally:
+        await other.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("db", ["concurrent"], indirect=True)
+async def test_an_old_replay_cannot_speak_for_a_release_by_a_corrected_request(db, releasable, monkeypatch):
+    outcome = await _stale_replay_across_a_free_and_a_reuse(db, releasable, monkeypatch, corrected_reason="A corrected reason.")
+    assert isinstance(outcome, lr.LeaderRecoveryError) and outcome.code == "recovery_context_changed", outcome
+    assert len(await _release_audits(db)) == 1
+    notices = await _notices(db)
+    assert len(notices) == 1 and "A corrected reason." in notices[0].body_markdown   # only the corrected request's notice
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("db", ["concurrent"], indirect=True)
+async def test_an_old_replay_of_the_same_request_after_a_reuse_answers_with_the_one_notice(db, releasable, monkeypatch):
+    outcome = await _stale_replay_across_a_free_and_a_reuse(db, releasable, monkeypatch, corrected_reason=REASON)
+    assert isinstance(outcome, dict) and outcome["status"] == "already_released", outcome
+    assert len(await _release_audits(db)) == 1 and len(await _notices(db)) == 1   # the keyed notice dedupes

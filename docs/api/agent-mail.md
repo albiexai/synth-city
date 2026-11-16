@@ -340,6 +340,10 @@ a later attempt that is refused before its own revoker still cannot free the id.
 earlier interim is read the same way. The retry is guarded and can fail: if the revoker refuses, the response is
 its error (503), the id stays bound, the lease stays, and no success notice is sent. Use a new `operation_id` only
 after the operator confirms the earlier attempt's effect.
+A replayed release answers `already_released`, and sends its one keyed notice, only while the ledger row of its
+`operation_id` still holds that exact request. A replay that woke after its id was freed and reused by a corrected
+request is refused (`recovery_context_changed`) and sends nothing, because the committed release belongs to the
+other request.
 
 ### Continuation phases
 

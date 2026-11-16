@@ -410,6 +410,14 @@ async def _mark_executing(db, ctx, attempt, *, created_here):
     return not clean
 
 
+async def _binding_holds(db, ctx):
+    """True while the ledger row of this operation id still holds this exact request."""
+    await db.rollback()
+    return await db.scalar(select(GithubMaintenanceEvent.id).where(
+        GithubMaintenanceEvent.operation_id == ctx.claim_key,
+        GithubMaintenanceEvent.request_sha256 == ctx.claim_digest)) is not None
+
+
 async def _settle_release_claim(db, ctx, operation_id, attempt, *, inherited, started, workspace_id, leased_at):
     """After a failed release attempt: free the id only if THIS attempt provably never started its revoker.
 
@@ -442,6 +450,11 @@ async def release_workspace(db, item, session, *, workspace_id, expected_leased_
     replay = await _existing_claim(db, ctx.item_id, "release", operation_id, digest)
 
     async def already_released():
+        # The effect proof belongs to the lease, not to this request. A replay that woke after its id was freed
+        # and reused by a corrected request must not speak for that release: it answers only while the ledger
+        # row for THIS operation id still holds THIS request's digest.
+        if not await _binding_holds(db, ctx):
+            raise LeaderRecoveryError("recovery_context_changed")
         notice = await _notify(db, ctx, kind="release", operation_id=operation_id, digest=digest,
             summary=f"workspace {workspace_id} was released.", reason=reason)
         return {"status": "already_released", "workspace_id": workspace_id, "notice": notice}
@@ -496,6 +509,8 @@ async def release_workspace(db, item, session, *, workspace_id, expected_leased_
         if await _abandon(db, "release", ctx, operation_id, replay, workspace_id=workspace_id, leased_at=expected_leased_at):
             return await already_released()  # a replay released it; the shared claim record stays
         raise LeaderRecoveryError("workspace_lease_changed")
+    if not await _binding_holds(db, ctx):   # the same gate before the success notice
+        raise LeaderRecoveryError("recovery_context_changed")
     notice = await _notify(db, ctx, kind="release", operation_id=operation_id,
         digest=digest, summary=f"workspace {workspace_id} was released.", reason=reason)
     return {"status": "released", "workspace_id": workspace_id, "notice": notice}
