@@ -1620,7 +1620,7 @@ class GithubVerificationService:
         client: GithubClient,
         revision: GithubAttemptScopeRevision,
     ) -> None:
-        """A positively settled revision waits for its PR: record a merge, escalate a closed PR, else do nothing.
+        """A positively settled revision waits for its PR: record a merge, escalate a closed PR, promote an open one.
 
         Everything here is contained to this item. A GitHub read that fails changes nothing and logs nothing: the
         item simply waits for the next poll. A first response that fails the identity check changes nothing and
@@ -1639,6 +1639,8 @@ class GithubVerificationService:
                     source="github_verification_service._observe_settled_revision")
             elif verdict == "closed_unmerged":
                 await self._escalate_settled_closed(db, scope, item, client, revision)
+            elif verdict == "open":
+                await self._promote_settled_revision(db, scope, item, client, revision, pull)
         except TerminalRevisionContextChanged:
             raise  # the caller rolls back and records that the attempt changed
         except (httpx.HTTPError, GithubClientResponseError):
@@ -1649,6 +1651,50 @@ class GithubVerificationService:
             await db.rollback()
             await db.refresh(scope)
             self._log_inconsistent_once(None, f"a PR response failed the identity check ({exc})", snapshot=snapshot)
+
+    async def _promote_settled_revision(
+        self,
+        db: AsyncSession,
+        scope: TeamGithubScope,
+        item: GithubWorkItem,
+        client: GithubClient,
+        revision: GithubAttemptScopeRevision,
+        pull: dict,
+    ) -> None:
+        """An open PR on a positively settled revision: promote it like any verified item, or say why not (#957).
+
+        Settlement completes the revision and leaves the item 'verifying'. Nothing else would read its checks or
+        move it to ready_for_review, so an accepted, green, ready and unheld PR never reached the auto-merge gates.
+        The promotion needs the PR head to be the settled head, an active acceptance of that exact head from a
+        current verifier, and every required check green. Then the existing promotion runs, with no revision
+        because this one is already completed, and every merge gate and policy applies unchanged: the auto policy
+        goes on to the merge gates, the human policy stops at ready_for_review and never merges.
+        When one condition fails the reason is recorded as the item's note, written only when it changes. No retry
+        is charged, no status changes and no revision is touched.
+        """
+        await self._verify_settled_pull(scope, item, client, pull)  # a ValueError is logged once by the caller
+        head = self._head_sha(pull)
+        if not isinstance(head, str) or not head:
+            return
+        reason = None
+        if head != revision.submitted_head_sha:
+            reason = (f"Settled revision not promoted: the PR head {head[:7]} is not the settled head "
+                      f"{str(revision.submitted_head_sha)[:7]}.")
+        else:
+            from app.services import github_head_acceptance_service as acceptance
+
+            acceptance_note = await acceptance.gate_note(db, scope, item, head)
+            if acceptance_note is not None:
+                reason = f"Settled revision not promoted: {acceptance_note}"
+            elif not await self._head_is_green(scope, client, head, item=item):
+                reason = f"Settled revision not promoted: the required checks are not all green at {head[:7]}."
+        if reason is not None:
+            if item.status_note != reason:
+                item.status_note = reason
+                item.updated_at = datetime.utcnow()
+                await db.commit()
+            return
+        await self._promote_verified_item(db, scope, item, client, pull, head)
 
     @staticmethod
     def _require_pull_shape(pull: object) -> None:
