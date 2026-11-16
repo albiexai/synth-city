@@ -24,6 +24,7 @@ type Publication = {
 type Progress = {
   work_item_id: number
   dispatch_nonce: string | null
+  dispatch_generation: string | null
   owner_slot_id: number | null
   checked_at: string
   valid_until: string
@@ -76,9 +77,9 @@ function date(value: string | null | undefined) {
   const time = timestamp(value)
   return Number.isFinite(time) ? new Date(time).toLocaleString() : 'Unavailable'
 }
-function valid(data: Progress, itemId: number, nonce: string | null, owner: number | null) {
+function valid(data: Progress, itemId: number, generation: string | null, owner: number | null) {
   const publication = data?.publication
-  return data?.work_item_id === itemId && data.dispatch_nonce === nonce && data.owner_slot_id === owner
+  return data?.work_item_id === itemId && data.dispatch_generation === generation && data.owner_slot_id === owner
     && Number.isFinite(timestamp(data.checked_at)) && Number.isFinite(timestamp(data.valid_until))
     && timestamp(data.valid_until) <= timestamp(data.checked_at) + 30_000
     && typeof data.phase === 'string' && typeof data.next_action === 'string'
@@ -108,16 +109,16 @@ type PanelProps = {
 }
 export function WorkPublicationPanel(props: PanelProps) {
   const { item } = props
-  const key = JSON.stringify([item.id, item.dispatch_nonce, item.owner_slot_id,
+  const key = JSON.stringify([item.id, item.dispatch_generation, item.owner_slot_id,
     item.dispatch_status, item.pending_approval_request_id, item.ack_evidence_message_id, item.updated_at])
   return <WorkPublicationReader key={key} {...props} />
 }
 
 function WorkPublicationReader({ item, ownerName, ownerActivity }: PanelProps) {
   const id = item.id
-  const nonce = item.dispatch_nonce ?? null
+  const generation = item.dispatch_generation ?? null
   const owner = item.owner_slot_id ?? null
-  const requestKey = JSON.stringify([id, nonce, owner, item.dispatch_status,
+  const requestKey = JSON.stringify([id, generation, owner, item.dispatch_status,
     item.pending_approval_request_id, item.ack_evidence_message_id])
   const [result, setResult] = useState<{ key: string; data: Progress } | null>(null)
   const data = result?.key === requestKey ? result.data : null
@@ -149,7 +150,7 @@ function WorkPublicationReader({ item, ownerName, ownerActivity }: PanelProps) {
             deadline = setTimeout(() => { controller.abort(); reject(new Error('Progress timeout')) }, 12_000)
           }),
         ])
-        if (!valid(next, id, nonce, owner)) throw new Error('Invalid progress data')
+        if (!valid(next, id, generation, owner)) throw new Error('Invalid progress data')
         if (active && !controller.signal.aborted) {
           setResult({ key: requestKey, data: next }); setError(false); setClock(Date.now())
           expiresAt = timestamp(next.valid_until)
@@ -168,9 +169,9 @@ function WorkPublicationReader({ item, ownerName, ownerActivity }: PanelProps) {
     }
     void poll()
     return () => { active = false; clearTimeout(timer); request?.abort() }
-  }, [id, nonce, owner, requestKey, refresh])
+  }, [id, generation, owner, requestKey, refresh])
 
-  const matches = data?.work_item_id === id && data.dispatch_nonce === nonce && data.owner_slot_id === owner
+  const matches = data?.work_item_id === id && data.dispatch_generation === generation && data.owner_slot_id === owner
   const expiry = data && matches ? timestamp(data.valid_until) : NaN
   useEffect(() => {
     const update = () => setClock(Date.now())

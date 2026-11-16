@@ -4,6 +4,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional
 from pydantic import AfterValidator, BaseModel as PydanticBaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 from app.models.api_model import ApiModel as BaseModel, naive_utc_confirmation
 from app.config import settings
+from mcp_shim.work_remaining_protocol import public_generation
 
 
 class TerminalRevisionReconcileRequest(BaseModel):
@@ -2127,6 +2128,7 @@ class GithubScopeRevisionResponse(BaseModel):
     id: int
     work_item_id: int
     dispatch_nonce: str
+    dispatch_generation: Optional[str] = None
     revision: int
     owner_slot_id: int
     owner_member_id: int
@@ -2169,6 +2171,14 @@ class GithubScopeRevisionResponse(BaseModel):
     expires_at: Optional[datetime] = None
     created_at: datetime
     approval_request: Optional["GithubApprovalRequestResponse"] = None
+
+
+    @model_validator(mode="after")
+    def _public_generation(self):
+        """A public, non-authorizing name for the dispatch, so a caller never needs the nonce to tell attempts apart."""
+        if self.dispatch_generation is None and self.dispatch_nonce:
+            self.dispatch_generation = public_generation(self.work_item_id, self.dispatch_nonce)
+        return self
 
 
 class GithubContinuationRequestResponse(BaseModel):
@@ -2925,6 +2935,7 @@ class GithubWorkItemResponse(BaseModel):
     ack_approver_member_id: Optional[int] = None
     ack_evidence_message_id: Optional[int] = None
     dispatch_nonce: Optional[str] = None
+    dispatch_generation: Optional[str] = None
     ack_enforcement_epoch: Optional[int] = None
     ack_approval_round: Optional[int] = None
     dispatch_head_ref: Optional[str] = None
@@ -2963,6 +2974,13 @@ class GithubWorkItemResponse(BaseModel):
     workspace_path: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+
+    @model_validator(mode="after")
+    def _public_generation(self):
+        """A public, non-authorizing name for the dispatch, so a caller never needs the nonce to tell attempts apart."""
+        if self.dispatch_generation is None and self.dispatch_nonce:
+            self.dispatch_generation = public_generation(self.id, self.dispatch_nonce)
+        return self
 
 
 class GithubWorkItemListResponse(BaseModel):

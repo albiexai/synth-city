@@ -448,6 +448,7 @@ export interface GithubScopeRevision {
   id: number
   work_item_id: number
   dispatch_nonce: string
+  dispatch_generation?: string | null
   revision: number
   owner_slot_id: number
   owner_member_id: number
@@ -522,6 +523,7 @@ export interface GithubWorkItem {
   handoff_target_slot_id?: number | null
   approval_round_count: number
   dispatch_nonce?: string | null
+  dispatch_generation?: string | null
   ack_evidence_message_id?: number | null
   dispatch_head_ref?: string | null
   pr_number?: number | null

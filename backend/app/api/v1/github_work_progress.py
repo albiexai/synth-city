@@ -18,8 +18,8 @@ from mcp_shim.work_remaining_protocol import public_generation
 router = APIRouter()
 
 
-@router.get("/github-work-items/{item_id}/progress", response_model=GithubWorkProgressResponse)
-async def work_progress(item_id: int, response: Response, db: AsyncSession = Depends(get_db)):
+async def _progress(item_id: int, response: Response, db: AsyncSession) -> GithubWorkProgressResponse:
+    """The full internal result, nonce included. Only an authenticated route may use it and it never returns it."""
     response.headers["Cache-Control"] = "no-store"
     try:
         result = await asyncio.wait_for(github_work_progress_service.summary(db, item_id), timeout=9)
@@ -29,6 +29,13 @@ async def work_progress(item_id: int, response: Response, db: AsyncSession = Dep
     if result is None:
         raise HTTPException(status_code=404, detail="GitHub work item not found")
     return result
+
+
+@router.get("/github-work-items/{item_id}/progress", response_model=GithubWorkProgressResponse)
+async def work_progress(item_id: int, response: Response, db: AsyncSession = Depends(get_db)):
+    """Unauthenticated: the dispatch is named by its public generation, never by the nonce."""
+    result = await _progress(item_id, response, db)
+    return result.model_copy(update={"dispatch_nonce": None})
 
 
 @router.get("/github-work-items/{item_id}/remaining-work-context", response_model=GithubWorkProgressResponse)
@@ -44,7 +51,7 @@ async def remaining_work_context(item_id: int, response: Response,
     scope_id = item.scope_id
     try:
         await github_coordination_service.require_leader(db, scope_id, principal)
-        result = await work_progress(item_id, response, db)
+        result = await _progress(item_id, response, db)
         # Progress observation ends its DB snapshot. Recheck current membership and scope after its asynchronous
         # source reads: the FINAL awaited Leader check comes first, then ONE coherent joined projection of the item
         # and its workspace lease, then only synchronous comparisons and the return. Nothing awaits after the
