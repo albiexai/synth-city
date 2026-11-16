@@ -1,6 +1,6 @@
 """The Leader runs three standard recoveries with the operator guards, one audit fact and one Supervisor notice."""
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -181,7 +181,8 @@ async def releasable(db, ready, monkeypatch):
     a = ready
     a.item.dispatch_status = "merged"
     await db.commit()
-    monkeypatch.setattr(lr.github_workspace_service, "release_blocker", AsyncMock(return_value=None))
+    a.workspace_leased_at = a.workspace.leased_at
+    monkeypatch.setattr(lr.github_workspace_service, "delegated_release_blocker", AsyncMock(return_value=None))
     return a
 
 
@@ -205,7 +206,7 @@ async def test_release_refuses_each_guard_and_keeps_the_lease(db, releasable, mo
     if refusal == "owner":
         session = a.owner_session
     elif refusal == "dirty":
-        monkeypatch.setattr(lr.github_workspace_service, "release_blocker",
+        monkeypatch.setattr(lr.github_workspace_service, "delegated_release_blocker",
                             AsyncMock(return_value="uncommitted or untracked changes"))
     elif refusal == "not_terminal":
         a.item.dispatch_status = "dispatched"
@@ -245,7 +246,7 @@ async def test_a_replay_is_proved_by_the_recorded_release_never_by_a_missing_lea
 @pytest.mark.asyncio
 async def test_an_unknown_tree_state_is_not_clean(db, releasable, monkeypatch):
     a = releasable
-    monkeypatch.setattr(lr.github_workspace_service, "release_blocker",
+    monkeypatch.setattr(lr.github_workspace_service, "delegated_release_blocker",
                         AsyncMock(return_value="workspace status could not be determined"))
     with pytest.raises(lr.LeaderRecoveryError) as error:
         await _release(db, a, a.leader_session)
@@ -318,3 +319,293 @@ def test_operator_only_actions_are_not_exposed_to_the_leader():
     for route in agent_teams.router.routes:
         if "leader-recovery" in route.path:
             assert "require_operator" not in str(route.dependant.dependencies)
+
+
+# --- review 5919432941: one complete correction batch ------------------------------------------------------
+
+import subprocess
+
+from app.models.database import GithubOwnerObservationPause
+
+
+async def _pause(db, a, status):
+    db.add(GithubOwnerObservationPause(work_item_id=a.item.id, wait_key=f"wait-{status}", authority_sha256="x",
+                                       status=status, deadline=datetime.utcnow() + timedelta(minutes=5)))
+    await db.commit()
+
+
+def _git(repo, *args):
+    return subprocess.run(["git", "-C", str(repo), "-c", "user.name=Fixture", "-c", "user.email=f@example.invalid",
+                           *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+async def _act(db, a, action, over=None):
+    over = over or {}
+    if action == "cancel":
+        return await _cancel(db, a, a.leader_session, **over)
+    if action == "release":
+        return await _release(db, a, a.leader_session, **over)
+    read = _merged_reader(a)
+    if not hasattr(a, "digest"):  # the digest of the first read binds the replay; a terminal item has no preview
+        a.digest = (await lr.finalize_preview(db, a.item, a.leader_session, read_pull=read))["context_sha256"]
+    await db.refresh(a.item)
+    await db.refresh(a.leader_session)
+    return await lr.finalize_merged(db, a.item, a.leader_session, read_pull=read, operation_id="fin-9",
+                                    expected_context_sha256=a.digest, reason=REASON)
+
+
+@pytest.fixture
+def primary_release(db, releasable, monkeypatch):
+    """Real inspection of a real disposable repository: nothing about the probe is mocked."""
+    monkeypatch.undo()  # drop the releasable fixture's probe mock
+    return releasable
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["waiting", "paused"])
+@pytest.mark.parametrize("action", ["cancel", "finalize", "release"])
+async def test_a_recorded_observation_pause_refuses_every_delegated_action(db, releasable, action, status):
+    a = releasable
+    if action != "release":
+        a.item.dispatch_status = "verifying"
+        await db.commit()
+    await _pause(db, a, status)
+    with pytest.raises(lr.LeaderRecoveryError) as error:
+        await _act(db, a, action)
+    assert error.value.code == "observation_pause_active" and await _notices(db) == []
+    await db.refresh(a.item)
+    assert a.item.dispatch_status != "merged" or action == "release"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["hold", "supervisor", "autonomy", "pause"])
+async def test_authority_that_changes_during_the_awaited_pull_read_stops_the_finalize_write(db, ready, monkeypatch, change):
+    a = ready
+    flipped = {"done": False}
+
+    async def read():
+        pull = await _merged_reader(a)()
+        if not flipped["done"] and flipped.setdefault("calls", 0) >= 1:
+            flipped["done"] = True
+            if change == "hold":
+                monkeypatch.setattr(lr, "hold_code", lambda: "operator_hold")
+            elif change == "supervisor":
+                a.preset.supervisor_actor_id = None
+                await db.commit()
+            elif change == "pause":
+                await _pause(db, a, "waiting")
+            else:
+                a.preset.autonomy_enabled = False
+                await db.commit()
+        flipped["calls"] += 1
+        return pull
+    digest = (await lr.finalize_preview(db, a.item, a.leader_session, read_pull=_merged_reader(a)))["context_sha256"]
+    flipped["calls"] = 1
+    with pytest.raises(lr.LeaderRecoveryError):
+        await lr.finalize_merged(db, a.item, a.leader_session, read_pull=read, operation_id="fin-3",
+                                 expected_context_sha256=digest, reason=REASON)
+    await db.refresh(a.item)
+    assert a.item.dispatch_status != "merged" and await _notices(db) == []
+
+
+@pytest.mark.asyncio
+async def test_an_item_that_stops_being_terminal_during_the_clean_probe_keeps_its_lease(db, releasable, monkeypatch):
+    a = releasable
+
+    async def probe(*_args):
+        a.item.dispatch_status = "dispatched"
+        await db.commit()
+        return None
+    monkeypatch.setattr(lr.github_workspace_service, "delegated_release_blocker", probe)
+    item_id = a.item.id
+    with pytest.raises(lr.LeaderRecoveryError):
+        await _release(db, a, a.leader_session)
+    await db.refresh(a.workspace)
+    assert a.workspace.leased_item_id == item_id and await _notices(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_hold_raised_during_the_cancel_head_read_stops_the_cancellation(db, ready, monkeypatch):
+    a = ready
+    real = lr.github_approval_service._active_cancellation_head_sha
+
+    async def head(*args, **kwargs):
+        monkeypatch.setattr(lr, "hold_code", lambda: "operator_hold")
+        return await real(*args, **kwargs)
+    monkeypatch.setattr(lr.github_approval_service, "_active_cancellation_head_sha", head)
+    with pytest.raises(lr.LeaderRecoveryError):
+        await _cancel(db, a, a.leader_session)
+    await db.refresh(a.revision)
+    assert a.revision.status == "submitted" and await _notices(db) == []
+
+
+def _prepare_primary(a, repo_state):
+    a.workspace.kind = "primary"
+    base = _git(a.repo, "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines()
+    a.scope.base_ref = next(b for b in base if b != a.item.dispatch_head_ref)
+    if repo_state == "dirty":
+        (a.repo / "scratch.txt").write_text("not committed\n")
+    elif repo_state == "unpublished":
+        (a.repo / "work.txt").write_text("committed but not on the base\n")
+        _git(a.repo, "add", ".")
+        _git(a.repo, "commit", "-qm", "unpublished")
+    elif repo_state == "missing":
+        a.workspace.path = str(a.repo) + "-gone"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repo_state", ["dirty", "unpublished", "missing"])
+async def test_a_primary_workspace_is_really_inspected_and_unclean_ones_are_refused(db, releasable, monkeypatch, repo_state):
+    a = releasable
+    monkeypatch.undo()
+    _prepare_primary(a, repo_state)
+    await db.commit()
+    with pytest.raises(lr.LeaderRecoveryError) as error:
+        await _release(db, a, a.leader_session)
+    assert error.value.code == "workspace_not_clean"
+    await db.refresh(a.workspace)
+    assert a.workspace.leased_item_id == a.item.id and await _notices(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_clean_primary_workspace_is_released_after_the_real_inspection(db, releasable, monkeypatch):
+    a = releasable
+    monkeypatch.undo()
+    _prepare_primary(a, "clean")
+    await db.commit()
+    result = await _release(db, a, a.leader_session)
+    assert result["status"] == "released"
+
+
+@pytest.mark.asyncio
+async def test_finalize_records_the_authenticated_leader_once_even_on_replay(db, ready):
+    a = ready
+    leader_id, session_id = a.leader.id, a.leader_session.id
+    await _act(db, a, "finalize")
+    await _act(db, a, "finalize")
+    facts = (await db.execute(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == "leader_recovery_finalize"))).scalars().all()
+    assert len(facts) == 1
+    assert (facts[0].actor_kind, facts[0].actor_member_id, facts[0].actor_session_id) == (
+        "member", leader_id, session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("db", ["concurrent"], indirect=True)
+@pytest.mark.parametrize("action", ["finalize", "release"])
+async def test_the_losing_concurrent_claim_is_a_clean_replay_or_refusal(db, releasable, monkeypatch, action):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.models.database import GithubWorkItem
+    a = releasable
+    if action == "finalize":
+        a.item.dispatch_status = "verifying"
+        await db.commit()
+    barrier = asyncio.Barrier(2)
+    real = lr._claim
+
+    async def synced(*args, **kwargs):
+        await barrier.wait()
+        return await real(*args, **kwargs)
+    monkeypatch.setattr(lr, "_claim", synced)
+    other = async_sessionmaker(db.bind, expire_on_commit=False)()
+    try:
+        item2 = await other.get(GithubWorkItem, a.item.id)
+        session2 = await other.get(MailAgentSession, a.leader_session.id)
+        if action == "release":
+            call = lambda d, i, s: lr.release_workspace(d, i, s, workspace_id=a.workspace.id,  # noqa: E731
+                expected_leased_at=a.workspace.leased_at, operation_id="rel-c", reason=REASON)
+        else:
+            read = _merged_reader(a)
+            digest = (await lr.finalize_preview(db, a.item, a.leader_session, read_pull=read))["context_sha256"]
+            call = lambda d, i, s: lr.finalize_merged(d, i, s, read_pull=read, operation_id="fin-c",  # noqa: E731
+                expected_context_sha256=digest, reason=REASON)
+        results = await asyncio.gather(call(db, a.item, a.leader_session), call(other, item2, session2),
+                                       return_exceptions=True)
+    finally:
+        await other.close()
+    for r in results:
+        assert isinstance(r, (dict, lr.LeaderRecoveryError)), r  # never an uncaught ORM error
+    assert any(isinstance(r, dict) for r in results) and len(await _notices(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_residual_race_is_a_clean_409_not_an_uncaught_orm_error(db, ready, monkeypatch):
+    from fastapi import HTTPException
+    from sqlalchemy.exc import MissingGreenlet
+    from app.api.v1 import agent_teams
+    a = ready
+    item_id = a.item.id
+    monkeypatch.setattr(lr, "cancel_revision", AsyncMock(side_effect=MissingGreenlet("expired row")))
+    with pytest.raises(HTTPException) as error:
+        await agent_teams.leader_cancel_revision(item_id, lr.CancelRevisionRequest(revision_number=1,
+            dispatch_nonce=a.nonce, operation_id="op-9", reason=REASON), a.leader_session, db)
+    assert error.value.status_code == 409 and error.value.detail == "recovery_context_changed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["hold", "leader_session"])
+async def test_the_fence_runs_before_the_credential_revoker_and_the_config_writer(db, releasable, monkeypatch, change):
+    """Authority that changes during the last awaited probe stops the release before ANY external effect."""
+    a = releasable
+    revoker, config_writer = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", revoker)
+    monkeypatch.setattr(lr.github_workspace_service, "remove_managed_worktree_config", config_writer)
+    session_id, item_id = a.leader_session.id, a.item.id
+
+    async def probe(*_args):
+        if change == "hold":
+            monkeypatch.setattr(lr, "hold_code", lambda: "operator_hold")
+        else:
+            session = await db.get(MailAgentSession, session_id)
+            session.closed_at = datetime.utcnow()
+            await db.commit()
+        return None
+    monkeypatch.setattr(lr.github_workspace_service, "delegated_release_blocker", probe)
+    with pytest.raises(lr.LeaderRecoveryError):
+        await _release(db, a, a.leader_session)
+    revoker.assert_not_called()
+    config_writer.assert_not_called()
+    await db.refresh(a.workspace)
+    assert a.workspace.leased_item_id == item_id and await _notices(db) == []
+
+
+@pytest.mark.asyncio
+async def test_the_operator_default_release_path_is_unchanged_without_a_fence(db, releasable, monkeypatch):
+    """No before_commit: the shared release core behaves exactly as before for the operator and the scheduler."""
+    a = releasable
+    ok = await lr.github_workspace_service.force_release_acquisition(db, workspace_id=a.workspace.id,
+        scope_id=a.scope.id, item_id=a.item.id, expected_leased_at=a.workspace.leased_at, lease_token="synthetic-lease")
+    assert ok is True
+    await db.refresh(a.workspace)
+    assert a.workspace.leased_item_id is None
+
+
+@pytest.mark.asyncio
+async def test_authority_that_changes_during_the_external_effects_stops_the_commit(db, releasable, monkeypatch):
+    """The second fence, right before the commit: a HOLD raised while the credential is revoked keeps the lease row."""
+    a = releasable
+    item_id = a.item.id
+
+    async def revoke(*_args, **_kwargs):
+        monkeypatch.setattr(lr, "hold_code", lambda: "operator_hold")
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", AsyncMock(side_effect=revoke))
+    monkeypatch.setattr(lr.github_workspace_service, "remove_managed_worktree_config", AsyncMock())
+    with pytest.raises(lr.LeaderRecoveryError) as error:
+        await _release(db, a, a.leader_session)
+    assert error.value.code == "operator_hold"
+    await db.refresh(a.workspace)
+    assert a.workspace.leased_item_id == item_id and await _notices(db) == []  # the database write was rolled back
+
+
+@pytest.mark.asyncio
+async def test_a_replay_that_loses_the_final_compare_and_clear_is_reported_as_already_released(db, releasable, monkeypatch):
+    a = releasable
+    await _release(db, a, a.leader_session)  # a real release: claim row, applied audit fact, one notice
+    await db.refresh(a.workspace)
+    # the same lease is visible again to the replay (a stale read), but the compare-and-clear finds nothing to clear
+    a.workspace.leased_item_id, a.workspace.leased_at, a.workspace.lease_token = (
+        a.item.id, a.workspace_leased_at, "synthetic-lease")
+    await db.commit()
+    monkeypatch.setattr(lr.github_workspace_service, "force_release_acquisition", AsyncMock(return_value=False))
+    again = await _release(db, a, a.leader_session, expected_leased_at=a.workspace_leased_at)
+    assert again["status"] == "already_released" and len(await _notices(db)) == 1
