@@ -4,8 +4,10 @@ import { useEffect } from 'react'
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ProjectProvider } from '../src/contexts/ProjectContext'
-import { ScopeSelector, ScopedPage } from '../src/features/projects/ScopeSelector'
-import { projectScopedSurface } from '../src/features/native-settings/projectScope'
+import { ScopeSelector, ScopedPage, SurfaceScopeSelector } from '../src/features/projects/ScopeSelector'
+import { DashboardProvider, useDashboard } from '../src/contexts/DashboardContext'
+import { useProjectContext } from '../src/contexts/ProjectContext'
+import { globalUserSurface, projectScopedSurface } from '../src/features/native-settings/projectScope'
 import { apiClient, scopeUserHeaders } from '../src/lib/api'
 import { fetchAgentTeamPresets } from '../src/features/agent-teams/api'
 import type { HarnessScopeResponse } from '../src/types/harnessScope'
@@ -17,6 +19,17 @@ vi.mock('../src/lib/api', async (importOriginal) => ({
 vi.mock('../src/features/agent-teams/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/features/agent-teams/api')>()),
   fetchAgentTeamPresets: vi.fn(),
+}))
+
+// The dashboard reads these hooks. Their results are stable, as the real hooks' are.
+const sessionsApi = { getDashboardStats: async () => ({}) }
+const contextApi = { getActiveSessions: async () => ({ sessions: [] }) }
+const plansApi = { getStats: async () => ({ total_plans: 0 }) }
+vi.mock('../src/hooks/useSessionsApi', () => ({ useSessionsApi: () => sessionsApi }))
+vi.mock('../src/hooks/useContextApi', () => ({ useContextApi: () => contextApi }))
+vi.mock('../src/hooks/usePlansApi', () => ({ usePlansApi: () => plansApi }))
+vi.mock('../src/contexts/ProviderContext', () => ({
+  useProviderContext: () => ({ selectedProviderId: 'claude-code', selectedProvider: { display_name: 'Claude Code' } }),
 }))
 
 const twoUsers: HarnessScopeResponse = {
@@ -131,6 +144,15 @@ describe('scope header', () => {
     expect(scopeUserHeaders()).toEqual({})
   })
 
+  it('offers the global user only on the surfaces whose backend carries the scope', () => {
+    for (const surface of ['summary', 'config', 'mcp', 'plugins', 'commands', 'hooks', 'permissions', 'agents', 'skills', 'memory', 'output-styles']) {
+      expect(globalUserSurface(surface), surface).toBe(true)
+    }
+    for (const surface of ['backup', 'plans', 'sessions', 'usage', 'statusline', null]) {
+      expect(globalUserSurface(surface), String(surface)).toBe(false)
+    }
+  })
+
   it('treats a harness own page as project-scoped, so the tile counts follow the project', () => {
     expect(projectScopedSurface('/harnesses/claude-code')).toBe('summary')
     expect(projectScopedSurface('/harnesses')).toBeNull()
@@ -156,5 +178,102 @@ describe('page remount', () => {
 
     await userEvent.selectOptions(screen.getByLabelText('Global scope of'), 'ctl')
     await waitFor(() => expect(mounts).toHaveLength(2))
+  })
+})
+
+describe('unscoped surfaces', () => {
+  it('keep only the project picker, with no agent user and no directory line', async () => {
+    serve(twoUsers)
+    render(
+      <MemoryRouter initialEntries={['/harnesses/claude-code/backup']}>
+        <ProjectProvider><ScopeSelector showGlobalUser={false} /></ProjectProvider>
+      </MemoryRouter>,
+    )
+
+    expect(await screen.findByLabelText('Project')).toBeInTheDocument()
+    await waitFor(() => expect(apiClient).toHaveBeenCalled())
+    expect(screen.queryByLabelText('Global scope of')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Global scope reads/)).not.toBeInTheDocument()
+  })
+})
+
+describe('surface scope control', () => {
+  it.each([
+    ['claude-code', 'skills', true], ['claude-code', 'mcp', true], ['claude-code', 'summary', true],
+    ['claude-code', 'backup', false], ['claude-code', 'plans', false], ['codex-cli', 'skills', false],
+  ])('%s %s: global user picker %s', async (providerId, surface, shown) => {
+    serve(twoUsers)
+    render(
+      <MemoryRouter initialEntries={[`/harnesses/${providerId}/${surface}`]}>
+        <ProjectProvider><SurfaceScopeSelector providerId={providerId} surface={surface} /></ProjectProvider>
+      </MemoryRouter>,
+    )
+
+    expect(await screen.findByLabelText('Project')).toBeInTheDocument()
+    if (shown) expect(await screen.findByLabelText('Global scope of')).toBeInTheDocument()
+    else {
+      await waitFor(() => expect(apiClient).toHaveBeenCalledWith('harness-scope'))
+      expect(screen.queryByLabelText('Global scope of')).not.toBeInTheDocument()
+      expect(screen.queryByText(/Global scope reads/)).not.toBeInTheDocument()
+    }
+  })
+})
+
+describe('tile counts', () => {
+  const PROJECT = '/work/p'
+  function skillReads() {
+    return vi.mocked(apiClient).mock.calls.filter(([endpoint]) => String(endpoint).startsWith('agents/skills')).map(([endpoint]) => String(endpoint))
+  }
+  function Controls() {
+    const { setProjectPath, setScopeUser } = useProjectContext()
+    useDashboard({ autoFetch: true })
+    return (
+      <>
+        <button onClick={() => setProjectPath(PROJECT)}>choose project</button>
+        <button onClick={() => setProjectPath(null)}>back to global</button>
+        <button onClick={() => setScopeUser('ctl')}>choose controller</button>
+      </>
+    )
+  }
+  function mountDashboard(path = '/harnesses/claude-code') {
+    vi.mocked(apiClient).mockImplementation((async (endpoint: string) => {
+      if (endpoint === 'projects') return { projects: [{ id: 1, name: 'p', path: PROJECT, is_active: false, last_accessed: '', created_at: '' }] }
+      return {}
+    }) as never)
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <ProjectProvider><DashboardProvider><Controls /></DashboardProvider></ProjectProvider>
+      </MemoryRouter>,
+    )
+  }
+
+  it('read again on the first change from Global to a project, not only on later ones', async () => {
+    mountDashboard()
+    await waitFor(() => expect(skillReads()).toHaveLength(1))
+    expect(skillReads()[0]).not.toContain('project_path')
+
+    await userEvent.click(screen.getByRole('button', { name: 'choose project' }))
+    await waitFor(() => expect(skillReads()).toHaveLength(2))
+    expect(skillReads()[1]).toContain(`project_path=${encodeURIComponent(PROJECT)}`)
+
+    await userEvent.click(screen.getByRole('button', { name: 'back to global' }))
+    await waitFor(() => expect(skillReads()).toHaveLength(3))
+    expect(skillReads()[2]).not.toContain('project_path')
+  })
+
+  it('read again when a project in the page URL hydrates after the first read', async () => {
+    mountDashboard(`/harnesses/claude-code?project=${encodeURIComponent(PROJECT)}`)
+    // The project list arrives after the first read, so the first read is Global and a second one follows.
+    await waitFor(() => expect(skillReads().some((url) => url.includes('project_path='))).toBe(true))
+  })
+
+  it('read again when the global user changes, and not when nothing changes', async () => {
+    mountDashboard()
+    await waitFor(() => expect(skillReads()).toHaveLength(1))
+
+    await userEvent.click(screen.getByRole('button', { name: 'choose controller' }))
+    await waitFor(() => expect(skillReads()).toHaveLength(2))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(skillReads()).toHaveLength(2)
   })
 })

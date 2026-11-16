@@ -13,3 +13,14 @@ export function projectScopedSurface(pathname: string): string | null {
   const surface = parts[0] === 'harnesses' ? parts[2] : parts[0]
   return surface && PROJECT_SCOPED_SURFACES.has(surface) ? surface : null
 }
+
+// Surfaces whose backend routes carry the harness scope (#969): they read the global scope of the chosen
+// OS user. Backup and Plans stay on the controller's own home, so they offer no user choice.
+const GLOBAL_USER_SURFACES = new Set([
+  'summary', 'config', 'mcp', 'plugins', 'commands', 'hooks', 'permissions', 'agents', 'skills', 'memory', 'output-styles',
+])
+
+/** True when the page at this surface reads the global scope of the user that the picker names. */
+export function globalUserSurface(surface: string | null): boolean {
+  return surface !== null && GLOBAL_USER_SURFACES.has(surface)
+}

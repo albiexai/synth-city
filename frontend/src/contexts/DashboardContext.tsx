@@ -119,9 +119,8 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastFetched, setLastFetched] = useState<Date | null>(null);
-  const prevProjectPath = useRef<string | undefined>(undefined);
-  const prevScopeUser = useRef<string | null | undefined>(undefined);
-  const prevProviderId = useRef<string | undefined>(undefined);
+  // undefined is a real value for the project (Global scope), so "not initialised yet" is its own flag.
+  const watchedScope = useRef<{ project?: string; user: string | null; provider?: string } | null>(null);
   const fetchId = useRef(0);
 
   const fetchStats = useCallback(async () => {
@@ -402,19 +401,15 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProject?.path, scopeUser, selectedProvider?.display_name, selectedProviderId]);
 
-  // Re-fetch when active project or provider changes (but not on initial mount)
+  // Re-fetch when the project, the global user or the provider changes (but not on initial mount).
+  // The first change away from Global (project undefined) counts, as does a project that hydrates late.
   useEffect(() => {
-    const currentPath = activeProject?.path;
-    const currentProvider = selectedProviderId;
-    const projectChanged = prevProjectPath.current !== undefined && prevProjectPath.current !== currentPath;
-    const userChanged = prevScopeUser.current !== undefined && prevScopeUser.current !== scopeUser;
-    const providerChanged = prevProviderId.current !== undefined && prevProviderId.current !== currentProvider;
-    if (projectChanged || providerChanged || userChanged) {
+    const current = { project: activeProject?.path, user: scopeUser ?? null, provider: selectedProviderId };
+    const previous = watchedScope.current;
+    watchedScope.current = current;
+    if (previous && (previous.project !== current.project || previous.user !== current.user || previous.provider !== current.provider)) {
       fetchStats();
     }
-    prevScopeUser.current = scopeUser;
-    prevProjectPath.current = currentPath;
-    prevProviderId.current = currentProvider;
   }, [activeProject?.path, scopeUser, selectedProviderId, fetchStats]);
 
   return (

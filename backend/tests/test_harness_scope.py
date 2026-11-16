@@ -214,3 +214,133 @@ async def test_backups_and_the_controllers_own_data_never_follow_the_scope(homes
         assert get_backup_storage_dir() == homes.controller / ".albiex-synth-city" / "backups"
     finally:
         path_utils._scope_home.reset(token)
+
+
+# --- #970 review: OAuth callback binding, MCP cache partition ---------------------------------------------
+
+class _FakeTokenClient:
+    """Stands in for the identity provider's token endpoint. No network is used."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def post(self, url, data=None, headers=None, json=None):
+        return SimpleNamespace(
+            status_code=200, text="",
+            json=lambda: {"access_token": "synthetic-access", "refresh_token": "synthetic-refresh", "expires_in": 60},
+        )
+
+
+@pytest.fixture
+def oauth_flow(homes, monkeypatch):
+    from app.api.v1 import mcp as mcp_api
+    from app.services import oauth_service as oauth_module
+
+    for home in (homes.controller, homes.agent):
+        (home / ".claude.json").write_text(json.dumps({"mcpServers": {"remote": {"type": "http", "url": "https://mcp.example.test/mcp"}}}))
+    monkeypatch.setattr(settings, "harness_agent_user", AGENT)
+
+    async def metadata(self, server_url):
+        return {"authorization_endpoint": "https://idp.example.test/authorize",
+                "token_endpoint": "https://idp.example.test/token",
+                "registration_endpoint": "https://idp.example.test/register"}
+
+    async def register(self, registration_endpoint, redirect_uri, server_name):
+        return {"client_id": "synthetic-client"}
+
+    monkeypatch.setattr(oauth_module.MCPOAuthService, "_discover_oauth_metadata", metadata)
+    monkeypatch.setattr(oauth_module.MCPOAuthService, "_register_client", register)
+    # Replace the name inside the service module only: the test client is an httpx.AsyncClient too.
+    fake_httpx = SimpleNamespace(**{name: getattr(httpx, name) for name in dir(httpx) if not name.startswith("_")})
+    fake_httpx.AsyncClient = _FakeTokenClient
+    monkeypatch.setattr(oauth_module, "httpx", fake_httpx)
+    mcp_api.oauth_service._pending.clear()
+    return homes
+
+
+async def _start(client, user):
+    response = await client.post("/api/v1/mcp/servers/remote/auth/start", headers={HEADER: user})
+    assert response.status_code == 200, response.text
+    return response.json()["state"]
+
+
+def _credentials(home: Path) -> Path:
+    return home / ".claude" / ".credentials.json"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("callback_headers", [{}, {HEADER: AGENT}, {HEADER: "deckcontroller"}])
+async def test_the_oauth_token_goes_to_the_home_of_the_user_who_started_the_flow(oauth_flow, client, callback_headers):
+    controller = path_utils.controller_user_name()
+    state = await _start(client, controller)  # started on the controller's page
+    headers = {k: (controller if v == "deckcontroller" else v) for k, v in callback_headers.items()}
+
+    response = await client.get("/api/v1/mcp/auth/callback", params={"code": "c", "state": state}, headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert _credentials(oauth_flow.controller).exists()
+    assert not _credentials(oauth_flow.agent).exists()  # a callback never redirects the write
+
+
+@pytest.mark.asyncio
+async def test_a_flow_started_on_the_agent_page_writes_the_agent_home_even_from_a_controller_callback(oauth_flow, client):
+    state = await _start(client, AGENT)
+
+    response = await client.get(
+        "/api/v1/mcp/auth/callback", params={"code": "c", "state": state},
+        headers={HEADER: path_utils.controller_user_name()},
+    )
+
+    assert response.status_code == 200, response.text
+    assert _credentials(oauth_flow.agent).exists() and not _credentials(oauth_flow.controller).exists()
+    assert path_utils.get_user_home() == oauth_flow.controller  # the write left no override behind
+
+
+@pytest.mark.asyncio
+async def test_the_mcp_cache_is_kept_apart_per_user_home(homes, client, monkeypatch):
+    monkeypatch.setattr(settings, "harness_agent_user", AGENT)
+    controller = path_utils.controller_user_name()
+    (homes.controller / ".claude.json").write_text(json.dumps({"mcpServers": {"same": {"command": "ctl-cmd"}}}))
+    (homes.agent / ".claude.json").write_text(json.dumps({"mcpServers": {"same": {"command": "agt-cmd"}}}))
+    from app.services.mcp_service import MCPService
+
+    service = MCPService()
+    engine_session = app.dependency_overrides[get_db]
+    async for db in engine_session():
+        token = path_utils.set_scope_home(homes.agent)
+        try:
+            await service.update_server_cache(
+                "same", "user", {"success": True, "server_name": "agt-identity", "tools": [{"name": "agt-tool"}], "tool_count": 1},
+                "hash-agt", db)
+        finally:
+            path_utils._scope_home.reset(token)
+
+    seen = {}
+    for user in (AGENT, controller, AGENT):
+        servers = (await client.get("/api/v1/mcp/servers", headers={HEADER: user})).json()["servers"]
+        same = next(s for s in servers if s["name"] == "same" and s["scope"] == "user")
+        seen.setdefault(user, []).append((same["command"], same["mcp_server_name"], same["is_connected"], same["tool_count"]))
+
+    # The agent user's observation belongs to the agent user's server only, before and after switching.
+    assert seen[AGENT] == [("agt-cmd", "agt-identity", True, 1)] * 2
+    assert seen[controller] == [("ctl-cmd", None, None, None)]  # never tested here: no observation of its own
+
+
+@pytest.mark.asyncio
+async def test_the_controllers_own_cache_key_is_unchanged(homes):
+    from app.services.mcp_service import MCPService
+
+    assert MCPService._cache_scope("user") == "user"  # a single-user install keeps its existing cache
+    assert MCPService._cache_scope("project") == "project"
+    token = path_utils.set_scope_home(homes.agent)
+    try:
+        assert MCPService._cache_scope("user") == f"user:{homes.agent}"
+        assert MCPService._cache_scope("project") == "project"
+    finally:
+        path_utils._scope_home.reset(token)

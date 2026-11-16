@@ -4,11 +4,13 @@ import secrets
 import base64
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Optional
 
 import httpx
 
 from app.services.credentials_service import CredentialsService
+from app.utils.path_utils import _scope_home, get_user_home, set_scope_home
 
 
 @dataclass
@@ -22,6 +24,10 @@ class PendingAuth:
     client_id: str
     client_secret: Optional[str]
     redirect_uri: str
+    # The global-scope home of the user who started this flow (#969). The callback comes from the
+    # identity provider and carries no scope of its own, so the token is written here, never to a home
+    # that the callback request happens to resolve.
+    home: Optional[Path] = None
     created_at: float = field(default_factory=time.time)
 
 
@@ -195,6 +201,7 @@ class MCPOAuthService:
             client_id=client_id,
             client_secret=client_secret,
             redirect_uri=redirect_uri,
+            home=get_user_home(),
         )
 
         # Build authorization URL
@@ -260,16 +267,24 @@ class MCPOAuthService:
         expires_in = token_resp.get("expires_in", 3600)
         expires_at = int(time.time() + expires_in)
 
-        # Store token
-        self._credentials.store_mcp_token(
-            server_name=pending.server_name,
-            server_url=pending.server_url,
-            client_id=pending.client_id,
-            client_secret=pending.client_secret,
-            access_token=access_token,
-            refresh_token=refresh_token,
-            expires_at=expires_at,
-        )
+        # Store the token in the home of the user who started the flow, whatever scope this request resolved.
+        token = set_scope_home(pending.home) if pending.home else None
+        try:
+            self._credentials.store_mcp_token(
+                server_name=pending.server_name,
+                server_url=pending.server_url,
+                client_id=pending.client_id,
+                client_secret=pending.client_secret,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                expires_at=expires_at,
+            )
+        finally:
+            if token is not None:
+                try:
+                    _scope_home.reset(token)
+                except ValueError:
+                    pass
 
         # Clean up pending state
         del self._pending[state]

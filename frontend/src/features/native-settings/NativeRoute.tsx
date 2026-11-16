@@ -24,7 +24,7 @@ import { UsagePage } from "@/features/usage/UsagePage";
 import type { AgentProviderId } from "@/types/providers";
 import { useProviderOperations } from "@/hooks/useProviders";
 import { nativeAdapter, nativeAccess } from "./surfaceRegistry";
-import { ScopeSelector, ScopedPage } from "@/features/projects/ScopeSelector";
+import { ScopedPage, SurfaceScopeSelector } from "@/features/projects/ScopeSelector";
 import { projectScopedSurface } from "./projectScope";
 import { HarnessBreadcrumb, HarnessSubNav } from "@/features/harnesses/HarnessNav";
 import { useDocumentTitle } from "@/features/harnesses/harnessPages";
@@ -120,7 +120,7 @@ export function NativeRoute({
             {access === "read_only" && (
               <p className="inline-flex items-center gap-1 text-sm text-muted-foreground"><Lock className="h-3 w-3" aria-hidden="true" />View only</p>
             )}
-            {!detail && projectScopedSurface(`/harnesses/${provider}/${surface}`) && <ScopeSelector showGlobalUser={provider === "claude-code"} />}
+            {!detail && projectScopedSurface(`/harnesses/${provider}/${surface}`) && <SurfaceScopeSelector providerId={provider} surface={surface} />}
             <ScopedPage>
               {detail === "session" ? (
                 <SessionViewPage />

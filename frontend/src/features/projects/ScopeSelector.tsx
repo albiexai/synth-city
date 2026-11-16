@@ -7,6 +7,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { apiClient } from '@/lib/api';
 import { useProjectContext } from '@/contexts/ProjectContext';
 import { ProjectSelector } from '@/features/projects/ProjectSelector';
+import { globalUserSurface } from '@/features/native-settings/projectScope';
 import type { HarnessScopeResponse, HarnessScopeUser } from '@/types/harnessScope';
 
 function useHarnessScope(): HarnessScopeResponse | null {
@@ -79,4 +80,9 @@ export function ScopeSelector({ showGlobalUser = true }: { showGlobalUser?: bool
 export function ScopedPage({ children }: { children: ReactNode }) {
   const { scopeUser } = useProjectContext();
   return <div key={scopeUser ?? 'default'} className="space-y-4">{children}</div>;
+}
+
+/** The scope control of one native page: the global user is offered only where the page's backend carries it. */
+export function SurfaceScopeSelector({ providerId, surface }: { providerId: string; surface: string }) {
+  return <ScopeSelector showGlobalUser={providerId === 'claude-code' && globalUserSurface(surface)} />;
 }
