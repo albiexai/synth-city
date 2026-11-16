@@ -744,6 +744,36 @@ def synth_city_request_scope_amendment(
 
 
 @mcp.tool()
+def synth_city_extend_effort_limit(
+    work_item_id: int,
+    dispatch_nonce: str,
+    minutes: int,
+    reason: str,
+) -> dict:
+    """Leader only: extend a work item's effort limit once, by at most 30 minutes or 25 percent of the limit.
+
+    The limit and its ledger are advisory elapsed working time from the system, not the owner's reported active
+    effort. The extension changes no expiry, nonce, lease or status. The owner asks for it by Mail.
+    """
+    err = _guard()
+    if err:
+        return err
+    result = _request(
+        "POST",
+        "/effort-extensions",
+        json={
+            "work_item_id": work_item_id,
+            "dispatch_nonce": dispatch_nonce,
+            "minutes": minutes,
+            "reason": reason,
+        },
+    )
+    if not result["ok"]:
+        return result
+    return {"ok": True, **result["data"], **_counts()}
+
+
+@mcp.tool()
 def synth_city_decide_continuation(
     approval_request_id: int,
     work_item_id: int,

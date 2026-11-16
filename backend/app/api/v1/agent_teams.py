@@ -484,6 +484,7 @@ def _scope_response(
         max_concurrent_dispatched=scope.max_concurrent_dispatched,
         max_verification_retries=scope.max_verification_retries,
         max_auto_merges_per_day=scope.max_auto_merges_per_day,
+        max_item_effort_minutes=scope.max_item_effort_minutes,
         auto_merges_last_24h=auto_merges_last_24h,
         base_ref=scope.base_ref,
         builds_out_of_tree=scope.builds_out_of_tree,
@@ -681,7 +682,7 @@ async def _scope_identity_in_use(db: AsyncSession, scope_id: int) -> bool:
 _SCOPE_CONFIGURATION_FIELDS = (
     "preset_id", "repo_owner", "repo_name", "repo_path", "dispatch_label", "design_label",
     "merge_policy", "review_hold_label", "max_approval_rounds", "max_concurrent_dispatched", "max_verification_retries",
-    "max_auto_merges_per_day", "base_ref", "builds_out_of_tree", "build_dir_template",
+    "max_auto_merges_per_day", "max_item_effort_minutes", "base_ref", "builds_out_of_tree", "build_dir_template",
     "build_command_hint", "max_build_parallelism", "github_auth_mode", "github_app_installation_id",
     "continuation_enabled", "max_continuation_revisions", "max_continuation_failed_heads",
     "max_failed_heads_per_revision", "max_scope_paths", "max_scope_commands", "enabled",
@@ -792,6 +793,8 @@ def _apply_scope_create(
         scope.max_verification_retries = request.max_verification_retries
     if request.max_auto_merges_per_day is not None:
         scope.max_auto_merges_per_day = request.max_auto_merges_per_day
+    if request.max_item_effort_minutes is not None:
+        scope.max_item_effort_minutes = request.max_item_effort_minutes
     if request.base_ref is not None:
         scope.base_ref = _clean_required(request.base_ref, "Base ref")
     if request.github_auth_mode is not None:

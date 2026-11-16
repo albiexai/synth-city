@@ -12,7 +12,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from app.config import settings
 from app.services import companion_paths
 
 _EXECUTION_TARGETS = {"workspace", "hosted_ci", "workspace_and_hosted_ci"}
@@ -82,8 +81,8 @@ _MESSAGES = {
     "plan_allowed_paths_missing": "plan_metadata.allowed_paths must be a non-empty list of closed file paths; later amendments read it.",
     "plan_metadata_reserved_key": "plan_metadata uses a key the server reserves for companion paths.",
     "estimate_invalid": "The estimate must be a positive finite number of minutes, or an object with high (and optionally low) minutes.",
-    "estimate_exceeds_window": "The estimate is longer than the current authority window.",
-    "estimate_near_window": "The estimate is close to the end of the current authority window.",
+    "estimate_exceeds_window": "The estimate is longer than the scope's effort ceiling.",
+    "estimate_near_window": "The estimate is close to the scope's effort ceiling.",
     "unread_authority_mail": "Unread stop, hold or decision Mail from your Leader, Supervisor or Synth City is waiting; read your inbox first.",
     "stale_nonce": "The dispatch nonce is not the current one.",
     "lease_token_mismatch": "The lease token does not match the workspace lease.",
@@ -370,13 +369,19 @@ def schema_problems(kind, *, summary, plan_metadata=None, phase=None, execution_
     return []
 
 
-def authority_window_minutes(scope=None) -> float:
-    """The authority window a request is judged against.
+DEFAULT_ITEM_EFFORT_MINUTES = 120
 
-    Today this is the one fixed window every revision gets. #938 derives it from an approved estimate and a
-    scope maximum, and replaces only this function.
+
+def authority_window_minutes(scope=None) -> float:
+    """The most effort an estimate may ask for: the scope's ``max_item_effort_minutes`` (#938, option C).
+
+    The proposal expiry (one hour) only bounds the path from proposal to activation and is not a limit on work, so
+    it no longer judges an estimate. The finding names keep their #937 spelling.
     """
-    return settings.github_continuation_proposal_expiry_seconds / 60
+    ceiling = getattr(scope, "max_item_effort_minutes", None)
+    if isinstance(ceiling, int) and not isinstance(ceiling, bool) and ceiling > 0:
+        return float(ceiling)
+    return float(DEFAULT_ITEM_EFFORT_MINUTES)
 
 
 def _usable_minutes(value) -> bool:
@@ -421,10 +426,10 @@ def estimate_problems(estimate, scope=None):
     window = authority_window_minutes(scope)
     if upper > window:
         return [problem("estimate_exceeds_window",
-                        message=f"The estimate's upper bound is {_minutes_text(upper)} minutes; the current authority window is {window:g}.")], []
+                        message=f"The estimate's upper bound is {_minutes_text(upper)} minutes; this scope's effort ceiling is {window:g} minutes (max_item_effort_minutes).")], []
     if upper > window - WINDOW_WARNING_MARGIN_MINUTES:
         return [], [problem("estimate_near_window",
-                            message=f"The estimate's upper bound is {_minutes_text(upper)} minutes of a {window:g}-minute window.")]
+                            message=f"The estimate's upper bound is {_minutes_text(upper)} minutes of a {window:g}-minute effort ceiling.")]
     return [], []
 
 
