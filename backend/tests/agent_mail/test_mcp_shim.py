@@ -1221,7 +1221,7 @@ def test_upgrade_probe_refuses_actual_dispatch_including_direct_http_tools(monke
             types.CallToolRequest(method="tools/call", params=types.CallToolRequestParams(
                 name=name, arguments=arguments)))
         assert wire.root.structuredContent == denied
-        assert len(tools) == 43
+        assert len(tools) == 44
         # Every published tool is refused before validation or execution.
         for tool in tools:
             assert await shim.mcp.call_tool(tool.name, {}) == denied
@@ -1251,7 +1251,7 @@ def test_upgrade_probe_lists_tools_without_registration_and_cannot_call_member_t
     spec.loader.exec_module(shim)
     calls = []
     monkeypatch.setattr(shim, "_request", lambda *args, **kwargs: calls.append((args, kwargs)))
-    assert len(asyncio.run(shim.mcp.list_tools())) == 43
+    assert len(asyncio.run(shim.mcp.list_tools())) == 44
     assert shim._ensure_registered() == {"ok": False, "error": {"code": "upgrade_probe_read_only"}}
     assert shim._state["member_id"] is None and shim._state["capability_token"] is None
     assert calls == []
@@ -1459,3 +1459,35 @@ async def test_shim_does_not_resolve_a_legacy_nested_pending_request(db, monkeyp
     assert result["ok"] is True and result["resolved_request"] is False, result
     assert seen[0]["root"]["id"] == root.id
     assert (await db.get(MailMessage, nested.id)).request_status == "pending"
+
+
+def test_preflight_tool_posts_one_read_only_check_and_returns_its_answer(monkeypatch):
+    import mcp_shim.agent_mail_server as shim
+    calls = []
+    answer = {"passed": False, "problems": [{"code": "allowed_paths_invalid", "field": "allowed_paths",
+                                             "message": "x"}], "warnings": []}
+    monkeypatch.setattr(shim, "_guard", lambda: None)
+    monkeypatch.setattr(shim, "_request", lambda method, path, **kwargs:
+        calls.append((method, path, kwargs)) or {"ok": True, "data": answer})
+    result = shim.synth_city_preflight_request(
+        "continuation", 19, "attempt", "Fix it", phase="implementation", execution_target="workspace",
+        allowed_paths=["/abs"], allowed_actions=["push_pr_head", "request_verification"],
+        max_failed_heads=1, estimate_active_minutes={"low": 10, "high": 30})
+    assert result == {"ok": True, **answer}
+    assert [(method, path) for method, path, _ in calls] == [("POST", "/preflight-request")]
+    sent = calls[0][2]["json"]
+    assert sent["kind"] == "continuation" and sent["work_item_id"] == 19
+    assert sent["estimate_active_minutes"] == {"low": 10, "high": 30}
+    assert sent["allowed_paths"] == ["/abs"] and sent["lease_token"] is None
+    assert set(sent) == {
+        "kind", "work_item_id", "dispatch_nonce", "summary", "plan_metadata", "phase", "execution_target",
+        "allowed_paths", "allowed_actions", "allowed_commands", "prohibited_actions", "max_failed_heads",
+        "tool_fallbacks", "estimate_active_minutes", "lease_token"}
+
+
+def test_preflight_tool_passes_a_server_refusal_through(monkeypatch):
+    import mcp_shim.agent_mail_server as shim
+    refusal = {"ok": False, "error": {"code": "not_item_owner"}}
+    monkeypatch.setattr(shim, "_guard", lambda: None)
+    monkeypatch.setattr(shim, "_request", lambda *args, **kwargs: refusal)
+    assert shim.synth_city_preflight_request("initial_plan", 19, "attempt", "Plan") == refusal

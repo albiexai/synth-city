@@ -5,7 +5,7 @@ import logging
 import os
 import sqlite3
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -28,9 +28,11 @@ from app.database import get_db
 from app.models.api_model import format_utc_time
 from app.utils import peer_process
 from mcp_shim.team_question_hook import is_guarded_tool
+from app.services import request_preflight
 from app.models.database import (
     GithubApprovalRequest,
     GithubWorkItem,
+    GithubWorkspace,
     MailAgentSession,
     MailPaneLifecycle,
     MailMessage,
@@ -466,6 +468,74 @@ def _is_sqlite_busy(db: AsyncSession, exc: OperationalError) -> bool:
         isinstance(exc.orig, sqlite3.OperationalError)
         and str(exc.orig) == "database is locked"
     )
+
+
+class MailPreflightRequest(BaseModel):
+    """A plan, amendment or continuation request to check. Fields mirror the submit tools."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["initial_plan", "scope_amendment", "continuation"]
+    work_item_id: int
+    dispatch_nonce: str
+    summary: Any = ""
+    plan_metadata: Any = Field(default_factory=dict)
+    phase: Any = None
+    execution_target: Any = None
+    # Typed loosely on purpose: a wrong type is a problem to report, not a 422 that hides the rest.
+    allowed_paths: Any = Field(default_factory=list)
+    allowed_actions: Any = Field(default_factory=list)
+    allowed_commands: Any = Field(default_factory=list)
+    prohibited_actions: Any = Field(default_factory=list)
+    max_failed_heads: Any = None
+    tool_fallbacks: Any = Field(default_factory=dict)
+    estimate_active_minutes: Any = None
+    lease_token: Optional[str] = None
+
+
+@router.post("/preflight-request")
+async def preflight_request(
+    request: MailPreflightRequest,
+    session: MailAgentSession = Depends(require_mail_session),
+    db: AsyncSession = Depends(get_db),
+):
+    """Report every mechanical problem of a request before it is submitted (#937).
+
+    Read-only: it creates no request, Mail, nudge or audit row. Only the item's owner may ask, and
+    neither the nonce nor the lease token is echoed back.
+    """
+    item = await db.get(GithubWorkItem, request.work_item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="work_item_not_found")
+    if session.team_slot_id is None or item.owner_slot_id != session.team_slot_id:
+        raise HTTPException(status_code=403, detail="not_item_owner")
+    scope = await db.get(TeamGithubScope, item.scope_id)
+    if scope is None:
+        raise HTTPException(status_code=404, detail="scope_not_found")
+    try:
+        blocking = await agent_mail_service.blocking_unread_authority(db, session.member_id)
+    except Exception as exc:
+        logger.warning("preflight mail check failed: %s", exc)
+        blocking = None
+    result = request_preflight.preflight(
+        request.kind, summary=request.summary, scope=scope, plan_metadata=request.plan_metadata,
+        phase=request.phase, attempt_phase=item.attempt_phase, execution_target=request.execution_target,
+        allowed_paths=request.allowed_paths, allowed_actions=request.allowed_actions,
+        allowed_commands=request.allowed_commands, prohibited_actions=request.prohibited_actions,
+        max_failed_heads=request.max_failed_heads, tool_fallbacks=request.tool_fallbacks,
+        estimate=request.estimate_active_minutes,
+        unread_authority_message_id=blocking.id if blocking is not None else None)
+    if item.dispatch_nonce != request.dispatch_nonce:
+        result.problems.insert(0, request_preflight.problem("stale_nonce"))
+    if request.lease_token is not None:
+        workspace = (await db.execute(
+            select(GithubWorkspace).where(
+                GithubWorkspace.scope_id == scope.id, GithubWorkspace.leased_item_id == item.id)
+        )).scalar_one_or_none()
+        if (workspace is None or workspace.lease_token is None
+                or not hmac.compare_digest(workspace.lease_token, request.lease_token)):
+            result.problems.insert(0, request_preflight.problem("lease_token_mismatch", 403))
+    return result.as_dict()
 
 
 @router.post(

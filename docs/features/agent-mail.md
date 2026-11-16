@@ -149,6 +149,12 @@ Open **Agent Mail** in Synth City and use the **Install** tab.
 
 The Install tab also shows manual Codex snippets and Copilot fallback commands/hook JSON.
 
+## Check a request before you submit it
+
+Most rejected plan and continuation requests fail on mechanical rules, not on design: the wrong phase for the work, a missing completion action, an omitted companion path, a path list that is not closed. `synth_city_preflight_request` checks a plan, scope amendment or continuation request first and returns every problem at once, as a code, a field and a message. It creates nothing and sends no Mail, so it is safe to call as often as needed, and only the item's owner can call it. The continuation and amendment submit tools use the same checks, so a request that passes is not refused for these rules.
+
+It also compares an optional estimate (`estimate_active_minutes`, in minutes) with the current authority window, reports unread stop or hold Mail for the owner, and lists the companion paths the server will add. Today the window is the single fixed 60-minute expiry; deriving it from an estimate and adding an item ceiling is tracked in #938. Budgets, a request already pending and the repository head are checked only when you submit. See the [API reference](../api/agent-mail.md#check-a-request-before-submitting-it) for every rule and code.
+
 ## Amend an approved scope and end a submitted revision
 
 An owner can request a healthy scope amendment before or after opening a PR. The current Leader

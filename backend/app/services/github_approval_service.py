@@ -31,7 +31,7 @@ from app.models.database import (
     TeamGithubScope,
 )
 from app.models.schemas import MailMessageCreate
-from app.services import companion_paths
+from app.services import companion_paths, request_preflight
 from app.services import factory_audit_service as audit
 from app.services.agent_mail_service import agent_mail_service
 from app.services.continuation_phase_guidance import PHASE_GUIDANCE
@@ -655,28 +655,27 @@ class GithubApprovalService:
             raise GithubApprovalError("stale_nonce")
         if not hmac.compare_digest(proposal["lease_token"], workspace.lease_token):
             raise GithubApprovalError("lease_token_mismatch", status_code=403)
-        if proposal["phase"] != "implementation" or item.attempt_phase != "implementation":
-            raise GithubApprovalError("amendment_diagnostic_restoration_required")
-        if proposal["execution_target"] not in {"workspace", "hosted_ci", "workspace_and_hosted_ci"}:
-            raise GithubApprovalError("execution_target_invalid", status_code=400)
-        paths = self._canonical_paths(proposal["allowed_paths"])
-        if any(path.endswith("/") for path in paths):
-            raise GithubApprovalError("amendment_closed_file_paths_required")
-        actions = self._canonical_strings(proposal["allowed_actions"], label="allowed_actions", allow_empty=False)
-        if set(actions) - _CONTINUATION_ACTIONS or not IMPLEMENTATION_COMPLETION_ACTIONS <= set(actions):
-            raise GithubApprovalError("implementation_completion_actions_required", status_code=400)
-        commands = self._canonical_strings(proposal["allowed_commands"], label="allowed_commands")
-        prohibitions = self._canonical_strings(proposal["prohibited_actions"], label="prohibited_actions")
-        fallbacks = self._canonical_tool_fallbacks(proposal["tool_fallbacks"], execution_target=proposal["execution_target"])
-        if bool(fallbacks) != ("install_hosted_ci_tool" in actions):
-            raise GithubApprovalError("hosted_tool_fallback_required", status_code=400)
-        if len(paths) > scope.max_scope_paths or len(commands) > scope.max_scope_commands:
-            raise GithubApprovalError("continuation_path_limit_exceeded")
-        if not proposal["summary"].strip():
-            raise GithubApprovalError("continuation_summary_required", status_code=400)
+        problems, normalized = request_preflight.amendment_body(
+            phase=proposal["phase"],
+            attempt_phase=item.attempt_phase,
+            execution_target=proposal["execution_target"],
+            summary=proposal["summary"],
+            allowed_paths=proposal["allowed_paths"],
+            allowed_actions=proposal["allowed_actions"],
+            allowed_commands=proposal["allowed_commands"],
+            prohibited_actions=proposal["prohibited_actions"],
+            max_failed_heads=proposal["max_failed_heads"],
+            tool_fallbacks=proposal["tool_fallbacks"],
+            scope=scope,
+        )
+        if problems:
+            raise GithubApprovalError(problems[0].code, status_code=problems[0].status_code)
+        paths = normalized.paths
+        actions = normalized.actions
+        commands = normalized.commands
+        prohibitions = normalized.prohibitions
+        fallbacks = normalized.fallbacks
         max_failures = proposal["max_failed_heads"]
-        if type(max_failures) is not int or max_failures < 1 or max_failures > scope.max_failed_heads_per_revision:
-            raise GithubApprovalError("continuation_failed_head_limit_exceeded")
         base_paths = await self.amendment_base_paths(db, item, owner, leader)
         named = paths
         owner_summary = proposal["summary"].strip()
@@ -947,16 +946,9 @@ class GithubApprovalService:
             raise GithubApprovalError("continuation_pr_required")
         if item.dispatch_nonce != dispatch_nonce:
             raise GithubApprovalError("stale_nonce")
-        if phase not in {"implementation", "diagnostic"}:
-            raise GithubApprovalError("continuation_phase_invalid", status_code=400)
-        if execution_target not in {
-            "workspace",
-            "hosted_ci",
-            "workspace_and_hosted_ci",
-        }:
-            raise GithubApprovalError("execution_target_invalid", status_code=400)
-        if not summary.strip():
-            raise GithubApprovalError("continuation_summary_required", status_code=400)
+        header = request_preflight.continuation_header(phase, execution_target, summary)
+        if header:
+            raise GithubApprovalError(header[0].code, status_code=header[0].status_code)
 
         owner, leader = await self._current_participants(db, item)
         if owner.id != authenticated_owner_member_id:
@@ -981,63 +973,24 @@ class GithubApprovalService:
         if not hmac.compare_digest(workspace.lease_token, lease_token):
             raise GithubApprovalError("lease_token_mismatch", status_code=403)
 
-        canonical_paths = self._canonical_paths(allowed_paths)
-        canonical_actions = self._canonical_strings(
-            allowed_actions,
-            label="allowed_actions",
-            allow_empty=False,
-        )
-        unknown_actions = set(canonical_actions) - _CONTINUATION_ACTIONS
-        if unknown_actions:
-            raise GithubApprovalError("allowed_actions_invalid", status_code=400)
-        if phase == "implementation" and not (
-            IMPLEMENTATION_COMPLETION_ACTIONS <= set(canonical_actions)
-        ):
-            raise GithubApprovalError(
-                "implementation_completion_actions_required",
-                status_code=400,
-            )
-        canonical_commands = self._canonical_strings(
-            allowed_commands,
-            label="allowed_commands",
-        )
-        canonical_prohibitions = self._canonical_strings(
-            prohibited_actions,
-            label="prohibited_actions",
-        )
-        canonical_fallbacks = self._canonical_tool_fallbacks(
-            tool_fallbacks,
+        problems, normalized = request_preflight.continuation_body(
+            phase=phase,
             execution_target=execution_target,
+            allowed_paths=allowed_paths,
+            allowed_actions=allowed_actions,
+            allowed_commands=allowed_commands,
+            prohibited_actions=prohibited_actions,
+            max_failed_heads=max_failed_heads,
+            tool_fallbacks=tool_fallbacks,
+            scope=scope,
         )
-        if phase == "diagnostic":
-            if "revert_diagnostic_changes" not in canonical_actions:
-                raise GithubApprovalError("diagnostic_revert_required", status_code=400)
-            if execution_target == "hosted_ci" and any(
-                _HOSTED_ONLY_LOCAL_BUILD.search(command)
-                for command in canonical_commands
-            ):
-                raise GithubApprovalError(
-                    "hosted_diagnostic_local_build_forbidden",
-                    status_code=400,
-                )
-            installs_hosted_tool = "install_hosted_ci_tool" in canonical_actions
-            if installs_hosted_tool != bool(canonical_fallbacks):
-                raise GithubApprovalError(
-                    "hosted_tool_fallback_required",
-                    status_code=400,
-                )
-        elif "install_hosted_ci_tool" in canonical_actions:
-            if not canonical_fallbacks:
-                raise GithubApprovalError(
-                    "hosted_tool_fallback_required",
-                    status_code=400,
-                )
-        if len(canonical_paths) > scope.max_scope_paths:
-            raise GithubApprovalError("continuation_path_limit_exceeded")
-        if len(canonical_commands) > scope.max_scope_commands:
-            raise GithubApprovalError("continuation_command_limit_exceeded")
-        if max_failed_heads > scope.max_failed_heads_per_revision:
-            raise GithubApprovalError("continuation_failed_head_limit_exceeded")
+        if problems:
+            raise GithubApprovalError(problems[0].code, status_code=problems[0].status_code)
+        canonical_paths = normalized.paths
+        canonical_actions = normalized.actions
+        canonical_commands = normalized.commands
+        canonical_prohibitions = normalized.prohibitions
+        canonical_fallbacks = normalized.fallbacks
 
         revision_count, failed_head_count = await self.continuation_budget_usage(
             db,
