@@ -10,13 +10,14 @@ from __future__ import annotations
 import logging
 import math
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import exists, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.database import GithubOwnerObservationPause, GithubWorkItem
+from app.config import settings
+from app.models.database import GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace, TeamGithubScope
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +189,33 @@ class GithubEffortLimitService:
 
     # -- the one Leader extension -----------------------------------------------------------------------------------
 
+    async def _read_activity(self, db: AsyncSession, item: GithubWorkItem, scope, now: datetime):
+        """Why an extension must be refused for want of recent owner activity, as ``(code, contact)``.
+
+        ``code`` is ``None`` when the attempt is acknowledged, no observation pause is waiting or paused, and the
+        leased workspace shows owner contact within the owner idle window (the window the idle monitor uses: the
+        delivery policy's, else the setting). ``contact`` is the contact time read, for the guarded update to repeat.
+        """
+        if item.ack_received_at is None:
+            return "effort_extension_not_acknowledged", None
+        if await db.scalar(select(self._pause_exists(item.id))):
+            return "effort_extension_paused", None
+        contact = await db.scalar(select(GithubWorkspace.lease_last_owner_contact_at).where(
+            GithubWorkspace.leased_item_id == item.id))
+        from app.services.factory_delivery_policy import effective_policy
+
+        window = timedelta(seconds=effective_policy(item, scope).owner_idle_seconds
+                           or settings.github_owner_idle_timeout_seconds)
+        if contact is None or now - contact > window:
+            return "effort_extension_no_recent_activity", contact
+        return None, contact
+
+    @staticmethod
+    def _pause_exists(item_id: int):
+        return exists(select(GithubOwnerObservationPause.id).where(
+            GithubOwnerObservationPause.work_item_id == item_id,
+            GithubOwnerObservationPause.status.in_(("waiting", "paused"))))
+
     async def extend(self, db: AsyncSession, *, work_item_id: int, dispatch_nonce: str, leader_member_id: int,
                      minutes, reason, now: datetime | None = None) -> dict:
         """Grant the item's one extension. A single guarded update decides; a loser changes nothing."""
@@ -232,10 +260,22 @@ class GithubEffortLimitService:
             await db.rollback()
             raise EffortLimitError("extension_exceeds_cap", status_code=400,
                                    message=f"The extension is at most {cap} minutes for a limit of {limit} minutes.")
+        scope = await db.get(TeamGithubScope, item.scope_id)
+        refusal, contact = await self._read_activity(db, item, scope, now)
+        if refusal is not None:
+            await db.rollback()
+            raise EffortLimitError(refusal)
+        # The writer is held, so nothing can change between the read above and this update; the update still
+        # repeats every check (acknowledged, no pause, the same owner contact) so the decision never rests on a
+        # read alone.
         result = await db.execute(update(GithubWorkItem).where(
             GithubWorkItem.id == work_item_id, GithubWorkItem.dispatch_nonce == dispatch_nonce,
             GithubWorkItem.dispatch_status == "dispatched", GithubWorkItem.effort_limit_minutes.is_not(None),
-            GithubWorkItem.effort_extension_minutes == 0,
+            GithubWorkItem.effort_extension_minutes == 0, GithubWorkItem.ack_received_at.is_not(None),
+            ~self._pause_exists(work_item_id),
+            exists(select(GithubWorkspace.id).where(
+                GithubWorkspace.leased_item_id == work_item_id,
+                GithubWorkspace.lease_last_owner_contact_at == contact)),
         ).values(effort_extension_minutes=minutes, effort_extension_decided_at=now, effort_extension_reason=reason)
             .execution_options(synchronize_session=False))
         if result.rowcount != 1:
