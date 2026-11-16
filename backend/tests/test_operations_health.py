@@ -455,6 +455,35 @@ async def test_an_initialized_database_that_lost_the_findings_table_is_unreadabl
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("present", [
+    ["agent_team_presets"],                                 # V1's case: one application table, not github_work_items
+    ["projects", "mail_messages", "team_github_scopes"],    # a few tables of a real schema
+    ["github_work_items"],                                  # the table the first check looked for
+])
+async def test_any_application_table_without_the_findings_table_is_unreadable_not_healthy(tmp_path, monkeypatch, present):
+    """A partial or broken schema is not a fresh database."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'partial.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(lambda sync: [Base.metadata.tables[name].create(sync) for name in present])
+    monkeypatch.setattr(ops_module.operations_health_service, "_session", async_sessionmaker(engine, expire_on_commit=False))
+    for body in (await health_check(), await root_health()):
+        assert body["health"] == "degraded" and body["reasons"] == ["findings_unreadable"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_database_with_only_tables_that_are_not_the_applications_counts_as_empty(tmp_path, monkeypatch):
+    from sqlalchemy import text
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'foreign.db'}")
+    async with engine.begin() as connection:
+        await connection.execute(text("CREATE TABLE somebody_elses_table (id INTEGER)"))
+    monkeypatch.setattr(ops_module.operations_health_service, "_session", async_sessionmaker(engine, expire_on_commit=False))
+    body = await health_check()
+    assert body["health"] == "ok" and body["reasons"] == []
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_a_store_that_does_not_exist_yet_is_not_a_finding_and_keeps_the_exact_shape(tmp_path, monkeypatch):
     """A database init_db has not touched has no findings; it must not degrade a fresh installation."""
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'empty.db'}")

@@ -17,7 +17,7 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import AsyncSessionLocal
+from app.database import AsyncSessionLocal, Base
 from app.models.database import AgentTeamPreset, GithubWorkItem, MailMessage, OperationsFinding, TeamGithubScope
 
 logger = logging.getLogger(__name__)
@@ -292,13 +292,15 @@ class OperationsHealthService:
         }
 
     async def _database_is_uninitialized(self) -> bool:
-        """True only when the database holds none of the application's tables. A failed check counts as no."""
+        """True only when none of the application's known tables exists. A failed check counts as no.
+
+        Any application table present means the schema was initialized, however partially: a missing findings table
+        then is a lost store, not a fresh database.
+        """
         try:
             async with self._session() as db:
-                existing = await db.scalar(
-                    text("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = :name"),
-                    {"name": GithubWorkItem.__tablename__})
-            return existing == 0
+                names = set((await db.scalars(text("SELECT name FROM sqlite_master WHERE type = 'table'"))).all())
+            return not (names & set(Base.metadata.tables))
         except Exception:
             return False
 
