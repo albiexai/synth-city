@@ -69,14 +69,24 @@ async def _seed(ops, *, supervisor=6, status="verifying", pr_number=5, age_minut
 
 
 class _Client:
-    def __init__(self, merged=True, error=None):
+    """A GitHub stand-in: every PR is merged (or not) with a merged_at the given minutes ago, unless numbers say otherwise."""
+
+    def __init__(self, merged=True, error=None, merged_minutes_ago=60, with_merged_at=True, merged_numbers=None):
         self.merged, self.error, self.calls = merged, error, 0
+        self.merged_minutes_ago, self.with_merged_at, self.merged_numbers = merged_minutes_ago, with_merged_at, merged_numbers
+        self.read_numbers = []
 
     async def get_pull(self, owner, repo, number):
         self.calls += 1
+        self.read_numbers.append(number)
         if self.error:
             raise self.error
-        return {"number": number, "merged": self.merged, "state": "closed" if self.merged else "open"}
+        merged = self.merged if self.merged_numbers is None else number in self.merged_numbers
+        pull = {"number": number, "merged": merged, "state": "closed" if merged else "open"}
+        if merged and self.with_merged_at:
+            stamp = datetime.utcnow() - timedelta(minutes=self.merged_minutes_ago)
+            pull["merged_at"] = stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return pull
 
 
 async def _findings(ops, kind=None, status=None):
@@ -128,14 +138,31 @@ async def test_verifying_after_merge_opens_one_finding_and_one_notice_and_resolv
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["too_recent", "not_merged", "unreadable_pr", "no_pr", "other_status"])
+@pytest.mark.parametrize("case", ["recent_merge", "not_merged", "unreadable_pr", "no_pr", "other_status", "no_merged_at"])
 async def test_verifying_after_merge_stays_quiet_when_a_condition_is_not_met(ops, case):
+    # An old updated_at proves nothing: only GitHub's merged_at starts the clock.
     seeded = await _seed(
-        ops, age_minutes=2 if case == "too_recent" else 60, pr_number=None if case == "no_pr" else 5,
+        ops, age_minutes=600, pr_number=None if case == "no_pr" else 5,
         status="ready_for_review" if case == "other_status" else "verifying")
-    client = _Client(merged=case != "not_merged", error=RuntimeError("down") if case == "unreadable_pr" else None)
+    client = _Client(
+        merged=case != "not_merged", error=RuntimeError("down") if case == "unreadable_pr" else None,
+        merged_minutes_ago=2 if case == "recent_merge" else 60, with_merged_at=case != "no_merged_at")
     await ops.service.sweep_verifying_after_merge(seeded.scope_id, "o", "r", client)
     assert await _findings(ops) == [] and await _notices(ops) == []
+
+
+@pytest.mark.asyncio
+async def test_the_clock_starts_at_the_merge_not_at_the_items_last_change(ops):
+    seeded = await _seed(ops, age_minutes=1)  # the item changed a minute ago; the PR merged long before
+    await ops.service.sweep_verifying_after_merge(seeded.scope_id, "o", "r", _Client(merged_minutes_ago=VERIFYING_AFTER_MERGE_MINUTES + 1))
+    assert len(await _findings(ops, VERIFYING_AFTER_MERGE, "open")) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_merge_just_under_the_threshold_opens_nothing_yet(ops):
+    seeded = await _seed(ops)
+    await ops.service.sweep_verifying_after_merge(seeded.scope_id, "o", "r", _Client(merged_minutes_ago=VERIFYING_AFTER_MERGE_MINUTES - 1))
+    assert await _findings(ops) == []
 
 
 @pytest.mark.asyncio
@@ -151,6 +178,51 @@ async def test_the_merged_sweep_reads_at_most_eight_pull_requests_a_poll(ops):
     client = _Client(merged=True)
     await ops.service.sweep_verifying_after_merge(seeded.scope_id, "o", "r", client)
     assert client.calls == 8
+
+
+async def _add_items(ops, scope_id, numbers):
+    async with ops.maker() as db:
+        for number in numbers:
+            db.add(GithubWorkItem(
+                scope_id=scope_id, issue_number=number, issue_title="x", issue_url="u",
+                github_updated_at=datetime.utcnow(), dispatch_status="verifying", pr_number=100 + number,
+                dispatch_head_ref="h", dispatch_base_ref="origin/master", updated_at=datetime.utcnow()))
+        await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_the_merged_sweep_rotates_so_the_first_eight_cannot_starve_the_rest(ops):
+    seeded = await _seed(ops, pr_number=None)  # the seeded item has no PR; the twelve below do
+    await _add_items(ops, seeded.scope_id, range(2, 14))
+    client = _Client(merged_numbers={113})  # only the LAST candidate's PR is merged
+    await ops.service.sweep_verifying_after_merge(seeded.scope_id, "o", "r", client)
+    assert client.read_numbers == [102, 103, 104, 105, 106, 107, 108, 109] and await _findings(ops) == []
+    await ops.service.sweep_verifying_after_merge(seeded.scope_id, "o", "r", client)  # the next poll continues
+    assert [f.subject for f in await _findings(ops, VERIFYING_AFTER_MERGE, "open")] == [
+        f"work_item:{(await _item_ids(ops))[113]}"]
+    assert set(client.read_numbers) == {100 + n for n in range(2, 14)}  # all twelve were read within two polls
+
+
+async def _item_ids(ops):
+    async with ops.maker() as db:
+        return {pr: item_id for item_id, pr in (await db.execute(select(GithubWorkItem.id, GithubWorkItem.pr_number))).all()}
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_cursors_are_kept_per_scope(ops):
+    first = await _seed(ops, pr_number=None)
+    async with ops.maker() as db:
+        scope = TeamGithubScope(preset_id=first.preset_id, repo_owner="o", repo_name="other", repo_path="/tmp/o")
+        db.add(scope)
+        await db.commit()
+        second_scope = scope.id
+    await _add_items(ops, first.scope_id, range(2, 12))
+    await _add_items(ops, second_scope, range(20, 24))
+    client_a, client_b = _Client(merged_numbers=set()), _Client(merged_numbers=set())
+    await ops.service.sweep_verifying_after_merge(first.scope_id, "o", "r", client_a)
+    await ops.service.sweep_verifying_after_merge(second_scope, "o", "other", client_b)
+    assert client_a.read_numbers == [102, 103, 104, 105, 106, 107, 108, 109]
+    assert client_b.read_numbers == [120, 121, 122, 123]  # the second scope starts from its own beginning
 
 
 # ---- detector 2: skipped by verification poll after poll ----
@@ -174,6 +246,35 @@ async def test_a_skipped_item_opens_a_finding_at_the_threshold_and_resolves_when
     assert await _findings(ops, status="open") == []
     await ops.service.record_verification_skips(seeded.scope_id, {seeded.item_id})
     assert len(await _findings(ops, status="open")) == 1 and len(await _notices(ops)) == 2
+
+
+@pytest.mark.asyncio
+async def test_alternating_scopes_each_reach_the_skip_threshold_and_do_not_reset_each_other(ops):
+    first = await _seed(ops)
+    async with ops.maker() as db:
+        scope = TeamGithubScope(preset_id=first.preset_id, repo_owner="o", repo_name="other", repo_path="/tmp/o")
+        db.add(scope)
+        await db.flush()
+        item = GithubWorkItem(scope_id=scope.id, issue_number=2, issue_title="x", issue_url="u",
+                              github_updated_at=datetime.utcnow(), dispatch_status="verifying")
+        db.add(item)
+        await db.commit()
+        second_scope, second_item = scope.id, item.id
+    for _ in range(SKIPPED_POLLS):  # the scopes are polled in turn; each skips its own item every time
+        await ops.service.record_verification_skips(first.scope_id, {first.item_id})
+        await ops.service.record_verification_skips(second_scope, {second_item})
+    assert sorted(f.work_item_id for f in await _findings(ops, ITEM_SKIPPED, "open")) == sorted([first.item_id, second_item])
+    assert len(await _notices(ops)) == 2
+
+
+@pytest.mark.asyncio
+async def test_one_scope_clearing_its_item_does_not_clear_another_scopes_count(ops):
+    first = await _seed(ops)
+    for _ in range(SKIPPED_POLLS - 1):
+        await ops.service.record_verification_skips(first.scope_id, {first.item_id})
+    await ops.service.record_verification_skips(first.scope_id + 1000, set())  # another scope's poll processed nothing
+    await ops.service.record_verification_skips(first.scope_id, {first.item_id})
+    assert len(await _findings(ops, ITEM_SKIPPED, "open")) == 1
 
 
 @pytest.mark.asyncio
@@ -201,7 +302,7 @@ async def test_a_labeled_issue_without_a_work_item_opens_a_finding_and_resolves_
     for _ in range(3):
         await ops.service.record_admissions(seeded.scope_id, {1, 7})
     [finding] = await _findings(ops, ADMISSION_MISSING, "open")
-    assert finding.subject == "issue:7" and "#7" in finding.detail and len(await _notices(ops)) == 1
+    assert finding.subject == f"scope:{seeded.scope_id}:issue:7" and "#7" in finding.detail and len(await _notices(ops)) == 1
 
     async with ops.maker() as db:  # the admission finally lands
         db.add(GithubWorkItem(scope_id=seeded.scope_id, issue_number=7, issue_title="x", issue_url="u",
@@ -209,6 +310,29 @@ async def test_a_labeled_issue_without_a_work_item_opens_a_finding_and_resolves_
         await db.commit()
     await ops.service.record_admissions(seeded.scope_id, {1, 7})
     assert await _findings(ops, status="open") == [] and len(await _findings(ops, status="resolved")) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_same_issue_number_in_two_scopes_opens_two_findings_and_two_notices(ops):
+    first = await _seed(ops)
+    async with ops.maker() as db:
+        scope = TeamGithubScope(preset_id=first.preset_id, repo_owner="o", repo_name="other", repo_path="/tmp/o")
+        db.add(scope)
+        await db.commit()
+        second = scope.id
+    for _ in range(MISSING_ADMISSION_POLLS):
+        await ops.service.record_admissions(first.scope_id, {9})
+        await ops.service.record_admissions(second, {9})
+    assert sorted(f.subject for f in await _findings(ops, ADMISSION_MISSING, "open")) == sorted(
+        [f"scope:{first.scope_id}:issue:9", f"scope:{second}:issue:9"])
+    assert len(await _notices(ops)) == 2
+    async with ops.maker() as db:  # admitting it in one scope resolves only that scope's finding
+        db.add(GithubWorkItem(scope_id=second, issue_number=9, issue_title="x", issue_url="u",
+                              github_updated_at=datetime.utcnow(), dispatch_status="pending"))
+        await db.commit()
+    await ops.service.record_admissions(first.scope_id, {9})
+    await ops.service.record_admissions(second, {9})
+    assert [f.subject for f in await _findings(ops, ADMISSION_MISSING, "open")] == [f"scope:{first.scope_id}:issue:9"]
 
 
 @pytest.mark.asyncio
@@ -230,7 +354,7 @@ async def test_the_watcher_reports_what_it_listed_after_its_admissions_commit(op
         scope = await db.get(TeamGithubScope, seeded.scope_id)
         for _ in range(MISSING_ADMISSION_POLLS):
             await watcher.poll_scope(db, scope, Lister())
-    assert [f.subject for f in await _findings(ops, ADMISSION_MISSING, "open")] == ["issue:7"]
+    assert [f.subject for f in await _findings(ops, ADMISSION_MISSING, "open")] == [f"scope:{seeded.scope_id}:issue:7"]
 
 
 async def _async_noop(*args, **kwargs):
@@ -310,11 +434,21 @@ async def test_health_still_answers_when_the_findings_cannot_be_read(ops, monkey
         raise RuntimeError("database is gone")
 
     monkeypatch.setattr(ops_module.operations_health_service, "_session", broken)
+    for body in (await health_check(), await root_health()):
+        assert body["status"] in {"ok", "running"}  # the status values never change
+        assert body["health"] == "degraded"
+        assert body["reasons"] == ["findings_unreadable"] and body["open_findings"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_store_that_does_not_exist_yet_is_not_a_finding_and_keeps_the_exact_shape(tmp_path, monkeypatch):
+    """A database init_db has not touched has no findings; it must not degrade a fresh installation."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'empty.db'}")
+    monkeypatch.setattr(ops_module.operations_health_service, "_session", async_sessionmaker(engine, expire_on_commit=False))
     body = await health_check()
-    assert body["status"] == "ok" and body["health"] == "degraded"
-    assert body["reasons"] == ["findings_unreadable"] and body["open_findings"] is None
-    # The root liveness probe does not depend on the database: it keeps its exact shape.
+    assert body["health"] == "ok" and body["reasons"] == [] and body["open_findings"] == 0
     assert set(await root_health()) == {"name", "version", "status"}
+    await engine.dispose()
 
 
 @pytest.mark.asyncio

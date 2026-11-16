@@ -11,9 +11,10 @@ Findings hold identifiers and counts only; no prompt, token or raw error text.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
@@ -40,8 +41,9 @@ class OperationsHealthService:
     def __init__(self) -> None:
         # Consecutive-poll counters live in this process: a restart starts counting again, which can only delay a
         # finding, never invent one.
-        self._skips: dict[int, int] = {}
-        self._missing: dict[tuple[int, int], int] = {}
+        self._skips: dict[tuple[int, int], int] = {}      # (scope id, work item id) -> polls in a row
+        self._missing: dict[tuple[int, int], int] = {}    # (scope id, issue number) -> polls in a row
+        self._sweep_cursor: dict[int, int] = {}           # scope id -> last work item id the merged sweep read
         # Every write uses a session of its own, never the caller's: detection cannot discard the poll's pending
         # writes, and it cannot hold SQLite's single write lock against them. Tests replace this factory.
         self._session = AsyncSessionLocal
@@ -140,26 +142,34 @@ class OperationsHealthService:
     # ---- detector 1: still verifying after the PR merged -------------------------------------------------
 
     async def sweep_verifying_after_merge(self, scope_id: int, owner: str, repo: str, client) -> None:
+        """An item still verifying when GitHub's own merged_at is at least 15 minutes old."""
         try:
             async with self._session() as db:
-                cutoff = datetime.utcnow() - timedelta(minutes=VERIFYING_AFTER_MERGE_MINUTES)
-                stale = (await db.execute(
+                now = datetime.utcnow()
+                candidates = (await db.execute(
                     select(GithubWorkItem.id, GithubWorkItem.pr_number).where(
                         GithubWorkItem.scope_id == scope_id, GithubWorkItem.dispatch_status == "verifying",
-                        GithubWorkItem.pr_number.is_not(None), GithubWorkItem.updated_at < cutoff,
-                    ).order_by(GithubWorkItem.id).limit(SWEEP_LIMIT))).all()
-                for item_id, pr_number in stale:
+                        GithubWorkItem.pr_number.is_not(None),
+                    ).order_by(GithubWorkItem.id))).all()
+                # Read at most SWEEP_LIMIT PRs a poll and rotate from where the last poll stopped, so a first group
+                # of unmerged PRs cannot starve the rest.
+                cursor = self._sweep_cursor.get(scope_id, 0)
+                after = [row for row in candidates if row.id > cursor]
+                batch = (after + [row for row in candidates if row.id <= cursor])[:SWEEP_LIMIT]
+                self._sweep_cursor[scope_id] = batch[-1].id if batch else 0
+                for item_id, pr_number in batch:
                     try:
                         pull = await client.get_pull(owner, repo, pr_number)
                     except Exception:
                         continue  # an unreadable PR is not a finding
-                    if not isinstance(pull, dict) or pull.get("merged") is not True:
+                    merged_at = self._merged_at(pull)
+                    if merged_at is None or now - merged_at < timedelta(minutes=VERIFYING_AFTER_MERGE_MINUTES):
                         continue
                     await self._open(
                         db, kind=VERIFYING_AFTER_MERGE, subject=f"work_item:{item_id}", scope_id=scope_id,
                         work_item_id=item_id,
-                        detail=(f"Work item {item_id} (PR #{pr_number}) is still verifying more than "
-                                f"{VERIFYING_AFTER_MERGE_MINUTES} minutes after GitHub reports the PR merged."))
+                        detail=(f"Work item {item_id} (PR #{pr_number}) is still verifying "
+                                f"{VERIFYING_AFTER_MERGE_MINUTES} or more minutes after GitHub reports the PR merged."))
                 # A finding closes when its item is no longer verifying.
                 for finding in await self._open_findings(db, VERIFYING_AFTER_MERGE, scope_id=scope_id):
                     status = await db.scalar(select(GithubWorkItem.dispatch_status).where(
@@ -169,6 +179,21 @@ class OperationsHealthService:
         except Exception:
             self._failed("verifying_after_merge sweep")
 
+    @staticmethod
+    def _merged_at(pull) -> datetime | None:
+        """GitHub's own merge time as naive UTC, or None when the PR is not merged or the time is unreadable."""
+        if not isinstance(pull, dict) or pull.get("merged") is not True:
+            return None
+        raw = pull.get("merged_at")
+        if not isinstance(raw, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=None) if parsed.tzinfo is None else parsed.astimezone(
+            timezone.utc).replace(tzinfo=None)
+
     # ---- detector 2: skipped by verification, poll after poll ------------------------------------------
 
     async def record_verification_skips(self, scope_id: int, skipped: set[int]) -> None:
@@ -176,15 +201,17 @@ class OperationsHealthService:
         try:
             async with self._session() as db:
                 for item_id in sorted(skipped):
-                    self._skips[item_id] = self._skips.get(item_id, 0) + 1
-                    if self._skips[item_id] >= SKIPPED_POLLS:
+                    key = (scope_id, item_id)
+                    self._skips[key] = self._skips.get(key, 0) + 1
+                    if self._skips[key] >= SKIPPED_POLLS:
                         await self._open(
                             db, kind=ITEM_SKIPPED, subject=f"work_item:{item_id}", scope_id=scope_id,
                             work_item_id=item_id,
                             detail=(f"Verification skipped work item {item_id} on "
-                                    f"{self._skips[item_id]} polls in a row."))
-                for item_id in [item_id for item_id in self._skips if item_id not in skipped]:
-                    del self._skips[item_id]
+                                    f"{self._skips[key]} polls in a row."))
+                # Only this scope's counters: another scope's poll is a different run.
+                for key in [key for key in self._skips if key[0] == scope_id and key[1] not in skipped]:
+                    del self._skips[key]
                 for finding in await self._open_findings(db, ITEM_SKIPPED, scope_id=scope_id):
                     if finding.work_item_id not in skipped:
                         await self._resolve(db, [finding])
@@ -206,13 +233,13 @@ class OperationsHealthService:
                     self._missing[key] = self._missing.get(key, 0) + 1
                     if self._missing[key] >= MISSING_ADMISSION_POLLS:
                         await self._open(
-                            db, kind=ADMISSION_MISSING, subject=f"issue:{number}", scope_id=scope_id,
+                            db, kind=ADMISSION_MISSING, subject=f"scope:{scope_id}:issue:{number}", scope_id=scope_id,
                             detail=(f"Issue #{number} carries the dispatch label but has had no work item for "
                                     f"{self._missing[key]} polls in a row."))
                 for key in [key for key in self._missing if key[0] == scope_id and key[1] not in missing]:
                     del self._missing[key]
                 for finding in await self._open_findings(db, ADMISSION_MISSING, scope_id=scope_id):
-                    if int(finding.subject.removeprefix("issue:")) not in missing:
+                    if int(finding.subject.rsplit(":", 1)[1]) not in missing:
                         await self._resolve(db, [finding])
         except Exception:
             self._failed("admission record")
@@ -247,6 +274,13 @@ class OperationsHealthService:
                 rows = (await db.execute(
                     select(OperationsFinding.kind, func.count(OperationsFinding.id))
                     .where(OperationsFinding.status == "open").group_by(OperationsFinding.kind))).all()
+        except OperationalError as error:
+            if "no such table" in str(error.orig).lower():
+                # The store has not been created yet (a database that init_db has not touched): there are no
+                # findings to report, and nothing to degrade.
+                return {"health": "ok", "reasons": [], "open_findings": 0}
+            logger.warning("operations findings could not be read for /health", exc_info=True)
+            return {"health": "degraded", "reasons": ["findings_unreadable"], "open_findings": None}
         except Exception:
             logger.warning("operations findings could not be read for /health", exc_info=True)
             return {"health": "degraded", "reasons": ["findings_unreadable"], "open_findings": None}

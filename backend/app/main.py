@@ -85,12 +85,11 @@ async def health():
         "version": settings.app_version,
         "status": "running"
     }
-    # 'status' keeps its value: deploy tooling and the E2E harness read it, and this liveness body keeps its exact
-    # shape while nothing is wrong, and when the findings cannot be read (it must not depend on the database;
-    # /api/v1/health does report that case). While #941 findings are open it adds 'health': 'degraded', the
-    # reason codes and the count.
+    # 'status' keeps its value: deploy tooling and the E2E harness read it, and this body keeps its exact shape
+    # while nothing is wrong. While #941 findings are open, or cannot be read, it adds 'health': 'degraded', the
+    # reason codes ('findings_unreadable' when the store fails) and the count.
     findings = await operations_health_service.health()
-    if findings["reasons"] and findings["reasons"] != ["findings_unreadable"]:
+    if findings["reasons"]:
         body.update(findings)
     if settings.test_instance:
         # The E2E harness checks that this server is its own run's instance.
