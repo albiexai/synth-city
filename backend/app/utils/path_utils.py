@@ -7,8 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from app.config import settings
-
 
 def get_managed_settings_file() -> Path:
     """
@@ -123,6 +121,10 @@ def scope_users() -> list[ScopeUser]:
     A request never names an arbitrary user. Anything outside this list is refused, so a caller cannot
     point the controller at another person's home.
     """
+    # Read when a scope is resolved, not when the module loads: path_utils is imported very early (by the
+    # provider modules) and the settings stack is not needed there.
+    from app.config import settings
+
     controller = controller_user_name()
     agent = (settings.harness_agent_user or "").strip() or None
     users = [ScopeUser(controller, Path.home(), True, agent in (None, controller))]

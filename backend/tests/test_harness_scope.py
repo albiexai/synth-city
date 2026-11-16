@@ -344,3 +344,28 @@ async def test_the_controllers_own_cache_key_is_unchanged(homes):
         assert MCPService._cache_scope("project") == "project"
     finally:
         path_utils._scope_home.reset(token)
+
+
+# --- #970 backend gate: importing path_utils must stay cheap ----------------------------------------------
+
+def test_importing_path_utils_does_not_import_the_settings_stack():
+    """provider_operations_service imports path_utils through the Claude Code provider, and a readiness test starts
+    that import in a fresh Python inside a 0.7 second window. The settings are read when a scope is resolved, not
+    when the module loads, so the import costs what it cost before #969 (a hosted backend check failed on 645b0c56
+    and 9c25a0d8; the cause there is unconfirmed, and this guard only keeps the measured import cost from returning).
+    """
+    import subprocess
+    import sys
+
+    import app
+
+    backend = Path(app.__file__).resolve().parent.parent
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import sys, app.utils.path_utils; "
+         "loaded = [m for m in ('app.config', 'pydantic_settings') if m in sys.modules]; "
+         "print(','.join(loaded)); sys.exit(1 if loaded else 0)"],
+        cwd=backend, capture_output=True, text=True, timeout=60,
+    )
+
+    assert result.returncode == 0, f"importing path_utils loaded: {result.stdout.strip()} {result.stderr[-300:]}"
