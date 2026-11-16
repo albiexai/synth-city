@@ -1620,7 +1620,7 @@ class GithubVerificationService:
         client: GithubClient,
         revision: GithubAttemptScopeRevision,
     ) -> None:
-        """A positively settled revision waits for its PR: record a merge, escalate a closed PR, else do nothing.
+        """A positively settled revision waits for its PR: record a merge, escalate a closed PR, promote an open one.
 
         Everything here is contained to this item. A GitHub read that fails changes nothing and logs nothing: the
         item simply waits for the next poll. A first response that fails the identity check changes nothing and
@@ -1639,6 +1639,8 @@ class GithubVerificationService:
                     source="github_verification_service._observe_settled_revision")
             elif verdict == "closed_unmerged":
                 await self._escalate_settled_closed(db, scope, item, client, revision)
+            elif verdict == "open":
+                await self._promote_settled_revision(db, scope, item, client, revision, pull)
         except TerminalRevisionContextChanged:
             raise  # the caller rolls back and records that the attempt changed
         except (httpx.HTTPError, GithubClientResponseError):
@@ -1649,6 +1651,162 @@ class GithubVerificationService:
             await db.rollback()
             await db.refresh(scope)
             self._log_inconsistent_once(None, f"a PR response failed the identity check ({exc})", snapshot=snapshot)
+
+    async def _promote_settled_revision(
+        self,
+        db: AsyncSession,
+        scope: TeamGithubScope,
+        item: GithubWorkItem,
+        client: GithubClient,
+        revision: GithubAttemptScopeRevision,
+        pull: dict,
+    ) -> None:
+        """An open PR on a positively settled revision: promote it like any verified item, or say why not (#957).
+
+        Settlement completes the revision and leaves the item 'verifying'. Nothing else would read its checks or
+        move it to ready_for_review, so an accepted, green, ready and unheld PR never reached the auto-merge gates.
+        The promotion needs the PR head to be the settled head, an active acceptance of that exact head from a
+        current verifier, and every required check green. Then the existing promotion runs, with no revision
+        because this one is already completed, and every merge gate and policy applies unchanged: the auto policy
+        goes on to the merge gates, the human policy stops at ready_for_review and never merges.
+        When one condition fails the reason is recorded as the item's note, written only when it changes. No retry
+        is charged, no status changes and no revision is touched.
+        """
+        await self._verify_settled_pull(scope, item, client, pull)  # a ValueError is logged once by the caller
+        head = self._head_sha(pull)
+        if not isinstance(head, str) or not head:
+            return
+        # What the decision rests on is captured before any awaited read and compared again under the terminal
+        # writer, so a context withdrawn while GitHub was awaited is never promoted.
+        item_before = {name: getattr(item, name) for name in _SETTLEMENT_ITEM_IDENTITY}
+        scope_before = {name: getattr(scope, name) for name in _SETTLEMENT_SCOPE_IDENTITY}
+        revision_before = {column.name: getattr(revision, column.name) for column in revision.__table__.columns}
+        reason = None
+        if head != revision.submitted_head_sha:
+            reason = (f"Settled revision not promoted: the PR head {head[:7]} is not the settled head "
+                      f"{str(revision.submitted_head_sha)[:7]}.")
+        else:
+            from app.services import github_head_acceptance_service as acceptance
+
+            acceptance_note = await acceptance.gate_note(db, scope, item, head)
+            if acceptance_note is not None:
+                reason = f"Settled revision not promoted: {acceptance_note}"
+            elif not await self._head_is_green(scope, client, head, item=item):
+                reason = f"Settled revision not promoted: the required checks are not all green at {head[:7]}."
+        context = (item_before, scope_before, revision_before)
+        if reason is not None:
+            await self._record_settled_note(db, scope, item, revision, context, reason)
+            return
+        policy_guard = policy_context(item)
+        if not await claim_policy_context(db, item, policy_guard):
+            return
+        fresh = await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
+        if not await self._validate_polled_pull_identity(
+            db, scope, item, client, fresh, retry_status=item.dispatch_status,
+        ):
+            return
+        if self._head_sha(fresh) != head:
+            await self._record_settled_note(
+                db, scope, item, revision, context, "Head changed before readiness; verifying the current head.")
+            return
+        readiness_note = self._draft_readiness_note(item, fresh)
+        if readiness_note is not None:
+            await self._record_settled_note(db, scope, item, revision, context, readiness_note, last_verified=head)
+            return
+        # No network call from here to the commit: the writer is held only for the compare and the write.
+        await self._fence_settled_context(db, scope, item, revision, context)
+        if revision.status != "completed" or revision.completed_at is None or revision.submitted_head_sha != head:
+            raise TerminalRevisionContextChanged("terminal_revision_context_changed")
+        item.last_verified_sha = head
+        item.dispatch_status = "ready_for_review"
+        item.status_note = f"PR #{item.pr_number} is ready for review."
+        item.updated_at = datetime.utcnow()
+        if scope.merge_policy == "human":
+            await self._notify_code_pr_ready_for_review(db, item)
+        await db.commit()
+        await self._process_review_item(db, scope, item, client, pull=fresh)
+
+    async def _fence_settled_context(
+        self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem,
+        revision: GithubAttemptScopeRevision, context: tuple,
+    ) -> None:
+        """Take the terminal writer and compare the item, scope and revision with what the decision rested on.
+
+        No network call may sit between this and the write that follows. A lost fence raises, so nothing is written.
+        """
+        item_before, scope_before, revision_before = context
+        await lock_terminal_transition(db, item)
+        await db.refresh(item)
+        await db.refresh(scope)
+        await db.refresh(revision)
+        if ({name: getattr(item, name) for name in _SETTLEMENT_ITEM_IDENTITY} != item_before
+                or {name: getattr(scope, name) for name in _SETTLEMENT_SCOPE_IDENTITY} != scope_before
+                or {column.name: getattr(revision, column.name) for column in revision.__table__.columns}
+                != revision_before):
+            raise TerminalRevisionContextChanged("terminal_revision_context_changed")
+
+    async def _record_settled_note(
+        self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem,
+        revision: GithubAttemptScopeRevision, context: tuple, note: str, *, last_verified: str | None = None,
+    ) -> None:
+        """Record why a settled revision was not promoted, only under the fence and only when it changes.
+
+        A note written after an awaited read would otherwise overwrite the note of a new attempt that replaced
+        the item meanwhile.
+        """
+        if item.status_note == note and (last_verified is None or item.last_verified_sha == last_verified):
+            return
+        await self._fence_settled_context(db, scope, item, revision, context)
+        if last_verified is not None:
+            item.last_verified_sha = last_verified
+        item.status_note = note
+        item.updated_at = datetime.utcnow()
+        await db.commit()
+
+    @staticmethod
+    async def _settled_snapshot(db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem) -> dict | None:
+        """The settled revision row, every column, and the scope's enabled flag as they stand now, or ``None``.
+
+        Taken before any awaited read of an operation, so the operation keeps the identity it began with. Only an
+        item that has a scoped revision row has one; read as plain columns, never through the identity map.
+        """
+        if not item.active_scope_revision:
+            return None
+        row = (await db.execute(
+            select(GithubAttemptScopeRevision.__table__).where(
+                GithubAttemptScopeRevision.work_item_id == item.id,
+                GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce,
+                GithubAttemptScopeRevision.revision == item.active_scope_revision)
+        )).mappings().first()
+        if row is None:
+            return None
+        enabled = await db.scalar(select(TeamGithubScope.enabled).where(TeamGithubScope.id == scope.id))
+        return {"row": dict(row), "enabled": enabled}
+
+    @staticmethod
+    async def _settled_context_note(db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem,
+                                    head: str, expected: dict | None) -> str | None:
+        """Why a merge must not go ahead because the settlement or the scope it rested on changed, or ``None``.
+
+        ``expected`` is the snapshot the operation began with. The row is read again, fresh and column by column,
+        so a change another connection committed while GitHub was awaited is seen: any column that differs from the
+        snapshot blocks, so no changed field can slip through. The row must also still be completed with its
+        completion time, an implementation row must carry the very head being merged (a row that began as a settled
+        diagnostic restored the baseline and is not compared with the head), and the scope must still be enabled.
+        """
+        if expected is None:
+            return None
+        began = expected["row"]
+        row = (await db.execute(
+            select(GithubAttemptScopeRevision.__table__).where(GithubAttemptScopeRevision.id == began["id"])
+        )).mappings().first()
+        enabled = await db.scalar(select(TeamGithubScope.enabled).where(TeamGithubScope.id == scope.id))
+        if (row is None or dict(row) != began or enabled is not True or enabled != expected["enabled"]
+                or row["status"] != "completed" or row["completed_at"] is None
+                or (began["phase"] == "implementation" and row["submitted_head_sha"] != head)):
+            return ("Auto-merge blocked: the settled revision or the scope changed since promotion; "
+                    "verifying the current state.")
+        return None
 
     @staticmethod
     def _require_pull_shape(pull: object) -> None:
@@ -2472,6 +2630,8 @@ class GithubVerificationService:
         client: GithubClient,
         pull: dict | None = None,
     ) -> None:
+        # Before any awaited read: the merge boundary compares the settled revision with this, not with its state then.
+        settled_began = await self._settled_snapshot(db, scope, item)
         ci_context = await github_ci_watch_service.capture(db, scope, item)
         pull = pull or await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
         if not await self._validate_polled_pull_identity(
@@ -2697,6 +2857,10 @@ class GithubVerificationService:
             await self._fallback_to_human_merge(
                 db, item, "Auto-merge blocked: distinct current-round leader approval is "
                 f"required ({approval_reason}).")
+            return
+        withdrawn = await self._settled_context_note(db, scope, item, current_head, settled_began)
+        if withdrawn is not None:
+            await self._record_readiness_hold(db, item, withdrawn)
             return
         try:
             await client.merge_pull(
