@@ -70,6 +70,10 @@ def _exe_identity(pid: int) -> tuple[str, int, int]:
     return os.path.basename(target), info.st_dev, info.st_ino
 
 
+def _cmdline(pid: int) -> list[str]:
+    return [os.fsdecode(part) for part in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if part]
+
+
 def _fd_targets(pid: int) -> list[str]:
     root = Path(f"/proc/{pid}/fd")
     targets = []
@@ -110,36 +114,137 @@ def _trusted_root(uid: int) -> Path:
     return root
 
 
-def _presence_ids(pid: int, root: Path) -> list[str]:
-    presence = str(root / "presence") + os.sep
+class _Tree:
+    """Directory descriptors from the passwd home down, each opened with ``O_NOFOLLOW`` relative to
+    its parent and checked (directory, owned by the uid, not world-writable). Files are opened
+    relative to a held descriptor, so a component replaced during the read is never followed;
+    ``unchanged`` then detects the replacement."""
+
+    def __init__(self, root: Path, uid: int):
+        self.uid, self.root, self.fds, self.ids = uid, root, {}, {}
+        home = root.parent.parent
+        try:
+            self._hold("", os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+            self.dir(".gemini/antigravity-cli")
+        except BaseException:
+            self.close()
+            raise
+
+    def _hold(self, rel: str, fd: int) -> None:
+        self.fds[rel] = fd
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != self.uid or info.st_mode & stat.S_IWOTH:
+            raise _Unknown("session_mismatch")
+        self.ids[rel] = (info.st_dev, info.st_ino)
+
+    def dir(self, rel: str) -> int:
+        parent = ""
+        for part in rel.split("/"):
+            if part in ("", ".", ".."):
+                raise _Unknown("session_mismatch")
+            current = f"{parent}/{part}" if parent else part
+            if current not in self.fds:
+                try:
+                    fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fds[parent])
+                except FileNotFoundError:
+                    raise _Unknown("native_log_unavailable") from None
+                except PermissionError:
+                    raise
+                except OSError:
+                    # ELOOP or ENOTDIR: a symlink or a non-directory in place of a directory.
+                    raise _Unknown("session_mismatch") from None
+                self._hold(current, fd)
+            parent = current
+        return self.fds[parent]
+
+    def data(self, rel: str = "") -> int:
+        """A directory below ``antigravity-cli``."""
+        return self.dir(".gemini/antigravity-cli" + (f"/{rel}" if rel else ""))
+
+    def unchanged(self) -> bool:
+        home = self.root.parent.parent
+        for rel, ident in self.ids.items():
+            try:
+                info = os.lstat(home / rel if rel else home)
+            except OSError:
+                return False
+            if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != ident:
+                return False
+        return True
+
+    def close(self) -> None:
+        for fd in self.fds.values():
+            os.close(fd)
+        self.fds = {}
+
+
+def _presence_ids(pid: int, tree: "_Tree") -> list[str]:
+    presence = str(tree.root / "presence") + os.sep
+    presence_fd = tree.data("presence")
     found = []
     for target in _fd_targets(pid):
         if target.startswith(presence) and target.endswith(".lock"):
-            name = target[len(presence):-len(".lock")]
-            if _UUID.fullmatch(name):
-                found.append(name)
+            name = target[len(presence):]
+            if not _UUID.fullmatch(name[:-len(".lock")]):
+                continue
+            try:
+                info = os.stat(name, dir_fd=presence_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_uid == tree.uid:
+                found.append(name[:-len(".lock")])
     return sorted(set(found))
+
+
+_VALUED = ("--model", "--effort")
+
+
+def permission_context(argv: list[str]) -> bool | None:
+    """True for ``--dangerously-skip-permissions``, False without it, None for any argv that is not
+    exactly the shape Albiex Synth City launches (``providers/antigravity_cli.py``)."""
+    if not argv or not is_agy_executable(argv[0]):
+        return None
+    rest, skip = argv[1:], False
+    for option in _VALUED:
+        if rest[:1] == [option]:
+            if len(rest) < 2 or not rest[1] or rest[1].startswith("-"):
+                return None
+            rest = rest[2:]
+    if rest[:1] == ["--dangerously-skip-permissions"]:
+        skip, rest = True, rest[1:]
+    if rest[:1] == ["--conversation"] and len(rest) >= 2 and _UUID.fullmatch(rest[1]):
+        rest = rest[2:]
+    elif rest[:1] and rest[0].startswith("--conversation=") and _UUID.fullmatch(rest[0].split("=", 1)[1]):
+        rest = rest[1:]
+    if rest[:1] == ["-i"] and len(rest) == 2:
+        rest = []
+    return skip if not rest else None
 
 
 def _identity(pid: int) -> tuple:
     uid = _process_uid(pid)
     exe = _exe_identity(pid)
-    return uid, exe
+    try:
+        permission = permission_context(_cmdline(pid))
+    except OSError:
+        permission = None
+    return uid, exe, permission
 
 
-def _bound_root(pid: int) -> tuple[int, Path, tuple]:
+def _bound_root(pid: int) -> tuple[int, "_Tree", tuple]:
     identity = _identity(pid)
     if not is_agy_executable(identity[1][0]):
         raise _Unknown("session_mismatch")
-    return identity[0], _trusted_root(identity[0]), identity
+    return identity[0], _Tree(_trusted_root(identity[0]), identity[0]), identity
 
 
-# --- Bounded, coherent snapshots of live SQLite files ---------------------------------------
+# --- Bounded snapshots of live SQLite files --------------------------------------------------
 
-def _read_file(path: Path, uid: int, deadline: float) -> tuple[bytes, tuple] | None:
-    """The bytes of one regular file owned by ``uid``; None when it does not exist."""
+def _read_file(source: tuple[int, str], uid: int, deadline: float) -> tuple[bytes, tuple] | None:
+    """The bytes of one regular file owned by ``uid`` in a held directory; None when it does not exist."""
+    dir_fd, path = source
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     except FileNotFoundError:
         return None
     except OSError:
@@ -167,7 +272,7 @@ def _read_file(path: Path, uid: int, deadline: float) -> tuple[bytes, tuple] | N
     if (before.st_ino, before.st_size, before.st_mtime_ns) != key or len(data) != after.st_size:
         raise _Unknown("binding_changed")
     try:
-        current = os.lstat(path)
+        current = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
     except FileNotFoundError:
         raise _Unknown("binding_changed") from None
     if (current.st_ino, current.st_size, current.st_mtime_ns) != key:
@@ -175,7 +280,7 @@ def _read_file(path: Path, uid: int, deadline: float) -> tuple[bytes, tuple] | N
     return data, key
 
 
-def _round(paths: dict[str, Path], uid: int, deadline: float) -> dict[str, tuple | None]:
+def _round(paths: dict[str, tuple[int, str]], uid: int, deadline: float) -> dict[str, tuple | None]:
     files = {}
     for name, path in paths.items():
         read = _read_file(path, uid, deadline)
@@ -183,7 +288,7 @@ def _round(paths: dict[str, Path], uid: int, deadline: float) -> dict[str, tuple
     return files
 
 
-def _snapshot(paths: dict[str, Path], uid: int, deadline: float) -> dict[str, bytes | None]:
+def _snapshot(paths: dict[str, tuple[int, str]], uid: int, deadline: float) -> dict[str, bytes | None]:
     """Two identical copy rounds of every file, once retried; otherwise ``binding_changed``."""
     for attempt in range(2):
         first = _round(paths, uid, deadline)
@@ -256,10 +361,11 @@ def _record(line: bytes) -> dict:
     return record
 
 
-def read_transcript_records(path: Path, uid: int) -> tuple[list[dict] | None, str | None]:
+def read_transcript_records(path: Path | str, uid: int, *, dir_fd: int | None = None,
+                            ) -> tuple[list[dict] | None, str | None]:
     """The latest records, back to the latest USER_INPUT where the bounded scan reaches it."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     except FileNotFoundError:
         return None, "native_log_unavailable"
     except OSError:
@@ -299,58 +405,80 @@ def _second(value: object) -> datetime | None:
         return None
 
 
+def _step_time(record: dict, earliest: datetime, latest: datetime) -> datetime | None:
+    """The record's whole-second time when its step index is an integer and the time lies in range."""
+    index = record.get("step_index")
+    if not isinstance(index, int) or isinstance(index, bool):
+        return None
+    at = _second(record.get("created_at"))
+    return at if at is not None and earliest <= at <= latest else None
+
+
 def antigravity_state(summary: dict | None, step_count: int, steps: list[tuple[int, int, int]],
-                      records: list[dict], started_at: datetime, now: datetime):
-    """(state, reason, observed_at) from one coherent snapshot. Anything unproven is unknown."""
-    inputs = [r for r in records if r["type"] == "USER_INPUT" and r["source"] == "USER_EXPLICIT"]
+                      records: list[dict], started_at: datetime, now: datetime, *,
+                      skip_permissions: bool = False):
+    """(state, reason, observed_at) from one snapshot. Anything unproven is unknown.
+
+    ``skip_permissions`` is True only when the bound process was launched with exactly
+    ``--dangerously-skip-permissions``, the only context in which a running ``run_command`` was observed.
+    """
+    inputs = [r for r in records if r.get("type") == "USER_INPUT" and r.get("source") == "USER_EXPLICIT"]
     if not inputs:
         return "unknown", "no_native_event", None
     current = inputs[-1]
-    created = _second(current["created_at"])
     start_second = started_at.replace(microsecond=0)
+    latest = now + timedelta(seconds=1)
+    created = _step_time(current, start_second, latest)
     # One-second resolution: the input must be from a later second than the process start.
-    if created is None or not isinstance(current["step_index"], int) or created <= start_second:
+    if created is None or created <= start_second:
         return "unknown", "no_native_event", None
     live = {idx: (step_type, status) for idx, step_type, status in steps}
     if live.get(current["step_index"]) != (_INPUT, _DONE):
         return "unknown", "completion_unconfirmed", None
     if summary is None:
         return "unknown", "session_mismatch", None
+    after = [r for r in records if isinstance(r.get("step_index"), int) and not isinstance(r.get("step_index"), bool)
+             and r["step_index"] > current["step_index"]]
+    # Every record of the current turn must be well formed and from U's second up to now.
+    if any(_step_time(r, created, latest) is None for r in after):
+        return "unknown", "observation_invalid", None
+    planners = [r for r in after if r.get("type") == "PLANNER_RESPONSE" and r.get("source") == "MODEL"]
+    # A reply carries no tool call or exactly one; any other shape was not observed.
+    if any(tools is not None and len(tools) != 1 for tools in (_tools(r) for r in planners)):
+        return "unknown", "completion_unconfirmed", None
     last_idx = max(live)
     last = live[last_idx]
-    after = [r for r in records if isinstance(r["step_index"], int) and r["step_index"] > current["step_index"]]
-    planners = [r for r in after if r["type"] == "PLANNER_RESPONSE" and r["source"] == "MODEL"]
     status, not_fully_idle = summary.get("status"), summary.get("not_fully_idle")
 
     if status == _IDLE and not_fully_idle == 0:
+        reply = [r for r in planners if r["step_index"] == last_idx]
         if (last == (_PLANNER, _DONE) and last_idx > current["step_index"] and summary.get("step_count") == step_count
-                and any(r["step_index"] == last_idx for r in planners)):
-            return "idle", "native_turn_completed", created
+                and len(reply) == 1 and _tools(reply[0]) is None):
+            return "idle", "native_turn_completed", _step_time(reply[0], created, latest)
         return "unknown", "completion_unconfirmed", None
     if status != _RUNNING or not_fully_idle != 1:
         return "unknown", "completion_unconfirmed", None
 
     planner = planners[-1] if planners else None
     tools = _tools(planner) if planner else None
-    single = tools[0] if isinstance(tools, list) and len(tools) == 1 else None
-    follows = planner is not None and last_idx == planner["step_index"] + 1 and live.get(planner["step_index"]) == (_PLANNER, _DONE)
-    planner_at = _second(planner["created_at"]) if planner else None
-    fresh_planner = planner_at is not None and planner_at > start_second
+    single = tools[0] if tools else None
+    follows = (planner is not None and last_idx == planner["step_index"] + 1
+               and live.get(planner["step_index"]) == (_PLANNER, _DONE))
+    planner_at = _step_time(planner, created, latest) if planner else None
 
     if last[0] == _TOOL and last[1] == _USER_WAIT:
-        if follows and fresh_planner and single == "ask_question":
+        if follows and planner_at is not None and single == "ask_question":
             return "waiting_input", "native_question_open", planner_at
         return "unknown", "native_wait_unconfirmed", None
     if last[0] == _TOOL and last[1] == _TOOL_RUNNING:
-        if follows and fresh_planner and single == "run_command":
+        if follows and planner_at is not None and single == "run_command" and skip_permissions is True:
             return _working(planner_at, now)
         return "unknown", "completion_unconfirmed", None
     if last_idx == current["step_index"]:
         return _working(created, now)
     if last == (_SYSTEM, _DONE) and last_idx > current["step_index"]:
-        latest = max([created] + [t for t in (_second(r["created_at"]) for r in after) if t is not None])
-        return _working(latest, now)
-    if last == (_TOOL, _DONE) and follows and fresh_planner and single is not None:
+        return _working(max([created] + [_step_time(r, created, latest) for r in after]), now)
+    if last == (_TOOL, _DONE) and follows and planner_at is not None and single is not None:
         return _working(planner_at, now)
     return "unknown", "completion_unconfirmed", None
 
@@ -373,73 +501,78 @@ def _working(at: datetime, now: datetime):
 
 # --- Observation and discovery --------------------------------------------------------------
 
-def _databases(root: Path, conversation_id: str) -> dict[str, Path]:
-    return {"summaries": root / "conversation_summaries.db",
-            "summaries_wal": root / "conversation_summaries.db-wal",
-            "conversation": root / "conversations" / f"{conversation_id}.db",
-            "conversation_wal": root / "conversations" / f"{conversation_id}.db-wal"}
+def _databases(tree: _Tree, conversation_id: str) -> dict[str, tuple[int, str]]:
+    root, conversations = tree.data(), tree.data("conversations")
+    return {"summaries": (root, "conversation_summaries.db"),
+            "summaries_wal": (root, "conversation_summaries.db-wal"),
+            "conversation": (conversations, f"{conversation_id}.db"),
+            "conversation_wal": (conversations, f"{conversation_id}.db-wal")}
 
 
-def _owned_tree(root: Path, relative: str, uid: int) -> Path:
-    path = root
-    for part in Path(relative).parts:
-        path = path / part
-        _owned_dir(path, uid)
-    return path
+_SUMMARY_QUERY = ("select status, not_fully_idle, step_count, workspace_uris from conversation_summaries"
+                  " where conversation_id=? limit 2")
+
+
+def _final(pid: int, tree: _Tree, identity: tuple, ids: list[str], deadline: float) -> bool:
+    """The binding still holds and the observation finished inside its one deadline."""
+    if _identity(pid) != identity or _presence_ids(pid, tree) != ids or not tree.unchanged():
+        raise _Unknown("binding_changed")
+    return time.monotonic() <= deadline
 
 
 def discover_antigravity_conversation(pid: int, cwd: str) -> str | None:
     """The conversation id of the one presence lock this process holds, bound to ``cwd``."""
+    deadline = time.monotonic() + _DEADLINE_SECONDS
+    tree = None
     try:
-        uid, root, identity = _bound_root(pid)
-        ids = _presence_ids(pid, root)
+        uid, tree, identity = _bound_root(pid)
+        ids = _presence_ids(pid, tree)
         if len(ids) != 1:
             return None
-        deadline = time.monotonic() + _DEADLINE_SECONDS
-        files = _snapshot({"summaries": root / "conversation_summaries.db",
-                           "summaries_wal": root / "conversation_summaries.db-wal"}, uid, deadline)
+        root = tree.data()
+        files = _snapshot({"summaries": (root, "conversation_summaries.db"),
+                           "summaries_wal": (root, "conversation_summaries.db-wal")}, uid, deadline)
         if files["summaries"] is None:
             return None
-        rows = _query(files["summaries"], files["summaries_wal"], deadline, [(
-            "select status, not_fully_idle, step_count, workspace_uris from conversation_summaries"
-            " where conversation_id=? limit 2", (ids[0],))])[0]
-        if _summary(rows, cwd) is None or _identity(pid) != identity or _presence_ids(pid, root) != ids:
+        rows = _query(files["summaries"], files["summaries_wal"], deadline, [(_SUMMARY_QUERY, (ids[0],))])[0]
+        if _summary(rows, cwd) is None or not _final(pid, tree, identity, ids, deadline):
             return None
         return ids[0]
     except (_Unknown, OSError, KeyError):
         return None
+    finally:
+        if tree is not None:
+            tree.close()
 
 
 def observe_antigravity(pid: int, conversation_id: str, cwd: str, now: datetime, started_at: datetime):
+    deadline = time.monotonic() + _DEADLINE_SECONDS
+    tree = None
     try:
         if not _UUID.fullmatch(conversation_id):
             return "unknown", "session_mismatch", None
-        uid, root, identity = _bound_root(pid)
-        if _presence_ids(pid, root) != [conversation_id]:
+        uid, tree, identity = _bound_root(pid)
+        if _presence_ids(pid, tree) != [conversation_id]:
             return "unknown", "session_mismatch", None
-        deadline = time.monotonic() + _DEADLINE_SECONDS
-        files = _snapshot(_databases(root, conversation_id), uid, deadline)
+        files = _snapshot(_databases(tree, conversation_id), uid, deadline)
         if files["summaries"] is None or files["conversation"] is None:
             return "unknown", "native_log_unavailable", None
-        summary_rows = _query(files["summaries"], files["summaries_wal"], deadline, [(
-            "select status, not_fully_idle, step_count, workspace_uris from conversation_summaries"
-            " where conversation_id=? limit 2", (conversation_id,))])[0]
+        summary_rows = _query(files["summaries"], files["summaries_wal"], deadline,
+                              [(_SUMMARY_QUERY, (conversation_id,))])[0]
         count_rows, step_rows = _query(files["conversation"], files["conversation_wal"], deadline, [
             ("select count(*) from steps", ()),
             ("select idx, step_type, status from steps order by idx desc limit ?", (_STEP_ROWS,))])
         summary = _summary(summary_rows, cwd)
-        try:
-            logs = _owned_tree(root, f"brain/{conversation_id}/.system_generated/logs", uid)
-        except FileNotFoundError:
-            return "unknown", "native_log_unavailable", None
-        records, failure = read_transcript_records(logs / "transcript.jsonl", uid)
+        logs = tree.data(f"brain/{conversation_id}/.system_generated/logs")
+        records, failure = read_transcript_records("transcript.jsonl", uid, dir_fd=logs)
         if failure:
             return "unknown", failure, None
-        if time.monotonic() > deadline:
+        state = antigravity_state(summary, count_rows[0][0], step_rows, records, started_at, now,
+                                  skip_permissions=identity[2] is True)
+        # Refuse any result that arrives after the one deadline, after every final check.
+        if not _final(pid, tree, identity, [conversation_id], deadline):
             return "unknown", "observation_incomplete", None
-        if _identity(pid) != identity or _presence_ids(pid, root) != [conversation_id]:
-            return "unknown", "binding_changed", None
-        return antigravity_state(summary, count_rows[0][0], step_rows, records, started_at, now)
+        return state
     except _Unknown as failure:
         return "unknown", failure.reason, None
     except PermissionError:
@@ -447,3 +580,6 @@ def observe_antigravity(pid: int, conversation_id: str, cwd: str, now: datetime,
         return "unknown", "native_log_unreadable", None
     except OSError:
         return "unknown", "observation_unavailable", None
+    finally:
+        if tree is not None:
+            tree.close()

@@ -54,9 +54,9 @@ RUNNING = {"status": "CASCADE_RUN_STATUS_RUNNING", "not_fully_idle": 1}
 IDLE = {"status": "CASCADE_RUN_STATUS_IDLE", "not_fully_idle": 0}
 
 
-def state(summary, steps, records, *, count=None, now=NOW, started=START):
+def state(summary, steps, records, *, count=None, now=NOW, started=START, skip=False):
     summary = None if summary is None else {**summary, "step_count": len(steps) if count is None else count}
-    return ag.antigravity_state(summary, len(steps), steps, records, started, now)[:2]
+    return ag.antigravity_state(summary, len(steps), steps, records, started, now, skip_permissions=skip)[:2]
 
 
 # --- States from observed shapes ------------------------------------------------------------
@@ -69,7 +69,10 @@ def test_question_waiting_is_observed_status_nine_after_a_single_ask_question():
 
 def test_tool_running_is_only_the_observed_run_command_status_two():
     records = [user(0), planner(1, tools=["run_command"])]
-    assert state(RUNNING, [(0, 14, 3), (1, 15, 3), (2, 132, 2)], records, count=0) == ("working", "native_progress")
+    steps = [(0, 14, 3), (1, 15, 3), (2, 132, 2)]
+    assert state(RUNNING, steps, records, count=0, skip=True) == ("working", "native_progress")
+    # The same numeric shape without the observed skip-permissions context may be a permission review.
+    assert state(RUNNING, steps, records, count=0, skip=False)[0] == "unknown"
 
 
 @pytest.mark.parametrize("tool", ["write_file", "edit_file", "invoke_subagent", "search_web"])
@@ -86,8 +89,9 @@ def test_status_nine_for_another_tool_is_an_unconfirmed_wait(tool):
 
 def test_two_tool_calls_are_never_attributed():
     records = [user(0), planner(1, tools=["ask_question", "run_command"])]
-    assert state(RUNNING, [(0, 14, 3), (1, 15, 3), (2, 132, 9)], records) == ("unknown", "native_wait_unconfirmed")
-    assert state(RUNNING, [(0, 14, 3), (1, 15, 3), (2, 132, 2)], records)[0] == "unknown"
+    assert state(RUNNING, [(0, 14, 3), (1, 15, 3), (2, 132, 9)], records)[0] == "unknown"
+    assert state(RUNNING, [(0, 14, 3), (1, 15, 3), (2, 132, 2)], records, skip=True)[0] == "unknown"
+    assert state(RUNNING, [(0, 14, 3), (1, 15, 3), (2, 132, 3)], records)[0] == "unknown"
 
 
 def test_waiting_step_must_follow_its_planner_response():
@@ -154,7 +158,8 @@ def test_input_missing_from_the_live_steps_is_unknown():
 def test_working_evidence_older_than_the_freshness_window_is_stale():
     records = [user(0), planner(1, tools=["run_command"])]
     late = NOW + timedelta(seconds=400)
-    assert state(RUNNING, [(0, 14, 3), (1, 15, 3), (2, 132, 2)], records, now=late) == ("unknown", "native_event_stale")
+    assert state(RUNNING, [(0, 14, 3), (1, 15, 3), (2, 132, 2)], records, now=late, skip=True) == (
+        "unknown", "native_event_stale")
 
 
 @pytest.mark.parametrize("summary", [None, {"status": "CASCADE_RUN_STATUS_BUSY", "not_fully_idle": 1},
@@ -187,7 +192,7 @@ def test_fixture_transcripts_parse_to_the_observed_states():
     tool_start = datetime(2026, 11, 16, 11, 43, 26, tzinfo=timezone.utc)
     assert ag.antigravity_state({**RUNNING, "step_count": 0}, 3, [(0, 14, 3), (1, 15, 3), (2, 132, 2)],
                                 load("tool_turn_working.jsonl"), tool_start,
-                                tool_start + timedelta(seconds=10))[0] == "working"
+                                tool_start + timedelta(seconds=10), skip_permissions=True)[0] == "working"
     resume_start = datetime(2026, 11, 16, 11, 44, 12, tzinfo=timezone.utc)
     assert ag.antigravity_state({**IDLE, "step_count": 5}, 5,
                                 [(0, 14, 3), (1, 15, 3), (2, 14, 3), (3, 101, 3), (4, 15, 3)],
@@ -276,6 +281,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setattr(ag, "_process_uid", lambda pid: os.getuid())
     monkeypatch.setattr(ag, "_passwd_home", lambda uid: str(home))
     monkeypatch.setattr(ag, "_exe_identity", lambda pid: ("agy", 1, 2))
+    monkeypatch.setattr(ag, "_cmdline", lambda pid: ["agy", "--conversation", CID])  # never a host /proc read
     monkeypatch.setattr(ag, "_fd_targets", lambda pid: [str(root / "presence" / f"{CID}.lock"),
                                                         str(root / "conversations" / f"{CID}.db")])
     yield {"home": home, "root": root, "ws": str(workspace), "summaries": summaries,
@@ -548,3 +554,189 @@ async def test_discovered_identity_switches_the_slot_to_resume(db):
     assert not await activity._save_codex_identities(db, [first], [{}], current)
     await db.refresh(slots[0])
     assert slots[0].launch_options["session_id"] == CID
+
+
+# --- Review 5920805239 corrections ----------------------------------------------------------
+
+# F1: the current turn's evidence must be well formed, ordered and not from the future.
+def _bad(**changes):
+    return lambda record: {**record, **changes}
+
+
+@pytest.mark.parametrize("label,records,steps,summary,skip", [
+    ("question P missing time", [user(0), _bad(created_at=None)(planner(1, tools=["ask_question"]))],
+     [(0, 14, 3), (1, 15, 3), (2, 132, 9)], RUNNING, False),
+    ("question P malformed time", [user(0), _bad(created_at="yesterday")(planner(1, tools=["ask_question"]))],
+     [(0, 14, 3), (1, 15, 3), (2, 132, 9)], RUNNING, False),
+    ("question P before process", [user(0), planner(1, s=-5, tools=["ask_question"])],
+     [(0, 14, 3), (1, 15, 3), (2, 132, 9)], RUNNING, False),
+    ("question P in the future", [user(0), planner(1, s=600, tools=["ask_question"])],
+     [(0, 14, 3), (1, 15, 3), (2, 132, 9)], RUNNING, False),
+    ("question P before U", [user(0, s=5), planner(1, s=3, tools=["ask_question"])],
+     [(0, 14, 3), (1, 15, 3), (2, 132, 9)], RUNNING, False),
+    ("tool P before U", [user(0, s=5), planner(1, s=3, tools=["run_command"])],
+     [(0, 14, 3), (1, 15, 3), (2, 132, 2)], RUNNING, True),
+    ("idle reply missing time", [user(0), _bad(created_at=None)(planner(1))],
+     [(0, 14, 3), (1, 15, 3)], IDLE, False),
+    ("idle reply in the future", [user(0), planner(1, s=600)], [(0, 14, 3), (1, 15, 3)], IDLE, False),
+    ("idle reply before U", [user(0, s=5), planner(1, s=3)], [(0, 14, 3), (1, 15, 3)], IDLE, False),
+    ("idle reply with a tool call", [user(0), planner(1, tools=["run_command"])], [(0, 14, 3), (1, 15, 3)], IDLE, False),
+    ("idle reply with two tool calls", [user(0), planner(1, tools=["a", "b"])], [(0, 14, 3), (1, 15, 3)], IDLE, False),
+    ("idle reply with an empty tool list", [user(0), planner(1, tools=[])], [(0, 14, 3), (1, 15, 3)], IDLE, False),
+    ("U in the future", [user(0, s=600), planner(1, s=600)], [(0, 14, 3), (1, 15, 3)], IDLE, False),
+    ("U index not an integer", [_bad(step_index=True)(user(0)), planner(1)], [(0, 14, 3), (1, 15, 3)], IDLE, False),
+    ("system step with a bad time", [user(0), _bad(created_at=7)(system(1))], [(0, 14, 3), (1, 101, 3)], RUNNING, False),
+])
+def test_unsupported_turn_records_are_unknown(label, records, steps, summary, skip):
+    assert state(summary, steps, records, skip=skip)[0] == "unknown", label
+
+
+def test_an_input_in_the_process_start_second_is_refused_even_with_a_later_reply():
+    # Only U's guard decides here: P is from a later second.
+    records = [user(0, s=0), planner(1, s=1, tools=["ask_question"])]
+    assert state(RUNNING, [(0, 14, 3), (1, 15, 3), (2, 132, 9)], records)[0] == "unknown"
+    assert state(RUNNING, [(0, 14, 3), (1, 15, 3), (2, 132, 9)], [user(0, s=1), planner(1, s=1, tools=["ask_question"])])[0] == "waiting_input"
+
+
+# F2: the permission context is read from the bound process's exact argv.
+@pytest.mark.parametrize("argv,expected", [
+    (["agy", "--dangerously-skip-permissions", "--conversation", CID], True),
+    (["/opt/agy/bin/agy", "--model", "m-1", "--effort", "high", "--dangerously-skip-permissions", "-i", "go"], True),
+    (["agy", "--conversation", CID], False),
+    (["agy", "-i", "--dangerously-skip-permissions"], False),  # the prompt text is not the flag
+    (["agy"], False),
+    (["agy", "--yolo"], None),
+    (["agy", "--conversation", CID, "--dangerously-skip-permissions"], None),
+    (["agy", "--model"], None),
+    (["python3", "--dangerously-skip-permissions"], None),
+    ([], None),
+])
+def test_permission_context_accepts_only_the_launched_shape(argv, expected):
+    assert ag.permission_context(argv) is expected
+
+
+@pytest.fixture
+def running_tool(home):
+    home["conversation"].execute("update steps set status=2 where idx=2")
+    home["conversation"].commit()
+    home["transcript"].write_text("".join(json.dumps(r) + "\n" for r in [user(0), planner(1, tools=["run_command"])]))
+    os.chmod(home["transcript"], 0o600)
+    return home
+
+
+def test_running_command_is_working_only_with_skip_permissions(running_tool, monkeypatch):
+    monkeypatch.setattr(ag, "_cmdline", lambda pid: ["agy", "--dangerously-skip-permissions", "--conversation", CID])
+    assert observe(running_tool) == ("working", "native_progress")
+    monkeypatch.setattr(ag, "_cmdline", lambda pid: ["agy", "--conversation", CID])
+    assert observe(running_tool)[0] == "unknown"
+
+
+def test_unreadable_argv_is_not_the_skip_context(running_tool, monkeypatch):
+    def unreadable(pid):
+        raise PermissionError(pid)
+    monkeypatch.setattr(ag, "_cmdline", unreadable)
+    assert observe(running_tool)[0] == "unknown"
+
+
+def test_argv_changing_during_the_read_is_binding_changed(running_tool, monkeypatch):
+    calls = {"n": 0}
+
+    def argv(pid):
+        calls["n"] += 1
+        return ["agy", "--dangerously-skip-permissions", "--conversation", CID] if calls["n"] == 1 else ["agy", "--conversation", CID]
+    monkeypatch.setattr(ag, "_cmdline", argv)
+    assert observe(running_tool) == ("unknown", "binding_changed")
+
+
+# F3: a conversation configured on more than one slot is never observed or discovered.
+def test_duplicate_conversation_is_refused_before_observation(monkeypatch):
+    from app.services import agent_activity_service as activity
+    called = []
+    monkeypatch.setattr(activity, "_process", lambda _: ("S", "27"))
+    monkeypatch.setattr(activity, "discover_antigravity_conversation", lambda *a: called.append("discover") or CID)
+    monkeypatch.setattr(activity, "observe_antigravity",
+                        lambda *a, **k: called.append("observe") or ("working", "native_progress", None))
+    binding = activity.ActivityBinding(41000, "27", "/tmp/agy-fixture-ws", tmux_target="%8", binding_id=1)
+    for session_id in (CID, None):
+        metadata = {}
+        result = activity._observe(1, "antigravity-cli", session_id, [binding], True, datetime.now(timezone.utc),
+                                   provenance=metadata)
+        assert (result.state, result.reason) == ("unknown", "duplicate_native_identity")
+        assert result.waiting_input is None
+        assert not {"input_wait_known", "discovered_session_id"} & set(metadata)
+    assert called == []
+
+
+# F4: every directory below the trusted root is checked and held while it is read.
+@pytest.mark.parametrize("target", ["conversations", "presence", f"brain/{CID}", f"brain/{CID}/.system_generated/logs"])
+def test_a_symlinked_data_directory_is_never_followed(home, tmp_path, target):
+    real = tmp_path / "elsewhere"
+    (home["root"] / target).rename(real)
+    (home["root"] / target).symlink_to(real)
+    # Refused when the directory is opened (no-follow), not only by the later replacement check.
+    assert observe(home) == ("unknown", "session_mismatch")
+    if target == "presence":
+        assert ag.discover_antigravity_conversation(4242, home["ws"]) is None
+
+
+@pytest.mark.parametrize("target", ["conversations", "presence", "brain"])
+def test_a_world_writable_data_directory_is_refused(home, target):
+    os.chmod(home["root"] / target, 0o777)
+    assert observe(home)[0] == "unknown"
+
+
+def test_a_directory_replaced_during_the_read_is_binding_changed(home, monkeypatch):
+    def replace(attempt):
+        if attempt == 0:
+            conversations = home["root"] / "conversations"
+            conversations.rename(home["root"] / "conversations-old")
+            conversations.mkdir(mode=0o700)
+            (conversations / f"{CID}.db").write_bytes(b"")
+    monkeypatch.setattr(ag, "_between_rounds", replace)
+    assert observe(home) == ("unknown", "binding_changed")
+
+
+def test_no_descriptor_is_left_open(home):
+    before = len(os.listdir("/proc/self/fd"))
+    observe(home)
+    ag.discover_antigravity_conversation(4242, home["ws"])
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+# F5 (bounded part): one deadline from entry; an overdue known result or identity is refused.
+class _Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+
+def test_a_result_finished_after_the_deadline_is_refused(home, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(ag, "time", clock)
+    identity = ag._identity
+
+    def slow_identity(pid):
+        clock.now += 0.6  # the binding at entry and the final recheck together cross the 1 s deadline
+        return identity(pid)
+    monkeypatch.setattr(ag, "_identity", slow_identity)
+    assert observe(home) == ("unknown", "observation_incomplete")
+
+
+def test_discovery_finished_after_the_deadline_returns_no_identity(home, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(ag, "time", clock)
+    identity = ag._identity
+
+    def slow_identity(pid):
+        clock.now += 0.6
+        return identity(pid)
+    monkeypatch.setattr(ag, "_identity", slow_identity)
+    assert ag.discover_antigravity_conversation(4242, home["ws"]) is None
+
+
+def test_results_inside_the_deadline_are_kept(home, monkeypatch):
+    monkeypatch.setattr(ag, "time", _Clock())
+    assert observe(home) == ("waiting_input", "native_question_open")
+    assert ag.discover_antigravity_conversation(4242, home["ws"]) == CID

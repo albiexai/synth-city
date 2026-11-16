@@ -396,6 +396,9 @@ def _observe(slot_id: int, provider: str, session_id: str | None,
                 provenance.update(pane_pid=pid, pane_start=start, provider=provider)
             return result(state, reason, observed_at)
         if provider in {"muse-cli", "antigravity-cli"}:
+            if provider == "antigravity-cli" and duplicate_identity:
+                # Another slot is configured with this conversation: its events cannot be attributed.
+                return result("unknown", "duplicate_native_identity")
             if not session_id:
                 discover = discover_muse_session if provider == "muse-cli" else discover_antigravity_conversation
                 identity = discover(pid, cwd)

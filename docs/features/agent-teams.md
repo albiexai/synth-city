@@ -329,12 +329,20 @@ world-writable.
   first plain launch, Synth City takes the id from the single lock the process holds,
   checks that `conversation_summaries.db` lists the member's workspace, saves the id to
   the slot and asks for a restart in resume mode. An unknown result never clears a saved
-  id.
+  id. A conversation id configured on more than one slot is never observed or
+  discovered (`duplicate_native_identity`).
+- **Directories.** Every directory below the home is opened without following symlinks
+  and held open while its files are read; a symlinked, foreign-owned or world-writable
+  directory, or one replaced during the read, gives `unknown`.
 - **Snapshots.** The two SQLite databases and their WAL files are read as bytes only,
   copied twice and compared (once retried), then queried on a private copy with fixed,
-  limited queries, a step budget and one fixed deadline. Files over 16 MiB, damaged
-  copies and a file changing between rounds give `unknown`. The live files are never
-  opened by SQLite or changed.
+  limited queries and a step budget. Files over 16 MiB, damaged copies and a file
+  changing between rounds give `unknown`. The live files are never opened by SQLite or
+  changed. That the copied files form one consistent state across both databases is not
+  proven yet (continuation of #737); the checks above only refuse change they detect.
+- **Deadline.** One deadline starts when an observation or discovery starts; a result or
+  conversation id produced after it is refused. The work itself is bounded by the size
+  caps, not interrupted at the deadline.
 - **Transcript.** From `brain/<id>/.system_generated/logs/transcript.jsonl`, only the
   step index, type, source, time and tool names are read; message text is ignored.
 - **States**, from the shapes observed on `agy` 1.5.9 (the turn is the latest user input,
@@ -342,13 +350,16 @@ world-writable.
 
   | State | Evidence |
   |---|---|
-  | working | Summary RUNNING. The last live step is the input, a system message, a finished tool step after a single-tool reply, or a running (`2`) `run_command` step right after its reply. |
+  | working | Summary RUNNING. The last live step is the input, a system message, a finished tool step after a single-tool reply, or a running (`2`) `run_command` step right after its reply when the member was launched with exactly `--dangerously-skip-permissions`. |
   | waiting for an answer | Summary RUNNING. A single `ask_question` call, then its step waiting (`9`). |
   | idle | Summary IDLE with matching step counts, and the last live step is a finished reply after the input. |
   | unknown | Everything else, including other tools running or waiting (`native_wait_unconfirmed`), permission reviews, more than one tool call, and status `6` (seen only after exit). |
 
-  Only `run_command` with `--dangerously-skip-permissions` was observed running. Other
-  tools, other modes and permission reviews were not observed and stay unknown.
+  Only `run_command` with `--dangerously-skip-permissions` was observed running, so a
+  running step counts as working only when the bound process's command line has that
+  flag. Other tools, other modes and permission reviews were not observed and stay
+  unknown. Every record of the current turn must be well formed and dated between the
+  input and now.
 - **Not yet available.** The team guard does not yet handle `agy` members, and there is
   no screen fallback. Both are tracked in a continuation of #737. Readiness stays blocked
   as described above.
