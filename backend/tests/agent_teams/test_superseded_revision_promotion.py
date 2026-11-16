@@ -71,6 +71,7 @@ async def superseded_case(db, *, shape="stopped", policy="auto", pull_head=HEAD,
     revision, _workspace = await _implementation_revision(db, scope, item, slot, member)
     await db.execute(update(GithubAttemptScopeRevision).where(GithubAttemptScopeRevision.id == revision.id).values(
         status="superseded", completed_at=ENDED_AT, submitted_head_sha=OLD,
+        expected_lease_token_hash=github_approval_service.lease_token_hash(f"lease-{item.id}"),
         origin_kind="scope_amendment" if stopped else "continuation"))
     if accepted_head is not None:
         _slot, verifier = await slot_member(db, scope, role="verifier", name="V1")
@@ -83,7 +84,10 @@ async def superseded_case(db, *, shape="stopped", policy="auto", pull_head=HEAD,
     client.pull["head"] = dict(client.pull["head"], sha=pull_head)
     client.pull["draft"] = draft
     client.pull["labels"] = labels or []
-    return Case(db, scope, item, revision, client)
+    case = Case(db, scope, item, revision, client)
+    # Plain ids, read now: a poll expires the ORM objects and a second connection must not touch them mid-poll.
+    case.ids = {"item": item.id, "scope": scope.id, "team": scope.preset_id, "owner_slot": slot.id}
+    return case
 
 
 def _untouched(case):
@@ -364,7 +368,10 @@ async def test_the_observer_consults_the_acceptance_gate(db, monkeypatch, shape)
 REQUIRED = ["Full backend regression tests", "Product CI gate", "Changed Python undefined names", "e2e",
             "Rename old-name guard"]
 LATE = ["handoff", "escalated", "revision_pointer", "phase", "scope_disabled", "human_policy", "autonomy_off",
-        "paused", "hold", "reviewer_role", "acceptance_negative", "approval_round", "workspace_release"]
+        "paused", "hold", "reviewer_role", "acceptance_negative", "approval_round", "workspace_release",
+        # V1 review 5924614352: current participants, a re-acquired lease and every column of the revision row
+        "verifier_replaced", "leader_replaced", "owner_disabled", "workspace_reacquired", "budget_changed",
+        "revision_summary_changed"]
 
 
 async def _configured_case(db, monkeypatch):
@@ -384,7 +391,7 @@ async def _configured_case(db, monkeypatch):
 
 async def _commit_change(case, maker, kind, monkeypatch, fact_id, slot_id):
     """Commit one withdrawal of authority through a second connection."""
-    item_id, scope_id, team_id = case.item.id, case.scope.id, case.scope.preset_id
+    item_id, scope_id, team_id = case.ids["item"], case.ids["scope"], case.ids["team"]
     async with maker() as other:
         item = update(GithubWorkItem).where(GithubWorkItem.id == item_id)
         changes = {
@@ -402,8 +409,23 @@ async def _commit_change(case, maker, kind, monkeypatch, fact_id, slot_id):
             .values(verdict="changes_required"),
             "workspace_release": update(GithubWorkspace).where(GithubWorkspace.leased_item_id == item_id)
             .values(leased_item_id=None, lease_token=None),
+            "workspace_reacquired": update(GithubWorkspace).where(GithubWorkspace.leased_item_id == item_id)
+            .values(lease_token="a-new-acquisition", leased_at=datetime.utcnow() + timedelta(seconds=5)),
+            "owner_disabled": update(AgentTeamSlot).where(AgentTeamSlot.id == case.ids["owner_slot"])
+            .values(enabled=False),
+            "budget_changed": update(GithubAttemptScopeRevision).where(
+                GithubAttemptScopeRevision.work_item_id == item_id).values(failed_head_count=1),
+            "revision_summary_changed": update(GithubAttemptScopeRevision).where(
+                GithubAttemptScopeRevision.work_item_id == item_id).values(summary="A changed summary"),
         }
-        if kind == "paused":
+        if kind in ("verifier_replaced", "leader_replaced"):
+            replaced_slot = slot_id if kind == "verifier_replaced" else await other.scalar(
+                select(AgentTeamPreset.leader_slot_id).where(AgentTeamPreset.id == team_id))
+            other.add(MailTeamMember(
+                identity_key=f"slot:{replaced_slot}:replacement", repo_id="r", repo_path="/tmp/r", repo_name="r",
+                display_name="Replacement", participant_kind="team_slot", team_preset_id=team_id,
+                team_slot_id=replaced_slot))
+        elif kind == "paused":
             other.add(GithubOwnerObservationPause(
                 work_item_id=item_id, wait_key="a-late-pause", authority_sha256="0" * 64, status="paused",
                 deadline=datetime.utcnow() + timedelta(minutes=1)))
@@ -447,7 +469,9 @@ async def test_authority_withdrawn_at_the_last_label_read_does_not_merge(twin, m
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["handoff", "paused", "workspace_release", "human_policy", "autonomy_off",
-                                  "approval_round", "reviewer_role", "acceptance_negative", "hold"])
+                                  "approval_round", "reviewer_role", "acceptance_negative", "hold",
+                                  "verifier_replaced", "leader_replaced", "owner_disabled", "workspace_reacquired",
+                                  "budget_changed", "revision_summary_changed"])
 async def test_authority_withdrawn_at_the_final_local_boundary_does_not_merge(twin, monkeypatch, kind):
     """The change lands after the last awaited check of the merge path and before the merge call."""
     db, maker = twin
@@ -492,3 +516,48 @@ async def test_an_item_that_carries_an_escalation_reason_is_refused_at_entry(db)
     assert case.item.dispatch_status == "dispatched" and case.item.last_verified_sha == OLD
     assert "escalation" in case.item.status_note
     _untouched(case)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["stopped", "plain"])
+async def test_a_replaced_acquisition_at_entry_is_refused_precisely(db, shape):
+    """A re-acquired workspace has a new token while the revision keeps the hash it was approved with."""
+    case = await superseded_case(db, shape=shape)
+    await db.execute(update(GithubWorkspace).where(GithubWorkspace.leased_item_id == case.item.id)
+                     .values(lease_token="a-new-acquisition", leased_at=datetime.utcnow() + timedelta(seconds=5)))
+    await db.commit()
+    await case.tick()
+    assert case.item.dispatch_status == "dispatched" and case.item.last_verified_sha == OLD
+    assert "acquired again" in case.item.status_note
+    _untouched(case)
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_note_never_overwrites_a_replaced_attempt(twin):
+    """An already promoted item is replaced by a new dispatch while the capture is awaited."""
+    db, maker = twin
+    case = await superseded_case(db, status="ready_for_review")
+    await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == case.item.id).values(last_verified_sha=HEAD))
+    await db.execute(update(GithubWorkspace).where(GithubWorkspace.leased_item_id == case.item.id)
+                     .values(leased_item_id=None, lease_token=None))
+    await db.commit()
+    item_id = case.ids["item"]
+    original = service._capture_superseded_fence
+
+    async def replaced_during_capture(*args, **kwargs):
+        refusal = await original(*args, **kwargs)
+        assert isinstance(refusal, str), refusal  # the old attempt's lease is gone, so the capture refuses
+        async with maker() as other:
+            await other.execute(update(GithubWorkItem).where(GithubWorkItem.id == item_id).values(
+                dispatch_nonce="a-newer-attempt", status_note="The new owner's own note"))
+            await other.commit()
+        return refusal
+
+    service._capture_superseded_fence = replaced_during_capture
+    try:
+        await case.tick()
+    finally:
+        del service._capture_superseded_fence  # back to the class method
+    assert case.item.dispatch_nonce == "a-newer-attempt"
+    assert case.item.status_note == "The new owner's own note"
+    assert case.client.merge_calls == 0

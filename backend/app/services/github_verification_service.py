@@ -10,7 +10,8 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta
 
 import httpx
-from sqlalchemy import and_, exists, func, inspect, select, update
+from sqlalchemy import JSON, and_, exists, func, inspect, or_, select, update
+from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -107,15 +108,24 @@ _MERGE_FENCE_ITEM = (
     "attempt_phase", "pr_number", "dispatch_head_ref", "dispatch_base_ref", "last_verified_sha",
     "approval_round_count", "ack_approval_round", "ack_enforcement_epoch", "ack_approver_member_id",
 )
-_MERGE_FENCE_SCOPE = ("id", "preset_id", "repo_owner", "repo_name", "github_auth_mode", "delivery_policy_revision")
-_MERGE_FENCE_REVISION = (
-    "id", "work_item_id", "dispatch_nonce", "revision", "phase", "owner_slot_id", "submitted_head_sha",
-    "completed_at", "expected_workspace_id", "expected_lease_token_hash",
+_MERGE_FENCE_NOTE_IDENTITY = (
+    "id", "scope_id", "dispatch_status", "dispatch_nonce", "owner_slot_id", "active_scope_revision", "pr_number",
 )
+_MERGE_FENCE_SCOPE = ("id", "preset_id", "repo_owner", "repo_name", "github_auth_mode", "delivery_policy_revision")
+
+
+def _latest_member(slot_id):
+    """The id of the member currently occupying a slot: the latest by update time, then id (as the slot lookups do)."""
+    other = aliased(MailTeamMember)
+    return (select(other.id).where(other.team_slot_id == slot_id)
+            .order_by(other.updated_at.desc(), other.id.desc()).limit(1).scalar_subquery())
 
 
 def _same_value(column, value):
-    return column.is_(None) if value is None else column == value
+    """A null-safe equality; a JSON column holds a missing value as SQL NULL or as a JSON null."""
+    if value is None:
+        return or_(column.is_(None), column == JSON.NULL) if isinstance(column.type, JSON) else column.is_(None)
+    return column == value
 
 
 class GithubVerificationService:
@@ -2755,10 +2765,11 @@ class GithubVerificationService:
         settled_began = await self._settled_snapshot(db, scope, item)
         fence = None
         if superseded_ok:
+            began = {name: getattr(item, name) for name in _MERGE_FENCE_NOTE_IDENTITY}
             fence = await self._capture_superseded_fence(db, scope, item)
             if isinstance(fence, str):  # a refusal: say why once and stop
                 if item.status_note != fence:
-                    await self._record_readiness_hold(db, item, fence)
+                    await self._record_fenced_note(db, item, began, fence)
                 return
         ci_context = await github_ci_watch_service.capture(db, scope, item)
         pull = pull or await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
@@ -3061,7 +3072,7 @@ class GithubVerificationService:
             select(*(getattr(TeamGithubScope, name) for name in _MERGE_FENCE_SCOPE))
             .where(TeamGithubScope.id == scope.id))).mappings().first()
         revision = (await db.execute(
-            select(*(getattr(GithubAttemptScopeRevision, name) for name in _MERGE_FENCE_REVISION))
+            select(GithubAttemptScopeRevision.__table__)
             .where(GithubAttemptScopeRevision.work_item_id == item.id,
                    GithubAttemptScopeRevision.dispatch_nonce == item_row["dispatch_nonce"],
                    GithubAttemptScopeRevision.revision == item_row["active_scope_revision"],
@@ -3078,6 +3089,11 @@ class GithubVerificationService:
         if lease is None or not lease["lease_token"]:
             return ("Auto-merge blocked: the item's workspace lease is missing, released or replaced; "
                     "a superseded revision is promoted only while its owner still holds the lease.")
+        if not (isinstance(revision["expected_lease_token_hash"], str)
+                and github_approval_service.lease_token_matches(lease["lease_token"],
+                                                                revision["expected_lease_token_hash"])):
+            return ("Auto-merge blocked: the workspace was acquired again and its lease is not the one this revision "
+                    "was approved with; a superseded revision is promoted only while its owner holds that lease.")
         leader_slot_id = await db.scalar(select(AgentTeamPreset.leader_slot_id)
                                          .where(AgentTeamPreset.id == scope_row["preset_id"]))
         review = (await db.execute(
@@ -3118,8 +3134,7 @@ class GithubVerificationService:
             AgentTeamSlot.id == fence["leader_slot_id"], AgentTeamSlot.enabled.is_(True)))
         revision_ok = exists(select(GithubAttemptScopeRevision.id).where(
             GithubAttemptScopeRevision.status == "superseded",
-            *(_same_value(getattr(GithubAttemptScopeRevision, name), fence["revision"][name])
-              for name in _MERGE_FENCE_REVISION)))
+            *(_same_value(column, fence["revision"][column.name]) for column in GithubAttemptScopeRevision.__table__.columns)))
         lease = fence["lease"]
         lease_ok = exists(select(GithubWorkspace.id).where(
             GithubWorkspace.id == lease["id"], GithubWorkspace.leased_item_id == item.id,
@@ -3131,15 +3146,44 @@ class GithubVerificationService:
             .join(AgentTeamSlot, AgentTeamSlot.id == MailTeamMember.team_slot_id)
             .where(GithubHeadReview.id == fence["review"]["id"], GithubHeadReview.status == "active",
                    GithubHeadReview.verdict == "accepted", AgentTeamSlot.enabled.is_(True),
+                   MailTeamMember.team_preset_id == scope.preset_id, AgentTeamSlot.preset_id == scope.preset_id,
                    func.lower(func.trim(AgentTeamSlot.role)) == "verifier",
                    AgentTeamSlot.id != began["owner_slot_id"],
-                   AgentTeamSlot.id != fence["leader_slot_id"]))
+                   AgentTeamSlot.id != fence["leader_slot_id"],
+                   # the accepting member is still the current occupant of its slot
+                   MailTeamMember.id == _latest_member(MailTeamMember.team_slot_id)))
+        # the approver is the current Leader-slot member, the owner slot is enabled with a current member, and the
+        # two are distinct people
+        occupants_ok = exists(select(GithubWorkItem.id).where(
+            GithubWorkItem.id == item.id,
+            GithubWorkItem.ack_approver_member_id == _latest_member(fence["leader_slot_id"]),
+            _latest_member(GithubWorkItem.owner_slot_id).is_not(None),
+            GithubWorkItem.ack_approver_member_id != _latest_member(GithubWorkItem.owner_slot_id),
+            exists(select(AgentTeamSlot.id).where(
+                AgentTeamSlot.id == GithubWorkItem.owner_slot_id, AgentTeamSlot.enabled.is_(True),
+                AgentTeamSlot.preset_id == scope.preset_id)),
+        ))
         quiet = ~exists(select(GithubOwnerObservationPause.id).where(
             GithubOwnerObservationPause.work_item_id == item.id,
             GithubOwnerObservationPause.status.in_(("waiting", "paused"))))
         no_pending = ~exists(select(GithubApprovalRequest.id).where(
             GithubApprovalRequest.work_item_id == item.id, GithubApprovalRequest.status == "pending"))
-        return and_(item_ok, scope_ok, leader_ok, revision_ok, lease_ok, review_ok, quiet, no_pending)
+        return and_(item_ok, scope_ok, leader_ok, revision_ok, lease_ok, review_ok, occupants_ok, quiet, no_pending)
+
+    @staticmethod
+    async def _record_fenced_note(db: AsyncSession, item: GithubWorkItem, began: dict, note: str) -> None:
+        """Write a refusal note only while the attempt it was read for is still the one on the item (#972).
+
+        The note is decided after awaited reads; a new dispatch that replaced the item meanwhile keeps its own note.
+        """
+        claim = await db.execute(update(GithubWorkItem).where(
+            *(_same_value(getattr(GithubWorkItem, name), value) for name, value in began.items()),
+        ).values(status_note=note, updated_at=datetime.utcnow()).execution_options(synchronize_session=False))
+        if claim.rowcount != 1:
+            await db.rollback()
+            return
+        await db.commit()
+        await db.refresh(item)
 
     @staticmethod
     def _draft_readiness_note(item: GithubWorkItem, pull: dict) -> str | None:
