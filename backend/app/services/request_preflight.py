@@ -140,6 +140,15 @@ class PreflightResult:
         }
 
 
+def _scalar(value):
+    """A string stays itself; anything else (a list, an object, a number) becomes ``None``.
+
+    A request field of the wrong type must be reported, never used in a set membership test, where an
+    unhashable value would raise. The raw value is still handed to the schema check for the report.
+    """
+    return value if isinstance(value, str) else None
+
+
 def _service():
     # Imported on use: the approval service imports this module, so a top-level import would be a cycle.
     from app.services import github_approval_service as module
@@ -162,6 +171,7 @@ def _attempt(problems: list, function, *args, **kwargs):
 
 def continuation_header(phase, execution_target, summary) -> list:
     """The checks a continuation request meets before its owner and lease are looked at."""
+    phase, execution_target = _scalar(phase), _scalar(execution_target)
     problems = []
     if phase not in {"implementation", "diagnostic"}:
         problems.append(problem("continuation_phase_invalid", 400))
@@ -183,6 +193,7 @@ def continuation_body(
     """
     module = _service()
     service = module.github_approval_service
+    phase, execution_target = _scalar(phase), _scalar(execution_target)
     problems: list = []
     paths = _attempt(problems, service._canonical_paths, allowed_paths)
     actions = _attempt(problems, service._canonical_strings, allowed_actions,
@@ -232,6 +243,7 @@ def amendment_body(
     """
     module = _service()
     service = module.github_approval_service
+    phase, execution_target = _scalar(phase), _scalar(execution_target)
     problems: list = []
     if phase != "implementation" or attempt_phase != "implementation":
         problems.append(problem("amendment_diagnostic_restoration_required"))

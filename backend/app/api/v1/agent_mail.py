@@ -478,7 +478,7 @@ class MailPreflightRequest(BaseModel):
     kind: Literal["initial_plan", "scope_amendment", "continuation"]
     work_item_id: int
     dispatch_nonce: str
-    summary: str = ""
+    summary: Any = ""
     plan_metadata: Any = Field(default_factory=dict)
     phase: Any = None
     execution_target: Any = None

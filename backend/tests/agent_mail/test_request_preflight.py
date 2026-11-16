@@ -648,3 +648,65 @@ def test_a_wrong_container_type_is_one_schema_problem_and_no_noise(field):
     result = request_preflight.preflight("continuation", **values)
     assert [(p.code, p.field) for p in result.problems] == [("request_schema_invalid", field)]
     assert "not-a-list" not in str(result.as_dict())
+
+
+# --- Review batch 2 (#955): no scalar of any JSON type may make preflight raise ---------------
+
+JSON_VALUES = [None, True, False, 0, 1, -1, 1.5, "", "text", [], ["a"], {}, {"a": 1}]
+SCALAR_FIELDS = ["phase", "execution_target", "summary", "max_failed_heads", "estimate"]
+KINDS_WITH_FIELDS = [("continuation", continuation), ("scope_amendment", amendment_values)]
+
+
+@pytest.mark.parametrize("kind,builder", KINDS_WITH_FIELDS)
+@pytest.mark.parametrize("field", SCALAR_FIELDS)
+@pytest.mark.parametrize("value", JSON_VALUES, ids=lambda v: f"{type(v).__name__}-{str(v)[:6]}")
+def test_no_json_scalar_can_make_preflight_raise(kind, builder, field, value):
+    values = builder()
+    values["estimate" if field == "estimate" else field] = value
+    result = request_preflight.preflight(kind, **values)
+    # Any value that is not the valid one for the field is a reported problem, never an exception.
+    assert isinstance(result.as_dict()["problems"], list)
+    assert "x" * 5 not in str(result.as_dict()) or field != "summary"
+
+
+@pytest.mark.parametrize("kind", ["continuation", "scope_amendment"])
+@pytest.mark.parametrize("field", ["phase", "execution_target"])
+@pytest.mark.parametrize("value", [[], {}, ["implementation"], {"a": 1}, 5, True, None])
+def test_a_wrong_typed_phase_or_target_is_a_problem_on_that_field(kind, field, value):
+    if kind == "scope_amendment" and field == "phase" and value is None:
+        pytest.skip("an amendment without a phase means implementation, as its submit schema does")
+    values = continuation() if kind == "continuation" else amendment_values()
+    values[field] = value
+    result = request_preflight.preflight(kind, **values)
+    assert not result.ok
+    assert field in {problem.field for problem in result.problems}
+    # Unrelated problems stay visible next to it.
+    values["allowed_paths"] = ["/abs"]
+    again = request_preflight.preflight(kind, **values)
+    assert {field, "allowed_paths"} <= {problem.field for problem in again.problems}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["phase", "execution_target"])
+@pytest.mark.parametrize("value", [[], {}, ["x"], {"a": 1}])
+@pytest.mark.parametrize("kind", ["continuation", "scope_amendment"])
+async def test_the_route_answers_a_structured_problem_not_a_500_for_container_scalars(client, db, field, value, kind):
+    item, _members, tokens = await _dispatch_approval_fixture(db)
+    headers = {"X-Synth-City-Session-Token": tokens[1]}
+    response = await client.post(URL, headers=headers, json=body(item, kind=kind, **{field: value}))
+    assert response.status_code == 200, response.text
+    answer = response.json()
+    assert answer["passed"] is False
+    assert field in {p["field"] for p in answer["problems"]}
+    assert "Traceback" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [[], {}, 7, True])
+async def test_the_route_reports_a_non_string_summary_as_a_problem(client, db, value):
+    item, _members, tokens = await _dispatch_approval_fixture(db)
+    headers = {"X-Synth-City-Session-Token": tokens[1]}
+    response = await client.post(URL, headers=headers, json=body(item, summary=value))
+    assert response.status_code == 200, response.text
+    answer = response.json()
+    assert answer["passed"] is False and "summary" in {p["field"] for p in answer["problems"]}
