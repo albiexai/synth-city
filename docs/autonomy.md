@@ -25,7 +25,7 @@ Synth City watches itself for four conditions that used to be found only by hand
 
 The thresholds are fixed in code. A finding holds identifiers and counts only, never a prompt, token or raw error. It is stored together with its notice in one transaction, so a failure leaves neither and the next poll tries again; a condition that appears again after it cleared opens a new finding and a new notice. Detection never blocks the poll or the verification it watches.
 
-While a finding is open, `/api/v1/health` reports `"health": "degraded"` with `reasons` (the codes) and `open_findings`, and `/health` adds the same fields. If the findings store itself cannot be read, both report `findings_unreadable`; a store that has not been created yet counts as no findings. The existing `status` values do not change, because the deploy gate and scripts read them. `/api/v1/health/findings` lists open findings first, then recently resolved ones, and the Overview shows a "Needs a look: operations" card while any is open.
+While a finding is open, `/api/v1/health` reports `"health": "degraded"` with `reasons` (the codes) and `open_findings`, and `/health` adds the same fields. If the findings store itself cannot be read, both report `findings_unreadable`; a database that holds none of the application's tables yet counts as no findings, but an initialized database that lost the findings table does not. The existing `status` values do not change, because the deploy gate and scripts read them. `/api/v1/health/findings` lists open findings first, then recently resolved ones, and the Overview shows a "Needs a look: operations" card while any is open.
 
 ### When automatic merge does not fire
 

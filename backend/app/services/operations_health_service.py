@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -275,9 +275,9 @@ class OperationsHealthService:
                     select(OperationsFinding.kind, func.count(OperationsFinding.id))
                     .where(OperationsFinding.status == "open").group_by(OperationsFinding.kind))).all()
         except OperationalError as error:
-            if "no such table" in str(error.orig).lower():
-                # The store has not been created yet (a database that init_db has not touched): there are no
-                # findings to report, and nothing to degrade.
+            if "no such table" in str(error.orig).lower() and await self._database_is_uninitialized():
+                # A database init_db has not touched at all: there are no findings to report, and nothing to
+                # degrade. An initialized database that lost only this table is NOT this case: it is unreadable.
                 return {"health": "ok", "reasons": [], "open_findings": 0}
             logger.warning("operations findings could not be read for /health", exc_info=True)
             return {"health": "degraded", "reasons": ["findings_unreadable"], "open_findings": None}
@@ -290,6 +290,17 @@ class OperationsHealthService:
             "reasons": reasons,
             "open_findings": sum(count for _kind, count in rows),
         }
+
+    async def _database_is_uninitialized(self) -> bool:
+        """True only when the database holds none of the application's tables. A failed check counts as no."""
+        try:
+            async with self._session() as db:
+                existing = await db.scalar(
+                    text("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = :name"),
+                    {"name": GithubWorkItem.__tablename__})
+            return existing == 0
+        except Exception:
+            return False
 
     async def findings(self, db: AsyncSession, *, limit: int = 50) -> list[OperationsFinding]:
         """Open findings first, then the most recently resolved."""

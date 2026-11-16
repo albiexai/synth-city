@@ -441,6 +441,20 @@ async def test_health_still_answers_when_the_findings_cannot_be_read(ops, monkey
 
 
 @pytest.mark.asyncio
+async def test_an_initialized_database_that_lost_the_findings_table_is_unreadable_not_healthy(ops):
+    """Only a database the application never initialized may be read as 'no findings'."""
+    from sqlalchemy import text
+    await _seed(ops)
+    await ops.service.record_poll_failure("o", "r", RuntimeError("fixture"))
+    assert (await ops.service.health())["health"] == "degraded"
+    async with ops.engine.begin() as connection:
+        await connection.execute(text("DROP TABLE operations_findings"))
+    for body in (await ops.service.health(), await health_check(), await root_health()):
+        assert body["health"] == "degraded" and body["reasons"] == ["findings_unreadable"]
+        assert body["open_findings"] is None
+
+
+@pytest.mark.asyncio
 async def test_a_store_that_does_not_exist_yet_is_not_a_finding_and_keeps_the_exact_shape(tmp_path, monkeypatch):
     """A database init_db has not touched has no findings; it must not degrade a fresh installation."""
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'empty.db'}")
