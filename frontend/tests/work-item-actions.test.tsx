@@ -55,6 +55,7 @@ const workItem: GithubWorkItem = {
   github_updated_at: '2026-09-29T12:00:00Z',
   issue_type: 'code',
   dispatch_status: 'escalated',
+  dispatch_generation: 'a'.repeat(64),
   approval_round_count: 1,
   retry_count: 0,
   active_scope_revision: 1,
@@ -68,6 +69,7 @@ const workItem: GithubWorkItem = {
 const revision = {
   id: 10,
   revision: 1,
+  dispatch_generation: 'a'.repeat(64),
   summary: 'Hosted-only diagnostic',
   phase: 'diagnostic',
   status: 'proposed',
@@ -220,6 +222,18 @@ describe('WorkItemActions operator-dialog first mention', () => {
     render(<Harness item={{ ...workItem, dispatch_status: 'dispatched', pr_number: 99 }} onFetchScopeRevisions={vi.fn().mockResolvedValue([active])} />)
     await user.click(await screen.findByRole('button', { name: 'Cancel active revision' }))
     expect(await screen.findByText(authorityText)).toBeInTheDocument()
+  })
+
+  it.each([
+    ['a revision of a different dispatch generation', { dispatch_generation: 'b'.repeat(64) }, {}],
+    ['an item and revision that both carry no generation', { dispatch_generation: undefined }, { dispatch_generation: undefined }],
+  ])('disables the cancel-active action for %s', async (_name, revisionChange, itemChange) => {
+    setOperatorToken('test-token')
+    const active = { ...revision, status: 'active', ...revisionChange } as unknown as GithubScopeRevision
+    const item = { ...workItem, dispatch_status: 'dispatched', pr_number: 99, ...itemChange } as GithubWorkItem
+    render(<Harness item={item} onFetchScopeRevisions={vi.fn().mockResolvedValue([active])} />)
+    expect(await screen.findByText('Hosted-only diagnostic')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Cancel active revision' })).toBeDisabled()
   })
 })
 

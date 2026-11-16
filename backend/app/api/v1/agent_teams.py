@@ -3054,7 +3054,7 @@ async def list_github_work_items(
                 pending_revision=authority_by_item[item.id].pending_revision,
                 continuation_revision_count=authority_by_item[item.id].revision_count,
                 continuation_failed_head_count=authority_by_item[item.id].failed_head_count,
-            )
+            ).model_copy(update={"dispatch_nonce": None})  # unauthenticated read: the public generation names the dispatch
             for item, scope, workspace_path in rows
         ]
     )

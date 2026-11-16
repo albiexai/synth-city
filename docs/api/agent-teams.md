@@ -260,11 +260,19 @@ Historical reports do not expose current numeric bounds.
 The view contains three short fields: `remaining`, `estimate`, and `next_action`.
 It includes report state, author, time, source SHA, and optional completed work and assumptions.
 The ordinary progress read makes no GitHub writes and changes no dispatch authority.
+The progress read is not authenticated, so it names a dispatch by `dispatch_generation`, a public one-way digest of the
+work-item id and the dispatch nonce, and never returns the nonce: `dispatch_nonce` is `null`. The same holds for the
+preset work-item list. The authenticated routes (scope revisions, approval requests, workspaces) keep the nonce that
+operator actions need, and add the same `dispatch_generation`. The generation is a public reference, not a secret,
+and no endpoint accepts it as a capability. Limit: the dispatch branch name still embeds the nonce and is public on
+GitHub; that exposure is tracked separately from this field.
 
 The current Leader uses `synth_city_prepare_work_remaining_summary` to prepare a report.
 The tool reads `/github-work-items/{item_id}/remaining-work-context` with its Agent Mail capability.
 That route requires the current Leader for this item's scope. It checks the Leader again after asynchronous observations.
 An unavailable published source returns `progress_context_unavailable`. It does not create a report for an unconfirmed checkpoint.
+A merged, completed or closed item has no workspace to observe; its context rests on the recorded verified head, is read
+once more after the last Leader check, and the response carries no nonce.
 
 Tool inputs are `work_item_id`, `remaining`, and `next_action`.
 For a time estimate, supply ordered `effort_low_minutes` and `effort_high_minutes`, `confidence`, and `effort_scope`.

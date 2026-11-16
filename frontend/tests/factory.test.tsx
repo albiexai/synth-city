@@ -413,7 +413,7 @@ describe("work details and protected controls", () => {
             items: [{
               id: record.id, scope_id: record.scope_id, repo_owner: "fixture", repo_name: "shared",
               issue_number: record.issue_number, issue_title: record.issue_title, issue_url: "https://github.com/fixture/shared/issues/1",
-              github_updated_at: record.updated_at, issue_type: "code", dispatch_status: "completed", approval_round_count: 0,
+              github_updated_at: record.updated_at, issue_type: "code", dispatch_status: "completed", dispatch_generation: "a".repeat(64), approval_round_count: 0,
               retry_count: 0, active_scope_revision: 0, attempt_phase: "implementation", diagnostic_retry_count: 0,
               retry_allowed: false, created_at: record.created_at, updated_at: record.updated_at,
             }],
