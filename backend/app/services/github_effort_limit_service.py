@@ -81,6 +81,39 @@ class GithubEffortLimitService:
         """The most one Leader extension may add: the smaller of 30 minutes and 25 percent of the limit."""
         return max(0, min(EXTENSION_CAP_MINUTES, limit_minutes * EXTENSION_CAP_PERCENT // 100))
 
+    @classmethod
+    def extension_cap_for(cls, limit_minutes: int, ceiling_minutes) -> int:
+        """The extension cap under the scope ceiling (#968): limit plus extension never passes ``max_item_effort_minutes``.
+
+        The ordinary cap, clamped to the room the limit leaves under the ceiling and never below zero. A ceiling
+        that cannot be read leaves the ordinary cap.
+        """
+        cap = cls.extension_cap(limit_minutes)
+        if isinstance(ceiling_minutes, int) and not isinstance(ceiling_minutes, bool):
+            cap = min(cap, max(0, ceiling_minutes - limit_minutes))
+        return cap
+
+    @classmethod
+    def effort_view(cls, item, scope) -> dict | None:
+        """What an item's recorded estimate, limit and extension look like in a view, or ``None`` without a limit.
+
+        Plain numbers only: no ledger time, no nonce, no lease. ``extension_cap_minutes`` is the most the Leader may
+        still add, under the ceiling, and is zero once the extension was used.
+        """
+        limit = getattr(item, "effort_limit_minutes", None)
+        if limit is None:
+            return None
+        extension = item.effort_extension_minutes or 0
+        ceiling = getattr(scope, "max_item_effort_minutes", None)
+        return {
+            "estimate_minutes": item.effort_estimate_minutes,
+            "limit_minutes": limit,
+            "extension_minutes": extension,
+            "effective_limit_minutes": limit + extension,
+            "ceiling_minutes": ceiling,
+            "extension_cap_minutes": 0 if extension else cls.extension_cap_for(limit, ceiling),
+        }
+
     # -- ledger -----------------------------------------------------------------------------------------------------
 
     async def tick_scope(self, db: AsyncSession, scope, *, now: datetime | None = None) -> None:
@@ -250,7 +283,9 @@ class GithubEffortLimitService:
         # Read everything needed before any rollback: a rollback expires the loaded row.
         limit, used = item.effort_limit_minutes, item.effort_extension_minutes
         recorded = self._result(item, repeated=True)
-        cap = self.extension_cap(limit)
+        scope = await db.get(TeamGithubScope, item.scope_id)
+        ceiling = getattr(scope, "max_item_effort_minutes", None)
+        cap = self.extension_cap_for(limit, ceiling)
         if used:
             await db.rollback()
             if used == minutes:
@@ -258,9 +293,12 @@ class GithubEffortLimitService:
             raise EffortLimitError("effort_extension_already_used")
         if minutes > cap:
             await db.rollback()
-            raise EffortLimitError("extension_exceeds_cap", status_code=400,
-                                   message=f"The extension is at most {cap} minutes for a limit of {limit} minutes.")
-        scope = await db.get(TeamGithubScope, item.scope_id)
+            if cap < self.extension_cap(limit):
+                message = (f"The extension is at most {cap} minutes: a limit of {limit} minutes plus the extension "
+                           f"may not pass the scope ceiling of {ceiling} minutes (max_item_effort_minutes).")
+            else:
+                message = f"The extension is at most {cap} minutes for a limit of {limit} minutes."
+            raise EffortLimitError("extension_exceeds_cap", status_code=400, message=message)
         refusal, contact = await self._read_activity(db, item, scope, now)
         if refusal is not None:
             await db.rollback()
