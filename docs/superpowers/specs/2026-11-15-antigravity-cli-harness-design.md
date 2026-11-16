@@ -126,6 +126,24 @@ key was used, and Google's terms were not accepted.
 - **Not observed:** the trust prompt and the question screen (both hidden behind onboarding), `PostToolUse`, real-model
   behaviour, an expired login, linked git worktrees, and behaviour inside a Synth City team launch.
 
+### Agent Mail observations (#736)
+
+#736 ran the same pinned `agy` 1.5.9 three more times in the same isolation, with a stdio MCP stub server and recorder
+hooks. All rows here are **observed**:
+
+- **MCP server entry.** A plain `{"mcpServers": {"<name>": {"command": ..., "args": [...], "env": {...}}}}` in
+  `~/.gemini/config/mcp_config.json`, with no `type` or `transport` field, is loaded. `agy` starts the stdio server as
+  its own child and sends `server/discover`, `initialize`, `notifications/initialized` and `tools/list`. The model does
+  not see the server's tools by name: it gets three generic tools, `call_mcp_tool`, `list_resources` and
+  `read_resource`. A real `call_mcp_tool` → `tools/call` round trip was **not observed**.
+- **Hook output.** Claude Code's `{"hookSpecificOutput": ...}` printed by a `SessionStart` or `PreInvocation` hook is
+  rejected (`failed to unmarshal result ... via protojson`) and ignored; the turn still runs. Empty output is accepted.
+- **Blocking a question.** A `PreToolUse` hook that prints `{"decision": "deny", "reason": "<text>"}` blocks
+  `ask_question`: the model receives the tool error `tool call denied by pre-tool hook: <text>`, the turn continues, and
+  `Stop` fires with `fullyIdle: true`. No `PostToolUse` fires for the denied call.
+- **Hook process.** A command hook runs as `agy` → `sh -c <command>` → the command, so the command's parent is a
+  short-lived shell and `agy` is its grandparent.
+
 ## Q2–Q7: what is documented and what was observed
 
 Each row states the source of every claim.
@@ -158,7 +176,7 @@ Each row states the source of every claim.
 | `permissions.deny` | The documented rule actions are `read_file`, `write_file`, `read_url`, `execute_url`, `command`, `unsandboxed` and `mcp` (<https://antigravity.google/docs/permissions?tab=cli>). No action covers a question tool. | official; blocking it is unknown |
 | Rule precedence | "Your fine-grained `allow`, `ask`, and `deny` rules always take precedence (`Deny > Ask > Allow`)." ([Execution modes and the terminal sandbox](https://antigravity.google/docs/permissions?tab=cli#execution-modes-and-the-terminal-sandbox)) | official |
 | `--dangerously-skip-permissions` | A separate behaviour: it sets the `toolPermission` setting to `always-proceed`, and "`strict` and `always-proceed` (`--dangerously-skip-permissions`) take precedence over `auto` mode." On the page as fetched on 2026-11-15, it does not override explicit `deny` rules. The page names no version, and it can change. Whether the flag suppresses `ask_question`, or affects a hook's `deny`, is not stated. A permission override is not evidence that the question screen is suppressed. | official; effect on questions and hooks unknown |
-| `PreToolUse` for `ask_question` | Fires, with `toolCall.name` `ask_question` and the questions in `toolCall.args`. The turn then waits: no `PostToolUse`, no `Stop` and no further model request while the question is unanswered. This shows the observed wait only. Whether a `deny` decision blocks the question was not tested. | observed; denial unknown |
+| `PreToolUse` for `ask_question` | Fires, with `toolCall.name` `ask_question` and the questions in `toolCall.args`. Without a decision the turn then waits: no `PostToolUse`, no `Stop` and no further model request while the question is unanswered. With `{"decision": "deny", "reason": ...}` the question is blocked and the turn continues (#736). | observed |
 | Open question in the transcript, the summaries database and on screen | unknown. The question screen was hidden behind onboarding. | unknown |
 
 ### Q4: identity and resume
@@ -237,8 +255,9 @@ These follow from the official documentation alone. They are inputs for #735–#
 - Deck cannot rely on `UserPromptSubmit`, which does not exist. A new conversation's `SessionStart` carries
   `conversationId`, but a resume does not fire it, so resumed identity needs `PreInvocation`'s `conversationId` or the
   launch argv.
-- `PreToolUse` fires for `ask_question`; whether denying it blocks the question is not observed. #736 and #737 must
-  still treat questions as possible, and the guard's waiting-for-input detection has to cover them.
+- `PreToolUse` fires for `ask_question`, and a `deny` decision blocks it (#736). #736's hook denies it for team members
+  even when Synth City is unreachable. A question that still opens, for example without the hooks installed, is
+  possible, so #737's waiting-for-input detection has to cover it.
 - The provider (#735) resumes with `--conversation <id>` and, when a prompt is given, `-i <prompt>` (observed, #952).
 - Readiness stays blocked until a user has completed onboarding and a completion signal exists. Synth City never
   accepts the terms or presets onboarding.

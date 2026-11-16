@@ -24,7 +24,7 @@ def configured(**changes):
         opencode_version_ready=True,
         pi_mail_ready=True, pi_mail_reason=None,
         muse_cli_available=True, muse_mcp_installed=True, muse_hooks_missing=[],
-        antigravity_cli_available=True,
+        antigravity_cli_available=True, antigravity_mcp_installed=True, antigravity_hooks_missing=[],
     )
     values.update(changes)
     return SimpleNamespace(**values)
@@ -37,7 +37,7 @@ def test_binary_and_shared_mail_agreement(provider, installed):
     readiness = configuration_readiness(provider.id, provider.display_name, installed, status)
     reason = agent_mail_ready_reason(provider.id, status)
     assert (readiness.state == "ready") == (installed is True and reason is None)
-    # Antigravity CLI has no Agent Mail install yet (#736), so a complete snapshot still blocks it.
+    # Antigravity CLI keeps unproven gates after its Agent Mail install (#736), so a complete snapshot still blocks it.
     assert readiness.state == ("blocked" if installed is False or reason else "ready" if installed else "unknown")
 
 
@@ -312,31 +312,44 @@ def test_launch_plan_refuses_opencode_v1_with_its_own_block_code(monkeypatch):
     assert service._blocked_result_status(BLOCK_CODE) == "blocked_opencode_version_unsupported"
 
 
-def test_antigravity_readiness_fails_closed_until_agent_mail_is_installed():
-    assert agent_mail_ready_reason("antigravity-cli", configured(antigravity_cli_available=False)) == (
-        "Antigravity CLI is not available on this machine")
-    assert agent_mail_ready_reason("antigravity-cli", configured()) == (
-        "Agent Mail for Antigravity CLI is not installed yet")
-    # A snapshot from before this provider existed has no field: the binary is not proven.
-    legacy = SimpleNamespace(**{k: v for k, v in vars(configured()).items() if k != "antigravity_cli_available"})
-    assert agent_mail_ready_reason("antigravity-cli", legacy) == "Antigravity CLI is not available on this machine"
-    readiness = configuration_readiness("antigravity-cli", "Antigravity CLI", True, configured())
+UNPROVEN_MAIL = "Agent Mail for Antigravity CLI is installed, but its Mail tool calls and registration are not proven yet"
+ONBOARDING = "Complete Antigravity CLI onboarding (terms and data-use choices) once as this user before launching agents"
+
+
+@pytest.mark.parametrize("changes,reason", [
+    ({"antigravity_cli_available": False}, "Antigravity CLI is not available on this machine"),
+    ({"antigravity_mcp_installed": False}, "Antigravity CLI Agent Mail MCP is not installed"),
+    ({"antigravity_hooks_missing": ["PreToolUse"]}, "Antigravity CLI Agent Mail hooks are missing"),
+    # Installed is still not ready: a Mail tool call through agy is not proven (#736).
+    ({}, UNPROVEN_MAIL),
+])
+def test_antigravity_readiness_reasons(changes, reason):
+    status = configured(**changes)
+    assert agent_mail_ready_reason("antigravity-cli", status) == reason
+    readiness = configuration_readiness("antigravity-cli", "Antigravity CLI", True, status)
     assert readiness.state == "blocked"
     assert [check.code for check in readiness.checks] == ["binary_installed", "agent_mail_not_configured"]
+
+
+def test_antigravity_legacy_snapshot_is_not_proven():
+    # A snapshot from before these fields existed proves neither the binary nor the install.
+    legacy = SimpleNamespace(**{k: v for k, v in vars(configured()).items() if k != "antigravity_cli_available"})
+    assert agent_mail_ready_reason("antigravity-cli", legacy) == "Antigravity CLI is not available on this machine"
     assert configuration_readiness("antigravity-cli", "Antigravity CLI", True, legacy).state == "unknown"
+    older = SimpleNamespace(**{k: v for k, v in vars(configured()).items()
+                               if k not in ("antigravity_mcp_installed", "antigravity_hooks_missing")})
+    assert agent_mail_ready_reason("antigravity-cli", older) == "Antigravity CLI Agent Mail MCP is not installed"
+    assert configuration_readiness("antigravity-cli", "Antigravity CLI", True, older).state == "unknown"
 
 
 def test_antigravity_onboarding_stays_a_closed_gate_after_agent_mail(monkeypatch):
     # No onboarding completion signal is proven (#952), and terms and data-use choices are the
-    # user's, so readiness never reads, guesses or presets them. Lifting only the Agent Mail gate
-    # (#736) still blocks with the onboarding instruction.
+    # user's, so readiness never reads, guesses or presets them. Lifting only the unproven Agent
+    # Mail gate still blocks with the onboarding instruction.
     gates = provider_readiness_service.ANTIGRAVITY_UNPROVEN_GATES
-    assert gates == (
-        "Agent Mail for Antigravity CLI is not installed yet",
-        "Complete Antigravity CLI onboarding (terms and data-use choices) once as this user before launching agents",
-    )
+    assert gates == (UNPROVEN_MAIL, ONBOARDING)
     monkeypatch.setattr(provider_readiness_service, "ANTIGRAVITY_UNPROVEN_GATES", gates[1:])
-    assert agent_mail_ready_reason("antigravity-cli", configured()) == gates[1]
+    assert agent_mail_ready_reason("antigravity-cli", configured()) == ONBOARDING
     assert configuration_readiness("antigravity-cli", "Antigravity CLI", True, configured()).state == "blocked"
     assert agent_mail_ready_reason("antigravity-cli", configured(antigravity_cli_available=False)) == (
         "Antigravity CLI is not available on this machine")

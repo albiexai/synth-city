@@ -2795,17 +2795,17 @@
         "mcp": {
           "state": "unknown",
           "label": "MCP Servers",
-          "reason": "Agent Mail for Antigravity CLI is not installed yet."
+          "reason": "Agent Mail can install an Antigravity CLI MCP entry; a Mail tool call through agy is not proven yet."
         },
         "hooks": {
           "state": "unknown",
           "label": "Hooks",
-          "reason": "Antigravity CLI hooks are documented but not observed or installed yet."
+          "reason": "Agent Mail can install Antigravity CLI SessionStart, PreInvocation and question hooks; registration through them is not proven yet."
         },
         "permissions": {
           "state": "unknown",
           "label": "Permissions",
-          "reason": "Whether a hook or permission rule can block questions is not observed yet."
+          "reason": "A team member's ask_question is denied by its own PreToolUse hook; other permission rules are not managed."
         },
         "config": {
           "state": "unknown",
@@ -3017,7 +3017,7 @@
             {
               "state": "unknown",
               "code": "agent_mail_not_configured",
-              "reason": "Agent Mail for Antigravity CLI is not installed yet. Positive launch evidence is missing; legacy flags do not distinguish absence from a failed probe.",
+              "reason": "Agent Mail for Antigravity CLI is installed, but its Mail tool calls and registration are not proven yet. Positive launch evidence is missing; legacy flags do not distinguish absence from a failed probe.",
               "source": "agent_team_service.py:_agent_mail_ready_reason"
             }
           ]
