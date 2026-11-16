@@ -7,15 +7,21 @@ merged it by hand. The superseded revision alone grants nothing: the exact-head 
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from app.config import settings
-from app.models.database import GithubAttemptScopeRevision, GithubHeadReview, GithubWorkItem, TeamGithubScope
+from app.models.database import (
+    AgentTeamPreset, AgentTeamSlot, GithubAttemptScopeRevision, GithubHeadReview, GithubOwnerObservationPause,
+    GithubWorkItem, GithubWorkspace, MailTeamMember, TeamGithubScope,
+)
+from app.services import github_coordination_service as coordination
+from app.services import github_head_acceptance_service as acceptance
 from app.services.github_approval_service import github_approval_service
+from app.services.github_ci_watch_service import github_ci_watch_service as ci_watch
 from app.services.github_verification_service import github_verification_service as service
 from tests.agent_teams.test_github_verification_service import (  # noqa: F401  (fixtures and helpers shared)
     _HoldClient, _implementation_revision, _item, _owner, _scope, db,
@@ -54,6 +60,8 @@ async def superseded_case(db, *, shape="stopped", policy="auto", pull_head=HEAD,
     acknowledgement and an ordinary revision.
     """
     scope = await _scope(db, merge_policy=policy, review_hold_label="review-hold")
+    await db.execute(update(AgentTeamPreset).where(AgentTeamPreset.id == scope.preset_id).values(autonomy_enabled=True))
+    await db.commit()
     slot, member = await _owner(db, scope)
     stopped = shape == "stopped"
     item = await _item(db, scope, dispatch_status=status, pr_number=5, owner_slot_id=slot.id,
@@ -314,3 +322,173 @@ async def test_with_no_change_the_two_connection_flow_still_merges(twin):
     await case.tick()
     assert state["calls"] >= 2
     assert case.item.dispatch_status == "merged" and case.client.merge_calls == 1
+
+
+# --- V1 review 5923921938: the former-verifier case through this observer ------------------------------------------
+
+
+async def _demote_the_accepting_reviewer(db):
+    member_id = await db.scalar(select(GithubHeadReview.reviewer_member_id))
+    slot_id = await db.scalar(select(MailTeamMember.team_slot_id).where(MailTeamMember.id == member_id))
+    await db.execute(update(AgentTeamSlot).where(AgentTeamSlot.id == slot_id).values(role="implementer"))
+    await db.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["stopped", "plain"])
+async def test_an_acceptance_from_a_reviewer_who_is_no_longer_a_verifier_does_not_promote(db, shape):
+    case = await superseded_case(db, shape=shape)
+    await _demote_the_accepting_reviewer(db)
+    await case.tick()
+    assert case.item.dispatch_status == "dispatched" and case.client.merge_calls == 0
+    assert case.item.last_verified_sha == OLD
+    assert "no longer from a current verifier" in case.item.status_note
+    _untouched(case)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["stopped", "plain"])
+async def test_the_observer_consults_the_acceptance_gate(db, monkeypatch, shape):
+    """The control: with the entry gate forced open the former-verifier fixture is promoted, so the gate is what
+    stops it at entry; and the final fence, which reads the verifier role itself, still refuses the merge."""
+    monkeypatch.setattr(acceptance, "gate_note", AsyncMock(return_value=None))
+    case = await superseded_case(db, shape=shape)
+    await _demote_the_accepting_reviewer(db)
+    await case.tick()
+    assert case.item.last_verified_sha == HEAD and case.item.dispatch_status == "ready_for_review"
+    assert case.client.merge_calls == 0
+
+
+# --- V1 review 5923921938: authority withdrawn after the last awaited read --------------------------------------------
+
+REQUIRED = ["Full backend regression tests", "Product CI gate", "Changed Python undefined names", "e2e",
+            "Rename old-name guard"]
+LATE = ["handoff", "escalated", "revision_pointer", "phase", "scope_disabled", "human_policy", "autonomy_off",
+        "paused", "hold", "reviewer_role", "acceptance_negative", "approval_round", "workspace_release"]
+
+
+async def _configured_case(db, monkeypatch):
+    """The superseded fixture under a modern delivery policy: all five required job identities, autonomy on."""
+    monkeypatch.setattr(ci_watch, "_wake", AsyncMock(return_value=True))
+    case = await superseded_case(db)
+    case.item.delivery_policy_revision = 2
+    case.item.delivery_policy = {"required_checks": [{"name": n, "app_slug": "github-actions"} for n in REQUIRED],
+                                 "broad_checks": "hosted"}
+    case.client.check_runs = [{"name": n, "app": {"slug": "github-actions"}, "head_sha": HEAD, "status": "completed",
+                               "conclusion": "success"} for n in REQUIRED]
+    await db.execute(update(AgentTeamPreset).where(AgentTeamPreset.id == case.scope.preset_id)
+                     .values(autonomy_enabled=True))
+    await db.commit()
+    return case
+
+
+async def _commit_change(case, maker, kind, monkeypatch, fact_id, slot_id):
+    """Commit one withdrawal of authority through a second connection."""
+    item_id, scope_id, team_id = case.item.id, case.scope.id, case.scope.preset_id
+    async with maker() as other:
+        item = update(GithubWorkItem).where(GithubWorkItem.id == item_id)
+        changes = {
+            "handoff": item.values(handoff_state="pending"),
+            "escalated": item.values(dispatch_status="escalated"),
+            "revision_pointer": item.values(active_scope_revision=5),
+            "phase": item.values(attempt_phase="diagnostic"),
+            "approval_round": item.values(approval_round_count=2),
+            "scope_disabled": update(TeamGithubScope).where(TeamGithubScope.id == scope_id).values(enabled=False),
+            "human_policy": update(TeamGithubScope).where(TeamGithubScope.id == scope_id).values(merge_policy="human"),
+            "autonomy_off": update(AgentTeamPreset).where(AgentTeamPreset.id == team_id)
+            .values(autonomy_enabled=False),
+            "reviewer_role": update(AgentTeamSlot).where(AgentTeamSlot.id == slot_id).values(role="implementer"),
+            "acceptance_negative": update(GithubHeadReview).where(GithubHeadReview.id == fact_id)
+            .values(verdict="changes_required"),
+            "workspace_release": update(GithubWorkspace).where(GithubWorkspace.leased_item_id == item_id)
+            .values(leased_item_id=None, lease_token=None),
+        }
+        if kind == "paused":
+            other.add(GithubOwnerObservationPause(
+                work_item_id=item_id, wait_key="a-late-pause", authority_sha256="0" * 64, status="paused",
+                deadline=datetime.utcnow() + timedelta(minutes=1)))
+        elif kind == "hold":
+            monkeypatch.setattr(coordination, "hold_code", lambda: "hold")
+        else:
+            await other.execute(changes[kind])
+        await other.commit()
+
+
+def _late_change(case, maker, kind, monkeypatch, fact_id, slot_id):
+    """Commit the change while the last issue-label read is awaited."""
+    original, state = case.client.get_issue, {"calls": 0}
+
+    async def get_issue(*args, **kwargs):
+        state["calls"] += 1
+        result = await original(*args, **kwargs)
+        if state["calls"] == 2 and kind != "never":
+            await _commit_change(case, maker, kind, monkeypatch, fact_id, slot_id)
+        return result
+
+    case.client.get_issue = get_issue
+    return state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", LATE + ["never"])
+async def test_authority_withdrawn_at_the_last_label_read_does_not_merge(twin, monkeypatch, kind):
+    db, maker = twin
+    case = await _configured_case(db, monkeypatch)
+    fact = (await db.execute(select(GithubHeadReview))).scalar_one()
+    slot_id = await db.scalar(select(MailTeamMember.team_slot_id).where(MailTeamMember.id == fact.reviewer_member_id))
+    state = _late_change(case, maker, kind, monkeypatch, fact.id, slot_id)
+    await case.tick()
+    assert state["calls"] == 2, (kind, state, case.item.status_note)
+    if kind == "never":  # the control: nothing changes, and the configured five-job fixture merges
+        assert case.item.dispatch_status == "merged" and case.client.merge_calls == 1
+    else:
+        assert case.client.merge_calls == 0, (kind, case.item.dispatch_status, case.item.status_note)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["handoff", "paused", "workspace_release", "human_policy", "autonomy_off",
+                                  "approval_round", "reviewer_role", "acceptance_negative", "hold"])
+async def test_authority_withdrawn_at_the_final_local_boundary_does_not_merge(twin, monkeypatch, kind):
+    """The change lands after the last awaited check of the merge path and before the merge call."""
+    db, maker = twin
+    case = await _configured_case(db, monkeypatch)
+    fact = (await db.execute(select(GithubHeadReview))).scalar_one()
+    slot_id = await db.scalar(select(MailTeamMember.team_slot_id).where(MailTeamMember.id == fact.reviewer_member_id))
+    original = service._settled_context_note
+    state = {"calls": 0}
+
+    async def boundary(*args, **kwargs):
+        note = await original(*args, **kwargs)
+        state["calls"] += 1
+        await _commit_change(case, maker, kind, monkeypatch, fact.id, slot_id)
+        return note
+
+    monkeypatch.setattr(service, "_settled_context_note", boundary)
+    await case.tick()
+    assert state["calls"] == 1, (kind, state)
+    assert case.client.merge_calls == 0, (kind, case.item.dispatch_status, case.item.status_note)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["stopped", "plain"])
+async def test_a_missing_lease_at_entry_is_refused_precisely(db, shape):
+    case = await superseded_case(db, shape=shape)
+    await db.execute(update(GithubWorkspace).where(GithubWorkspace.leased_item_id == case.item.id)
+                     .values(leased_item_id=None, lease_token=None))
+    await db.commit()
+    await case.tick()
+    assert case.item.dispatch_status == "dispatched" and case.item.last_verified_sha == OLD
+    assert "workspace lease is missing" in case.item.status_note
+    _untouched(case)
+
+
+@pytest.mark.asyncio
+async def test_an_item_that_carries_an_escalation_reason_is_refused_at_entry(db):
+    case = await superseded_case(db)
+    await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == case.item.id)
+                     .values(escalation_reason="retry_count_exhausted"))
+    await db.commit()
+    await case.tick()
+    assert case.item.dispatch_status == "dispatched" and case.item.last_verified_sha == OLD
+    assert "escalation" in case.item.status_note
+    _untouched(case)
