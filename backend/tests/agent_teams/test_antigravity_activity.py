@@ -901,3 +901,89 @@ def test_raw_tool_evidence_on_a_non_reply_record_is_refused():
     assert state(RUNNING, [(0, 14, 3)], [{**user(0), "tool_calls": [{"name": "run_command"}]}])[0] == "unknown"
     assert state(RUNNING, SYSTEM_STEPS, [user(0), planner(1, tools=["run_command"]),
                                          {**system(2), "tool_calls": []}])[0] == "unknown"
+
+
+# --- #992: a question that still opens is escalated (fallback evidence for #736) --------------
+
+async def _antigravity_wait_team(db, *, duplicate=False):
+    from app.models.database import (AgentPaneBinding, AgentTeamPreset, AgentTeamSlot, MailAgentSession,
+                                     MailExternalActor, MailTeamMember)
+    team = AgentTeamPreset(name="Antigravity wait fixture")
+    actor = MailExternalActor(actor_key="agy-wait-actor", display_name="Supervisor", kind="external_tool",
+                              token_hash="synthetic-hash")
+    db.add_all([team, actor]); await db.flush()
+    slot = AgentTeamSlot(preset_id=team.id, display_name="Antigravity worker", provider="antigravity-cli",
+                         repo_path="/synthetic/project", repo_id="fixture", repo_name="fixture",
+                         launch_mode="resume", launch_options={"session_id": CID, "use_last": False})
+    leader = AgentTeamSlot(preset_id=team.id, display_name="Leader", provider="codex-cli",
+                           repo_path="/synthetic/project", repo_id="fixture", repo_name="fixture")
+    db.add_all([slot, leader]); await db.flush()
+    if duplicate:  # another slot configured with the same conversation
+        db.add(AgentTeamSlot(preset_id=team.id, display_name="Copy", provider="antigravity-cli",
+                             repo_path="/synthetic/other", repo_id="fixture", repo_name="fixture",
+                             launch_mode="resume", launch_options={"session_id": CID, "use_last": False}))
+    team.leader_slot_id = leader.id
+    team.supervisor_actor_id = actor.id
+    member = MailTeamMember(identity_key=f"agy-wait-{slot.id}", repo_id="fixture", repo_name="fixture",
+                            repo_path="/synthetic/project", display_name=slot.display_name,
+                            team_preset_id=team.id, team_slot_id=slot.id)
+    db.add(member); await db.flush()
+    binding = AgentPaneBinding(pane_pid=41000, pane_proc_start="27", slot_id=slot.id, preset_id=team.id,
+                               tmux_target="%8")
+    session = MailAgentSession(member_id=member.id, provider="antigravity-cli", source="mcp",
+                               session_key="agy-wait-session", team_slot_id=slot.id, team_preset_id=team.id,
+                               bound_pane_pid=41000, bound_pane_proc_start="27", cwd="/synthetic/project",
+                               capability_token_hash="synthetic-hash", mailbox_status="connected")
+    db.add_all([binding, session]); await db.commit()
+    return team, actor, slot, binding
+
+
+async def _observe_with(db, monkeypatch, team, observed):
+    from app.services import agent_activity_service as activity
+    monkeypatch.setattr(activity, "_process", lambda _pid: ("S", "27"))  # never a host /proc read
+    monkeypatch.setattr(activity, "observe_antigravity", lambda *args, **kwargs: observed)
+    return await activity.observe_team(db, team.id, include_agent_status=False, persist_identities=False)
+
+
+@pytest.mark.asyncio
+async def test_an_open_antigravity_question_is_escalated_once_and_cleared_when_idle(db, monkeypatch):
+    from sqlalchemy import select
+    from app.models.database import MailMessage
+    from app.services.agent_team_supervisor_service import supervisor_inbox
+    team, actor, slot, binding = await _antigravity_wait_team(db)
+    asked = datetime.now(timezone.utc)
+    response = await _observe_with(db, monkeypatch, team, ("waiting_input", "native_question_open", asked))
+    observed = next(entry for entry in response.slots if entry.slot_id == slot.id)
+    assert observed.waiting_input is not None and observed.waiting_input.reason == "question"
+    messages = (await db.scalars(select(MailMessage))).all()
+    assert len(messages) == 1
+    notice = messages[0]
+    assert notice.payload["reason"] == "question" and notice.payload["slot_id"] == slot.id
+    assert notice.payload["supervisor_actor_id"] == actor.id
+    assert "synthetic/project" not in notice.body_markdown
+    assert len(await supervisor_inbox(db, actor)) == 1
+    # The same continuous wait is not announced twice.
+    await _observe_with(db, monkeypatch, team, ("waiting_input", "native_question_open", asked))
+    assert len((await db.scalars(select(MailMessage))).all()) == 1
+    await db.refresh(binding)
+    assert binding.waiting_input_reason == "question"
+    # A completed reply clears the wait.
+    await _observe_with(db, monkeypatch, team, ("idle", "native_turn_completed", datetime.now(timezone.utc)))
+    await db.refresh(binding)
+    assert binding.waiting_input_reason is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["unconfirmed_wait", "duplicate_conversation"])
+async def test_an_unproven_or_unattributable_antigravity_wait_sends_no_notice(db, monkeypatch, case):
+    from sqlalchemy import select
+    from app.models.database import MailMessage
+    team, _actor, slot, binding = await _antigravity_wait_team(db, duplicate=case == "duplicate_conversation")
+    observed = (("unknown", "native_wait_unconfirmed", None) if case == "unconfirmed_wait"
+                else ("waiting_input", "native_question_open", datetime.now(timezone.utc)))
+    response = await _observe_with(db, monkeypatch, team, observed)
+    entry = next(item for item in response.slots if item.slot_id == slot.id)
+    assert entry.waiting_input is None
+    assert (await db.scalars(select(MailMessage))).all() == []
+    await db.refresh(binding)
+    assert binding.waiting_input_reason is None
