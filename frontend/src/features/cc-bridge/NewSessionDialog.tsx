@@ -69,6 +69,8 @@ const OPENCODE_MODE_OPTIONS: { value: Mode; label: string }[] = [
 
 const OTHER_FOLDER = '__other_folder__'
 const OPENCODE_SESSION_ID = /^ses[0-9A-Za-z_-]{1,96}$/
+// Antigravity CLI conversation ids are UUIDs (#952); a resume names the exact conversation.
+const ANTIGRAVITY_CONVERSATION_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
 
 const PLATFORM_STORAGE_KEY = 'cc-bridge.platform'
 const DEFAULT_LAUNCH_OPTIONS: SlotLaunchOptions = { no_alt_screen: true }
@@ -147,9 +149,10 @@ export function NewSessionDialog({ open, onOpenChange, onSpawned, initialProvide
   const isOpenCode = provider === 'opencode-cli'
   const isPi = provider === 'pi-cli'
   const isMuse = provider === 'muse-cli'
+  const isAntigravity = provider === 'antigravity-cli'
   const supportsPlatform = launchDescriptor?.bedrock_supported ?? false
   const isBedrock = supportsPlatform && launchOptions.platform === 'bedrock'
-  const modeOptions = isOpenCode || isPi || isMuse
+  const modeOptions = isOpenCode || isPi || isMuse || isAntigravity
     ? OPENCODE_MODE_OPTIONS
     : isCopilot
       ? COPILOT_MODE_OPTIONS
@@ -183,6 +186,11 @@ export function NewSessionDialog({ open, onOpenChange, onSpawned, initialProvide
     if (!open) return
     if (provider === 'pi-cli') {
       setLaunchOptions({ platform: 'openrouter' })
+      setMode('plain')
+      return
+    }
+    if (provider === 'antigravity-cli') {
+      setLaunchOptions({}) // Antigravity CLI runs only on Google; a remembered platform does not apply.
       setMode('plain')
       return
     }
@@ -282,6 +290,9 @@ export function NewSessionDialog({ open, onOpenChange, onSpawned, initialProvide
     if (isPi && mode === 'resume') {
       return directory.trim().length > 0 && (useLast || codexSessionId.trim().length > 0)
     }
+    if (isAntigravity && mode === 'resume') {
+      return directory.trim().length > 0 && ANTIGRAVITY_CONVERSATION_ID.test(codexSessionId.trim())
+    }
     if (isClaude && mode === 'resume') return directory.trim().length > 0 && selectedSession !== null
     return directory.trim().length > 0
   })()
@@ -330,9 +341,9 @@ export function NewSessionDialog({ open, onOpenChange, onSpawned, initialProvide
         }),
         ...(provider === 'claude-code' && skipPermissions && { skip_permissions: true }),
         ...(isCodex && prompt.trim() && { prompt: prompt.trim() }),
-        ...((isCopilot || isOpenCode || isPi) && prompt.trim() && { prompt: prompt.trim() }),
+        ...((isCopilot || isOpenCode || isPi || isAntigravity) && prompt.trim() && { prompt: prompt.trim() }),
         ...(isCodex && !isBedrock && optionModel && { model: optionModel }),
-        ...((isCopilot || isOpenCode || isPi) && optionModel && { model: optionModel }),
+        ...((isCopilot || isOpenCode || isPi || isAntigravity) && optionModel && { model: optionModel }),
         ...(isCodex && optionProfile && { profile: optionProfile }),
         ...(isCodex && optionProfileV2 && { profile_v2: optionProfileV2 }),
         ...(isCodex && optionSandbox && { sandbox: optionSandbox }),
@@ -355,10 +366,11 @@ export function NewSessionDialog({ open, onOpenChange, onSpawned, initialProvide
           ...(!useLast && codexSessionId.trim() && { session_id: codexSessionId.trim() }),
         }),
         ...(isOpenCode && mode === 'resume' && { session_id: codexSessionId.trim() }),
+        ...(isAntigravity && mode === 'resume' && { session_id: codexSessionId.trim() }),
         ...(isOpenCode && boolOption(launchOptions, 'skip_permissions') && { skip_permissions: true }),
         ...((isCopilot || isOpenCode) && optionAgent && { agent: optionAgent }),
         ...(isCopilot && optionContextTier && { context_tier: optionContextTier }),
-        ...((isCodex || isCopilot || isPi) && optionReasoningEffort && { reasoning_effort: optionReasoningEffort }),
+        ...((isCodex || isCopilot || isPi || isAntigravity) && optionReasoningEffort && { reasoning_effort: optionReasoningEffort }),
         ...(isPi && { platform: 'openrouter' as const }),
         ...(isCopilot && boolOption(launchOptions, 'plan') && { plan: true }),
         ...(isCopilot && boolOption(launchOptions, 'remote') && { remote: true }),
@@ -550,6 +562,19 @@ export function NewSessionDialog({ open, onOpenChange, onSpawned, initialProvide
             </div>
           )}
 
+          {isAntigravity && mode === 'resume' && (
+            <div className="space-y-1.5">
+              <Label htmlFor="antigravity-conversation-id">Antigravity conversation ID</Label>
+              <Input
+                id="antigravity-conversation-id"
+                value={codexSessionId}
+                onChange={(e) => setCodexSessionId(e.target.value)}
+                placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+              />
+              <p className="text-xs text-muted-foreground">The exact conversation id that agy prints on exit.</p>
+            </div>
+          )}
+
           {(isCodex || isCopilot || isPi) && (mode === 'resume' || mode === 'fork') && (
             <div className="space-y-2">
               <div className="flex items-center space-x-2">
@@ -592,7 +617,7 @@ export function NewSessionDialog({ open, onOpenChange, onSpawned, initialProvide
             </p>
           )}
 
-          {(isCodex || isCopilot || isOpenCode || isPi) && (
+          {(isCodex || isCopilot || isOpenCode || isPi || isAntigravity) && (
             <div className="space-y-1.5">
               <Label htmlFor="session-prompt">Initial Prompt</Label>
               <Input

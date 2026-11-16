@@ -139,7 +139,7 @@ describe('mailSetupState', () => {
   })
 
   it('names the full product name first in every install and remove confirmation', () => {
-    for (const provider of ['codex-cli', 'copilot-cli', 'muse-cli', 'opencode-cli'] as const) {
+    for (const provider of ['codex-cli', 'copilot-cli', 'muse-cli', 'opencode-cli', 'antigravity-cli'] as const) {
       for (const action of ['setup', 'remove'] as const) {
         expect(mailConfirm(provider, action, status()).description).toContain('before Albiex Synth City')
       }

@@ -2622,6 +2622,428 @@
         "request_wait_seconds": 2,
         "aggregate_probe_seconds": 90
       }
+    },
+    "antigravity-cli": {
+      "schema_version": 1,
+      "provider": "antigravity-cli",
+      "provider_display_name": "Antigravity CLI",
+      "operations": {
+        "launch": {
+          "state": "conditional",
+          "reason": "Albiex Synth City has a validated native launch contract.",
+          "conditions": [
+            "Binary and Mail prerequisites",
+            "Validated provider launch options",
+            "Existing launch actor authorization"
+          ],
+          "evidence": [
+            "backend/app/services/providers/antigravity_cli.py",
+            "backend/app/services/agent_team_service.py",
+            "backend/tests/test_provider_operations.py::test_contract_matrix"
+          ]
+        },
+        "observe_session": {
+          "state": "conditional",
+          "reason": "Albiex Synth City can associate native sessions under identity checks.",
+          "conditions": [
+            "Provider-specific discovery",
+            "Exact team/slot/member and pane identity",
+            "Fresh observations"
+          ],
+          "evidence": [
+            "backend/app/services/providers/antigravity_cli.py",
+            "backend/app/services/agent_team_service.py",
+            "backend/tests/test_provider_operations.py::test_contract_matrix"
+          ]
+        },
+        "mail_identity": {
+          "state": "conditional",
+          "reason": "Authenticated Mail identifies a team slot under the server binding contract.",
+          "conditions": [
+            "Installed provider Mail integration",
+            "Connected MCP session",
+            "Matching team slot and capability"
+          ],
+          "evidence": [
+            "backend/app/services/providers/antigravity_cli.py",
+            "backend/app/services/agent_team_service.py",
+            "backend/tests/test_provider_operations.py::test_contract_matrix",
+            "backend/app/services/agent_mail_service.py"
+          ]
+        },
+        "receive_work": {
+          "state": "conditional",
+          "reason": "Mail briefs and wake delivery require a verified runnable recipient.",
+          "conditions": [
+            "Current owned dispatch",
+            "Authenticated Mail identity",
+            "Verified wake target"
+          ],
+          "evidence": [
+            "backend/app/services/providers/antigravity_cli.py",
+            "backend/app/services/agent_team_service.py",
+            "backend/tests/test_provider_operations.py::test_contract_matrix",
+            "backend/app/services/agent_mail_service.py"
+          ]
+        },
+        "report_work_status": {
+          "state": "conditional",
+          "reason": "Structured status reporting preserves current owner authority.",
+          "conditions": [
+            "Current owned work item",
+            "Fresh dispatch and workspace lease",
+            "Supported status transition"
+          ],
+          "evidence": [
+            "backend/app/services/providers/antigravity_cli.py",
+            "backend/app/services/agent_team_service.py",
+            "backend/tests/test_provider_operations.py::test_contract_matrix",
+            "backend/app/services/agent_mail_service.py"
+          ]
+        },
+        "approval_participation": {
+          "state": "conditional",
+          "reason": "Approval participation is constrained to the designated actor.",
+          "conditions": [
+            "Current designated Leader or owner as required",
+            "Current normalized approval round",
+            "Server principal checks"
+          ],
+          "evidence": [
+            "backend/app/services/providers/antigravity_cli.py",
+            "backend/app/services/agent_team_service.py",
+            "backend/tests/test_provider_operations.py::test_contract_matrix",
+            "backend/app/services/agent_mail_service.py"
+          ]
+        },
+        "workspace_association": {
+          "state": "conditional",
+          "reason": "Assigned checkout participation requires the existing lease contract.",
+          "conditions": [
+            "Current work-item lease",
+            "Assigned workspace identity",
+            "No inferred authority from working directory"
+          ],
+          "evidence": [
+            "backend/app/services/providers/antigravity_cli.py",
+            "backend/app/services/agent_team_service.py",
+            "backend/tests/test_provider_operations.py::test_contract_matrix",
+            "backend/app/services/github_workspace_service.py"
+          ]
+        },
+        "resume_exact": {
+          "state": "conditional",
+          "reason": "Exact resume requires an identified native session and matching project.",
+          "conditions": [
+            "Exact session selector",
+            "Matching project/workspace",
+            "Current binding and approved recovery authority"
+          ],
+          "evidence": [
+            "backend/app/services/providers/antigravity_cli.py",
+            "backend/app/services/agent_team_service.py",
+            "backend/tests/test_provider_operations.py::test_contract_matrix"
+          ]
+        },
+        "interactive_terminal": {
+          "state": "conditional",
+          "reason": "The existing Bridge can expose a verified native terminal.",
+          "conditions": [
+            "Verified session association",
+            "Existing terminal-mode/server authority",
+            "A live pane is not generic provider readiness"
+          ],
+          "evidence": [
+            "backend/app/services/providers/antigravity_cli.py",
+            "backend/app/services/agent_team_service.py",
+            "backend/tests/test_provider_operations.py::test_contract_matrix",
+            "backend/app/services/agent_bridge/discovery.py"
+          ]
+        },
+        "execution_controls": {
+          "state": "conditional",
+          "reason": "Native launch options expose provider-specific controls; enforcement is not certified by a flag.",
+          "conditions": [
+            "Supported native launch options",
+            "Explicit operator configuration",
+            "No inferred sandbox or recovery guarantee",
+            "Explicit native permission/sandbox settings; bypass does not supply isolation"
+          ],
+          "evidence": [
+            "backend/app/services/providers/antigravity_cli.py",
+            "backend/app/services/agent_team_service.py",
+            "backend/tests/test_provider_operations.py::test_contract_matrix"
+          ]
+        }
+      },
+      "native_capabilities": {
+        "spawn": {
+          "state": "write_capable",
+          "label": "Spawn Sessions",
+          "reason": "Albiex Synth City can launch the Antigravity CLI (agy)."
+        },
+        "resume": {
+          "state": "write_capable",
+          "label": "Resume Sessions",
+          "reason": "agy --conversation resumes a conversation by its UUID."
+        },
+        "sessions": {
+          "state": "read_only",
+          "label": "Agent Bridge Sessions",
+          "reason": "Read an Antigravity CLI member's conversation state and discover its conversation from the live process."
+        },
+        "mcp": {
+          "state": "unknown",
+          "label": "MCP Servers",
+          "reason": "Agent Mail can install an Antigravity CLI MCP entry; a Mail tool call through agy is not proven yet."
+        },
+        "hooks": {
+          "state": "unknown",
+          "label": "Hooks",
+          "reason": "Agent Mail can install Antigravity CLI SessionStart, PreInvocation and question hooks; registration through them is not proven yet."
+        },
+        "permissions": {
+          "state": "unknown",
+          "label": "Permissions",
+          "reason": "A team member's ask_question is denied by its own PreToolUse hook; other permission rules are not managed."
+        },
+        "config": {
+          "state": "unknown",
+          "label": "Configuration",
+          "reason": "Antigravity CLI settings, including workspace trust, are not managed yet."
+        },
+        "fork": {
+          "state": "unknown",
+          "label": "Fork",
+          "reason": "Capability has not been classified."
+        },
+        "plugins": {
+          "state": "unknown",
+          "label": "Plugins",
+          "reason": "Capability has not been classified."
+        },
+        "commands": {
+          "state": "unknown",
+          "label": "Commands",
+          "reason": "Capability has not been classified."
+        },
+        "agents": {
+          "state": "unknown",
+          "label": "Agents",
+          "reason": "Capability has not been classified."
+        },
+        "skills": {
+          "state": "unknown",
+          "label": "Skills",
+          "reason": "Capability has not been classified."
+        },
+        "memory": {
+          "state": "unknown",
+          "label": "Memory",
+          "reason": "Capability has not been classified."
+        },
+        "output_styles": {
+          "state": "unknown",
+          "label": "Output Styles",
+          "reason": "Capability has not been classified."
+        },
+        "statusline": {
+          "state": "unknown",
+          "label": "Statusline",
+          "reason": "Capability has not been classified."
+        },
+        "usage": {
+          "state": "unknown",
+          "label": "Usage",
+          "reason": "Capability has not been classified."
+        },
+        "context": {
+          "state": "unknown",
+          "label": "Context",
+          "reason": "Capability has not been classified."
+        },
+        "doctor": {
+          "state": "unknown",
+          "label": "Doctor",
+          "reason": "Capability has not been classified."
+        },
+        "backup": {
+          "state": "unknown",
+          "label": "Backup",
+          "reason": "Capability has not been classified."
+        },
+        "restore": {
+          "state": "unknown",
+          "label": "Restore",
+          "reason": "Capability has not been classified."
+        },
+        "plans": {
+          "state": "unknown",
+          "label": "Plans",
+          "reason": "Capability has not been classified."
+        }
+      },
+      "native_surfaces": {
+        "summary": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        },
+        "config": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        },
+        "mcp": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        },
+        "plugins": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        },
+        "commands": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        },
+        "hooks": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        },
+        "permissions": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        },
+        "agents": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        },
+        "skills": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        },
+        "memory": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        },
+        "backup": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        },
+        "output-styles": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        },
+        "statusline": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        },
+        "sessions": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        },
+        "plans": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        },
+        "context": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        },
+        "usage": {
+          "state": "unavailable",
+          "adapter_id": null,
+          "access": "none",
+          "reason": "No available implemented provider-specific native adapter.",
+          "conditions": []
+        }
+      },
+      "readiness": {
+        "configuration": {
+          "state": "blocked",
+          "checks": [
+            {
+              "state": "ready",
+              "code": "binary_installed",
+              "reason": "Provider binary is installed.",
+              "source": "providers/base.py:get_status"
+            },
+            {
+              "state": "unknown",
+              "code": "agent_mail_not_configured",
+              "reason": "Agent Mail for Antigravity CLI is installed, but its Mail tool calls and registration are not proven yet. Positive launch evidence is missing; legacy flags do not distinguish absence from a failed probe.",
+              "source": "agent_team_service.py:_agent_mail_ready_reason"
+            }
+          ]
+        },
+        "credentials": {
+          "state": "unknown",
+          "reason": "Credentials not checked; configuration does not prove model access.",
+          "source": null,
+          "observed_at": null
+        },
+        "session": {
+          "state": "unknown",
+          "reason": "No team slot selected; a generic provider card cannot establish a worker binding.",
+          "team_id": null,
+          "slot_id": null,
+          "member_id": null,
+          "session_id": null,
+          "observed_provider": null
+        },
+        "observed_at": "2026-10-04T12:00:00Z",
+        "observation_started_at": "2026-10-04T12:00:00Z",
+        "probe_state": "observed",
+        "cache_ttl_seconds": 60,
+        "request_wait_seconds": 2,
+        "aggregate_probe_seconds": 90
+      }
     }
   },
   "scenarios": {

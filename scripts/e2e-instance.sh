@@ -14,7 +14,7 @@
 #     is not new, or the server does not use the instance HOME;
 #   - SYNTH_CITY_URL, or an Albiex Synth City Mail token variable, names another Albiex Synth City;
 #   - the instance HOME holds an Agent Mail MCP configuration;
-#   - a harness name (claude, codex, copilot, opencode, pi, muse), gh or tmux does
+#   - a harness name (claude, codex, copilot, opencode, pi, muse, agy), gh or tmux does
 #     not resolve to the instance's fake binaries.
 #
 # Environment:
@@ -139,7 +139,7 @@ fi
 
 # --- Fake binaries and the allowlisted environment ---------------------------
 
-for name in claude codex copilot opencode pi muse; do
+for name in claude codex copilot opencode pi muse agy; do
   install -m 755 "$REPO_ROOT/scripts/e2e/fake-harness.sh" "$FAKE_BIN/$name"
 done
 cat >"$FAKE_BIN/gh" <<'EOF'
@@ -180,7 +180,7 @@ if [[ -n "${E2E_SEED_NOW:-}" ]]; then
 fi
 run_clean() { env -i "${CLEAN_ENV[@]}" "$@"; }
 
-for name in claude codex copilot opencode pi muse gh tmux; do
+for name in claude codex copilot opencode pi muse agy gh tmux; do
   resolved="$(run_clean sh -c "command -v $name" || true)"
   [[ "$resolved" == "$FAKE_BIN/$name" ]] || refuse "$name resolves to ${resolved:-nothing}, not the fake binary"
 done
