@@ -373,6 +373,7 @@ async def settle_accepted_revision(db, item, *, review_id, leader_member_id, dis
     from app.services.factory_delivery_policy import effective_policy
     from app.services.github_approval_service import GithubApprovalError, github_approval_service as approval
     from app.services.github_ci_watch_service import check_matrix
+    from app.services.github_check_observation import GithubCheckObservationError
     from app.services.github_client import github_client
     fact = await db.get(GithubRevisionReview, review_id, populate_existing=True)
     if (not fact or fact.work_item_id != item.id or fact.dispatch_nonce != dispatch_nonce
@@ -411,8 +412,14 @@ async def settle_accepted_revision(db, item, *, review_id, leader_member_id, dis
     # digest matches the watch and the runs match that app.
     if not policy.required_checks or any(required.app_slug != 'github-actions' for required in policy.required_checks):
         raise GithubApprovalError('required_checks_not_successful')
-    checks = await github_client.list_check_runs_for_ref(scope.repo_owner, scope.repo_name, fact.head_sha,
-        token=await approval.github_read_token(scope))
+    try:
+        checks = await github_client.list_check_runs_for_ref(scope.repo_owner, scope.repo_name, fact.head_sha,
+            token=await approval.github_read_token(scope))
+    except GithubCheckObservationError as exc:
+        # Checks that GitHub reports inconsistently (#1007) are unavailable, not failed. Nothing has been written, so
+        # the attempt stays as it was and the Leader settles again once the checks read consistently. The code is
+        # the observation's own fixed reason; nothing GitHub sent is repeated.
+        raise GithubApprovalError(f'checks_not_observable:{exc}', status_code=409) from exc
     if any(row['result'] != 'success' for row in check_matrix(policy, checks, fact.head_sha)):
         raise GithubApprovalError('required_checks_not_successful')
     # The check read awaited, so the head and the whole authority are read and claimed again before the write.
