@@ -1221,7 +1221,7 @@ def test_upgrade_probe_refuses_actual_dispatch_including_direct_http_tools(monke
             types.CallToolRequest(method="tools/call", params=types.CallToolRequestParams(
                 name=name, arguments=arguments)))
         assert wire.root.structuredContent == denied
-        assert len(tools) == 44
+        assert len(tools) == 45
         # Every published tool is refused before validation or execution.
         for tool in tools:
             assert await shim.mcp.call_tool(tool.name, {}) == denied
@@ -1251,7 +1251,7 @@ def test_upgrade_probe_lists_tools_without_registration_and_cannot_call_member_t
     spec.loader.exec_module(shim)
     calls = []
     monkeypatch.setattr(shim, "_request", lambda *args, **kwargs: calls.append((args, kwargs)))
-    assert len(asyncio.run(shim.mcp.list_tools())) == 44
+    assert len(asyncio.run(shim.mcp.list_tools())) == 45
     assert shim._ensure_registered() == {"ok": False, "error": {"code": "upgrade_probe_read_only"}}
     assert shim._state["member_id"] is None and shim._state["capability_token"] is None
     assert calls == []
@@ -1491,3 +1491,23 @@ def test_preflight_tool_passes_a_server_refusal_through(monkeypatch):
     monkeypatch.setattr(shim, "_guard", lambda: None)
     monkeypatch.setattr(shim, "_request", lambda *args, **kwargs: refusal)
     assert shim.synth_city_preflight_request("initial_plan", 19, "attempt", "Plan") == refusal
+
+
+def test_the_leader_extension_tool_posts_one_request_and_changes_nothing_else(monkeypatch):
+    """#938: one tool, one POST; the Leader's call carries the nonce, minutes and reason and nothing else."""
+    import mcp_shim.agent_mail_server as shim
+
+    calls = []
+    monkeypatch.setattr(shim, "_guard", lambda: None)
+    monkeypatch.setattr(shim, "_counts", lambda: {})
+
+    def fake_request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"ok": True, "data": {"extension_minutes": 15, "effective_limit_minutes": 75, "repeated": False}}
+
+    monkeypatch.setattr(shim, "_request", fake_request)
+    answer = shim.synth_city_extend_effort_limit(19, "nonce-19", 15, "healthy and close to done")
+    assert answer == {"ok": True, "extension_minutes": 15, "effective_limit_minutes": 75, "repeated": False}
+    assert calls == [("POST", "/effort-extensions", {"json": {
+        "work_item_id": 19, "dispatch_nonce": "nonce-19", "minutes": 15, "reason": "healthy and close to done"}})]
+    assert "not the owner's reported active effort" in " ".join(shim.synth_city_extend_effort_limit.__doc__.split())

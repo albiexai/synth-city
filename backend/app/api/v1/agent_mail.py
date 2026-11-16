@@ -758,6 +758,31 @@ async def _record_decision_notice(
         await db.rollback()
 
 
+class MailEffortExtensionRequest(BaseModel):
+    work_item_id: int
+    dispatch_nonce: str
+    minutes: Any = None
+    reason: Any = None
+
+
+@router.post("/effort-extensions")
+async def extend_effort_limit(
+    request: MailEffortExtensionRequest,
+    session: MailAgentSession = Depends(require_mail_session),
+    db: AsyncSession = Depends(get_db),
+):
+    """The Leader's one extension of an item's effort limit (#938). It never changes an expiry."""
+    from app.services.github_effort_limit_service import EffortLimitError, effort_limit_service
+
+    try:
+        result = await effort_limit_service.extend(
+            db, work_item_id=request.work_item_id, dispatch_nonce=request.dispatch_nonce,
+            leader_member_id=session.member_id, minutes=request.minutes, reason=request.reason)
+    except EffortLimitError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+    return result
+
+
 @router.post("/continuation-decisions", response_model=MailMessageResponse)
 async def decide_work_item_continuation(
     request: MailContinuationDecisionRequest,

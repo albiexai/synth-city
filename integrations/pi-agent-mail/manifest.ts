@@ -309,6 +309,38 @@ export const manifest = [
     }
   },
   {
+    "name": "synth_city_extend_effort_limit",
+    "description": "Leader only: extend a work item's effort limit once, by at most 30 minutes or 25 percent of the limit.\n\n    The limit and its ledger are advisory elapsed working time from the system, not the owner's reported active\n    effort. The extension changes no expiry, nonce, lease or status. The owner asks for it by Mail.\n    ",
+    "inputSchema": {
+      "properties": {
+        "work_item_id": {
+          "title": "Work Item Id",
+          "type": "integer"
+        },
+        "dispatch_nonce": {
+          "title": "Dispatch Nonce",
+          "type": "string"
+        },
+        "minutes": {
+          "title": "Minutes",
+          "type": "integer"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "work_item_id",
+        "dispatch_nonce",
+        "minutes",
+        "reason"
+      ],
+      "title": "synth_city_extend_effort_limitArguments",
+      "type": "object"
+    }
+  },
+  {
     "name": "synth_city_get_backlog_coordination",
     "description": "Current Leader: read the assigned backlog, observations and request version.\n\n    Reconcile reviewed dependency/milestone gates and already-landed fixes even for\n    issues without a dispatch-ready label. While ON, this read returns a short-lived\n    snapshot_token for publishing a current assessment without another notification.\n    Read again immediately before reporting; keep the token private. OFF/HOLD reads\n    grant no publication challenge. This tool grants no implementation authority.\n    ",
     "inputSchema": {

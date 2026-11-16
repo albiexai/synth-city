@@ -268,6 +268,7 @@ class TeamGithubScope(Base):
     max_concurrent_dispatched: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
     max_verification_retries: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
     max_auto_merges_per_day: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
+    max_item_effort_minutes: Mapped[int] = mapped_column(Integer, default=120, server_default="120", nullable=False)
     base_ref: Mapped[str] = mapped_column(String, default="origin/HEAD", nullable=False)
     builds_out_of_tree: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     build_dir_template: Mapped[str | None] = mapped_column(String, default="build", nullable=True)
@@ -436,6 +437,14 @@ class GithubWorkItem(Base):
     continuation_activated_at: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True
     )
+    # Effort limit (#938): advisory elapsed working time against the approved estimate; it never expires work.
+    effort_estimate_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    effort_limit_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    effort_elapsed_seconds: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    effort_last_tick_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    effort_extension_minutes: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    effort_extension_decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    effort_extension_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 

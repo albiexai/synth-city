@@ -2757,6 +2757,10 @@ class GithubDispatchService:
         preset_slots: list[AgentTeamSlot],
         wake_state_by_slot: dict[int, str] | None = None,
     ) -> None:
+        # #938: advance the advisory effort ledger of this scope's limited items; it never ends or expires work.
+        from app.services.github_effort_limit_service import effort_limit_service
+
+        await effort_limit_service.tick_scope(db, scope)
         enabled = sorted(
             [slot for slot in preset_slots if slot.enabled],
             key=lambda slot: slot.position,

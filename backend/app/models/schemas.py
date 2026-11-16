@@ -2704,6 +2704,7 @@ class TeamGithubScopeCreate(BaseModel):
     max_concurrent_dispatched: int = Field(default=3, ge=1)
     max_verification_retries: int = Field(default=2, ge=0)
     max_auto_merges_per_day: int = Field(default=5, ge=0)
+    max_item_effort_minutes: int = Field(default=120, ge=15, le=1440)
     base_ref: str = "origin/HEAD"
     github_auth_mode: Literal["unknown", "ambient", "app"] = "unknown"
     builds_out_of_tree: bool = False
@@ -2725,6 +2726,7 @@ class TeamGithubScopeUpdate(BaseModel):
     max_concurrent_dispatched: Optional[int] = Field(default=None, ge=1)
     max_verification_retries: Optional[int] = Field(default=None, ge=0)
     max_auto_merges_per_day: Optional[int] = Field(default=None, ge=0)
+    max_item_effort_minutes: Optional[int] = Field(default=None, ge=15, le=1440)
     base_ref: Optional[str] = None
     github_auth_mode: Optional[Literal["unknown", "ambient", "app"]] = None
     builds_out_of_tree: Optional[bool] = None
@@ -2753,6 +2755,7 @@ class TeamGithubScopeResponse(BaseModel):
     max_concurrent_dispatched: int
     max_verification_retries: int
     max_auto_merges_per_day: int
+    max_item_effort_minutes: int = 120
     auto_merges_last_24h: Optional[int] = None
     base_ref: str
     builds_out_of_tree: bool

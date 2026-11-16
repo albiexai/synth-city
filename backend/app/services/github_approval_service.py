@@ -35,6 +35,7 @@ from app.services import companion_paths, request_preflight
 from app.services import factory_audit_service as audit
 from app.services.agent_mail_service import agent_mail_service
 from app.services.continuation_phase_guidance import PHASE_GUIDANCE
+from app.services.github_effort_limit_service import EffortLimitError, effort_limit_service
 from app.services.github_app_auth_service import (
     GithubAppAuthError,
     github_app_auth_service,
@@ -2189,6 +2190,13 @@ class GithubApprovalService:
         owner, leader = await self._current_participants(db, item)
         if owner.id != authenticated_owner_member_id:
             raise GithubApprovalError("not_item_owner", status_code=403)
+        # #938: the estimate becomes the item's effort limit; an estimate over the scope ceiling is refused here,
+        # before anything is written or any request is created.
+        effort_scope = await db.get(TeamGithubScope, item.scope_id)
+        try:
+            effort_limit = effort_limit_service.limit_for_plan(plan_metadata, effort_scope)
+        except EffortLimitError as exc:
+            raise GithubApprovalError(exc.code, status_code=exc.status_code) from exc
 
         if not commit:
             # Serialize the composing API before looking up pending/terminal
@@ -2280,7 +2288,8 @@ class GithubApprovalService:
                 GithubWorkItem.owner_slot_id == owner.team_slot_id,
                 ~terminal_exists,
             )
-            .values(updated_at=GithubWorkItem.updated_at)
+            .values(updated_at=GithubWorkItem.updated_at, effort_estimate_minutes=effort_limit,
+                    effort_limit_minutes=effort_limit)
             .execution_options(synchronize_session=False)
         )
         if guard.rowcount != 1:

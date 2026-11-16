@@ -853,6 +853,10 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         await conn.execute(
             text("ALTER TABLE team_github_scopes ADD COLUMN max_auto_merges_per_day INTEGER DEFAULT 5 NOT NULL")
         )
+    if scope_columns and "max_item_effort_minutes" not in scope_columns:
+        await conn.execute(
+            text("ALTER TABLE team_github_scopes ADD COLUMN max_item_effort_minutes INTEGER DEFAULT 120 NOT NULL")
+        )
     if scope_columns and "base_ref" not in scope_columns:
         await conn.execute(
             text("ALTER TABLE team_github_scopes ADD COLUMN base_ref VARCHAR DEFAULT 'origin/HEAD' NOT NULL")
@@ -1008,6 +1012,17 @@ async def _run_sqlite_compat_migrations(conn) -> None:
                 "ALTER TABLE github_work_items ADD COLUMN continuation_nudged_at DATETIME"
             )
         )
+    for column, definition in (
+        ("effort_estimate_minutes", "INTEGER"),
+        ("effort_limit_minutes", "INTEGER"),
+        ("effort_elapsed_seconds", "INTEGER DEFAULT 0 NOT NULL"),
+        ("effort_last_tick_at", "DATETIME"),
+        ("effort_extension_minutes", "INTEGER DEFAULT 0 NOT NULL"),
+        ("effort_extension_decided_at", "DATETIME"),
+        ("effort_extension_reason", "VARCHAR"),
+    ):
+        if work_item_columns and column not in work_item_columns:
+            await conn.execute(text(f"ALTER TABLE github_work_items ADD COLUMN {column} {definition}"))
     if work_item_columns and "continuation_activated_at" not in work_item_columns:
         await conn.execute(
             text(

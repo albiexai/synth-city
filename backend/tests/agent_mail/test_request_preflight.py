@@ -28,7 +28,8 @@ from tests.agent_teams.test_github_workspace_api import (
 from tests.agent_teams.test_scope_amendments import amendment, healthy_attempt  # noqa: F401
 
 URL = "/api/v1/agent-mail/preflight-request"
-SCOPE = SimpleNamespace(max_scope_paths=32, max_scope_commands=16, max_failed_heads_per_revision=2)
+SCOPE = SimpleNamespace(max_scope_paths=32, max_scope_commands=16, max_failed_heads_per_revision=2,
+                        max_item_effort_minutes=60)
 IMPLEMENTATION = ["edit_production", "push_pr_head", "request_verification"]
 FALLBACK = {"target": "hosted_ci", "if_missing": "install_temporarily", "package": "ruff", "revert_required": True}
 
@@ -206,11 +207,21 @@ def test_an_unknown_kind_is_refused():
 # --- The estimate against the current window ---------------------------------------------------
 
 
-def test_the_window_today_is_the_fixed_proposal_expiry(monkeypatch):
-    assert request_preflight.authority_window_minutes(SCOPE) == settings.github_continuation_proposal_expiry_seconds / 60 == 60
+def test_the_window_is_the_scope_effort_ceiling_not_the_proposal_expiry(monkeypatch):
+    """#938 option C: the estimate is judged against max_item_effort_minutes; the proposal expiry is unrelated."""
+    assert request_preflight.authority_window_minutes(SCOPE) == 60
     monkeypatch.setattr(settings, "github_continuation_proposal_expiry_seconds", 7200)
-    assert request_preflight.authority_window_minutes(SCOPE) == 120
-    assert request_preflight.preflight("continuation", **continuation(estimate=90)).ok
+    assert request_preflight.authority_window_minutes(SCOPE) == 60
+    ceiling = SimpleNamespace(**{**vars(SCOPE), "max_item_effort_minutes": 120})
+    assert request_preflight.authority_window_minutes(ceiling) == 120
+    assert request_preflight.preflight("continuation", **continuation(estimate=90, scope=ceiling)).ok
+    assert request_preflight.authority_window_minutes(None) == 120
+
+
+def test_the_ceiling_message_names_the_effort_ceiling():
+    result = request_preflight.preflight("continuation", **continuation(estimate=90))
+    messages = [p.message for p in result.problems if p.code == "estimate_exceeds_window"]
+    assert messages and "effort ceiling" in messages[0] and "60" in messages[0]
 
 
 @pytest.mark.parametrize("estimate,code,warned", [
@@ -397,7 +408,7 @@ async def test_the_route_reports_problems_and_writes_nothing(client, db):
     assert clean.status_code == 200, clean.text
     assert clean.json() == {"passed": True, "problems": [], "warnings": []}
     bad = await client.post(URL, headers=headers, json=body(
-        item, phase="bogus", allowed_paths=["/abs"], estimate_active_minutes=90))
+        item, phase="bogus", allowed_paths=["/abs"], estimate_active_minutes=150))
     assert bad.status_code == 200
     payload = bad.json()
     assert payload["passed"] is False
