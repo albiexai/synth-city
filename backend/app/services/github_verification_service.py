@@ -1693,11 +1693,9 @@ class GithubVerificationService:
                 reason = f"Settled revision not promoted: {acceptance_note}"
             elif not await self._head_is_green(scope, client, head, item=item):
                 reason = f"Settled revision not promoted: the required checks are not all green at {head[:7]}."
+        context = (item_before, scope_before, revision_before)
         if reason is not None:
-            if item.status_note != reason:
-                item.status_note = reason
-                item.updated_at = datetime.utcnow()
-                await db.commit()
+            await self._record_settled_note(db, scope, item, revision, context, reason)
             return
         policy_guard = policy_context(item)
         if not await claim_policy_context(db, item, policy_guard):
@@ -1708,25 +1706,16 @@ class GithubVerificationService:
         ):
             return
         if self._head_sha(fresh) != head:
-            await self._record_readiness_hold(
-                db, item, "Head changed before readiness; verifying the current head.")
+            await self._record_settled_note(
+                db, scope, item, revision, context, "Head changed before readiness; verifying the current head.")
             return
         readiness_note = self._draft_readiness_note(item, fresh)
         if readiness_note is not None:
-            item.last_verified_sha = head
-            await self._record_readiness_hold(db, item, readiness_note)
+            await self._record_settled_note(db, scope, item, revision, context, readiness_note, last_verified=head)
             return
         # No network call from here to the commit: the writer is held only for the compare and the write.
-        await lock_terminal_transition(db, item)
-        await db.refresh(item)
-        await db.refresh(scope)
-        await db.refresh(revision)
-        if ({name: getattr(item, name) for name in _SETTLEMENT_ITEM_IDENTITY} != item_before
-                or {name: getattr(scope, name) for name in _SETTLEMENT_SCOPE_IDENTITY} != scope_before
-                or {column.name: getattr(revision, column.name) for column in revision.__table__.columns}
-                != revision_before
-                or revision.status != "completed" or revision.completed_at is None
-                or revision.submitted_head_sha != head):
+        await self._fence_settled_context(db, scope, item, revision, context)
+        if revision.status != "completed" or revision.completed_at is None or revision.submitted_head_sha != head:
             raise TerminalRevisionContextChanged("terminal_revision_context_changed")
         item.last_verified_sha = head
         item.dispatch_status = "ready_for_review"
@@ -1737,14 +1726,52 @@ class GithubVerificationService:
         await db.commit()
         await self._process_review_item(db, scope, item, client, pull=fresh)
 
+    async def _fence_settled_context(
+        self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem,
+        revision: GithubAttemptScopeRevision, context: tuple,
+    ) -> None:
+        """Take the terminal writer and compare the item, scope and revision with what the decision rested on.
+
+        No network call may sit between this and the write that follows. A lost fence raises, so nothing is written.
+        """
+        item_before, scope_before, revision_before = context
+        await lock_terminal_transition(db, item)
+        await db.refresh(item)
+        await db.refresh(scope)
+        await db.refresh(revision)
+        if ({name: getattr(item, name) for name in _SETTLEMENT_ITEM_IDENTITY} != item_before
+                or {name: getattr(scope, name) for name in _SETTLEMENT_SCOPE_IDENTITY} != scope_before
+                or {column.name: getattr(revision, column.name) for column in revision.__table__.columns}
+                != revision_before):
+            raise TerminalRevisionContextChanged("terminal_revision_context_changed")
+
+    async def _record_settled_note(
+        self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem,
+        revision: GithubAttemptScopeRevision, context: tuple, note: str, *, last_verified: str | None = None,
+    ) -> None:
+        """Record why a settled revision was not promoted, only under the fence and only when it changes.
+
+        A note written after an awaited read would otherwise overwrite the note of a new attempt that replaced
+        the item meanwhile.
+        """
+        if item.status_note == note and (last_verified is None or item.last_verified_sha == last_verified):
+            return
+        await self._fence_settled_context(db, scope, item, revision, context)
+        if last_verified is not None:
+            item.last_verified_sha = last_verified
+        item.status_note = note
+        item.updated_at = datetime.utcnow()
+        await db.commit()
+
     @staticmethod
     async def _settled_context_note(db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem,
                                     head: str) -> str | None:
         """Why a merge must not go ahead because the settlement or the scope it rested on was withdrawn, or ``None``.
 
         Read fresh, column by column, so a change another connection committed while GitHub was awaited is seen.
-        Only an item that has a scoped revision row is judged: its revision must still be completed, with its
-        completion time and the very head being merged, and the scope must still be enabled.
+        Only an item that has a scoped revision row is judged, whatever its phase: the revision must still be
+        completed with its completion time, an implementation revision must carry the very head being merged, and
+        the scope must still be enabled.
         """
         if not item.active_scope_revision:
             return None
@@ -1755,11 +1782,12 @@ class GithubVerificationService:
                    GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce,
                    GithubAttemptScopeRevision.revision == item.active_scope_revision)
         )).first()
-        if row is None or row.phase != "implementation":
+        if row is None:
             return None
         enabled = await db.scalar(select(TeamGithubScope.enabled).where(TeamGithubScope.id == scope.id))
-        if (row.status != "completed" or row.completed_at is None or row.submitted_head_sha != head
-                or enabled is not True):
+        # A settled diagnostic restores the baseline, so only an implementation row must carry the merged head.
+        if (row.status != "completed" or row.completed_at is None or enabled is not True
+                or (row.phase == "implementation" and row.submitted_head_sha != head)):
             return ("Auto-merge blocked: the settled revision or the scope changed since promotion; "
                     "verifying the current state.")
         return None

@@ -347,3 +347,129 @@ async def test_the_terminal_writer_is_taken_once_before_the_promotion_is_written
     await case.tick()
     assert calls == ["verifying"], calls  # the item was still verifying when the writer was taken
     assert case.item.dispatch_status == "ready_for_review"
+
+
+# --- V1 review 5914361919: the boundary judges the revision by status for every phase, and notes are fenced ----
+
+
+@pytest.mark.asyncio
+async def test_a_revision_turned_diagnostic_and_superseded_before_the_merge_does_not_merge(twin):
+    db, maker = twin
+    case = await settled_case(db)
+    revision_id = case.revision.id
+    original, state = case.client.list_check_runs_for_ref, {"calls": 0}
+
+    async def racing(owner, repo, ref):
+        state["calls"] += 1
+        if state["calls"] == 2:
+            async with maker() as other:
+                await other.execute(_update(GithubAttemptScopeRevision)
+                                    .where(GithubAttemptScopeRevision.id == revision_id)
+                                    .values(phase="diagnostic", status="superseded"))
+                await other.commit()
+        return await original(owner, repo, ref)
+
+    case.client.list_check_runs_for_ref = racing
+    await case.tick()
+    assert state["calls"] >= 2
+    assert case.client.merge_calls == 0 and case.item.dispatch_status != "merged"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase,status,completed,head,blocked", [
+    ("implementation", "completed", True, HEAD, False),
+    ("implementation", "completed", True, OTHER, True),
+    ("implementation", "completed", False, HEAD, True),
+    ("implementation", "superseded", True, HEAD, True),
+    ("implementation", "active", True, HEAD, True),
+    ("diagnostic", "completed", True, OTHER, False),   # a settled diagnostic restores the baseline: no head match
+    ("diagnostic", "completed", False, OTHER, True),
+    ("diagnostic", "superseded", True, OTHER, True),
+    ("diagnostic", "submitted", True, OTHER, True),
+])
+async def test_the_boundary_judges_a_revision_row_by_its_status_in_every_phase(db, phase, status, completed, head,
+                                                                              blocked):
+    case = await settled_case(db)
+    await db.execute(_update(GithubAttemptScopeRevision).where(GithubAttemptScopeRevision.id == case.revision.id)
+                     .values(phase=phase, status=status, completed_at=SETTLED_AT if completed else None))
+    await db.commit()
+    note = await service._settled_context_note(db, case.scope, case.item, head)
+    assert (note is not None) == blocked, note
+
+
+@pytest.mark.asyncio
+async def test_an_item_with_no_revision_row_is_not_judged_by_the_boundary(db):
+    case = await settled_case(db)
+    await db.execute(_update(GithubWorkItem).where(GithubWorkItem.id == case.item.id).values(active_scope_revision=0))
+    await db.commit()
+    await db.refresh(case.item)
+    assert await service._settled_context_note(db, case.scope, case.item, HEAD) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocker", ["checks", "acceptance", "head"])
+async def test_a_note_never_overwrites_a_new_attempt_that_replaced_the_item_during_the_read(twin, blocker):
+    db, maker = twin
+    overrides = {"checks": dict(checks=[{"name": "ci", "status": "in_progress", "conclusion": None}]),
+                 "acceptance": dict(accepted_head=None), "head": dict(pull_head=OTHER)}[blocker]
+    case = await settled_case(db, **overrides)
+    item_id = case.item.id
+    original, state = case.client.list_check_runs_for_ref, {"fired": False}
+
+    async def replace_the_attempt():
+        async with maker() as other:
+            await other.execute(_update(GithubWorkItem).where(GithubWorkItem.id == item_id).values(
+                dispatch_nonce="a-newer-attempt", dispatch_status="dispatched",
+                status_note="The new attempt is healthy."))
+            await other.commit()
+        state["fired"] = True
+
+    async def racing_checks(owner, repo, ref):
+        if not state["fired"]:
+            await replace_the_attempt()
+        return await original(owner, repo, ref)
+
+    case.client.list_check_runs_for_ref = racing_checks
+    original_pull = case.client.get_pull
+
+    async def racing_pull(owner, repo, number):
+        pull = await original_pull(owner, repo, number)
+        if blocker != "checks" and not state["fired"]:
+            await replace_the_attempt()
+        return pull
+
+    case.client.get_pull = racing_pull
+    await case.tick()
+    await db.refresh(case.item)
+    assert state["fired"]
+    assert case.item.status_note == "The new attempt is healthy."
+    assert case.client.merge_calls == 0
+
+
+
+@pytest.mark.asyncio
+async def test_the_policy_claim_holds_the_writer_across_the_fresh_pr_read(twin):
+    """After the policy claim the first connection holds the SQLite writer, so a second connection cannot commit
+    a replacement attempt during the fresh PR read: the draft and head-changed notes need no further fence."""
+    db, maker = twin
+    case = await settled_case(db, draft=True)
+    item_id = case.item.id
+    original, outcome = case.client.get_pull, {"calls": 0, "blocked": False}
+
+    async def probing(owner, repo, number):
+        outcome["calls"] += 1
+        if outcome["calls"] == 2:
+            from sqlalchemy.exc import OperationalError
+            async with maker() as other:
+                try:
+                    await other.execute(_update(GithubWorkItem).where(GithubWorkItem.id == item_id)
+                                        .values(status_note="a second connection wrote"))
+                    await other.commit()
+                except OperationalError:
+                    outcome["blocked"] = True
+                    await other.rollback()
+        return await original(owner, repo, number)
+
+    case.client.get_pull = probing
+    await case.tick()
+    assert outcome["calls"] >= 2 and outcome["blocked"] is True
