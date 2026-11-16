@@ -17,11 +17,12 @@ from sqlalchemy import JSON, exists, insert, literal, select
 from sqlalchemy.exc import IntegrityError
 
 from app.models.database import (
-    AgentTeamPreset, FactoryAuditEvent, GithubMaintenanceEvent, GithubOwnerObservationPause, GithubWorkItem,
+    AgentTeamPreset, AgentTeamSlot, FactoryAuditEvent, GithubMaintenanceEvent, GithubAttemptScopeRevision, GithubOwnerObservationPause, GithubWorkItem,
     GithubWorkspace, MailAgentSession, MailExternalActor, MailMessage, MailReceipt, TeamGithubScope,
 )
 from app.models.api_model import naive_utc_confirmation
 from app.services import factory_audit_service as audit
+from app.services.agent_mail_service import agent_mail_service
 from app.services.github_approval_service import (
     ActiveCancellationNoticeError, GithubApprovalError, github_approval_service,
 )
@@ -67,6 +68,33 @@ def _actor(ctx: _Ctx) -> dict:
     return audit.derive_actor(actor_kind="member", member_id=ctx.member_id, session_id=ctx.session_id)
 
 
+async def _fresh_leader(db, item_id):
+    """The current Leader member, read from the database now.
+
+    The shared participant lookup goes through ``db.get`` and so returns the preset this session already
+    loaded; a replacement Leader that another connection committed would not show. Every row here is a fresh
+    query. Owner separation is kept: the Leader must differ from the owner and sit in another slot.
+    """
+    item_row = (await db.execute(select(GithubWorkItem.scope_id, GithubWorkItem.owner_slot_id).where(
+        GithubWorkItem.id == item_id))).one_or_none()
+    preset_id = await db.scalar(select(TeamGithubScope.preset_id).where(
+        TeamGithubScope.id == item_row.scope_id)) if item_row is not None else None
+    leader_slot_id = await db.scalar(select(AgentTeamPreset.leader_slot_id).where(
+        AgentTeamPreset.id == preset_id)) if preset_id is not None else None
+    slot_id = await db.scalar(select(AgentTeamSlot.id).where(
+        AgentTeamSlot.id == leader_slot_id, AgentTeamSlot.preset_id == preset_id,
+        AgentTeamSlot.enabled.is_(True))) if leader_slot_id is not None else None
+    owner = await agent_mail_service._slot_member(db, item_row.owner_slot_id) if item_row is not None else None
+    leader = await agent_mail_service._slot_member(db, slot_id)
+    if owner is None:
+        raise LeaderRecoveryError("owner_not_registered")
+    if leader is None:
+        raise LeaderRecoveryError("leader_not_registered")
+    if owner.id == leader.id or owner.team_slot_id == leader.team_slot_id:
+        raise LeaderRecoveryError("owner_cannot_approve_own_work")
+    return leader
+
+
 async def _authorize(db, item, session, *, need_supervisor=True):
     """The same current-Leader proof the settle tools use, plus the stop conditions and the bound Supervisor."""
     if hold_code():
@@ -75,10 +103,7 @@ async def _authorize(db, item, session, *, need_supervisor=True):
     preset = await db.get(AgentTeamPreset, scope.preset_id) if scope is not None else None
     if scope is None or preset is None or not scope.enabled or not preset.autonomy_enabled:
         raise LeaderRecoveryError("recovery_context_unavailable")
-    try:
-        _owner, leader = await github_approval_service._current_participants(db, item)
-    except GithubApprovalError as exc:
-        raise LeaderRecoveryError(exc.detail, exc.status_code) from exc
+    leader = await _fresh_leader(db, item.id)
     if leader.id != session.member_id:
         raise LeaderRecoveryError("leader_only", 403)
     supervisor = None
@@ -123,10 +148,7 @@ async def _assert_authority(db, ctx, *, terminal=False):
             MailAgentSession.id == ctx.session_id, MailAgentSession.member_id == ctx.member_id,
             MailAgentSession.closed_at.is_(None))) is None:
         raise LeaderRecoveryError("leader_only", 403)
-    try:
-        _owner, leader = await github_approval_service._current_participants(db, await db.get(GithubWorkItem, ctx.item_id))
-    except GithubApprovalError as exc:
-        raise LeaderRecoveryError(exc.detail, exc.status_code) from exc
+    leader = await _fresh_leader(db, ctx.item_id)
     if leader.id != ctx.member_id:
         raise LeaderRecoveryError("leader_only", 403)
     await _refuse_observation_pause(db, ctx.item_id)
@@ -173,6 +195,36 @@ async def _unclaim(db, kind, operation_id):
     if event is not None:
         await db.delete(event)
         await db.commit()
+
+
+async def _effect_recorded(db, kind, ctx, operation_id, *, revision_number=None, workspace_id=None, leased_at=None):
+    """Whether the action this operation id claimed has committed, proved by its own recorded fact."""
+    if kind == "release":
+        return await _release_applied(db, workspace_id, leased_at)
+    if kind == "finalize":
+        return await db.scalar(select(GithubMaintenanceEvent.id).where(
+            GithubMaintenanceEvent.operation_id == f"finalize_merged:{operation_id}")) is not None
+    revision_id = await db.scalar(select(GithubAttemptScopeRevision.id).where(
+        GithubAttemptScopeRevision.work_item_id == ctx.item_id,
+        GithubAttemptScopeRevision.revision == revision_number))
+    return revision_id is not None and await db.scalar(select(FactoryAuditEvent.id).where(
+        FactoryAuditEvent.event_kind == "recovery_cancellation", FactoryAuditEvent.action_outcome == "applied",
+        FactoryAuditEvent.operation_id == f"active_cancellation:revision:{revision_id}")) is not None
+
+
+async def _abandon(db, kind, ctx, operation_id, replay, **proof):
+    """A refused or lost action frees its operation id only if the action did not commit.
+
+    The claim record is shared with every replay. A claimant that lost the race to its own replay must not
+    erase the record the winner's success rests on; it answers with the replay outcome instead. True means the
+    effect is recorded and the claim stays.
+    """
+    await db.rollback()
+    if await _effect_recorded(db, kind, ctx, operation_id, **proof):
+        return True
+    if not replay:
+        await _unclaim(db, kind, operation_id)
+    return False
 
 
 async def _insert_notice(db, *, preset_id, leader_member_id, supervisor_actor_id, key, subject, body, payload) -> bool:
@@ -237,14 +289,12 @@ async def cancel_revision(db, item, session, *, revision_number, dispatch_nonce,
             actor=_actor(ctx), before_commit=lambda: _assert_authority(db, ctx))
     except ActiveCancellationNoticeError as exc:
         owner_notice_error, changed = exc, True  # the cancellation is committed; only its owner notice failed
-    except GithubApprovalError as exc:
-        if not replay:
-            await _unclaim(db, "cancel", operation_id)
-        raise LeaderRecoveryError(exc.detail, exc.status_code) from exc
-    except LeaderRecoveryError:
-        if not replay:
-            await _unclaim(db, "cancel", operation_id)
-        raise
+    except (GithubApprovalError, LeaderRecoveryError) as exc:
+        if not await _abandon(db, "cancel", ctx, operation_id, replay, revision_number=revision_number):
+            if isinstance(exc, LeaderRecoveryError):
+                raise
+            raise LeaderRecoveryError(exc.detail, exc.status_code) from exc
+        changed = False  # the cancellation committed under this operation id (a replay won): answer as the replay
     notice = await _notify(db, ctx, kind="cancel", operation_id=operation_id,
         digest=digest, summary=f"revision {revision_number} was cancelled.", reason=reason)
     if owner_notice_error is not None:
@@ -274,14 +324,12 @@ async def finalize_merged(db, item, session, *, read_pull, operation_id, expecte
         result = await finalize_merged_item(db, item, scope, read_pull, expected_context_sha256=expected_context_sha256,
             operation_id=operation_id, reason=reason, decided_by="the Leader", actor=_actor(ctx),
             before_commit=lambda: _assert_authority(db, ctx))
-    except ValueError as exc:
-        if not replay:
-            await _unclaim(db, "finalize", operation_id)
-        raise LeaderRecoveryError(str(exc)) from None
-    except LeaderRecoveryError:
-        if not replay:
-            await _unclaim(db, "finalize", operation_id)
-        raise
+    except (ValueError, LeaderRecoveryError) as exc:
+        if not await _abandon(db, "finalize", ctx, operation_id, replay):
+            if isinstance(exc, LeaderRecoveryError):
+                raise
+            raise LeaderRecoveryError(str(exc)) from None
+        result = {"status": "already_finalized"}  # the finalize committed under this operation id: answer as the replay
     notice = await _notify(db, ctx, kind="finalize", operation_id=operation_id,
         digest=digest, summary="the merged pull request was recorded.", reason=reason)
     return {"status": result["status"], "work_item_id": ctx.item_id, "notice": notice}
@@ -329,8 +377,8 @@ async def release_workspace(db, item, session, *, workspace_id, expected_leased_
         replay = await _claim(db, ctx.item_id, "release", operation_id, digest)
     await _reload(db, item, scope, workspace)
     if not _held(workspace, ctx.item_id, expected_leased_at):
-        if replay and workspace.leased_item_id != ctx.item_id and await _release_applied(db, workspace_id, expected_leased_at):
-            return await already_released()
+        if workspace.leased_item_id != ctx.item_id and await _release_applied(db, workspace_id, expected_leased_at):
+            return await already_released()  # a replay released it; the shared claim record stays
         if not replay:
             await _unclaim(db, "release", operation_id)
         raise LeaderRecoveryError("workspace_lease_changed")
@@ -345,14 +393,12 @@ async def release_workspace(db, item, session, *, workspace_id, expected_leased_
     except GithubWorkspaceConfigError as exc:
         raise LeaderRecoveryError(exc.block_code) from exc
     except LeaderRecoveryError:
-        if not replay:
-            await _unclaim(db, "release", operation_id)
+        if await _abandon(db, "release", ctx, operation_id, replay, workspace_id=workspace_id, leased_at=expected_leased_at):
+            return await already_released()
         raise
     if not released:
-        if replay and await _release_applied(db, workspace_id, expected_leased_at):
-            return await already_released()
-        if not replay:
-            await _unclaim(db, "release", operation_id)
+        if await _abandon(db, "release", ctx, operation_id, replay, workspace_id=workspace_id, leased_at=expected_leased_at):
+            return await already_released()  # a replay released it; the shared claim record stays
         raise LeaderRecoveryError("workspace_lease_changed")
     notice = await _notify(db, ctx, kind="release", operation_id=operation_id,
         digest=digest, summary=f"workspace {workspace_id} was released.", reason=reason)

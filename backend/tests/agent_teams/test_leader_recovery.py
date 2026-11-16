@@ -586,13 +586,17 @@ async def test_authority_that_changes_during_the_external_effects_stops_the_comm
     a = releasable
     item_id = a.item.id
 
-    async def revoke(*_args, **_kwargs):
+    async def write_config(*_args, **_kwargs):  # the last external mutation: the hold arrives while it runs
         monkeypatch.setattr(lr, "hold_code", lambda: "operator_hold")
-    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", AsyncMock(side_effect=revoke))
-    monkeypatch.setattr(lr.github_workspace_service, "remove_managed_worktree_config", AsyncMock())
+    restorer = AsyncMock()
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", AsyncMock())
+    monkeypatch.setattr(lr.github_workspace_service, "snapshot_worktree_config", AsyncMock(return_value={"snap": 1}))
+    monkeypatch.setattr(lr.github_workspace_service, "remove_managed_worktree_config", AsyncMock(side_effect=write_config))
+    monkeypatch.setattr(lr.github_workspace_service, "restore_worktree_config", restorer)
     with pytest.raises(lr.LeaderRecoveryError) as error:
         await _release(db, a, a.leader_session)
     assert error.value.code == "operator_hold"
+    restorer.assert_called_once()  # the config removal ran, so the snapshot is restored on rollback
     await db.refresh(a.workspace)
     assert a.workspace.leased_item_id == item_id and await _notices(db) == []  # the database write was rolled back
 
@@ -609,3 +613,225 @@ async def test_a_replay_that_loses_the_final_compare_and_clear_is_reported_as_al
     monkeypatch.setattr(lr.github_workspace_service, "force_release_acquisition", AsyncMock(return_value=False))
     again = await _release(db, a, a.leader_session, expected_leased_at=a.workspace_leased_at)
     assert again["status"] == "already_released" and len(await _notices(db)) == 1
+
+
+# --- review 5920192577: residual findings ---------------------------------------------------------------------
+
+from app.models.database import AgentTeamPreset, GithubMaintenanceEvent
+
+
+async def _replace_leader_from_another_session(db, a):
+    """Another connection commits a replacement Leader slot; the request's own session never sees it by itself."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    other = async_sessionmaker(db.bind, expire_on_commit=False)()
+    try:
+        preset = await other.get(AgentTeamPreset, a.preset.id)
+        preset.leader_slot_id = a.item_owner_slot_id  # a different slot than the current Leader's
+        await other.commit()
+    finally:
+        await other.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("db", ["concurrent"], indirect=True)
+@pytest.mark.parametrize("action", ["finalize", "release", "cancel"])
+async def test_a_leader_replaced_by_another_session_during_the_probe_stops_the_action(db, releasable, monkeypatch, action):
+    a = releasable
+    a.item_owner_slot_id = a.item.owner_slot_id
+    flipped = {"n": 0}
+
+    async def flip():
+        if not flipped["n"]:
+            flipped["n"] = 1
+            await _replace_leader_from_another_session(db, a)
+    if action == "release":
+        async def probe(*_args):
+            await flip()
+            return None
+        monkeypatch.setattr(lr.github_workspace_service, "delegated_release_blocker", probe)
+    elif action == "cancel":
+        a.item.dispatch_status = "verifying"
+        await db.commit()
+        real = lr.github_approval_service._active_cancellation_head_sha
+
+        async def head(*args, **kwargs):
+            await flip()
+            return await real(*args, **kwargs)
+        monkeypatch.setattr(lr.github_approval_service, "_active_cancellation_head_sha", head)
+    else:
+        a.item.dispatch_status = "verifying"
+        await db.commit()
+        base = _merged_reader(a)
+        calls = {"n": 0}
+
+        async def read():
+            calls["n"] += 1
+            if calls["n"] >= 2:  # the digest read is done; this is the action's own second, final read
+                await flip()
+            return await base()
+        a.read = read
+    with pytest.raises(lr.LeaderRecoveryError):
+        if action == "finalize":
+            digest = (await lr.finalize_preview(db, a.item, a.leader_session, read_pull=_merged_reader(a)))["context_sha256"]
+            await db.refresh(a.item)
+            await db.refresh(a.leader_session)
+            await lr.finalize_merged(db, a.item, a.leader_session, read_pull=a.read, operation_id="fin-L",
+                                     expected_context_sha256=digest, reason=REASON)
+        else:
+            await _act(db, a, action)
+    await db.refresh(a.item)
+    assert await _notices(db) == []
+    if action == "release":
+        await db.refresh(a.workspace)
+        assert a.workspace.leased_item_id == a.item.id
+    else:
+        assert a.item.dispatch_status != "merged"
+
+
+@pytest.mark.asyncio
+async def test_a_hold_raised_in_the_revoker_stops_the_config_writer_and_skips_a_needless_restore(db, releasable, monkeypatch):
+    a = releasable
+    item_id = a.item.id
+    writer, restorer = AsyncMock(), AsyncMock()
+
+    async def revoke(*_args, **_kwargs):
+        monkeypatch.setattr(lr, "hold_code", lambda: "operator_hold")
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", AsyncMock(side_effect=revoke))
+    monkeypatch.setattr(lr.github_workspace_service, "snapshot_worktree_config", AsyncMock(return_value={"snap": 1}))
+    monkeypatch.setattr(lr.github_workspace_service, "remove_managed_worktree_config", writer)
+    monkeypatch.setattr(lr.github_workspace_service, "restore_worktree_config", restorer)
+    with pytest.raises(lr.LeaderRecoveryError) as error:
+        await _release(db, a, a.leader_session)
+    assert error.value.code == "operator_hold"
+    writer.assert_not_called()      # the next external mutation never started
+    restorer.assert_not_called()    # nothing was touched, so nothing is restored
+    await db.refresh(a.workspace)
+    assert a.workspace.leased_item_id == item_id and await _notices(db) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("db", ["concurrent"], indirect=True)
+@pytest.mark.parametrize("action", ["release", "finalize", "cancel"])
+async def test_a_claimant_that_loses_to_its_replay_keeps_the_ledger_and_a_third_request_replays(db, releasable, monkeypatch, action):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.models.database import GithubWorkItem
+    a = releasable
+    if action != "release":
+        a.item.dispatch_status = "verifying"
+        await db.commit()
+    workspace_id, item_id, session_id = a.workspace.id, a.item.id, a.leader_session.id  # plain values: rollbacks expire rows
+    target, name = {
+        "release": (lr.github_workspace_service, "force_release_acquisition"),
+        "finalize": (lr, "finalize_merged_item"),
+        "cancel": (lr.github_approval_service, "cancel_active_continuation"),
+    }[action]
+    real = getattr(target, name)
+    entered, gate, state = asyncio.Event(), asyncio.Event(), {"first": True}
+
+    async def paused(*args, **kwargs):
+        if state["first"]:           # the original claimant stops between its claim and its action
+            state["first"] = False
+            entered.set()
+            await gate.wait()
+        return await real(*args, **kwargs)
+    monkeypatch.setattr(target, name, paused)
+    other = async_sessionmaker(db.bind, expire_on_commit=False)()
+    try:
+        item2 = await other.get(GithubWorkItem, item_id)
+        session2 = await other.get(MailAgentSession, session_id)
+        read = _merged_reader(a)
+        digest = None
+        if action == "finalize":
+            digest = (await lr.finalize_preview(db, a.item, a.leader_session, read_pull=read))["context_sha256"]
+
+        def call(d, i, s):
+            if action == "release":
+                return lr.release_workspace(d, i, s, workspace_id=workspace_id,
+                    expected_leased_at=a.workspace_leased_at, operation_id="race-1", reason=REASON)
+            if action == "finalize":
+                return lr.finalize_merged(d, i, s, read_pull=read, operation_id="race-1",
+                    expected_context_sha256=digest, reason=REASON)
+            return lr.cancel_revision(d, i, s, revision_number=1, dispatch_nonce=a.nonce,
+                operation_id="race-1", reason=REASON)
+        first = asyncio.ensure_future(call(db, a.item, a.leader_session))
+        await entered.wait()
+        second = await call(other, item2, session2)   # the replay completes the whole action and its notice
+        gate.set()
+        first_result = await asyncio.gather(first, return_exceptions=True)
+        assert isinstance(first_result[0], dict), first_result  # the losing claimant answers as the replay outcome
+        ledger = (await db.execute(select(GithubMaintenanceEvent).where(
+            GithubMaintenanceEvent.operation_id == f"leader-recovery:{ {'release': 'release', 'finalize': 'finalize', 'cancel': 'cancel'}[action] }:race-1"))).scalars().all()
+        assert len(ledger) == 1                                 # the shared claim record survives
+        third = await call(other, item2, session2)
+        assert isinstance(third, dict) and isinstance(second, dict)
+    finally:
+        await other.close()
+    assert len(await _notices(db)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("db", ["concurrent"], indirect=True)
+async def test_a_claimant_that_finds_the_lease_gone_after_its_reload_answers_as_the_replay(db, releasable, monkeypatch):
+    """The other losing path: the replay finishes between the original claim and the claimant's reload."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.models.database import GithubWorkItem
+    a = releasable
+    workspace_id, item_id, session_id, leased_at = a.workspace.id, a.item.id, a.leader_session.id, a.workspace_leased_at
+    real = lr._claim
+    entered, gate, state = asyncio.Event(), asyncio.Event(), {"first": True}
+
+    async def paused_claim(*args, **kwargs):
+        result = await real(*args, **kwargs)
+        if state["first"]:
+            state["first"] = False
+            entered.set()
+            await gate.wait()
+        return result
+    monkeypatch.setattr(lr, "_claim", paused_claim)
+    other = async_sessionmaker(db.bind, expire_on_commit=False)()
+    try:
+        item2 = await other.get(GithubWorkItem, item_id)
+        session2 = await other.get(MailAgentSession, session_id)
+
+        def call(d, i, s):
+            return lr.release_workspace(d, i, s, workspace_id=workspace_id, expected_leased_at=leased_at,
+                                        operation_id="race-2", reason=REASON)
+        first = asyncio.ensure_future(call(db, a.item, a.leader_session))
+        await entered.wait()
+        await call(other, item2, session2)
+        gate.set()
+        result = (await asyncio.gather(first, return_exceptions=True))[0]
+        assert isinstance(result, dict) and result["status"] == "already_released", result
+        third = await call(other, item2, session2)
+        assert third["status"] == "already_released"
+    finally:
+        await other.close()
+    assert len(await _notices(db)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["cancel", "finalize"])
+async def test_abandon_keeps_the_claim_when_the_action_is_recorded_and_frees_it_otherwise(db, ready, kind):
+    a = ready
+    ctx = lr._ctx(a.item, a.leader_session)
+    op = "op-1" if kind == "cancel" else "fin-9"
+    proof = dict(revision_number=1) if kind == "cancel" else {}
+    if kind == "cancel":
+        digest = lr._digest("cancel", ctx.item_id, 1, a.nonce, REASON)
+        await _cancel(db, a, a.leader_session)
+    else:
+        digest = None
+        await _act(db, a, "finalize")
+    await db.refresh(a.item)
+    ctx = lr._ctx(a.item, a.leader_session)
+    claim = f"leader-recovery:{kind}:{op}"
+    assert await lr._abandon(db, kind, ctx, op, False, **proof) is True   # recorded: the claim stays
+    assert await db.scalar(select(GithubMaintenanceEvent.id).where(GithubMaintenanceEvent.operation_id == claim)) is not None
+    # an operation id whose action never happened is freed again
+    db.add(GithubMaintenanceEvent(operation_id=f"leader-recovery:{kind}:never", work_item_id=ctx.item_id,
+                                  outcome="claimed", request_sha256="x"))
+    await db.commit()
+    never = dict(revision_number=9) if kind == "cancel" else {}  # a revision that was never cancelled
+    assert await lr._abandon(db, kind, ctx, "never", False, **never) is False
+    assert await db.scalar(select(GithubMaintenanceEvent.id).where(
+        GithubMaintenanceEvent.operation_id == f"leader-recovery:{kind}:never")) is None
