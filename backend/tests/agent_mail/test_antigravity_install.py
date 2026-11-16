@@ -428,3 +428,20 @@ async def test_uninstall_removes_our_entries_under_both_keys_only(gemini, old_ow
     servers = json.loads(mcp.read_text())["mcpServers"]
     expected = {"mine": USER_SERVER} if old_owner == "ours" else {OLD_KEY: USER_SERVER, "mine": USER_SERVER}
     assert servers == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [None, "x", 1, [], {}, {"command": "/usr/bin/other", "args": ["--serve"]}])
+async def test_any_value_already_under_the_new_key_that_is_not_ours_is_refused(gemini, value):
+    # Review 5924741712: a present key with JSON null must count as a collision too.
+    mcp, hooks, scopes = gemini
+    mcp.parent.mkdir(parents=True)
+    original = json.dumps({"mcpServers": {NEW_KEY: value, OLD_KEY: _ours()}})
+    mcp.write_text(original)
+    hooks.write_text('{"user-group": {"Stop": []}}')
+    hooks_before = hooks.read_bytes()
+    with pytest.raises(ValueError):
+        await svc.apply_antigravity_install(None)
+    assert mcp.read_text() == original  # our old-key entry is not removed either
+    assert hooks.read_bytes() == hooks_before
+    assert scopes == []

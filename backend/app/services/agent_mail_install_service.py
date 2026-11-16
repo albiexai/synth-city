@@ -1616,8 +1616,8 @@ async def apply_antigravity_install(db: AsyncSession) -> AgentMailInstallStatus:
     for event in ANTIGRAVITY_MAIL_HOOKS:
         _antigravity_event_entries(hooks, event)
     servers = mcp.get("mcpServers", {})
-    current = servers.get(ANTIGRAVITY_MCP_SERVER_KEY)
-    if current is not None and not _is_our_antigravity_entry(current):
+    # Key presence, not its value, decides a collision: even a JSON null is someone else's entry.
+    if ANTIGRAVITY_MCP_SERVER_KEY in servers and not _is_our_antigravity_entry(servers[ANTIGRAVITY_MCP_SERVER_KEY]):
         raise ValueError(f"The Antigravity CLI MCP server '{ANTIGRAVITY_MCP_SERVER_KEY}' is not Synth City's; "
                          "rename or remove it before setting up Agent Mail")
     await _backup_before_mutation(db, "antigravity")
