@@ -1,7 +1,7 @@
 """Shared route dependencies for capability-token enforcement."""
 
 import hmac
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy import select
@@ -12,6 +12,7 @@ from app.database import get_db
 from app.models.database import MailAgentSession
 from app.services.agent_mail_service import agent_mail_service
 from app.utils import peer_process
+from app.utils.path_utils import resolve_scope_user, set_scope_home, _scope_home
 
 
 def resolve_request_pane_detailed(
@@ -197,3 +198,55 @@ async def require_mail_session_or_operator(
         return await mail_session(x_synth_city_session_token, db)
     await require_operator(x_synth_city_operator_token)
     return None
+
+
+def _permission_error(error: BaseException) -> Optional[PermissionError]:
+    """The PermissionError that caused this error, if one did."""
+    seen = 0
+    while error is not None and seen < 8:
+        if isinstance(error, PermissionError):
+            return error
+        error = error.__cause__ or error.__context__
+        seen += 1
+    return None
+
+
+async def apply_harness_scope(
+    request: Request,
+    x_harness_scope_user: Optional[str] = Header(default=None),
+) -> AsyncIterator[None]:
+    """Show one OS user's global scope for this request, and nothing else.
+
+    The user comes from the X-Harness-Scope-User header and must be one of scope_users(): the controller
+    itself or the configured agent user. With no header the default applies: the agent user when one is
+    configured, otherwise the controller. Other routers never run this, so backups and the controller's
+    own data keep the controller's home.
+
+    A non-controller home that the controller cannot read or write answers 403 and names the directory,
+    instead of a 500.
+    """
+    try:
+        user = resolve_scope_user(x_harness_scope_user)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except LookupError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    token = set_scope_home(user.home)
+    try:
+        yield
+    except (PermissionError, HTTPException) as error:
+        # Most routes turn an OSError into their own 500. Look for the permission error behind it.
+        denied = _permission_error(error)
+        if denied is None or user.is_controller:
+            raise
+        action = "read" if request.method in _READ_METHODS else "write"
+        where = denied.filename or str(user.home / ".claude")
+        raise HTTPException(
+            status_code=403,
+            detail=f"The controller cannot {action} {where}. It belongs to {user.name}.",
+        ) from error
+    finally:
+        try:
+            _scope_home.reset(token)
+        except ValueError:
+            pass

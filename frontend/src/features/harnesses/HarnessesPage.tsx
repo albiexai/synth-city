@@ -14,6 +14,7 @@ import { cn } from "@/lib/utils";
 import { surfaceRegistry, nativeAccess } from "@/features/native-settings/surfaceRegistry";
 import { SURFACE_GROUPS } from "@/features/harnesses/surfaceCatalog";
 import { HarnessBreadcrumb } from "@/features/harnesses/HarnessNav";
+import { ScopeSelector } from "@/features/projects/ScopeSelector";
 import { availablePages, focusRing, useDocumentTitle } from "@/features/harnesses/harnessPages";
 import { providerOperationKeys, type AgentProviderId, type AgentProviderStatus, type ProviderOperations } from "@/types/providers";
 
@@ -169,6 +170,7 @@ function HarnessPage({ id, metadata, registryLoading }: { id: AgentProviderId; m
         </header>
         {state === "error" && <p role="alert">Operating catalog unavailable. Readiness is unknown and native pages are unavailable.</p>}
         <HarnessMailSetup providerId={id} harnessInstalled={metadata?.installed !== false} setup={mail} />
+        {catalog && id === "claude-code" && summaryAccess !== null && <ScopeSelector />}
         {catalog && (
           <DashboardProvider>
             <Tiles id={id} metadata={metadata} catalog={catalog} withCounts={summaryAccess !== null} />

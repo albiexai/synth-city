@@ -39,6 +39,9 @@ interface ProjectContextType {
   activeProject: ProjectResponse | null;
   knownFolders: KnownFolder[];
   setProjectPath: (path: string | null) => void;
+  /** The OS user whose global scope this Harnesses page shows (?scope_user=), or null for the default. */
+  scopeUser: string | null;
+  setScopeUser: (name: string | null) => void;
   loading: boolean;
   error: string | null;
   fetchProjects: () => Promise<void>;
@@ -192,6 +195,16 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     }, { replace: true });
   }, [setSearchParams]);
 
+  const scopeUser = pathname.startsWith('/harnesses') ? searchParams.get('scope_user') : null;
+  const setScopeUser = useCallback((name: string | null) => {
+    setSearchParams((current) => {
+      const next = new URLSearchParams(current);
+      if (name) next.set('scope_user', name);
+      else next.delete('scope_user');
+      return next;
+    }, { replace: true });
+  }, [setSearchParams]);
+
   useEffect(() => {
     let cancelled = false;
     fetchAgentTeamPresets()
@@ -231,6 +244,8 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
         activeProject,
         knownFolders,
         setProjectPath,
+        scopeUser,
+        setScopeUser,
         loading,
         error,
         fetchProjects,

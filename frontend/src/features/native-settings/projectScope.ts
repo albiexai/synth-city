@@ -8,6 +8,8 @@ const PROJECT_SCOPED_SURFACES = new Set([
 /** The project-scoped native surface that a URL path shows, or null. */
 export function projectScopedSurface(pathname: string): string | null {
   const parts = pathname.split('/').filter(Boolean)
+  // A harness's own page (/harnesses/<id>) shows tile counts that follow the project too.
+  if (parts[0] === 'harnesses' && parts.length === 2) return 'summary'
   const surface = parts[0] === 'harnesses' ? parts[2] : parts[0]
   return surface && PROJECT_SCOPED_SURFACES.has(surface) ? surface : null
 }

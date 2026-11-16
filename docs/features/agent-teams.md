@@ -250,6 +250,8 @@ turn can remain Idle while the same process and identity are still current.
 
 ### Deployment with separate controller and agent users
 
+Set `harness_agent_user` to the agent user's name so that the Harnesses pages show the global scope that the agents load, not the controller's own. See [Which user the Harnesses pages show as "global"](/guide/installation#which-user-the-harnesses-pages-show-as-global).
+
 If the controller cannot read the runtime user's Codex history, labels remain
 steady at Activity unknown. Before enabling observations, arrange read access to
 the dedicated runtime's process descriptors and rollout logs, with directory

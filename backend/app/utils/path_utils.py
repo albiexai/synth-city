@@ -1,7 +1,13 @@
 """Path utilities for Claude Code configuration file locations."""
+import os
 import platform
+import pwd
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from app.config import settings
 
 
 def get_managed_settings_file() -> Path:
@@ -88,9 +94,66 @@ class ClaudePathUtils:
         return get_managed_settings_file()
 
 
+# The home that one request reads as its "global" (user) scope. Only the harness scope dependency sets it,
+# for one request. Everything else (backups, the controller's own data) keeps the controller's home.
+_scope_home: ContextVar[Optional[Path]] = ContextVar("harness_scope_home", default=None)
+
+
+@dataclass(frozen=True)
+class ScopeUser:
+    """One OS user whose Claude Code configuration the global scope can show."""
+
+    name: str
+    home: Path
+    is_controller: bool
+    is_default: bool
+
+
+def controller_user_name() -> str:
+    """The OS user that runs this controller."""
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        return os.environ.get("USER") or str(os.geteuid())
+
+
+def scope_users() -> list[ScopeUser]:
+    """The users the global scope may read: the controller itself and the one configured agent user.
+
+    A request never names an arbitrary user. Anything outside this list is refused, so a caller cannot
+    point the controller at another person's home.
+    """
+    controller = controller_user_name()
+    agent = (settings.harness_agent_user or "").strip() or None
+    users = [ScopeUser(controller, Path.home(), True, agent in (None, controller))]
+    if agent and agent != controller:
+        try:
+            users.append(ScopeUser(agent, Path(pwd.getpwnam(agent).pw_dir), False, True))
+        except KeyError:
+            # An unknown configured user must not silently fall back to the controller's home.
+            raise LookupError(f"The configured harness agent user {agent!r} does not exist on this host.")
+    return users
+
+
+def resolve_scope_user(name: Optional[str]) -> ScopeUser:
+    """The user for a request: the named one, or the default (the agent user when one is configured)."""
+    users = scope_users()
+    if not name:
+        return next(user for user in users if user.is_default)
+    for user in users:
+        if user.name == name:
+            return user
+    raise ValueError(f"{name!r} is not a user whose global scope can be shown.")
+
+
+def set_scope_home(home: Optional[Path]):
+    """Use this home as the global scope for the current request. Returns the token to reset it."""
+    return _scope_home.set(home)
+
+
 def get_user_home() -> Path:
-    """Get user's home directory."""
-    return Path.home()
+    """The home of the global (user) scope for this request; the controller's own home by default."""
+    return _scope_home.get() or Path.home()
 
 
 def get_claude_user_config_dir() -> Path:

@@ -10,14 +10,16 @@ from app.models.schemas import Agent, AgentCreate, AgentUpdate, AgentHook, Skill
 from app.utils.path_utils import (
     ensure_directory_exists,
     get_claude_user_agents_dir,
+    get_claude_user_config_dir,
     get_claude_user_skills_dir,
+    get_installed_plugins_file,
     get_project_agents_dir,
 )
 
 
 def get_agent_memory_dir(agent_name: str) -> Path:
     """Get the memory directory for an agent."""
-    return Path.home() / ".claude" / "agent-memory" / agent_name
+    return get_claude_user_config_dir() / "agent-memory" / agent_name
 
 
 class AgentService:
@@ -31,7 +33,7 @@ class AgentService:
         Returns:
             List of dicts with plugin name, path, and scope
         """
-        plugins_file = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
+        plugins_file = get_installed_plugins_file()
         if not plugins_file.exists():
             return []
 

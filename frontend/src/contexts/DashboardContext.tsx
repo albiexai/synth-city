@@ -109,7 +109,7 @@ async function safeFetch<T>(
 }
 
 export function DashboardProvider({ children }: { children: ReactNode }) {
-  const { activeProject } = useProjectContext();
+  const { activeProject, scopeUser } = useProjectContext();
   const { selectedProviderId, selectedProvider } = useProviderContext();
   const { getDashboardStats } = useSessionsApi();
   const { getActiveSessions } = useContextApi();
@@ -120,6 +120,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null);
   const [lastFetched, setLastFetched] = useState<Date | null>(null);
   const prevProjectPath = useRef<string | undefined>(undefined);
+  const prevScopeUser = useRef<string | null | undefined>(undefined);
   const prevProviderId = useRef<string | undefined>(undefined);
   const fetchId = useRef(0);
 
@@ -399,20 +400,22 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   // getDashboardStats and getActiveSessions have stable refs (empty deps).
   // getPlanStats changes with activeProject?.path and selectedProviderId; those are handled below.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeProject?.path, selectedProvider?.display_name, selectedProviderId]);
+  }, [activeProject?.path, scopeUser, selectedProvider?.display_name, selectedProviderId]);
 
   // Re-fetch when active project or provider changes (but not on initial mount)
   useEffect(() => {
     const currentPath = activeProject?.path;
     const currentProvider = selectedProviderId;
     const projectChanged = prevProjectPath.current !== undefined && prevProjectPath.current !== currentPath;
+    const userChanged = prevScopeUser.current !== undefined && prevScopeUser.current !== scopeUser;
     const providerChanged = prevProviderId.current !== undefined && prevProviderId.current !== currentProvider;
-    if (projectChanged || providerChanged) {
+    if (projectChanged || providerChanged || userChanged) {
       fetchStats();
     }
+    prevScopeUser.current = scopeUser;
     prevProjectPath.current = currentPath;
     prevProviderId.current = currentProvider;
-  }, [activeProject?.path, selectedProviderId, fetchStats]);
+  }, [activeProject?.path, scopeUser, selectedProviderId, fetchStats]);
 
   return (
     <DashboardContext.Provider
