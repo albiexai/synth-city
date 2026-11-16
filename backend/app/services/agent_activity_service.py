@@ -508,6 +508,11 @@ def _observe(slot_id: int, provider: str, session_id: str | None,
         return result("unknown", "observation_unavailable")
 
 
+# Providers whose slots keep a native session id in their launch options. Every place that counts or compares those
+# ids reads this one list, so the factory snapshot and the team read cannot drift apart (#982).
+SESSION_ID_PROVIDERS = ("claude-code", "codex-cli", "muse-cli", "antigravity-cli")
+
+
 async def _team_inputs(db: AsyncSession, preset_id: int, max_rows: int | None = None, identity: dict | None = None):
     async def rows(query):
         if max_rows is not None:
@@ -520,7 +525,7 @@ async def _team_inputs(db: AsyncSession, preset_id: int, max_rows: int | None = 
     slots = [row[0] for row in await rows(select(AgentTeamSlot).where(
         AgentTeamSlot.preset_id == preset_id).execution_options(populate_existing=True))]
     options = await rows(select(AgentTeamSlot.launch_options).where(
-        AgentTeamSlot.provider.in_(["codex-cli", "claude-code", "muse-cli", "antigravity-cli"])))
+        AgentTeamSlot.provider.in_(SESSION_ID_PROVIDERS)))
     members = [row[0] for row in await rows(select(MailTeamMember).where(
         MailTeamMember.team_preset_id == preset_id).order_by(
             MailTeamMember.updated_at.desc(), MailTeamMember.id.desc()).execution_options(
@@ -744,7 +749,7 @@ async def _save_codex_identities(db, inputs, metadata, current) -> bool:
             continue
         duplicate = exists(select(AgentTeamSlot.id).where(
             AgentTeamSlot.id != slot.id,
-            AgentTeamSlot.provider.in_(["claude-code", "codex-cli", "muse-cli", "antigravity-cli"]),
+            AgentTeamSlot.provider.in_(SESSION_ID_PROVIDERS),
             AgentTeamSlot.launch_options["session_id"].as_string() == identity))
         options_match = (or_(AgentTeamSlot.launch_options.is_(None),
                              AgentTeamSlot.launch_options == JSON.NULL)
