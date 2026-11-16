@@ -229,14 +229,50 @@ def discover_muse_session(pid: int, cwd: str) -> str | None:
     folder = found.pop()
     session_id = folder.name
     try:
-        lines, _offset, failure = _read_lines(folder / "session.jsonl", (folder / "session.jsonl").stat().st_uid)
+        # Read as the observed process's owner: a log another user wrote is not this process's session.
+        lines, _offset, failure = _read_lines(folder / "session.jsonl", _process_uid(pid))
         if failure or lines is None:
             return None
-        state, reason, _at, _details = muse_state_from_lines(
-            lines, session_id, cwd, datetime.now(timezone.utc), datetime.min.replace(tzinfo=timezone.utc))
+        return session_id if _session_binding(lines, session_id, cwd) else None
     except (OSError, ValueError):
         return None
-    return None if reason == "session_mismatch" else session_id
+
+
+def _session_binding(lines: list[bytes], session_id: str, cwd: str) -> bool:
+    """Affirmative identity proof for a first launch, from complete records only.
+
+    An incomplete activity tail is not identity proof: drop a trailing partial line,
+    then require this session's opened record and its workspace record for this cwd,
+    with every record on this session's stream.
+    """
+    if lines and not lines[-1].endswith(b"\n"):
+        lines = lines[:-1]
+    opened = workspace = False
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            return False
+        if not isinstance(row, dict):
+            return False
+        if "payload_type" not in row:
+            continue  # the retained-frame header carries no event
+        stream = row.get("stream")
+        if not isinstance(stream, dict) or stream.get("id") != session_id:
+            return False
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        record = payload.get("record") if isinstance(payload.get("record"), dict) else {}
+        if row["payload_type"] == "session.opened.observed":
+            if record.get("session_id") != session_id:
+                return False
+            opened = True
+        elif row["payload_type"] == "runtime.session.metadata":
+            root = record.get("workspace_root")
+            if (not isinstance(root, str) or not Path(root).is_absolute()
+                    or Path(root).resolve() != Path(cwd).resolve()):
+                return False
+            workspace = True
+    return opened and workspace
 
 
 def _identity(pid: int, session_id: str, cwd: str) -> bool:

@@ -61,6 +61,7 @@ def test_discovery_uses_this_process_lock_only(tmp_path, monkeypatch):
     (fds / "7").symlink_to(sessions / SID / ".session.lock")
     import app.services.muse_activity_service as m
     monkeypatch.setattr(m, "_process_fd_dir", lambda pid: fds)
+    monkeypatch.setattr(m, "_process_uid", lambda pid: __import__("os").getuid())  # never a host PID
     assert discover_muse_session(123, CWD) == SID
 
 
@@ -234,6 +235,7 @@ def _fds(tmp_path, monkeypatch, *targets):
     for number, target in enumerate(targets, start=7):
         (fds / str(number)).symlink_to(target)
     monkeypatch.setattr(m, "_process_fd_dir", lambda pid: fds)
+    monkeypatch.setattr(m, "_process_uid", lambda pid: __import__("os").getuid())  # never a host PID
 
 
 def test_cross_user_discovery_uses_the_owners_xdg_root_when_the_environ_is_readable(tmp_path, monkeypatch):
@@ -286,6 +288,7 @@ def test_discovery_reads_the_process_owners_sessions_not_the_controllers(tmp_pat
     fds.mkdir()
     (fds / "7").symlink_to(folder / ".session.lock")
     monkeypatch.setattr(m, "_process_fd_dir", lambda pid: fds)
+    monkeypatch.setattr(m, "_process_uid", lambda pid: __import__("os").getuid())  # never a host PID
     assert discover_muse_session(4100, CWD) == SID
 
 
@@ -300,6 +303,7 @@ def test_a_lock_under_the_controllers_root_is_not_this_processs_session(tmp_path
     fds.mkdir()
     (fds / "7").symlink_to(folder / ".session.lock")
     monkeypatch.setattr(m, "_process_fd_dir", lambda pid: fds)
+    monkeypatch.setattr(m, "_process_uid", lambda pid: __import__("os").getuid())  # never a host PID
     assert discover_muse_session(4100, CWD) is None
 
 
@@ -353,3 +357,94 @@ def test_the_guard_keeps_its_explicit_root(tmp_path, monkeypatch):
 def test_an_unreadable_log_is_an_observation_gap_like_an_unavailable_one():
     from app.services.owner_observation_pause import _GAPS
     assert {"native_log_unavailable", "native_log_unreadable"} <= _GAPS
+
+
+# V1 review 5914876734: discovery returns an id only on affirmative binding proof
+# (opened record with this id, metadata with this workspace, complete lines only),
+# read as the observed process's owner. Each case runs through the real saver.
+def _fixture_lines(sid=SID, cwd=CWD):
+    return (FIX / "turn_completed.jsonl").read_text().replace(SID, sid).replace(CWD, cwd).splitlines(keepends=True)
+
+
+def _discoverable(tmp_path, monkeypatch, lines, *, uid=None):
+    import os
+    import app.services.muse_activity_service as m
+    _cli, owner_home = _owner(monkeypatch, tmp_path)
+    folder = owner_home / ".local" / "share" / "muse" / "sessions" / "2026" / "10" / "14" / SID
+    folder.mkdir(parents=True)
+    (folder / ".session.lock").write_text("")
+    (folder / "session.jsonl").write_text("".join(lines))
+    _fds(tmp_path, monkeypatch, folder / ".session.lock")
+    monkeypatch.setattr(m, "_process_uid", lambda pid: os.getuid() if uid is None else uid)
+    return m
+
+
+async def _saved_through_the_real_saver(db, monkeypatch):
+    from app.models.database import AgentTeamPreset, AgentTeamSlot
+    from app.services import agent_activity_service as activity
+    preset = AgentTeamPreset(name="muse saver")
+    db.add(preset)
+    await db.flush()
+    slot = AgentTeamSlot(preset_id=preset.id, position=1, display_name="M1", provider="muse-cli", repo_id="r1",
+                         repo_path="/w1", repo_name="w1", launch_mode="plain", launch_options={"model": "m"})
+    db.add(slot)
+    await db.commit()
+    monkeypatch.setattr(activity, "_process", lambda _: ("S", "27"))
+    binding = activity.ActivityBinding(41000, "27", CWD, tmux_target="%8", binding_id=1)
+    metadata = {}
+    activity._observe(slot.id, "muse-cli", None, [binding], False, datetime.now(timezone.utc), provenance=metadata)
+    entry = (slot.id, "muse-cli", None)
+    await activity._save_codex_identities(db, [entry], [metadata], {slot.id: entry})
+    await db.refresh(slot)
+    return slot
+
+
+@pytest.mark.asyncio
+async def test_a_wrong_workspace_log_with_a_partial_last_record_is_not_saved(db, tmp_path, monkeypatch):
+    _discoverable(tmp_path, monkeypatch, _fixture_lines(cwd="/tmp/another-workspace") + ['{"partial'])
+    slot = await _saved_through_the_real_saver(db, monkeypatch)
+    assert slot.launch_mode == "plain" and "session_id" not in slot.launch_options
+
+
+@pytest.mark.asyncio
+async def test_a_log_owned_by_another_user_than_the_process_is_not_saved(db, tmp_path, monkeypatch):
+    import os
+    _discoverable(tmp_path, monkeypatch, _fixture_lines(), uid=os.getuid() + 1)
+    slot = await _saved_through_the_real_saver(db, monkeypatch)
+    assert slot.launch_mode == "plain" and "session_id" not in slot.launch_options
+
+
+@pytest.mark.asyncio
+async def test_a_same_workspace_log_with_a_partial_last_record_is_still_saved(db, tmp_path, monkeypatch):
+    _discoverable(tmp_path, monkeypatch, _fixture_lines() + ['{"partial'])
+    slot = await _saved_through_the_real_saver(db, monkeypatch)
+    assert slot.launch_mode == "resume" and slot.launch_options["session_id"] == SID
+
+
+def _without(kind):
+    return [line for line in _fixture_lines() if f'"payload_type": "{kind}"' not in line]
+
+
+def _with_bad_first_event(replacement):
+    lines = _fixture_lines()
+    index = next(i for i, line in enumerate(lines) if '"payload_type": "runtime.session"' in line)
+    lines[index] = replacement
+    return lines
+
+
+def _with_other_stream():
+    lines = _fixture_lines()
+    index = next(i for i, line in enumerate(lines) if '"payload_type": "runtime.session.metadata"' in line)
+    lines[index] = lines[index].replace(f'"id": "{SID}"', '"id": "01a13be9-0000-7000-8000-000000000000"', 1)
+    return lines
+
+
+@pytest.mark.parametrize("case", ["no_opened", "no_metadata", "non_object_row", "invalid_json", "other_stream"])
+def test_discovery_needs_every_binding_record_intact(tmp_path, monkeypatch, case):
+    lines = {"no_opened": lambda: _without("session.opened.observed"),
+             "no_metadata": lambda: _without("runtime.session.metadata"),
+             "non_object_row": lambda: _with_bad_first_event("[1, 2]\n"),
+             "invalid_json": lambda: _with_bad_first_event("{not json}\n"),
+             "other_stream": _with_other_stream}[case]()
+    _discoverable(tmp_path, monkeypatch, lines)
+    assert discover_muse_session(4100, CWD) is None
