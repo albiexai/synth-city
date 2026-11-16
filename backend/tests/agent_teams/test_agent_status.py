@@ -267,3 +267,70 @@ def test_opencode_member_below_2_shows_its_refusal_only_where_probes_are_allowed
         # Factory reads never run the OpenCode check (no version probe).
         assert status.wake_state == "can_wake"
         assert calls == []
+
+
+# --- #982: the factory snapshot and the team read must count shared native session ids the same way -------------
+
+SHARED_ID = "22222222-2222-4222-8222-222222222222"
+
+
+async def _two_slots_sharing_a_session(db, team, provider):
+    for index in range(2):
+        db.add(AgentTeamSlot(preset_id=team.id, display_name=f"{provider}-{index}", provider=provider,
+                             repo_id="fixture", repo_name="fixture", repo_path="/tmp/status-fixture",
+                             position=10 + index, launch_options={"session_id": SHARED_ID}))
+    await db.commit()
+
+
+async def _snapshot_and_team_inputs(db, monkeypatch, team):
+    from app.services.agent_status_service import agent_status_service
+    from app.services.factory_projection_service import actor_evidence
+    expected = await activity._team_inputs(db, team.id)
+    seen = []
+
+    def capture_inputs(slot_id, provider, session_id, bindings, duplicate, now):
+        seen.append((slot_id, provider, session_id, bindings, duplicate))
+        return AgentActivityObservation(slot_id=slot_id, state="unknown", reason="observation_unavailable")
+
+    monkeypatch.setattr(activity, "_observe", capture_inputs)
+    slots, members, sessions, bindings, lifecycles = await actor_evidence(db, {team.id}, {})
+    await agent_status_service.for_snapshot(db, members, slots, sessions, bindings, lifecycles)
+    return expected, seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["codex-cli", "claude-code", "muse-cli", "antigravity-cli"])
+async def test_two_slots_sharing_a_native_session_are_flagged_alike_in_the_snapshot_and_the_team_read(
+        db, monkeypatch, provider):
+    team, *_ = await seed_agent(db, monkeypatch)
+    await _two_slots_sharing_a_session(db, team, provider)
+    expected, seen = await _snapshot_and_team_inputs(db, monkeypatch, team)
+    assert seen == expected
+    shared = [entry for entry in seen if entry[2] == SHARED_ID]
+    assert len(shared) == 2 and all(entry[4] is True for entry in shared)
+
+
+@pytest.mark.asyncio
+async def test_a_shared_conversation_is_unattributable_for_antigravity_and_not_consulted_for_muse(monkeypatch):
+    """What the flag changes today, in the observer itself: it matters for antigravity-cli only."""
+    from app.services.agent_activity_service import ActivityBinding, _observe
+    now = datetime.now(timezone.utc)
+    binding = ActivityBinding(710001, "fixture-start", "/tmp/status-fixture", None, None, "t:0.0", 1)
+    monkeypatch.setattr(activity, "_process", lambda pid: ("S", "fixture-start"))
+    antigravity = _observe(1, "antigravity-cli", SHARED_ID, [binding], True, now)
+    assert (antigravity.state, antigravity.reason) == ("unknown", "duplicate_native_identity")
+    reasons = {}
+    for flag in (False, True):
+        muse = _observe(1, "muse-cli", SHARED_ID, [binding], flag, now)
+        reasons[flag] = (muse.state, muse.reason)
+    assert reasons[True] == reasons[False] and reasons[True][1] != "duplicate_native_identity"
+
+
+def test_the_three_call_sites_read_one_provider_list():
+    from app.services import agent_status_service as status_module
+    providers = getattr(activity, "SESSION_ID_PROVIDERS", None)
+    assert providers is not None and set(providers) == {"claude-code", "codex-cli", "muse-cli", "antigravity-cli"}
+    import inspect
+    for source in (inspect.getsource(activity._team_inputs), inspect.getsource(activity._save_codex_identities),
+                   inspect.getsource(status_module.AgentStatusService.for_snapshot)):
+        assert "SESSION_ID_PROVIDERS" in source and '"muse-cli"' not in source and '"codex-cli", "claude-code"]' not in source
