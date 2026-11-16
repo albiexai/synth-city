@@ -22,7 +22,7 @@ _PRIVATE_TEXT = re.compile(
 class ReportContext(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     work_item_id: int = Field(gt=0)
-    dispatch_nonce: str = Field(min_length=1, max_length=100)
+    attempt: int = Field(ge=0, le=1000)  # a public counter (the item's retry count), never an authority value
     owner_slot_id: int = Field(gt=0)
     scope_revision: int = Field(ge=0)
     source_sha: str = Field(pattern=r"^[0-9a-f]{40}$")

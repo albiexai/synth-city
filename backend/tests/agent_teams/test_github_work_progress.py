@@ -508,7 +508,7 @@ class ReportClient(Client):
     sha = SHA
     issue_calls = 0
     def __init__(self, item, **changes):
-        self.report = RemainingReport(work_item_id=item.id, dispatch_nonce=item.dispatch_nonce,
+        self.report = RemainingReport(work_item_id=item.id, attempt=item.retry_count,
             owner_slot_id=item.owner_slot_id, scope_revision=item.active_scope_revision, source_sha=SHA,
             phase="implementation", reported_at=datetime.now(timezone.utc), reported_by="Team member 2",
             remaining="Fix the interface, then review and merge.", next_action="B2 publishes the next checkpoint.",
@@ -652,8 +652,8 @@ async def test_a_terminal_released_item_still_has_a_remaining_work_context(db, s
     result = await GithubWorkProgressService(Observer(), Client()).summary(db, item.id)
     context = result.remaining_work_context
     assert context is not None, "the Leader cannot prepare the post-merge summary (409 progress_context_unavailable)"
-    assert (context.work_item_id, context.dispatch_nonce, context.owner_slot_id) == (
-        item.id, item.dispatch_nonce, item.owner_slot_id)
+    assert (context.work_item_id, context.attempt, context.owner_slot_id) == (
+        item.id, item.retry_count, item.owner_slot_id)
     assert (context.scope_revision, context.source_sha) == (item.active_scope_revision, SHA)
 
 
@@ -743,3 +743,172 @@ async def test_the_leader_route_returns_the_terminal_context_after_release_and_k
         await db.commit()
         refused = await http.get(path, headers={"X-Synth-City-Session-Token": "leader-token"})
         assert refused.status_code == 409 and refused.json()["detail"] == "progress_context_unavailable"
+
+
+# --- #971 folded into #976: no dispatch nonce in any public report value; terminal facts after the last await -----
+
+NONCE = "public-dispatch-id"
+
+
+def _report_from(context):
+    return RemainingReport(**{**context.model_dump(), "reported_at": datetime.now(timezone.utc),
+        "reported_by": "Team member 2", "remaining": "Review and merge.", "next_action": "V1 reviews the head."})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["in_flight", "terminal"])
+async def test_no_report_value_carries_the_dispatch_nonce(db, state):
+    if state == "terminal":
+        item, *_ = await _released(db)
+        service = GithubWorkProgressService(Observer(), Client())
+    else:
+        item, *_ = await seed(db)
+        service = GithubWorkProgressService(Observer(), type("C", (Client,), {"sha": SHA})())
+    result = await service.summary(db, item.id)
+    context = result.remaining_work_context
+    assert context is not None
+    assert NONCE not in context.model_dump_json()                 # the context a Leader receives
+    report = _report_from(context)
+    assert NONCE not in report.markdown() and NONCE not in report.model_dump_json()   # the published block and marker
+    assert "dispatch_nonce" not in context.model_dump()
+
+
+def test_a_published_block_that_still_carries_a_nonce_is_never_trusted():
+    from mcp_shim.work_remaining_protocol import parse_report
+    good = RemainingReport(work_item_id=1, owner_slot_id=2, scope_revision=0, source_sha=SHA, phase="review",
+        attempt=0, reported_at=datetime.now(timezone.utc), reported_by="Team member 2",
+        remaining="Review.", next_action="V1 reviews.")
+    assert parse_report(good.markdown()) is not None
+    old = good.markdown().replace('{"work_item_id"', '{"dispatch_nonce":"old-nonce","work_item_id"', 1)
+    assert "old-nonce" in old and parse_report(old) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late", ["nonterminal", "replaced_head", "workspace_leased", "status_swap"])
+async def test_terminal_facts_that_change_during_the_final_check_view_give_no_context(db, monkeypatch, late):
+    item, scope, preset, workspace = await _released(db)
+    item_id, workspace_id = item.id, workspace.id  # plain values: the service rolls the session back after the await
+    from app.services import github_ci_watch_service as watch_module
+    real = watch_module.github_ci_watch_service.view
+
+    async def view(session, row):
+        if late == "nonterminal":
+            await session.execute(update(GithubWorkItem).where(GithubWorkItem.id == item_id).values(dispatch_status="dispatched"))
+        elif late == "status_swap":   # still terminal, but not the status the phase and next step were computed from
+            await session.execute(update(GithubWorkItem).where(GithubWorkItem.id == item_id).values(dispatch_status="closed"))
+        elif late == "replaced_head":
+            await session.execute(update(GithubWorkItem).where(GithubWorkItem.id == item_id).values(last_verified_sha=REMOTE))
+        else:
+            await session.execute(update(GithubWorkspace).where(GithubWorkspace.id == workspace_id).values(
+                leased_item_id=item_id, lease_token="private-lease-value", leased_at=datetime.utcnow()))
+        await session.commit()
+        return await real(session, row)
+    monkeypatch.setattr(watch_module.github_ci_watch_service, "view", view)
+    result = await GithubWorkProgressService(Observer(), Client()).summary(db, item_id)
+    context = result.remaining_work_context
+    if late == "replaced_head":   # a coherent re-read binds the NEW recorded head or refuses; never the old one
+        assert context is None or context.source_sha == REMOTE
+    elif late == "status_swap":
+        assert context is None
+    else:
+        assert context is None
+
+
+async def _leader_http(db, monkeypatch, item, scope, preset, workspace, service):
+    """The authenticated Leader route over the same database, returning (client factory, path)."""
+    from app.config import settings
+    from app.models.database import MailAgentSession, MailTeamMember
+    from app.services.agent_mail_service import agent_mail_service
+    monkeypatch.setattr(settings, "mail_capability_tokens_required", True)
+    monkeypatch.setattr("app.utils.peer_process.pane_is_alive", lambda *_: True)
+    owner_slot = await db.get(AgentTeamSlot, item.owner_slot_id)
+    owner_slot.position = 1
+    slot = AgentTeamSlot(preset_id=preset.id, position=0, display_name="Leader", role="Leader",
+        provider="codex-cli", repo_id="repo", repo_path="/safe/leader", repo_name="repo")
+    db.add(slot); await db.flush()
+    preset.leader_slot_id = slot.id
+    member = MailTeamMember(identity_key="leader", repo_id="repo", repo_path=slot.repo_path,
+        repo_name="repo", display_name="Leader", participant_kind="team_slot", team_preset_id=preset.id, team_slot_id=slot.id)
+    db.add(member); await db.flush()
+    db.add(MailAgentSession(member_id=member.id, provider="codex-cli", source="mcp", session_key="leader",
+        team_preset_id=preset.id, team_slot_id=slot.id,
+        capability_token_hash=agent_mail_service.hash_capability_token("leader-token"),
+        bound_pane_pid=1234, bound_pane_proc_start="1", wake_enabled=True))
+    await db.commit()
+    app = FastAPI(); app.include_router(api.router)
+    async def session(): yield db
+    app.dependency_overrides[get_db] = session
+    monkeypatch.setattr(api, "github_work_progress_service", service)
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test"), \
+        f"/github-work-items/{item.id}/remaining-work-context", {"X-Synth-City-Session-Token": "leader-token"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["in_flight", "terminal"])
+async def test_the_leader_route_response_never_carries_the_dispatch_nonce(db, monkeypatch, state):
+    if state == "terminal":
+        item, scope, preset, workspace = await _released(db)
+        service = GithubWorkProgressService(Observer(), Client())
+    else:
+        item, scope, preset, workspace = await seed(db)
+        service = GithubWorkProgressService(Observer(), type("C", (Client,), {"sha": SHA})())
+    http, path, headers = await _leader_http(db, monkeypatch, item, scope, preset, workspace, service)
+    async with http:
+        response = await http.get(path, headers=headers)
+    assert response.status_code == 200, response.text
+    assert NONCE not in response.text and response.json()["dispatch_nonce"] is None
+    assert response.json()["remaining_work_context"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late", ["nonterminal", "replaced_head", "workspace_leased"])
+async def test_the_route_refuses_a_terminal_context_whose_facts_changed_after_the_service_read(db, monkeypatch, late):
+    item, scope, preset, workspace = await _released(db)
+    item_id, workspace_id = item.id, workspace.id
+    real = GithubWorkProgressService(Observer(), Client())
+
+    class Racing:
+        async def summary(self, session, row_id):
+            result = await real.summary(session, row_id)
+            assert result.remaining_work_context_basis == "recorded_head"
+            if late == "nonterminal":
+                await session.execute(update(GithubWorkItem).where(GithubWorkItem.id == item_id).values(dispatch_status="dispatched"))
+            elif late == "replaced_head":
+                await session.execute(update(GithubWorkItem).where(GithubWorkItem.id == item_id).values(last_verified_sha=REMOTE))
+            else:
+                await session.execute(update(GithubWorkspace).where(GithubWorkspace.id == workspace_id).values(
+                    leased_item_id=item_id, lease_token="private-lease-value", leased_at=datetime.utcnow()))
+            await session.commit()
+            return result
+    http, path, headers = await _leader_http(db, monkeypatch, item, scope, preset, workspace, Racing())
+    async with http:
+        response = await http.get(path, headers=headers)
+    assert response.status_code == 409 and response.json()["detail"] == "progress_context_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_a_published_report_that_contains_the_live_dispatch_nonce_is_refused(db):
+    item, *_ = await seed(db)
+    client = ReportClient(item)
+    client.body = client.report.model_copy(update={"remaining": f"Review and merge {NONCE}."}).markdown()
+    result = await GithubWorkProgressService(Observer(), client).summary(db, item.id)
+    assert result.remaining_work.state != "current" and result.remaining_work.reason == "report_invalid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["in_flight", "terminal"])
+async def test_the_context_carries_the_public_attempt_counter_and_a_report_from_another_attempt_is_stale(db, state):
+    if state == "terminal":
+        item, *_ = await _released(db)
+        client = Client()
+    else:
+        item, *_ = await seed(db)
+        client = type("C", (Client,), {"sha": SHA})()
+    item.retry_count = 2
+    await db.commit()
+    service = GithubWorkProgressService(Observer(), client)
+    context = (await service.summary(db, item.id)).remaining_work_context
+    assert context is not None and context.attempt == 2
+    old_attempt = _report_from(context.model_copy(update={"attempt": 1}))
+    from mcp_shim.work_remaining_protocol import report_reason
+    assert report_reason(old_attempt, context, datetime.now(timezone.utc)) == "context_changed"

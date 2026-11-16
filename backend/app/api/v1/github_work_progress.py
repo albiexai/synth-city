@@ -2,16 +2,17 @@
 import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException, Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.deps import require_mail_session
 from app.database import get_db
-from app.models.database import GithubWorkItem, MailAgentSession, TeamGithubScope
+from app.models.database import GithubWorkItem, GithubWorkspace, MailAgentSession, TeamGithubScope
 from app.models.github_work_progress_schemas import GithubWorkProgressResponse
 from app.services.github_client import github_client
 from app.services.github_coordination_service import CoordinationError, github_coordination_service
 from app.services.github_summary_publication_service import SummaryUnavailable, github_summary_publication_service
-from app.services.github_work_progress_service import github_work_progress_service
+from app.services.github_work_progress_service import _TERMINAL_REPORT_STATUSES, github_work_progress_service
 
 router = APIRouter()
 
@@ -54,7 +55,14 @@ async def remaining_work_context(item_id: int, response: Response,
                 or result.remaining_work_context is None
                 or result.remaining_work_context.scope_revision != item.active_scope_revision):
             raise HTTPException(status_code=409, detail="progress_context_unavailable")
-        return result
+        if result.remaining_work_context_basis == "recorded_head":
+            # A terminal context rests on recorded facts: check them again against the item as it is now.
+            leased = await db.scalar(select(GithubWorkspace.id).where(GithubWorkspace.leased_item_id == item.id))
+            if (item.dispatch_status not in _TERMINAL_REPORT_STATUSES or leased is not None
+                    or item.last_verified_sha != result.remaining_work_context.source_sha):
+                raise HTTPException(status_code=409, detail="progress_context_unavailable")
+        # The nonce binds this check privately; the response the Leader receives never carries it.
+        return result.model_copy(update={"dispatch_nonce": None})
     except CoordinationError as error:
         raise HTTPException(status_code=error.status, detail=error.code) from error
 

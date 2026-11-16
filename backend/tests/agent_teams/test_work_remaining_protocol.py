@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from mcp_shim.work_remaining_protocol import RemainingReport, ReportContext, parse_report, report_reason
 
 NOW = datetime(2026, 10, 6, 20, tzinfo=timezone.utc)
-CONTEXT = dict(work_item_id=1, dispatch_nonce="dispatch", owner_slot_id=2,
+CONTEXT = dict(work_item_id=1, attempt=0, owner_slot_id=2,
                scope_revision=0, source_sha="a" * 40, phase="implementation")
 
 
@@ -53,7 +53,7 @@ def test_rejects_duplicate_tampered_or_private_blocks():
     assert parse_report(report(remaining="private-lease-value").markdown(), ("private-lease-value",)) is None
 
 
-@pytest.mark.parametrize("key,value", [("work_item_id", 3), ("dispatch_nonce", "new"), ("owner_slot_id", 3),
+@pytest.mark.parametrize("key,value", [("work_item_id", 3), ("attempt", 1), ("owner_slot_id", 3),
     ("scope_revision", 1), ("source_sha", "b" * 40), ("phase", "review")])
 def test_context_change_is_historical(key, value):
     changed = ReportContext(**{**CONTEXT, key: value})

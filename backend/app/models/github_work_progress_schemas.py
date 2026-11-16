@@ -72,3 +72,4 @@ class GithubWorkProgressResponse(BaseModel):
     publication: GithubPublicationObservation
     remaining_work: GithubWorkRemainingView = Field(default_factory=GithubWorkRemainingView)
     remaining_work_context: ReportContext | None = None
+    remaining_work_context_basis: Literal["workspace", "recorded_head"] | None = None
