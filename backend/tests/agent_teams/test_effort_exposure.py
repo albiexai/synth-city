@@ -237,3 +237,36 @@ async def test_the_preflight_stays_read_only(fx):
     async with fx.maker() as db:
         await agent_mail.preflight_request(_preflight_request(fx), session=session, db=db)
     assert await counts() == before
+
+
+# --- V1 review 5925693104: the extension must read the ceiling as it is now, not as the session saw it -------------
+
+
+@pytest.mark.asyncio
+async def test_a_ceiling_lowered_by_another_connection_after_the_scope_was_loaded_is_honoured(fx):
+    """The session already holds the scope row (ceiling 120); a second connection lowers it to 110 and commits."""
+    await _limited(fx, limit=100)
+    async with fx.maker() as session:
+        cached = await session.get(TeamGithubScope, fx.scope_id)
+        assert cached.max_item_effort_minutes == 120
+        await _ceiling(fx, 110)  # a second connection, committed before the extension starts
+        with pytest.raises(EffortLimitError) as caught:
+            await service.extend(session, work_item_id=fx.item_id, dispatch_nonce=fx.nonce, leader_member_id=fx.leader,
+                                 minutes=15, reason="healthy", now=T0)
+    assert caught.value.code == "extension_exceeds_cap" and "110" in str(caught.value)
+    async with fx.maker() as db:
+        item = await _item(fx, db)
+        assert item.effort_extension_minutes == 0 and item.effort_extension_decided_at is None
+
+
+@pytest.mark.asyncio
+async def test_a_ceiling_raised_by_another_connection_after_the_scope_was_loaded_is_honoured(fx):
+    await _limited(fx, limit=100)
+    await _ceiling(fx, 110)
+    async with fx.maker() as session:
+        cached = await session.get(TeamGithubScope, fx.scope_id)
+        assert cached.max_item_effort_minutes == 110
+        await _ceiling(fx, 480)
+        result = await service.extend(session, work_item_id=fx.item_id, dispatch_nonce=fx.nonce,
+                                      leader_member_id=fx.leader, minutes=15, reason="healthy", now=T0)
+    assert result["effective_limit_minutes"] == 115

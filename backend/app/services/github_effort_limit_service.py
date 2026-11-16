@@ -283,7 +283,9 @@ class GithubEffortLimitService:
         # Read everything needed before any rollback: a rollback expires the loaded row.
         limit, used = item.effort_limit_minutes, item.effort_extension_minutes
         recorded = self._result(item, repeated=True)
-        scope = await db.get(TeamGithubScope, item.scope_id)
+        # Read as it is now: the session may hold an older copy of the scope row (V1 review 5925693104).
+        scope = (await db.execute(select(TeamGithubScope).where(TeamGithubScope.id == item.scope_id)
+                                  .execution_options(populate_existing=True))).scalar_one_or_none()
         ceiling = getattr(scope, "max_item_effort_minutes", None)
         cap = self.extension_cap_for(limit, ceiling)
         if used:
