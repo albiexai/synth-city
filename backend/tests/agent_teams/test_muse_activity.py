@@ -575,3 +575,39 @@ def test_two_turn_ends_without_a_start_between_stay_unconfirmed(tmp_path):
     ended = _index(lines, "terminal")
     data = (b"".join(lines[:ended + 1]) + lines[ended] + _filler_after(lines[ended], m._TAIL_BYTES + 4096))
     assert _write_and_read(tmp_path, data) == ("unknown", "completion_unconfirmed")
+
+
+# Conservative results for scanned records (Leader, plan 330): an unreadable turn record
+# before the tail ends the scan as unknown; a mismatched or out-of-order record found by
+# the scan reaches the unchanged parser, which rejects it.
+def test_an_unreadable_turn_record_in_the_scan_stays_unknown(tmp_path):
+    import app.services.muse_activity_service as m
+    lines = _fixture("tool_turn_working")
+    start = _prompted_start(lines)
+    broken = b'{"payload_type": "runtime.session", "payload": {"event": {"kind": "terminal"\n'
+    data = (b"".join(lines[:start + 1]) + broken + _filler_after(lines[start], m._TAIL_BYTES + 4096)
+            + b"".join(lines[start + 1:]))
+    assert _write_and_read(tmp_path, data)[0] == "unknown"
+
+
+def test_a_scanned_start_from_another_session_is_a_mismatch(tmp_path):
+    import app.services.muse_activity_service as m
+    lines = _fixture("tool_turn_working")
+    start = _prompted_start(lines)
+    foreign = lines[start].replace(SID.encode(), b"01a13be9-0000-7000-8000-000000000000", 1)
+    data = (b"".join(lines[:start]) + foreign + _filler_after(lines[start], m._TAIL_BYTES + 4096)
+            + b"".join(lines[start + 1:]))
+    assert _write_and_read(tmp_path, data) == ("unknown", "session_mismatch")
+
+
+def test_a_scanned_start_after_the_tail_events_is_invalid(tmp_path):
+    import json
+    import app.services.muse_activity_service as m
+    lines = _fixture("tool_turn_working")
+    start = _prompted_start(lines)
+    row = json.loads(lines[start])
+    row["recorded_at"] = max(json.loads(line).get("recorded_at", 0) for line in lines[start + 1:]) + 1_000_000
+    late = (json.dumps(row) + "\n").encode()
+    data = (b"".join(lines[:start]) + late + _filler_after(lines[start], m._TAIL_BYTES + 4096)
+            + b"".join(lines[start + 1:]))
+    assert _write_and_read(tmp_path, data)[0] == "unknown"

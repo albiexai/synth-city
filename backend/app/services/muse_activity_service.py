@@ -178,14 +178,20 @@ def _read_at(stream, offset: int, size: int) -> bytes:
 
 
 def _turn_record(line: bytes) -> str | None:
-    """Classify a complete record: a turn start, a turn end, a question event, or neither."""
+    """Classify a complete record: a turn start, a turn end, a question event, or neither.
+
+    A record that names runtime.session but cannot be read is "invalid": it might be
+    the turn boundary the scan is looking for, so the scan must not pass over it.
+    """
     if not line.endswith(b"\n") or b'"runtime.session"' not in line:
         return None
     try:
         row = json.loads(line)
     except ValueError:
-        return None
-    if not isinstance(row, dict) or row.get("payload_type") != "runtime.session":
+        return "invalid"
+    if not isinstance(row, dict):
+        return "invalid"
+    if row.get("payload_type") != "runtime.session":
         return None
     payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
     event = payload.get("event")
@@ -222,6 +228,8 @@ def _scan_for_turn(stream, offset: int, fragment: bytes) -> list[bytes]:
             carry = b""
         for line in reversed(pieces):
             kind = _turn_record(line)
+            if kind == "invalid":
+                return []  # cannot tell what this record was: stay as conservative as before
             if kind == "question" and not ended:
                 kept.append(line)
             elif kind == "start":
