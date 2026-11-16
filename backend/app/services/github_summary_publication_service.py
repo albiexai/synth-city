@@ -242,11 +242,13 @@ class GithubSummaryPublicationService:
         """The head review for this exact head. Only a canonical GitHub review link of THIS pull request is shown."""
         if row is None:
             return None
-        canonical = re.fullmatch(
-            rf"https://github\.com/{re.escape(scope.repo_owner)}/{re.escape(scope.repo_name)}/pull/{number}"
-            r"#pullrequestreview-\d{1,20}", str(row.evidence_url or ""))
+        evidence = str(row.evidence_url or "")
+        prefix = f"https://github.com/{scope.repo_owner}/{scope.repo_name}/pull/{number}#pullrequestreview-"
+        # Plain string checks, no pattern built from stored values: only this pull request's own review link passes.
+        canonical = evidence if (evidence.startswith(prefix) and evidence[len(prefix):].isascii()
+                                 and evidence[len(prefix):].isdigit() and 0 < len(evidence[len(prefix):]) <= 20) else None
         verdict = row.verdict if _VERDICT.fullmatch(str(row.verdict or "")) else "unknown"
-        return verdict, (canonical.group(0) if canonical else None)
+        return verdict, canonical
 
     @staticmethod
     async def _token(scope: TeamGithubScope):
