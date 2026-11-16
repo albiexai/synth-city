@@ -87,6 +87,19 @@ def proc_stat(pid):
         return None
     return fields[19], int(fields[1])
 
+def proc_pgid(pid):
+    """The process group id from /proc/<pid>/stat, or None when the process is gone."""
+    try:
+        return int(open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[2])
+    except (OSError, IndexError, ValueError):
+        return None
+
+def owned(pid):
+    try:
+        return os.stat(f"/proc/{pid}").st_uid == os.getuid()
+    except OSError:
+        return False
+
 def argv_hash(pid):
     try:
         return hashlib.sha256(open(f"/proc/{pid}/cmdline", "rb").read()).hexdigest()
@@ -266,6 +279,48 @@ def unrecorded(inst, procs, root):
             unreadable.append(pid)
     return found, unreadable
 
+def group_leaders(inst, procs, root):
+    """#1010: proved service roles that lead their own process group (tmux starts each pane with setsid).
+    A process can join a group only inside its own session, and a live leader keeps its pid, so the
+    group of a live, proved leader can hold only processes that descend from the kit."""
+    leaders = {}
+    for name in sorted(SERVICES):
+        entry = entry_of(procs, name)
+        if entry is not None and check(inst, procs, name, entry, root) == "ok" and proc_pgid(entry["pid"]) == entry["pid"]:
+            leaders[entry["pid"]] = name
+    return leaders
+
+MEMBER_KEYS = {"pid": int, "start": str, "argv": str, "pgid": int, "leader": str}
+
+def member_check(inst, procs, root, member):
+    """The word gone, the word ok, or a reason: an unrecorded member of a proved service group, proved again."""
+    if not isinstance(member, dict) or any(not isinstance(member.get(key), kind) for key, kind in MEMBER_KEYS.items()):
+        return "the group member record is malformed"
+    pid = member["pid"]
+    now = proc_stat(pid)
+    if now is None or now[0] != member["start"]:
+        return "gone"
+    if any(isinstance(entry, dict) and entry.get("pid") == pid for entry in procs.values()):
+        return f"pid {pid} is a recorded role, not a group member"
+    if argv_hash(pid) != member["argv"]:
+        return f"group member pid {pid} has another command line"
+    if not owned(pid):
+        return f"group member pid {pid} is not a process of the caller"
+    try:
+        net = link(pid, "net")
+    except OSError:
+        return f"group member pid {pid} cannot be inspected"
+    if inst["net"] is None or net != inst["net"]:
+        return f"group member pid {pid} is outside the kit network namespace"
+    leader = member["leader"]
+    entry = entry_of(procs, leader) if leader in SERVICES else None
+    if (entry is None or entry["pid"] != member["pgid"] or check(inst, procs, leader, entry, root) != "ok"
+            or proc_pgid(entry["pid"]) != entry["pid"]):
+        return f"group member pid {pid} has no proved {leader} group leader"
+    if proc_pgid(pid) != member["pgid"]:
+        return f"group member pid {pid} left the {leader} process group"
+    return "ok"
+
 def plan(root):
     """Read-only teardown plan: every proof first, then the ordered targets; never signals."""
     inst, procs = instance(root), processes(root)
@@ -286,11 +341,54 @@ def plan(root):
         elif result != "gone":
             problems.append(result)
     found, unreadable = unrecorded(inst, procs, root)
-    if found:
-        problems.append("unrecorded processes in the kit namespace: " + " ".join(map(str, found)))
+    # #1010: an unrecorded process in the group of a proved service leader is a member, stopped
+    # before the roles; any other unrecorded process still refuses the whole teardown.
+    leaders = group_leaders(inst, procs, root) if found else {}
+    members, others = [], []
+    for pid in found:
+        pgid, now = proc_pgid(pid), proc_stat(pid)
+        member = None
+        if pgid in leaders and now is not None:
+            member = {"pid": pid, "start": now[0], "argv": argv_hash(pid), "pgid": pgid, "leader": leaders[pgid]}
+        if member is not None and member_check(inst, procs, root, member) == "ok":
+            members.append(member)
+        else:
+            others.append(pid)
+    if others:
+        problems.append("unrecorded processes in the kit namespace: " + " ".join(map(str, others)))
     if unreadable:
         problems.append("processes that cannot be inspected: " + " ".join(map(str, unreadable)))
-    return {"targets": targets, "problems": problems}
+    return {"targets": targets, "members": members, "problems": problems}
+
+def send_member(root, spec, signame, dry):
+    """Open a pidfd first, prove the member again, then signal only that process through the pidfd."""
+    inst, procs = instance(root), processes(root)
+    try:
+        member = json.loads(spec)
+    except ValueError:
+        die(2, "the group member record is malformed")
+    if not isinstance(member, dict) or not isinstance(member.get("pid"), int):
+        die(2, "the group member record is malformed")
+    if os.environ.get("RUNTIME_KIT_TEST_NO_PIDFD") or not hasattr(os, "pidfd_open") \
+            or not hasattr(signal, "pidfd_send_signal"):
+        die(4, "pidfd support is unavailable; nothing was signalled")
+    try:
+        fd = os.pidfd_open(member["pid"])
+    except ProcessLookupError:
+        die(3, "the group member is gone")
+    except OSError as exc:
+        die(4, f"cannot open a pidfd for the group member: {exc}")
+    try:
+        result = member_check(inst, procs, root, member)
+        if result == "gone":
+            die(3, "the group member is gone")
+        if result != "ok":
+            die(2, result + "; nothing was signalled")
+        if not dry:
+            signal.pidfd_send_signal(fd, getattr(signal, "SIG" + signame))
+        print("checked" if dry else "signalled")
+    finally:
+        os.close(fd)
 
 def send(root, name, signame, dry):
     """Open a pidfd first, then prove the full recorded identity, then signal through that pidfd."""
@@ -986,6 +1084,12 @@ def main():
         result = plan(root)
         print(json.dumps(result))
         sys.exit(0 if not result["problems"] else 5)
+    elif command == "check-member":
+        send_member(root, rest[0], "TERM", dry=True)
+    elif command == "signal-member":
+        if rest[1] not in ("TERM", "KILL"):
+            die(2, "a group member gets only TERM or KILL")
+        send_member(root, rest[0], rest[1], dry=False)
     elif command == "check-signal":
         send(root, rest[0], rest[1] if len(rest) > 1 else "TERM", dry=True)
     elif command == "signal":
@@ -1636,6 +1740,13 @@ down() {
   if ((code == 5)); then
     incomplete "teardown refused before any signal: $(python3 -I -c 'import json,sys; print("; ".join(json.loads(sys.argv[1])["problems"]))' "$plan"); the root and anchors are kept"
   fi
+  # #1010: unrecorded members of a proved service's process group first, each proved again by pidfd.
+  local spec
+  local -a members
+  mapfile -t members < <(python3 -I -c 'import json,sys; [print(json.dumps(m)) for m in json.loads(sys.argv[1])["members"]]' "$plan")
+  for spec in "${members[@]}"; do
+    stop_member "$spec" || incomplete "an unrecorded member of a kit process group could not be stopped with a proved identity; teardown stopped and the root is kept"
+  done
   # Children before parents: cli, stub, backend, tmux, then inner and outer last.
   for name in $(python3 -I -c 'import json,sys; print(" ".join(json.loads(sys.argv[1])["targets"]))' "$plan"); do
     stop_role "$name" || incomplete "$name could not be stopped with a proved identity; teardown stopped and the root is kept"
@@ -1648,7 +1759,7 @@ down() {
   done
   code=0
   plan="$(kitpy plan-teardown "$ROOT")" || code=$?
-  [[ $code -eq 0 && "$plan" == *'"targets": []'* ]] || incomplete "processes of this kit instance are still running; the root is kept"
+  [[ $code -eq 0 && "$plan" == *'"targets": []'* && "$plan" == *'"members": []'* ]] || incomplete "processes of this kit instance are still running; the root is kept"
   kitpy gone "$ROOT" launcher || incomplete "the anchor launcher has not exited; the root is kept"
   if [[ -f "$ROOT/evidence/MANIFEST.sha256" ]]; then
     (cd "$ROOT/evidence" && sha256sum -c --quiet MANIFEST.sha256) || fail "the evidence manifest does not match; the root is kept"
@@ -1737,6 +1848,26 @@ stop_role() { # name: TERM through a proved pidfd, a bounded wait, then KILL aft
   ((code == 0)) || return 1
   for i in $(seq 1 20); do
     [[ "$(kitpy verify "$ROOT" "$1" >/dev/null 2>&1; echo $?)" == 3 ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+stop_member() { # spec: TERM through a proved pidfd, a bounded wait, then KILL after a fresh proof
+  local code=0 i
+  kitpy signal-member "$ROOT" "$1" TERM >/dev/null 2>&1 || code=$?
+  ((code == 3)) && return 0
+  ((code == 0)) || return 1
+  for i in $(seq 1 20); do
+    [[ "$(kitpy check-member "$ROOT" "$1" >/dev/null 2>&1; echo $?)" == 3 ]] && return 0
+    sleep 0.1
+  done
+  code=0
+  kitpy signal-member "$ROOT" "$1" KILL >/dev/null 2>&1 || code=$?
+  ((code == 3)) && return 0
+  ((code == 0)) || return 1
+  for i in $(seq 1 20); do
+    [[ "$(kitpy check-member "$ROOT" "$1" >/dev/null 2>&1; echo $?)" == 3 ]] && return 0
     sleep 0.1
   done
   return 1

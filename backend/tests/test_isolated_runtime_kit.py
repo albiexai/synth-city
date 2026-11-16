@@ -330,6 +330,38 @@ def test_down_refuses_an_unrecorded_process_before_any_signal(kit_root):
     assert not kit_root.exists() and not [pid for pid in summary["pids"].values() if _alive(pid)]
 
 
+def test_down_stops_unrecorded_members_of_the_cli_group_and_nothing_outside(kit_root):
+    """#1010: a real OpenCode starts its server and Mail shim in the pane's process group; down stops them."""
+    _needs_namespaces()
+    victim = subprocess.Popen(["sleep", "300"], start_new_session=True)  # outside the kit, in a group of its own
+    victim_id = None
+    try:
+        time.sleep(0.2)
+        victim_id = _identity(victim.pid)
+        summary = _up(kit_root, RUNTIME_KIT_TEST_FAULT="cli_grandchild")
+        marker = kit_root / "run" / "fake-cli" / "members"
+        deadline = time.monotonic() + 10
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        members = [int(pid) for pid in marker.read_text().split()]
+        assert len(members) == 2 and all(_alive(pid) for pid in members)
+        down = _kit("down", "--root", str(kit_root))
+        assert down.returncode == 0, down.stderr
+        assert not kit_root.exists()
+        assert not [pid for pid in [*summary["pids"].values(), *members] if _alive(pid)]
+        assert _alive(victim.pid) and _identity(victim.pid) == victim_id
+    finally:
+        try:
+            if victim_id is not None and victim.poll() is None:
+                _pidfd_kill(victim_id)
+        finally:
+            # The fallback when the identity was never read or the proved kill failed: the victim is this
+            # test's own unreaped child, so its pid can't name another process until wait() reaps it.
+            # Popen.kill() polls first, so it does nothing after an exit.
+            victim.kill()
+            victim.wait(timeout=10)
+
+
 def test_up_refuses_a_retained_root_before_starting_anything(kit_root):
     _needs_namespaces()
     _up(kit_root)
@@ -451,6 +483,8 @@ def _model(preflight=False):
                       106: {"ppid": 103, "net": net, "user": inner_user, "argv": [b"cli"]}})
     for pid, proc in world.items():
         proc["start"] = str(1000 + pid)
+    if not preflight:
+        world[106]["pgid"] = 106  # tmux starts each pane as a session and group leader
     roles = {100: "launcher", 101: "outer", 102: "inner", 103: "tmux", 104: "stub", 105: "backend", 106: "cli"}
     procs = {roles[pid]: {"pid": pid, "start": proc["start"], "argv": f"h{pid}", "ppid": proc["ppid"],
                           "pstart": str(1000 + proc["ppid"])} for pid, proc in world.items()}
@@ -473,7 +507,10 @@ def _bind(module, world, procs, inst):
             raise PermissionError(pid)
         return proc[kind]
     module["link"] = link
-    module["own_pids"] = lambda: sorted(world)
+    module["own_pids"] = lambda: sorted(pid for pid, proc in world.items() if not proc.get("foreign"))
+    module["owned"] = lambda pid: int(pid) in world and not world[int(pid)].get("foreign")
+    # Every model process is in the launcher's group unless it says otherwise (the launcher runs under setsid).
+    module["proc_pgid"] = lambda pid: world[int(pid)].get("pgid", 100) if int(pid) in world else None
     module["HOST"] = {"net": "net:[1]", "user": "user:[1]"}
     module["instance"] = lambda root: inst
     module["processes"] = lambda root: procs
@@ -483,7 +520,7 @@ def _bind(module, world, procs, inst):
 def test_model_plan_proves_every_role_and_orders_children_first():
     world, procs, inst = _model()
     module = _bind(_helper_module(), world, procs, inst)
-    assert module["plan"](ROOT_MODEL) == {"targets": ["cli", "stub", "backend", "tmux", "inner", "outer"], "problems": []}
+    assert module["plan"](ROOT_MODEL) == {"targets": ["cli", "stub", "backend", "tmux", "inner", "outer"], "members": [], "problems": []}
 
 
 @pytest.mark.parametrize("role", ["outer", "inner", "tmux", "stub", "backend", "cli"])
@@ -508,7 +545,7 @@ def test_model_a_host_namespace_anchor_never_qualifies_even_with_a_valid_chain()
 def test_model_preflight_anchors_in_their_own_namespaces_qualify():
     world, procs, inst = _model(preflight=True)
     module = _bind(_helper_module(), world, procs, inst)
-    assert module["plan"](ROOT_MODEL) == {"targets": ["inner", "outer"], "problems": []}
+    assert module["plan"](ROOT_MODEL) == {"targets": ["inner", "outer"], "members": [], "problems": []}
 
 
 def test_model_a_foreign_anchor_with_a_wrong_command_is_refused():
@@ -540,6 +577,123 @@ def test_model_an_unreadable_process_refuses_the_plan():
     world[200] = {"ppid": 1, "start": "1200", "net": "net:[50]", "user": "user:[52]", "argv": [b"x"], "unreadable": True}
     module = _bind(_helper_module(), world, procs, inst)
     assert any("cannot be inspected" in p for p in module["plan"](ROOT_MODEL)["problems"])
+
+
+def _cli_group(world, *pids, **fields):
+    """Unrecorded processes in the kit namespace and the cli's process group, like OpenCode's server and Mail shim."""
+    parent = 106
+    for pid in pids:
+        world[pid] = {"ppid": parent, "start": str(1000 + pid), "net": "net:[50]", "user": "user:[52]",
+                      "argv": [b"x"], "pgid": 106, **fields}
+        parent = pid
+
+
+def test_model_unrecorded_members_of_the_cli_group_are_targets_before_any_role():
+    world, procs, inst = _model()
+    _cli_group(world, 107, 108)  # a child and a grandchild of the cli
+    module = _bind(_helper_module(), world, procs, inst)
+    result = module["plan"](ROOT_MODEL)
+    assert result["problems"] == [] and result["targets"] == ["cli", "stub", "backend", "tmux", "inner", "outer"]
+    assert result["members"] == [
+        {"pid": 107, "start": "1107", "argv": "h107", "pgid": 106, "leader": "cli"},
+        {"pid": 108, "start": "1108", "argv": "h108", "pgid": 106, "leader": "cli"},
+    ]
+
+
+@pytest.mark.parametrize("where", ["host_net", "other_net", "foreign_uid"])
+def test_model_a_process_outside_the_kit_is_never_a_member_even_in_the_cli_group(where):
+    world, procs, inst = _model()
+    fields = {"host_net": {"net": "net:[1]"}, "other_net": {"net": "net:[77]"}, "foreign_uid": {"foreign": True}}[where]
+    _cli_group(world, 107, **fields)
+    module = _bind(_helper_module(), world, procs, inst)
+    result = module["plan"](ROOT_MODEL)
+    assert result["members"] == [] and not any("107" in p for p in result["problems"])
+    assert result["targets"] == ["cli", "stub", "backend", "tmux", "inner", "outer"]
+
+
+@pytest.mark.parametrize("case", ["own_session", "anchor_group", "launcher_group", "leader_unproved",
+                                  "leader_not_a_group_leader", "leader_gone"])
+def test_model_an_unrecorded_process_outside_a_proved_service_group_still_refuses(case):
+    world, procs, inst = _model()
+    _cli_group(world, 107)
+    if case == "own_session":
+        world[107]["pgid"] = 107  # it left the group with setsid
+    elif case == "anchor_group":
+        world[107]["pgid"] = 102  # the inner anchor never leads a teardown group
+    elif case == "launcher_group":
+        world[107]["pgid"] = 100
+    elif case == "leader_unproved":
+        procs["cli"]["argv"] = "another"
+    elif case == "leader_not_a_group_leader":
+        world[106]["pgid"] = 100
+    else:
+        del world[106]
+    module = _bind(_helper_module(), world, procs, inst)
+    result = module["plan"](ROOT_MODEL)
+    assert result["members"] == [] and any("unrecorded" in p and "107" in p for p in result["problems"])
+
+
+@pytest.mark.parametrize("change", ["start", "argv", "pgid", "net", "foreign", "leader_gone", "leader_regrouped",
+                                    "leader_unproved", "now_a_role", "leader_not_a_service"])
+def test_model_a_member_is_proved_again_before_its_signal(change):
+    world, procs, inst = _model()
+    _cli_group(world, 107)
+    module = _bind(_helper_module(), world, procs, inst)
+    member = module["plan"](ROOT_MODEL)["members"][0]
+    assert module["member_check"](inst, procs, ROOT_MODEL, member) == "ok"
+    if change == "start":
+        world[107]["start"] = "9999"  # the pid now names another process
+    elif change == "argv":
+        member = {**member, "argv": "other"}
+    elif change == "pgid":
+        world[107]["pgid"] = 107
+    elif change == "net":
+        world[107]["net"] = "net:[1]"
+    elif change == "foreign":
+        world[107]["foreign"] = True
+    elif change == "leader_gone":
+        del world[106]
+    elif change == "leader_regrouped":
+        world[106]["pgid"] = 100
+    elif change == "leader_unproved":
+        procs["cli"]["argv"] = "another"  # alive and still leading its group, but no longer the recorded cli
+    elif change == "now_a_role":
+        procs["stub"] = {**procs["stub"], "pid": 107}
+    else:
+        # Even an anchor that leads its own group, with the process in that group, is never a member's leader.
+        world[102]["pgid"] = world[107]["pgid"] = 102
+        member = {**member, "leader": "inner", "pgid": 102}
+    expected = "gone" if change == "start" else None
+    result = module["member_check"](inst, procs, ROOT_MODEL, member)
+    assert result == expected if expected else result not in ("ok", "gone")
+
+
+def test_model_group_leaders_are_only_proved_services_that_lead_their_own_group():
+    world, procs, inst = _model()
+    world[102]["pgid"] = 102  # the inner anchor leads a group of its own: still never a leader
+    world[104]["pgid"] = 104  # the stub leads its own group
+    module = _bind(_helper_module(), world, procs, inst)
+    # tmux and the backend are proved but in the launcher's group, so they lead nothing.
+    assert module["group_leaders"](inst, procs, ROOT_MODEL) == {104: "stub", 106: "cli"}
+    procs["stub"]["argv"] = "another"  # an unproved service leads nothing either
+    assert module["group_leaders"](inst, procs, ROOT_MODEL) == {106: "cli"}
+
+
+def test_model_the_plan_proves_each_candidate_again_before_it_is_a_member():
+    world, procs, inst = _model()
+    _cli_group(world, 107)
+    module = _bind(_helper_module(), world, procs, inst)
+    module["argv_hash"] = lambda pid: None if int(pid) == 107 else f"h{pid}"  # its command line can't be read
+    result = module["plan"](ROOT_MODEL)
+    assert result["members"] == [] and any("unrecorded" in p and "107" in p for p in result["problems"])
+
+
+@pytest.mark.parametrize("bad", [None, [], {"pid": "107"}, {"pid": 107}])
+def test_model_a_malformed_member_spec_is_refused(bad):
+    world, procs, inst = _model()
+    _cli_group(world, 107)
+    module = _bind(_helper_module(), world, procs, inst)
+    assert module["member_check"](inst, procs, ROOT_MODEL, bad) not in ("ok", "gone")
 
 
 @pytest.mark.parametrize("change", ["argv_only", "replacement_pid", "new_parent"])
