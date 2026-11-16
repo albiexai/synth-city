@@ -1655,6 +1655,50 @@ def _revision_review_request(path: str, payload: dict) -> dict:
 
 
 @mcp.tool()
+def synth_city_leader_cancel_revision(work_item_id: int, revision_number: int, dispatch_nonce: str,
+    operation_id: str, reason: str) -> dict:
+    """Current Leader cancels one active or submitted revision with every operator guard.
+
+    Replays with the same operation_id are safe; a different request under the same id is refused.
+    One audit fact and one notice to the bound Supervisor are written. This changes no policy or
+    limit and does not approve, retry, release a lease or merge.
+    """
+    return _revision_review_request(f"/github-work-items/{work_item_id}/leader-recovery/cancel-revision",
+        {"revision_number": revision_number, "dispatch_nonce": dispatch_nonce,
+         "operation_id": operation_id, "reason": reason})
+
+
+@mcp.tool()
+def synth_city_leader_finalize_merged(work_item_id: int, operation_id: str = "", expected_context_sha256: str = "",
+    reason: str = "", dry_run: bool = True) -> dict:
+    """Current Leader records a merged PR the poll could not settle, from fresh evidence.
+
+    Call with dry_run true (the default) for the evidence and its digest. Then call with dry_run false,
+    the digest, an operation_id and a reason. It performs no merge and releases nothing. Replay-safe;
+    one notice to the bound Supervisor.
+    """
+    if dry_run:
+        return _revision_review_request(
+            f"/github-work-items/{work_item_id}/leader-recovery/finalize-merged/preview", {})
+    return _revision_review_request(f"/github-work-items/{work_item_id}/leader-recovery/finalize-merged",
+        {"operation_id": operation_id, "expected_context_sha256": expected_context_sha256, "reason": reason})
+
+
+@mcp.tool()
+def synth_city_leader_release_workspace(work_item_id: int, workspace_id: int, expected_leased_at: str,
+    operation_id: str, reason: str) -> dict:
+    """Current Leader releases a CLEAN workspace of a terminal item.
+
+    Refused when the tree is dirty, has unpushed commits or cannot be inspected, when the item is not
+    terminal, or when the lease changed. Dirty or unknown state is operator-only. One notice to the
+    bound Supervisor; replay-safe.
+    """
+    return _revision_review_request(f"/github-work-items/{work_item_id}/leader-recovery/release-workspace",
+        {"workspace_id": workspace_id, "expected_leased_at": expected_leased_at,
+         "operation_id": operation_id, "reason": reason})
+
+
+@mcp.tool()
 def synth_city_record_revision_review(work_item_id: int, revision: int, dispatch_nonce: str,
     head_sha: str, summary: str, evidence_url: str, verdict: str = "changes_required") -> dict:
     """Assigned independent reviewer records CHANGES REQUIRED (default) or ACCEPTED for this exact submitted head.
