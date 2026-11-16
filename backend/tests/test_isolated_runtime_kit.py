@@ -1187,6 +1187,7 @@ REFUSAL_ONLY = {  # run everywhere: each is refused by argument or root checks b
     "test_stub_script_kit_status_refuses_the_option",
     "test_crash_kit_refuses_without_a_kit_root",  # #947 A2a
     "test_crash_kit_refuses_another_role_and_role_elsewhere",
+    "test_relaunch_kit_refuses_without_a_crash",  # #947 A2b
 }
 
 
@@ -2255,3 +2256,134 @@ def test_crash_kit_refuses_another_role_and_role_elsewhere(tmp_path):
     assert missing.returncode == 2 and "only for --role cli" in missing.stderr
     elsewhere = _kit("status", "--root", str(root), "--role", "cli")
     assert elsewhere.returncode == 2 and "--role is only for crash" in elsewhere.stderr
+
+
+# #947 A2b: `relaunch` resumes the crashed CLI in its exact saved session and consumes the
+# crash marker only after the new pane, its registration and the unchanged session are proved.
+SAVED_SES = "ses_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3"
+
+
+def _relaunch_db(tmp_path, *, mode="resume", options=None, provider="opencode-cli", slot=7):
+    import sqlite3
+    root = tmp_path / "kit"
+    (root / "state").mkdir(parents=True)
+    (root / "state" / "launch.json").write_text(json.dumps({"preset_id": 3, "slot_id": 7}))
+    (root / "state" / "provider").write_text(provider + "\n")
+    db = sqlite3.connect(root / "kit.db")
+    db.execute("CREATE TABLE agent_team_slots (id INTEGER PRIMARY KEY, provider TEXT, launch_mode TEXT, launch_options TEXT)")
+    options = {"session_id": SAVED_SES} if options is None else options
+    db.execute("INSERT INTO agent_team_slots VALUES (?, ?, ?, ?)", (slot, provider, mode, json.dumps(options)))
+    db.commit()
+    db.close()
+    return root
+
+
+def test_model_saved_session_is_the_exact_resumable_opencode_session(tmp_path, capsys):
+    root = _relaunch_db(tmp_path)
+    _helper_module()["saved_session"](str(root))
+    assert capsys.readouterr().out.strip() == SAVED_SES
+
+
+@pytest.mark.parametrize("case", ["plain_mode", "no_id", "short_id", "uuid", "other_provider", "no_slot", "string_options"])
+def test_model_saved_session_refuses_anything_else(tmp_path, case):
+    kwargs = {"plain_mode": {"mode": "plain"}, "no_id": {"options": {}}, "short_id": {"options": {"session_id": "ses_abc"}},
+              "uuid": {"options": {"session_id": "6f1c2b8e-4d3a-4b7f-9c2e-1a2b3c4d5e6f"}},
+              "other_provider": {"provider": "claude-code"}, "no_slot": {"slot": 8},
+              "string_options": {"options": "ses_x"}}[case]
+    root = _relaunch_db(tmp_path, **kwargs)
+    with pytest.raises(SystemExit) as refused:
+        _helper_module()["saved_session"](str(root))
+    assert refused.value.code == 2
+
+
+@pytest.mark.parametrize("state", ["file", "symlink", "missing", "directory"])
+def test_model_crash_clear_removes_only_its_own_marker(tmp_path, state):
+    (tmp_path / "state").mkdir()
+    marker = tmp_path / "state" / "crash.json"
+    target = tmp_path / "elsewhere"
+    target.write_text("keep")
+    if state == "file":
+        marker.write_text("{}")
+    elif state == "symlink":
+        marker.symlink_to(target)
+    elif state == "directory":
+        marker.mkdir()
+    module = _helper_module()
+    if state == "file":
+        module["crash_clear"](str(tmp_path))
+        assert not marker.exists()
+    else:
+        with pytest.raises(SystemExit) as refused:
+            module["crash_clear"](str(tmp_path))
+        assert refused.value.code == 2
+        assert target.read_text() == "keep" and (state == "missing" or os.path.lexists(marker))
+
+
+def _relaunch_step(tmp_path, *, marker=True, gone=0, saved=(SAVED_SES, SAVED_SES), launch=0, registration=0, clear=0):
+    """The kit's relaunch function with its runtime boundaries mocked; every call is logged in order."""
+    root = tmp_path / "kit"
+    (root / "state").mkdir(parents=True, exist_ok=True)
+    (root / ".deck-runtime-kit").write_text("")
+    if marker:
+        (root / "state" / "crash.json").write_text("{}")
+    log = tmp_path / "calls.log"
+    sessions = tmp_path / "sessions"
+    sessions.write_text("\n".join(saved) + "\n")
+    script = KIT.read_text()
+    reporters = "\n".join(line for line in script.splitlines()
+                          if line.startswith(("refuse() {", "fail() {", "incomplete() {", "note() {")))
+    first = script.index("relaunch() {")
+    function = script[first:script.index("\n}\n", first) + 3]
+    mocks = f"""
+MARKER=.deck-runtime-kit ROOT={root}
+call() {{ echo "$*" >>{log}; }}
+kitpy() {{ call kitpy "$1"; case "$1" in instance) return 0 ;; gone) return {gone} ;; crash-clear) return {clear} ;; esac; return 9; }}
+verify() {{ call verify "$1"; echo 1; }}
+load_env() {{ call load_env; }}
+slot_session() {{ call slot_session; local line; line="$(head -1 {sessions})"; sed -i 1d {sessions}; [[ -n "$line" ]] && echo "$line"; }}
+relaunch_slot() {{ call relaunch_slot; return {launch}; }}
+record_cli_pane() {{ call record_cli_pane; }}
+await_registration() {{ call await_registration; return {registration}; }}
+"""
+    program = "\n".join([reporters, mocks, function, "relaunch", "echo continued"])
+    result = subprocess.run(["bash", "-c", program], capture_output=True, text=True, timeout=10, env={"PATH": "/usr/bin:/bin"})
+    calls = log.read_text().split("\n")[:-1] if log.exists() else []
+    return result, calls
+
+
+def test_relaunch_consumes_the_marker_only_after_every_proof(tmp_path):
+    result, calls = _relaunch_step(tmp_path)
+    assert result.returncode == 0 and "continued" in result.stdout, result.stderr
+    assert calls == ["kitpy instance", "kitpy gone", "verify tmux", "verify backend", "load_env", "slot_session",
+                     "relaunch_slot", "record_cli_pane", "await_registration", "slot_session", "kitpy crash-clear"]
+
+
+@pytest.mark.parametrize("case, code, last", [
+    ("no_marker", 2, None), ("cli_running", 2, "kitpy gone"), ("no_saved", 2, "slot_session"),
+    ("launch_failed", 1, "relaunch_slot"), ("registration_failed", 1, "await_registration"),
+    ("other_session", 2, "slot_session"), ("clear_failed", 1, "kitpy crash-clear")])
+def test_relaunch_stops_before_consuming_the_marker(tmp_path, case, code, last):
+    kwargs = {"no_marker": {"marker": False}, "cli_running": {"gone": 1}, "no_saved": {"saved": ("",)},
+              "launch_failed": {"launch": 1}, "registration_failed": {"registration": 1},
+              "other_session": {"saved": (SAVED_SES, "ses_" + "Z" * 26)}, "clear_failed": {"clear": 1}}[case]
+    result, calls = _relaunch_step(tmp_path, **kwargs)
+    assert result.returncode == code and "continued" not in result.stdout, result.stderr
+    assert (calls[-1] if calls else None) == last
+    assert case == "clear_failed" or "kitpy crash-clear" not in calls
+
+
+def test_up_keeps_the_private_tmux_server_when_its_sessions_end():
+    up = KIT.read_text()
+    up = up[up.index("\nup() {"):]
+    keep = up.index("set-option -s exit-empty off")
+    assert keep < up.index("kill-session -t '=kit-probe'")
+
+
+def test_relaunch_kit_refuses_without_a_crash(tmp_path):
+    missing = _kit("relaunch", "--root", str(tmp_path / "kit"))
+    assert missing.returncode == 2 and "not a kit root" in missing.stderr
+    root = tmp_path / "kit"
+    root.mkdir()
+    (root / ".deck-runtime-kit").write_text("")
+    no_crash = _kit("relaunch", "--root", str(root))
+    assert no_crash.returncode == 2 and "no recorded crash" in no_crash.stderr

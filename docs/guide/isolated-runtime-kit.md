@@ -34,6 +34,8 @@ scripts/isolated-runtime-kit.sh down   --root /tmp/kit [--keep]
 | `status` | 15 s | Checks the instance, every recorded process, the backend's health and the registration before it writes anything. It then builds the evidence and the summary in a new attempt directory and publishes them; see [Evidence](#evidence) for the commit point and exit codes. |
 | `exec` | 120 s by default, at most 600 s | Runs a command inside the namespaces with the kit's environment. |
 | `down` | 30 s | Stops every process of the instance, including ones started later inside its namespace, proves none remains, checks the evidence manifest, and removes the root (`--keep` keeps it). If it can't prove cleanup, it fails as incomplete and keeps the root. |
+| `crash --role cli` | 15 s | Kills only the recorded CLI, for a crash test. It opens a pidfd first, proves the CLI's full recorded identity, sends `SIGKILL` through that pidfd, and writes `state/crash.json` only after the pidfd shows the exit. Any other role, a failed proof, a CLI that is already gone, or an existing crash marker is refused before any signal. An exit it can't prove records nothing and is incomplete. |
+| `relaunch` | 75 s | After a `crash`, relaunches the slot through the isolated backend so the member resumes its exact saved session. It needs an `opencode-cli` slot saved for resume with a `ses_…` session id. It records the new pane under the recorded tmux server, waits for its Agent Mail registration, checks that the saved session is unchanged, and only then clears the crash marker. The tmux server is set to outlive its sessions, so a crashed pane doesn't stop it. |
 
 **Exit codes:** 0 means success, 1 a failure, a deadline or an incomplete proof, and 2 a refusal.
 

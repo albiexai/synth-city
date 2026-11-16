@@ -7,6 +7,7 @@
 #   isolated-runtime-kit.sh exec   --root DIR [--timeout S] -- COMMAND...
 #   isolated-runtime-kit.sh down   --root DIR [--keep]
 #   isolated-runtime-kit.sh crash  --root DIR --role cli
+#   isolated-runtime-kit.sh relaunch --root DIR
 #
 # Everything runs inside the kit's own user and network namespaces:
 #   - an outer anchor (`unshare --user --map-root-user --net`) brings up `lo`,
@@ -55,6 +56,7 @@ EXEC_DEFAULT=120
 EXEC_CAP=600
 DOWN_DEADLINE=30
 CRASH_DEADLINE=15
+RELAUNCH_DEADLINE=60
 DOWN_TERM_WAIT=10
 
 refuse() { echo "isolated-runtime-kit: refused: $*" >&2; exit 2; }
@@ -366,6 +368,53 @@ def crash(root, role):
     finally:
         os.close(out)
     print("crashed")
+
+SES_ID = re.compile(r"ses_[0-9A-Za-z]{26}")
+
+def saved_session(root):
+    """#947: the exact OpenCode session the crashed member must resume, read from the kit database."""
+    import sqlite3
+    real = os.path.realpath(root)
+    try:
+        with open(os.path.join(real, "state", "provider")) as handle:
+            provider = handle.read().strip()
+        with open(os.path.join(real, "state", "launch.json")) as handle:
+            slot = int(json.load(handle)["slot_id"])
+    except (OSError, ValueError, KeyError, TypeError):
+        die(2, "the launch record cannot be read; nothing was relaunched")
+    if provider != "opencode-cli":
+        die(2, f"relaunch resumes only opencode-cli members, not {provider}; nothing was relaunched")
+    row = None
+    try:
+        db = sqlite3.connect("file:" + os.path.join(real, "kit.db") + "?mode=ro", uri=True)
+        try:
+            row = db.execute("SELECT provider, launch_mode, launch_options FROM agent_team_slots WHERE id = ?",
+                             (slot,)).fetchone()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        row = None
+    if row is None or row[0] != provider or row[1] != "resume":
+        die(2, "the slot is not saved for an exact resume; nothing was relaunched")
+    try:
+        options = json.loads(row[2]) if isinstance(row[2], str) else None
+    except ValueError:
+        options = None
+    session = options.get("session_id") if isinstance(options, dict) else None
+    if not isinstance(session, str) or not SES_ID.fullmatch(session):
+        die(2, "the slot has no exact saved OpenCode session; nothing was relaunched")
+    print(session)
+
+def crash_clear(root):
+    """#947: consume the crash marker only when it is this kit regular file, never through a link."""
+    marker = os.path.join(root, "state", "crash.json")
+    try:
+        info = os.lstat(marker)
+    except FileNotFoundError:
+        die(2, "no recorded crash to clear")
+    if not stat.S_ISREG(info.st_mode):
+        die(2, "the crash marker is not a regular file; it was kept")
+    os.unlink(marker)
 
 def record(root, name, pid):
     pid = int(pid)
@@ -933,6 +982,10 @@ def main():
         stub_script_verify(root)
     elif command == "crash":
         crash(root, rest[0])
+    elif command == "saved-session":
+        saved_session(root)
+    elif command == "crash-clear":
+        crash_clear(root)
     else:
         die(2, "unknown helper command")
 
@@ -1209,6 +1262,8 @@ up() {
   [[ "$(in_ns "$ROOT/bin/tmux" list-sessions -F '#{session_name}')" == kit-probe ]] || refuse "the tmux server is not private"
   [[ "$(in_ns "$ROOT/bin/tmux" display-message -p '#{pid}')" == "$(verify tmux)" ]] \
     || refuse "the tmux server is not the recorded one"
+  # #947: the recorded server outlives its sessions, so a crashed CLI pane cannot stop it.
+  in_ns "$ROOT/bin/tmux" set-option -s exit-empty off
   in_ns "$ROOT/bin/tmux" kill-session -t '=kit-probe'
 
   # --- Stub model provider -------------------------------------------------------------
@@ -1308,43 +1363,8 @@ PY
     || fail "the team launch through the isolated backend failed (see $ROOT/logs/backend.log)"
   echo "$launch" >"$ROOT/state/launch.json"
 
-  # The launched pane is the CLI: record it at once (parent = the recorded tmux server),
-  # so any later failure can still stop it with a proved identity.
-  local pane_pid="" i
-  for i in $(seq 1 50); do
-    pane_pid="$(in_ns "$ROOT/bin/tmux" list-panes -a -F '#{pane_pid}' 2>/dev/null | head -1)"
-    [[ -n "$pane_pid" ]] && break
-    sleep 0.1
-  done
-  [[ "$pane_pid" =~ ^[0-9]+$ ]] || fail "the launch started no pane"
-  # Wait until the pane's command line is stable (a CLI may exec once at start).
-  local last="" now stable=0
-  for i in $(seq 1 50); do
-    now="$(sha256sum "/proc/$pane_pid/cmdline" 2>/dev/null | cut -c1-64)"
-    if [[ -n "$now" && "$now" == "$last" ]]; then stable=$((stable + 1)); else stable=0; fi
-    last="$now"
-    ((stable >= 5)) && break
-    sleep 0.1
-  done
-  record cli "$pane_pid"
-  verify cli >/dev/null
-  python3 -I - "$ROOT/state/processes.json" <<'PY' || refuse "the CLI pane is not a child of the recorded tmux server"
-import json, sys
-procs = json.load(open(sys.argv[1]))
-sys.exit(0 if procs["cli"]["ppid"] == procs["tmux"]["pid"] and procs["cli"]["pstart"] == procs["tmux"]["start"] else 1)
-PY
-
-  local registered=$((SECONDS + REGISTRATION_DEADLINE))
-  until registration_row >/dev/null 2>&1; do
-    ((SECONDS < registered && SECONDS < deadline)) || fail "deadline: the CLI did not register through Agent Mail"
-    sleep 0.5
-  done
-  [[ "$(registration_row | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["bound_pane_pid"])')" == "$pane_pid" ]] \
-    || refuse "the registration is bound to another pane than the recorded CLI"
-  # The fake CLI exec'd into its idle loop after registering: refresh only its command line.
-  kitpy refresh "$ROOT" cli || refuse "the CLI could not be refreshed with an unchanged identity"
-  verify cli >/dev/null
-
+  record_cli_pane
+  await_registration "$deadline"
   trap - EXIT
   summary
 }
@@ -1356,6 +1376,48 @@ token = open(sys.argv[1]).read().strip()
 body = json.load(urllib.request.urlopen("http://127.0.0.1:18780/health", timeout=2))
 sys.exit(0 if token and body.get("test_instance", {}).get("token") == token else 1)
 PY
+}
+
+# The launched pane is the CLI: record it at once (parent = the recorded tmux server),
+# so any later failure can still stop it with a proved identity. Used by up and relaunch.
+record_cli_pane() {
+  local i
+  CLI_PANE_PID=""
+  for i in $(seq 1 50); do
+    CLI_PANE_PID="$(in_ns "$ROOT/bin/tmux" list-panes -a -F '#{pane_pid}' 2>/dev/null | head -1)"
+    [[ -n "$CLI_PANE_PID" ]] && break
+    sleep 0.1
+  done
+  [[ "$CLI_PANE_PID" =~ ^[0-9]+$ ]] || fail "the launch started no pane"
+  # Wait until the pane's command line is stable (a CLI may exec once at start).
+  local last="" now stable=0
+  for i in $(seq 1 50); do
+    now="$(sha256sum "/proc/$CLI_PANE_PID/cmdline" 2>/dev/null | cut -c1-64)"
+    if [[ -n "$now" && "$now" == "$last" ]]; then stable=$((stable + 1)); else stable=0; fi
+    last="$now"
+    ((stable >= 5)) && break
+    sleep 0.1
+  done
+  record cli "$CLI_PANE_PID"
+  verify cli >/dev/null
+  python3 -I - "$ROOT/state/processes.json" <<'PY' || refuse "the CLI pane is not a child of the recorded tmux server"
+import json, sys
+procs = json.load(open(sys.argv[1]))
+sys.exit(0 if procs["cli"]["ppid"] == procs["tmux"]["pid"] and procs["cli"]["pstart"] == procs["tmux"]["start"] else 1)
+PY
+}
+
+await_registration() { # deadline: the recorded pane registers through Agent Mail and is bound
+  local deadline="$1" registered=$((SECONDS + REGISTRATION_DEADLINE))
+  until registration_row >/dev/null 2>&1; do
+    ((SECONDS < registered && SECONDS < deadline)) || fail "deadline: the CLI did not register through Agent Mail"
+    sleep 0.5
+  done
+  [[ "$(registration_row | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["bound_pane_pid"])')" == "$CLI_PANE_PID" ]] \
+    || refuse "the registration is bound to another pane than the recorded CLI"
+  # The fake CLI exec'd into its idle loop after registering: refresh only its command line.
+  kitpy refresh "$ROOT" cli || refuse "the CLI could not be refreshed with an unchanged identity"
+  verify cli >/dev/null
 }
 
 registration_row() { # the registered session and its pane binding, read from the kit's own database
@@ -1569,6 +1631,53 @@ crash() { # #947: KILL only the recorded cli through a proved pidfd; the marker 
   esac
 }
 
+slot_session() { kitpy saved-session "$ROOT"; }
+
+relaunch_slot() { # the recorded preset again, through the isolated backend; the slot resumes its saved session
+  local python="${PYTHON:-}"
+  if [[ -z "$python" ]]; then
+    if [[ -x "$REPO_ROOT/backend/venv/bin/python" ]]; then python="$REPO_ROOT/backend/venv/bin/python"; else python="$(command -v python3)"; fi
+  fi
+  in_ns "$python" -I - 18780 "$ROOT/state/operator-token" "$ROOT/state/launch.json" <<'PY'
+import json, sys, urllib.error, urllib.request
+port, token_file, launch_file = sys.argv[1:4]
+token = open(token_file).read().strip()
+preset = int(json.load(open(launch_file))["preset_id"])
+def call(path):
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/api/v1/agent-teams/presets/{preset}{path}", method="POST",
+        data=json.dumps({"skip_plan_confirmation": True}).encode(),
+        headers={"Content-Type": "application/json", "X-Synth-City-Operator-Token": token})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        sys.exit(f"POST {path}: HTTP {exc.code}")
+plan = call("/plan-launch")
+if any(item.get("blocked") or item.get("block_code") for item in plan.get("items", [])):
+    sys.exit("relaunch plan blocked")
+call("/launch")
+PY
+}
+
+relaunch() { # #947: relaunch the crashed cli in its exact saved session; the crash marker is consumed last
+  [[ -f "$ROOT/$MARKER" ]] || refuse "$ROOT is not a kit root (no $MARKER)"
+  [[ -f "$ROOT/state/crash.json" && ! -L "$ROOT/state/crash.json" ]] || refuse "no recorded crash; relaunch follows a crash"
+  kitpy instance "$ROOT" >/dev/null || refuse "this root has no valid kit instance; nothing was relaunched"
+  kitpy gone "$ROOT" cli || refuse "the recorded cli is still running; nothing was relaunched"
+  verify tmux >/dev/null
+  verify backend >/dev/null
+  load_env
+  local saved after deadline=$((SECONDS + RELAUNCH_DEADLINE))
+  saved="$(slot_session)" || refuse "the slot has no exact saved session to resume; nothing was relaunched"
+  relaunch_slot || fail "the relaunch through the isolated backend failed (see $ROOT/logs/backend.log)"
+  record_cli_pane
+  await_registration "$deadline" || fail "the relaunched cli did not register"
+  after="$(slot_session)" || refuse "the slot lost its saved session during the relaunch"
+  [[ "$after" == "$saved" ]] || refuse "the relaunch resumed another session than the saved one"
+  kitpy crash-clear "$ROOT" || incomplete "the relaunch is proved but the crash marker could not be cleared"
+  note "relaunched the cli in its saved session"
+}
+
 stop_role() { # name: TERM through a proved pidfd, a bounded wait, then KILL after a fresh proof
   local code=0 i
   kitpy signal "$ROOT" "$1" TERM >/dev/null 2>&1 || code=$?
@@ -1597,12 +1706,13 @@ deadline_for() {
     status) echo "$STATUS_DEADLINE" ;;
     down) echo "$DOWN_DEADLINE" ;;
     crash) echo "$CRASH_DEADLINE" ;;
+    relaunch) echo $((RELAUNCH_DEADLINE + 15)) ;;
   esac
 }
 STUB_ARGS=()
 [[ -z "$STUB_SCRIPT" ]] || STUB_ARGS=(--stub-script "$STUB_SCRIPT")
 case "$COMMAND" in
-  up | status | down | crash)
+  up | status | down | crash | relaunch)
     set +e
     ROLE_ARGS=()
     [[ -z "$ROLE" ]] || ROLE_ARGS=(--role "$ROLE")
@@ -1620,6 +1730,7 @@ case "$COMMAND" in
   _status) status ;;
   _down) down ;;
   _crash) crash ;;
+  _relaunch) relaunch ;;
   exec) run_exec "$@" ;;
-  *) refuse "usage: isolated-runtime-kit.sh up|status|exec|down|crash --root DIR ..." ;;
+  *) refuse "usage: isolated-runtime-kit.sh up|status|exec|down|crash|relaunch --root DIR ..." ;;
 esac
