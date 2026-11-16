@@ -2387,3 +2387,129 @@ def test_relaunch_kit_refuses_without_a_crash(tmp_path):
     (root / ".deck-runtime-kit").write_text("")
     no_crash = _kit("relaunch", "--root", str(root))
     assert no_crash.returncode == 2 and "no recorded crash" in no_crash.stderr
+
+
+# #947 revision 2 (V1 review 5914249040): a registration proves only the current recorded CLI,
+# with its exact pid and start, as a connected MCP session of the kit provider and slot,
+# bound to that same pane. await_registration polls that proof; it never stops on an old row.
+def _registration_db(tmp_path, *, rows=(), bindings=None, cli=("206", "NEW"), provider="opencode-cli",
+                     launch=None, processes=True):
+    import sqlite3
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    (state / "launch.json").write_text(json.dumps({"preset_id": 3, "slot_id": 7}) if launch is None else launch)
+    if provider is not None:
+        (state / "provider").write_text(provider + "\n")
+    if processes:
+        record = {} if cli is None else {"cli": {"pid": int(cli[0]), "start": cli[1], "argv": "h", "ppid": 103, "pstart": "1103"}}
+        (state / "processes.json").write_text(json.dumps(record))
+    db = sqlite3.connect(tmp_path / "kit.db")
+    db.execute("CREATE TABLE mail_agent_sessions (id INTEGER PRIMARY KEY, provider TEXT, source TEXT, team_slot_id INTEGER, "
+               "bound_pane_pid INTEGER, bound_pane_proc_start TEXT, mailbox_status TEXT, closed_at TEXT)")
+    db.execute("CREATE TABLE agent_pane_bindings (id INTEGER PRIMARY KEY, pane_pid INTEGER, pane_proc_start TEXT, slot_id INTEGER)")
+    for row in rows:
+        values = {"provider": "opencode-cli", "source": "mcp", "slot": 7, "pid": 206, "start": "NEW",
+                  "status": "connected", "closed": None, **row}
+        db.execute("INSERT INTO mail_agent_sessions (provider, source, team_slot_id, bound_pane_pid, bound_pane_proc_start, "
+                   "mailbox_status, closed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                   (values["provider"], values["source"], values["slot"], values["pid"], values["start"], values["status"],
+                    values["closed"]))
+    for binding in ([{}] if bindings is None else bindings):
+        values = {"pid": 206, "start": "NEW", "slot": 7, **binding}
+        db.execute("INSERT INTO agent_pane_bindings (pane_pid, pane_proc_start, slot_id) VALUES (?, ?, ?)",
+                   (values["pid"], values["start"], values["slot"]))
+    db.commit()
+    db.close()
+
+
+def _registration_proof(tmp_path):
+    module = _helper_module()
+    try:
+        module["registration_proof"](str(tmp_path))
+    except SystemExit as stopped:
+        return stopped.code
+    return 0
+
+
+def test_registration_proof_accepts_the_current_connected_mcp_member(tmp_path, capsys):
+    _registration_db(tmp_path, rows=[{}])
+    assert _registration_proof(tmp_path) == 0
+    assert json.loads(capsys.readouterr().out)["bound_pane_pid"] == 206
+
+
+@pytest.mark.parametrize("case", [
+    "no_rows", "old_start", "old_pid_pair", "disconnected", "not_mcp", "other_provider", "other_slot", "closed",
+    "binding_other_start", "binding_other_slot", "binding_other_pid", "no_binding"])
+def test_registration_proof_waits_for_anything_but_the_current_member(tmp_path, case):
+    # old_start is V1's stale pair: the session and its binding both carry the old start of the same pid.
+    rows = {"no_rows": [], "old_start": [{"start": "OLD"}], "old_pid_pair": [{"pid": 106, "start": "OLD"}],
+            "disconnected": [{"status": "disconnected"}], "not_mcp": [{"source": "terminal"}],
+            "other_provider": [{"provider": "claude-code"}], "other_slot": [{"slot": 8}],
+            "closed": [{"closed": "2026-11-16 02:00:00"}]}.get(case, [{}])
+    bindings = {"old_start": [{"start": "OLD"}], "old_pid_pair": [{"pid": 106, "start": "OLD"}],
+                "binding_other_start": [{"start": "OLD"}], "binding_other_slot": [{"slot": 8}],
+                "binding_other_pid": [{"pid": 106}], "no_binding": []}.get(case)
+    _registration_db(tmp_path, rows=rows, bindings=bindings)
+    assert _registration_proof(tmp_path) == 1
+
+
+def test_registration_proof_ignores_an_old_pane_row_beside_the_current_one(tmp_path):
+    _registration_db(tmp_path, rows=[{"pid": 106, "start": "OLD"}, {}],
+                     bindings=[{"pid": 106, "start": "OLD"}, {}])
+    assert _registration_proof(tmp_path) == 0
+
+
+@pytest.mark.parametrize("case", ["no_processes", "no_cli_record", "bad_launch", "no_provider"])
+def test_registration_proof_refuses_malformed_state(tmp_path, case):
+    _registration_db(tmp_path, rows=[{}], processes=case != "no_processes", cli=None if case == "no_cli_record" else ("206", "NEW"),
+                     launch="{" if case == "bad_launch" else None, provider=None if case == "no_provider" else "opencode-cli")
+    assert _registration_proof(tmp_path) == 2
+
+
+def _await_step(tmp_path, proofs, deadline=4):
+    """await_registration with kitpy mocked: each proof call returns the next code, the last one repeats."""
+    script = Path(os.environ.get("RUNTIME_KIT_SCRIPT_UNDER_TEST", KIT)).read_text()
+    reporters = "\n".join(line for line in script.splitlines()
+                          if line.startswith(("refuse() {", "fail() {", "incomplete() {", "note() {")))
+    first = script.index("await_registration() {")
+    function = script[first:script.index("\n}\n", first) + 3]
+    codes = tmp_path / "codes"
+    codes.write_text("\n".join(map(str, proofs)) + "\n")
+    calls = tmp_path / "calls"
+    mocks = f"""
+ROOT={tmp_path} CLI_PANE_PID=206 REGISTRATION_DEADLINE={deadline}
+kitpy() {{
+  echo "$1" >>{calls}
+  case "$1" in
+    registration-proof)
+      local code; code="$(head -1 {codes})"
+      [[ "$(wc -l <{codes})" -gt 1 ]] && sed -i 1d {codes}
+      return "$code" ;;
+    refresh) return 0 ;;
+  esac
+  return 9
+}}
+verify() {{ echo 206; }}
+registration_row() {{ echo "registration_row must not decide the proof" >&2; return 0; }}
+"""
+    program = "\n".join([reporters, mocks, function, f"await_registration $((SECONDS + {deadline}))", "echo PROVED"])
+    result = subprocess.run(["bash", "-c", program], capture_output=True, text=True, timeout=deadline + 6,
+                            env={"PATH": "/usr/bin:/bin"})
+    return result, (calls.read_text().split() if calls.exists() else [])
+
+
+def test_await_registration_keeps_polling_past_old_rows_until_the_current_proof(tmp_path):
+    result, calls = _await_step(tmp_path, [1, 1, 0])
+    assert result.returncode == 0 and "PROVED" in result.stdout, result.stderr
+    assert calls == ["registration-proof", "registration-proof", "registration-proof", "refresh"]
+
+
+def test_await_registration_fails_when_the_current_member_never_registers(tmp_path):
+    result, calls = _await_step(tmp_path, [1], deadline=1)
+    assert result.returncode == 1 and "PROVED" not in result.stdout
+    assert "did not register" in result.stderr and "refresh" not in calls
+
+
+def test_await_registration_refuses_malformed_state(tmp_path):
+    result, calls = _await_step(tmp_path, [2])
+    assert result.returncode == 2 and "PROVED" not in result.stdout and calls == ["registration-proof"]

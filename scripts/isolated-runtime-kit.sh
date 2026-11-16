@@ -405,6 +405,44 @@ def saved_session(root):
         die(2, "the slot has no exact saved OpenCode session; nothing was relaunched")
     print(session)
 
+def registration_proof(root):
+    """#947: the open, connected MCP session of the kit provider and slot that is bound to the
+    current recorded CLI (exact pid and start) through a binding of the same pane and slot.
+    Exit 0 and the row when proved, 1 while not yet registered, 2 for unreadable kit state."""
+    import sqlite3
+    real = os.path.realpath(root)
+    try:
+        with open(os.path.join(real, "state", "provider")) as handle:
+            provider = handle.read().strip()
+        with open(os.path.join(real, "state", "launch.json")) as handle:
+            slot = int(json.load(handle)["slot_id"])
+        cli = processes(root)["cli"]
+        pid, start = int(cli["pid"]), str(cli["start"])
+    except (OSError, ValueError, KeyError, TypeError):
+        die(2, "the kit state needed for the registration proof cannot be read")
+    if not provider:
+        die(2, "the kit provider is not recorded")
+    row = None
+    try:
+        db = sqlite3.connect("file:" + os.path.join(real, "kit.db") + "?mode=ro", uri=True)
+        try:
+            row = db.execute(
+                "SELECT s.provider, s.source, s.team_slot_id, s.bound_pane_pid, s.bound_pane_proc_start, s.mailbox_status "
+                "FROM mail_agent_sessions s JOIN agent_pane_bindings b "
+                "ON b.pane_pid = s.bound_pane_pid AND b.pane_proc_start = s.bound_pane_proc_start AND b.slot_id = s.team_slot_id "
+                "WHERE s.team_slot_id = ? AND s.provider = ? AND s.source = ? AND s.mailbox_status = ? "
+                "AND s.closed_at IS NULL AND s.bound_pane_pid = ? AND s.bound_pane_proc_start = ? "
+                "ORDER BY s.id DESC LIMIT 1",
+                (slot, provider, "mcp", "connected", pid, start)).fetchone()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        row = None
+    if row is None:
+        die(1, "the current cli is not registered yet")
+    keys = ["provider", "source", "team_slot_id", "bound_pane_pid", "bound_pane_proc_start", "mailbox_status"]
+    print(json.dumps(dict(zip(keys, row))))
+
 def crash_clear(root):
     """#947: consume the crash marker only when it is this kit regular file, never through a link."""
     marker = os.path.join(root, "state", "crash.json")
@@ -986,6 +1024,8 @@ def main():
         saved_session(root)
     elif command == "crash-clear":
         crash_clear(root)
+    elif command == "registration-proof":
+        registration_proof(root)
     else:
         die(2, "unknown helper command")
 
@@ -1407,14 +1447,18 @@ sys.exit(0 if procs["cli"]["ppid"] == procs["tmux"]["pid"] and procs["cli"]["pst
 PY
 }
 
-await_registration() { # deadline: the recorded pane registers through Agent Mail and is bound
-  local deadline="$1" registered=$((SECONDS + REGISTRATION_DEADLINE))
-  until registration_row >/dev/null 2>&1; do
+await_registration() { # deadline: the current recorded pane registers through Agent Mail and is bound
+  # #947: poll the full proof (exact pid and start, provider, slot, connected MCP, same-pane binding);
+  # another pane's row, an old start or a disconnected session never ends the wait early.
+  local deadline="$1" registered=$((SECONDS + REGISTRATION_DEADLINE)) code
+  while :; do
+    code=0
+    kitpy registration-proof "$ROOT" >/dev/null 2>&1 || code=$?
+    ((code == 0)) && break
+    ((code == 1)) || refuse "the registration proof cannot read the kit state"
     ((SECONDS < registered && SECONDS < deadline)) || fail "deadline: the CLI did not register through Agent Mail"
     sleep 0.5
   done
-  [[ "$(registration_row | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["bound_pane_pid"])')" == "$CLI_PANE_PID" ]] \
-    || refuse "the registration is bound to another pane than the recorded CLI"
   # The fake CLI exec'd into its idle loop after registering: refresh only its command line.
   kitpy refresh "$ROOT" cli || refuse "the CLI could not be refreshed with an unchanged identity"
   verify cli >/dev/null
