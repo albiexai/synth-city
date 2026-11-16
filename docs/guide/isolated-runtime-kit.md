@@ -58,7 +58,7 @@ A process counts as the kit's only when every recorded field matches and its par
 
 **`down`** first computes a read-only plan. It refuses before any signal, keeping the root and the anchors, if any recorded process fails its proof, or if any unreadable process or any unrecorded process other than a group member (below) is in the kit's network namespace. Otherwise it stops the group members, then the CLI, the stub, the backend, the tmux server, the inner anchor and the outer anchor, in that order.
 
-**Group members (#1010).** A real CLI starts processes of its own: OpenCode runs `opencode serve` and the Agent Mail shim as its children. tmux starts each pane as a session and process-group leader, so those children are in the CLI's process group. `down` stops an unrecorded process only when all of these hold:
+**Group members (#1010).** A real CLI can start processes of its own. tmux starts each pane as a session and process-group leader, and a child stays in that group unless it calls `setsid` or `setpgid`. `down` stops an unrecorded process only when all of these hold:
 - its process group id is the pid of a proved service role (the CLI, the stub, the backend or the tmux server) that leads its own group;
 - it is one of the caller's processes;
 - it is in the kit's network namespace.
@@ -133,6 +133,7 @@ The end-to-end test `backend/tests/test_isolated_runtime_kit.py` runs a fake pro
 - **Linux only.** The kit needs unprivileged user and network namespaces, plus `tmux`, `unshare`, `nsenter`, `ip`, `timeout` and `setsid`. The kit's own checks without namespaces (the model, refusal, fake-CLI and stub tests) run on every host.
 - **Not on the hosted `ubuntu-latest` runner as configured.** The runner denies the namespace setup (`unshare: write failed /proc/self/uid_map: Operation not permitted`). The log shows the denial, not its cause. There, each namespace-dependent test skips with `capability unavailable: uid_map`, and the namespace path is proved by one local run in the owner's leased workspace, with evidence on the PR for review.
 - **Group members only.** A process that leaves its leader's group (with `setsid` or `setpgid`), or that outlives its leader, is still an unrecorded process, so `down` refuses (or, after it has stopped the roles, fails as incomplete) and keeps the root. The kit has no PID namespace, so it can't end every descendant at once.
+- **OpenCode is not covered.** OpenCode 2.2.7's `opencode serve` and its Agent Mail shim each lead their own session and group (observed in #963), so with a real OpenCode member `down` refuses before any signal and keeps the root. In #963, `crash --role cli` stopped the recorded CLI, both exited within 2 seconds, and `down` then succeeded. That is an observation of two runs, not a guarantee. A teardown that covers such children needs a PID namespace or a cgroup.
 - **One OS user.** Factory members share one OS user, so ownership is proved by the instance id and namespace, never by the user id alone.
 - **Local checks only.** The stub model doesn't model a real provider; a real-provider check is a separate decision with its own approval.
 - **One kit per root.** The ports (18780 for the backend, 18781 for the stub) belong to the kit's own network namespace, so separate kits don't collide.
