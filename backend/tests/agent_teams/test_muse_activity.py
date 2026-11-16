@@ -448,3 +448,198 @@ def test_discovery_needs_every_binding_record_intact(tmp_path, monkeypatch, case
              "other_stream": _with_other_stream}[case]()
     _discoverable(tmp_path, monkeypatch, lines)
     assert discover_muse_session(4100, CWD) is None
+
+
+# #769: a long turn writes more than the tail after its start. A bounded backward scan
+# recovers the nearest turn boundary (and any question after it) from before the tail.
+def _fixture(name):
+    return (FIX / f"{name}.jsonl").read_bytes().splitlines(keepends=True)
+
+
+def _filler_after(line, size):
+    import json
+    row = json.loads(line)
+    row["payload"]["event"] = {"kind": "output", "text": "x" * 4000}
+    one = (json.dumps(row) + "\n").encode()
+    return one * (size // len(one) + 1)
+
+
+def _index(lines, kind, nth=0):
+    found = [i for i, line in enumerate(lines) if f'"kind": "{kind}"'.encode() in line]
+    return found[nth]
+
+
+def _write_and_read(tmp_path, data):
+    import os
+    import app.services.muse_activity_service as m
+    path = tmp_path / "session.jsonl"
+    path.write_bytes(data)
+    lines, _offset, failure = m._read_lines(path, os.getuid())
+    assert failure is None
+    return muse_state_from_lines(lines, SID, CWD, NOW, START)[:2]
+
+
+def _prompted_start(lines):
+    return next(i for i, line in enumerate(lines) if b'"prompt"' in line)
+
+
+def test_a_turn_started_before_the_tail_is_working(tmp_path):
+    import app.services.muse_activity_service as m
+    lines = _fixture("tool_turn_working")
+    start = _prompted_start(lines)
+    data = b"".join(lines[:start + 1]) + _filler_after(lines[start], m._TAIL_BYTES + 4096) + b"".join(lines[start + 1:])
+    assert _write_and_read(tmp_path, data) == ("working", "native_progress")
+
+
+def test_an_open_question_from_before_the_tail_is_still_waiting(tmp_path):
+    import app.services.muse_activity_service as m
+    lines = _fixture("question_waiting")
+    asked = _index(lines, "user_input_prompt_requested")
+    data = b"".join(lines[:asked + 1]) + _filler_after(lines[asked], m._TAIL_BYTES + 4096)
+    assert _write_and_read(tmp_path, data) == ("waiting_input", "native_question_open")
+
+
+def test_a_question_settled_before_the_tail_is_not_waiting(tmp_path):
+    import app.services.muse_activity_service as m
+    lines = _fixture("question_answered")
+    settled = _index(lines, "user_input_prompt_settled")
+    progress = _index(lines, "tool_result_batch_committed")
+    data = (b"".join(lines[:settled + 1]) + _filler_after(lines[settled], m._TAIL_BYTES + 4096)
+            + lines[progress])
+    assert _write_and_read(tmp_path, data) == ("working", "native_progress")
+
+
+def test_a_turn_that_ended_before_the_tail_is_idle(tmp_path):
+    import app.services.muse_activity_service as m
+    lines = _fixture("turn_completed")
+    ended = _index(lines, "terminal")
+    data = b"".join(lines[:ended + 1]) + _filler_after(lines[ended], m._TAIL_BYTES + 4096)
+    assert _write_and_read(tmp_path, data) == ("idle", "native_turn_completed")
+
+
+def test_a_start_beyond_the_scan_cap_stays_unknown(tmp_path, monkeypatch):
+    import app.services.muse_activity_service as m
+    monkeypatch.setattr(m, "_TAIL_BYTES", 16_384)
+    monkeypatch.setattr(m, "_SCAN_STEP", 4_096)
+    monkeypatch.setattr(m, "_SCAN_BYTES", 32_768)
+    lines = _fixture("tool_turn_working")
+    start = _prompted_start(lines)
+    data = (b"".join(lines[:start + 1]) + _filler_after(lines[start], 16_384 + 32_768 + 8_192)
+            + b"".join(lines[start + 1:]))
+    assert _write_and_read(tmp_path, data) == ("unknown", "native_progress_without_start")
+
+
+@pytest.mark.parametrize("shift", range(0, 4_096, 97))
+def test_a_boundary_split_across_a_scan_step_is_found(tmp_path, monkeypatch, shift):
+    import app.services.muse_activity_service as m
+    monkeypatch.setattr(m, "_TAIL_BYTES", 16_384)
+    monkeypatch.setattr(m, "_SCAN_STEP", 4_096)
+    monkeypatch.setattr(m, "_SCAN_BYTES", 65_536)
+    lines = _fixture("tool_turn_working")
+    start = _prompted_start(lines)
+    # One valid filler record of varying length moves the start relative to the step edges,
+    # so for some shifts the start record straddles an edge.
+    import json
+    row = json.loads(lines[start])
+    row["payload"]["event"] = {"kind": "output", "text": "y" * (shift + 1)}
+    shim = (json.dumps(row) + "\n").encode()
+    data = (b"".join(lines[:start + 1]) + shim + _filler_after(lines[start], 16_384 + 4_096)
+            + b"".join(lines[start + 1:]))
+    assert _write_and_read(tmp_path, data) == ("working", "native_progress")
+
+
+def test_the_backward_scan_reads_at_most_its_cap(tmp_path, monkeypatch):
+    import os
+    import app.services.muse_activity_service as m
+    monkeypatch.setattr(m, "_TAIL_BYTES", 16_384)
+    monkeypatch.setattr(m, "_SCAN_STEP", 4_096)
+    monkeypatch.setattr(m, "_SCAN_BYTES", 32_768)
+    read = []
+    original = m._read_at
+
+    def counted(stream, offset, size):
+        read.append(size)
+        return original(stream, offset, size)
+    monkeypatch.setattr(m, "_read_at", counted)
+    lines = _fixture("tool_turn_working")
+    start = _prompted_start(lines)
+    path = tmp_path / "session.jsonl"
+    path.write_bytes(b"".join(lines[:start + 1]) + _filler_after(lines[start], 200_000) + b"".join(lines[start + 1:]))
+    m._read_lines(path, os.getuid())
+    assert sum(read) <= m._HEAD_BYTES + 16_384 + 32_768
+
+
+def test_two_turn_ends_without_a_start_between_stay_unconfirmed(tmp_path):
+    import app.services.muse_activity_service as m
+    lines = _fixture("turn_completed")
+    ended = _index(lines, "terminal")
+    data = (b"".join(lines[:ended + 1]) + lines[ended] + _filler_after(lines[ended], m._TAIL_BYTES + 4096))
+    assert _write_and_read(tmp_path, data) == ("unknown", "completion_unconfirmed")
+
+
+# Conservative results for scanned records (Leader, plan 330): an unreadable turn record
+# before the tail ends the scan as unknown; a mismatched or out-of-order record found by
+# the scan reaches the unchanged parser, which rejects it.
+def test_an_unreadable_turn_record_in_the_scan_stays_unknown(tmp_path):
+    import app.services.muse_activity_service as m
+    lines = _fixture("tool_turn_working")
+    start = _prompted_start(lines)
+    broken = b'{"payload_type": "runtime.session", "payload": {"event": {"kind": "terminal"\n'
+    data = (b"".join(lines[:start + 1]) + broken + _filler_after(lines[start], m._TAIL_BYTES + 4096)
+            + b"".join(lines[start + 1:]))
+    assert _write_and_read(tmp_path, data)[0] == "unknown"
+
+
+def test_a_scanned_start_from_another_session_is_a_mismatch(tmp_path):
+    import app.services.muse_activity_service as m
+    lines = _fixture("tool_turn_working")
+    start = _prompted_start(lines)
+    foreign = lines[start].replace(SID.encode(), b"01a13be9-0000-7000-8000-000000000000", 1)
+    data = (b"".join(lines[:start]) + foreign + _filler_after(lines[start], m._TAIL_BYTES + 4096)
+            + b"".join(lines[start + 1:]))
+    assert _write_and_read(tmp_path, data) == ("unknown", "session_mismatch")
+
+
+def test_a_scanned_start_after_the_tail_events_is_invalid(tmp_path):
+    import json
+    import app.services.muse_activity_service as m
+    lines = _fixture("tool_turn_working")
+    start = _prompted_start(lines)
+    row = json.loads(lines[start])
+    row["recorded_at"] = max(json.loads(line).get("recorded_at", 0) for line in lines[start + 1:]) + 1_000_000
+    late = (json.dumps(row) + "\n").encode()
+    data = (b"".join(lines[:start]) + late + _filler_after(lines[start], m._TAIL_BYTES + 4096)
+            + b"".join(lines[start + 1:]))
+    assert _write_and_read(tmp_path, data)[0] == "unknown"
+
+
+# V1 review 5915400053: an unfinished tail stays incomplete even when it fills the whole
+# tail, and any malformed or non-object row met by the scan stops it, typed or not.
+def _observe_written(tmp_path, monkeypatch, data):
+    import os
+    import app.services.muse_activity_service as m
+    _cli, owner_home = _owner(monkeypatch, tmp_path)
+    folder = owner_home / ".local" / "share" / "muse" / "sessions" / "2026" / "10" / "14" / SID
+    folder.mkdir(parents=True)
+    (folder / "session.jsonl").write_bytes(data)
+    monkeypatch.setattr(m, "_identity", lambda pid, session_id, cwd: True)
+    monkeypatch.setattr(m, "_process_uid", lambda pid: os.getuid())
+    return m.observe_muse(4100, SID, CWD, NOW, START)[:2]
+
+
+@pytest.mark.parametrize("name", ["tool_turn_working", "turn_completed"])
+def test_an_unfinished_record_larger_than_the_tail_stays_incomplete(tmp_path, monkeypatch, name):
+    import app.services.muse_activity_service as m
+    lines = _fixture(name)
+    unfinished = b'{"payload_type": "runtime.session", "payload": {"event": {"kind": "output", "text": "' + b"z" * (2 * m._TAIL_BYTES)
+    assert _observe_written(tmp_path, monkeypatch, b"".join(lines) + unfinished) == ("unknown", "observation_incomplete")
+
+
+@pytest.mark.parametrize("row", [b"{bad json}\n", b"[1, 2]\n", b'{"schema_version": 1, "payload_type":\n'])
+def test_a_tagless_malformed_row_in_the_scan_stays_unknown(tmp_path, row):
+    import app.services.muse_activity_service as m
+    lines = _fixture("tool_turn_working")
+    start = _prompted_start(lines)
+    data = (b"".join(lines[:start + 1]) + row + _filler_after(lines[start], m._TAIL_BYTES + 4096)
+            + b"".join(lines[start + 1:]))
+    assert _write_and_read(tmp_path, data)[0] == "unknown"
