@@ -34,14 +34,16 @@ def muse_data_dir_for_process(pid: int) -> Path:
     """The Muse data directory of the observed process, as _codex_home does for Codex.
 
     A member can run as another OS user than the controller. Use the process's own
-    MUSE_DATA_DIR, XDG_DATA_HOME or HOME when its environment is readable; otherwise
+    XDG_DATA_HOME, MUSE_DATA_DIR or HOME when its environment is readable; otherwise
     the process owner's default. Never the controller's environment or home.
+    Muse 1.4.20 wrote its sessions under XDG_DATA_HOME/muse with both variables set
+    (#746); MUSE_DATA_DIR alone was not observed and is honoured as documented.
     """
     try:
         environment = _process_environ(pid)
     except PermissionError:
         environment = {}
-    for key, suffix in ((b"MUSE_DATA_DIR", ()), (b"XDG_DATA_HOME", ("muse",)),
+    for key, suffix in ((b"XDG_DATA_HOME", ("muse",)), (b"MUSE_DATA_DIR", ()),
                         (b"HOME", (".local", "share", "muse"))):
         value = environment.get(key)
         if value:

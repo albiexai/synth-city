@@ -186,9 +186,14 @@ def test_the_root_is_the_process_owners_default_when_its_environ_is_unreadable(t
     assert cli.muse_data_dir_for_process(4100) == owner_home / ".local" / "share" / "muse"
 
 
+# Muse 1.4.20 wrote its sessions under XDG_DATA_HOME/muse with both variables set (#746 E2).
+# MUSE_DATA_DIR alone was not observed; it is honoured when XDG_DATA_HOME is unset.
 @pytest.mark.parametrize("environ,expected", [
-    ({b"MUSE_DATA_DIR": b"/srv/agent/muse", b"XDG_DATA_HOME": b"/srv/xdg", b"HOME": b"/srv/home"}, "/srv/agent/muse"),
+    ({b"MUSE_DATA_DIR": b"/srv/agent/muse", b"XDG_DATA_HOME": b"/srv/xdg", b"HOME": b"/srv/home"}, "/srv/xdg/muse"),
+    ({b"MUSE_DATA_DIR": b"/srv/agent/muse", b"XDG_DATA_HOME": b"/srv/xdg"}, "/srv/xdg/muse"),
     ({b"XDG_DATA_HOME": b"/srv/xdg", b"HOME": b"/srv/home"}, "/srv/xdg/muse"),
+    ({b"MUSE_DATA_DIR": b"/srv/agent/muse", b"HOME": b"/srv/home"}, "/srv/agent/muse"),
+    ({b"MUSE_DATA_DIR": b"/srv/agent/muse"}, "/srv/agent/muse"),
     ({b"HOME": b"/srv/home"}, "/srv/home/.local/share/muse"),
 ])
 def test_the_root_honours_the_processs_own_environment(tmp_path, monkeypatch, environ, expected):
@@ -201,11 +206,72 @@ def test_an_environ_without_any_root_falls_back_to_the_owners_home(tmp_path, mon
     assert cli.muse_data_dir_for_process(4100) == owner_home / ".local" / "share" / "muse"
 
 
-@pytest.mark.parametrize("key", [b"MUSE_DATA_DIR", b"XDG_DATA_HOME", b"HOME"])
-def test_a_relative_process_root_is_refused(tmp_path, monkeypatch, key):
-    cli, _owner_home = _owner(monkeypatch, tmp_path, {key: b"relative/dir"})
+@pytest.mark.parametrize("environ", [
+    {b"XDG_DATA_HOME": b"relative/dir", b"MUSE_DATA_DIR": b"/srv/agent/muse"},
+    {b"MUSE_DATA_DIR": b"relative/dir", b"HOME": b"/srv/home"},
+    {b"HOME": b"relative/dir"},
+])
+def test_a_relative_process_root_is_refused(tmp_path, monkeypatch, environ):
+    # The chosen step's value is relative: fail closed rather than skip to a later one.
+    cli, _owner_home = _owner(monkeypatch, tmp_path, environ)
     with pytest.raises(ValueError):
         cli.muse_data_dir_for_process(4100)
+
+
+def _owner_session(root, sid=SID, cwd=CWD):
+    folder = root / "sessions" / "2026" / "10" / "14" / sid
+    folder.mkdir(parents=True)
+    (folder / ".session.lock").write_text("")
+    (folder / "session.jsonl").write_text(
+        (FIX / "turn_completed.jsonl").read_text().replace(SID, sid).replace(CWD, cwd))
+    return folder
+
+
+def _fds(tmp_path, monkeypatch, *targets):
+    import app.services.muse_activity_service as m
+    fds = tmp_path / "fd"
+    fds.mkdir()
+    for number, target in enumerate(targets, start=7):
+        (fds / str(number)).symlink_to(target)
+    monkeypatch.setattr(m, "_process_fd_dir", lambda pid: fds)
+
+
+def test_cross_user_discovery_uses_the_owners_xdg_root_when_the_environ_is_readable(tmp_path, monkeypatch):
+    # The controller can read another user's descriptors with the service's capabilities (Supervisor-reported E1).
+    _owner(monkeypatch, tmp_path, {b"XDG_DATA_HOME": str(tmp_path / "agent-xdg").encode(),
+                                   b"MUSE_DATA_DIR": str(tmp_path / "unused").encode()})
+    folder = _owner_session(tmp_path / "agent-xdg" / "muse")
+    _fds(tmp_path, monkeypatch, folder / ".session.lock")
+    assert discover_muse_session(4100, CWD) == SID
+
+
+def test_cross_user_discovery_refuses_another_workspace(tmp_path, monkeypatch):
+    _cli, owner_home = _owner(monkeypatch, tmp_path)
+    folder = _owner_session(owner_home / ".local" / "share" / "muse", cwd="/tmp/another-workspace")
+    _fds(tmp_path, monkeypatch, folder / ".session.lock")
+    assert discover_muse_session(4100, CWD) is None
+
+
+def test_cross_user_discovery_refuses_two_held_sessions(tmp_path, monkeypatch):
+    _cli, owner_home = _owner(monkeypatch, tmp_path)
+    root = owner_home / ".local" / "share" / "muse"
+    first = _owner_session(root)
+    second = _owner_session(root, sid="01a13be9-ffff-7fff-bfff-ffffffffffff")
+    _fds(tmp_path, monkeypatch, first / ".session.lock", second / ".session.lock")
+    assert discover_muse_session(4100, CWD) is None
+
+
+def test_a_discovery_from_a_process_that_changed_is_not_saved(monkeypatch):
+    # The pane process is re-checked by start time after discovery; a reused PID cannot supply an identity.
+    from app.services import agent_activity_service as activity
+    starts = iter(["27", "28"])
+    monkeypatch.setattr(activity, "_process", lambda _: ("S", next(starts, "28")))
+    monkeypatch.setattr(activity, "discover_muse_session", lambda pid, cwd: SID)
+    binding = activity.ActivityBinding(41000, "27", CWD, tmux_target="%8", binding_id=1)
+    metadata = {}
+    result = activity._observe(1, "muse-cli", None, [binding], False, datetime.now(timezone.utc),
+                               provenance=metadata)
+    assert result.reason == "binding_changed" and "discovered_session_id" not in metadata
 
 
 def test_discovery_reads_the_process_owners_sessions_not_the_controllers(tmp_path, monkeypatch):
