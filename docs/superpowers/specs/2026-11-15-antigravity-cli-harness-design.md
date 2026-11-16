@@ -242,7 +242,9 @@ Each row states the source of every claim.
 The team supervisor (`scripts/product-factory/team-supervisor`) stops a team on a provider safety notice in an agent's own output. For an `antigravity-cli` member it works like this:
 
 - **Which conversation.** The slot's `session_id` must be a canonical lowercase UUID, as for the #737 observer; otherwise the guard fails closed (`native_session_identity_missing`).
-- **Which files.** The data root is the agent user's passwd home plus `.gemini/antigravity-cli`, unless the guard's config names `antigravity_data_root`. `presence/<id>.lock` and `brain/<id>/.system_generated/logs/transcript.jsonl` must exist. Every directory on the way and both files must belong to the agent user, and none may be a symlink. The transcript is opened without following a link. Anything else fails closed.
+- **Which files.** The data root is the agent user's passwd home plus `.gemini/antigravity-cli`, unless the guard's config names `antigravity_data_root`. `presence/<id>.lock` and `brain/<id>/.system_generated/logs/transcript.jsonl` must exist. Every directory on the way and both files must belong to the agent user, and none may be a symlink. Anything else fails closed.
+- **The proof holds through the open (#1020 review).** The guard walks from the data root one component at a time. It opens each directory relative to the one before, without following a link, and checks its type and owner on the open descriptor. It checks the lock relative to the held `presence` descriptor, and opens the transcript relative to the held `logs` descriptor. A component swapped after it was opened can't redirect the read.
+- **The saved position is bound to the file.** The guard saves the transcript's device and inode next to its offset, and reads the size from the opened file. A smaller file, a different file at a saved offset, or a saved offset without a saved identity fails closed.
 - **Limit.** The lock shows that the conversation is present. The guard can't check which process holds it, because another user's `/proc` file-descriptor table isn't readable.
 - **What is matched.** Only the text of a `PLANNER_RESPONSE` from `MODEL`. User input, system messages and tool-call arguments are never matched.
 - **Observed set.** Only the record shapes in the #737 fixtures pass:
@@ -251,6 +253,7 @@ The team supervisor (`scripts/product-factory/team-supervisor`) stops a team on 
   - `PLANNER_RESPONSE` from `MODEL` with text and no tool calls;
   - `PLANNER_RESPONSE` from `MODEL` with a non-empty list of named tool calls and no text.
 - **Every other record fails closed** (`antigravity_record_unobserved`) before the guard saves its position in the transcript. That includes an `ERROR` step (never captured, so not classified), any unknown type, and the records agy writes for finished tool steps. An armed team stops and needs recovery; a disarmed one reports a startup gap. Neither looks healthy, and the record is read again on the next tick.
+- **Shared skips are not record validation.** The guard's shared line reader still skips a line of only NUL bytes (crash padding) and a damaged line the operator acknowledged by its SHA-256. Neither is an observed Antigravity shape, and neither skip validates an Antigravity record.
 - **Consequence.** Until #984 Part 3 proves more shapes, **a routine Antigravity tool record that is not in the observed set stops an armed team.** Antigravity's team readiness stays blocked in v4.2 (the Mail and onboarding gates), so no Antigravity member runs in a team yet.
 
 ### Q6: trust and login

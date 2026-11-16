@@ -922,3 +922,112 @@ def test_a_disarmed_run_over_an_unobserved_record_reports_a_startup_gap(tmp_path
     ts.run(sup)
     state = json.loads(Path(sup.state_path).read_text())
     assert state["mode"] == "STARTUP_GAP" and state["error_type"] == "ValueError"
+
+
+# --- #1020 review: the checked path and the saved offset must hold through the open -----------
+
+def _armed(tmp_path, monkeypatch, records):
+    root, transcript = _agy_root(tmp_path, records=records)
+    sup = _agy_supervisor(tmp_path, root, armed_path=str(tmp_path / "ARMED"))
+    sup.state["autonomy_enabled"] = True
+    preset = {"autonomy_enabled": True, "slots": [{"id": i, "enabled": True} for i in (1, 2, 3)]}
+    calls = []
+
+    def api(method, path, body=None):
+        calls.append((method, path, body))
+        if path.startswith("/agent-mail/team"):
+            return {"members": [{"team_preset_id": 3, "team_slot_id": i, "status": "connected",
+                                 "wake_state": "wakeable"} for i in (1, 2, 3)]}
+        return {**preset, "autonomy_enabled": not any(m == "PATCH" for m, _, _ in calls)}
+
+    monkeypatch.setattr(sup, "api", api)
+    monkeypatch.setattr(sup, "bindings", lambda: [_agy_binding()])
+    monkeypatch.setattr(sup, "freeze", lambda: [])
+    return sup, transcript
+
+
+def _swap_before_open(monkeypatch, name, swap):
+    """Run swap() once, just before the guard opens `name`, by name or by its last component."""
+    import os
+    original = os.open
+    done = []
+
+    def opener(path, flags, *args, **kwargs):
+        if not done and os.path.basename(str(path)) == name:
+            done.append(True)
+            swap()
+        return original(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(ts.os, "open", opener)
+    return done
+
+
+def _harmless_logs(tmp_path):
+    other = tmp_path / "other-logs"
+    other.mkdir()
+    (other / "transcript.jsonl").write_text(json.dumps(_agy("PLANNER_RESPONSE", "MODEL", content="harmless")) + "\n")
+    return other
+
+
+@pytest.mark.parametrize("moment", ["logs", "transcript.jsonl"])
+def test_a_parent_swapped_during_the_walk_never_hides_a_notice(tmp_path, monkeypatch, moment):
+    sup, transcript = _armed(tmp_path, monkeypatch, [_agy("PLANNER_RESPONSE", "MODEL", content=NOTICE)])
+    other = _harmless_logs(tmp_path)
+
+    def swap():
+        transcript.parent.rename(tmp_path / "bound-logs")
+        transcript.parent.symlink_to(other, target_is_directory=True)
+
+    done = _swap_before_open(monkeypatch, moment, swap)
+    ts.run(sup)
+    assert done and sup.state["mode"] != "SUPERVISING"
+    assert str(transcript) not in sup.state["offsets"]
+    if moment == "transcript.jsonl":
+        # The logs directory was already held: the original transcript is read and its notice found.
+        assert sup.state["mode"] == "WAITING_FOR_USER" and sup.state["incident"]["rule"] == "cybersecurity_notice"
+    else:
+        assert sup.state["mode"] == "RECOVERY_REQUIRED"
+
+
+@pytest.mark.parametrize("replacement", ["shorter", "same_size", "longer"])
+def test_a_replaced_transcript_after_a_saved_offset_fails_closed(tmp_path, monkeypatch, replacement):
+    first = _agy("PLANNER_RESPONSE", "MODEL", content="x" * 512)
+    sup, transcript = _armed(tmp_path, monkeypatch, [first])
+    ts.run(sup)  # the first tick reads the file and saves its offset and identity
+    assert sup.state["mode"] == "SUPERVISING" and sup.state["offsets"][str(transcript)] == transcript.stat().st_size
+    size = transcript.stat().st_size
+    notice = json.dumps(_agy("PLANNER_RESPONSE", "MODEL", content=NOTICE)).encode() + b"\n"
+    body = {"shorter": notice,
+            "same_size": notice.rjust(size - 1, b" ")[: size - 1] + b"\n",
+            "longer": b" " * size + notice}[replacement]
+    other = tmp_path / "replacement.jsonl"
+    other.write_bytes(body)
+    done = _swap_before_open(monkeypatch, "transcript.jsonl", lambda: other.replace(transcript))
+    ts.run(sup)
+    assert done and sup.state["mode"] == "RECOVERY_REQUIRED"
+    assert sup.state["incident"]["reason"] == "supervision_ValueError"
+
+
+def test_a_saved_offset_without_a_saved_identity_fails_closed(tmp_path, monkeypatch):
+    sup, transcript = _armed(tmp_path, monkeypatch, [_agy("PLANNER_RESPONSE", "MODEL", content="x" * 64)])
+    sup.state["offsets"][str(transcript)] = 10
+    ts.run(sup)
+    assert sup.state["mode"] == "RECOVERY_REQUIRED"
+
+
+@pytest.mark.parametrize("component", ["presence", "brain", AGY_ID, ".system_generated", "logs"])
+def test_a_symlinked_directory_at_any_level_fails_closed_in_the_walk(tmp_path, monkeypatch, component):
+    sup, transcript = _armed(tmp_path, monkeypatch, [_agy("PLANNER_RESPONSE", "MODEL", content="hi")])
+    root = Path(sup.config["antigravity_data_root"])
+    target = root / "presence" if component == "presence" else {
+        "brain": root / "brain", AGY_ID: root / "brain" / AGY_ID,
+        ".system_generated": root / "brain" / AGY_ID / ".system_generated", "logs": transcript.parent}[component]
+
+    def swap():
+        moved = tmp_path / ("moved-" + target.name)
+        target.rename(moved)
+        target.symlink_to(moved, target_is_directory=True)
+
+    done = _swap_before_open(monkeypatch, component, swap)
+    ts.run(sup)
+    assert done and sup.state["mode"] == "RECOVERY_REQUIRED"

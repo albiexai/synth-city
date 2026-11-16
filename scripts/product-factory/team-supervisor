@@ -347,9 +347,18 @@ class Supervisor:
         for path, provider in paths.items():
             key = str(path)
             offset = int(self.state['offsets'].get(key, 0))
-            if path.stat().st_size < offset:
+            if provider != 'antigravity-cli' and path.stat().st_size < offset:
                 raise ValueError('native_transcript_shrank')
             with self.open_transcript(path, provider) as stream:
+                identity = None
+                if provider == 'antigravity-cli':
+                    # #1020 review: size and identity come from the opened file, never the path.
+                    info = os.fstat(stream.fileno())
+                    identity = [info.st_dev, info.st_ino]
+                    if info.st_size < offset:
+                        raise ValueError('native_transcript_shrank')
+                    if offset and self.state.get('native_identities', {}).get(key) != identity:
+                        raise ValueError('native_transcript_replaced')
                 stream.seek(offset)
                 inspected = 0
                 while inspected < 16 * 1024 * 1024:
@@ -373,6 +382,8 @@ class Supervisor:
                         self.stop('security_notice', security=True, rule=found)
                         return False
                 self.state['offsets'][key] = stream.tell()
+                if identity is not None:
+                    self.state.setdefault('native_identities', {})[key] = identity
         return True
 
     def record(self, line):
@@ -697,12 +708,44 @@ class Supervisor:
     def open_transcript(self, path, provider):
         if provider != 'antigravity-cli':
             return path.open('rb')
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != self.config['agent_uid']:
-            os.close(fd)
-            raise ValueError('antigravity_path_unsafe')
-        return os.fdopen(fd, 'rb')
+        # #1020 review: walk from the data root with one held directory descriptor per step, each
+        # opened without following a link and proved by fstat, so the proof holds through the open.
+        # A component replaced after it was opened no longer matters.
+        uid = self.config['agent_uid']
+        native_id = path.parents[2].name
+        held = []
+
+        def opened(name, dir_fd, kind, missing):
+            flags = os.O_RDONLY | os.O_NOFOLLOW | (os.O_DIRECTORY if kind == stat.S_IFDIR else os.O_NONBLOCK)
+            try:
+                fd = os.open(name, flags, dir_fd=dir_fd)
+            except FileNotFoundError:
+                raise FileNotFoundError(missing) from None
+            except OSError:
+                raise ValueError('antigravity_path_unsafe') from None  # a link (ELOOP/ENOTDIR) or worse
+            held.append(fd)
+            info = os.fstat(fd)
+            if stat.S_IFMT(info.st_mode) != kind or info.st_uid != uid:
+                raise ValueError('antigravity_path_unsafe')
+            return fd
+
+        try:
+            current = opened(str(path.parents[4]), None, stat.S_IFDIR, 'antigravity_data_root_missing')
+            presence = opened('presence', current, stat.S_IFDIR, 'antigravity_presence_missing')
+            try:
+                lock = os.stat(native_id + '.lock', dir_fd=presence, follow_symlinks=False)
+            except FileNotFoundError:
+                raise FileNotFoundError('antigravity_presence_missing') from None
+            if not stat.S_ISREG(lock.st_mode) or lock.st_uid != uid:
+                raise ValueError('antigravity_path_unsafe')
+            for part in ['brain', native_id, '.system_generated', 'logs']:
+                current = opened(part, current, stat.S_IFDIR, 'antigravity_transcript_missing')
+            final = opened('transcript.jsonl', current, stat.S_IFREG, 'antigravity_transcript_missing')
+            held.remove(final)
+            return os.fdopen(final, 'rb')
+        finally:
+            for fd in held:
+                os.close(fd)
 
     def tick(self):
         if self.hold_path.exists():
