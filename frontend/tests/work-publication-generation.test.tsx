@@ -41,4 +41,23 @@ describe('Work publication matching by the public dispatch generation', () => {
     render(<WorkPublicationPanel item={{ ...item, dispatch_nonce: 'unrelated' } as GithubWorkItem} />)
     expect(await screen.findByText('2 unpublished commits')).toBeTruthy()
   })
+  it('shows no progress and sends no request for an item without a generation, even with a nonce', async () => {
+    const bare = { ...item, dispatch_generation: null, dispatch_nonce: 'dispatch' } as GithubWorkItem
+    vi.mocked(apiClient).mockResolvedValue(progress({ dispatch_generation: null, dispatch_nonce: 'dispatch' }))
+    render(<WorkPublicationPanel item={bare} />)
+    expect(await screen.findByText('No progress data is available.')).toBeTruthy()
+    expect(screen.queryByText('2 unpublished commits')).toBeNull()
+    expect(vi.mocked(apiClient)).not.toHaveBeenCalled()
+  })
+  it.each([
+    ['a response with no generation for an item that has one', GENERATION, null],
+    ['a response with a generation for an item that has none', null, GENERATION],
+    ['a response with no generation for an item that has none', null, null],
+  ])('does not accept %s as current', async (_name, itemGeneration, responseGeneration) => {
+    vi.mocked(apiClient).mockResolvedValue(progress({ dispatch_generation: responseGeneration }))
+    render(<WorkPublicationPanel item={{ ...item, dispatch_generation: itemGeneration } as GithubWorkItem} />)
+    expect((await screen.findAllByText(/No progress data is available|Unable to refresh progress/)).length).toBeGreaterThan(0)
+    expect(screen.queryByText('2 unpublished commits')).toBeNull()
+    expect(screen.queryByText('Continue approved work.')).toBeNull()
+  })
 })

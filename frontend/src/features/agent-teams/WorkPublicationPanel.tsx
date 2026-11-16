@@ -79,7 +79,8 @@ function date(value: string | null | undefined) {
 }
 function valid(data: Progress, itemId: number, generation: string | null, owner: number | null) {
   const publication = data?.publication
-  return data?.work_item_id === itemId && data.dispatch_generation === generation && data.owner_slot_id === owner
+  // A missing generation names no dispatch, so it never matches, not even a response that also has none.
+  return generation != null && data?.work_item_id === itemId && data.dispatch_generation === generation && data.owner_slot_id === owner
     && Number.isFinite(timestamp(data.checked_at)) && Number.isFinite(timestamp(data.valid_until))
     && timestamp(data.valid_until) <= timestamp(data.checked_at) + 30_000
     && typeof data.phase === 'string' && typeof data.next_action === 'string'
@@ -135,6 +136,8 @@ function WorkPublicationReader({ item, ownerName, ownerActivity }: PanelProps) {
     let request: AbortController | undefined
     // Refresh when the shown observation expires, so new data replaces it without a gap.
     let expiresAt = NaN
+    // An item with no dispatch generation has no dispatch to read: no request, and the panel says so.
+    if (generation == null) return
     const poll = async () => {
       request?.abort()
       const controller = new AbortController()
@@ -171,7 +174,7 @@ function WorkPublicationReader({ item, ownerName, ownerActivity }: PanelProps) {
     return () => { active = false; clearTimeout(timer); request?.abort() }
   }, [id, generation, owner, requestKey, refresh])
 
-  const matches = data?.work_item_id === id && data.dispatch_generation === generation && data.owner_slot_id === owner
+  const matches = generation != null && data?.work_item_id === id && data.dispatch_generation === generation && data.owner_slot_id === owner
   const expiry = data && matches ? timestamp(data.valid_until) : NaN
   useEffect(() => {
     const update = () => setClock(Date.now())
