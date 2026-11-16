@@ -342,14 +342,70 @@ def test_antigravity_legacy_snapshot_is_not_proven():
     assert configuration_readiness("antigravity-cli", "Antigravity CLI", True, older).state == "unknown"
 
 
-def test_antigravity_onboarding_stays_a_closed_gate_after_agent_mail(monkeypatch):
-    # No onboarding completion signal is proven (#952), and terms and data-use choices are the
-    # user's, so readiness never reads, guesses or presets them. Lifting only the unproven Agent
-    # Mail gate still blocks with the onboarding instruction.
-    gates = provider_readiness_service.ANTIGRAVITY_UNPROVEN_GATES
-    assert gates == (UNPROVEN_MAIL, ONBOARDING)
-    monkeypatch.setattr(provider_readiness_service, "ANTIGRAVITY_UNPROVEN_GATES", gates[1:])
+@pytest.fixture
+def agy_home(tmp_path, monkeypatch):
+    """A scratch HOME. The onboarding signal is cache/onboarding.json, as the Director's human trial
+    recorded it on #995 (key names only); readiness only reads it."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cache = tmp_path / ".gemini" / "antigravity-cli" / "cache"
+    cache.mkdir(parents=True)
+    return cache
+
+
+def test_antigravity_mail_gate_stays_first_and_unchanged(agy_home):
+    # #994 (lifting the Mail gate) is in v4.3: Antigravity stays blocked with the Mail reason, even
+    # after onboarding is complete.
+    (agy_home / "onboarding.json").write_text('{"onboardingComplete": true}')
+    assert provider_readiness_service.ANTIGRAVITY_UNPROVEN_GATES == (UNPROVEN_MAIL,)
+    assert agent_mail_ready_reason("antigravity-cli", configured()) == UNPROVEN_MAIL
+    assert configuration_readiness("antigravity-cli", "Antigravity CLI", True, configured()).state == "blocked"
+
+
+def test_antigravity_onboarding_gate_follows_the_recorded_signal(agy_home, monkeypatch):
+    monkeypatch.setattr(provider_readiness_service, "ANTIGRAVITY_UNPROVEN_GATES", ())
+    assert provider_readiness_service.ANTIGRAVITY_ONBOARDING_REASON == ONBOARDING
+    # Missing file: onboarding not completed (fail closed), never an error.
     assert agent_mail_ready_reason("antigravity-cli", configured()) == ONBOARDING
     assert configuration_readiness("antigravity-cli", "Antigravity CLI", True, configured()).state == "blocked"
+    (agy_home / "onboarding.json").write_text('{"onboardingComplete": true, "enterpriseOnboardingComplete": false}')
+    assert agent_mail_ready_reason("antigravity-cli", configured()) is None
+    # The install checks still come first.
     assert agent_mail_ready_reason("antigravity-cli", configured(antigravity_cli_available=False)) == (
         "Antigravity CLI is not available on this machine")
+
+
+@pytest.mark.parametrize("content", [
+    '{"onboardingComplete": false}', '{"onboardingComplete": "true"}', '{"onboardingComplete": 1}', "{}",
+    '{"consumerOnboardingComplete": true}', "[true]", "not json", "",
+])
+def test_antigravity_onboarding_signal_fails_closed(agy_home, content):
+    from app.services.providers.antigravity_cli import antigravity_onboarding_complete
+    (agy_home / "onboarding.json").write_text(content)
+    assert antigravity_onboarding_complete() is False
+
+
+def test_antigravity_onboarding_signal_refuses_a_symlink_or_an_oversized_file(agy_home, tmp_path):
+    from app.services.providers.antigravity_cli import antigravity_onboarding_complete
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text('{"onboardingComplete": true}')
+    (agy_home / "onboarding.json").symlink_to(elsewhere)
+    assert antigravity_onboarding_complete() is False
+    (agy_home / "onboarding.json").unlink()
+    (agy_home / "onboarding.json").write_text('{"onboardingComplete": true, "pad": "' + "x" * 70000 + '"}')
+    assert antigravity_onboarding_complete() is False
+
+
+def test_antigravity_onboarding_check_never_opens_sign_in_files_or_writes(agy_home, monkeypatch):
+    import builtins
+    import os
+    from app.services.providers.antigravity_cli import antigravity_onboarding_complete
+    (agy_home / "onboarding.json").write_text('{"onboardingComplete": true}')
+    before = sorted(str(p) for p in agy_home.parent.parent.parent.rglob("*"))
+    opened = []
+    real_open, real_os_open = builtins.open, os.open
+    monkeypatch.setattr(builtins, "open", lambda path, *a, **k: opened.append(str(path)) or real_open(path, *a, **k))
+    monkeypatch.setattr(os, "open", lambda path, flags, *a, **k: opened.append(str(path)) or real_os_open(path, flags, *a, **k))
+    assert antigravity_onboarding_complete() is True
+    assert opened and all(path.endswith("onboarding.json") for path in opened)
+    assert not any("oauth" in path or "credential" in path for path in opened)
+    assert sorted(str(p) for p in agy_home.parent.parent.parent.rglob("*")) == before

@@ -308,8 +308,12 @@ until Agent Mail for `agy` is installed (#736) and until onboarding can be
 confirmed. On first run, `agy` shows its own onboarding, which includes Google's
 Terms of Service and a data-use choice. **Synth City never accepts these terms and
 never presets onboarding settings**: each user completes onboarding once, in their
-own `agy`, as the agent user. No signal that onboarding is complete has been
-observed, so readiness asks the user to complete it and stays blocked.
+own `agy`, as the agent user. Completing onboarding makes `agy` write
+`~/.gemini/antigravity-cli/cache/onboarding.json` with `"onboardingComplete": true`
+(recorded in a human trial, #995). Readiness only reads that file: a missing, unreadable
+or other value counts as not completed, and Synth City never writes it or reads the
+sign-in files. Until Agent Mail through `agy` is proven (#994), readiness stays blocked
+by the Agent Mail gate before onboarding is checked.
 
 When a member launches, Synth City adds the workspace to `trustedWorkspaces` in the
 agent user's `~/.gemini/antigravity-cli/settings.json` and reports
