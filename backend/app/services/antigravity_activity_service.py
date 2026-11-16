@@ -462,6 +462,9 @@ def antigravity_state(summary: dict | None, step_count: int, steps: list[tuple[i
            or not isinstance(r.get("type"), str) or not isinstance(r.get("source"), str) for r in after):
         return "unknown", "observation_invalid", None
     planners = [r for r in after if r["type"] == "PLANNER_RESPONSE" and r["source"] == "MODEL"]
+    # Tool evidence was observed only on replies; on the input or any other step it is unproven.
+    if any(_has_tool_evidence(r) for r in [current, *after] if not any(r is planner for planner in planners)):
+        return "unknown", "observation_invalid", None
     if any(_tools(r) == MALFORMED for r in planners):
         return "unknown", "observation_invalid", None
     # A reply carries no tool call or exactly one; any other shape was not observed.
@@ -502,6 +505,10 @@ def antigravity_state(summary: dict | None, step_count: int, steps: list[tuple[i
     if last == (_TOOL, _DONE) and follows and planner_at is not None and single is not None:
         return _working(planner_at, now)
     return "unknown", "completion_unconfirmed", None
+
+
+def _has_tool_evidence(record: dict) -> bool:
+    return "tools" in record or "tool_calls" in record
 
 
 def _tools(record: dict) -> list[str] | str | None:

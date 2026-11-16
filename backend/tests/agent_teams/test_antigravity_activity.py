@@ -873,3 +873,31 @@ def test_a_record_after_the_input_must_also_follow_it_by_index():
     records = [user(1), planner(0), planner(2)]
     assert state(IDLE, [(1, 14, 3), (2, 15, 3)], records)[0] == "unknown"
     assert state(IDLE, [(1, 14, 3), (2, 15, 3)], [user(1), planner(2)])[0] == "idle"
+
+
+# --- Review 5922278508: tool evidence is observed only on replies ---------------------------
+
+@pytest.mark.parametrize("calls", [{"name": "run_command"}, [{"name": True}], [{"name": "run_command"}]])
+def test_tool_evidence_on_the_current_input_is_refused(home, calls):
+    _scene(home, [{**user(0), "tool_calls": calls}], [(0, 14, 3)], RUNNING)
+    assert observe(home) == ("unknown", "observation_invalid")
+
+
+@pytest.mark.parametrize("calls", [{"name": "run_command"}, [{"name": True}], [{"name": "run_command"}]])
+def test_tool_evidence_on_a_system_step_is_refused(home, calls):
+    records = [user(0), planner(1, tools=["run_command"]), {**system(2), "tool_calls": calls}]
+    _scene(home, records, SYSTEM_STEPS, RUNNING)
+    assert observe(home) == ("unknown", "observation_invalid")
+
+
+def test_the_same_scenes_without_tool_evidence_still_classify(home):
+    _scene(home, [user(0)], [(0, 14, 3)], RUNNING)
+    assert observe(home) == ("working", "native_progress")
+    _scene(home, [user(0), planner(1, tools=["run_command"]), system(2)], SYSTEM_STEPS, RUNNING)
+    assert observe(home) == ("working", "native_progress")
+
+
+def test_raw_tool_evidence_on_a_non_reply_record_is_refused():
+    assert state(RUNNING, [(0, 14, 3)], [{**user(0), "tool_calls": [{"name": "run_command"}]}])[0] == "unknown"
+    assert state(RUNNING, SYSTEM_STEPS, [user(0), planner(1, tools=["run_command"]),
+                                         {**system(2), "tool_calls": []}])[0] == "unknown"
