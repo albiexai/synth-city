@@ -30,11 +30,14 @@ from .providers import router as providers_router
 from .codex_config import router as codex_config_router
 from .status import router as status_router
 from .factory_maintenance import router as factory_maintenance_router
-from .deps import require_operator_for_writes
+from .deps import apply_harness_scope, require_operator_for_writes
+from .harness_scope import router as harness_scope_router
 
 # Routers that change the controller's own harness settings: writes need the
 # Director key when one is configured (see require_operator_for_writes).
 SETTINGS_WRITES = [Depends(require_operator_for_writes)]
+# The same, and the request reads the global scope of the user that the X-Harness-Scope-User header names.
+SCOPED_SETTINGS = [Depends(require_operator_for_writes), Depends(apply_harness_scope)]
 
 router = APIRouter()
 
@@ -54,21 +57,22 @@ async def health_check():
 
 
 # Include sub-routers
-router.include_router(config_router, dependencies=SETTINGS_WRITES)
+router.include_router(harness_scope_router, tags=["Harness Scope"])
+router.include_router(config_router, dependencies=SCOPED_SETTINGS)
 router.include_router(projects_router, dependencies=SETTINGS_WRITES)
 router.include_router(cli_router, dependencies=SETTINGS_WRITES)
-router.include_router(mcp_router, prefix="/mcp", tags=["MCP Servers"], dependencies=SETTINGS_WRITES)
-router.include_router(commands_router, dependencies=SETTINGS_WRITES)
-router.include_router(plugins_router, tags=["Plugins"], dependencies=SETTINGS_WRITES)
-router.include_router(hooks_router, tags=["Hooks"], dependencies=SETTINGS_WRITES)
-router.include_router(permissions_router, tags=["Permissions"], dependencies=SETTINGS_WRITES)
-router.include_router(agents_router, tags=["Agents"], dependencies=SETTINGS_WRITES)
+router.include_router(mcp_router, prefix="/mcp", tags=["MCP Servers"], dependencies=SCOPED_SETTINGS)
+router.include_router(commands_router, dependencies=SCOPED_SETTINGS)
+router.include_router(plugins_router, tags=["Plugins"], dependencies=SCOPED_SETTINGS)
+router.include_router(hooks_router, tags=["Hooks"], dependencies=SCOPED_SETTINGS)
+router.include_router(permissions_router, tags=["Permissions"], dependencies=SCOPED_SETTINGS)
+router.include_router(agents_router, tags=["Agents"], dependencies=SCOPED_SETTINGS)
 router.include_router(backup_router, tags=["Backup"], dependencies=SETTINGS_WRITES)
-router.include_router(output_styles_router, tags=["Output Styles"], dependencies=SETTINGS_WRITES)
+router.include_router(output_styles_router, tags=["Output Styles"], dependencies=SCOPED_SETTINGS)
 router.include_router(statusline_router, tags=["Status Line"], dependencies=SETTINGS_WRITES)
 router.include_router(sessions_router, tags=["Sessions"])
 router.include_router(usage_router, tags=["Usage"], dependencies=SETTINGS_WRITES)
-router.include_router(memory_router, tags=["Memory"], dependencies=SETTINGS_WRITES)
+router.include_router(memory_router, tags=["Memory"], dependencies=SCOPED_SETTINGS)
 router.include_router(context_router, tags=["Context"])
 router.include_router(plans_router, tags=["Plans"])
 router.include_router(agent_mail_router, prefix="/agent-mail", tags=["Agent Mail"])

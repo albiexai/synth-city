@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Harnesses pages show the agents' global scope and let you choose it.** On an install where the controller and the agents run as different users, Claude Code's global scope no longer reads the controller's own `~/.claude`. Set `harness_agent_user` to show the agent user's skills, agents, commands, hooks, MCP servers and memory. A **Global scope of** control switches users, and each page names the folder it reads and says when the controller cannot write there ([#969](https://github.com/albiexai/synth-city/issues/969)).
+
 ## [4.1.0] - 2026-11-14
 
 Albiex Synth City 4.1.0 makes the delivery factory steadier: owners can amend an approved plan, automatic merges require the reviewer's acceptance of the exact head, dispatch follows priority labels, and several stuck states now settle on their own.

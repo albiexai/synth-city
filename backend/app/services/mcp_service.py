@@ -31,6 +31,7 @@ from app.utils.path_utils import (
     get_installed_plugins_file,
     get_managed_mcp_config_file,
     get_project_mcp_config_file,
+    get_user_home,
 )
 
 
@@ -252,6 +253,17 @@ class MCPService:
         config_str = json.dumps(server_config, sort_keys=True)
         return hashlib.md5(config_str.encode()).hexdigest()
 
+    @staticmethod
+    def _cache_scope(scope: str) -> str:
+        """The cache key for a scope. The user scope of another user's home has a key of its own (#969).
+
+        The controller's own home keeps the plain "user" key, so an existing single-user cache stays valid.
+        """
+        if scope != "user":
+            return scope
+        home = get_user_home()
+        return "user" if home == Path.home() else f"user:{home}"
+
     async def get_cached_server_info(
         self, name: str, scope: str, db: AsyncSession
     ) -> Optional[MCPServerCache]:
@@ -259,7 +271,7 @@ class MCPService:
         result = await db.execute(
             select(MCPServerCache).where(
                 MCPServerCache.server_name == name,
-                MCPServerCache.server_scope == scope,
+                MCPServerCache.server_scope == self._cache_scope(scope),
             )
         )
         return result.scalar_one_or_none()
@@ -308,7 +320,7 @@ class MCPService:
         else:
             cache_entry = MCPServerCache(
                 server_name=name,
-                server_scope=scope,
+                server_scope=self._cache_scope(scope),
                 **cache_data,
             )
             db.add(cache_entry)

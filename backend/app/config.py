@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     # Database settings
     database_url: str = Field(default="sqlite+aiosqlite:///./synth_city.db", repr=False)
 
+    # The OS user whose ~/.claude the Harnesses pages show as "global". Unset: the controller's own user.
+    # Set it on a two-user install (controller and agents run as different users) to the agent user.
+    harness_agent_user: str | None = None
+
     # Agent Bridge attachment settings
     bridge_attachment_dir: str = "~/.albiex-synth-city/bridge-attachments"
     bridge_attachment_agent_root: str | None = None

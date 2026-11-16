@@ -127,6 +127,14 @@ For remote access, install and run Synth City natively on the remote host where 
 
 If the controller and the agents run as different operating-system users, the operator must set up one `sudoers` rule for the cross-user terminal attach: turn `use_pty` off for the agent `tmux` command only. Synth City does not change `sudoers`. See [What you must set up: a command-scoped `!use_pty`](/features/agent-bridge#what-you-must-set-up-a-command-scoped-use-pty) and, for the rest of this layout, [Deployment with separate controller and agent users](/features/agent-teams#deployment-with-separate-controller-and-agent-users).
 
+### Which user the Harnesses pages show as "global"
+
+A Harnesses page for Claude Code shows two scopes: the global scope (the `~/.claude` folder of one user) and, when you choose one, a project. On a one-user install the global scope is the controller's own home, and nothing needs setting.
+
+If the controller and the agents run as different users, the controller's `~/.claude` is not the one that the agents load. Set `harness_agent_user` (environment variable `HARNESS_AGENT_USER`, or `backend/.env`) to the agent user's name. The pages then show that user's skills, agents, commands, hooks, MCP servers, memory and settings under Global, and the page names the folder it read. A **Global scope of** control lets a Director switch to the controller's own user. No other user can be chosen, and a name that does not exist on the host is an error, not a fall-back to the controller's home.
+
+The controller needs read access to that user's `~/.claude`, and write access for changes. When it cannot write there, the page says so and a change is refused with a message that names the folder. Synth City does not change any file permission. Backups and the controller's own data stay in the controller's home.
+
 ## What Gets Read
 
 Synth City reads these Claude Code configuration files:
