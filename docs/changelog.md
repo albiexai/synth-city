@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The team view flags members whose Mail tool list is out of date (first part of #960).** The Mail server reports a digest of the tools each session started with, and each member's status now carries `tool_catalog_state` (`current`, `stale` or `unknown`) judged over its connected sessions, with the reason "tool catalog stale: restart in resume mode" when stale. It is a display fact only and changes no wake, delivery or approval rule; restart a stale member in resume mode to load the new list. The roster badge and the `tools/list_changed` notification are separate follow-ups ([#960](https://github.com/albiexai/synth-city/issues/960)).
+
 ### Fixed
 
 - **Settling an accepted revision no longer fails with an HTTP 500 when GitHub reports a check run inconsistently.** A run that GitHub gave as `in_progress` with a conclusion, or as `completed` with none, made the check observation refuse it (as intended, since reading it as green could pass a bad head), but the settlement route did not catch that and answered 500. It now answers 409 with `checks_not_observable:<reason>`, using only the observation's own fixed reason code, and leaves the attempt unchanged; the Leader settles again once the checks read consistently. Verification and the automatic-merge gate already kept such an item pending with a "checks are unavailable" note and charged no retry; tests now cover both shapes there too. The observation itself stays strict ([#1007](https://github.com/albiexai/synth-city/issues/1007)).

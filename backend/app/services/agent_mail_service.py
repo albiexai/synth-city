@@ -333,6 +333,7 @@ class AgentMailService:
         session.provider = request.provider
         session.cwd = request.cwd
         session.pid = request.pid
+        session.tool_catalog = request.tool_catalog
         session.team_preset_id = team_preset_id
         session.team_slot_id = team_slot_id
         try:

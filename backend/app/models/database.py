@@ -727,6 +727,8 @@ class MailAgentSession(Base):
     bound_pane_pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     bound_pane_proc_start: Mapped[str | None] = mapped_column(String, nullable=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # The digest of the Mail tool names this session started with (#960); display only.
+    tool_catalog: Mapped[str | None] = mapped_column(String, nullable=True)
     wake_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     mailbox_status: Mapped[str] = mapped_column(String, default="connected", nullable=False)
     activity: Mapped[str | None] = mapped_column(String, nullable=True)

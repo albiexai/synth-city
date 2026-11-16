@@ -1,5 +1,6 @@
 """Albiex Synth City Agent Mail MCP server over stdio."""
 import asyncio
+import hashlib
 import os
 import sys
 import threading
@@ -246,6 +247,12 @@ def _bridge_session_path(target: str) -> str:
     return f"/sessions/{quote(target, safe='')}"
 
 
+def tool_catalog_fingerprint() -> str:
+    """A short digest of the tool names this shim registered (the backend computes the same digest of its list)."""
+    names = sorted({tool.name for tool in mcp._tool_manager.list_tools()})
+    return hashlib.sha256("\n".join(names).encode()).hexdigest()[:32]
+
+
 def _ensure_registered() -> dict:
     # Schema verification is registration-free and read-only. Member tools
     # cannot turn this startup probe into a synthetic authenticated session.
@@ -260,6 +267,8 @@ def _ensure_registered() -> dict:
             "cwd": os.getcwd(),
             "session_key": _state["session_key"],
             "pid": os.getppid(),
+            # What this session was started with, so the team view can say when the deployed list has moved on.
+            "tool_catalog": tool_catalog_fingerprint(),
         }
         team_preset_id = _env_int("SYNTH_CITY_TEAM_PRESET_ID")
         team_slot_id = _env_int("SYNTH_CITY_TEAM_SLOT_ID")
