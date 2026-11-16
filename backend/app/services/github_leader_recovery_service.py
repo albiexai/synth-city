@@ -17,8 +17,8 @@ from sqlalchemy import JSON, exists, insert, literal, select
 from sqlalchemy.exc import IntegrityError
 
 from app.models.database import (
-    AgentTeamPreset, FactoryAuditEvent, GithubMaintenanceEvent, GithubWorkspace, MailExternalActor, MailMessage,
-    MailReceipt, TeamGithubScope,
+    AgentTeamPreset, FactoryAuditEvent, GithubMaintenanceEvent, GithubOwnerObservationPause, GithubWorkItem,
+    GithubWorkspace, MailAgentSession, MailExternalActor, MailMessage, MailReceipt, TeamGithubScope,
 )
 from app.models.api_model import naive_utc_confirmation
 from app.services import factory_audit_service as audit
@@ -86,7 +86,58 @@ async def _authorize(db, item, session, *, need_supervisor=True):
         supervisor = await db.get(MailExternalActor, preset.supervisor_actor_id)
     if need_supervisor and supervisor is None:
         raise LeaderRecoveryError("supervisor_not_bound")
+    await _refuse_observation_pause(db, item.id)
     return scope, preset, leader, supervisor
+
+
+async def _refuse_observation_pause(db, item_id):
+    """A waiting or paused observation is recovered by the operator alone, from the unchanged context."""
+    if await db.scalar(select(GithubOwnerObservationPause.id).where(
+            GithubOwnerObservationPause.work_item_id == item_id,
+            GithubOwnerObservationPause.status.in_(("waiting", "paused")))) is not None:
+        raise LeaderRecoveryError("observation_pause_active")
+
+
+async def _assert_authority(db, ctx, *, terminal=False):
+    """Everything the entry check proved, read again inside the action's own transaction.
+
+    The delegated services call this right before their commit (and a release before any external effect), so
+    a HOLD, a Leader or session change, a disabled scope or autonomy, an unbound Supervisor, a new observation
+    pause or a nonterminal item that appeared during an awaited probe stops the write. A refusal here rolls the
+    action back, so nothing is written and no success notice follows.
+    """
+    if hold_code():
+        raise LeaderRecoveryError("operator_hold")
+    row = (await db.execute(select(GithubWorkItem.scope_id, GithubWorkItem.dispatch_status).where(
+        GithubWorkItem.id == ctx.item_id))).one_or_none()
+    scope = (await db.execute(select(TeamGithubScope.enabled, TeamGithubScope.preset_id).where(
+        TeamGithubScope.id == row.scope_id))).one_or_none() if row is not None else None
+    preset = (await db.execute(select(AgentTeamPreset.autonomy_enabled, AgentTeamPreset.supervisor_actor_id).where(
+        AgentTeamPreset.id == scope.preset_id))).one_or_none() if scope is not None else None
+    if row is None or scope is None or preset is None or not scope.enabled or not preset.autonomy_enabled:
+        raise LeaderRecoveryError("recovery_context_unavailable")
+    if preset.supervisor_actor_id != ctx.supervisor_id or await db.scalar(
+            select(MailExternalActor.id).where(MailExternalActor.id == ctx.supervisor_id)) is None:
+        raise LeaderRecoveryError("supervisor_not_bound")
+    if await db.scalar(select(MailAgentSession.id).where(
+            MailAgentSession.id == ctx.session_id, MailAgentSession.member_id == ctx.member_id,
+            MailAgentSession.closed_at.is_(None))) is None:
+        raise LeaderRecoveryError("leader_only", 403)
+    try:
+        _owner, leader = await github_approval_service._current_participants(db, await db.get(GithubWorkItem, ctx.item_id))
+    except GithubApprovalError as exc:
+        raise LeaderRecoveryError(exc.detail, exc.status_code) from exc
+    if leader.id != ctx.member_id:
+        raise LeaderRecoveryError("leader_only", 403)
+    await _refuse_observation_pause(db, ctx.item_id)
+    if terminal and row.dispatch_status not in TERMINAL_ITEMS:
+        raise LeaderRecoveryError("item_not_terminal")
+
+
+async def _reload(db, *rows):
+    """A lost claim rolls the session back, which expires every loaded row; read what the flow still needs again."""
+    for row in rows:
+        await db.refresh(row)
 
 
 async def _existing_claim(db, item_id, kind, operation_id, digest):
@@ -172,23 +223,28 @@ def _need_reason(reason):
 async def cancel_revision(db, item, session, *, revision_number, dispatch_nonce, operation_id, reason):
     reason = _need_reason(reason)
     ctx = _ctx(item, session)
-    _scope, preset, _leader, supervisor = await _authorize(db, item, session)
+    scope, preset, _leader, supervisor = await _authorize(db, item, session)
     ctx = replace(ctx, preset_id=preset.id, supervisor_id=supervisor.id)
-    digest = _digest("cancel", item.id, revision_number, dispatch_nonce, reason)
+    digest = _digest("cancel", ctx.item_id, revision_number, dispatch_nonce, reason)
     replay = await _existing_claim(db, ctx.item_id, "cancel", operation_id, digest)
     if not replay:
         replay = await _claim(db, ctx.item_id, "cancel", operation_id, digest)
+    await _reload(db, item)
     owner_notice_error = None
     try:
         _item, _revision, changed = await github_approval_service.cancel_active_continuation(
             db, item, revision_number=revision_number, dispatch_nonce=dispatch_nonce, reason=reason,
-            actor=_actor(ctx))
+            actor=_actor(ctx), before_commit=lambda: _assert_authority(db, ctx))
     except ActiveCancellationNoticeError as exc:
         owner_notice_error, changed = exc, True  # the cancellation is committed; only its owner notice failed
     except GithubApprovalError as exc:
         if not replay:
             await _unclaim(db, "cancel", operation_id)
         raise LeaderRecoveryError(exc.detail, exc.status_code) from exc
+    except LeaderRecoveryError:
+        if not replay:
+            await _unclaim(db, "cancel", operation_id)
+        raise
     notice = await _notify(db, ctx, kind="cancel", operation_id=operation_id,
         digest=digest, summary=f"revision {revision_number} was cancelled.", reason=reason)
     if owner_notice_error is not None:
@@ -209,17 +265,23 @@ async def finalize_merged(db, item, session, *, read_pull, operation_id, expecte
     ctx = _ctx(item, session)
     scope, preset, _leader, supervisor = await _authorize(db, item, session)
     ctx = replace(ctx, preset_id=preset.id, supervisor_id=supervisor.id)
-    digest = _digest("finalize", item.id, expected_context_sha256, reason)
+    digest = _digest("finalize", ctx.item_id, expected_context_sha256, reason)
     replay = await _existing_claim(db, ctx.item_id, "finalize", operation_id, digest)
     if not replay:
         replay = await _claim(db, ctx.item_id, "finalize", operation_id, digest)
+    await _reload(db, item, scope)
     try:
         result = await finalize_merged_item(db, item, scope, read_pull, expected_context_sha256=expected_context_sha256,
-            operation_id=operation_id, reason=reason, decided_by="the Leader")
+            operation_id=operation_id, reason=reason, decided_by="the Leader", actor=_actor(ctx),
+            before_commit=lambda: _assert_authority(db, ctx))
     except ValueError as exc:
         if not replay:
             await _unclaim(db, "finalize", operation_id)
         raise LeaderRecoveryError(str(exc)) from None
+    except LeaderRecoveryError:
+        if not replay:
+            await _unclaim(db, "finalize", operation_id)
+        raise
     notice = await _notify(db, ctx, kind="finalize", operation_id=operation_id,
         digest=digest, summary="the merged pull request was recorded.", reason=reason)
     return {"status": result["status"], "work_item_id": ctx.item_id, "notice": notice}
@@ -232,6 +294,11 @@ async def _release_applied(db, workspace_id, expected_leased_at):
         FactoryAuditEvent.action_outcome == "applied")) is not None
 
 
+def _held(workspace, item_id, expected_leased_at):
+    return (workspace.leased_item_id == item_id and workspace.leased_at == expected_leased_at
+            and workspace.lease_token is not None)
+
+
 async def release_workspace(db, item, session, *, workspace_id, expected_leased_at, operation_id, reason):
     reason = _need_reason(reason)
     ctx = _ctx(item, session)
@@ -239,35 +306,51 @@ async def release_workspace(db, item, session, *, workspace_id, expected_leased_
     ctx = replace(ctx, preset_id=preset.id, supervisor_id=supervisor.id)
     scope_id, item_status = scope.id, item.dispatch_status
     workspace = await db.get(GithubWorkspace, workspace_id, populate_existing=True)
-    if workspace is None or workspace.scope_id != scope.id:
+    if workspace is None or workspace.scope_id != scope_id:
         raise LeaderRecoveryError("workspace_not_found", 404)
     digest = _digest("release", ctx.item_id, workspace_id, expected_leased_at.isoformat(), reason)
     replay = await _existing_claim(db, ctx.item_id, "release", operation_id, digest)
-    held = (workspace.leased_item_id == ctx.item_id and workspace.leased_at == expected_leased_at
-            and workspace.lease_token is not None)
-    if not held:
+
+    async def already_released():
+        notice = await _notify(db, ctx, kind="release", operation_id=operation_id, digest=digest,
+            summary=f"workspace {workspace_id} was released.", reason=reason)
+        return {"status": "already_released", "workspace_id": workspace_id, "notice": notice}
+
+    if not _held(workspace, ctx.item_id, expected_leased_at):
         if replay and workspace.leased_item_id != ctx.item_id and await _release_applied(db, workspace_id, expected_leased_at):
-            notice = await _notify(db, ctx, kind="release", operation_id=operation_id,
-                digest=digest, summary=f"workspace {workspace_id} was released.", reason=reason)
-            return {"status": "already_released", "workspace_id": workspace_id, "notice": notice}
+            return await already_released()
         raise LeaderRecoveryError("workspace_lease_changed")
     if item_status not in TERMINAL_ITEMS:
         raise LeaderRecoveryError("item_not_terminal")
-    # Stricter than the operator route, which only reports dirty state: a dirty, unpushed or unknown tree refuses.
-    if await github_workspace_service.release_blocker(scope, workspace, item):
+    # Stricter than the operator route: a real inspection of every workspace kind; dirty, unpublished or unreadable refuses.
+    if await github_workspace_service.delegated_release_blocker(scope, workspace, item):
         raise LeaderRecoveryError("workspace_not_clean")
     if not replay:
         replay = await _claim(db, ctx.item_id, "release", operation_id, digest)
+    await _reload(db, item, scope, workspace)
+    if not _held(workspace, ctx.item_id, expected_leased_at):
+        if replay and workspace.leased_item_id != ctx.item_id and await _release_applied(db, workspace_id, expected_leased_at):
+            return await already_released()
+        if not replay:
+            await _unclaim(db, "release", operation_id)
+        raise LeaderRecoveryError("workspace_lease_changed")
+    lease_token = workspace.lease_token
     try:
         released = await github_workspace_service.force_release_acquisition(db, actor_kind="member",
             actor_member_id=ctx.member_id, actor_session_id=ctx.session_id, workspace_id=workspace_id,
             scope_id=scope_id, item_id=ctx.item_id, expected_leased_at=expected_leased_at,
-            lease_token=workspace.lease_token)
+            lease_token=lease_token, before_commit=lambda: _assert_authority(db, ctx, terminal=True))
     except GithubWorkspaceCredentialRevokeError as exc:
         raise LeaderRecoveryError(exc.block_code, 503) from exc
     except GithubWorkspaceConfigError as exc:
         raise LeaderRecoveryError(exc.block_code) from exc
+    except LeaderRecoveryError:
+        if not replay:
+            await _unclaim(db, "release", operation_id)
+        raise
     if not released:
+        if replay and await _release_applied(db, workspace_id, expected_leased_at):
+            return await already_released()
         if not replay:
             await _unclaim(db, "release", operation_id)
         raise LeaderRecoveryError("workspace_lease_changed")

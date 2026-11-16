@@ -3888,6 +3888,8 @@ async def settle_github_accepted_revision(item_id: int, request: GithubSubmitted
 
 
 async def _leader_recovery(item_id, session, db, source, run):
+    from sqlalchemy.exc import IntegrityError, InvalidRequestError, OperationalError
+    from sqlalchemy.exc import MissingGreenlet
     """One Leader recovery: session identity from the authenticated row, refusals observed like the operator routes."""
     from app.services.github_leader_recovery_service import LeaderRecoveryError
     if session is None:
@@ -3896,13 +3898,21 @@ async def _leader_recovery(item_id, session, db, source, run):
     item = await db.get(GithubWorkItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail='work_item_not_found')
+    actor = _session_actor(session)  # plain values first: a rollback below expires the session row
     try:
         return await run(item)
     except LeaderRecoveryError as exc:
         await db.rollback()
-        await _observe_refusal(db, event_kind='leader_recovery', source=source, actor=_session_actor(session),
+        await _observe_refusal(db, event_kind='leader_recovery', source=source, actor=actor,
             code=exc.code, item_id=item_id)
         raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+    except (IntegrityError, OperationalError, InvalidRequestError, MissingGreenlet) as exc:
+        # A residual race (a lost claim, a locked row, an expired row) is a clean refusal; the caller repeats the
+        # same request and the operation id makes it a replay.
+        await db.rollback()
+        await _observe_refusal(db, event_kind='leader_recovery', source=source, actor=actor,
+            code='recovery_context_changed', item_id=item_id)
+        raise HTTPException(status_code=409, detail='recovery_context_changed') from exc
 
 
 async def _merged_pull_reader(db, item_id):

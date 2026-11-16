@@ -3063,6 +3063,7 @@ class GithubApprovalService:
         dispatch_nonce: str,
         reason: str,
         actor: dict | None = None,
+        before_commit=None,
     ) -> tuple[GithubWorkItem, GithubAttemptScopeRevision, bool]:
         """Cancel one current active or submitted revision, retaining its history.
 
@@ -3417,6 +3418,12 @@ class GithubApprovalService:
                 attempt_phase="implementation", retry_count=cancellation_context["retry_count"] + int(charge_head),
                 last_verified_sha=head_sha if charge_head else cancellation_context["last_verified_sha"])
             await self.claim_healthy_scope_context(db, cancellation_context)
+        if before_commit is not None:
+            try:
+                await before_commit()  # a delegated caller's authority fence, in this transaction, right before the commit
+            except BaseException:
+                await db.rollback()
+                raise
         await db.commit()
         await db.refresh(item)
         await db.refresh(revision)
