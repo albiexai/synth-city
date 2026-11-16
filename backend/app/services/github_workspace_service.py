@@ -831,6 +831,8 @@ class GithubWorkspaceService:
                 )
                 credential_effect = "revoked_or_not_held"
                 if snapshot is not None:
+                    if before_commit is not None:
+                        await before_commit()  # the delegated fence again, before the next external mutation
                     config_effect = "unknown"
                     await self.remove_managed_worktree_config(config_workspace)
                     config_effect = "removed"
@@ -854,7 +856,9 @@ class GithubWorkspaceService:
                 await db.rollback()
                 restore_effect = "not_needed"
                 restore_exc_raised: GithubWorkspaceConfigError | None = None
-                if snapshot is not None:
+                # A delegated fence that stopped the release before the config was touched leaves nothing to restore.
+                config_untouched = before_commit is not None and config_effect == "not_attempted"
+                if snapshot is not None and not config_untouched:
                     try:
                         await self.restore_worktree_config(config_workspace, snapshot)
                         restore_effect = "restored"
