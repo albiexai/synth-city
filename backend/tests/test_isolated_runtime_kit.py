@@ -334,9 +334,10 @@ def test_down_stops_unrecorded_members_of_the_cli_group_and_nothing_outside(kit_
     """#1010: a real OpenCode starts its server and Mail shim in the pane's process group; down stops them."""
     _needs_namespaces()
     victim = subprocess.Popen(["sleep", "300"], start_new_session=True)  # outside the kit, in a group of its own
-    time.sleep(0.2)
-    victim_id = _identity(victim.pid)
+    victim_id = None
     try:
+        time.sleep(0.2)
+        victim_id = _identity(victim.pid)
         summary = _up(kit_root, RUNTIME_KIT_TEST_FAULT="cli_grandchild")
         marker = kit_root / "run" / "fake-cli" / "members"
         deadline = time.monotonic() + 10
@@ -350,8 +351,15 @@ def test_down_stops_unrecorded_members_of_the_cli_group_and_nothing_outside(kit_
         assert not [pid for pid in [*summary["pids"].values(), *members] if _alive(pid)]
         assert _alive(victim.pid) and _identity(victim.pid) == victim_id
     finally:
-        _pidfd_kill(victim_id)
-        victim.wait()
+        try:
+            if victim_id is not None and victim.poll() is None:
+                _pidfd_kill(victim_id)
+        finally:
+            # The fallback when the identity was never read or the proved kill failed: the victim is this
+            # test's own unreaped child, so its pid can't name another process until wait() reaps it.
+            # Popen.kill() polls first, so it does nothing after an exit.
+            victim.kill()
+            victim.wait(timeout=10)
 
 
 def test_up_refuses_a_retained_root_before_starting_anything(kit_root):
@@ -626,7 +634,7 @@ def test_model_an_unrecorded_process_outside_a_proved_service_group_still_refuse
 
 
 @pytest.mark.parametrize("change", ["start", "argv", "pgid", "net", "foreign", "leader_gone", "leader_regrouped",
-                                    "now_a_role", "leader_not_a_service"])
+                                    "leader_unproved", "now_a_role", "leader_not_a_service"])
 def test_model_a_member_is_proved_again_before_its_signal(change):
     world, procs, inst = _model()
     _cli_group(world, 107)
@@ -647,13 +655,37 @@ def test_model_a_member_is_proved_again_before_its_signal(change):
         del world[106]
     elif change == "leader_regrouped":
         world[106]["pgid"] = 100
+    elif change == "leader_unproved":
+        procs["cli"]["argv"] = "another"  # alive and still leading its group, but no longer the recorded cli
     elif change == "now_a_role":
         procs["stub"] = {**procs["stub"], "pid": 107}
     else:
+        # Even an anchor that leads its own group, with the process in that group, is never a member's leader.
+        world[102]["pgid"] = world[107]["pgid"] = 102
         member = {**member, "leader": "inner", "pgid": 102}
     expected = "gone" if change == "start" else None
     result = module["member_check"](inst, procs, ROOT_MODEL, member)
     assert result == expected if expected else result not in ("ok", "gone")
+
+
+def test_model_group_leaders_are_only_proved_services_that_lead_their_own_group():
+    world, procs, inst = _model()
+    world[102]["pgid"] = 102  # the inner anchor leads a group of its own: still never a leader
+    world[104]["pgid"] = 104  # the stub leads its own group
+    module = _bind(_helper_module(), world, procs, inst)
+    # tmux and the backend are proved but in the launcher's group, so they lead nothing.
+    assert module["group_leaders"](inst, procs, ROOT_MODEL) == {104: "stub", 106: "cli"}
+    procs["stub"]["argv"] = "another"  # an unproved service leads nothing either
+    assert module["group_leaders"](inst, procs, ROOT_MODEL) == {106: "cli"}
+
+
+def test_model_the_plan_proves_each_candidate_again_before_it_is_a_member():
+    world, procs, inst = _model()
+    _cli_group(world, 107)
+    module = _bind(_helper_module(), world, procs, inst)
+    module["argv_hash"] = lambda pid: None if int(pid) == 107 else f"h{pid}"  # its command line can't be read
+    result = module["plan"](ROOT_MODEL)
+    assert result["members"] == [] and any("unrecorded" in p and "107" in p for p in result["problems"])
 
 
 @pytest.mark.parametrize("bad", [None, [], {"pid": "107"}, {"pid": 107}])
