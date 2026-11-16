@@ -54,19 +54,11 @@ def test_contract_matrix(provider):
         assert "Latest/continue is not exact resume" in resume_conditions
 
 
-# Providers the frontend registry does not list yet. Their UI comes with its own issue
-# (antigravity-cli: #738), so they have no native adapter and no page until then.
-NOT_YET_IN_FRONTEND_REGISTRY = {"antigravity-cli"}
-
-
 @pytest.mark.parametrize("provider", get_providers(), ids=lambda p: p.id)
 def test_native_catalog_agrees_with_frozen_p02_adapters(provider):
     frozen = json.loads((ROOT / "frontend/tests/fixtures/factory/native-adapters.json").read_text())["registry"]
-    if provider.id in NOT_YET_IN_FRONTEND_REGISTRY:
-        assert provider.id not in frozen
-        registry = {}
-    else:
-        registry = frozen[provider.id]
+    # Every provider needs its frontend registry entry (an empty one means no native pages).
+    registry = frozen[provider.id]
     catalog = ops.native_surfaces(provider)
     for surface, entry in catalog.items():
         if surface not in registry:

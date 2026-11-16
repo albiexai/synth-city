@@ -219,6 +219,20 @@ export function uninstallMuseAgentMail(): Promise<AgentMailInstallStatus> {
   })
 }
 
+export function applyAntigravityAgentMailInstall(): Promise<AgentMailInstallStatus> {
+  return apiClient<AgentMailInstallStatus>('agent-mail/install/antigravity/apply', {
+    method: 'POST',
+    body: JSON.stringify({ confirmed: true }),
+  })
+}
+
+export function uninstallAntigravityAgentMail(): Promise<AgentMailInstallStatus> {
+  return apiClient<AgentMailInstallStatus>('agent-mail/install/antigravity/uninstall', {
+    method: 'POST',
+    body: JSON.stringify({ confirmed: true }),
+  })
+}
+
 export function fetchAgentMailSnippets(): Promise<AgentMailSnippets> {
   return apiClient<AgentMailSnippets>('agent-mail/install/snippets', { headers: directorReadHeaders() })
 }

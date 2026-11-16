@@ -502,6 +502,7 @@ function SlotDialog({
                 <SelectItem value="opencode-cli">OpenCode CLI</SelectItem>
                 <SelectItem value="pi-cli">Pi (OpenRouter)</SelectItem>
                 <SelectItem value="muse-cli">Muse Code (Meta)</SelectItem>
+                <SelectItem value="antigravity-cli">Antigravity CLI (Google)</SelectItem>
               </SelectContent>
             </Select>
           </div>
