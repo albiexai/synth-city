@@ -1,10 +1,11 @@
 # Antigravity CLI harness support: spike spec
 
-Date: 2026-11-15. Status: **draft checkpoint, not a finished spike.** Issue: #734. Target: release/v4.2.
+Date: 2026-11-15, live observation added 2026-11-16. Issues: #734 (documentation), #952 (runtime acceptance).
+Target: release/v4.2.
 
-This checkpoint records what Google's public documentation and terms say, and what is still unknown. It contains no live
-observation: no `agy` binary was installed or run, nobody signed in, and no model call was made. Questions 2–7 of #734
-therefore stay **open**. This document does not complete #734, and it does not unblock #735–#738.
+This spec records what Google's public documentation and terms say, and what #952 observed with `agy` 1.5.9 in an
+isolated runtime (see [Live observation (#952)](#live-observation-952)). Rows labelled **observed** come from that run.
+Rows still labelled **unknown** were not observed and must not be relied on.
 
 ## Goal
 
@@ -23,9 +24,8 @@ Every claim below carries one of these labels.
 | **issue** | From the #734 issue body: checked on `agy` 1.3.5 on the Director's machine without a model call, or read from Antigravity's bundled docs. Not re-checked here. |
 | **interpretation** | The author's reading of an official text. It is not a legal opinion and not a Google statement. |
 | **unofficial** | Third-party guides or Google developer-forum posts. Context only; never relied on. |
-| **unknown** | No source found. Needs live observation. |
-
-Live observation from a member in tmux, which #734's "Done when" requires, is **not present for any question**.
+| **observed** | Seen in #952's isolated run of `agy` 1.5.9: a loopback-only network namespace, a dummy `GEMINI_API_KEY`, a local scripted Gemini-compatible stub, a private home directory, and no sign-in. A stub shows harness mechanics only, not real-model behaviour. |
+| **unknown** | No source found, and not observed. |
 
 ## Q1: subscription terms
 
@@ -103,9 +103,32 @@ Before any live member runs, the Director decides:
 3. Who signs in. The sign-in is interactive (browser, or a device code over SSH: official, install page). An agent never
    handles the credential.
 
-## Q2–Q7: what is documented and what is still unknown
+## Live observation (#952)
 
-None of these has live evidence. Each row states the source of every claim.
+`agy` 1.5.9 (Linux x86-64 tarball from the official update manifest, sha512 checked against it; the installer and
+`agy install` were not run) ran in an unprivileged, loopback-only user and network namespace, with a minimal environment,
+a private home directory and a private tmux socket. Every model request went to a local stub. Nobody signed in, no real
+key was used, and Google's terms were not accepted.
+
+- **API-key route.** With `{"modelProvider": "gemini"}` in `~/.gemini/antigravity-cli/settings.json`, `GEMINI_API_KEY`
+  and `GOOGLE_GEMINI_BASE_URL`, `agy` skips sign-in and sends `POST v1beta/models/<model>:streamGenerateContent?alt=sse`
+  with the key header to the configured endpoint. Without `modelProvider` it shows only "You are currently not signed
+  in" with Google OAuth or a Google Cloud project, even when `GEMINI_API_KEY` is set. Each new turn sends a side request
+  to a `flash-lite` model and the main request, which offers 14 tools including `ask_question`.
+- **First-run onboarding.** A new user sees a colour-scheme picker, then "Terms of Service & Data Use" with a
+  data-collection opt-in that is checked by default. The interactive screen cannot be used until it is finished; turns
+  still run behind it. **Synth City never accepts it and never presets its settings: the terms and the data-use choice
+  belong to the user.** What `agy` records when onboarding is complete was not observed, so Synth City has no
+  completion signal. Antigravity readiness stays blocked with an instruction to complete onboarding once as that user
+  (`provider_readiness_service.ANTIGRAVITY_UNPROVEN_GATES`). Finding a completion signal is open for #736.
+- **Argv.** A prompt must be one `-i` (or `-p`) argument. A stray positional argument exits with code 2: "Prompts are
+  read only from -p/--print, -i/--prompt-interactive, or stdin".
+- **Not observed:** the trust prompt and the question screen (both hidden behind onboarding), `PostToolUse`, real-model
+  behaviour, an expired login, linked git worktrees, and behaviour inside a Synth City team launch.
+
+## Q2–Q7: what is documented and what was observed
+
+Each row states the source of every claim.
 
 ### Q2: hooks
 
@@ -115,14 +138,16 @@ None of these has live evidence. Each row states the source of every claim.
 | Workspace hooks file | `.agents/hooks.json` at the project root; a plugin's own `hooks.json` also loads | official |
 | Not loaded | Hooks placed in `~/.gemini/antigravity-cli/settings.json` | official |
 | Layout | Named top-level groups, then the event: `{"my-linter-hook": {"PostToolUse": [{"matcher": "run_command", "hooks": [{"type": "command", "command": "./scripts/lint.sh", "timeout": 10}]}]}}`. This differs from Claude Code's and Muse's `{"hooks": {...}}` layout. | official |
+| Layout for events without a matcher | **Flat command entries**: `{"my-stop-hook": {"Stop": [{"type": "command", "command": "...", "timeout": 10}]}}`. The `{"hooks": [...]}` wrapper is rejected for `SessionStart`, `PreInvocation`, `PostInvocation` and `Stop` ("command hook must specify 'command'"), and then no hook fires. `PreToolUse` and `PostToolUse` take `{"matcher": "*", "hooks": [...]}`. | observed |
 | Events | `SessionStart`, `PreToolUse`, `PostToolUse`, `PreInvocation`, `PostInvocation`, `Stop`. No `UserPromptSubmit`. | official, issue |
 | `SessionStart` payload | `conversationId`, `workspacePaths`, `transcriptPath`, `artifactDirectoryPath`, `modelName`, `lastUserInput` | official |
 | `PreToolUse` payload | adds `toolCall` (`name`, `args`) and `stepIdx` | official |
 | `Stop` payload | adds `executionNum`, `terminationReason`, `error`, `fullyIdle` | official |
 | `PreToolUse` decision | output field `decision`: `allow`, `auto_approve`, `deny`, `ask`, `force_ask`, `deny_unless_prior_grant` | official |
 | Matchers | `""` or `*` for all tools, exact names, `a\|b`, regex such as `browser_.*`; ignored for `SessionStart`, `PreInvocation`, `PostInvocation` and `Stop` | official |
-| `SessionStart` on a new conversation versus `--conversation <id>` | unknown | unknown |
-| Which hooks actually fire in the CLI | unknown. Forum posts report `Stop` and `PostToolUse` not firing in the Antigravity IDE. | unknown, unofficial |
+| Payload fields seen | Every event: `hookEventName`, `conversationId`, `transcriptPath`, `artifactDirectoryPath`, `modelName`, `lastUserInput`, `workspacePaths`, `cwd`. `PreInvocation` and `PostInvocation` add `invocationNum` and `initialNumSteps`. `Stop` adds `executionNum`, `terminationReason` (for example `NO_TOOL_CALL`), `error`, `fullyIdle` and `continuationActive`. `PreToolUse` adds `toolCall` (`name`, `args`, `id`) and `stepIdx`. | observed |
+| `SessionStart` on a new conversation versus `--conversation <id>` | A new conversation fires `SessionStart`, `PreInvocation`, `PostInvocation` and `Stop`. A resume with a prompt fires `PreInvocation`, `PostInvocation` and `Stop`, but **not** `SessionStart`. A resume without a prompt fires nothing. Session identity must not depend on `SessionStart` alone. | observed |
+| Which hooks actually fire in the CLI | `SessionStart`, `PreInvocation`, `PostInvocation`, `Stop` and `PreToolUse` fired from the global file. `PostToolUse` was not observed, because the only tool call (`ask_question`) was not answered; it is neither confirmed nor ruled out. The workspace file was not tested. | observed; `PostToolUse` unknown |
 
 ### Q3: questions
 
@@ -133,7 +158,8 @@ None of these has live evidence. Each row states the source of every claim.
 | `permissions.deny` | The documented rule actions are `read_file`, `write_file`, `read_url`, `execute_url`, `command`, `unsandboxed` and `mcp` (<https://antigravity.google/docs/permissions?tab=cli>). No action covers a question tool. | official; blocking it is unknown |
 | Rule precedence | "Your fine-grained `allow`, `ask`, and `deny` rules always take precedence (`Deny > Ask > Allow`)." ([Execution modes and the terminal sandbox](https://antigravity.google/docs/permissions?tab=cli#execution-modes-and-the-terminal-sandbox)) | official |
 | `--dangerously-skip-permissions` | A separate behaviour: it sets the `toolPermission` setting to `always-proceed`, and "`strict` and `always-proceed` (`--dangerously-skip-permissions`) take precedence over `auto` mode." On the page as fetched on 2026-11-15, it does not override explicit `deny` rules. The page names no version, and it can change. Whether the flag suppresses `ask_question`, or affects a hook's `deny`, is not stated. A permission override is not evidence that the question screen is suppressed. | official; effect on questions and hooks unknown |
-| Open question in the transcript, the summaries database and on screen | unknown | unknown |
+| `PreToolUse` for `ask_question` | Fires, with `toolCall.name` `ask_question` and the questions in `toolCall.args`. The turn then waits: no `PostToolUse`, no `Stop` and no further model request while the question is unanswered. This shows the observed wait only. Whether a `deny` decision blocks the question was not tested. | observed; denial unknown |
+| Open question in the transcript, the summaries database and on screen | unknown. The question screen was hidden behind onboarding. | unknown |
 
 ### Q4: identity and resume
 
@@ -142,7 +168,8 @@ None of these has live evidence. Each row states the source of every claim.
 | Conversation id from a hook | `SessionStart` carries `conversationId` and `transcriptPath` | official |
 | Conversation id from state | `~/.gemini/antigravity-cli/conversations/<uuid>.db` and `conversation_summaries.db` with `workspace_uris` | issue |
 | Resume | `--conversation <id>`, "Resume a previous conversation by ID"; `/resume` lists earlier conversations, and the CLI prints the resume command on exit | issue (flag), official (`/resume`, exit message) |
-| Same conversation resumed exactly | unknown | unknown |
+| On exit | Prints "Resume with -c (or command below):" and `agy --conversation=<id>` | observed |
+| Same conversation resumed exactly | Yes. `agy --conversation <id> -i <prompt>` and `--conversation=<id>` resume the same conversation id with its earlier turns, and deliver the prompt (`lastUserInput`). Without `-i`, nothing is sent. Conversation ids are UUIDs. | observed |
 
 ### Q5: activity
 
@@ -151,14 +178,15 @@ None of these has live evidence. Each row states the source of every claim.
 | Transcript | `brain/<conversation id>/.system_generated/logs/transcript*.jsonl` | issue |
 | Summaries | `conversation_summaries.db` columns `status` and `not_fully_idle` | issue |
 | `Stop` | `fullyIdle` and `terminationReason` | official |
-| Which source is reliable for working, idle and waiting during a turn | unknown | unknown |
+| Which source is reliable for working, idle and waiting during a turn | unknown. The hook order above and the `ask_question` wait were observed; no activity classifier was tested (#737). | unknown |
 
 ### Q6: trust and login
 
 | Point | Finding | Label |
 |---|---|---|
 | Trust setting | `trustedWorkspaces` in `~/.gemini/antigravity-cli/settings.json` | issue |
-| Trust prompt, and whether `trustedWorkspaces` pre-empts it | unknown. The permissions page does not cover workspace trust. | unknown |
+| Effect of `trustedWorkspaces` | `"trustedWorkspaces": ["<absolute path>"]` is accepted (`agy` rewrites the file and keeps it). With it, hook payloads report `workspacePaths` `["<path>"]` and `cwd` `<path>`; without it, `[]` and `""`. Observed for a plain directory only. Synth City writes this entry when it launches a team member (`team_workspace_trust.py`). | observed (workspace registration) |
+| Trust prompt, and whether `trustedWorkspaces` pre-empts it | unknown. No trust prompt was seen with or without the setting, because onboarding covered the screen. Suppressing a prompt is **not** claimed. | unknown |
 | Credential storage | The operating system keyring ("Linux Secret Service/dbus"); browser sign-in locally, a device code over SSH | official (install page) |
 | Keyring in a headless tmux member | unknown. A member without a Secret Service session may not find its sign-in; the API key route avoids the keyring. | unknown, interpretation |
 | Expired login on screen | unknown | unknown |
@@ -168,8 +196,8 @@ None of these has live evidence. Each row states the source of every claim.
 | Point | Finding | Label |
 |---|---|---|
 | Install | `curl -fsSL https://antigravity.google/cli/install.sh \| bash`, default `~/.local/bin/agy`; installer flags `--skip-aliases` and `--skip-path` | official (<https://antigravity.google/docs/getting-started>, install page) |
-| Version | 1.3.5 on the Director's machine | issue |
-| argv, `pane_current_command`, and whether `agy` is one process or a launcher | unknown | unknown |
+| Version | 1.3.5 on the Director's machine; 1.5.9 in #952 | issue, observed |
+| argv, `pane_current_command`, and whether `agy` is one process or a launcher | One process named `agy` under the pane's shell in #952's run; `pane_current_command` itself was not recorded. | observed (process), unknown (tmux field) |
 
 ## Live phase: plan and prerequisites
 
@@ -188,9 +216,9 @@ in it is approved by this checkpoint.
     ([Point the CLI to a custom endpoint](https://antigravity.google/docs/install?tab=cli#point-the-cli-to-a-custom-endpoint),
     official). The same page says that with an API key, model requests go directly to the Gemini API without an
     account session, and "The CLI skips the sign-in screen and opens the main interface directly."
-  - Untested: whether the pinned `agy` binary honours the variable, and whether a local stub is compatible enough.
-    That is a concrete candidate for an approved probe inside a loopback-only namespace, as in the OpenCode spike. It
-    needs no account sign-in.
+  - Observed in #952: `agy` 1.5.9 honours the variable, and a local stub is compatible enough, once
+    `modelProvider` is `gemini` in `settings.json`. The page's "skips the sign-in screen" did not hold without that
+    setting.
   - Whether question behaviour (Q3) needs the real service is **unknown**. A stub that emits an `ask_question` tool
     call may exercise the question screen and the hooks; that is a test-plan decision, not yet observed.
   - An expired account login (Q6) is a distinct case. It needs a real account session by definition.
@@ -203,12 +231,17 @@ in it is approved by this checkpoint.
 
 These follow from the official documentation alone. They are inputs for #735–#738, not decisions.
 
-- The Agent Mail install for `agy` (#736) must write the Antigravity hooks layout (named groups), not the
-  `{"hooks": {...}}` layout that Claude Code and Muse use, and must not put hooks in `settings.json`.
-- Deck cannot rely on `UserPromptSubmit`, which does not exist. Session identity can use `SessionStart`'s
-  `conversationId`, which is the same pattern as Muse.
-- Denying the question tool depends on `PreToolUse` firing for `ask_question`. Until that is observed, #736 and #737
-  must treat questions as possible, and the guard's waiting-for-input detection has to cover them.
+- The Agent Mail install for `agy` (#736) must write the Antigravity hooks layout (named groups), with flat entries
+  for events without a matcher, not the `{"hooks": {...}}` layout that Claude Code and Muse use, and must not put hooks
+  in `settings.json`.
+- Deck cannot rely on `UserPromptSubmit`, which does not exist. A new conversation's `SessionStart` carries
+  `conversationId`, but a resume does not fire it, so resumed identity needs `PreInvocation`'s `conversationId` or the
+  launch argv.
+- `PreToolUse` fires for `ask_question`; whether denying it blocks the question is not observed. #736 and #737 must
+  still treat questions as possible, and the guard's waiting-for-input detection has to cover them.
+- The provider (#735) resumes with `--conversation <id>` and, when a prompt is given, `-i <prompt>` (observed, #952).
+- Readiness stays blocked until a user has completed onboarding and a completion signal exists. Synth City never
+  accepts the terms or presets onboarding.
 - The provider (#735) must not assume a consumer subscription sign-in. Its credential route follows the Director's
   Q1 decision.
 

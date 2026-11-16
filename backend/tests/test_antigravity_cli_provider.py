@@ -13,8 +13,8 @@ from app.services.providers.launch_contract import (
     supports_bedrock,
 )
 
-# Conversation ids are UUIDs on agy 1.3.5 (`conversations/<uuid>.db`, #734); the format is not
-# proven by a live run (#952), so anything else is refused rather than passed to argv.
+# Conversation ids are UUIDs (`conversations/<uuid>.db`; observed live on agy 1.5.9, #952), so
+# anything else is refused rather than passed to argv.
 CID = "6f1c2b8e-4d3a-4b7f-9c2e-1a2b3c4d5e6f"
 
 
@@ -59,6 +59,14 @@ def test_resume_launch():
     assert build(mode="resume", session_id=CID.upper()) == ["agy", "--conversation", CID.upper()]
 
 
+def test_resume_launch_takes_a_prompt():
+    # Observed on agy 1.5.9 (#952): `--conversation <id> -i <prompt>` keeps the id and its history.
+    assert build(mode="resume", session_id=CID, prompt="Continue") == [
+        "agy", "--conversation", CID, "-i", "Continue"]
+    assert build(mode="resume", session_id=CID, model="m-1", skip_permissions=True, prompt="Go on") == [
+        "agy", "--model", "m-1", "--dangerously-skip-permissions", "--conversation", CID, "-i", "Go on"]
+
+
 @pytest.mark.parametrize("session_id", [
     "last", "abc", "", "-x", f"{CID}x", f"{CID} --model y", CID[:-1], "ses_e2e111c0dffe5XAqhRWBFFBZDf",
 ])
@@ -71,8 +79,7 @@ def test_resume_refuses_a_non_uuid_conversation_id(session_id):
 @pytest.mark.parametrize("kwargs,code", [
     ({"mode": "resume"}, "antigravity_session_invalid"),
     ({"session_id": CID}, "antigravity_session_invalid"),
-    # The resume prompt rule is not proven (#952), so a resumed member gets no prompt.
-    ({"mode": "resume", "session_id": CID, "prompt": "Continue"}, "antigravity_option_unsupported"),
+    ({"mode": "resume", "session_id": CID, "prompt": "-rf"}, "antigravity_literal_prompt_required"),
     ({"mode": "worktree"}, "unsupported_launch_mode"),
     ({"mode": "fork"}, "unsupported_launch_mode"),
     ({"reasoning_effort": "ultra"}, "invalid_reasoning_effort"),
@@ -131,8 +138,10 @@ def test_agy_executable_is_the_exact_basename(argv0, exact):
 @pytest.mark.parametrize("model", [None, "m-1"])
 @pytest.mark.parametrize("effort", [None, "low", "max"])
 @pytest.mark.parametrize("skip", [False, True])
-def test_every_built_resume_command_is_recognized_with_its_id(model, effort, skip):
-    command = build(mode="resume", session_id=CID, model=model, reasoning_effort=effort, skip_permissions=skip)
+@pytest.mark.parametrize("prompt", [None, "Continue", "two words"])
+def test_every_built_resume_command_is_recognized_with_its_id(model, effort, skip, prompt):
+    command = build(mode="resume", session_id=CID, model=model, reasoning_effort=effort, skip_permissions=skip,
+                    prompt=prompt)
     assert exact_resumed_conversation(command) == CID
     assert exact_resumed_conversation(["/home/u/.local/bin/agy", *command[1:]]) == CID
 
@@ -145,6 +154,12 @@ def test_every_built_resume_command_is_recognized_with_its_id(model, effort, ski
     ["agy", "--model", "--conversation", CID],
     ["agy", f"--conversation={CID}"],
     ["agy", "--conversation", CID, "extra"],
+    ["agy", "--conversation", CID, "-i"],
+    ["agy", "--conversation", CID, "-i", "-x"],
+    ["agy", "--conversation", CID, "-i", "hi", "extra"],
+    ["agy", "--conversation", CID, "-i", "hi", "-i", "again"],
+    ["agy", "--conversation", CID, "-p", "hi"],
+    ["agy", "-i", "hi", "--conversation", CID],
     ["agy", "--conversation", "last"],
     ["agy", "--dangerously-skip-permissions", "--model", "m-1", "--conversation", CID],
     ["agy", "--effort", "high", "--model", "m-1", "--conversation", CID],

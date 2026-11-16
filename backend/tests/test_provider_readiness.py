@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.services import provider_readiness_service
 from app.services.provider_readiness_service import agent_mail_ready_reason, configuration_readiness
 from app.services import provider_operations_service as ops
 from app.services.providers import get_providers
@@ -323,3 +324,19 @@ def test_antigravity_readiness_fails_closed_until_agent_mail_is_installed():
     assert readiness.state == "blocked"
     assert [check.code for check in readiness.checks] == ["binary_installed", "agent_mail_not_configured"]
     assert configuration_readiness("antigravity-cli", "Antigravity CLI", True, legacy).state == "unknown"
+
+
+def test_antigravity_onboarding_stays_a_closed_gate_after_agent_mail(monkeypatch):
+    # No onboarding completion signal is proven (#952), and terms and data-use choices are the
+    # user's, so readiness never reads, guesses or presets them. Lifting only the Agent Mail gate
+    # (#736) still blocks with the onboarding instruction.
+    gates = provider_readiness_service.ANTIGRAVITY_UNPROVEN_GATES
+    assert gates == (
+        "Agent Mail for Antigravity CLI is not installed yet",
+        "Complete Antigravity CLI onboarding (terms and data-use choices) once as this user before launching agents",
+    )
+    monkeypatch.setattr(provider_readiness_service, "ANTIGRAVITY_UNPROVEN_GATES", gates[1:])
+    assert agent_mail_ready_reason("antigravity-cli", configured()) == gates[1]
+    assert configuration_readiness("antigravity-cli", "Antigravity CLI", True, configured()).state == "blocked"
+    assert agent_mail_ready_reason("antigravity-cli", configured(antigravity_cli_available=False)) == (
+        "Antigravity CLI is not available on this machine")

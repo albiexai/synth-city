@@ -299,6 +299,23 @@ controller cannot read the descriptors, set the member's first session id by han
 and restart the slot in resume mode. The evidence and the route are recorded on
 issue #746.
 
+### Antigravity CLI members
+
+Antigravity CLI (`agy`) members cannot be launched yet. Readiness stays blocked
+until Agent Mail for `agy` is installed (#736) and until onboarding can be
+confirmed. On first run, `agy` shows its own onboarding, which includes Google's
+Terms of Service and a data-use choice. **Synth City never accepts these terms and
+never presets onboarding settings**: each user completes onboarding once, in their
+own `agy`, as the agent user. No signal that onboarding is complete has been
+observed, so readiness asks the user to complete it and stays blocked.
+
+When a member launches, Synth City adds the workspace to `trustedWorkspaces` in the
+agent user's `~/.gemini/antigravity-cli/settings.json` and reports
+`workspace_trust_changed`. Issue #952 observed that this registers the workspace
+with `agy` 1.5.9; it did not observe whether it also suppresses a trust prompt.
+Other settings in that file are kept unchanged. A resumed member is launched with
+`agy --conversation <id>` and, if the slot has a prompt, `-i <prompt>`.
+
 ## External Local Agents
 
 Local external agents can use the JSON API:
