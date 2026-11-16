@@ -333,3 +333,33 @@ the pull request's current head is `accepted` and its reviewer still qualifies w
 check does not depend on a required-check watch. The review hold label still blocks first, and the
 gate runs again at the merge boundary. The work view shows the state through the item's status note:
 `Waiting for reviewer acceptance at <sha>`, `Head changed since acceptance (accepted at <sha>, head is <sha>)`, `Reviewer requires changes at <sha>` or `Reviewer accepted head <sha>`.
+
+## Remaining-work report context
+
+`synth_city_prepare_work_remaining_summary` reads the current Leader's context from
+`GET /github-work-items/{id}/remaining-work-context` and turns it into the three short lines (Remaining, Estimate,
+Next) that the owner publishes. Only the current Leader may read it.
+
+- **In-flight item.** The context exists only while a leased workspace's local head equals the published head. It is
+  bound to that head.
+- **Terminal item.** A merged, completed or closed item has no workspace to observe. Its context is bound to the
+  recorded verified head (`last_verified_sha`) instead, so the post-merge summary can still be prepared after the
+  workspace is released. Without a valid recorded head, or while the workspace is still leased, or when the item,
+  its verified head or its workspace changes while the route reads, the route returns `409
+  progress_context_unavailable`. The route checks the terminal facts again against the item before it answers.
+- **No authority value.** The context, the published marker and the route response carry no dispatch nonce, lease
+  token or other authority value. The marker holds only public references: `work_item_id`, `owner_slot_id`,
+  `scope_revision`, `source_sha`, `phase` and a public `generation`. The generation is the full SHA-256 digest of a
+  versioned domain string, the work-item id and the dispatch nonce. It names one dispatch, changes with every
+  replacement dispatch (a retry reset included, even for the same owner and the same published commit), and is not
+  a secret, a MAC or a capability: no endpoint accepts it, and every authority check still compares the raw private
+  nonce. The route compares the nonce with the live item and does not return it (`dispatch_nonce` is null in the
+  response). A published block that still carries a `dispatch_nonce`, or an old counter-only `attempt`, is treated
+  as invalid and is never trusted; the product does not rewrite old blocks, so the operator removes them by hand.
+- **Final fence.** After its last awaited Leader check the route reads one joined projection of the item and its
+  workspace lease, then compares nonce, owner slot, scope revision, generation and the item status the context was
+  built under (`remaining_work_context_status`) before it answers; a recorded-head context also needs a terminal
+  status, no leased workspace and the same verified head. Nothing awaits after that projection. Any difference
+  returns `409 progress_context_unavailable`.
+- **No GitHub write.** The tool and the route write nothing to GitHub. The owner publishes the block, or the
+  system-owned PR comment shows the generated summary.

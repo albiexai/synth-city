@@ -23,7 +23,7 @@ from app.models.github_work_progress import GithubWorkProgressSnapshot
 from app.models.github_work_progress_schemas import (
     GithubPublicationObservation, GithubWorkProgressResponse, GithubWorkRemainingView,
 )
-from mcp_shim.work_remaining_protocol import RemainingReport, ReportContext, parse_report, report_reason
+from mcp_shim.work_remaining_protocol import RemainingReport, ReportContext, parse_report, public_generation, report_reason
 from app.services.github_client import GithubClientResponseError, github_client
 from app.services.github_coordination_service import hold_code
 from app.services.github_work_progress_observation import (
@@ -31,6 +31,7 @@ from app.services.github_work_progress_observation import (
 )
 
 _SHA = re.compile(r"[0-9a-f]{40}")
+_TERMINAL_REPORT_STATUSES = frozenset({"merged", "completed", "closed"})
 _REPO_PART = re.compile(r"[A-Za-z0-9_.-]{1,100}")
 _REF = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,250}")
 _CACHE_SECONDS = 15
@@ -281,7 +282,7 @@ class GithubWorkProgressService:
                             for key, value in started_identity.items()) else None)
         remaining_packet = (matching.observation.get("_remaining_report")
                             if matching and isinstance(matching.observation, dict) else None)
-        private_values = tuple(value for value in (lease, settings.operator_token, settings.github_token) if value)
+        private_values = tuple(value for value in (lease, item.dispatch_nonce, settings.operator_token, settings.github_token) if value)
         if workspace is None or lease is None:
             publication = _historical(matching, "workspace_not_leased")
         elif (matching and matching.identity == workspace_identity
@@ -382,6 +383,8 @@ class GithubWorkProgressService:
             phase, actor, action = ("workspace_wait", "leader",
                 "Reconcile the missing workspace lease before work continues.")
         from app.services.github_ci_watch_service import github_ci_watch_service
+        status_before, head_before = item.dispatch_status, item.last_verified_sha
+        leased_before = final_workspace is not None and bool(final_workspace.lease_token)
         required_checks = await github_ci_watch_service.view(db, item)
         if required_checks and phase in {"ci", "review"} and actor != "operator":
             if required_checks["state"] == "waiting":
@@ -393,17 +396,37 @@ class GithubWorkProgressService:
             else:
                 phase, actor, action = ("ci_finished", "leader",
                     "Required checks finished. Complete the current-head review or correction handoff; merge gates remain.")
+        # The check view above awaited. Take one fresh, coherent item/scope/workspace projection AFTER it, so a
+        # terminal context is never built from facts that changed during that await.
+        if db.in_transaction():
+            await db.rollback()
+        fresh = await self._rows(db, item_id, final=True)
+        if fresh is None:
+            return None
+        item, scope, preset, final_workspace, pending, polled_at = fresh
+        facts_stable = (item.dispatch_status == status_before and item.last_verified_sha == head_before
+                        and (final_workspace is not None and bool(final_workspace.lease_token)) == leased_before)
         check_head = item.last_verified_sha
         if not isinstance(check_head, str) or not _SHA.fullmatch(check_head):
             check_head = None
-        context = None
+        context, basis = None, None
         if (publication.state == "current" and publication.local_sha
                 and publication.local_sha == publication.published_sha
                 and item.dispatch_nonce and item.owner_slot_id
                 and _base_identity(item, scope) == started_identity):
-            context = ReportContext(work_item_id=item_id, dispatch_nonce=item.dispatch_nonce,
+            context = ReportContext(work_item_id=item_id, generation=public_generation(item_id, item.dispatch_nonce),
                 owner_slot_id=item.owner_slot_id, scope_revision=item.active_scope_revision,
                 source_sha=publication.local_sha, phase=phase)
+            basis = "workspace"
+        elif (facts_stable and item.dispatch_status in _TERMINAL_REPORT_STATUSES and final_workspace is None
+                and check_head is not None and item.dispatch_nonce and item.owner_slot_id
+                and _base_identity(item, scope) == started_identity):
+            # A merged or closed item has no workspace to observe, so the local-sha rule above can never hold.
+            # Its report is bound to the recorded verified head instead; every other binding is unchanged.
+            context = ReportContext(work_item_id=item_id, generation=public_generation(item_id, item.dispatch_nonce),
+                owner_slot_id=item.owner_slot_id, scope_revision=item.active_scope_revision,
+                source_sha=check_head, phase=phase)
+            basis = "recorded_head"
         issue_url = (f"https://github.com/{scope.repo_owner}/{scope.repo_name}/issues/{item.issue_number}#work-remaining"
                      if all(_REPO_PART.fullmatch(part or "") and part not in {".", ".."}
                             for part in (scope.repo_owner, scope.repo_name)) else None)
@@ -420,7 +443,8 @@ class GithubWorkProgressService:
             next_poll_expected_at=(_utc(polled_at) + timedelta(
                 seconds=settings.github_dispatch_interval_seconds)) if polled_at else None,
             last_check_head=check_head, publication=publication, required_checks=required_checks,
-            remaining_work=remaining, remaining_work_context=context,
+            remaining_work=remaining, remaining_work_context=context, remaining_work_context_basis=basis,
+            remaining_work_context_status=item.dispatch_status if context is not None else None,
         )
 
 

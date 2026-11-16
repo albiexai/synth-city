@@ -18,7 +18,7 @@ def test_remaining_summary_uses_authenticated_context_and_makes_no_writes(monkey
     import mcp_shim.agent_mail_server as shim
     from mcp_shim.work_remaining_protocol import parse_report
     requests = []
-    context = dict(work_item_id=7, dispatch_nonce="dispatch", owner_slot_id=2,
+    context = dict(work_item_id=7, generation="a" * 64, owner_slot_id=2,
                    scope_revision=0, source_sha="a" * 40, phase="implementation")
     monkeypatch.setattr(shim, "_ensure_registered", lambda: {"ok": True})
     monkeypatch.setitem(shim._state, "member_id", 3)
