@@ -486,7 +486,8 @@ async def finalize_merged_preview(db, item, scope, read_pull):
             "limits": "Read-only evidence. A finalize records the merge and performs no merge, retry, lease or approval."}
 
 
-async def finalize_merged_item(db, item, scope, read_pull, *, expected_context_sha256, operation_id, reason):
+async def finalize_merged_item(db, item, scope, read_pull, *, expected_context_sha256, operation_id, reason,
+                               decided_by="an operator"):
     """Record a merge that the poll cannot settle, from fresh merged-PR evidence and one operator decision.
 
     The PR is read again right before the write and must match the evidence the digest was bound to. It performs
@@ -524,6 +525,6 @@ async def finalize_merged_item(db, item, scope, read_pull, *, expected_context_s
     db.add(GithubMaintenanceEvent(operation_id=operation, work_item_id=item_id,
                                   outcome="merged_item_finalized", request_sha256=request_digest))
     await verification._mark_merged_with_fact(db, item, pull, source="factory_maintenance.finalize_merged_item")
-    item.status_note = "Finalized as merged by an operator: " + audit.sanitize_reason(reason)
+    item.status_note = f"Finalized as merged by {decided_by}: " + audit.sanitize_reason(reason)
     await db.commit()
     return {"status": "finalized", "work_item_id": item_id, **_evidence_now}

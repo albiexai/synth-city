@@ -42,6 +42,9 @@ from app.models.database import (
     MailTeamMember,
     TeamGithubScope,
 )
+from app.services.github_leader_recovery_service import (
+    CancelRevisionRequest, FinalizeMergedLeaderRequest, ReleaseWorkspaceRequest,
+)
 from app.models.schemas import (
     GithubScopeAmendmentCreate, GithubRevisionReviewCreate, GithubRevisionReviewWithdraw,
     GithubSubmittedRevisionEnd, GithubRevisionReviewResponse,
@@ -3882,6 +3885,74 @@ async def settle_github_accepted_revision(item_id: int, request: GithubSubmitted
     except GithubApprovalError as exc:
         await db.rollback()
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+async def _leader_recovery(item_id, session, db, source, run):
+    """One Leader recovery: session identity from the authenticated row, refusals observed like the operator routes."""
+    from app.services.github_leader_recovery_service import LeaderRecoveryError
+    if session is None:
+        raise HTTPException(status_code=401, detail='session_token_required')
+    require_session_slot(session)
+    item = await db.get(GithubWorkItem, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail='work_item_not_found')
+    try:
+        return await run(item)
+    except LeaderRecoveryError as exc:
+        await db.rollback()
+        await _observe_refusal(db, event_kind='leader_recovery', source=source, actor=_session_actor(session),
+            code=exc.code, item_id=item_id)
+        raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+
+
+async def _merged_pull_reader(db, item_id):
+    from app.api.v1.factory_maintenance import read_merged_pull
+    item = await db.get(GithubWorkItem, item_id)
+    scope = await db.get(TeamGithubScope, item.scope_id)
+
+    async def read():
+        return await read_merged_pull(db, scope, item)
+    return read
+
+
+@router.post('/github-work-items/{item_id}/leader-recovery/cancel-revision')
+async def leader_cancel_revision(item_id: int, request: CancelRevisionRequest,
+    session: MailAgentSession | None = Depends(mail_session), db: AsyncSession = Depends(get_db)):
+    from app.services import github_leader_recovery_service as recovery
+    return await _leader_recovery(item_id, session, db, 'agent_teams.leader_cancel_revision',
+        lambda item: recovery.cancel_revision(db, item, session, revision_number=request.revision_number,
+            dispatch_nonce=request.dispatch_nonce, operation_id=request.operation_id, reason=request.reason))
+
+
+@router.post('/github-work-items/{item_id}/leader-recovery/finalize-merged/preview')
+async def leader_finalize_merged_preview(item_id: int,
+    session: MailAgentSession | None = Depends(mail_session), db: AsyncSession = Depends(get_db)):
+    from app.services import github_leader_recovery_service as recovery
+    return await _leader_recovery(item_id, session, db, 'agent_teams.leader_finalize_merged_preview',
+        lambda item: _with_reader(db, item_id, lambda read: recovery.finalize_preview(db, item, session, read_pull=read)))
+
+
+@router.post('/github-work-items/{item_id}/leader-recovery/finalize-merged')
+async def leader_finalize_merged(item_id: int, request: FinalizeMergedLeaderRequest,
+    session: MailAgentSession | None = Depends(mail_session), db: AsyncSession = Depends(get_db)):
+    from app.services import github_leader_recovery_service as recovery
+    return await _leader_recovery(item_id, session, db, 'agent_teams.leader_finalize_merged',
+        lambda item: _with_reader(db, item_id, lambda read: recovery.finalize_merged(db, item, session,
+            read_pull=read, operation_id=request.operation_id,
+            expected_context_sha256=request.expected_context_sha256, reason=request.reason)))
+
+
+@router.post('/github-work-items/{item_id}/leader-recovery/release-workspace')
+async def leader_release_workspace(item_id: int, request: ReleaseWorkspaceRequest,
+    session: MailAgentSession | None = Depends(mail_session), db: AsyncSession = Depends(get_db)):
+    from app.services import github_leader_recovery_service as recovery
+    return await _leader_recovery(item_id, session, db, 'agent_teams.leader_release_workspace',
+        lambda item: recovery.release_workspace(db, item, session, workspace_id=request.workspace_id,
+            expected_leased_at=request.leased_at(), operation_id=request.operation_id, reason=request.reason))
+
+
+async def _with_reader(db, item_id, call):
+    return await call(await _merged_pull_reader(db, item_id))
 
 
 @router.post('/github-work-items/{item_id}/submitted-revision/end', response_model=GithubScopeRevisionResponse)
