@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import pwd
 import re
 from pathlib import Path
 
@@ -12,8 +13,43 @@ _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 _BINARY = re.compile(r"muse-bin-[0-9][0-9A-Za-z.\-]*")
 
 
+_PROC = Path("/proc")
+
+
 def muse_data_dir() -> Path:
+    """The controller's own Muse data directory, for its own config paths."""
     return Path(os.environ.get("MUSE_DATA_DIR", "~/.local/share/muse")).expanduser()
+
+
+def _process_environ(pid: int) -> dict[bytes, bytes]:
+    data = (_PROC / str(pid) / "environ").read_bytes()
+    return dict(entry.split(b"=", 1) for entry in data.split(b"\0") if b"=" in entry)
+
+
+def _owner_home(pid: int) -> Path:
+    return Path(pwd.getpwuid((_PROC / str(pid)).stat().st_uid).pw_dir)
+
+
+def muse_data_dir_for_process(pid: int) -> Path:
+    """The Muse data directory of the observed process, as _codex_home does for Codex.
+
+    A member can run as another OS user than the controller. Use the process's own
+    MUSE_DATA_DIR, XDG_DATA_HOME or HOME when its environment is readable; otherwise
+    the process owner's default. Never the controller's environment or home.
+    """
+    try:
+        environment = _process_environ(pid)
+    except PermissionError:
+        environment = {}
+    for key, suffix in ((b"MUSE_DATA_DIR", ()), (b"XDG_DATA_HOME", ("muse",)),
+                        (b"HOME", (".local", "share", "muse"))):
+        value = environment.get(key)
+        if value:
+            result = Path(os.fsdecode(value))
+            if not result.is_absolute():
+                raise ValueError("Relative Muse data directory")
+            return result.joinpath(*suffix)
+    return _owner_home(pid) / ".local" / "share" / "muse"
 
 
 def muse_config_dir() -> Path:

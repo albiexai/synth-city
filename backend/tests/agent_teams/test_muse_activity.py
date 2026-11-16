@@ -54,7 +54,8 @@ def test_discovery_uses_this_process_lock_only(tmp_path, monkeypatch):
         (folder / ".session.lock").write_text("")
         text = (FIX / "turn_completed.jsonl").read_text()
         (folder / "session.jsonl").write_text(text.replace(SID, sid))
-    monkeypatch.setenv("MUSE_DATA_DIR", str(tmp_path))
+    import app.services.providers.muse_cli as cli
+    monkeypatch.setattr(cli, "_process_environ", lambda pid: {b"MUSE_DATA_DIR": str(tmp_path).encode()})
     fds = tmp_path / "fd"
     fds.mkdir()
     (fds / "7").symlink_to(sessions / SID / ".session.lock")
@@ -161,3 +162,128 @@ def test_an_out_of_range_timestamp_is_invalid_not_an_error():
     lines[-1] = (json.dumps(row) + "\n").encode()
     with pytest.raises(ValueError):
         muse_state_from_lines(lines, SID, CWD, NOW, START)
+
+
+# #746: a Muse member can run as another OS user than the controller. Its sessions root
+# comes from the observed process, never from the controller's own environment or home.
+def _owner(monkeypatch, tmp_path, environ=None):
+    import app.services.providers.muse_cli as cli
+    owner_home = tmp_path / "agent-home"
+    monkeypatch.setenv("MUSE_DATA_DIR", str(tmp_path / "controller-muse"))
+    monkeypatch.setenv("HOME", str(tmp_path / "controller-home"))
+    monkeypatch.setattr(cli, "_owner_home", lambda pid: owner_home)
+
+    def read(pid):
+        if environ is None:
+            raise PermissionError("another user's environ")
+        return environ
+    monkeypatch.setattr(cli, "_process_environ", read)
+    return cli, owner_home
+
+
+def test_the_root_is_the_process_owners_default_when_its_environ_is_unreadable(tmp_path, monkeypatch):
+    cli, owner_home = _owner(monkeypatch, tmp_path)
+    assert cli.muse_data_dir_for_process(4100) == owner_home / ".local" / "share" / "muse"
+
+
+@pytest.mark.parametrize("environ,expected", [
+    ({b"MUSE_DATA_DIR": b"/srv/agent/muse", b"XDG_DATA_HOME": b"/srv/xdg", b"HOME": b"/srv/home"}, "/srv/agent/muse"),
+    ({b"XDG_DATA_HOME": b"/srv/xdg", b"HOME": b"/srv/home"}, "/srv/xdg/muse"),
+    ({b"HOME": b"/srv/home"}, "/srv/home/.local/share/muse"),
+])
+def test_the_root_honours_the_processs_own_environment(tmp_path, monkeypatch, environ, expected):
+    cli, _owner_home = _owner(monkeypatch, tmp_path, environ)
+    assert cli.muse_data_dir_for_process(4100) == Path(expected)
+
+
+def test_an_environ_without_any_root_falls_back_to_the_owners_home(tmp_path, monkeypatch):
+    cli, owner_home = _owner(monkeypatch, tmp_path, {b"PATH": b"/usr/bin"})
+    assert cli.muse_data_dir_for_process(4100) == owner_home / ".local" / "share" / "muse"
+
+
+@pytest.mark.parametrize("key", [b"MUSE_DATA_DIR", b"XDG_DATA_HOME", b"HOME"])
+def test_a_relative_process_root_is_refused(tmp_path, monkeypatch, key):
+    cli, _owner_home = _owner(monkeypatch, tmp_path, {key: b"relative/dir"})
+    with pytest.raises(ValueError):
+        cli.muse_data_dir_for_process(4100)
+
+
+def test_discovery_reads_the_process_owners_sessions_not_the_controllers(tmp_path, monkeypatch):
+    import app.services.muse_activity_service as m
+    _cli, owner_home = _owner(monkeypatch, tmp_path)
+    root = owner_home / ".local" / "share" / "muse"
+    folder = root / "sessions" / "2026" / "10" / "14" / SID
+    folder.mkdir(parents=True)
+    (folder / ".session.lock").write_text("")
+    (folder / "session.jsonl").write_text((FIX / "turn_completed.jsonl").read_text())
+    fds = tmp_path / "fd"
+    fds.mkdir()
+    (fds / "7").symlink_to(folder / ".session.lock")
+    monkeypatch.setattr(m, "_process_fd_dir", lambda pid: fds)
+    assert discover_muse_session(4100, CWD) == SID
+
+
+def test_a_lock_under_the_controllers_root_is_not_this_processs_session(tmp_path, monkeypatch):
+    import app.services.muse_activity_service as m
+    _owner(monkeypatch, tmp_path)
+    folder = tmp_path / "controller-muse" / "sessions" / "2026" / "10" / "14" / SID
+    folder.mkdir(parents=True)
+    (folder / ".session.lock").write_text("")
+    (folder / "session.jsonl").write_text((FIX / "turn_completed.jsonl").read_text())
+    fds = tmp_path / "fd"
+    fds.mkdir()
+    (fds / "7").symlink_to(folder / ".session.lock")
+    monkeypatch.setattr(m, "_process_fd_dir", lambda pid: fds)
+    assert discover_muse_session(4100, CWD) is None
+
+
+def _observable(tmp_path, monkeypatch):
+    import app.services.muse_activity_service as m
+    _cli, owner_home = _owner(monkeypatch, tmp_path)
+    sessions = owner_home / ".local" / "share" / "muse" / "sessions"
+    folder = sessions / "2026" / "10" / "14" / SID
+    folder.mkdir(parents=True)
+    (folder / "session.jsonl").write_text((FIX / "turn_completed.jsonl").read_text())
+    monkeypatch.setattr(m, "_identity", lambda pid, session_id, cwd: True)
+    return m, sessions, folder
+
+
+def test_observation_reads_the_owners_log(tmp_path, monkeypatch):
+    import os
+    m, _sessions, _folder = _observable(tmp_path, monkeypatch)
+    monkeypatch.setattr(m, "_process_uid", lambda pid: os.getuid())
+    assert m.observe_muse(4100, SID, CWD, NOW, START)[:2] == ("idle", "native_turn_completed")
+
+
+@pytest.mark.skipif(__import__("os").geteuid() == 0, reason="root reads every mode")
+@pytest.mark.parametrize("blocked", ["sessions", "day", "file"])
+def test_an_unreadable_log_is_reported_as_unreadable(tmp_path, monkeypatch, blocked):
+    import os
+    m, sessions, folder = _observable(tmp_path, monkeypatch)
+    monkeypatch.setattr(m, "_process_uid", lambda pid: os.getuid())
+    target = {"sessions": sessions, "day": folder.parent, "file": folder / "session.jsonl"}[blocked]
+    target.chmod(0)
+    try:
+        assert m.observe_muse(4100, SID, CWD, NOW, START)[:2] == ("unknown", "native_log_unreadable")
+    finally:
+        target.chmod(0o700)
+
+
+def test_a_missing_log_is_still_unavailable(tmp_path, monkeypatch):
+    import os
+    m, _sessions, folder = _observable(tmp_path, monkeypatch)
+    monkeypatch.setattr(m, "_process_uid", lambda pid: os.getuid())
+    (folder / "session.jsonl").unlink()
+    folder.rmdir()
+    assert m.observe_muse(4100, SID, CWD, NOW, START)[:2] == ("unknown", "native_log_unavailable")
+
+
+def test_the_guard_keeps_its_explicit_root(tmp_path, monkeypatch):
+    # The supervisor guard is configured with its own muse_sessions_root; the per-process root does not reach it.
+    supervisor = (Path(__file__).resolve().parents[3] / "scripts" / "product-factory" / "team-supervisor").read_text()
+    assert "muse_sessions_root" in supervisor and "muse_data_dir_for_process" not in supervisor
+
+
+def test_an_unreadable_log_is_an_observation_gap_like_an_unavailable_one():
+    from app.services.owner_observation_pause import _GAPS
+    assert {"native_log_unavailable", "native_log_unreadable"} <= _GAPS

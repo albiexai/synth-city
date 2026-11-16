@@ -16,7 +16,7 @@ from pathlib import Path
 import re
 import stat
 
-from app.services.providers.muse_cli import is_muse_command, muse_data_dir
+from app.services.providers.muse_cli import is_muse_command, muse_data_dir_for_process
 
 _TAIL_BYTES = 1_048_576
 _HEAD_BYTES = 262_144
@@ -34,8 +34,12 @@ def _cmdline(pid: int) -> list[str]:
     return [os.fsdecode(part) for part in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if part]
 
 
-def _sessions_root() -> Path:
-    return (muse_data_dir() / "sessions").resolve()
+def _sessions_root(pid: int) -> Path:
+    return (muse_data_dir_for_process(pid) / "sessions").resolve()
+
+
+def _process_uid(pid: int) -> int:
+    return Path(f"/proc/{pid}").stat().st_uid
 
 
 def _timestamp(value: object) -> datetime:
@@ -173,14 +177,38 @@ def _is_binding_record(line: bytes) -> bool:
     return isinstance(row, dict) and row.get("payload_type") in _BINDING_RECORDS
 
 
-def _session_path(session_id: str) -> Path | None:
-    matches = list(_sessions_root().glob(f"*/*/*/{session_id}/session.jsonl"))
+def _session_path(root: Path, session_id: str) -> Path | None:
+    """Find the one session log. An unreadable level raises PermissionError.
+
+    Path.glob silently skips directories it cannot read, which would report an
+    unreadable log as a missing one, so each level is listed explicitly.
+    """
+    matches = []
+    try:
+        years = list(os.scandir(root))
+    except FileNotFoundError:
+        return None
+    for year in years:
+        if not year.is_dir(follow_symlinks=False):
+            continue
+        for month in os.scandir(year.path):
+            if not month.is_dir(follow_symlinks=False):
+                continue
+            for day in os.scandir(month.path):
+                if not day.is_dir(follow_symlinks=False):
+                    continue
+                path = Path(day.path) / session_id / "session.jsonl"
+                try:
+                    os.stat(path, follow_symlinks=False)
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                matches.append(path)
     return matches[0] if len(matches) == 1 else None
 
 
 def discover_muse_session(pid: int, cwd: str) -> str | None:
     """Find the one session whose lock this exact process holds."""
-    root = _sessions_root()
+    root = _sessions_root(pid)
     found = set()
     with os.scandir(_process_fd_dir(pid)) as entries:
         for index, entry in enumerate(entries):
@@ -225,10 +253,14 @@ def observe_muse(pid: int, session_id: str, cwd: str, now: datetime,
                  started_at: datetime, *, provenance: dict | None = None):
     if not _UUID.fullmatch(session_id) or not _identity(pid, session_id, cwd):
         return "unknown", "session_mismatch", None
-    path = _session_path(session_id)
-    if path is None:
-        return "unknown", "native_log_unavailable", None
-    lines, _offset, failure = _read_lines(path, Path(f"/proc/{pid}").stat().st_uid)
+    try:
+        path = _session_path(_sessions_root(pid), session_id)
+        if path is None:
+            return "unknown", "native_log_unavailable", None
+        lines, _offset, failure = _read_lines(path, _process_uid(pid))
+    except PermissionError:
+        # The controller cannot read this member's log: see the cross-user install notes.
+        return "unknown", "native_log_unreadable", None
     if failure or lines is None:
         return "unknown", failure or "observation_unavailable", None
     state, reason, observed_at, details = muse_state_from_lines(lines, session_id, cwd, now, started_at)
