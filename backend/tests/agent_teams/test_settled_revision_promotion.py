@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from sqlalchemy import delete as _delete
+from sqlalchemy import select as _select
 from sqlalchemy import update
 
 from app.config import settings
@@ -393,7 +395,8 @@ async def test_the_boundary_judges_a_revision_row_by_its_status_in_every_phase(d
     await db.execute(_update(GithubAttemptScopeRevision).where(GithubAttemptScopeRevision.id == case.revision.id)
                      .values(phase=phase, status=status, completed_at=SETTLED_AT if completed else None))
     await db.commit()
-    note = await service._settled_context_note(db, case.scope, case.item, head)
+    expected = await service._settled_snapshot(db, case.scope, case.item)
+    note = await service._settled_context_note(db, case.scope, case.item, head, expected)
     assert (note is not None) == blocked, note
 
 
@@ -403,7 +406,9 @@ async def test_an_item_with_no_revision_row_is_not_judged_by_the_boundary(db):
     await db.execute(_update(GithubWorkItem).where(GithubWorkItem.id == case.item.id).values(active_scope_revision=0))
     await db.commit()
     await db.refresh(case.item)
-    assert await service._settled_context_note(db, case.scope, case.item, HEAD) is None
+    expected = await service._settled_snapshot(db, case.scope, case.item)
+    assert expected is None
+    assert await service._settled_context_note(db, case.scope, case.item, HEAD, expected) is None
 
 
 @pytest.mark.asyncio
@@ -473,3 +478,94 @@ async def test_the_policy_claim_holds_the_writer_across_the_fresh_pr_read(twin):
     case.client.get_pull = probing
     await case.tick()
     assert outcome["calls"] >= 2 and outcome["blocked"] is True
+
+
+# --- V1 review 5914463958: an operation that began on a settled revision keeps the identity it began with ------
+
+
+def _changed(value, column=None):
+    """A different value of the same kind, for any revision column (a null takes its column type)."""
+    if value is None and column is not None:
+        kind = column.type.python_type
+        return {datetime: SETTLED_AT, int: 7, str: "changed", dict: {"changed": True}, list: ["changed"]}[kind]
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, int):
+        return value + 7
+    if isinstance(value, str):
+        return value + "x"
+    if isinstance(value, datetime):
+        return value.replace(year=value.year + 1)
+    if isinstance(value, list):
+        return [*value, "changed"]
+    if isinstance(value, dict):
+        return {**value, "changed": True}
+    return "changed"
+
+
+async def _change_during_check_read(case, maker, values, call_number=2):
+    revision_id = case.revision.id
+    original, state = case.client.list_check_runs_for_ref, {"calls": 0}
+
+    async def racing(owner, repo, ref):
+        state["calls"] += 1
+        if state["calls"] == call_number:
+            async with maker() as other:
+                await other.execute(_update(GithubAttemptScopeRevision)
+                                    .where(GithubAttemptScopeRevision.id == revision_id).values(**values))
+                await other.commit()
+        return await original(owner, repo, ref)
+
+    case.client.list_check_runs_for_ref = racing
+    return state
+
+
+@pytest.mark.asyncio
+async def test_a_revision_turned_diagnostic_with_another_head_during_the_read_does_not_merge(twin):
+    """V1's retained case: phase and submitted head change, status and completion time stay as they were."""
+    db, maker = twin
+    case = await settled_case(db)
+    state = await _change_during_check_read(case, maker, {"phase": "diagnostic", "submitted_head_sha": OTHER})
+    await case.tick()
+    assert state["calls"] >= 2
+    assert case.client.merge_calls == 0 and case.item.dispatch_status != "merged"
+
+
+_REVISION_COLUMNS = [column.name for column in GithubAttemptScopeRevision.__table__.columns if column.name != "id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("column", _REVISION_COLUMNS)
+async def test_a_change_to_any_revision_column_during_the_read_does_not_merge(twin, column):
+    db, maker = twin
+    case = await settled_case(db)
+    row = (await db.execute(_select(GithubAttemptScopeRevision.__table__)
+                            .where(GithubAttemptScopeRevision.id == case.revision.id))).mappings().one()
+    state = await _change_during_check_read(case, maker, {column: _changed(row[column], GithubAttemptScopeRevision.__table__.c[column])})
+    await case.tick()
+    assert state["calls"] >= 2
+    assert case.client.merge_calls == 0 and case.item.dispatch_status != "merged"
+
+
+@pytest.mark.asyncio
+async def test_an_operation_that_began_on_a_settled_diagnostic_is_not_blocked_by_its_phase(db):
+    case = await settled_case(db)
+    await db.execute(_update(GithubAttemptScopeRevision).where(GithubAttemptScopeRevision.id == case.revision.id)
+                     .values(phase="diagnostic", submitted_head_sha=OTHER))
+    await db.commit()
+    expected = await service._settled_snapshot(db, case.scope, case.item)
+    assert expected is not None
+    assert await service._settled_context_note(db, case.scope, case.item, HEAD, expected) is None
+    await db.execute(_update(GithubAttemptScopeRevision).where(GithubAttemptScopeRevision.id == case.revision.id)
+                     .values(phase="implementation"))
+    await db.commit()
+    assert await service._settled_context_note(db, case.scope, case.item, HEAD, expected) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_revision_row_deleted_during_the_operation_blocks_the_merge(db):
+    case = await settled_case(db)
+    expected = await service._settled_snapshot(db, case.scope, case.item)
+    await db.execute(_delete(GithubAttemptScopeRevision).where(GithubAttemptScopeRevision.id == case.revision.id))
+    await db.commit()
+    assert await service._settled_context_note(db, case.scope, case.item, HEAD, expected) is not None

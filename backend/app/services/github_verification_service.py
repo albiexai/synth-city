@@ -1764,30 +1764,46 @@ class GithubVerificationService:
         await db.commit()
 
     @staticmethod
-    async def _settled_context_note(db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem,
-                                    head: str) -> str | None:
-        """Why a merge must not go ahead because the settlement or the scope it rested on was withdrawn, or ``None``.
+    async def _settled_snapshot(db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem) -> dict | None:
+        """The settled revision row, every column, and the scope's enabled flag as they stand now, or ``None``.
 
-        Read fresh, column by column, so a change another connection committed while GitHub was awaited is seen.
-        Only an item that has a scoped revision row is judged, whatever its phase: the revision must still be
-        completed with its completion time, an implementation revision must carry the very head being merged, and
-        the scope must still be enabled.
+        Taken before any awaited read of an operation, so the operation keeps the identity it began with. Only an
+        item that has a scoped revision row has one; read as plain columns, never through the identity map.
         """
         if not item.active_scope_revision:
             return None
         row = (await db.execute(
-            select(GithubAttemptScopeRevision.status, GithubAttemptScopeRevision.completed_at,
-                   GithubAttemptScopeRevision.submitted_head_sha, GithubAttemptScopeRevision.phase)
-            .where(GithubAttemptScopeRevision.work_item_id == item.id,
-                   GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce,
-                   GithubAttemptScopeRevision.revision == item.active_scope_revision)
-        )).first()
+            select(GithubAttemptScopeRevision.__table__).where(
+                GithubAttemptScopeRevision.work_item_id == item.id,
+                GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce,
+                GithubAttemptScopeRevision.revision == item.active_scope_revision)
+        )).mappings().first()
         if row is None:
             return None
         enabled = await db.scalar(select(TeamGithubScope.enabled).where(TeamGithubScope.id == scope.id))
-        # A settled diagnostic restores the baseline, so only an implementation row must carry the merged head.
-        if (row.status != "completed" or row.completed_at is None or enabled is not True
-                or (row.phase == "implementation" and row.submitted_head_sha != head)):
+        return {"row": dict(row), "enabled": enabled}
+
+    @staticmethod
+    async def _settled_context_note(db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem,
+                                    head: str, expected: dict | None) -> str | None:
+        """Why a merge must not go ahead because the settlement or the scope it rested on changed, or ``None``.
+
+        ``expected`` is the snapshot the operation began with. The row is read again, fresh and column by column,
+        so a change another connection committed while GitHub was awaited is seen: any column that differs from the
+        snapshot blocks, so no changed field can slip through. The row must also still be completed with its
+        completion time, an implementation row must carry the very head being merged (a row that began as a settled
+        diagnostic restored the baseline and is not compared with the head), and the scope must still be enabled.
+        """
+        if expected is None:
+            return None
+        began = expected["row"]
+        row = (await db.execute(
+            select(GithubAttemptScopeRevision.__table__).where(GithubAttemptScopeRevision.id == began["id"])
+        )).mappings().first()
+        enabled = await db.scalar(select(TeamGithubScope.enabled).where(TeamGithubScope.id == scope.id))
+        if (row is None or dict(row) != began or enabled is not True or enabled != expected["enabled"]
+                or row["status"] != "completed" or row["completed_at"] is None
+                or (began["phase"] == "implementation" and row["submitted_head_sha"] != head)):
             return ("Auto-merge blocked: the settled revision or the scope changed since promotion; "
                     "verifying the current state.")
         return None
@@ -2614,6 +2630,8 @@ class GithubVerificationService:
         client: GithubClient,
         pull: dict | None = None,
     ) -> None:
+        # Before any awaited read: the merge boundary compares the settled revision with this, not with its state then.
+        settled_began = await self._settled_snapshot(db, scope, item)
         ci_context = await github_ci_watch_service.capture(db, scope, item)
         pull = pull or await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
         if not await self._validate_polled_pull_identity(
@@ -2840,7 +2858,7 @@ class GithubVerificationService:
                 db, item, "Auto-merge blocked: distinct current-round leader approval is "
                 f"required ({approval_reason}).")
             return
-        withdrawn = await self._settled_context_note(db, scope, item, current_head)
+        withdrawn = await self._settled_context_note(db, scope, item, current_head, settled_began)
         if withdrawn is not None:
             await self._record_readiness_hold(db, item, withdrawn)
             return
