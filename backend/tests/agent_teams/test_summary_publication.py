@@ -147,35 +147,51 @@ class FakeGithub:
         self.comments: dict[int, dict] = {}
         self.next_id = 1000
         self.calls: list[tuple] = []
+        self.tokens: list = []
         self.fail_write = False
         self.checks = [{"name": "ci", "status": "completed", "conclusion": "success", "head_sha": HEAD,
                         "app": {"slug": "github-actions"}}]
 
+    def _seen(self, token):
+        self.tokens.append(token)
+
+    @staticmethod
+    def _issue_url(number):
+        return f"https://api.github.com/repos/o/r/issues/{number}"
+
     async def get_pull(self, owner, repo, number, *, token=None):
+        self._seen(token)
         self.calls.append(("get_pull", number))
         return dict(self.pull)
 
     async def list_check_runs_for_ref(self, owner, repo, ref, *, token=None):
+        self._seen(token)
         self.calls.append(("checks", ref))
         return list(self.checks)
 
-    async def list_issue_comments(self, owner, repo, number):
+    async def list_issue_comments(self, owner, repo, number, *, token=None):
+        self._seen(token)
         self.calls.append(("list_comments", number))
-        return [dict(comment) for comment in self.comments.values()]
+        return [dict(comment) for comment in self.comments.values()
+                if comment.get("issue_url", self._issue_url(number)).endswith(f"/issues/{number}")]
 
-    async def get_issue_comment(self, owner, repo, comment_id):
+    async def get_issue_comment(self, owner, repo, comment_id, *, token=None):
+        self._seen(token)
         self.calls.append(("get_comment", comment_id))
         return dict(self.comments[comment_id]) if comment_id in self.comments else None
 
-    async def create_issue_comment(self, owner, repo, number, body):
+    async def create_issue_comment(self, owner, repo, number, body, *, token=None):
+        self._seen(token)
         self.calls.append(("create_comment", number))
         if self.fail_write:
             raise RuntimeError("write refused")
         self.next_id += 1
-        self.comments[self.next_id] = {"id": self.next_id, "body": body, "user": {"login": BOT}}
+        self.comments[self.next_id] = {"id": self.next_id, "body": body, "user": {"login": BOT},
+                                       "issue_url": self._issue_url(number)}
         return dict(self.comments[self.next_id])
 
-    async def update_issue_comment(self, owner, repo, comment_id, body):
+    async def update_issue_comment(self, owner, repo, comment_id, body, *, token=None):
+        self._seen(token)
         self.calls.append(("update_comment", comment_id))
         if self.fail_write:
             raise RuntimeError("write refused")
@@ -198,6 +214,7 @@ async def fx(tmp_path, monkeypatch):
     async with maker() as db:
         item, members, _tokens = await _dispatch_approval_fixture(db)
         scope = await db.get(TeamGithubScope, item.scope_id)
+        scope.repo_name = "r"  # the fake GitHub, the canonical links and the comments all name o/r
         scope.review_hold_label = "synth-city-v42-review-hold"
         scope.delivery_policy = {"required_checks": [{"name": "ci", "app_slug": "github-actions"}],
                                  "broad_checks": "hosted"}
@@ -446,10 +463,10 @@ async def test_the_status_commit_is_written_before_the_comment_in_the_scope_pass
     client = FakeGithub()
     original = client.create_issue_comment
 
-    async def spying(owner, repo, number, body):
+    async def spying(owner, repo, number, body, *, token=None):
         async with fx.maker() as db:
             order.append(("write", (await db.get(GithubWorkItem, fx.item_id)).dispatch_status))
-        return await original(owner, repo, number, body)
+        return await original(owner, repo, number, body, token=token)
 
     client.create_issue_comment = spying
     async with fx.maker() as db:
@@ -611,7 +628,8 @@ async def test_the_verification_poll_runs_the_summary_pass_last_and_a_failure_ne
 @pytest.mark.asyncio
 async def test_a_comment_by_the_bot_without_the_marker_is_never_adopted_or_edited(fx):
     client = FakeGithub()
-    client.comments[1] = {"id": 1, "body": "a bot note without the marker", "user": {"login": BOT}}
+    client.comments[1] = {"id": 1, "body": "a bot note without the marker", "user": {"login": BOT},
+                          "issue_url": "https://api.github.com/repos/o/r/issues/12"}
     await _publish(fx, client)
     assert client.comments[1]["body"] == "a bot note without the marker" and len(client.comments) == 2
 
@@ -654,4 +672,247 @@ async def test_a_merged_item_already_published_as_merged_is_not_touched_again_by
         assert len(client.writes()) == 1
         client.calls.clear()
         await service.publish_scope(db, scope, client)
+    assert client.calls == []
+
+
+# --- V1 review 5917176293: the five findings --------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence", [
+    "https://github.com/o/r/pull/12#pullrequestreview-77?access_token=opaquevalue",
+    "https://github.com/o/r/pull/12?access_token=opaquevalue#pullrequestreview-77",
+    "https://user:password@github.com/o/r/pull/12#pullrequestreview-77",
+    "https://github.com/o/r/pull/12%23pullrequestreview-77",
+    "https://github.com/o/r/pull/12#pullrequestreview-77&x_api_key=opaquevalue",
+    "https://evil.example/o/r/pull/12#pullrequestreview-77",
+    "https://github.com/o/r/pull/13#pullrequestreview-77",
+    "https://github.com/other/r/pull/12#pullrequestreview-77",
+    "https://github.com/o/r/pull/12#pullrequestreview-77/extra",
+    "http://github.com/o/r/pull/12#pullrequestreview-77",
+])
+async def test_a_noncanonical_or_credential_bearing_evidence_link_is_withheld_never_published(fx, evidence):
+    async with fx.maker() as db:
+        await db.execute(update(GithubHeadReview).where(GithubHeadReview.work_item_id == fx.item_id)
+                         .values(evidence_url=evidence))
+        await db.commit()
+    client = FakeGithub()
+    assert await _publish(fx, client) == "created"
+    body = next(iter(client.comments.values()))["body"]
+    assert "- **Head review:** accepted at this exact head (evidence link withheld)." in body
+    for piece in ("opaquevalue", "password", "evil.example", "access_token", "api_key", "%23", "/extra"):
+        assert piece not in body
+
+
+def test_the_guard_recognises_a_credential_name_after_an_underscore_or_hyphen_but_not_inside_a_word():
+    for text in ("access_token=abc", "x-api-token: abc", "client_secret=abc", "?key_password=abc"):
+        with pytest.raises(module.SummaryRenderError):
+            render_comment(facts(pull_url=f"https://github.com/o/r/pull/12?{text}"))
+    render_comment(facts(base="release/v4.2"))  # 'release' contains 'lease': allowed
+
+
+@pytest.mark.asyncio
+async def test_the_pull_url_and_merge_sha_come_from_the_repository_and_number_not_from_a_response_field(fx):
+    client = FakeGithub(html_url="https://evil.example/steal?access_token=zzz", merged=True, state="closed",
+                        merge_commit_sha="not-a-sha")
+    async with fx.maker() as db:
+        await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == fx.item_id).values(dispatch_status="merged"))
+        await db.commit()
+    await _publish(fx, client)
+    body = next(iter(client.comments.values()))["body"]
+    assert "https://github.com/o/r/pull/12 into" in body and "evil.example" not in body and "not-a-sha" not in body
+
+
+@pytest.mark.asyncio
+async def test_an_app_mode_scope_passes_its_pull_request_token_to_every_read_and_write(fx, monkeypatch):
+    from app.services.github_approval_service import github_approval_service
+
+    seen = []
+
+    async def mint(scope):
+        seen.append(scope.id)
+        return "app-token-value"
+
+    monkeypatch.setattr(github_approval_service, "github_read_token", mint)
+    client = FakeGithub()
+    assert await _publish(fx, client) == "created"
+    assert seen and set(client.tokens) == {"app-token-value"}, client.tokens
+    async with fx.maker() as db:
+        scope = await db.get(TeamGithubScope, fx.scope_id)
+        await service.render(db, scope, 12, client)
+    assert set(client.tokens) == {"app-token-value"}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_token_mint_is_unavailable_never_a_fallback_and_never_a_raise(fx, monkeypatch):
+    from app.services.github_approval_service import github_approval_service
+
+    async def broken(scope):
+        raise RuntimeError("mint failed")
+
+    monkeypatch.setattr(github_approval_service, "github_read_token", broken)
+    client = FakeGithub()
+    assert await _publish(fx, client) == "unavailable"
+    assert client.calls == [] and client.comments == {}
+    async with fx.maker() as db:
+        scope = await db.get(TeamGithubScope, fx.scope_id)
+        assert await service.publish_pull(db, scope, 77, client) == "unavailable"
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_the_real_client_sends_the_authorization_header_on_the_comment_get_and_post(fx, monkeypatch):
+    import httpx
+
+    from app.services.github_approval_service import github_approval_service
+
+    async def mint(scope):
+        return "app-token-value"
+
+    monkeypatch.setattr(github_approval_service, "github_read_token", mint)
+    seen = []
+
+    def api(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, request.headers.get("authorization")))
+        path = request.url.path
+        if path == "/repos/o/r/pulls/12":
+            return httpx.Response(200, json={"number": 12, "state": "open", "draft": False, "merged": False,
+                                             "base": {"ref": "release/v4.2"}, "head": {"sha": HEAD}, "labels": []})
+        if path.startswith("/repos/o/r/commits/") or path.endswith("/check-runs"):
+            return httpx.Response(200, json={"check_runs": []})
+        if request.method == "GET" and path.endswith("/comments"):
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and path.endswith("/comments"):
+            return httpx.Response(201, json={"id": 5, "body": "x", "user": {"login": BOT},
+                                             "issue_url": "https://api.github.com/repos/o/r/issues/12"})
+        return httpx.Response(200, json={})
+
+    async def no_checks(owner, repo, ref, *, token=None):  # check observation has its own multi-call tests
+        return []
+
+    async with httpx.AsyncClient(base_url="https://api.github.com", transport=httpx.MockTransport(api)) as http:
+        real = GithubClient(http=http, token=None)
+        real.list_check_runs_for_ref = no_checks
+        assert await _publish(fx, real) == "created"
+    comment_calls = [row for row in seen if row[1].endswith("/comments")]
+    assert comment_calls and all(row[2] == "Bearer app-token-value" for row in seen), seen
+
+
+async def _age_the_publication(fx, minutes):
+    from datetime import datetime, timedelta
+
+    async with fx.maker() as db:
+        await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == fx.item_id).values(
+            summary_published_at=datetime.utcnow() - timedelta(minutes=minutes)))
+        await db.commit()
+
+
+async def _scope_pass(fx, client):
+    async with fx.maker() as db:
+        scope = await db.get(TeamGithubScope, fx.scope_id)
+        await service.publish_scope(db, scope, client)
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_publication_is_not_re_read_by_the_scope_pass_within_five_minutes(fx):
+    client = FakeGithub()
+    await _scope_pass(fx, client)
+    client.calls.clear()
+    await _scope_pass(fx, client)
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["review_withdrawn", "hold_added", "check_failed"])
+async def test_the_scope_pass_refreshes_same_head_facts_after_the_throttle(fx, change):
+    client = FakeGithub()
+    await _scope_pass(fx, client)
+    comment = next(iter(client.comments.values()))
+    assert "accepted at this exact head" in comment["body"]
+    async with fx.maker() as db:
+        if change == "review_withdrawn":
+            await db.execute(update(GithubHeadReview).where(GithubHeadReview.work_item_id == fx.item_id)
+                             .values(status="ended"))
+        await db.commit()
+    if change == "hold_added":
+        client.pull["labels"] = [{"name": "synth-city-v42-review-hold"}]
+    if change == "check_failed":
+        client.checks = [dict(row, conclusion="failure") for row in client.checks]
+    await _age_the_publication(fx, 6)
+    await _scope_pass(fx, client)
+    body = next(iter(client.comments.values()))["body"]
+    assert {"review_withdrawn": "none recorded for this head", "hold_added": "hold label:** present",
+            "check_failed": "ci: failure"}[change] in body
+    assert len(client.comments) == 1
+
+
+@pytest.mark.asyncio
+async def test_unchanged_facts_after_the_throttle_write_nothing(fx):
+    client = FakeGithub()
+    await _scope_pass(fx, client)
+    await _age_the_publication(fx, 6)
+    client.calls.clear()
+    await _scope_pass(fx, client)
+    assert client.writes() == []
+
+
+@pytest.mark.asyncio
+async def test_a_retained_comment_id_of_another_pull_is_never_edited_and_the_current_pull_gets_its_own(fx):
+    client = FakeGithub()
+    await _publish(fx, client)
+    first_id = next(iter(client.comments))
+    first_body = client.comments[first_id]["body"]
+    async with fx.maker() as db:
+        await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == fx.item_id).values(pr_number=13))
+        await db.commit()
+    client.pull["number"] = 13
+    client.pull["html_url"] = "https://github.com/o/r/pull/13"
+    assert await _publish(fx, client) == "created"
+    assert client.comments[first_id]["body"] == first_body
+    other = [c for cid, c in client.comments.items() if cid != first_id]
+    assert len(other) == 1 and other[0]["issue_url"].endswith("/issues/13")
+    assert "pull/13" in other[0]["body"]
+
+
+@pytest.mark.asyncio
+async def test_a_comment_whose_issue_url_names_another_repository_is_not_adopted(fx):
+    client = FakeGithub()
+    client.comments[1] = {"id": 1, "body": MARKER_COMMENT, "user": {"login": BOT},
+                          "issue_url": "https://api.github.com/repos/other/repo/issues/12"}
+    await _publish(fx, client)
+    assert client.comments[1]["body"] == MARKER_COMMENT and len(client.comments) == 2
+
+
+MARKER_COMMENT = "<!-- deck:summary-comment -->\nanother repository's"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["head", "closed"])
+async def test_a_standalone_pull_is_rechecked_right_before_the_write(fx, change):
+    client = FakeGithub(number=77)
+    original = client.list_issue_comments
+
+    async def moving(owner, repo, number, *, token=None):
+        rows = await original(owner, repo, number, token=token)
+        if change == "head":
+            client.pull["head"] = {"sha": OTHER}
+        else:
+            client.pull["state"] = "closed"
+        return rows
+
+    client.list_issue_comments = moving
+    async with fx.maker() as db:
+        scope = await db.get(TeamGithubScope, fx.scope_id)
+        assert await service.publish_pull(db, scope, 77, client) == "skipped"
+    assert client.writes() == []
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_re_read_restarts_the_throttle_so_the_next_pass_makes_no_github_call(fx):
+    client = FakeGithub()
+    await _scope_pass(fx, client)
+    await _age_the_publication(fx, 6)
+    await _scope_pass(fx, client)  # re-read, nothing changed, nothing written
+    client.calls.clear()
+    await _scope_pass(fx, client)
     assert client.calls == []

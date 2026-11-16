@@ -10,7 +10,7 @@ from app.models.database import GithubWorkItem, MailAgentSession, TeamGithubScop
 from app.models.github_work_progress_schemas import GithubWorkProgressResponse
 from app.services.github_client import github_client
 from app.services.github_coordination_service import CoordinationError, github_coordination_service
-from app.services.github_summary_publication_service import github_summary_publication_service
+from app.services.github_summary_publication_service import SummaryUnavailable, github_summary_publication_service
 from app.services.github_work_progress_service import github_work_progress_service
 
 router = APIRouter()
@@ -76,7 +76,10 @@ async def render_pull_summary(scope_id: int, pull_number: int,
                               db: AsyncSession = Depends(get_db)):
     """Render the generated review and remaining-work blocks for a pull request. This GET writes nothing."""
     scope = await _leader_scope(db, scope_id, principal)
-    return await github_summary_publication_service.render(db, scope, pull_number, github_client)
+    try:
+        return await github_summary_publication_service.render(db, scope, pull_number, github_client)
+    except SummaryUnavailable as error:
+        raise HTTPException(status_code=502, detail="summary_unavailable") from error
 
 
 @router.post("/github-pull-summaries/{scope_id}/{pull_number}/publish")
