@@ -6,9 +6,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.deps import require_mail_session
 from app.database import get_db
-from app.models.database import GithubWorkItem, MailAgentSession
+from app.models.database import GithubWorkItem, MailAgentSession, TeamGithubScope
 from app.models.github_work_progress_schemas import GithubWorkProgressResponse
+from app.services.github_client import github_client
 from app.services.github_coordination_service import CoordinationError, github_coordination_service
+from app.services.github_summary_publication_service import github_summary_publication_service
 from app.services.github_work_progress_service import github_work_progress_service
 
 router = APIRouter()
@@ -55,3 +57,33 @@ async def remaining_work_context(item_id: int, response: Response,
         return result
     except CoordinationError as error:
         raise HTTPException(status_code=error.status, detail=error.code) from error
+
+
+async def _leader_scope(db: AsyncSession, scope_id: int, principal: MailAgentSession) -> TeamGithubScope:
+    scope = await db.get(TeamGithubScope, scope_id)
+    if scope is None:
+        raise HTTPException(status_code=404, detail="scope_not_found")
+    try:
+        await github_coordination_service.require_leader(db, scope_id, principal)
+    except CoordinationError as error:
+        raise HTTPException(status_code=error.status, detail=error.code) from error
+    return scope
+
+
+@router.get("/github-pull-summaries/{scope_id}/{pull_number}")
+async def render_pull_summary(scope_id: int, pull_number: int,
+                              principal: MailAgentSession = Depends(require_mail_session),
+                              db: AsyncSession = Depends(get_db)):
+    """Render the generated review and remaining-work blocks for a pull request. This GET writes nothing."""
+    scope = await _leader_scope(db, scope_id, principal)
+    return await github_summary_publication_service.render(db, scope, pull_number, github_client)
+
+
+@router.post("/github-pull-summaries/{scope_id}/{pull_number}/publish")
+async def publish_pull_summary(scope_id: int, pull_number: int,
+                               principal: MailAgentSession = Depends(require_mail_session),
+                               db: AsyncSession = Depends(get_db)):
+    """The Leader's one mutation: write or refresh the system-owned summary comment. It never edits a body."""
+    scope = await _leader_scope(db, scope_id, principal)
+    result = await github_summary_publication_service.publish_pull(db, scope, pull_number, github_client)
+    return {"result": result, "pull_number": pull_number}

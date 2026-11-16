@@ -870,6 +870,28 @@ export const manifest = [
     }
   },
   {
+    "name": "synth_city_publish_pull_summary",
+    "description": "Leader-only: write or refresh the system-owned summary comment of a PR.\n\n    It creates one comment and then edits only that comment by id. It never edits a PR or issue body, an\n    operator record or any other comment, and it grants no approval, review or merge authority.\n    ",
+    "inputSchema": {
+      "properties": {
+        "scope_id": {
+          "title": "Scope Id",
+          "type": "integer"
+        },
+        "pull_number": {
+          "title": "Pull Number",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "scope_id",
+        "pull_number"
+      ],
+      "title": "synth_city_publish_pull_summaryArguments",
+      "type": "object"
+    }
+  },
+  {
     "name": "synth_city_record_head_review",
     "description": "Assigned verifier records an explicit ACCEPTED or CHANGES_REQUIRED verdict for the PR's exact current head.\n\n    The verdict is required and is never inferred from the summary. Auto-merge needs an accepted fact for the\n    current head. The fact grants no source or readiness authority; link the source review on this PR.\n    ",
     "inputSchema": {
@@ -990,6 +1012,28 @@ export const manifest = [
         "summary"
       ],
       "title": "synth_city_render_github_summaryArguments",
+      "type": "object"
+    }
+  },
+  {
+    "name": "synth_city_render_pull_summary",
+    "description": "Leader-only, read-only: render the generated Human review summary and Work remaining blocks of a PR.\n\n    Facts come from recorded work, review and check facts, or from GitHub alone for a pull request that is not a\n    dispatched work item (plan, review and effort then read 'not recorded'). Estimate is always Unknown here;\n    the recorded effort limit is shown on its own line and is not an estimate of remaining work.\n    This call writes nothing and grants no approval, review or merge authority.\n    ",
+    "inputSchema": {
+      "properties": {
+        "scope_id": {
+          "title": "Scope Id",
+          "type": "integer"
+        },
+        "pull_number": {
+          "title": "Pull Number",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "scope_id",
+        "pull_number"
+      ],
+      "title": "synth_city_render_pull_summaryArguments",
       "type": "object"
     }
   },

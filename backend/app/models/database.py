@@ -445,6 +445,14 @@ class GithubWorkItem(Base):
     effort_extension_minutes: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     effort_extension_decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     effort_extension_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Generated summary comment (#940): one system-owned PR comment, edited by id. All nullable.
+    summary_comment_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    summary_comment_author: Mapped[str | None] = mapped_column(String, nullable=True)
+    summary_published_digest: Mapped[str | None] = mapped_column(String, nullable=True)
+    summary_published_head_sha: Mapped[str | None] = mapped_column(String, nullable=True)
+    summary_published_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    summary_published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    summary_publish_claim_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 

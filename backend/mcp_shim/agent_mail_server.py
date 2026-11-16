@@ -1317,6 +1317,40 @@ def synth_city_prepare_work_remaining_summary(
 
 
 @mcp.tool()
+def synth_city_render_pull_summary(scope_id: int, pull_number: int) -> dict:
+    """Leader-only, read-only: render the generated Human review summary and Work remaining blocks of a PR.
+
+    Facts come from recorded work, review and check facts, or from GitHub alone for a pull request that is not a
+    dispatched work item (plan, review and effort then read 'not recorded'). Estimate is always Unknown here;
+    the recorded effort limit is shown on its own line and is not an estimate of remaining work.
+    This call writes nothing and grants no approval, review or merge authority.
+    """
+    identity = _ensure_registered()
+    if not identity.get("ok"):
+        return identity
+    result = _team_request("GET", f"/github-pull-summaries/{scope_id}/{pull_number}")
+    if not result.get("ok"):
+        return result
+    return {"ok": True, **result["data"]}
+
+
+@mcp.tool()
+def synth_city_publish_pull_summary(scope_id: int, pull_number: int) -> dict:
+    """Leader-only: write or refresh the system-owned summary comment of a PR.
+
+    It creates one comment and then edits only that comment by id. It never edits a PR or issue body, an
+    operator record or any other comment, and it grants no approval, review or merge authority.
+    """
+    identity = _ensure_registered()
+    if not identity.get("ok"):
+        return identity
+    result = _team_request("POST", f"/github-pull-summaries/{scope_id}/{pull_number}/publish")
+    if not result.get("ok"):
+        return result
+    return {"ok": True, **result["data"]}
+
+
+@mcp.tool()
 def synth_city_report_dispatch_status(
     work_item_id: int,
     status: str,

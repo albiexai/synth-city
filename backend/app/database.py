@@ -1020,6 +1020,13 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         ("effort_extension_minutes", "INTEGER DEFAULT 0 NOT NULL"),
         ("effort_extension_decided_at", "DATETIME"),
         ("effort_extension_reason", "VARCHAR"),
+        ("summary_comment_id", "BIGINT"),
+        ("summary_comment_author", "VARCHAR"),
+        ("summary_published_digest", "VARCHAR"),
+        ("summary_published_head_sha", "VARCHAR"),
+        ("summary_published_status", "VARCHAR"),
+        ("summary_published_at", "DATETIME"),
+        ("summary_publish_claim_at", "DATETIME"),
     ):
         if work_item_columns and column not in work_item_columns:
             await conn.execute(text(f"ALTER TABLE github_work_items ADD COLUMN {column} {definition}"))
