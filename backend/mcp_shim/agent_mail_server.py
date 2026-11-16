@@ -1248,16 +1248,18 @@ def synth_city_render_github_summary(
     try:
         from datetime import datetime, timezone
         try:
-            from mcp_shim.github_summary_protocol import CurrentSummary, render_summary
+            from mcp_shim.github_summary_protocol import CurrentSummary, explain, render_summary
         except ModuleNotFoundError as error:
             if error.name != "mcp_shim":
                 raise
-            from github_summary_protocol import CurrentSummary, render_summary
+            from github_summary_protocol import CurrentSummary, explain, render_summary
         report = CurrentSummary.model_validate({**summary, "reported_at": datetime.now(timezone.utc)})
         result = render_summary(current_body, report, expected_body_sha256=expected_body_sha256)
-    except (ValueError, TypeError):
-        return {"ok": False, "error": {"code": "invalid_github_summary"},
-                "suggestion": "Use bounded public text, valid markers and a scoped effort range, or Unknown."}
+    except (ValueError, TypeError) as error:
+        # The code stays; the reason and the failing field names (never their values) say what to fix.
+        refusal = explain(error)
+        return {"ok": False, "error": {key: value for key, value in refusal.items() if key != "suggestion"},
+                "suggestion": refusal["suggestion"]}
     return {"ok": True, **result,
             "next_action": "Publish with existing authorized access after reconciling the current body."}
 

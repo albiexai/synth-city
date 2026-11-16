@@ -66,3 +66,91 @@ def test_effort_and_waiting_are_separate_and_unknown_is_explicit():
     assert "3–5 hours of active work" in text
     assert "**Waiting:** Review and CI waits are not estimated." in text
     assert "**Human action:** No action is required." in text
+
+
+# --- #987: every refusal says why, and never repeats the body or the summary text ------------------------------------
+
+def _refusal(body, report=None, **kwargs):
+    from mcp_shim.github_summary_protocol import explain
+    try:
+        render_summary(body, report or summary(), **kwargs)
+    except (ValueError, TypeError) as error:
+        return explain(error)
+    pytest.fail("the render was not refused")
+
+
+REASONS = [
+    ("body_changed", dict(body="Human requirements.\n", expected_body_sha256="0" * 64)),
+    ("body_invalid", dict(body="x" * 65537)),
+    ("rendered_body_too_large", dict(body="x" * 65535)),
+    ("summary_markers_ambiguous", dict(body=START + END + START + END)),
+    ("summary_markers_invalid", dict(body="<details>\n" + START + "old" + END)),
+    ("summary_markers_invalid", dict(body="x" * 4100 + "\n" + START + "old" + END)),
+    ("summary_contains_foreign_section", dict(body=START + "<!-- deck:operator-actions:start -->" + END)),
+]
+
+
+@pytest.mark.parametrize("reason,case", REASONS, ids=[f"{r}-{i}" for i, (r, _c) in enumerate(REASONS)])
+def test_each_body_refusal_names_its_reason_and_keeps_the_stable_code(reason, case):
+    refusal = _refusal(case.pop("body"), **case)
+    assert refusal["code"] == "invalid_github_summary" and refusal["reason"] == reason
+    assert refusal["suggestion"] and "fields" not in refusal
+
+
+def test_the_same_body_renders_without_a_hash_and_is_refused_with_a_wrong_one():
+    """The reproduced failure: a body that renders on a test call is refused only because the hash did not match."""
+    body = "## Requirements\n\n" + "Existing issue text. " * 200 + "\n<!-- deck:operator-actions:start -->\nR\n<!-- deck:operator-actions:end -->\n"
+    assert render_summary(body, summary())["changed"]
+    right = hashlib.sha256(body.encode()).hexdigest()
+    assert render_summary(body, summary(), expected_body_sha256=right)["changed"]
+    wrong = hashlib.sha256((body + " ").encode()).hexdigest()
+    refusal = _refusal(body, expected_body_sha256=wrong)
+    assert refusal["reason"] == "body_changed"
+    assert "placeholder" in refusal["suggestion"] or "hash" in refusal["suggestion"]
+
+
+@pytest.mark.parametrize("changes,fields", [
+    ({"goal": "password=zzqq"}, ["goal"]),
+    ({"completed": "ghp_zzqq"}, ["completed"]),
+    ({"human_action": "[Link](zzqq)"}, ["human_action"]),
+    ({"remaining": "a" * 241}, ["remaining"]),
+    ({"goal": "token a1b2c3d4e5f6a7b8c9"}, ["goal"]),
+    ({"effort_low_minutes": 60}, ["effort_range"]),
+    ({"goal": "password=zzqq", "next_action": "ghp_zzqq"}, ["goal", "next_action"]),
+])
+def test_a_summary_text_refusal_names_the_fields_and_never_their_values(changes, fields):
+    from mcp_shim.github_summary_protocol import explain
+    with pytest.raises(ValidationError) as caught:
+        summary(**changes)
+    refusal = explain(caught.value)
+    assert refusal["code"] == "invalid_github_summary" and refusal["reason"] == "invalid_summary_field"
+    assert refusal["fields"] == fields
+    text = str(refusal)
+    for secret in ("password", "ghp_", "zzqq", "a1b2c3d4", "Link", "aaaa"):
+        assert secret not in text
+
+
+def test_an_unexpected_error_gets_the_generic_reason_and_no_text():
+    from mcp_shim.github_summary_protocol import explain
+    refusal = explain(TypeError("a secret value in a message"))
+    assert refusal["code"] == "invalid_github_summary" and refusal["reason"] == "invalid_summary"
+    assert "secret" not in str(refusal)
+    refusal = explain(ValueError("a body fragment that is not one of the known reasons"))
+    assert refusal["reason"] == "invalid_summary" and "fragment" not in str(refusal)
+
+
+def test_the_tool_returns_the_reason_and_keeps_its_old_shape(monkeypatch):
+    import mcp_shim.agent_mail_server as shim
+    monkeypatch.setattr(shim, "_ensure_registered", lambda: {"ok": True})
+    fields = dict(goal="Goal.", status="Working", completed="Done.", remaining="Left.", next_action="Next.",
+                  human_action="None.")
+    body = "Human requirements.\n"
+    refused = shim.synth_city_render_github_summary(body, fields, expected_body_sha256="0" * 64)
+    assert refused["ok"] is False and refused["error"]["code"] == "invalid_github_summary"
+    assert refused["error"]["reason"] == "body_changed" and refused["suggestion"]
+    bad_text = shim.synth_city_render_github_summary(body, {**fields, "goal": "password=zzqq"})
+    assert bad_text["error"]["reason"] == "invalid_summary_field" and bad_text["error"]["fields"] == ["goal"]
+    assert "zzqq" not in str(bad_text)
+    ok = shim.synth_city_render_github_summary(
+        body, fields, expected_body_sha256=hashlib.sha256(body.encode()).hexdigest())
+    assert ok["ok"] is True and ok["changed"] is True and "error" not in ok

@@ -104,3 +104,38 @@ def render_summary(body: str, summary: CurrentSummary, *, expected_body_sha256: 
     return {"body_markdown": rendered, "source_body_sha256": observed,
             "rendered_body_sha256": hashlib.sha256(rendered.encode()).hexdigest(),
             "changed": rendered != body}
+
+
+# Why a render was refused (#987). The shim used to collapse every refusal into one code; a caller could not tell a
+# mistyped body hash from a bad marker or a bad summary text. The reasons are fixed words: nothing here repeats the
+# body, the summary text or an error message, so a refusal never carries content.
+CODE = "invalid_github_summary"
+_BODY_SUGGESTIONS = {
+    "body_changed": ("The body passed in is not the body the expected hash was taken from. Fetch the body again and "
+                     "pass it unchanged, or render over a placeholder body and compare the rendered hash locally "
+                     "before you publish."),
+    "body_invalid": "The body must be text of at most 65536 bytes.",
+    "rendered_body_too_large": "The rendered body would pass 65536 bytes. Shorten the body or move old records out first.",
+    "summary_markers_ambiguous": ("The body holds a repeated or unpaired deck:current-summary marker. Leave one "
+                                  "start and one end marker, or none."),
+    "summary_markers_invalid": ("An existing summary block is not safely placed: it starts after the first 4096 "
+                                "characters, or after an open code fence, an open HTML comment or an HTML tag."),
+    "summary_contains_foreign_section": ("Another deck: section sits inside the summary block. Move that section "
+                                         "outside the markers; the renderer will not overwrite it."),
+}
+_FIELD_SUGGESTION = ("Use bounded public text without markup, long hex strings or private values, and an ordered "
+                     "active-effort range with confidence and scope, or Unknown. The fields named here failed.")
+_GENERIC_SUGGESTION = "Use bounded public text, valid markers and a scoped effort range, or Unknown."
+
+
+def explain(error: Exception) -> dict:
+    """The structured refusal for a failed render: the stable code, the specific reason, and field names only."""
+    from pydantic import ValidationError
+
+    if isinstance(error, ValidationError):
+        fields = sorted({str(item["loc"][0]) if item.get("loc") else "effort_range" for item in error.errors()})
+        return {"code": CODE, "reason": "invalid_summary_field", "fields": fields, "suggestion": _FIELD_SUGGESTION}
+    reason = str(error) if isinstance(error, ValueError) and str(error) in _BODY_SUGGESTIONS else None
+    if reason is None:
+        return {"code": CODE, "reason": "invalid_summary", "suggestion": _GENERIC_SUGGESTION}
+    return {"code": CODE, "reason": reason, "suggestion": _BODY_SUGGESTIONS[reason]}
