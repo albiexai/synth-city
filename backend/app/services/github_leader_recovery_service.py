@@ -8,12 +8,13 @@ repeating the action. Policy, limits, merge and approval are not reachable from 
 """
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import JSON, delete, exists, insert, literal, select, true
+from sqlalchemy import JSON, delete, exists, insert, literal, select, true, update
 from sqlalchemy.orm import aliased
 from sqlalchemy.exc import IntegrityError
 
@@ -199,8 +200,12 @@ async def _claim(db, item_id, kind, operation_id, digest):
     return False
 
 
-async def _no_effect(db, kind, ctx, operation_id, *, revision_number=None):
+async def _no_effect(db, kind, ctx, operation_id, *, revision_number=None, workspace_id=None, leased_at=None):
     """The condition 'the action this id claimed has not committed', as SQL the deleting statement evaluates itself."""
+    if kind == "release":
+        return ~exists().where(
+            FactoryAuditEvent.event_kind == "workspace_release", FactoryAuditEvent.action_outcome == "applied",
+            FactoryAuditEvent.correlation_id == f"workspace_release:workspace:{workspace_id}:leased_at:{leased_at.isoformat()}")
     if kind == "finalize":
         done = aliased(GithubMaintenanceEvent)
         return ~exists().where(done.operation_id == f"finalize_merged:{operation_id}")
@@ -382,6 +387,47 @@ def _held(workspace, item_id, expected_leased_at):
             and workspace.lease_token is not None)
 
 
+async def _mark_executing(db, ctx, attempt, *, created_here):
+    """Commit this attempt's marker on the claim row BEFORE any external effect can start.
+
+    The row's outcome text is the state: 'claimed' is clean (no external effect started), 'executing:<attempt>'
+    means that attempt may have started its credential revoker, and a trailing ':u' means the attempt adopted an
+    earlier executing or legacy row, so it INHERITS that uncertainty. The marker is a compare-and-set on the exact
+    state read, so two callers can never both own it. Returns True when the uncertainty is inherited.
+    """
+    outcome = await db.scalar(select(GithubMaintenanceEvent.outcome).where(
+        GithubMaintenanceEvent.operation_id == ctx.claim_key, GithubMaintenanceEvent.request_sha256 == ctx.claim_digest))
+    clean = outcome == "claimed" and created_here
+    if outcome is None or not (outcome == "claimed" or outcome.startswith("executing:")):
+        raise LeaderRecoveryError("recovery_context_changed")
+    marker = f"executing:{attempt}" if clean else f"executing:{attempt}:u"
+    result = await db.execute(update(GithubMaintenanceEvent).where(
+        GithubMaintenanceEvent.operation_id == ctx.claim_key, GithubMaintenanceEvent.request_sha256 == ctx.claim_digest,
+        GithubMaintenanceEvent.outcome == outcome).values(outcome=marker))
+    await db.commit()
+    if result.rowcount != 1:
+        raise LeaderRecoveryError("recovery_context_changed")
+    return not clean
+
+
+async def _settle_release_claim(db, ctx, operation_id, attempt, *, inherited, started, workspace_id, leased_at):
+    """After a failed release attempt: free the id only if THIS attempt provably never started its revoker.
+
+    An inherited marker is never reverted, and an attempt whose fence passed may have started the revoker, so
+    its marker stays. A clean attempt reverts its own marker by exact attempt id and then frees the id with the
+    atomic no-effect delete.
+    """
+    await db.rollback()
+    if started or inherited:
+        return
+    reverted = await db.execute(update(GithubMaintenanceEvent).where(
+        GithubMaintenanceEvent.operation_id == ctx.claim_key, GithubMaintenanceEvent.request_sha256 == ctx.claim_digest,
+        GithubMaintenanceEvent.outcome == f"executing:{attempt}").values(outcome="claimed"))
+    await db.commit()
+    if reverted.rowcount == 1:
+        await _unclaim(db, "release", ctx, operation_id, workspace_id=workspace_id, leased_at=leased_at)
+
+
 async def release_workspace(db, item, session, *, workspace_id, expected_leased_at, operation_id, reason):
     reason = _need_reason(reason)
     ctx = _ctx(item, session)
@@ -417,20 +463,36 @@ async def release_workspace(db, item, session, *, workspace_id, expected_leased_
             return await already_released()  # a replay released it; the shared claim record stays
         raise LeaderRecoveryError("workspace_lease_changed")  # the claim is kept: see _abandon
     lease_token = workspace.lease_token
+    attempt = uuid.uuid4().hex[:12]
+    inherited = await _mark_executing(db, ctx, attempt, created_here=not replay)   # durable before any external effect
+    await _reload(db, item, scope, workspace)
+    fence = {"passed": 0}
+
+    async def guarded():
+        await _assert_authority(db, ctx, terminal=True)
+        fence["passed"] += 1   # once the first fence passed, the revoker may start
+
+    def settle():
+        return _settle_release_claim(db, ctx, operation_id, attempt, inherited=inherited,
+            started=fence["passed"] > 0, workspace_id=workspace_id, leased_at=expected_leased_at)
     try:
         released = await github_workspace_service.force_release_acquisition(db, actor_kind="member",
             actor_member_id=ctx.member_id, actor_session_id=ctx.session_id, workspace_id=workspace_id,
             scope_id=scope_id, item_id=ctx.item_id, expected_leased_at=expected_leased_at,
-            lease_token=lease_token, before_commit=lambda: _assert_authority(db, ctx, terminal=True))
+            lease_token=lease_token, before_commit=guarded)
     except GithubWorkspaceCredentialRevokeError as exc:
+        await settle()
         raise LeaderRecoveryError(exc.block_code, 503) from exc
     except GithubWorkspaceConfigError as exc:
+        await settle()
         raise LeaderRecoveryError(exc.block_code) from exc
     except LeaderRecoveryError:
+        await settle()
         if await _abandon(db, "release", ctx, operation_id, replay, workspace_id=workspace_id, leased_at=expected_leased_at):
             return await already_released()
         raise
     if not released:
+        await settle()
         if await _abandon(db, "release", ctx, operation_id, replay, workspace_id=workspace_id, leased_at=expected_leased_at):
             return await already_released()  # a replay released it; the shared claim record stays
         raise LeaderRecoveryError("workspace_lease_changed")

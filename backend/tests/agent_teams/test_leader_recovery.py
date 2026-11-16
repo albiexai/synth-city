@@ -1038,3 +1038,250 @@ async def test_a_hold_raised_during_the_entry_checks_own_reads_claims_nothing(db
     assert error.value.code == "operator_hold"
     await db.rollback()
     assert (await db.execute(select(GithubMaintenanceEvent))).scalars().all() == []   # no ledger row, so the id is free
+
+
+# --- #998: the release execution marker and the retry protocol --------------------------------------------------
+
+class _Crash(BaseException):
+    """A process-level stop: it is not an Exception, so no cleanup after it may be assumed."""
+
+
+async def _claim_outcome(db, op="rel-1"):
+    await db.rollback()
+    return await db.scalar(select(GithubMaintenanceEvent.outcome).where(
+        GithubMaintenanceEvent.operation_id == f"leader-recovery:release:{op}"))
+
+
+def _same_lease(a):
+    return dict(workspace_id=a.workspace.id, expected_leased_at=a.workspace_leased_at)   # plain values: rollbacks expire rows
+
+
+async def _again(db, a, same, **over):
+    await db.rollback()
+    await db.refresh(a.workspace)
+    return await _release(db, a, a.leader_session, **same, **over)
+
+
+def _first_fence_refuses(monkeypatch, times=1):
+    real, state = lr._assert_authority, {"n": 0}
+
+    async def fence(*args, **kwargs):
+        state["n"] += 1
+        if state["n"] <= times:
+            raise lr.LeaderRecoveryError("operator_hold")
+        return await real(*args, **kwargs)
+    monkeypatch.setattr(lr, "_assert_authority", fence)
+    return state
+
+
+async def _release_audits(db):
+    await db.rollback()
+    return (await db.execute(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == "workspace_release", FactoryAuditEvent.action_outcome == "applied"))).scalars().all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("db", ["concurrent"], indirect=True)
+async def test_the_executing_marker_is_committed_before_the_revoker_runs(db, releasable, monkeypatch):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    a = releasable
+    seen = []
+    other = async_sessionmaker(db.bind, expire_on_commit=False)()
+
+    async def revoker(*args, **kwargs):
+        seen.append(await other.scalar(select(GithubMaintenanceEvent.outcome).where(
+            GithubMaintenanceEvent.operation_id == "leader-recovery:release:rel-1")))
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", AsyncMock(side_effect=revoker))
+    try:
+        result = await _release(db, a, a.leader_session)
+    finally:
+        await other.close()
+    assert result["status"] == "released"
+    assert len(seen) == 1 and seen[0].startswith("executing:") and not seen[0].endswith(":u"), seen
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_before_any_external_effect_frees_the_id_for_a_corrected_request(db, releasable, monkeypatch):
+    a = releasable
+    revoker = AsyncMock()
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", revoker)
+    same = _same_lease(a)
+    _first_fence_refuses(monkeypatch)
+    with pytest.raises(lr.LeaderRecoveryError) as error:
+        await _release(db, a, a.leader_session)
+    assert error.value.code == "operator_hold"
+    revoker.assert_not_called()
+    assert await _claim_outcome(db) is None                   # the attempt provably never started: the id is free
+    result = await _again(db, a, same, reason="A corrected reason.")   # the same id, now with a corrected request
+    assert result["status"] == "released"
+    assert len(await _release_audits(db)) == 1 and len(await _notices(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_attempt_a_refused_retry_and_a_cleanup_never_release_the_binding(db, releasable, monkeypatch):
+    from app.services.github_workspace_service import GithubWorkspaceCredentialRevokeError
+    a = releasable
+    revoker = AsyncMock(side_effect=GithubWorkspaceCredentialRevokeError("revoke result unknown"))
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", revoker)
+    same = _same_lease(a)
+    with pytest.raises(lr.LeaderRecoveryError):                 # attempt A: the revoker's result is unknown
+        await _release(db, a, a.leader_session)
+    first = await _claim_outcome(db)
+    assert first.startswith("executing:") and not first.endswith(":u")
+    with pytest.raises(lr.LeaderRecoveryError) as conflict:     # a corrected request must not reuse the id
+        await _again(db, a, same, reason="A corrected reason.")
+    assert conflict.value.code == "operation_conflict"
+    calls = revoker.await_count
+    _first_fence_refuses(monkeypatch)                           # the exact retry R adopts, then is refused before its revoker
+    with pytest.raises(lr.LeaderRecoveryError) as refused:
+        await _again(db, a, same)
+    assert refused.value.code == "operation_hold" or refused.value.code == "operator_hold"
+    adopted = await _claim_outcome(db)
+    assert adopted is not None and adopted.startswith("executing:") and adopted.endswith(":u") and adopted != first
+    assert revoker.await_count == calls                         # R never started its own revoker
+    with pytest.raises(lr.LeaderRecoveryError) as conflict_again:   # the inherited uncertainty still binds the id
+        await _again(db, a, same, reason="Another corrected reason.")
+    assert conflict_again.value.code == "operation_conflict"
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", AsyncMock())
+    done = await _again(db, a, same)                            # the exact retry completes
+    assert done["status"] == "released"
+    assert len(await _release_audits(db)) == 1 and len(await _notices(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_revoker_that_refuses_on_the_retry_keeps_the_binding_and_sends_no_notice(db, releasable, monkeypatch):
+    from app.services.github_workspace_service import GithubWorkspaceCredentialRevokeError
+    a = releasable
+    revoker = AsyncMock(side_effect=GithubWorkspaceCredentialRevokeError("revoke refused"))
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", revoker)
+    same, item_id = _same_lease(a), a.item.id
+    for _ in range(2):
+        with pytest.raises(lr.LeaderRecoveryError) as error:
+            await _again(db, a, same)
+        assert error.value.status_code == 503
+    outcome = await _claim_outcome(db)
+    assert outcome.startswith("executing:") and outcome.endswith(":u")
+    assert await _notices(db) == [] and await _release_audits(db) == []
+    await db.refresh(a.workspace)
+    assert a.workspace.leased_item_id == item_id
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_plain_claim_is_adopted_only_as_inherited_uncertainty(db, releasable, monkeypatch):
+    a = releasable
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", AsyncMock())
+    same = _same_lease(a)
+    item_id = a.item.id
+    digest = lr._digest("release", item_id, same["workspace_id"], same["expected_leased_at"].isoformat(), REASON)
+    db.add(GithubMaintenanceEvent(operation_id="leader-recovery:release:rel-1", work_item_id=item_id,
+                                  outcome="claimed", request_sha256=digest))
+    await db.commit()
+    _first_fence_refuses(monkeypatch)
+    with pytest.raises(lr.LeaderRecoveryError):                 # an exact retry refused before its own revoker
+        await _again(db, a, same)
+    outcome = await _claim_outcome(db)
+    assert outcome is not None and outcome.startswith("executing:") and outcome.endswith(":u")   # never clean again
+    with pytest.raises(lr.LeaderRecoveryError) as conflict:
+        await _again(db, a, same, reason="A corrected reason.")
+    assert conflict.value.code == "operation_conflict"
+    assert (await _again(db, a, same))["status"] == "released"
+
+
+@pytest.mark.asyncio
+async def test_a_crash_after_the_marker_keeps_the_binding(db, releasable, monkeypatch):
+    a = releasable
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", AsyncMock(side_effect=_Crash()))
+    same = _same_lease(a)
+    with pytest.raises(_Crash):
+        await _release(db, a, a.leader_session)
+    outcome = await _claim_outcome(db)
+    assert outcome is not None and outcome.startswith("executing:")   # absence of a success audit never proves no effect
+    with pytest.raises(lr.LeaderRecoveryError) as conflict:
+        await _again(db, a, same, reason="A corrected reason.")
+    assert conflict.value.code == "operation_conflict"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("db", ["concurrent"], indirect=True)
+async def test_a_claimant_paused_before_its_marker_answers_as_the_replay_that_released(db, releasable, monkeypatch):
+    """A claimed the id and stops before its marker; its exact replay B adopts the row and releases the lease."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.models.database import GithubWorkItem
+    a = releasable
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", AsyncMock())
+    workspace_id, leased_at, item_id, session_id = a.workspace.id, a.workspace_leased_at, a.item.id, a.leader_session.id
+    real = lr._mark_executing
+    entered, gate, state = asyncio.Event(), asyncio.Event(), {"first": True}
+
+    async def paused(*args, **kwargs):
+        if state["first"]:
+            state["first"] = False
+            entered.set()
+            await gate.wait()
+        return await real(*args, **kwargs)
+    monkeypatch.setattr(lr, "_mark_executing", paused)
+    other = async_sessionmaker(db.bind, expire_on_commit=False)()
+    try:
+        item2 = await other.get(GithubWorkItem, item_id)
+        session2 = await other.get(MailAgentSession, session_id)
+        first = asyncio.ensure_future(lr.release_workspace(db, a.item, a.leader_session, workspace_id=workspace_id,
+            expected_leased_at=leased_at, operation_id="rel-1", reason=REASON))
+        await asyncio.wait_for(entered.wait(), 10)   # a missing marker step fails here instead of hanging
+        second = await lr.release_workspace(other, item2, session2, workspace_id=workspace_id,
+            expected_leased_at=leased_at, operation_id="rel-1", reason=REASON)
+        gate.set()
+        outcome = (await asyncio.gather(first, return_exceptions=True))[0]
+    finally:
+        await other.close()
+    assert second["status"] == "released"
+    assert isinstance(outcome, dict) and outcome["status"] == "already_released", outcome
+    assert len(await _release_audits(db)) == 1 and len(await _notices(db)) == 1
+    assert (await _claim_outcome(db)).startswith("executing:")      # the binding is never lost
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("db", ["concurrent"], indirect=True)
+async def test_a_clean_attempt_never_reverts_a_marker_that_another_attempt_adopted(db, releasable, monkeypatch):
+    """A marks and stops before its lease write; B adopts A's row and its revoker result is unknown; A is then refused."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.models.database import GithubWorkItem
+    from app.services.github_workspace_service import GithubWorkspaceCredentialRevokeError
+    a = releasable
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token",
+                        AsyncMock(side_effect=GithubWorkspaceCredentialRevokeError("revoke result unknown")))
+    workspace_id, leased_at, item_id, session_id = a.workspace.id, a.workspace_leased_at, a.item.id, a.leader_session.id
+    real_release, real_fence = lr.github_workspace_service.force_release_acquisition, lr._assert_authority
+    entered, gate, state = asyncio.Event(), asyncio.Event(), {"release": 0, "fence": 0}
+
+    async def release(*args, **kwargs):
+        state["release"] += 1
+        if state["release"] == 1:         # A stops after its marker, before its lease write opens
+            entered.set()
+            await gate.wait()
+        return await real_release(*args, **kwargs)
+
+    async def fence(*args, **kwargs):
+        state["fence"] += 1
+        if state["fence"] == 2:           # the first fence call is B's; the second is A's: A is refused before its revoker
+            raise lr.LeaderRecoveryError("operator_hold")
+        return await real_fence(*args, **kwargs)
+    monkeypatch.setattr(lr.github_workspace_service, "force_release_acquisition", release)
+    monkeypatch.setattr(lr, "_assert_authority", fence)
+    other = async_sessionmaker(db.bind, expire_on_commit=False)()
+    try:
+        item2 = await other.get(GithubWorkItem, item_id)
+        session2 = await other.get(MailAgentSession, session_id)
+        first = asyncio.ensure_future(lr.release_workspace(db, a.item, a.leader_session, workspace_id=workspace_id,
+            expected_leased_at=leased_at, operation_id="rel-1", reason=REASON))
+        await asyncio.wait_for(entered.wait(), 10)
+        with pytest.raises(lr.LeaderRecoveryError) as unknown:   # B adopts A's row; its revoker result is unknown
+            await lr.release_workspace(other, item2, session2, workspace_id=workspace_id,
+                expected_leased_at=leased_at, operation_id="rel-1", reason=REASON)
+        assert unknown.value.status_code == 503
+        gate.set()
+        refused = (await asyncio.gather(first, return_exceptions=True))[0]
+    finally:
+        await other.close()
+    assert isinstance(refused, lr.LeaderRecoveryError) and state["fence"] == 2, (refused, state)
+    outcome = await _claim_outcome(db)
+    assert outcome is not None and outcome.startswith("executing:") and outcome.endswith(":u")   # B's binding survives A

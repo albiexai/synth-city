@@ -329,9 +329,17 @@ merge, and dirty or unknown-state releases remain operator-only. These tools gra
 A refused cancel or finalize that committed nothing frees its `operation_id` for a corrected request. The id is
 freed by one statement that also proves no effect committed, and every execution that rests on the id re-checks
 inside its own transaction that the id still holds its request, so a refused caller cannot erase a winner's record
-or let a conflicting request commit. A HOLD that arrives during these checks stops the action. A release keeps its
-id once it passed the final check, because the credential revoker may have run; repeat the same request to
-replay it, and use a new `operation_id` for a corrected request.
+or let a conflicting request commit. A HOLD that arrives during these checks stops the action.
+
+A release commits an execution marker on its id before any external effect can start. The id is freed for a
+corrected request only when that attempt provably never started the credential revoker, that is, the final
+authority check refused it before the first external step. Once the revoker may have run (it failed, its result
+is unknown, or the process stopped), the id stays bound to the exact request: a corrected request is refused as
+`operation_conflict` and the same request retries. A retry that adopts such a marker inherits its uncertainty, so
+a later attempt that is refused before its own revoker still cannot free the id. A plain legacy claim from the
+earlier interim is read the same way. The retry is guarded and can fail: if the revoker refuses, the response is
+its error (503), the id stays bound, the lease stays, and no success notice is sent. Use a new `operation_id` only
+after the operator confirms the earlier attempt's effect.
 
 ### Continuation phases
 
