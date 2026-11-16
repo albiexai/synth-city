@@ -1117,6 +1117,15 @@ class GithubVerificationService:
         await self._reconcile_escalated_merges(
             db, scope, client, recovery_only_attempt=recovery_only_attempt
         )
+        # #940: the generated summary comment, only after every decision above has been committed. It reads no gate,
+        # changes no status and never raises into the poll.
+        try:
+            from app.services.github_summary_publication_service import github_summary_publication_service
+
+            await github_summary_publication_service.publish_scope(db, scope, client)
+        except Exception as exc:
+            await db.rollback()
+            logger.warning("summary_publication_failed error_type=%s", type(exc).__name__)
 
     async def _reconcile_escalated_merges(
         self,

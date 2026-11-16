@@ -701,6 +701,71 @@ class GithubClient:
             if self._http is None:
                 await client.aclose()
 
+    async def list_issue_comments(self, owner: str, repo: str, number: int, *, token: str | None = None) -> list[dict]:
+        """The first 500 comments of a pull request, oldest first (five pages of 100)."""
+        client = self._client()
+        try:
+            comments: list[dict] = []
+            for page in range(1, 6):
+                resp = await client.get(
+                    f"/repos/{owner}/{repo}/issues/{number}/comments",
+                    headers=self._headers(token), params={"per_page": "100", "page": str(page)},
+                )
+                resp.raise_for_status()
+                batch = self._json_list(resp, "issue comments")
+                comments.extend(row for row in batch if isinstance(row, dict))
+                if len(batch) < 100:
+                    break
+            return comments
+        finally:
+            if self._http is None:
+                await client.aclose()
+
+    async def get_issue_comment(
+        self, owner: str, repo: str, comment_id: int, *, token: str | None = None
+    ) -> dict | None:
+        client = self._client()
+        try:
+            resp = await client.get(
+                f"/repos/{owner}/{repo}/issues/comments/{comment_id}", headers=self._headers(token),
+            )
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return self._json_object(resp, "issue comment")
+        finally:
+            if self._http is None:
+                await client.aclose()
+
+    async def create_issue_comment(
+        self, owner: str, repo: str, number: int, body: str, *, token: str | None = None
+    ) -> dict:
+        client = self._client()
+        try:
+            resp = await client.post(
+                f"/repos/{owner}/{repo}/issues/{number}/comments", headers=self._headers(token), json={"body": body},
+            )
+            resp.raise_for_status()
+            return self._json_object(resp, "issue comment")
+        finally:
+            if self._http is None:
+                await client.aclose()
+
+    async def update_issue_comment(
+        self, owner: str, repo: str, comment_id: int, body: str, *, token: str | None = None
+    ) -> dict:
+        """Edit a comment by id. This is the only text the system edits; it never edits a PR or issue body."""
+        client = self._client()
+        try:
+            resp = await client.patch(
+                f"/repos/{owner}/{repo}/issues/comments/{comment_id}", headers=self._headers(token), json={"body": body},
+            )
+            resp.raise_for_status()
+            return self._json_object(resp, "issue comment")
+        finally:
+            if self._http is None:
+                await client.aclose()
+
     async def merge_pull(
         self, owner: str, repo: str, pr_number: int, *, expected_head_sha: str
     ) -> dict:
