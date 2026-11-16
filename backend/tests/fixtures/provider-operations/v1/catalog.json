@@ -2788,9 +2788,9 @@
           "reason": "agy --conversation resumes a conversation by its UUID."
         },
         "sessions": {
-          "state": "unknown",
+          "state": "read_only",
           "label": "Agent Bridge Sessions",
-          "reason": "Antigravity CLI session discovery is not implemented yet."
+          "reason": "Read an Antigravity CLI member's conversation state and discover its conversation from the live process."
         },
         "mcp": {
           "state": "unknown",

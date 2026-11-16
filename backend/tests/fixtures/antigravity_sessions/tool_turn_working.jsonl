@@ -1,0 +1,2 @@
+{"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-16T11:43:27Z", "content": "fixture input"}
+{"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-16T11:43:27Z", "model": "fixture-model", "tool_calls": [{"name": "run_command", "args": {}}]}

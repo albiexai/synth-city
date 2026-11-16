@@ -33,6 +33,7 @@ const ACTIVITY_REASONS: Record<string, string> = {
   restart_needed_for_observation: 'Restart this session in resume mode through Synth City to see its activity.',
   observation_unavailable: 'The controller cannot read or validate this activity observation.',
   native_log_unreadable: "The controller cannot read this member's native activity log. See the install notes for separate controller and agent users.",
+  native_wait_unconfirmed: 'The member is waiting on something other than a question. Its activity cannot be confirmed.',
 }
 
 export function activityReasonText(reason: string): string {
