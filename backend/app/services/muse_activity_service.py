@@ -20,6 +20,8 @@ from app.services.providers.muse_cli import is_muse_command, muse_data_dir_for_p
 
 _TAIL_BYTES = 1_048_576
 _HEAD_BYTES = 262_144
+_SCAN_STEP = 1_048_576
+_SCAN_BYTES = 8 * 1_048_576  # backward scan cap for a turn that started before the tail
 _BINDING_RECORDS = {"session.opened.observed", "runtime.session.metadata"}
 _MAX_DESCRIPTORS = 4096
 _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
@@ -152,19 +154,86 @@ def _read_lines(path: Path, uid: int) -> tuple[list[bytes] | None, int, str | No
         offset = max(0, before.st_size - _TAIL_BYTES)
         # The binding records are written once, near the head; a long session
         # pushes them out of the tail. Keep them from a bounded head read.
-        head = stream.read(min(_HEAD_BYTES, offset)) if offset else b""
-        stream.seek(offset)
-        data = stream.read(_TAIL_BYTES)
+        head = _read_at(stream, 0, min(_HEAD_BYTES, offset)) if offset else b""
+        data = _read_at(stream, offset, _TAIL_BYTES)
+        lines = data.splitlines(keepends=True)
+        carried: list[bytes] = []
+        if offset:
+            first, lines = (lines[0], lines[1:]) if lines else (b"", [])  # the first line of a tail may be partial
+            if not any(_turn_record(line) in {"start", "end"} for line in lines):
+                carried = _scan_for_turn(stream, offset, first)
         after = os.fstat(stream.fileno())
     current = path.stat(follow_symlinks=False)
     binding = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
     if binding(before) != binding(after) or binding(after) != binding(current):
         return None, offset, "binding_changed"
-    lines = data.splitlines(keepends=True)
     if offset:
-        lines = lines[1:]  # the first line of a tail may be partial
-        lines = [line for line in head.splitlines(keepends=True) if _is_binding_record(line)] + lines
+        lines = [line for line in head.splitlines(keepends=True) if _is_binding_record(line)] + carried + lines
     return lines, offset, None
+
+
+def _read_at(stream, offset: int, size: int) -> bytes:
+    stream.seek(offset)
+    return stream.read(size)
+
+
+def _turn_record(line: bytes) -> str | None:
+    """Classify a complete record: a turn start, a turn end, a question event, or neither."""
+    if not line.endswith(b"\n") or b'"runtime.session"' not in line:
+        return None
+    try:
+        row = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(row, dict) or row.get("payload_type") != "runtime.session":
+        return None
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    event = payload.get("event")
+    if not isinstance(event, dict):
+        return None
+    kind = event.get("kind")
+    if kind == "started" and "prompt" in event:
+        return "start"
+    if kind == "terminal":
+        return "end"
+    if kind in {"user_input_prompt_requested", "user_input_prompt_settled"}:
+        return "question"
+    return None
+
+
+def _scan_for_turn(stream, offset: int, fragment: bytes) -> list[bytes]:
+    """#769: a long turn can write more than the tail after its start.
+
+    Read backwards from the tail in bounded steps for the nearest turn boundary.
+    Keep that boundary and the question events after it, in file order. If the
+    boundary ends a turn, also look for that turn's start, so a finished turn is
+    confirmed. Give up at _SCAN_BYTES: the state then stays as conservative as before.
+    """
+    kept: list[bytes] = []
+    ended = False  # a terminal was found; now only its turn's start is wanted
+    carry = fragment  # the part of the line that straddles the tail offset
+    end, floor = offset, max(0, offset - _SCAN_BYTES)
+    while end > floor:
+        start = max(floor, end - _SCAN_STEP)
+        pieces = (_read_at(stream, start, end - start) + carry).splitlines(keepends=True)
+        if start > 0:
+            carry, pieces = (pieces[0], pieces[1:]) if pieces else (b"", [])
+        else:
+            carry = b""
+        for line in reversed(pieces):
+            kind = _turn_record(line)
+            if kind == "question" and not ended:
+                kept.append(line)
+            elif kind == "start":
+                kept.append(line)
+                return kept[::-1]
+            elif kind == "end":
+                if ended:  # two ends without a start between: do not pair them, stay unconfirmed
+                    return kept[::-1]
+                kept.append(line)
+                ended = True
+        end = start
+    return kept[::-1] if ended else []
 
 
 def _is_binding_record(line: bytes) -> bool:
