@@ -264,6 +264,41 @@ For custom `CODEX_HOME` or `HOME`, the process environment must be readable by t
 controller. When it is not readable, the adapter uses the process owner's default
 Codex home and returns unknown if it cannot find and validate the exact session.
 
+For Muse Code, the observer finds each member's sessions root from the observed
+process, not from the controller. When the process environment is readable, it
+uses the process's own `XDG_DATA_HOME/muse`, then `MUSE_DATA_DIR`, then
+`HOME/.local/share/muse`; otherwise it uses the process owner's
+`~/.local/share/muse`. A relative value is refused. Muse 1.4.20 wrote its sessions
+under `XDG_DATA_HOME/muse` when both variables were set; `MUSE_DATA_DIR` on its own
+has not been observed. A controller-wide `MUSE_DATA_DIR` override is therefore no
+longer needed for observation. The guard keeps its own explicit
+`muse_sessions_root` setting.
+
+Muse writes its session folders with mode `770` and its files with mode `660`, in
+the agent's primary group, so the controller cannot read them by default. To give
+the controller read access:
+
+- Choose a group that both the agent user and the controller user belong to.
+- Give the agent's Muse `sessions` tree that group and set the setgid bit on its
+  directories, so that new date and session folders inherit the group.
+- Keep the tree closed to other users. Do not make the home directory or the
+  sessions world-readable.
+
+When the controller still cannot read a member's session log, its activity shows
+"The controller cannot read this member's native activity log" (reason
+`native_log_unreadable`) instead of a missing log. This change does not alter live
+filesystem permissions.
+
+A first plain Muse launch learns its session id from the process's open
+descriptors: the pane process itself holds its session's `.session.lock`, which
+must be the only one it holds, under that process owner's root, with a session log
+for the pane's working directory. Reading another user's descriptors needs the
+controller service's ptrace read capability (`cap_sys_ptrace`); the production unit
+is reported to grant it, but that has not been verified independently. If the
+controller cannot read the descriptors, set the member's first session id by hand
+and restart the slot in resume mode. The evidence and the route are recorded on
+issue #746.
+
 ## External Local Agents
 
 Local external agents can use the JSON API:

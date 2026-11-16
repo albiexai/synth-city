@@ -23,6 +23,7 @@ from app.utils.peer_process import process_is_confirmed_dead
 
 REASON = "owner_observation_unavailable"
 _GAPS = {"observation_unavailable", "observation_incomplete", "native_log_unavailable",
+         "native_log_unreadable",
          "no_native_event", "history_window_exceeded"}
 
 

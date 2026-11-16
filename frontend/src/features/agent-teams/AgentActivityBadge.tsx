@@ -19,6 +19,7 @@ const reasons: Record<string, string> = {
   session_mismatch: 'The running process and native session identity do not match.',
   binding_changed: 'The session binding changed during observation.',
   native_log_unavailable: 'The native activity log is unavailable.',
+  native_log_unreadable: 'The controller cannot read this member\'s native activity log. See the install notes for separate controller and agent users.',
   no_native_event: 'No supported native turn event is available.',
   observation_incomplete: 'The latest native activity record is incomplete.',
   observation_invalid: 'The native activity observation could not be validated.',
