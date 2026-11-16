@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import time
@@ -1184,6 +1185,8 @@ REFUSAL_ONLY = {  # run everywhere: each is refused by argument or root checks b
     "test_status_on_an_invalid_root_writes_nothing",
     "test_stub_script_kit_up_refuses_a_malformed_script_before_creating_anything",  # #912 A1b
     "test_stub_script_kit_status_refuses_the_option",
+    "test_crash_kit_refuses_without_a_kit_root",  # #947 A2a
+    "test_crash_kit_refuses_another_role_and_role_elsewhere",
 }
 
 
@@ -2137,3 +2140,118 @@ def test_stub_script_capture_status_control_is_caught(tmp_path, monkeypatch):
     with pytest.raises(AssertionError):
         test_stub_script_final_check_keeps_the_verifier_status()
     assert hashlib.sha256(real.read_bytes()).hexdigest() == before
+
+
+# #947 A2a: `crash --role cli` KILLs only the recorded CLI, through a pidfd opened before
+# the identity proof, and records state/crash.json only after the pidfd proves the exit.
+# Signal-free model: every /proc read, the pidfd, the signal and the exit wait are mocked.
+def _crash_model(tmp_path, *, readable=True, lookup=None):
+    world, procs, inst = _model()
+    (tmp_path / "state").mkdir()
+    module = _bind(_helper_module(), world, procs, inst)
+    events = []
+    def pidfd_open(pid):
+        if lookup is not None:
+            raise lookup
+        events.append(("open", pid))
+        return 41
+    module["os"] = type("ModelOs", (), {
+        "environ": os.environ, "path": os.path, "open": os.open, "write": os.write, "fstat": os.fstat,
+        "lstat": os.lstat, "unlink": os.unlink, "O_WRONLY": os.O_WRONLY, "O_CREAT": os.O_CREAT,
+        "O_EXCL": os.O_EXCL, "O_NOFOLLOW": os.O_NOFOLLOW,
+        "pidfd_open": staticmethod(pidfd_open),
+        "close": staticmethod(lambda fd: events.append(("close", fd)) if fd == 41 else os.close(fd))})
+    def send_signal(fd, sig):
+        events.append(("signal", fd, sig, (tmp_path / "state" / "crash.json").exists()))
+    module["signal"] = type("ModelSignal", (), {"SIGKILL": signal.SIGKILL, "pidfd_send_signal": staticmethod(send_signal)})
+    module["_exited"] = lambda fd, seconds: events.append(("wait", fd)) or readable
+    return module, procs, events
+
+
+def test_model_crash_kills_the_proved_cli_then_records_the_proved_exit(tmp_path):
+    module, procs, events = _crash_model(tmp_path)
+    module["crash"](str(tmp_path), "cli")
+    assert events == [("open", 106), ("signal", 41, signal.SIGKILL, False), ("wait", 41), ("close", 41)]
+    marker = tmp_path / "state" / "crash.json"
+    assert json.loads(marker.read_text()) == {"role": "cli", "pid": 106, "start": procs["cli"]["start"], "signal": "KILL"}
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("role", ["stub", "backend", "tmux", "inner", "outer", "launcher", "helper"])
+def test_model_crash_is_only_for_the_cli_role(tmp_path, role):
+    module, _procs, events = _crash_model(tmp_path)
+    with pytest.raises(SystemExit) as refused:
+        module["crash"](str(tmp_path), role)
+    assert refused.value.code == 2 and events == [] and not (tmp_path / "state" / "crash.json").exists()
+
+
+@pytest.mark.parametrize("fault", ["start", "argv", "parent", "no_pidfd", "gone_at_open", "unrecorded"])
+def test_model_crash_refuses_before_any_signal(tmp_path, monkeypatch, fault):
+    module, procs, events = _crash_model(tmp_path, lookup=ProcessLookupError() if fault == "gone_at_open" else None)
+    if fault == "start":
+        procs["cli"]["start"] = "1106" + "0"
+    elif fault == "argv":
+        procs["cli"]["argv"] = "0" * 64
+    elif fault == "parent":
+        procs["cli"]["ppid"] = 104
+    elif fault == "no_pidfd":
+        monkeypatch.setenv("RUNTIME_KIT_TEST_NO_PIDFD", "1")
+    elif fault == "unrecorded":
+        del procs["cli"]
+    with pytest.raises(SystemExit) as refused:
+        module["crash"](str(tmp_path), "cli")
+    assert refused.value.code in (2, 3, 4)
+    assert not any(event[0] == "signal" for event in events)
+    assert not (tmp_path / "state" / "crash.json").exists()
+
+
+def test_model_crash_without_a_proved_exit_records_nothing(tmp_path):
+    module, _procs, events = _crash_model(tmp_path, readable=False)
+    with pytest.raises(SystemExit) as incomplete:
+        module["crash"](str(tmp_path), "cli")
+    assert incomplete.value.code == 1
+    assert [event[0] for event in events] == ["open", "signal", "wait", "close"]
+    assert not (tmp_path / "state" / "crash.json").exists()
+
+
+@pytest.mark.parametrize("existing", ["file", "symlink"])
+def test_model_crash_refuses_while_a_crash_is_recorded(tmp_path, existing):
+    module, _procs, events = _crash_model(tmp_path)
+    marker = tmp_path / "state" / "crash.json"
+    if existing == "file":
+        marker.write_text("{}")
+    else:
+        marker.symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(SystemExit) as refused:
+        module["crash"](str(tmp_path), "cli")
+    assert refused.value.code == 2 and events == []
+    assert not (tmp_path / "elsewhere").exists()
+
+
+def test_model_crash_exit_wait_uses_the_pidfd(tmp_path):
+    module = _helper_module()
+    read, write = os.pipe()
+    try:
+        assert module["_exited"](read, 0.05) is False
+        os.write(write, b"x")
+        assert module["_exited"](read, 0.05) is True
+    finally:
+        os.close(read)
+        os.close(write)
+
+
+def test_crash_kit_refuses_without_a_kit_root(tmp_path):
+    result = _kit("crash", "--root", str(tmp_path / "kit"), "--role", "cli")
+    assert result.returncode == 2 and "not a kit root" in result.stderr
+
+
+def test_crash_kit_refuses_another_role_and_role_elsewhere(tmp_path):
+    root = tmp_path / "kit"
+    root.mkdir()
+    (root / ".deck-runtime-kit").write_text("")
+    other = _kit("crash", "--root", str(root), "--role", "stub")
+    assert other.returncode == 2 and "only for --role cli" in other.stderr
+    missing = _kit("crash", "--root", str(root))
+    assert missing.returncode == 2 and "only for --role cli" in missing.stderr
+    elsewhere = _kit("status", "--root", str(root), "--role", "cli")
+    assert elsewhere.returncode == 2 and "--role is only for crash" in elsewhere.stderr

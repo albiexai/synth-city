@@ -6,6 +6,7 @@
 #   isolated-runtime-kit.sh status --root DIR
 #   isolated-runtime-kit.sh exec   --root DIR [--timeout S] -- COMMAND...
 #   isolated-runtime-kit.sh down   --root DIR [--keep]
+#   isolated-runtime-kit.sh crash  --root DIR --role cli
 #
 # Everything runs inside the kit's own user and network namespaces:
 #   - an outer anchor (`unshare --user --map-root-user --net`) brings up `lo`,
@@ -53,6 +54,7 @@ STATUS_DEADLINE=15
 EXEC_DEFAULT=120
 EXEC_CAP=600
 DOWN_DEADLINE=30
+CRASH_DEADLINE=15
 DOWN_TERM_WAIT=10
 
 refuse() { echo "isolated-runtime-kit: refused: $*" >&2; exit 2; }
@@ -63,7 +65,7 @@ note() { echo "isolated-runtime-kit: $*" >&2; }
 # --- Instance and process identity (one Python helper, run isolated) ---------------
 
 KITPY='
-import hashlib, json, os, re, signal, stat, sys
+import hashlib, json, os, re, select, signal, stat, sys
 
 ROLES_ORDER = ["cli", "stub", "backend", "tmux", "inner", "outer"]
 SERVICES = {"cli", "stub", "backend", "tmux"}
@@ -316,6 +318,54 @@ def send(root, name, signame, dry):
         print("checked" if dry else "signalled")
     finally:
         os.close(fd)
+
+CRASH_WAIT = 5.0
+
+def _exited(fd, seconds):
+    """A pidfd becomes readable when its process has exited: the proof is the pidfd, not the pid."""
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    return bool(poller.poll(int(seconds * 1000)))
+
+def crash(root, role):
+    """#947: KILL the recorded cli through a pidfd opened before its identity proof; the
+    crash marker is written only after that pidfd proves the exit, and never twice."""
+    if role != "cli":
+        die(2, f"crash is only for the cli role, not {role}; nothing was signalled")
+    marker = os.path.join(root, "state", "crash.json")
+    if os.path.lexists(marker):
+        die(2, "a crash is already recorded; relaunch before another crash; nothing was signalled")
+    inst, procs = instance(root), processes(root)
+    entry = entry_of(procs, "cli")
+    if entry is None:
+        die(2, "no recorded cli process; nothing was signalled")
+    if os.environ.get("RUNTIME_KIT_TEST_NO_PIDFD") or not hasattr(os, "pidfd_open") \
+            or not hasattr(signal, "pidfd_send_signal"):
+        die(4, "pidfd support is unavailable; nothing was signalled")
+    try:
+        fd = os.pidfd_open(entry["pid"])
+    except ProcessLookupError:
+        die(3, "the cli is not running; nothing was signalled")
+    except OSError as exc:
+        die(4, f"cannot open a pidfd for the cli: {exc}; nothing was signalled")
+    try:
+        result = check(inst, procs, "cli", entry, root)
+        if result == "gone":
+            die(3, "the cli is not running; nothing was signalled")
+        if result != "ok":
+            die(2, result + "; nothing was signalled")
+        signal.pidfd_send_signal(fd, signal.SIGKILL)
+        if not _exited(fd, CRASH_WAIT):
+            die(1, "the cli exit was not proved; no crash was recorded")
+    finally:
+        os.close(fd)
+    data = json.dumps({"role": "cli", "pid": entry["pid"], "start": entry["start"], "signal": "KILL"}).encode()
+    out = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(out, data)
+    finally:
+        os.close(out)
+    print("crashed")
 
 def record(root, name, pid):
     pid = int(pid)
@@ -881,6 +931,8 @@ def main():
         stub_script(root, rest[0])
     elif command == "stub-script-verify":
         stub_script_verify(root)
+    elif command == "crash":
+        crash(root, rest[0])
     else:
         die(2, "unknown helper command")
 
@@ -981,7 +1033,7 @@ if [[ "$COMMAND" == _kitpy ]]; then  # the helper, for the kit's own tests
   exit $?
 fi
 
-ROOT_ARG="" PROVIDER="" CLI="" KEEP=0 EXEC_TIMEOUT="$EXEC_DEFAULT" STUB_SCRIPT=""
+ROOT_ARG="" PROVIDER="" CLI="" KEEP=0 EXEC_TIMEOUT="$EXEC_DEFAULT" STUB_SCRIPT="" ROLE=""
 KIT_STUB_PORT=18781 KIT_STUB_URL="http://127.0.0.1:18781"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -989,6 +1041,7 @@ while [[ $# -gt 0 ]]; do
     --provider) PROVIDER="$2"; shift 2 ;;
     --cli) CLI="$2"; shift 2 ;;
     --stub-script) STUB_SCRIPT="$2"; shift 2 ;;
+    --role) ROLE="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
     --timeout) EXEC_TIMEOUT="$2"; shift 2 ;;
     --) shift; break ;;
@@ -997,6 +1050,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -z "$STUB_SCRIPT" || "$COMMAND" == up || "$COMMAND" == _up ]] || refuse "--stub-script is only for up"
+[[ -z "$ROLE" || "$COMMAND" == crash || "$COMMAND" == _crash ]] || refuse "--role is only for crash"
 [[ -n "$ROOT_ARG" ]] || refuse "--root is required"
 mkdir -p "$(dirname "$ROOT_ARG")"
 ROOT="$(cd "$(dirname "$ROOT_ARG")" && pwd)/$(basename "$ROOT_ARG")"
@@ -1502,6 +1556,19 @@ down() {
   fi
 }
 
+crash() { # #947: KILL only the recorded cli through a proved pidfd; the marker follows the proved exit
+  [[ -f "$ROOT/$MARKER" ]] || refuse "$ROOT is not a kit root (no $MARKER)"
+  [[ "$ROLE" == cli ]] || refuse "crash is only for --role cli"
+  kitpy instance "$ROOT" >/dev/null || refuse "this root has no valid kit instance; nothing was signalled"
+  local out code=0
+  out="$(kitpy crash "$ROOT" "$ROLE" 2>&1)" || code=$?
+  case "$code" in
+    0) note "crashed the cli; recorded state/crash.json" ;;
+    1) incomplete "$out" ;;
+    *) refuse "$out" ;;
+  esac
+}
+
 stop_role() { # name: TERM through a proved pidfd, a bounded wait, then KILL after a fresh proof
   local code=0 i
   kitpy signal "$ROOT" "$1" TERM >/dev/null 2>&1 || code=$?
@@ -1529,15 +1596,18 @@ deadline_for() {
     up) echo $((UP_DEADLINE + 15)) ;;
     status) echo "$STATUS_DEADLINE" ;;
     down) echo "$DOWN_DEADLINE" ;;
+    crash) echo "$CRASH_DEADLINE" ;;
   esac
 }
 STUB_ARGS=()
 [[ -z "$STUB_SCRIPT" ]] || STUB_ARGS=(--stub-script "$STUB_SCRIPT")
 case "$COMMAND" in
-  up | status | down)
+  up | status | down | crash)
     set +e
+    ROLE_ARGS=()
+    [[ -z "$ROLE" ]] || ROLE_ARGS=(--role "$ROLE")
     timeout -k 5 "$(deadline_for "$COMMAND")" "$SELF" "_$COMMAND" --root "$ROOT" --provider "$PROVIDER" --cli "$CLI" \
-      "${STUB_ARGS[@]}" $( ((KEEP)) && echo --keep )
+      "${STUB_ARGS[@]}" "${ROLE_ARGS[@]}" $( ((KEEP)) && echo --keep )
     status=$?
     if [[ $status -eq 124 || $status -eq 137 ]]; then
       echo "isolated-runtime-kit: failed: deadline: $COMMAND did not finish in $(deadline_for "$COMMAND") s" >&2
@@ -1549,6 +1619,7 @@ case "$COMMAND" in
   _up) up ;;
   _status) status ;;
   _down) down ;;
+  _crash) crash ;;
   exec) run_exec "$@" ;;
-  *) refuse "usage: isolated-runtime-kit.sh up|status|exec|down --root DIR ..." ;;
+  *) refuse "usage: isolated-runtime-kit.sh up|status|exec|down|crash --root DIR ..." ;;
 esac
