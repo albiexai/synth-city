@@ -304,6 +304,35 @@ visible and inconclusive, consume no product-failure unit, and cannot satisfy re
 A real failed check in the same observation still charges the head once.
 
 
+### Leader-run standard recoveries
+
+Three recoveries that only the operator API offered are also available to the current Leader, through
+`synth_city_leader_cancel_revision`, `synth_city_leader_finalize_merged` and
+`synth_city_leader_release_workspace` (routes under `POST /github-work-items/{id}/leader-recovery/`:
+`cancel-revision`, `finalize-merged/preview`, `finalize-merged` and `release-workspace`). Each one calls the
+operator service, so it keeps every operator guard, and adds these checks: the caller is the current Leader
+and differs from the owner, there is no pause or HOLD, and a Supervisor is bound.
+
+- **Cancel** needs the revision number, nonce and a reason, and cancels one active or submitted revision.
+- **Finalize merged** first reads fresh merge evidence and a digest (`dry_run`, the default in the tool),
+  then records the merge only if the digest still matches. It performs no merge and releases nothing.
+- **Release workspace** needs the inspected `leased_at`. The item must be terminal and the tree clean, with no
+  unpushed commits. A dirty, unpushed or unreadable tree is refused and stays an operator action.
+
+Every request carries an `operation_id`. The same request again is a replay and never repeats the action; a
+different request under the same id is refused as `operation_conflict`. The action keeps its existing audit
+fact. One notice per action goes to the bound Supervisor, from the Leader's own member identity, with a stable
+key. If the action committed but the notice failed, the response is `recovery_notice_failed` (502), the failure
+is recorded, and repeating the same request sends only the notice. Policy changes, limit raises, approval,
+merge, and dirty or unknown-state releases remain operator-only. These tools grant no other authority.
+
+A refused cancel or finalize that committed nothing frees its `operation_id` for a corrected request. The id is
+freed by one statement that also proves no effect committed, and every execution that rests on the id re-checks
+inside its own transaction that the id still holds its request, so a refused caller cannot erase a winner's record
+or let a conflicting request commit. A HOLD that arrives during these checks stops the action. A release keeps its
+id once it passed the final check, because the credential revoker may have run; repeat the same request to
+replay it, and use a new `operation_id` for a corrected request.
+
 ### Continuation phases
 
 A continuation or amendment request names one phase. The Leader's decision prompt and the recovery proposal

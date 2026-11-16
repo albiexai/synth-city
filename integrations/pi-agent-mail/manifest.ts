@@ -456,6 +456,117 @@ export const manifest = [
     }
   },
   {
+    "name": "synth_city_leader_cancel_revision",
+    "description": "Current Leader cancels one active or submitted revision with every operator guard.\n\n    Replays with the same operation_id are safe; a different request under the same id is refused.\n    One audit fact and one notice to the bound Supervisor are written. This changes no policy or\n    limit and does not approve, retry, release a lease or merge.\n    ",
+    "inputSchema": {
+      "properties": {
+        "work_item_id": {
+          "title": "Work Item Id",
+          "type": "integer"
+        },
+        "revision_number": {
+          "title": "Revision Number",
+          "type": "integer"
+        },
+        "dispatch_nonce": {
+          "title": "Dispatch Nonce",
+          "type": "string"
+        },
+        "operation_id": {
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "work_item_id",
+        "revision_number",
+        "dispatch_nonce",
+        "operation_id",
+        "reason"
+      ],
+      "title": "synth_city_leader_cancel_revisionArguments",
+      "type": "object"
+    }
+  },
+  {
+    "name": "synth_city_leader_finalize_merged",
+    "description": "Current Leader records a merged PR the poll could not settle, from fresh evidence.\n\n    Call with dry_run true (the default) for the evidence and its digest. Then call with dry_run false,\n    the digest, an operation_id and a reason. It performs no merge and releases nothing. Replay-safe;\n    one notice to the bound Supervisor.\n    ",
+    "inputSchema": {
+      "properties": {
+        "work_item_id": {
+          "title": "Work Item Id",
+          "type": "integer"
+        },
+        "operation_id": {
+          "default": "",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "expected_context_sha256": {
+          "default": "",
+          "title": "Expected Context Sha256",
+          "type": "string"
+        },
+        "reason": {
+          "default": "",
+          "title": "Reason",
+          "type": "string"
+        },
+        "dry_run": {
+          "default": true,
+          "title": "Dry Run",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "work_item_id"
+      ],
+      "title": "synth_city_leader_finalize_mergedArguments",
+      "type": "object"
+    }
+  },
+  {
+    "name": "synth_city_leader_release_workspace",
+    "description": "Current Leader releases a CLEAN workspace of a terminal item.\n\n    Refused when the tree is dirty, has unpushed commits or cannot be inspected, when the item is not\n    terminal, or when the lease changed. Dirty or unknown state is operator-only. One notice to the\n    bound Supervisor; replay-safe.\n    ",
+    "inputSchema": {
+      "properties": {
+        "work_item_id": {
+          "title": "Work Item Id",
+          "type": "integer"
+        },
+        "workspace_id": {
+          "title": "Workspace Id",
+          "type": "integer"
+        },
+        "expected_leased_at": {
+          "title": "Expected Leased At",
+          "type": "string"
+        },
+        "operation_id": {
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "work_item_id",
+        "workspace_id",
+        "expected_leased_at",
+        "operation_id",
+        "reason"
+      ],
+      "title": "synth_city_leader_release_workspaceArguments",
+      "type": "object"
+    }
+  },
+  {
     "name": "synth_city_list_bridge_attachments",
     "description": "List recent image attachments for an Agent Bridge tmux target.",
     "inputSchema": {

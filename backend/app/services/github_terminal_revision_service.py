@@ -486,7 +486,8 @@ async def finalize_merged_preview(db, item, scope, read_pull):
             "limits": "Read-only evidence. A finalize records the merge and performs no merge, retry, lease or approval."}
 
 
-async def finalize_merged_item(db, item, scope, read_pull, *, expected_context_sha256, operation_id, reason):
+async def finalize_merged_item(db, item, scope, read_pull, *, expected_context_sha256, operation_id, reason,
+                               decided_by="an operator", actor=None, before_commit=None):
     """Record a merge that the poll cannot settle, from fresh merged-PR evidence and one operator decision.
 
     The PR is read again right before the write and must match the evidence the digest was bound to. It performs
@@ -524,6 +525,18 @@ async def finalize_merged_item(db, item, scope, read_pull, *, expected_context_s
     db.add(GithubMaintenanceEvent(operation_id=operation, work_item_id=item_id,
                                   outcome="merged_item_finalized", request_sha256=request_digest))
     await verification._mark_merged_with_fact(db, item, pull, source="factory_maintenance.finalize_merged_item")
-    item.status_note = "Finalized as merged by an operator: " + audit.sanitize_reason(reason)
+    item.status_note = f"Finalized as merged by {decided_by}: " + audit.sanitize_reason(reason)
+    if actor is not None:
+        # One distinct, idempotent action fact naming the authenticated caller; the merge outcome above is not repeated.
+        await audit.record_event(db, event_kind="leader_recovery_finalize", source="github_terminal_revision_service.finalize_merged_item",
+            occurred_at=datetime.utcnow(), actor=actor, scope_id=scope.id, item_id=item_id, action_outcome="applied",
+            sanitized_reason="merged item finalized by the Leader", operation_id=operation,
+            correlation_id=operation)
+    if before_commit is not None:
+        try:
+            await before_commit()  # a delegated caller's authority fence, in this transaction, right before the commit
+        except BaseException:
+            await db.rollback()
+            raise
     await db.commit()
     return {"status": "finalized", "work_item_id": item_id, **_evidence_now}
