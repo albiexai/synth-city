@@ -58,6 +58,16 @@ describe('Antigravity CLI harness', () => {
     expect(remove.mutations.join('\n')).toContain(HOOKS_FILE)
   })
 
+  it('names the agy-safe MCP server key in its confirmations (#991)', () => {
+    const setup = mailConfirm('antigravity-cli', 'setup', status({})).mutations.join('\n')
+    expect(setup).toContain('MCP server synth-city-mail')
+    expect(setup).not.toContain('MCP server albiex-synth-city-mail')
+    const remove = mailConfirm('antigravity-cli', 'remove', status({})).mutations.join('\n')
+    expect(remove).toContain('MCP server synth-city-mail')
+    // An earlier Synth City entry under the old key is migrated or removed too.
+    expect(remove).toContain('albiex-synth-city-mail')
+  })
+
   it('falls back to the documented file locations when the status has none', () => {
     const value = status({ antigravity_mcp_config_path: null, antigravity_hooks_path: null })
     const text = mailConfirm('antigravity-cli', 'setup', value).mutations.join('\n')

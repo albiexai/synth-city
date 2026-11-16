@@ -22,6 +22,8 @@ export type MailActionHarness = 'claude-code' | 'codex-cli' | 'copilot-cli' | 'o
 export const MAIL_ACTION_HARNESSES: MailActionHarness[] = ['claude-code', 'codex-cli', 'copilot-cli', 'opencode-cli', 'muse-cli', 'antigravity-cli']
 
 // #738: Agent Mail setup does not make an Antigravity member launchable (#736, #952).
+// #991: agy limits mcp_<server>_<tool> to 64 characters, so Antigravity uses a shorter server key.
+const ANTIGRAVITY_SERVER = 'synth-city-mail'
 const ANTIGRAVITY_READINESS = 'blocked: a Mail tool call through agy is not proven yet, and the agent user must complete agy onboarding'
 
 export const HARNESS_NAMES: Record<AgentProviderId, string> = {
@@ -313,7 +315,7 @@ export function mailConfirm(harness: MailActionHarness, mode: MailActionMode, st
         title: 'Install Agent Mail for Antigravity CLI',
         description: 'A backup is attempted before Albiex Synth City adds its MCP server and hooks to the Antigravity CLI user configuration. Team launch readiness stays blocked after setup: a Mail tool call through agy is not proven yet, and the agent user must complete agy onboarding themselves.',
         mutations: [
-          `${status.antigravity_mcp_config_path || '~/.gemini/config/mcp_config.json'}: add MCP server ${server}`,
+          `${status.antigravity_mcp_config_path || '~/.gemini/config/mcp_config.json'}: add MCP server ${ANTIGRAVITY_SERVER} (an earlier Synth City entry ${server} is replaced)`,
           `${status.antigravity_hooks_path || '~/.gemini/config/hooks.json'}: add Agent Mail SessionStart, PreInvocation and ask_question PreToolUse hooks`,
           command,
         ],
@@ -323,7 +325,7 @@ export function mailConfirm(harness: MailActionHarness, mode: MailActionMode, st
         title: 'Remove Agent Mail from Antigravity CLI',
         description: 'A backup is attempted before Albiex Synth City removes its MCP server and hooks. Other servers and hooks stay as they are.',
         mutations: [
-          `${status.antigravity_mcp_config_path || '~/.gemini/config/mcp_config.json'}: remove MCP server ${server}`,
+          `${status.antigravity_mcp_config_path || '~/.gemini/config/mcp_config.json'}: remove MCP server ${ANTIGRAVITY_SERVER} and an earlier Synth City entry ${server}`,
           `${status.antigravity_hooks_path || '~/.gemini/config/hooks.json'}: remove the Agent Mail hook commands`,
         ],
       }
