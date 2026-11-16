@@ -184,6 +184,11 @@ async def supervisor_checkin(db, actor, preset_id: int, next_check_at: datetime,
     # the authenticated caller; do not re-observe or advance the Supervisor clock.
     async with async_sessionmaker(db.bind, expire_on_commit=False)() as observation_db:
         result["team_idle"] = await github_team_idle_service.projection(observation_db, preset_id, now=current)
+        # Unanswered explicit requests (#752), in the same isolated session. A failure of this read
+        # becomes an incomplete view; it never undoes the promise committed above.
+        from app.services.mail_request_stall_service import mail_request_stall_service
+        result["unanswered_requests"] = await mail_request_stall_service.projection(
+            observation_db, preset_id, now=current)
     return result
 
 
@@ -246,10 +251,41 @@ def _is_leader_ack_wait_notice(root) -> bool:
             "work_item_id", "approval_request_id", "leader_slot_id", "supervisor_actor_id")))
 
 
+def _is_auto_merge_not_fired_notice(root) -> bool:
+    payload = root.payload
+    return (getattr(root, "sender_type", None) == "system"
+        and root.sender_member_id is None and root.sender_actor_id is None
+        and root.recipient_member_id is None and root.subject == "Auto-merge did not fire"
+        and isinstance(payload, dict) and set(payload) == {
+            "notice", "work_item_id", "pr_number", "reason", "detail", "head_sha", "supervisor_actor_id"}
+        and payload["notice"] == "auto_merge_not_fired"
+        and all(type(payload[key]) is int and payload[key] > 0 for key in (
+            "work_item_id", "pr_number", "supervisor_actor_id"))
+        and payload["reason"] in {"auto_merge_cap_reached", "item_not_eligible"}
+        and isinstance(payload["detail"], str) and bool(payload["detail"])
+        and (payload["head_sha"] is None or isinstance(payload["head_sha"], str)))
+
+
+def _is_operations_finding_notice(root) -> bool:
+    payload = root.payload
+    return (getattr(root, "sender_type", None) == "system"
+        and root.sender_member_id is None and root.sender_actor_id is None
+        and root.recipient_member_id is None and root.subject == "Operations finding"
+        and isinstance(payload, dict) and set(payload) == {
+            "notice", "finding_id", "kind", "subject", "detail", "supervisor_actor_id"}
+        and payload["notice"] == "operations_finding"
+        and all(type(payload[key]) is int and payload[key] > 0 for key in ("finding_id", "supervisor_actor_id"))
+        and payload["kind"] in {
+            "verifying_after_merge", "item_skipped", "admission_missing", "poll_rolled_back"}
+        and all(isinstance(payload[key], str) and bool(payload[key]) for key in ("subject", "detail")))
+
+
 def is_supervisor_message(root) -> bool:
     return (root.kind == "message" and root.audience_type == "team_preset"
             and (root.sender_member_id is not None or _is_native_wait_notice(root)
-                 or _is_leader_ack_wait_notice(root)) and root.thread_root_id is None
+                 or _is_leader_ack_wait_notice(root) or _is_auto_merge_not_fired_notice(root)
+                 or _is_operations_finding_notice(root))
+            and root.thread_root_id is None
             and isinstance(root.payload, dict) and "supervisor_actor_id" in root.payload)
 
 

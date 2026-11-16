@@ -2,16 +2,16 @@
   "schema_version": 1,
   "source_base_sha": "667841e7e71ea4c1007a4124273bb7c3a6b04869",
   "exact_review_head": "Recorded in external authenticated freeze receipt; no self-referential commit hash",
-  "catalog_sha256": "8124062a55ebb442df8c8db2239e9dba155c7661d6cd7b33bc9f00b0d2b71d8b",
+  "catalog_sha256": "748bcb574c23b43ab329d5a8c75d0e24273e3d099c98d0602f29f5949c232316",
   "source_sha256": {
     "backend/app/models/provider_operations_schemas.py": "53e6e0a3aac830a381e7c06e7157ac3987d60a178e0263859c6792675f101fac",
-    "backend/app/services/provider_readiness_service.py": "cad7cc4ad28b56957c5fc26a53387ee2387b297fb5ba75cb288d8defaf9ac432",
-    "backend/app/services/provider_operations_service.py": "d36ddf686f3eff3ad38f7c53b3bd8cf9e92b59aa3bd1ec65b9ebb36193357211",
+    "backend/app/services/provider_readiness_service.py": "201156c5c01aa200b60fbbde26ed75fdeb1f574828b60832268ee1733a245dd1",
+    "backend/app/services/provider_operations_service.py": "6561533b94e35f78267702262012d70bb8d93c43b37267e4608da014a39bc57d",
     "backend/app/api/v1/providers.py": "1568537ef086cd1188e9b641460a6a50d851a53d3aba7e6eeb6370de6933e2fd",
-    "backend/app/services/agent_team_service.py": "dd95ac9322df5e16a948663a9dbfb755152bb73bf0c614a9d33c835fefb4e139",
+    "backend/app/services/agent_team_service.py": "23be4d5ff6217b1f360c6345d4c88298148180c4eb42d95ff131c8789d73dbab",
     "frontend/tests/fixtures/factory/native-adapters.json": "40e931b0c9d855877595e86539fde51d7506a60169ac2582edd0120e167706fd",
-    "backend/tests/test_provider_operations.py": "ebe6960bea779891fcf96e4a598389197812c08280133c2ed7046cca51f8fa5e",
-    "backend/tests/test_provider_readiness.py": "b847ea811c6c5ab62aa447b09fbd28411be2dd9c9d35f7770bcc565e36dfc43c"
+    "backend/tests/test_provider_operations.py": "e134302bb33cc9fada5d91e637135b40c5ce8f8ada68c497cc191f16c8ee7a70",
+    "backend/tests/test_provider_readiness.py": "6aadc5ca79595db5a5e9fae4d2adcee68c56be92f3466fec25baf42c2095241c"
   },
   "providers": [
     "claude-code",
@@ -19,7 +19,8 @@
     "copilot-cli",
     "opencode-cli",
     "pi-cli",
-    "muse-cli"
+    "muse-cli",
+    "antigravity-cli"
   ],
   "scenarios": [
     "binary_missing",

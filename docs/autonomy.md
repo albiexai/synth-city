@@ -1,6 +1,6 @@
 # Autonomous GitHub dispatch
 
-This guide is for the operator of a Albiex Synth City team. Autonomy is off until you enable it for the team, and a watched repo can also be paused separately.
+This guide is for the operator of an Albiex Synth City team. Autonomy is off until you enable it for the team, and a watched repo can also be paused separately.
 
 ## Before enabling
 
@@ -8,9 +8,34 @@ This guide is for the operator of a Albiex Synth City team. Autonomy is off unti
 2. Assign the Leader explicitly and launch it. Guided repository setup names the Leader slot for a new team. For an existing team, use **Set Leader** on an enabled slot in Roster while team automation is off; the server also requires a quiescent team. The team's `leader_slot_id` supplies Leader authority. Slot order and the Role field do not select it. The Leader approves plans and takes issues that no other slot matches.
 3. Add a watched repo. Give its GitHub owner/name and an existing primary clone under your home directory. Synth City creates a separate issue worktree beside that clone; ordinary slot sessions keep using their own repo path.
 4. Create the dispatch and optional design/area labels on GitHub. Adding the dispatch label queues an issue; an area label routes it to a matching owner. Without one, Synth City uses slot expertise and finally the Leader. A design label on the same issue uses the human-review design pipeline. Removing the dispatch label during an attempt escalates it.
-5. Choose merge policy and finite budgets. Human policy leaves PRs for review. Auto policy merges eligible code PRs after checks pass, subject to the daily cap; design PRs always need human review. Enable autonomy when the roster and watched repos are ready.
+5. Choose merge policy and finite budgets. Human policy leaves PRs for review. Auto policy merges eligible code PRs after checks pass, subject to the daily cap; design PRs always need human review. With Auto policy a code PR also needs the team's reviewer to have accepted its exact current head (a push after the acceptance waits for a new one), and a scope can name a review hold label: while the PR or its issue carries that label, automatic merge is blocked. See [Agent Mail](/features/agent-mail#amend-an-approved-scope-and-end-a-submitted-revision) and the [API workflow](/api/agent-mail) for the exact rules. Enable autonomy when the roster and watched repos are ready.
 
 Synth City polls GitHub every 60 seconds by default. The Activity table refreshes every five seconds while open; it does not trigger another GitHub poll. Issues move through queued, dispatched, verifying, and ready for human review or merged. An escalated issue has stopped and needs attention.
+
+### Stuck work and silent background failures
+
+Synth City watches itself for four conditions that used to be found only by hand. Each opens a finding, shows it, tells the Supervisor once, and clears it when the condition ends:
+
+| Reason code | What it means | When it opens |
+|---|---|---|
+| `verifying_after_merge` | A work item is still verifying although GitHub reports its PR merged. | 15 minutes after GitHub's own merge time; at most 8 PRs are read per poll, and the next poll continues where the last stopped. |
+| `item_skipped` | Verification skipped the same work item. | 5 polls in a row, counted per repository scope. |
+| `admission_missing` | An issue carries the dispatch label but has no work item. | 3 polls in a row, per repository scope. |
+| `poll_rolled_back` | A poll of a repository failed, so everything it had not yet committed was discarded. | At the first failed run; it clears at the next good run. |
+
+The thresholds are fixed in code. A finding holds identifiers and counts only, never a prompt, token or raw error. It is stored together with its notice in one transaction, so a failure leaves neither and the next poll tries again; a condition that appears again after it cleared opens a new finding and a new notice. Detection never blocks the poll or the verification it watches.
+
+While a finding is open, `/api/v1/health` reports `"health": "degraded"` with `reasons` (the codes) and `open_findings`, and `/health` adds the same fields. If the findings store itself cannot be read, both report `findings_unreadable`; a database that holds none of the application's tables yet counts as no findings, but an initialized database that lost the findings table does not. The existing `status` values do not change, because the deploy gate and scripts read them. `/api/v1/health/findings` lists open findings first, then recently resolved ones, and the Overview shows a "Needs a look: operations" card while any is open.
+
+### When automatic merge does not fire
+
+With Auto policy, an accepted code PR can still wait for a human. Synth City now says why, instead of leaving the PR unmerged without a reason.
+
+- **Daily cap reached.** The work item note ends with `[auto_merge_cap_reached: n of N automatic merges in the last 24 hours]`. The Leader side gets the existing "Code PR ready for review" notice with the reason in its payload, and the Supervisor gets one notice. Repeated polls send nothing more. The cap is the per-scope setting **Max auto-merges per day**; the repository settings page shows "n of N in the last 24 hours" next to it.
+- **Escalated item.** An accepted, ready, unheld PR on an escalated item records `[item_not_eligible: escalated: <reason>]` and sends the same two notices once.
+- **Settled diagnostic escalation.** An item that is escalated only because of a completed diagnostic revision, whose PR head is unchanged since it was verified and was accepted by the reviewer, goes back to ready for review once for that head. The normal automatic merge path then applies every gate: hold label, reviewer acceptance of the exact head, Leader approval, the daily cap and green checks. Any other escalation stays with a human.
+
+These notices grant no merge authority.
 
 ### Dispatch priority and queue order
 
@@ -124,6 +149,8 @@ the configured merge policy; human policy still requires human merge. The owner
 context returned by `synth_city_get_work_item_context` includes `review_rework_guidance`;
 that text explains the workflow and does not grant approval.
 
+When the approved plan no longer fits the work, the owner can request a healthy scope amendment instead of escalating: the Leader reviews the new paths, actions and commands, and the owner acknowledges the approval before editing. An approved plan also carries the companion files that normally travel with the files it names (tests, fixtures, docs and generated contracts). Each attempt has fixed limits on approved amendments, amendment requests and added paths. When review requires changes to a submitted revision, the reviewer records a structured disposition for the exact head and the Leader ends that revision, so the owner stays on the same branch and lease. See [Amend an approved scope](/features/agent-mail#amend-an-approved-scope-and-end-a-submitted-revision), the [API workflow](/api/agent-mail#healthy-scope-amendments-and-submitted-review-settlement) and [Companion paths](/guide/supervised-factory-playbook#companion-paths).
+
 This rule applies to nonterminal, non-escalated initial implementation attempts
 with `active_scope_revision=0`. Scoped and diagnostic continuations retain their
 approved paths, commands and finite budgets. Completing one does not grant
@@ -178,3 +205,46 @@ no pre-upgrade idle duration is guessed. Human, native-input and external-check
 waits, OFF/HOLD and incomplete bounded observations suppress this signal. Actual
 progress clears it. Last actor names come from authenticated recorded evidence;
 otherwise the view says Unknown. Idle attention grants no execution authority.
+
+### Unanswered explicit requests
+
+The team summary and the Supervisor check-in also show **unanswered requests**: a pending
+Agent Mail `context_request` or `handoff` that is addressed to an idle member of the team and
+is older than `MAIL_REQUEST_UNANSWERED_SECONDS` (default 1200 seconds, valid 60–86400; an age
+equal to the threshold counts). The team card shows "C1 has not answered L1's request for 25
+min" and the Supervisor line shows a second sentence with the count and the age of the oldest.
+The names are display names only. A subject, a body or a payload is never shown.
+
+- Only an **explicit** request counts. A plain message that asks for something carries no
+  request marker, and Albiex Synth City does not guess from prose. Send a request that needs an
+  answer as a context request addressed to the member directly.
+- A request leaves the view when it is answered, superseded or acknowledged, or when the
+  addressed member sends a plain reply in the request's own thread. A message from any other
+  member, including the requester, never clears it. Approval requests have their own timeout
+  flow and are not listed. A working member is active, so its requests are not listed.
+- The view says when it is **incomplete**, with a fixed reason: `candidate_limit` (more than 64
+  unresolved requests, or older history than the budget below was not examined), `native_unknown` (a member's activity is unknown, stopped or could not be
+  read in time), `ambiguous_legacy_request` (an older request nested inside a thread cannot be
+  matched to a reply), `reply_scan_limit` (the reply check reached its bound) or `entry_limit`
+  (more than 16 unanswered requests; the count of those not listed is shown). A truncated or
+  unproven view is never shown as complete.
+- Requests are examined oldest first, page after page, and a request that is provably answered,
+  including one answered only through an older nested reply in its own thread, is skipped without
+  counting. The first 64 requests that are not provably answered are evaluated, and a 65th means
+  `candidate_limit`. All of the reading shares one budget: 256 reply rows, 512 reads (each examined
+  request is one read) and five seconds. History beyond that budget is reported as incomplete,
+  never as complete, and it is not claimed to have been examined.
+- The signal grants no authority and does not change `team_idle` or the next actor.
+
+### Thread view limits
+
+A thread read returns at most 500 replies. It reads the thread breadth first, by depth and then by
+id, with indexed page reads, so the work depends on the replies kept and not on how many
+descendants exist. The depth bound is 33. A thread with at most 500 replies and a depth below 33
+is returned whole, in the usual order (creation time, then id).
+
+When a thread is **truncated**, the reply list says so with `replies_complete: false` and the
+reason `reply_limit` (more than 500 replies) or `depth_limit` (a reply at depth 33). A truncated
+view holds the 500 replies with the smallest ids by depth and then id. It does **not** hold the
+500 earliest replies by time, and it must not be read that way. The kept replies are still shown
+ordered by creation time and id.

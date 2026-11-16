@@ -2946,6 +2946,52 @@ async def test_muse_launch_sends_the_bootstrap_prompt_only_to_a_new_session(db, 
         assert commands[0][-1].startswith("Custom team startup prompt.")
 
 
+
+AGY_CONVERSATION = "6f1c2b8e-4d3a-4b7f-9c2e-1a2b3c4d5e6f"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["plain", "resume"])
+async def test_antigravity_options_send_the_bootstrap_prompt_only_to_a_new_conversation(db, tmp_path, mode):
+    # The resume prompt rule for `agy --conversation <id>` is not proven (#952), so a resumed member gets none.
+    from app.models.database import AgentTeamSlot
+    from app.services.providers.antigravity_cli import AntigravityCliProvider
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    preset = await agent_team_service.create_preset(db, AgentTeamPresetCreate(
+        name="Antigravity team", slots=[AgentTeamSlotCreate(
+            display_name="Antigravity member", provider="antigravity-cli", repo_path=str(repo),
+            launch_mode=mode,
+            launch_options={"session_id": AGY_CONVERSATION} if mode == "resume" else {})]))
+    slot = await db.get(AgentTeamSlot, preset.slots[0].id)
+    options = agent_team_service._spawn_options_for_slot(slot, "Custom team startup prompt.")
+    command = AntigravityCliProvider().build_spawn_command(options)
+    if mode == "resume":
+        assert options.prompt is None
+        assert command == ["agy", "--conversation", AGY_CONVERSATION]
+    else:
+        assert command == ["agy", "-i", "Custom team startup prompt."]
+
+
+@pytest.mark.asyncio
+async def test_antigravity_launch_plan_is_blocked_until_agent_mail_is_installed(db, tmp_path, monkeypatch):
+    async def install_status():
+        return SimpleNamespace(**{**vars(_ready_install_status()), "antigravity_cli_available": True})
+
+    monkeypatch.setattr(
+        "app.services.agent_team_service.agent_mail_install_service.get_install_status", install_status)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    preset = await agent_team_service.create_preset(db, AgentTeamPresetCreate(
+        name="Antigravity plan", slots=[AgentTeamSlotCreate(
+            display_name="Antigravity member", provider="antigravity-cli", repo_path=str(repo))]))
+    plan = await agent_team_service.plan_launch(db, preset.id)
+    item = plan.items[0]
+    assert item.status == "blocked"
+    assert item.block_code == "agent_mail_not_configured"
+    assert "Agent Mail for Antigravity CLI is not installed yet" in item.reasons
+
 async def _opencode_preset(db, repo, *, launch_mode="plain"):
     return await agent_team_service.create_preset(
         db,

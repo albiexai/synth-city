@@ -48,7 +48,8 @@ def _process_identity(slot, session, workspace):
             or registered > datetime.now(timezone.utc) + timedelta(seconds=5)):
         raise ValueError("owner_generation_unavailable")
     options = slot.launch_options or {}
-    if slot.provider in {"claude-code", "codex-cli", "muse-cli"} and not activity._canonical_session_id(options.get("session_id")):
+    if (slot.provider in {"claude-code", "codex-cli", "muse-cli", "antigravity-cli"}
+            and not activity._canonical_session_id(options.get("session_id"))):
         raise ValueError("owner_native_identity_changed")
     if slot.provider == "claude-code":
         from app.services.claude_activity_service import _identity
@@ -66,6 +67,18 @@ def _process_identity(slot, session, workspace):
         argv = [os.fsdecode(part) for part in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if part]
         resumed = "resume" in argv and argv.index("resume") + 1 < len(argv) and argv[argv.index("resume") + 1] == native_id
         if not native_id or not argv or not is_muse_command(argv[0]) or not resumed:
+            raise ValueError("owner_native_identity_changed")
+    elif slot.provider == "antigravity-cli":
+        from app.services.providers.antigravity_cli import exact_resumed_conversation
+        # Only this provider's exact resume command for the saved conversation; discovery comes with #737.
+        native_id = activity._canonical_session_id(options.get("session_id"))
+        # Keep every argument position; only the final NUL terminator is removed, so an
+        # empty argument reaches the exact parser and is refused.
+        fields = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        if fields and fields[-1] == b"":
+            fields.pop()
+        argv = [os.fsdecode(field) for field in fields]
+        if not native_id or activity._canonical_session_id(exact_resumed_conversation(argv)) != native_id:
             raise ValueError("owner_native_identity_changed")
     elif slot.provider == "pi-cli":
         from app.services.pi_activity_service import _native_process

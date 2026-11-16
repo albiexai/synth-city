@@ -15,6 +15,27 @@ class TerminalRevisionReconcileRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=240)
 
 
+class FinalizeMergedRequest(BaseModel):
+    """One operator request about a merge the poll cannot settle.
+
+    ``dry_run`` (the default is false) reads fresh merge evidence and returns it with the context digest, and
+    changes nothing. A real finalize requires the digest, an operation id and a reason; a missing one is
+    refused here, before any mutation.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+    dry_run: bool = False
+    operation_id: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9_.-]{1,100}$")
+    expected_context_sha256: Optional[str] = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    reason: Optional[str] = Field(default=None, min_length=1, max_length=240)
+
+    @model_validator(mode="after")
+    def _a_real_finalize_names_everything(self):
+        if not self.dry_run and None in (self.operation_id, self.expected_context_sha256, self.reason):
+            raise ValueError("a finalize requires expected_context_sha256, operation_id and reason")
+        return self
+
+
 class ConfigFile(BaseModel):
     """Represents a configuration file."""
 
@@ -1876,6 +1897,33 @@ class TeamIdleItem(BaseModel):
     last_progress_at: datetime
 
 
+UnansweredRequestReason = Literal[
+    "candidate_limit", "native_unknown", "ambiguous_legacy_request", "reply_scan_limit", "entry_limit"]
+
+
+class UnansweredRequestItem(BaseModel):
+    """One pending explicit request that its idle addressee has not answered. Names and ids only."""
+    model_config = ConfigDict(extra="forbid")
+    request_id: int = Field(gt=0)
+    kind: Literal["context_request", "handoff"]
+    requester: str = Field(max_length=80)
+    recipient: str = Field(max_length=80)
+    requested_at: datetime
+    unanswered_seconds: int = Field(ge=0)
+    threshold_seconds: int = Field(ge=1)
+    text: str = Field(max_length=240)
+
+
+class UnansweredRequestView(BaseModel):
+    """The bounded view. It is complete only when nothing was truncated or left unproven."""
+    model_config = ConfigDict(extra="forbid")
+    items: list[UnansweredRequestItem] = Field(default_factory=list)
+    complete: bool = True
+    reason: UnansweredRequestReason | None = None
+    # Known omitted entries within the evaluated candidates; never a total beyond an unscanned bound.
+    omitted_count: int = Field(default=0, ge=0)
+
+
 class SupervisorObservation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status: Literal["none", "healthy", "late", "absent"]
@@ -1887,6 +1935,7 @@ class SupervisorObservation(BaseModel):
     note: str | None
     attention: Literal["Supervisor check-in overdue"] | None
     team_idle: list[TeamIdleItem] = Field(default_factory=list)
+    unanswered_requests: UnansweredRequestView | None = None
 
 
 class SupervisorBindingRequest(BaseModel):
@@ -2022,6 +2071,31 @@ class GithubRevisionReviewCreate(BaseModel):
     summary: str = Field(min_length=1, max_length=12000)
     evidence_url: str = Field(min_length=1, max_length=2000)
     verdict: str = Field(default="changes_required", pattern=r"^(changes_required|accepted)$")
+
+
+class GithubHeadReviewCreate(BaseModel):
+    """An explicit reviewer verdict for the exact current head of a work item's PR; the verdict has no default."""
+
+    dispatch_nonce: str = Field(min_length=1)
+    head_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    verdict: str = Field(pattern=r"^(changes_required|accepted)$")
+    summary: str = Field(min_length=1, max_length=12000)
+    evidence_url: str = Field(min_length=1, max_length=2000)
+
+
+class GithubHeadReviewResponse(BaseModel):
+    id: int
+    work_item_id: int
+    pr_number: int
+    head_sha: str
+    scope_revision: int
+    reviewer_member_id: int
+    verdict: str
+    summary: str
+    evidence_url: str
+    status: str
+    created_at: datetime
+    ended_at: Optional[datetime] = None
 
 
 class GithubRevisionReviewWithdraw(BaseModel):
@@ -2187,6 +2261,9 @@ class MailMessageResponse(BaseModel):
 class MailThreadResponse(BaseModel):
     root: MailMessageResponse
     replies: List[MailMessageResponse] = Field(default_factory=list)
+    # False when the bounded read stopped early; never a complete-looking truncated thread.
+    replies_complete: bool = True
+    replies_incomplete_reason: Optional[Literal["reply_limit", "depth_limit"]] = None
 
 
 class MailInboxResponse(BaseModel):
@@ -2308,6 +2385,7 @@ class AgentMailInstallStatus(BaseModel):
     muse_hooks: List[str] = Field(default_factory=list)
     muse_hooks_missing: List[str] = Field(default_factory=list)
     muse_settings_path: Optional[str] = None
+    antigravity_cli_available: bool = False
     copilot_cli_available: bool = False
     copilot_mcp_installed: bool = False
     copilot_hooks: List[str] = Field(default_factory=list)
@@ -2675,6 +2753,7 @@ class TeamGithubScopeResponse(BaseModel):
     max_concurrent_dispatched: int
     max_verification_retries: int
     max_auto_merges_per_day: int
+    auto_merges_last_24h: Optional[int] = None
     base_ref: str
     builds_out_of_tree: bool
     build_dir_template: Optional[str] = None

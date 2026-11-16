@@ -34,7 +34,8 @@ def test_contract_matrix(provider):
             assert (ROOT / source.split("::")[0]).is_file()
         if operation.state == "conditional":
             assert operation.conditions
-    assert report.readiness.configuration.state == "ready"
+    # Antigravity CLI has no Agent Mail install yet (#736), so its configuration fails closed.
+    assert report.readiness.configuration.state == ("blocked" if provider.id == "antigravity-cli" else "ready")
     assert report.readiness.credentials.state == report.readiness.session.state == "unknown"
     assert report.readiness.credentials.observed_at is None
     if provider.id == "pi-cli":
@@ -53,9 +54,19 @@ def test_contract_matrix(provider):
         assert "Latest/continue is not exact resume" in resume_conditions
 
 
+# Providers the frontend registry does not list yet. Their UI comes with its own issue
+# (antigravity-cli: #738), so they have no native adapter and no page until then.
+NOT_YET_IN_FRONTEND_REGISTRY = {"antigravity-cli"}
+
+
 @pytest.mark.parametrize("provider", get_providers(), ids=lambda p: p.id)
 def test_native_catalog_agrees_with_frozen_p02_adapters(provider):
-    registry = json.loads((ROOT / "frontend/tests/fixtures/factory/native-adapters.json").read_text())["registry"][provider.id]
+    frozen = json.loads((ROOT / "frontend/tests/fixtures/factory/native-adapters.json").read_text())["registry"]
+    if provider.id in NOT_YET_IN_FRONTEND_REGISTRY:
+        assert provider.id not in frozen
+        registry = {}
+    else:
+        registry = frozen[provider.id]
     catalog = ops.native_surfaces(provider)
     for surface, entry in catalog.items():
         if surface not in registry:

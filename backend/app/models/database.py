@@ -1001,6 +1001,28 @@ class GithubRevisionReview(Base):
     settlement_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class GithubHeadReview(Base):
+    """Authenticated reviewer verdict bound to one PR head; the auto-merge gate reads it.
+
+    It grants no source authority. A newer fact for the same work item, nonce, PR and head supersedes older ones.
+    """
+
+    __tablename__ = "github_head_reviews"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    work_item_id: Mapped[int] = mapped_column(Integer, ForeignKey("github_work_items.id", ondelete="CASCADE"), index=True)
+    dispatch_nonce: Mapped[str] = mapped_column(String, nullable=False)
+    pr_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    head_sha: Mapped[str] = mapped_column(String, nullable=False)
+    scope_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    reviewer_member_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    verdict: Mapped[str] = mapped_column(String, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_url: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, default="active", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class FactoryContextKey(Base):
     """Immutable context key allocation for audit history.
 
@@ -1148,3 +1170,39 @@ class FactoryResultCursor(Base):
         Integer, ForeignKey("team_github_scopes.id", ondelete="CASCADE"), primary_key=True)
     last_event_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class OperationsFinding(Base):
+    """A stuck state or silent background failure the factory found in itself (#941).
+
+    One open row per (kind, subject); a resolved row stays as history, and the same condition appearing
+    again opens a new row, so the operator is told once per episode. The detail is public-safe: it names
+    identifiers and counts, never prompts, tokens or raw errors.
+    """
+
+    __tablename__ = "operations_findings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    subject: Mapped[str] = mapped_column(String, nullable=False)
+    scope_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("team_github_scopes.id", ondelete="CASCADE"), nullable=True, index=True)
+    work_item_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("github_work_items.id", ondelete="SET NULL"), nullable=True)
+    detail: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, default="open", nullable=False, index=True)
+    occurrences: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uix_operations_findings_open",
+            "kind",
+            "subject",
+            unique=True,
+            sqlite_where=text("status = 'open'"),
+        ),
+    )

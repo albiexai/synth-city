@@ -161,3 +161,15 @@ def test_claude_primary_checkout_keeps_special_path_characters(monkeypatch, tmp_
     monkeypatch.setattr(trust.subprocess, "run", git)
     assert trust.prepare_workspace_trust("claude-code", str(repo)) is True
     assert list(json.loads((home / ".claude.json").read_text())["projects"]) == [str(primary)]
+
+
+def test_antigravity_trust_is_not_written_until_the_format_is_proven(monkeypatch, tmp_path):
+    # The trustedWorkspaces format and its effect are unobserved (#734 Q6, #952), so nothing is written.
+    trust, home, repo = trust_fixture(monkeypatch, tmp_path)
+    settings = home / ".gemini" / "antigravity-cli" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text('{"keep": true}')
+    assert trust.prepare_workspace_trust("antigravity-cli", str(repo)) is False
+    assert settings.read_text() == '{"keep": true}'
+    assert sorted(path.relative_to(home).as_posix() for path in home.rglob("*")) == [
+        ".gemini", ".gemini/antigravity-cli", ".gemini/antigravity-cli/settings.json"]

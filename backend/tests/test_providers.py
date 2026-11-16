@@ -10,7 +10,7 @@ def test_provider_registry_contains_initial_providers():
 
     provider_ids = {provider.id for provider in get_providers()}
 
-    assert provider_ids == {"claude-code", "codex-cli", "copilot-cli", "opencode-cli", "pi-cli", "muse-cli"}
+    assert provider_ids == {"claude-code", "codex-cli", "copilot-cli", "opencode-cli", "pi-cli", "muse-cli", "antigravity-cli"}
     assert get_provider("claude-code").display_name == "Claude Code"
     assert get_provider("codex-cli").binary_name == "codex"
     assert get_provider("copilot-cli").binary_name == "copilot"

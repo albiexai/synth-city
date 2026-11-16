@@ -8,8 +8,8 @@ def test_provider_registry_smoke_exposes_provider_statuses():
     response = providers_api.list_providers()
 
     provider_ids = {provider["id"] for provider in response["providers"]}
-    assert response["count"] == 6
-    assert provider_ids == {"claude-code", "codex-cli", "copilot-cli", "opencode-cli", "pi-cli", "muse-cli"}
+    assert response["count"] == 7
+    assert provider_ids == {"claude-code", "codex-cli", "copilot-cli", "opencode-cli", "pi-cli", "muse-cli", "antigravity-cli"}
 
     claude_status = providers_api.get_provider_status("claude-code")
     codex_status = providers_api.get_provider_status("codex-cli")
@@ -18,6 +18,9 @@ def test_provider_registry_smoke_exposes_provider_statuses():
     muse_status = providers_api.get_provider_status("muse-cli")
     assert muse_status["capabilities"]["spawn"] is True and muse_status["capabilities"]["resume"] is True
     assert muse_status["capabilities"]["permissions"] is False
+    agy_status = providers_api.get_provider_status("antigravity-cli")
+    assert agy_status["capabilities"]["spawn"] is True and agy_status["capabilities"]["resume"] is True
+    assert agy_status["capabilities"]["mcp"] is False and agy_status["capabilities"]["hooks"] is False
 
     assert claude_status["capabilities"]["sessions"] is True
     assert claude_status["capabilities"]["usage"] is True

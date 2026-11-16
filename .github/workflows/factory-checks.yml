@@ -2,7 +2,7 @@ name: Factory source checks
 
 on:
   pull_request:
-    branches: [master, feature/software-delivery-product-reposition, release/v3.1, release/v4.0, release/v4.1]
+    branches: [master, feature/software-delivery-product-reposition, release/v3.1, release/v4.0, release/v4.1, release/v4.2]
     types: [opened, synchronize, reopened]
 
 permissions:
@@ -27,6 +27,8 @@ jobs:
           python-version: '3.12'
       - name: Reject unclassified old runtime names
         run: python scripts/ci/old_names.py
+      - name: Docs changelog matches CHANGELOG.md
+        run: python scripts/sync-docs-changelog.py --check
   python:
     name: Changed Python undefined names
     runs-on: ubuntu-latest

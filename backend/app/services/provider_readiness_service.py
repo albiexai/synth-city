@@ -40,6 +40,11 @@ def agent_mail_ready_reason(provider: str, install_status: Any) -> str | None:
         if install_status.muse_hooks_missing:
             return "Muse Code Agent Mail hooks are missing"
         return None
+    if provider == "antigravity-cli":
+        if not getattr(install_status, "antigravity_cli_available", False):
+            return "Antigravity CLI is not available on this machine"
+        # Fail closed: Agent Mail for agy is installed by #736, so no member is ready before then.
+        return "Agent Mail for Antigravity CLI is not installed yet"
     if provider == "codex-cli":
         if not install_status.codex_cli_available:
             return "Codex CLI is not available on this machine"
@@ -80,6 +85,7 @@ def configuration_readiness(provider_id: str, display_name: str, installed: bool
         "opencode-cli": {"opencode_cli_available": bool, "opencode_mcp_installed": bool, "opencode_plugin_events_missing": list, "opencode_version_ready": bool},
         "pi-cli": {"pi_mail_ready": bool},
         "muse-cli": {"muse_cli_available": bool, "muse_mcp_installed": bool, "muse_hooks_missing": list},
+        "antigravity-cli": {"antigravity_cli_available": bool},
     }
     expected = fields.get(provider_id)
     if expected is None or (install_status is not None and any(type(getattr(install_status, name, None)) is not kind for name, kind in expected.items())):

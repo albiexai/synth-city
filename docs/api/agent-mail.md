@@ -137,11 +137,23 @@ GET /api/v1/agent-mail/agent/inbox?member_id={member_id}&unread_only=false
 POST /api/v1/agent-mail/hooks/session-start
 POST /api/v1/agent-mail/hooks/user-prompt-submit
 POST /api/v1/agent-mail/hooks/post-tool-use
+POST /api/v1/agent-mail/hooks/pre-tool-use
 POST /api/v1/agent-mail/hooks/session-end
 POST /api/v1/agent-mail/hooks/activity
 ```
 
 Use the MCP tools from agent sessions instead of calling these directly unless you are debugging the integration.
+
+### Pre-tool-use edit guard
+
+`POST /api/v1/agent-mail/hooks/pre-tool-use` backs the Claude Code edit guard. The managed hook sends `tool_name`, `session_id`, `provider` and `team_slot_id`. The route answers one of three things: `{"guard": "allow"}`, a `hookSpecificOutput` with `permissionDecision: "deny"`, or `{"guard": "unavailable"}`. The hook accepts only those; any other answer is treated as unavailable.
+
+The member is the one whose slot owns the tmux pane that the loopback request came from. That is the same kernel-verified pane binding that registration uses. The route never selects a member from a session key or from the claimed slot alone, because native hooks, MCP registration and this hook name sessions differently. A claimed slot that the pane does not confirm, or a pane with no binding, answers `unavailable`.
+
+- It refuses only `Edit`, `Write`, `MultiEdit`, `NotebookEdit` and Mail tools that change state. `synth_city_check_inbox`, `synth_city_whoami` and the `get_`, `list_`, `render_` and `prepare_` tools are never refused.
+- It refuses only while the calling member has an unread message that counts as a stop (see [Edit guard](../features/agent-mail.md#edit-guard-for-unread-stop-and-hold-mail)). Reading the message with `synth_city_check_inbox` lifts the refusal on the next call.
+- Like the other native hooks it is unauthenticated, so the refusal reason names only the message id. It never carries the subject or body.
+- A non-team event, an unguarded tool, or a slot that has not registered yet answers `allow`. A lookup failure or an unverifiable pane answers `unavailable`.
 
 ## Install Endpoints
 
@@ -251,3 +263,34 @@ Closed, unmerged submitted PRs on escalated attempts are superseded by bounded v
 that observation grants neither retry nor lease release. Cancelled or timed-out check runs remain
 visible and inconclusive, consume no product-failure unit, and cannot satisfy required CI.
 A real failed check in the same observation still charges the head once.
+
+
+### Continuation phases
+
+A continuation or amendment request names one phase. The Leader's decision prompt and the recovery proposal
+prompt use this wording:
+
+> Temporary diagnostic changes (instrumentation, hosted log collection, probe edits) use phase `diagnostic` and must be reverted with `revert_diagnostic_changes`. Any change that stays in the PR, including re-adding tests or code, uses phase `implementation` and includes `push_pr_head` plus `request_verification`.
+
+- **Example, `diagnostic`:** add a temporary log line to a probe script and read the hosted run's output. The PR returns to its approved baseline with `revert_diagnostic_changes` before the attempt can continue.
+- **Example, `implementation`:** re-add a test that an earlier revision removed. The test is a permanent change, so the revision allows `push_pr_head` and `request_verification`, and the test stays in the PR.
+
+### Reviewer verdict for the exact head and the auto-merge gate
+
+`synth_city_record_head_review`, or `POST /github-work-items/{id}/head-reviews`, records an explicit
+`accepted` or `changes_required` verdict for the pull request's exact current head. The verdict is
+required and is never inferred from the summary. The request carries the attempt nonce, the 40-character
+head, the verdict, a summary and the link to the source review on this pull request. It covers initial
+attempts and scoped correction heads alike, and it does not replace the revision-review tools or the
+Leader's settlement of a submitted revision.
+
+The recording member comes from the authenticated session. It must be, at that moment, the current
+member of an enabled slot of this team whose role is `verifier`, and it must not be the owner or the
+Leader. A newer fact for the same head supersedes older ones, and an identical replay returns the
+existing fact. A fact grants no source, readiness or merge authority.
+
+With `merge_policy` set to `auto`, a code item merges automatically only when the latest active fact for
+the pull request's current head is `accepted` and its reviewer still qualifies when the gate runs. This
+check does not depend on a required-check watch. The review hold label still blocks first, and the
+gate runs again at the merge boundary. The work view shows the state through the item's status note:
+`Waiting for reviewer acceptance at <sha>`, `Head changed since acceptance (accepted at <sha>, head is <sha>)`, `Reviewer requires changes at <sha>` or `Reviewer accepted head <sha>`.
