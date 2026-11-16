@@ -326,6 +326,13 @@ key. If the action committed but the notice failed, the response is `recovery_no
 is recorded, and repeating the same request sends only the notice. Policy changes, limit raises, approval,
 merge, and dirty or unknown-state releases remain operator-only. These tools grant no other authority.
 
+A refused cancel or finalize that committed nothing frees its `operation_id` for a corrected request. The id is
+freed by one statement that also proves no effect committed, and every execution that rests on the id re-checks
+inside its own transaction that the id still holds its request, so a refused caller cannot erase a winner's record
+or let a conflicting request commit. A HOLD that arrives during these checks stops the action. A release keeps its
+id once it passed the final check, because the credential revoker may have run; repeat the same request to
+replay it, and use a new `operation_id` for a corrected request.
+
 ### Continuation phases
 
 A continuation or amendment request names one phase. The Leader's decision prompt and the recovery proposal

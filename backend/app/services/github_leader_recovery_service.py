@@ -13,7 +13,8 @@ from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import JSON, exists, insert, literal, select
+from sqlalchemy import JSON, delete, exists, insert, literal, select, true
+from sqlalchemy.orm import aliased
 from sqlalchemy.exc import IntegrityError
 
 from app.models.database import (
@@ -54,6 +55,8 @@ class _Ctx:
     session_id: int
     preset_id: int = 0
     supervisor_id: int = 0
+    claim_key: str = ""      # the shared ledger row this execution rests on, and the request it was claimed for
+    claim_digest: str = ""
 
 
 def _digest(*parts: Any) -> str:
@@ -112,6 +115,8 @@ async def _authorize(db, item, session, *, need_supervisor=True):
     if need_supervisor and supervisor is None:
         raise LeaderRecoveryError("supervisor_not_bound")
     await _refuse_observation_pause(db, item.id)
+    if hold_code():  # HOLD may have arrived during the reads above
+        raise LeaderRecoveryError("operator_hold")
     return scope, preset, leader, supervisor
 
 
@@ -154,6 +159,14 @@ async def _assert_authority(db, ctx, *, terminal=False):
     await _refuse_observation_pause(db, ctx.item_id)
     if terminal and row.dispatch_status not in TERMINAL_ITEMS:
         raise LeaderRecoveryError("item_not_terminal")
+    if ctx.claim_key and await db.scalar(select(GithubMaintenanceEvent.id).where(
+            GithubMaintenanceEvent.operation_id == ctx.claim_key,
+            GithubMaintenanceEvent.request_sha256 == ctx.claim_digest)) is None:
+        # Every admitted execution, claimant or replay, commits only while the ledger row it rests on still holds
+        # this request. A cleanup that freed the id meanwhile stops it here, inside its own transaction.
+        raise LeaderRecoveryError("recovery_context_changed")
+    if hold_code():  # the last await is behind us: a HOLD that arrived during these reads must still stop the write
+        raise LeaderRecoveryError("operator_hold")
 
 
 async def _reload(db, *rows):
@@ -186,15 +199,35 @@ async def _claim(db, item_id, kind, operation_id, digest):
     return False
 
 
-async def _unclaim(db, kind, operation_id):
-    """A refused action did nothing, so its id is free again; a corrected request may reuse it."""
+async def _no_effect(db, kind, ctx, operation_id, *, revision_number=None):
+    """The condition 'the action this id claimed has not committed', as SQL the deleting statement evaluates itself."""
+    if kind == "finalize":
+        done = aliased(GithubMaintenanceEvent)
+        return ~exists().where(done.operation_id == f"finalize_merged:{operation_id}")
+    revision_id = await db.scalar(select(GithubAttemptScopeRevision.id).where(
+        GithubAttemptScopeRevision.work_item_id == ctx.item_id,
+        GithubAttemptScopeRevision.revision == revision_number))
+    if revision_id is None:
+        return true()
+    return ~exists().where(
+        FactoryAuditEvent.event_kind == "recovery_cancellation", FactoryAuditEvent.action_outcome == "applied",
+        FactoryAuditEvent.operation_id == f"active_cancellation:revision:{revision_id}")
+
+
+async def _unclaim(db, kind, ctx, operation_id, **proof):
+    """Free an id whose action did nothing, in ONE statement that also proves no effect committed.
+
+    A separate proof read followed by an unconditional delete lets a replay commit in between and lose its
+    ledger row. Here the database evaluates the no-effect condition and deletes under the same write lock, so a
+    row whose action committed is never removed. True means this call freed the id.
+    """
     await db.rollback()
-    event = await db.scalar(select(GithubMaintenanceEvent).where(
+    no_effect = await _no_effect(db, kind, ctx, operation_id, **proof)
+    result = await db.execute(delete(GithubMaintenanceEvent).where(
         GithubMaintenanceEvent.operation_id == f"{KEY}:{kind}:{operation_id}",
-        GithubMaintenanceEvent.outcome == "claimed"))
-    if event is not None:
-        await db.delete(event)
-        await db.commit()
+        GithubMaintenanceEvent.outcome == "claimed", no_effect))
+    await db.commit()
+    return result.rowcount == 1
 
 
 async def _effect_recorded(db, kind, ctx, operation_id, *, revision_number=None, workspace_id=None, leased_at=None):
@@ -220,11 +253,11 @@ async def _abandon(db, kind, ctx, operation_id, replay, **proof):
     effect is recorded and the claim stays.
     """
     await db.rollback()
-    if await _effect_recorded(db, kind, ctx, operation_id, **proof):
-        return True
-    if not replay:
-        await _unclaim(db, kind, operation_id)
-    return False
+    if kind != "release" and not replay and await _unclaim(db, kind, ctx, operation_id, **proof):
+        return False  # the action did not commit and the id is free again
+    # A release claim is kept: its credential revoker may have run, so its binding is never dropped (split B
+    # designs the full protocol). A replay never deletes. Otherwise a winner's committed effect keeps the row.
+    return await _effect_recorded(db, kind, ctx, operation_id, **proof)
 
 
 async def _insert_notice(db, *, preset_id, leader_member_id, supervisor_actor_id, key, subject, body, payload) -> bool:
@@ -278,6 +311,7 @@ async def cancel_revision(db, item, session, *, revision_number, dispatch_nonce,
     scope, preset, _leader, supervisor = await _authorize(db, item, session)
     ctx = replace(ctx, preset_id=preset.id, supervisor_id=supervisor.id)
     digest = _digest("cancel", ctx.item_id, revision_number, dispatch_nonce, reason)
+    ctx = replace(ctx, claim_key=f"{KEY}:cancel:{operation_id}", claim_digest=digest)
     replay = await _existing_claim(db, ctx.item_id, "cancel", operation_id, digest)
     if not replay:
         replay = await _claim(db, ctx.item_id, "cancel", operation_id, digest)
@@ -316,6 +350,7 @@ async def finalize_merged(db, item, session, *, read_pull, operation_id, expecte
     scope, preset, _leader, supervisor = await _authorize(db, item, session)
     ctx = replace(ctx, preset_id=preset.id, supervisor_id=supervisor.id)
     digest = _digest("finalize", ctx.item_id, expected_context_sha256, reason)
+    ctx = replace(ctx, claim_key=f"{KEY}:finalize:{operation_id}", claim_digest=digest)
     replay = await _existing_claim(db, ctx.item_id, "finalize", operation_id, digest)
     if not replay:
         replay = await _claim(db, ctx.item_id, "finalize", operation_id, digest)
@@ -357,6 +392,7 @@ async def release_workspace(db, item, session, *, workspace_id, expected_leased_
     if workspace is None or workspace.scope_id != scope_id:
         raise LeaderRecoveryError("workspace_not_found", 404)
     digest = _digest("release", ctx.item_id, workspace_id, expected_leased_at.isoformat(), reason)
+    ctx = replace(ctx, claim_key=f"{KEY}:release:{operation_id}", claim_digest=digest)
     replay = await _existing_claim(db, ctx.item_id, "release", operation_id, digest)
 
     async def already_released():
@@ -379,9 +415,7 @@ async def release_workspace(db, item, session, *, workspace_id, expected_leased_
     if not _held(workspace, ctx.item_id, expected_leased_at):
         if workspace.leased_item_id != ctx.item_id and await _release_applied(db, workspace_id, expected_leased_at):
             return await already_released()  # a replay released it; the shared claim record stays
-        if not replay:
-            await _unclaim(db, "release", operation_id)
-        raise LeaderRecoveryError("workspace_lease_changed")
+        raise LeaderRecoveryError("workspace_lease_changed")  # the claim is kept: see _abandon
     lease_token = workspace.lease_token
     try:
         released = await github_workspace_service.force_release_acquisition(db, actor_kind="member",
