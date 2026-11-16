@@ -25,6 +25,7 @@ const reasons: Record<string, string> = {
   observation_invalid: 'The native activity observation could not be validated.',
   restart_needed_for_observation: 'This session cannot be observed yet. Restart it in resume mode through Synth City to see its activity. Unknown activity grants no authority.',
   observation_unavailable: 'The controller cannot read or validate this activity observation.',
+  native_wait_unconfirmed: 'The member is waiting on something other than a question. Its activity cannot be confirmed.',
 }
 
 export function AgentActivityBadge({ activity }: { activity?: AgentActivityObservation }) {

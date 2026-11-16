@@ -185,6 +185,7 @@ Each row states the source of every claim.
 |---|---|---|
 | Conversation id from a hook | `SessionStart` carries `conversationId` and `transcriptPath` | official |
 | Conversation id from state | `~/.gemini/antigravity-cli/conversations/<uuid>.db` and `conversation_summaries.db` with `workspace_uris` | issue |
+| Conversation id of a live process | The process holds `presence/<uuid>.lock` open, also after a resume; `workspace_uris` holds the trusted workspace's `file://` URI | observed (#737) |
 | Resume | `--conversation <id>`, "Resume a previous conversation by ID"; `/resume` lists earlier conversations, and the CLI prints the resume command on exit | issue (flag), official (`/resume`, exit message) |
 | On exit | Prints "Resume with -c (or command below):" and `agy --conversation=<id>` | observed |
 | Same conversation resumed exactly | Yes. `agy --conversation <id> -i <prompt>` and `--conversation=<id>` resume the same conversation id with its earlier turns, and deliver the prompt (`lastUserInput`). Without `-i`, nothing is sent. Conversation ids are UUIDs. | observed |
@@ -196,7 +197,11 @@ Each row states the source of every claim.
 | Transcript | `brain/<conversation id>/.system_generated/logs/transcript*.jsonl` | issue |
 | Summaries | `conversation_summaries.db` columns `status` and `not_fully_idle` | issue |
 | `Stop` | `fullyIdle` and `terminationReason` | official |
-| Which source is reliable for working, idle and waiting during a turn | unknown. The hook order above and the `ask_question` wait were observed; no activity classifier was tested (#737). | unknown |
+| Summaries during a turn | `status` `CASCADE_RUN_STATUS_RUNNING` with `not_fully_idle` 1 during a turn, including while waiting; `CASCADE_RUN_STATUS_IDLE` with 0 after it. `step_count` can lag the live steps. | observed (#737) |
+| Live `steps(idx, step_type, status)` | Types 14 user input, 15 planner reply, 101 system message, 132 tool or wait step. Status 3 done; 2 while `run_command` ran (`--dangerously-skip-permissions`); 9 while `ask_question` waited; 6 only after the process exited. | observed (#737) |
+| Transcript records | `step_index`, `source`, `type`, `status`, `created_at` (whole seconds), `tool_calls[].name`; statuses are not updated later; a resume appends | observed (#737) |
+| Permission review, other tools, other modes | Not observed. Synth City reports them as unknown. | unknown |
+| Classifier | Synth City's read-only observer (#737) uses only the observed shapes above. The guard and a screen fallback are deferred. | implemented |
 
 ### Q6: trust and login
 

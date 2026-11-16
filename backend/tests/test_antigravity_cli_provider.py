@@ -37,7 +37,9 @@ def test_registry_and_contract():
 def test_capabilities_claim_only_what_this_provider_implements():
     flags = capability_flags("antigravity-cli")
     assert flags["spawn"] and flags["resume"]
-    assert not any(flags[key] for key in ("mcp", "hooks", "permissions", "sessions", "config"))
+    assert not any(flags[key] for key in ("mcp", "hooks", "permissions", "config"))
+    # Conversation state is observed read-only from the member's own files (#737).
+    assert normalize_capability_matrix("antigravity-cli")["sessions"]["state"] == "read_only"
     matrix = normalize_capability_matrix("antigravity-cli")
     assert matrix["hooks"]["state"] == "unknown"
     assert matrix["permissions"]["state"] == "unknown"

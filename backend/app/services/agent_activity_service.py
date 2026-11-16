@@ -36,6 +36,7 @@ from app.models.schemas import (
 from app.services.pi_activity_service import observe_pi
 from app.services.claude_activity_service import observe_claude
 from app.services.muse_activity_service import discover_muse_session, observe_muse
+from app.services.antigravity_activity_service import discover_antigravity_conversation, observe_antigravity
 
 _TAIL_BYTES = 1_048_576
 _MAX_PROCESS_DESCRIPTORS = 256
@@ -394,9 +395,13 @@ def _observe(slot_id: int, provider: str, session_id: str | None,
             if provenance is not None and provenance.get("session_id"):
                 provenance.update(pane_pid=pid, pane_start=start, provider=provider)
             return result(state, reason, observed_at)
-        if provider == "muse-cli":
+        if provider in {"muse-cli", "antigravity-cli"}:
+            if provider == "antigravity-cli" and duplicate_identity:
+                # Another slot is configured with this conversation: its events cannot be attributed.
+                return result("unknown", "duplicate_native_identity")
             if not session_id:
-                identity = discover_muse_session(pid, cwd)
+                discover = discover_muse_session if provider == "muse-cli" else discover_antigravity_conversation
+                identity = discover(pid, cwd)
                 process_state, current_start = _process(pid)
                 if current_start != start or process_state in _STOPPED_STATES:
                     return result("unknown", "binding_changed")
@@ -406,9 +411,13 @@ def _observe(slot_id: int, provider: str, session_id: str | None,
                               else "session_identity_unavailable")
             if _canonical_session_id(session_id) != session_id:
                 return result("unknown", "session_identity_unavailable")
-            options = {"provenance": provenance} if provenance is not None else {}
-            state, reason, observed_at = observe_muse(
-                pid, session_id, cwd, now, _process_started_at(start), **options)
+            if provider == "muse-cli":
+                options = {"provenance": provenance} if provenance is not None else {}
+                state, reason, observed_at = observe_muse(
+                    pid, session_id, cwd, now, _process_started_at(start), **options)
+            else:
+                state, reason, observed_at = observe_antigravity(
+                    pid, session_id, cwd, now, _process_started_at(start))
             process_state, current_start = _process(pid)
             if current_start != start:
                 return result("unknown", "binding_changed")
@@ -511,7 +520,7 @@ async def _team_inputs(db: AsyncSession, preset_id: int, max_rows: int | None = 
     slots = [row[0] for row in await rows(select(AgentTeamSlot).where(
         AgentTeamSlot.preset_id == preset_id).execution_options(populate_existing=True))]
     options = await rows(select(AgentTeamSlot.launch_options).where(
-        AgentTeamSlot.provider.in_(["codex-cli", "claude-code", "muse-cli"])))
+        AgentTeamSlot.provider.in_(["codex-cli", "claude-code", "muse-cli", "antigravity-cli"])))
     members = [row[0] for row in await rows(select(MailTeamMember).where(
         MailTeamMember.team_preset_id == preset_id).order_by(
             MailTeamMember.updated_at.desc(), MailTeamMember.id.desc()).execution_options(
@@ -716,7 +725,7 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
 
 
 # First-launch session ids that Albiex Synth City discovers from the live process.
-_DISCOVERED_IDENTITY_PROVIDERS = {"codex-cli", "muse-cli"}
+_DISCOVERED_IDENTITY_PROVIDERS = {"codex-cli", "muse-cli", "antigravity-cli"}
 
 
 async def _save_codex_identities(db, inputs, metadata, current) -> bool:
@@ -735,7 +744,7 @@ async def _save_codex_identities(db, inputs, metadata, current) -> bool:
             continue
         duplicate = exists(select(AgentTeamSlot.id).where(
             AgentTeamSlot.id != slot.id,
-            AgentTeamSlot.provider.in_(["claude-code", "codex-cli", "muse-cli"]),
+            AgentTeamSlot.provider.in_(["claude-code", "codex-cli", "muse-cli", "antigravity-cli"]),
             AgentTeamSlot.launch_options["session_id"].as_string() == identity))
         options_match = (or_(AgentTeamSlot.launch_options.is_(None),
                              AgentTeamSlot.launch_options == JSON.NULL)

@@ -71,7 +71,8 @@ def _process_identity(slot, session, workspace):
             raise ValueError("owner_native_identity_changed")
     elif slot.provider == "antigravity-cli":
         from app.services.providers.antigravity_cli import exact_resumed_conversation
-        # Only this provider's exact resume command for the saved conversation; discovery comes with #737.
+        # Only this provider's exact resume command for the saved conversation. A first plain launch is
+        # identified by the activity observer from the process's presence lock (#737).
         native_id = activity._canonical_session_id(options.get("session_id"))
         # Keep every argument position; only the final NUL terminator is removed, so an
         # empty argument reaches the exact parser and is refused.
