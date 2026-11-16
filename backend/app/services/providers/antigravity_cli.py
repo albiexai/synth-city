@@ -40,7 +40,8 @@ def exact_resumed_conversation(argv: Sequence[str]) -> str | None:
     ``agy [--model <m>] [--effort <tier>] [--dangerously-skip-permissions] --conversation <uuid> [-i <prompt>]``.
     """
     argv = list(argv)
-    if len(argv) >= 5 and argv[-2] == "-i" and not argv[-1].startswith("-"):
+    # The builder adds `-i` only for a nonempty prompt that does not start with "-".
+    if len(argv) >= 5 and argv[-2] == "-i" and argv[-1] and not argv[-1].startswith("-"):
         argv = argv[:-2]
     if len(argv) < 3 or not is_agy_executable(argv[0]) or argv[-2] != "--conversation":
         return None
