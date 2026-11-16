@@ -230,3 +230,120 @@ async def test_an_acceptance_from_a_reviewer_who_is_no_longer_a_verifier_does_no
     await case.tick()
     assert case.client.merge_calls == 0 and case.item.dispatch_status == "verifying"
     assert "no longer from a current verifier" in case.item.status_note
+
+
+# --- V1 review 5914280179: the settled context is fenced across awaits and at the merge boundary ---------------
+
+from sqlalchemy import update as _update  # noqa: E402
+
+from app.models.database import GithubWorkItem, TeamGithubScope  # noqa: E402
+from tests.agent_teams.test_head_acceptance import twin  # noqa: E402,F401  (fixture)
+
+WITHDRAWALS = ["revision_superseded", "submitted_head_changed", "completed_at_cleared", "scope_disabled",
+               "attempt_replaced"]
+
+
+def _withdraw(case, kind):
+    revision_id, scope_id, item_id = case.revision.id, case.scope.id, case.item.id
+    if kind == "revision_superseded":
+        return _update(GithubAttemptScopeRevision).where(GithubAttemptScopeRevision.id == revision_id).values(
+            status="superseded")
+    if kind == "submitted_head_changed":
+        return _update(GithubAttemptScopeRevision).where(GithubAttemptScopeRevision.id == revision_id).values(
+            submitted_head_sha=OTHER)
+    if kind == "completed_at_cleared":
+        return _update(GithubAttemptScopeRevision).where(GithubAttemptScopeRevision.id == revision_id).values(
+            completed_at=None)
+    if kind == "scope_disabled":
+        return _update(TeamGithubScope).where(TeamGithubScope.id == scope_id).values(enabled=False)
+    return _update(GithubWorkItem).where(GithubWorkItem.id == item_id).values(dispatch_nonce="a-newer-attempt")
+
+
+def _withdraw_during(case, maker, kind, call_number):
+    """Run the change through a second connection while the Nth check read is awaited."""
+    original, state = case.client.list_check_runs_for_ref, {"calls": 0}
+    statement = _withdraw(case, kind)
+
+    async def racing(owner, repo, ref):
+        state["calls"] += 1
+        if state["calls"] == call_number:
+            async with maker() as other:
+                await other.execute(statement)
+                await other.commit()
+        return await original(owner, repo, ref)
+
+    case.client.list_check_runs_for_ref = racing
+    return state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", WITHDRAWALS)
+async def test_a_withdrawal_during_the_first_check_read_promotes_and_merges_nothing(twin, kind):
+    db, maker = twin
+    case = await settled_case(db)
+    state = _withdraw_during(case, maker, kind, 1)
+    await case.tick()
+    assert state["calls"] >= 1
+    assert case.client.merge_calls == 0 and case.item.dispatch_status != "merged"
+    assert case.item.dispatch_status == "verifying" and case.item.last_verified_sha is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", WITHDRAWALS)
+async def test_a_withdrawal_during_a_later_read_before_the_merge_does_not_merge(twin, kind):
+    db, maker = twin
+    case = await settled_case(db)
+    state = _withdraw_during(case, maker, kind, 2)
+    await case.tick()
+    assert state["calls"] >= 2, "the merge path must read the checks again"
+    assert case.client.merge_calls == 0 and case.item.dispatch_status != "merged"
+
+
+@pytest.mark.asyncio
+async def test_with_no_withdrawal_the_two_connection_flow_still_merges(twin):
+    db, maker = twin
+    case = await settled_case(db)
+    state = _withdraw_during(case, maker, "revision_superseded", 99)  # never fires
+    await case.tick()
+    assert state["calls"] >= 2
+    assert case.item.dispatch_status == "merged" and case.client.merge_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a_concurrent_switch_to_the_human_policy_still_never_auto_merges(twin):
+    db, maker = twin
+    case = await settled_case(db)
+    scope_id = case.scope.id
+    original, done = case.client.list_check_runs_for_ref, {"fired": False}
+
+    async def racing(owner, repo, ref):
+        if not done["fired"]:
+            done["fired"] = True
+            async with maker() as other:
+                await other.execute(_update(TeamGithubScope).where(TeamGithubScope.id == scope_id)
+                                    .values(merge_policy="human"))
+                await other.commit()
+        return await original(owner, repo, ref)
+
+    case.client.list_check_runs_for_ref = racing
+    await case.tick()
+    assert case.client.merge_calls == 0 and case.item.dispatch_status != "merged"
+
+
+@pytest.mark.asyncio
+async def test_the_terminal_writer_is_taken_once_before_the_promotion_is_written(db, monkeypatch):
+    import app.services.github_verification_service as module
+
+    calls = []
+    real = module.lock_terminal_transition
+
+    async def counting(db_, item_):
+        calls.append(item_.dispatch_status)
+        return await real(db_, item_)
+
+    monkeypatch.setattr(module, "lock_terminal_transition", counting)
+    case = await settled_case(db, policy="human")
+    monkeypatch.setattr(service, "_notify_code_pr_ready_for_review", AsyncMock())
+    await case.tick()
+    assert calls == ["verifying"], calls  # the item was still verifying when the writer was taken
+    assert case.item.dispatch_status == "ready_for_review"

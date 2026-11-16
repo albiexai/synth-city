@@ -1676,6 +1676,11 @@ class GithubVerificationService:
         head = self._head_sha(pull)
         if not isinstance(head, str) or not head:
             return
+        # What the decision rests on is captured before any awaited read and compared again under the terminal
+        # writer, so a context withdrawn while GitHub was awaited is never promoted.
+        item_before = {name: getattr(item, name) for name in _SETTLEMENT_ITEM_IDENTITY}
+        scope_before = {name: getattr(scope, name) for name in _SETTLEMENT_SCOPE_IDENTITY}
+        revision_before = {column.name: getattr(revision, column.name) for column in revision.__table__.columns}
         reason = None
         if head != revision.submitted_head_sha:
             reason = (f"Settled revision not promoted: the PR head {head[:7]} is not the settled head "
@@ -1694,7 +1699,70 @@ class GithubVerificationService:
                 item.updated_at = datetime.utcnow()
                 await db.commit()
             return
-        await self._promote_verified_item(db, scope, item, client, pull, head)
+        policy_guard = policy_context(item)
+        if not await claim_policy_context(db, item, policy_guard):
+            return
+        fresh = await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
+        if not await self._validate_polled_pull_identity(
+            db, scope, item, client, fresh, retry_status=item.dispatch_status,
+        ):
+            return
+        if self._head_sha(fresh) != head:
+            await self._record_readiness_hold(
+                db, item, "Head changed before readiness; verifying the current head.")
+            return
+        readiness_note = self._draft_readiness_note(item, fresh)
+        if readiness_note is not None:
+            item.last_verified_sha = head
+            await self._record_readiness_hold(db, item, readiness_note)
+            return
+        # No network call from here to the commit: the writer is held only for the compare and the write.
+        await lock_terminal_transition(db, item)
+        await db.refresh(item)
+        await db.refresh(scope)
+        await db.refresh(revision)
+        if ({name: getattr(item, name) for name in _SETTLEMENT_ITEM_IDENTITY} != item_before
+                or {name: getattr(scope, name) for name in _SETTLEMENT_SCOPE_IDENTITY} != scope_before
+                or {column.name: getattr(revision, column.name) for column in revision.__table__.columns}
+                != revision_before
+                or revision.status != "completed" or revision.completed_at is None
+                or revision.submitted_head_sha != head):
+            raise TerminalRevisionContextChanged("terminal_revision_context_changed")
+        item.last_verified_sha = head
+        item.dispatch_status = "ready_for_review"
+        item.status_note = f"PR #{item.pr_number} is ready for review."
+        item.updated_at = datetime.utcnow()
+        if scope.merge_policy == "human":
+            await self._notify_code_pr_ready_for_review(db, item)
+        await db.commit()
+        await self._process_review_item(db, scope, item, client, pull=fresh)
+
+    @staticmethod
+    async def _settled_context_note(db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem,
+                                    head: str) -> str | None:
+        """Why a merge must not go ahead because the settlement or the scope it rested on was withdrawn, or ``None``.
+
+        Read fresh, column by column, so a change another connection committed while GitHub was awaited is seen.
+        Only an item that has a scoped revision row is judged: its revision must still be completed, with its
+        completion time and the very head being merged, and the scope must still be enabled.
+        """
+        if not item.active_scope_revision:
+            return None
+        row = (await db.execute(
+            select(GithubAttemptScopeRevision.status, GithubAttemptScopeRevision.completed_at,
+                   GithubAttemptScopeRevision.submitted_head_sha, GithubAttemptScopeRevision.phase)
+            .where(GithubAttemptScopeRevision.work_item_id == item.id,
+                   GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce,
+                   GithubAttemptScopeRevision.revision == item.active_scope_revision)
+        )).first()
+        if row is None or row.phase != "implementation":
+            return None
+        enabled = await db.scalar(select(TeamGithubScope.enabled).where(TeamGithubScope.id == scope.id))
+        if (row.status != "completed" or row.completed_at is None or row.submitted_head_sha != head
+                or enabled is not True):
+            return ("Auto-merge blocked: the settled revision or the scope changed since promotion; "
+                    "verifying the current state.")
+        return None
 
     @staticmethod
     def _require_pull_shape(pull: object) -> None:
@@ -2743,6 +2811,10 @@ class GithubVerificationService:
             await self._fallback_to_human_merge(
                 db, item, "Auto-merge blocked: distinct current-round leader approval is "
                 f"required ({approval_reason}).")
+            return
+        withdrawn = await self._settled_context_note(db, scope, item, current_head)
+        if withdrawn is not None:
+            await self._record_readiness_hold(db, item, withdrawn)
             return
         try:
             await client.merge_pull(
