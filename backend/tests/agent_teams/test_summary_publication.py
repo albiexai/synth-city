@@ -956,3 +956,17 @@ async def test_a_pull_that_is_already_merged_when_rendered_is_still_published_as
             await db.commit()
         assert await service.publish_pull(db, scope, number, client) == "created"
     assert f"merged as `{OTHER}`" in next(iter(client.comments.values()))["body"]
+
+
+@pytest.mark.asyncio
+async def test_a_released_merged_item_is_published_without_any_workspace_row(fx):
+    """#976: the comment publisher reads recorded facts and GitHub only, so a released item (no workspace) publishes."""
+    from app.models.database import GithubWorkspace
+    async with fx.maker() as db:
+        assert (await db.execute(select(GithubWorkspace))).scalars().all() == []
+        await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == fx.item_id).values(dispatch_status="merged"))
+        await db.commit()
+    client = FakeGithub(state="closed", merged=True, merge_commit_sha=OTHER)
+    assert await _publish(fx, client) == "created"
+    assert f"merged as `{OTHER}`" in next(iter(client.comments.values()))["body"]
+    assert await _publish(fx, client) in {"unchanged", "skipped"}

@@ -31,6 +31,7 @@ from app.services.github_work_progress_observation import (
 )
 
 _SHA = re.compile(r"[0-9a-f]{40}")
+_TERMINAL_REPORT_STATUSES = frozenset({"merged", "completed", "closed"})
 _REPO_PART = re.compile(r"[A-Za-z0-9_.-]{1,100}")
 _REF = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,250}")
 _CACHE_SECONDS = 15
@@ -404,6 +405,14 @@ class GithubWorkProgressService:
             context = ReportContext(work_item_id=item_id, dispatch_nonce=item.dispatch_nonce,
                 owner_slot_id=item.owner_slot_id, scope_revision=item.active_scope_revision,
                 source_sha=publication.local_sha, phase=phase)
+        elif (item.dispatch_status in _TERMINAL_REPORT_STATUSES and final_workspace is None
+                and check_head is not None and item.dispatch_nonce and item.owner_slot_id
+                and _base_identity(item, scope) == started_identity):
+            # A merged or closed item has no workspace to observe, so the local-sha rule above can never hold.
+            # Its report is bound to the recorded verified head instead; every other binding is unchanged.
+            context = ReportContext(work_item_id=item_id, dispatch_nonce=item.dispatch_nonce,
+                owner_slot_id=item.owner_slot_id, scope_revision=item.active_scope_revision,
+                source_sha=check_head, phase=phase)
         issue_url = (f"https://github.com/{scope.repo_owner}/{scope.repo_name}/issues/{item.issue_number}#work-remaining"
                      if all(_REPO_PART.fullmatch(part or "") and part not in {".", ".."}
                             for part in (scope.repo_owner, scope.repo_name)) else None)

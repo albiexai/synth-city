@@ -9,7 +9,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
-from sqlalchemy import select, update
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.database import Base, get_db
@@ -631,3 +631,115 @@ async def test_remaining_context_requires_current_scoped_leader_and_rechecks_aft
         monkeypatch.setattr(api, "github_work_progress_service", GithubWorkProgressService(ClosingObserver(), ReportClient(item)))
         closed = await http.get(path, headers={"X-Synth-City-Session-Token": "leader-token"})
         assert closed.status_code == 409 and closed.json()["detail"] == "leader_unavailable"
+
+
+# --- #976: the remaining-work context of a TERMINAL item after its workspace is released -----------------------
+
+async def _released(db, status="merged", last_verified=SHA):
+    item, scope, preset, workspace = await seed(db)
+    item.dispatch_status = status
+    item.last_verified_sha = last_verified
+    workspace.leased_item_id = None
+    workspace.lease_token = None
+    await db.commit()
+    return item, scope, preset, workspace
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["merged", "completed", "closed"])
+async def test_a_terminal_released_item_still_has_a_remaining_work_context(db, status):
+    item, *_ = await _released(db, status)
+    result = await GithubWorkProgressService(Observer(), Client()).summary(db, item.id)
+    context = result.remaining_work_context
+    assert context is not None, "the Leader cannot prepare the post-merge summary (409 progress_context_unavailable)"
+    assert (context.work_item_id, context.dispatch_nonce, context.owner_slot_id) == (
+        item.id, item.dispatch_nonce, item.owner_slot_id)
+    assert (context.scope_revision, context.source_sha) == (item.active_scope_revision, SHA)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["no_verified_head", "bad_verified_head", "nonterminal", "workspace_still_leased"])
+async def test_the_terminal_context_is_withheld_without_recorded_facts(db, case):
+    status = "dispatched" if case == "nonterminal" else "merged"
+    verified = None if case == "no_verified_head" else ("not-a-sha" if case == "bad_verified_head" else SHA)
+    item, scope, preset, workspace = await _released(db, status, verified)
+    if case == "workspace_still_leased":
+        workspace.leased_item_id, workspace.lease_token = item.id, "private-lease-value"
+        await db.commit()
+    result = await GithubWorkProgressService(Observer(), Client()).summary(db, item.id)
+    # a leased workspace keeps the existing rule (local and published sha must match): here they differ
+    assert result.remaining_work_context is None
+
+
+@pytest.mark.asyncio
+async def test_the_terminal_context_publishes_no_authority_value(db):
+    item, *_ = await _released(db)
+    result = await GithubWorkProgressService(Observer(), Client()).summary(db, item.id)
+    text = result.model_dump_json()
+    assert "private-lease-value" not in text and "/safe/repo" not in text
+    assert result.remaining_work_context is not None  # the context carries the nonce the existing report protocol binds
+
+
+@pytest.mark.asyncio
+async def test_a_changed_identity_during_the_terminal_read_gives_no_context(db, monkeypatch):
+    item, *_ = await _released(db)
+    service = GithubWorkProgressService(Observer(), Client())
+    real = service._rows
+    state = {"calls": 0}
+
+    async def rows(session, item_id, final=False):
+        state["calls"] += 1
+        if final:
+            row = await session.get(GithubWorkItem, item_id, populate_existing=True)
+            row.dispatch_nonce = "a-different-dispatch"
+            await session.commit()
+        return await real(session, item_id, final=final)
+    monkeypatch.setattr(service, "_rows", rows)
+    result = await service.summary(db, item.id)
+    assert result.remaining_work_context is None
+
+
+@pytest.mark.asyncio
+async def test_the_leader_route_returns_the_terminal_context_after_release_and_keeps_its_fences(db, monkeypatch):
+    from app.config import settings
+    from app.models.database import MailAgentSession, MailTeamMember
+    from app.services.agent_mail_service import agent_mail_service
+    item, scope, preset, workspace = await seed(db)
+    monkeypatch.setattr(settings, "mail_capability_tokens_required", True)
+    monkeypatch.setattr("app.utils.peer_process.pane_is_alive", lambda *_: True)
+    owner_slot = await db.get(AgentTeamSlot, item.owner_slot_id)
+    owner_slot.position = 1
+    slot = AgentTeamSlot(preset_id=preset.id, position=0, display_name="Leader", role="Leader",
+        provider="codex-cli", repo_id="repo", repo_path="/safe/leader", repo_name="repo")
+    db.add(slot); await db.flush()
+    preset.leader_slot_id = slot.id
+    member = MailTeamMember(identity_key="leader", repo_id="repo", repo_path=slot.repo_path,
+        repo_name="repo", display_name="Leader", participant_kind="team_slot", team_preset_id=preset.id, team_slot_id=slot.id)
+    db.add(member); await db.flush()
+    leader = MailAgentSession(member_id=member.id, provider="codex-cli", source="mcp", session_key="leader",
+        team_preset_id=preset.id, team_slot_id=slot.id, capability_token_hash=agent_mail_service.hash_capability_token("leader-token"),
+        bound_pane_pid=1234, bound_pane_proc_start="1", wake_enabled=True)
+    outsider = MailAgentSession(member_id=member.id, provider="codex-cli", source="mcp", session_key="outsider",
+        capability_token_hash=agent_mail_service.hash_capability_token("other-token"))
+    db.add_all([leader, outsider])
+    item.dispatch_status, item.last_verified_sha = "merged", SHA
+    workspace.leased_item_id, workspace.lease_token = None, None
+    await db.commit()
+    app = FastAPI(); app.include_router(api.router)
+    async def session(): yield db
+    app.dependency_overrides[get_db] = session
+    monkeypatch.setattr(api, "github_work_progress_service", GithubWorkProgressService(Observer(), Client()))
+    path = f"/github-work-items/{item.id}/remaining-work-context"
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http:
+        assert (await http.get(path)).status_code == 401
+        assert (await http.get(path, headers={"X-Synth-City-Session-Token": "other-token"})).status_code == 403
+        response = await http.get(path, headers={"X-Synth-City-Session-Token": "leader-token"})
+        assert response.status_code == 200, response.text
+        context = response.json()["remaining_work_context"]
+        assert context["source_sha"] == SHA and context["owner_slot_id"] == item.owner_slot_id
+        assert "private-lease-value" not in response.text and "/safe/repo" not in response.text
+        # the verified head is gone from the record: the same route refuses again instead of inventing a context
+        item.last_verified_sha = None
+        await db.commit()
+        refused = await http.get(path, headers={"X-Synth-City-Session-Token": "leader-token"})
+        assert refused.status_code == 409 and refused.json()["detail"] == "progress_context_unavailable"
