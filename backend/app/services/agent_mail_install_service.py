@@ -851,6 +851,8 @@ async def _backup_before_mutation(db: AsyncSession, scope: str) -> None:
             ]
         elif scope == "muse":
             paths = [muse_settings_path()]
+        elif scope == "antigravity":
+            paths = [antigravity_mcp_config_path(), antigravity_hooks_path()]
         elif scope == "copilot":
             paths = [
                 get_copilot_home() / "mcp-config.json",
@@ -980,6 +982,99 @@ def _muse_hook_entry(slug: str) -> dict:
     return {"hooks": [{"type": "command", "command": muse_hook_command(slug), "timeout": 2}]}
 
 
+# Antigravity CLI (#736), from the behaviour #952 and #736 P1 observed on agy 1.5.9. A named
+# group per hook; events without a matcher take flat command entries (a {"hooks": [...]} wrapper
+# there is rejected), and PreToolUse takes a matcher group. PreInvocation fires on every turn,
+# including a resumed conversation, which SessionStart does not.
+ANTIGRAVITY_MAIL_HOOKS = {
+    "SessionStart": ("albiex-synth-city-mail-session-start", "session-start", None),
+    "PreInvocation": ("albiex-synth-city-mail-pre-invocation", "user-prompt-submit", None),
+    "PreToolUse": ("albiex-synth-city-mail-question", "pre-tool-use", "ask_question"),
+}
+
+
+def antigravity_config_dir() -> Path:
+    from app.services.providers.antigravity_cli import antigravity_home
+    return antigravity_home() / "config"
+
+
+def antigravity_mcp_config_path() -> Path:
+    return antigravity_config_dir() / "mcp_config.json"
+
+
+def antigravity_hooks_path() -> Path:
+    return antigravity_config_dir() / "hooks.json"
+
+
+def antigravity_hook_command(slug: str) -> str:
+    return provider_hook_command("antigravity-cli", slug)
+
+
+def _antigravity_mcp_entry() -> dict:
+    # The plain stdio shape agy loaded in #736 P1: no "type" or "transport" field.
+    return {"command": sys.executable, "args": [shim_path()],
+            "env": {"SYNTH_CITY_URL": synth_city_base_url(), "SYNTH_CITY_PROVIDER": "antigravity-cli"}}
+
+
+def _antigravity_hook_group(event: str) -> dict:
+    _name, slug, matcher = ANTIGRAVITY_MAIL_HOOKS[event]
+    entry = {"type": "command", "command": antigravity_hook_command(slug), "timeout": 5}
+    return {event: [{"matcher": matcher, "hooks": [entry]}] if matcher else [entry]}
+
+
+def _load_antigravity_json(path: Path, label: str) -> dict:
+    """A missing or empty file is an empty document; anything else must be a JSON object."""
+    if not path.exists():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+        doc = json.loads(text) if text.strip() else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read the Antigravity CLI {label}: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise ValueError(f"The Antigravity CLI {label} must contain a JSON object")
+    return doc
+
+
+def _load_antigravity_mcp() -> dict:
+    doc = _load_antigravity_json(antigravity_mcp_config_path(), "MCP configuration")
+    if "mcpServers" in doc and not isinstance(doc["mcpServers"], dict):
+        raise ValueError("The Antigravity CLI MCP field 'mcpServers' must be a JSON object")
+    return doc
+
+
+def _load_antigravity_hooks() -> dict:
+    doc = _load_antigravity_json(antigravity_hooks_path(), "hooks file")
+    for name, group in doc.items():
+        if not isinstance(group, dict):
+            raise ValueError(f"The Antigravity CLI hook group '{name}' must be a JSON object")
+    return doc
+
+
+def _write_antigravity_json(path: Path, doc: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".deck-tmp")
+    temporary.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def antigravity_mcp_installed() -> bool:
+    try:
+        entry = _load_antigravity_mcp().get("mcpServers", {}).get(MCP_SERVER_NAME)
+    except ValueError:
+        return False
+    return isinstance(entry, dict) and shim_path() in entry.get("args", [])
+
+
+def installed_antigravity_hooks() -> list[str]:
+    try:
+        doc = _load_antigravity_hooks()
+    except ValueError:
+        return []
+    return [event for event, (name, _slug, _matcher) in ANTIGRAVITY_MAIL_HOOKS.items()
+            if doc.get(name) == _antigravity_hook_group(event)]
+
+
 
 async def get_install_status() -> AgentMailInstallStatus:
     from app.services.opencode_version import REASON_REQUIRED, opencode_version_gate
@@ -999,6 +1094,7 @@ async def get_install_status() -> AgentMailInstallStatus:
     codex_hook_events = installed_codex_hooks()
     codex_missing = [event for event in CODEX_MAIL_HOOK_EVENTS if event not in codex_hook_events]
     muse_hook_events = installed_muse_hooks()
+    antigravity_hook_events = installed_antigravity_hooks()
     muse_missing = [event for event in MUSE_MAIL_HOOK_EVENTS if event not in muse_hook_events]
     copilot_hook_events = installed_copilot_hooks()
     copilot_missing = [
@@ -1029,6 +1125,11 @@ async def get_install_status() -> AgentMailInstallStatus:
         muse_hooks_missing=muse_missing,
         muse_settings_path=str(muse_settings_path()),
         antigravity_cli_available=antigravity_cli_available(),
+        antigravity_mcp_installed=antigravity_mcp_installed(),
+        antigravity_hooks=antigravity_hook_events,
+        antigravity_hooks_missing=[event for event in ANTIGRAVITY_MAIL_HOOKS if event not in antigravity_hook_events],
+        antigravity_mcp_config_path=str(antigravity_mcp_config_path()),
+        antigravity_hooks_path=str(antigravity_hooks_path()),
         copilot_cli_available=copilot_cli_available(),
         copilot_mcp_installed=copilot_mcp_installed(),
         copilot_hooks=copilot_hook_events,
@@ -1424,4 +1525,35 @@ async def uninstall_muse(db: AsyncSession) -> AgentMailInstallStatus:
         doc.pop("hooks", None)
     if changed:
         _write_muse_settings(doc)
+    return await get_install_status()
+
+
+async def apply_antigravity_install(db: AsyncSession) -> AgentMailInstallStatus:
+    _require_upgrade_complete("antigravity-cli")
+    if not antigravity_cli_available():
+        raise ValueError("Antigravity CLI is not available on this machine")
+    # Both files are read and checked before anything is backed up or written.
+    mcp = _load_antigravity_mcp()
+    hooks = _load_antigravity_hooks()
+    await _backup_before_mutation(db, "antigravity")
+    mcp.setdefault("mcpServers", {})[MCP_SERVER_NAME] = _antigravity_mcp_entry()
+    for event, (name, _slug, _matcher) in ANTIGRAVITY_MAIL_HOOKS.items():
+        hooks[name] = _antigravity_hook_group(event)
+    _write_antigravity_json(antigravity_mcp_config_path(), mcp)
+    _write_antigravity_json(antigravity_hooks_path(), hooks)
+    return await get_install_status()
+
+
+async def uninstall_antigravity(db: AsyncSession) -> AgentMailInstallStatus:
+    _require_upgrade_complete("antigravity-cli")
+    if not antigravity_mcp_config_path().exists() and not antigravity_hooks_path().exists():
+        return await get_install_status()
+    mcp = _load_antigravity_mcp()
+    hooks = _load_antigravity_hooks()
+    await _backup_before_mutation(db, "antigravity")
+    if mcp.get("mcpServers", {}).pop(MCP_SERVER_NAME, None) is not None:
+        _write_antigravity_json(antigravity_mcp_config_path(), mcp)
+    removed = [name for name, *_rest in ANTIGRAVITY_MAIL_HOOKS.values() if hooks.pop(name, None) is not None]
+    if removed:
+        _write_antigravity_json(antigravity_hooks_path(), hooks)
     return await get_install_status()

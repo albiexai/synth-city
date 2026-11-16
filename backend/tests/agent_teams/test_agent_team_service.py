@@ -2975,9 +2975,15 @@ async def test_antigravity_options_send_the_bootstrap_prompt_only_to_a_new_conve
 
 
 @pytest.mark.asyncio
-async def test_antigravity_launch_plan_is_blocked_until_agent_mail_is_installed(db, tmp_path, monkeypatch):
+@pytest.mark.parametrize("install,reason", [
+    ({}, "Antigravity CLI Agent Mail MCP is not installed"),
+    # Installed is still blocked: a Mail tool call through agy is not proven (#736).
+    ({"antigravity_mcp_installed": True, "antigravity_hooks_missing": []},
+     "Agent Mail for Antigravity CLI is installed, but its Mail tool calls and registration are not proven yet"),
+])
+async def test_antigravity_launch_plan_stays_blocked(db, tmp_path, monkeypatch, install, reason):
     async def install_status():
-        return SimpleNamespace(**{**vars(_ready_install_status()), "antigravity_cli_available": True})
+        return SimpleNamespace(**{**vars(_ready_install_status()), "antigravity_cli_available": True, **install})
 
     monkeypatch.setattr(
         "app.services.agent_team_service.agent_mail_install_service.get_install_status", install_status)
@@ -2990,7 +2996,7 @@ async def test_antigravity_launch_plan_is_blocked_until_agent_mail_is_installed(
     item = plan.items[0]
     assert item.status == "blocked"
     assert item.block_code == "agent_mail_not_configured"
-    assert "Agent Mail for Antigravity CLI is not installed yet" in item.reasons
+    assert reason in item.reasons
 
 async def _opencode_preset(db, repo, *, launch_mode="plain"):
     return await agent_team_service.create_preset(

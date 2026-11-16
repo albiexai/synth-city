@@ -39,14 +39,15 @@ def capability(state: str, label: str, reason: str | None = None) -> dict[str, s
 
 
 PROVIDER_CAPABILITY_MATRIX: dict[str, dict[str, dict[str, str]]] = {
-    # Only launch is implemented. The rest waits for live evidence (#952) and later issues (#736, #737).
+    # Launch is implemented. #736 installs Agent Mail, but a Mail tool call through agy is not proven,
+    # so MCP, hooks and permissions stay unknown; sessions wait for #737.
     "antigravity-cli": {
         "spawn": capability("write_capable", "Spawn Sessions", "Albiex Synth City can launch the Antigravity CLI (agy)."),
         "resume": capability("write_capable", "Resume Sessions", "agy --conversation resumes a conversation by its UUID."),
         "sessions": capability("unknown", "Agent Bridge Sessions", "Antigravity CLI session discovery is not implemented yet."),
-        "mcp": capability("unknown", "MCP Servers", "Agent Mail for Antigravity CLI is not installed yet."),
-        "hooks": capability("unknown", "Hooks", "Antigravity CLI hooks are documented but not observed or installed yet."),
-        "permissions": capability("unknown", "Permissions", "Whether a hook or permission rule can block questions is not observed yet."),
+        "mcp": capability("unknown", "MCP Servers", "Agent Mail can install an Antigravity CLI MCP entry; a Mail tool call through agy is not proven yet."),
+        "hooks": capability("unknown", "Hooks", "Agent Mail can install Antigravity CLI SessionStart, PreInvocation and question hooks; registration through them is not proven yet."),
+        "permissions": capability("unknown", "Permissions", "A team member's ask_question is denied by its own PreToolUse hook; other permission rules are not managed."),
         "config": capability("unknown", "Configuration", "Antigravity CLI settings, including workspace trust, are not managed yet."),
     },
     "muse-cli": {

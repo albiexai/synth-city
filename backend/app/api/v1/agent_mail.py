@@ -1298,7 +1298,25 @@ async def agent_inbox(
 
 def _hook_provider(payload: dict) -> str:
     provider = str(payload.get("provider") or "claude-code")
-    return provider if provider in {"claude-code", "codex-cli", "copilot-cli", "opencode-cli", "muse-cli"} else "unknown"
+    return provider if provider in {
+        "claude-code", "codex-cli", "copilot-cli", "opencode-cli", "muse-cli", "antigravity-cli"} else "unknown"
+
+
+def _hook_tool_name(payload: dict) -> Optional[str]:
+    """The tool a PreToolUse hook names: agy sends toolCall.name, the others tool_name."""
+    if _hook_provider(payload) == "antigravity-cli":
+        call = payload.get("toolCall")
+        name = call.get("name") if isinstance(call, dict) else None
+        return name if isinstance(name, str) else None
+    name = payload.get("tool_name")
+    return name if isinstance(name, str) else None
+
+
+def _record_antigravity_question_denied(payload: dict) -> None:
+    """The member's own hook denied ask_question (#736). Records no question content."""
+    conversation = payload.get("conversationId") or payload.get("session_id")
+    logger.info("antigravity_question_denied conversation=%s team_slot=%s",
+                str(conversation)[:64] if conversation else None, _payload_int(payload, "team_slot_id"))
 
 
 def _hook_session_key(payload: dict) -> Optional[str]:
@@ -1312,6 +1330,7 @@ def _hook_session_key(payload: dict) -> Optional[str]:
         "copilot-cli": "copilot",
         "opencode-cli": "opencode",
         "muse-cli": "muse",
+        "antigravity-cli": "antigravity",
     }
     prefix = prefix_by_provider.get(provider, "unknown")
     team_slot_id = _payload_int(payload, "team_slot_id")
@@ -1493,6 +1512,12 @@ async def hook_pre_tool_use(
     only the message id.
     """
     try:
+        if _hook_provider(payload) == "antigravity-cli":
+            # The agy hook shim denies ask_question itself, without waiting for this route (#736).
+            # The #930 edit guard covers Claude Code only; extending it to agy is a separate decision.
+            if _hook_tool_name(payload) == "ask_question":
+                _record_antigravity_question_denied(payload)
+            return _GUARD_ALLOW
         claimed_slot = _payload_int(payload, "team_slot_id")
         if claimed_slot is None or not is_guarded_tool(payload.get("tool_name")):
             return _GUARD_ALLOW
@@ -1646,6 +1671,38 @@ async def uninstall_muse(
     _require_confirmed(body)
     try:
         return await agent_mail_install_service.uninstall_muse(db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/install/antigravity/apply",
+    response_model=AgentMailInstallStatus,
+    dependencies=INSTALL_WRITES,
+)
+async def install_antigravity(
+    body: dict[str, Any] | None = Body(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_confirmed(body)
+    try:
+        return await agent_mail_install_service.apply_antigravity_install(db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/install/antigravity/uninstall",
+    response_model=AgentMailInstallStatus,
+    dependencies=INSTALL_WRITES,
+)
+async def uninstall_antigravity(
+    body: dict[str, Any] | None = Body(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_confirmed(body)
+    try:
+        return await agent_mail_install_service.uninstall_antigravity(db)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -2386,6 +2386,11 @@ class AgentMailInstallStatus(BaseModel):
     muse_hooks_missing: List[str] = Field(default_factory=list)
     muse_settings_path: Optional[str] = None
     antigravity_cli_available: bool = False
+    antigravity_mcp_installed: bool = False
+    antigravity_hooks: List[str] = Field(default_factory=list)
+    antigravity_hooks_missing: List[str] = Field(default_factory=list)
+    antigravity_mcp_config_path: Optional[str] = None
+    antigravity_hooks_path: Optional[str] = None
     copilot_cli_available: bool = False
     copilot_mcp_installed: bool = False
     copilot_hooks: List[str] = Field(default_factory=list)
