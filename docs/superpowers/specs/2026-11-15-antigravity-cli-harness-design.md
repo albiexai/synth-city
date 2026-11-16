@@ -234,7 +234,24 @@ Each row states the source of every claim.
 | Live `steps(idx, step_type, status)` | Types 14 user input, 15 planner reply, 101 system message, 132 tool or wait step. Status 3 done; 2 while `run_command` ran (`--dangerously-skip-permissions`); 9 while `ask_question` waited; 6 only after the process exited. | observed (#737) |
 | Transcript records | `step_index`, `source`, `type`, `status`, `created_at` (whole seconds), `tool_calls[].name`; statuses are not updated later; a resume appends | observed (#737) |
 | Permission review, other tools, other modes | Not observed. Synth City reports them as unknown. | unknown |
-| Classifier | Synth City's read-only observer (#737) uses only the observed shapes above. The guard and a screen fallback are deferred. | implemented |
+| Classifier | Synth City's read-only observer (#737) uses only the observed shapes above. The screen fallback is deferred. | implemented |
+| Team guard | `team-supervisor` reads the transcript reply-only and fails closed on every unobserved record (#984 Part 1; see [Team guard](#team-guard-984-part-1)). | implemented |
+
+#### Team guard (#984 Part 1)
+
+The team supervisor (`scripts/product-factory/team-supervisor`) stops a team on a provider safety notice in an agent's own output. For an `antigravity-cli` member it works like this:
+
+- **Which conversation.** The slot's `session_id` must be a canonical lowercase UUID, as for the #737 observer; otherwise the guard fails closed (`native_session_identity_missing`).
+- **Which files.** The data root is the agent user's passwd home plus `.gemini/antigravity-cli`, unless the guard's config names `antigravity_data_root`. `presence/<id>.lock` and `brain/<id>/.system_generated/logs/transcript.jsonl` must exist. Every directory on the way and both files must belong to the agent user, and none may be a symlink. The transcript is opened without following a link. Anything else fails closed.
+- **Limit.** The lock shows that the conversation is present. The guard can't check which process holds it, because another user's `/proc` file-descriptor table isn't readable.
+- **What is matched.** Only the text of a `PLANNER_RESPONSE` from `MODEL`. User input, system messages and tool-call arguments are never matched.
+- **Observed set.** Only the record shapes in the #737 fixtures pass:
+  - `USER_INPUT` from `USER_EXPLICIT`;
+  - `SYSTEM_MESSAGE` from `SYSTEM`;
+  - `PLANNER_RESPONSE` from `MODEL` with text and no tool calls;
+  - `PLANNER_RESPONSE` from `MODEL` with a non-empty list of named tool calls and no text.
+- **Every other record fails closed** (`antigravity_record_unobserved`) before the guard saves its position in the transcript. That includes an `ERROR` step (never captured, so not classified), any unknown type, and the records agy writes for finished tool steps. An armed team stops and needs recovery; a disarmed one reports a startup gap. Neither looks healthy, and the record is read again on the next tick.
+- **Consequence.** Until #984 Part 3 proves more shapes, **a routine Antigravity tool record that is not in the observed set stops an armed team.** Antigravity's team readiness stays blocked in v4.2 (the Mail and onboarding gates), so no Antigravity member runs in a team yet.
 
 ### Q6: trust and login
 

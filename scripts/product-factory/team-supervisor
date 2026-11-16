@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pathlib
+import pwd
 import re
 import signal
 import sqlite3
@@ -95,6 +96,14 @@ def notice(record):
             text = str(event.get('message', ''))
             return _match(text) or _error_code(text)
         return None
+    if kind == 'PLANNER_RESPONSE':
+        # Antigravity CLI (#984): only the model's own reply text. antigravity_record() has
+        # already refused every unobserved shape, so tool calls and other steps never get here
+        # with text to match.
+        content = record.get('content')
+        if record.get('source') == 'MODEL' and isinstance(content, str):
+            return _match(content)
+        return None
     if kind == 'response_item':
         # Codex 0.159: the assistant message. Tool output and user input are not checked.
         payload = record.get('payload') or {}
@@ -120,6 +129,27 @@ def _match(text):
         if pattern.search(text):
             return rule
     return None
+
+# Antigravity CLI (#984 Part 1). Observed shapes only: the #737 fixtures from agy 1.5.9 in an
+# isolated runtime with a stub model. Everything else is unproven, including an ERROR step,
+# which was never captured, and the records agy writes for finished tool steps. An unproven
+# record fails closed before the stored offset moves, so the guard never reports a normal state
+# over it and reads it again on the next tick. Until those shapes are proven (#984 Part 3), a
+# routine Antigravity tool record that is not in this set stops an armed team.
+AGY_ID = re.compile(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}')
+
+def antigravity_record(record):
+    kind, source = record.get('type'), record.get('source')
+    if (kind, source) in {('USER_INPUT', 'USER_EXPLICIT'), ('SYSTEM_MESSAGE', 'SYSTEM')}:
+        return
+    if (kind, source) == ('PLANNER_RESPONSE', 'MODEL'):
+        if isinstance(record.get('content'), str) and 'tool_calls' not in record:
+            return
+        calls = record.get('tool_calls')
+        if ('content' not in record and isinstance(calls, list) and calls
+                and all(isinstance(call, dict) and isinstance(call.get('name'), str) for call in calls)):
+            return
+    raise ValueError('antigravity_record_unobserved')
 
 # Supervisor.record returns this for a line it skips. No JSON value can equal it.
 SKIP = object()
@@ -291,7 +321,7 @@ class Supervisor:
         save(self.state_path, self.state)
 
     def scan(self, bindings):
-        paths = set()
+        paths = {}
         opencode = []
         for binding in bindings:
             options = json.loads(binding['launch_options'] or '{}')
@@ -301,9 +331,12 @@ class Supervisor:
                     raise ValueError('opencode_session_id_invalid')
                 opencode.append((native_id, binding['repo_path']))
                 continue
+            provider = binding.get('provider') or 'claude-code'
             if not native_id or not re.fullmatch(r'[0-9a-f-]{36}', native_id):
                 raise ValueError('native_session_identity_missing')
-            paths.add(self.transcript(binding.get('provider') or 'claude-code', binding['repo_path'], native_id))
+            if provider == 'antigravity-cli' and not AGY_ID.fullmatch(native_id):
+                raise ValueError('native_session_identity_missing')
+            paths[self.transcript(provider, binding['repo_path'], native_id)] = provider
         if opencode:
             budget = OpenCodeBudget()
             for native_id, repo_path in opencode:
@@ -311,12 +344,12 @@ class Supervisor:
                 if found:
                     self.stop('security_notice', security=True, rule=found)
                     return False
-        for path in paths:
+        for path, provider in paths.items():
             key = str(path)
             offset = int(self.state['offsets'].get(key, 0))
             if path.stat().st_size < offset:
                 raise ValueError('native_transcript_shrank')
-            with path.open('rb') as stream:
+            with self.open_transcript(path, provider) as stream:
                 stream.seek(offset)
                 inspected = 0
                 while inspected < 16 * 1024 * 1024:
@@ -333,6 +366,8 @@ class Supervisor:
                     record = self.record(line)
                     if record is SKIP:
                         continue
+                    if provider == 'antigravity-cli':
+                        antigravity_record(record)  # before the offset is saved below
                     found = notice(record)
                     if found:
                         self.stop('security_notice', security=True, rule=found)
@@ -619,11 +654,55 @@ class Supervisor:
                 raise FileNotFoundError('native_transcript_missing' if not found else 'native_transcript_ambiguous')
             path = found[0]
             self.state.setdefault('native_paths', {})[native_id] = str(path)
+        elif provider == 'antigravity-cli':
+            path = self.antigravity_transcript(native_id)
         else:
             raise ValueError('native_provider_unsupported')
         if not path.exists():
             raise FileNotFoundError('native_transcript_missing')
         return path
+
+    def antigravity_transcript(self, native_id):
+        """The agent's own agy transcript for one conversation, or fail closed (#984).
+
+        The data root is the agent user's passwd home + .gemini/antigravity-cli, unless the
+        config names it. Every directory on the way and both files must be the agent user's own,
+        and nothing may be a symlink. presence/<id>.lock shows that the conversation is present;
+        which process holds it can't be checked here, because another user's /proc fd table is
+        not readable.
+        """
+        uid = self.config['agent_uid']
+        configured = self.config.get('antigravity_data_root')
+        root = pathlib.Path(configured) if configured else pathlib.Path(pwd.getpwuid(uid).pw_dir) / '.gemini' / 'antigravity-cli'
+
+        def owned(path, kind, missing):
+            try:
+                info = os.lstat(path)
+            except FileNotFoundError:
+                raise FileNotFoundError(missing) from None
+            if stat.S_IFMT(info.st_mode) != kind or info.st_uid != uid:
+                raise ValueError('antigravity_path_unsafe')
+
+        owned(root, stat.S_IFDIR, 'antigravity_data_root_missing')
+        owned(root / 'presence', stat.S_IFDIR, 'antigravity_presence_missing')
+        owned(root / 'presence' / (native_id + '.lock'), stat.S_IFREG, 'antigravity_presence_missing')
+        folder = root
+        for part in ['brain', native_id, '.system_generated', 'logs']:
+            folder = folder / part
+            owned(folder, stat.S_IFDIR, 'antigravity_transcript_missing')
+        path = folder / 'transcript.jsonl'
+        owned(path, stat.S_IFREG, 'antigravity_transcript_missing')
+        return path
+
+    def open_transcript(self, path, provider):
+        if provider != 'antigravity-cli':
+            return path.open('rb')
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != self.config['agent_uid']:
+            os.close(fd)
+            raise ValueError('antigravity_path_unsafe')
+        return os.fdopen(fd, 'rb')
 
     def tick(self):
         if self.hold_path.exists():
@@ -652,11 +731,7 @@ class Supervisor:
         self.state.update(last_tick=now(), mode='SUPERVISING' if preset['autonomy_enabled'] else 'PREPARED_DISARMED', autonomy_enabled=preset['autonomy_enabled'], connected_slots=sorted(connected), missing_slots=sorted(missing), live_panes=len(bindings))
         save(self.state_path, self.state)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', required=True)
-    args = parser.parse_args()
-    supervisor = Supervisor(json.loads(pathlib.Path(args.config).read_text()))
+def run(supervisor):
     try:
         supervisor.tick()
     except Exception as exc:
@@ -665,3 +740,9 @@ if __name__ == '__main__':
         else:
             supervisor.state.update(last_tick=now(), mode='STARTUP_GAP', error_type=type(exc).__name__)
             save(supervisor.state_path, supervisor.state)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', required=True)
+    args = parser.parse_args()
+    run(Supervisor(json.loads(pathlib.Path(args.config).read_text())))
