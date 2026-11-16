@@ -12,10 +12,13 @@ OPENCODE_VERSION_CODE = "opencode_version_unsupported"
 # Agent Mail for agy, but a Mail tool call through agy and its registration are not proven. Onboarding
 # (terms and data-use choices) belongs to the user: no completion signal is proven (#952), so it is
 # never read, guessed or preset here.
+# A Mail tool call through agy is not proven (#993); lifting this gate is #994.
 ANTIGRAVITY_UNPROVEN_GATES = (
     "Agent Mail for Antigravity CLI is installed, but its Mail tool calls and registration are not proven yet",
-    "Complete Antigravity CLI onboarding (terms and data-use choices) once as this user before launching agents",
 )
+# Checked from agy's own onboarding signal (#995); the terms and data-use choices stay the user's.
+ANTIGRAVITY_ONBOARDING_REASON = (
+    "Complete Antigravity CLI onboarding (terms and data-use choices) once as this user before launching agents")
 
 
 class _VersionAccepted:
@@ -57,7 +60,12 @@ def agent_mail_ready_reason(provider: str, install_status: Any) -> str | None:
         if getattr(install_status, "antigravity_hooks_missing", ["unknown"]):
             return "Antigravity CLI Agent Mail hooks are missing"
         # Fail closed: no member is ready while any gate is unproven.
-        return ANTIGRAVITY_UNPROVEN_GATES[0] if ANTIGRAVITY_UNPROVEN_GATES else None
+        if ANTIGRAVITY_UNPROVEN_GATES:
+            return ANTIGRAVITY_UNPROVEN_GATES[0]
+        from app.services.providers.antigravity_cli import antigravity_onboarding_complete
+        if not antigravity_onboarding_complete():
+            return ANTIGRAVITY_ONBOARDING_REASON
+        return None
     if provider == "codex-cli":
         if not install_status.codex_cli_available:
             return "Codex CLI is not available on this machine"

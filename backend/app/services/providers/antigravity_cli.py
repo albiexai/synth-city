@@ -5,7 +5,10 @@ agy 1.5.9 in an isolated runtime; anything still unproven is refused rather than
 """
 from __future__ import annotations
 
+import json
+import os
 import re
+import stat
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -18,6 +21,44 @@ _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 
 def antigravity_home() -> Path:
     return Path("~/.gemini").expanduser()
+
+
+# The Director's human trial on #995 recorded that completing onboarding writes this file with
+# "onboardingComplete": true. "consumerOnboardingComplete" may come from a sign-in instead, and the
+# sign-in files are never read. Synth City only reads this file; it never writes or presets it.
+_ONBOARDING_SIGNAL_MAX_BYTES = 65536
+
+
+def antigravity_onboarding_signal_path() -> Path:
+    return antigravity_home() / "antigravity-cli" / "cache" / "onboarding.json"
+
+
+def antigravity_onboarding_complete() -> bool:
+    """True only for a regular file holding a JSON object whose onboardingComplete is exactly true.
+
+    Anything else (missing, unreadable, a symlink, too large, malformed, false) means onboarding is not
+    completed: the signal lives under cache/, so its absence is never an error.
+    """
+    try:
+        fd = os.open(antigravity_onboarding_signal_path(), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _ONBOARDING_SIGNAL_MAX_BYTES:
+            return False
+        data = os.read(fd, _ONBOARDING_SIGNAL_MAX_BYTES + 1)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    if len(data) > _ONBOARDING_SIGNAL_MAX_BYTES:
+        return False
+    try:
+        document = json.loads(data)
+    except (ValueError, RecursionError):  # a deeply nested document under the size cap recurses
+        return False
+    return isinstance(document, dict) and document.get("onboardingComplete") is True
 
 
 def is_antigravity_command(command: str) -> bool:

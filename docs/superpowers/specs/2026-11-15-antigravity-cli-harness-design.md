@@ -118,9 +118,12 @@ key was used, and Google's terms were not accepted.
 - **First-run onboarding.** A new user sees a colour-scheme picker, then "Terms of Service & Data Use" with a
   data-collection opt-in that is checked by default. The interactive screen cannot be used until it is finished; turns
   still run behind it. **Synth City never accepts it and never presets its settings: the terms and the data-use choice
-  belong to the user.** What `agy` records when onboarding is complete was not observed, so Synth City has no
-  completion signal. Antigravity readiness stays blocked with an instruction to complete onboarding once as that user
-  (`provider_readiness_service.ANTIGRAVITY_UNPROVEN_GATES`). Finding a completion signal is open for #736.
+  belong to the user.** In a later human trial (#995), the Director completed onboarding himself in an isolated scratch
+  home: `agy` wrote `~/.gemini/antigravity-cli/cache/onboarding.json` with `onboardingComplete: true` (also
+  `consumerOnboardingComplete`, which a sign-in may set, and `enterpriseOnboardingComplete: false`). Readiness reads
+  only `onboardingComplete`, read-only and fail-closed (`antigravity_cli.antigravity_onboarding_complete`), and returns
+  the onboarding instruction (`provider_readiness_service.ANTIGRAVITY_ONBOARDING_REASON`) until it is true. The Agent
+  Mail gate is checked first and stays closed (#994).
 - **Argv.** A prompt must be one `-i` (or `-p`) argument. A stray positional argument exits with code 2: "Prompts are
   read only from -p/--print, -i/--prompt-interactive, or stdin".
 - **Not observed:** the trust prompt and the question screen (both hidden behind onboarding), `PostToolUse`, real-model
@@ -294,8 +297,8 @@ These follow from the official documentation alone. They are inputs for #735–#
   even when Synth City is unreachable. A question that still opens, for example without the hooks installed, is
   possible, so #737's waiting-for-input detection has to cover it.
 - The provider (#735) resumes with `--conversation <id>` and, when a prompt is given, `-i <prompt>` (observed, #952).
-- Readiness stays blocked until a user has completed onboarding and a completion signal exists. Synth City never
-  accepts the terms or presets onboarding.
+- Readiness is blocked until the user has completed onboarding (the `cache/onboarding.json` signal, #995) and the
+  Agent Mail gate is lifted (#994). Synth City never accepts the terms or presets onboarding.
 - The provider (#735) must not assume a consumer subscription sign-in. Its credential route follows the Director's
   Q1 decision.
 
