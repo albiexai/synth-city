@@ -301,6 +301,40 @@ controller cannot read the descriptors, set the member's first session id by han
 and restart the slot in resume mode. The evidence and the route are recorded on
 issue #746.
 
+#### Verify first-session discovery in production (read-only)
+
+`scripts/muse-discovery-probe.py` runs the production discovery function against one process and prints a single
+JSON object of facts. It reports capability names, whether the target belongs to another user, whether its
+descriptor directory can be listed (and, if not, only the kind of failure), counts of the `.session.lock`
+descriptors it holds, and whether discovery returned an id; with `--expect-session-id` it also says whether the
+discovered id matched. It never prints a path, an id, an environment value, a log line or a command line. It writes
+nothing, sends no signal and makes no network call, and it starts and stops no member.
+
+Whether to run it, against which process, and whether any Muse member has to exist for it, is the operator's
+decision. A member started for the check, as the agent user, needs the Supervisor's explicit approval first.
+Run it as the same user and with the same capabilities as the controller service, from the repository root, with the
+backend virtualenv's Python:
+
+```
+setpriv <the service's capability set> backend/venv/bin/python scripts/muse-discovery-probe.py \
+    --pid <the Muse pane process> --cwd <that pane's working directory> [--expect-session-id <the session id>]
+```
+
+Read the result like this:
+
+- `fd_listable: false` with `fd_failure: permission_denied` means the descriptors of another user's process cannot
+  be read with this capability set, so first-launch discovery cannot work there and the manual first session id
+  applies.
+- `lock_descriptors: 1` and `locks_under_sessions_root: 1` with `discovered: true` is the expected result; with
+  `--expect-session-id`, `matches_expected: true` confirms it is the right session.
+- `lock_descriptors` above 1 means the process holds several sessions, so discovery refuses by design.
+- `locks_under_sessions_root: 0` with a lock descriptor means the lock is outside the sessions root the observer
+  derived from the process environment; see the root order above.
+
+Run it once with the capability set, once without it as a control (it should report `permission_denied` for a
+process of another user), and once for a process that sets only `MUSE_DATA_DIR`. The probe checks the read; it does
+not by itself prove the production unit's capabilities, which are only as reported until it has been run there.
+
 ### Antigravity CLI members
 
 Antigravity CLI (`agy`) members cannot be launched yet. Readiness stays blocked
