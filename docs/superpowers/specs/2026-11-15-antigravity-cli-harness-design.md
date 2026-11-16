@@ -135,7 +135,8 @@ hooks. All rows here are **observed**:
   `~/.gemini/config/mcp_config.json`, with no `type` or `transport` field, is loaded. `agy` starts the stdio server as
   its own child and sends `server/discover`, `initialize`, `notifications/initialized` and `tools/list`. The model does
   not see the server's tools by name: it gets three generic tools, `call_mcp_tool`, `list_resources` and
-  `read_resource`. A real `call_mcp_tool` → `tools/call` round trip was **not observed**.
+  `read_resource`. A real `call_mcp_tool` → `tools/call` round trip was **not observed** (still not observed in #993,
+  below).
 - **Hook output.** Claude Code's `{"hookSpecificOutput": ...}` printed by a `SessionStart` or `PreInvocation` hook is
   rejected (`failed to unmarshal result ... via protojson`) and ignored; the turn still runs. Empty output is accepted.
 - **Blocking a question.** A `PreToolUse` hook that prints `{"decision": "deny", "reason": "<text>"}` blocks
@@ -143,6 +144,35 @@ hooks. All rows here are **observed**:
   `Stop` fires with `fullyIdle: true`. No `PostToolUse` fires for the denied call.
 - **Hook process.** A command hook runs as `agy` → `sh -c <command>` → the command, so the command's parent is a
   short-lived shell and `agy` is its grandparent.
+
+### Agent Mail round trip (#993)
+
+#993 ran the same pinned `agy` 1.5.9 (sha256 checked) twice more in the same loopback-only isolation, with a dummy key
+and the local stub model. A scratch Synth City backend ran on loopback with a scratch database and home, and Synth City's
+own Antigravity install (with the `synth-city-mail` server key from #991) was applied through it. Both runs used
+`--dangerously-skip-permissions` and a `trustedWorkspaces` entry. The first-run onboarding colour-scheme screen was
+displayed from the first sample (3 s) in both runs and **was never interacted with**: no keys were sent and no onboarding
+or consent setting was preset (Supervisor decision, 2026-11-16). No other screen appeared.
+
+**Observed:**
+
+- **Run 1 (new conversation):** `agy` loaded the Mail server under `synth-city-mail` and wrote its tool schema files,
+  with **no** invalid-tool-name errors. The model request offered only the 14 built-in tools; **`call_mcp_tool` was not
+  declared**, and a scripted `call_mcp_tool` for `synth_city_whoami` was refused with `unknown tool: "call_mcp_tool"`.
+  The `SessionStart` and `PreInvocation` hooks reached Synth City (`hooks/session-start` and
+  `hooks/user-prompt-submit`, both accepted), and Synth City recorded one connected `antigravity-cli` MCP session.
+- **Run 2 (`--conversation <id> -i` resume in the same home, with the server already loaded):** the same result. The
+  14 built-in tools only, the scripted call refused. No `SessionStart`; `PreInvocation` reached Synth City twice; the MCP
+  session was connected.
+
+**Not established:**
+
+- A `call_mcp_tool` → `tools/call` round trip **remains unproven**. Why `call_mcp_tool` was not declared is unknown. In
+  #736 P1, which declared it, the MCP server was a minimal stub and neither `--dangerously-skip-permissions` nor
+  `trustedWorkspaces` was used. Those differences were not tested, and the run evidence does not single out one cause.
+- Team-member (slot-bound) registration, real-model behaviour and any permission or other screen were not observed.
+
+Synth City's Antigravity readiness gates are unchanged by these runs.
 
 ## Q2–Q7: what is documented and what was observed
 
