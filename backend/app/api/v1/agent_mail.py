@@ -1515,7 +1515,9 @@ async def hook_pre_tool_use(
         if _hook_provider(payload) == "antigravity-cli":
             # The agy hook shim denies ask_question itself, without waiting for this route (#736).
             # The #930 edit guard covers Claude Code only; extending it to agy is a separate decision.
-            if _hook_tool_name(payload) == "ask_question":
+            slot = _payload_int(payload, "team_slot_id")
+            # Logged only where the shim denies: a team member with a positive slot id.
+            if _hook_tool_name(payload) == "ask_question" and slot is not None and slot > 0:
                 _record_antigravity_question_denied(payload)
             return _GUARD_ALLOW
         claimed_slot = _payload_int(payload, "team_slot_id")

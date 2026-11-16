@@ -1063,16 +1063,75 @@ def antigravity_mcp_installed() -> bool:
         entry = _load_antigravity_mcp().get("mcpServers", {}).get(MCP_SERVER_NAME)
     except ValueError:
         return False
-    return isinstance(entry, dict) and shim_path() in entry.get("args", [])
+    args = entry.get("args") if isinstance(entry, dict) else None
+    return isinstance(args, list) and shim_path() in args
+
+
+# Synth City owns only its own command entries inside its named groups. A user's entry, event
+# or matcher group in the same named group is kept; a shape that cannot be merged safely is
+# refused before anything is backed up or written.
+def _antigravity_event_entries(hooks: dict, event: str) -> list:
+    name, _slug, matcher = ANTIGRAVITY_MAIL_HOOKS[event]
+    entries = hooks.get(name, {}).get(event, [])
+    if not isinstance(entries, list):
+        raise ValueError(f"The Antigravity CLI hook group '{name}' event '{event}' must contain a list")
+    if matcher:
+        for group in entries:
+            if isinstance(group, dict) and group.get("matcher") == matcher and not isinstance(group.get("hooks"), list):
+                raise ValueError(f"The Antigravity CLI hook group '{name}' has a '{matcher}' entry without a hooks list")
+    return entries
+
+
+def _antigravity_without_ours(event: str, entries: list) -> list:
+    _name, slug, matcher = ANTIGRAVITY_MAIL_HOOKS[event]
+    if not matcher:
+        return [entry for entry in entries if not _codex_hook_matches_event(entry, slug)]
+    kept = []
+    for group in entries:
+        if isinstance(group, dict) and group.get("matcher") == matcher:
+            hooks = [hook for hook in group["hooks"] if not _codex_hook_matches_event(hook, slug)]
+            if not hooks:
+                continue
+            group = {**group, "hooks": hooks}
+        kept.append(group)
+    return kept
+
+
+def _antigravity_has_ours(event: str, entries: list) -> bool:
+    return _antigravity_without_ours(event, entries) != entries
 
 
 def installed_antigravity_hooks() -> list[str]:
     try:
         doc = _load_antigravity_hooks()
+        return [event for event in ANTIGRAVITY_MAIL_HOOKS
+                if _antigravity_has_ours(event, _antigravity_event_entries(doc, event))]
     except ValueError:
         return []
-    return [event for event, (name, _slug, _matcher) in ANTIGRAVITY_MAIL_HOOKS.items()
-            if doc.get(name) == _antigravity_hook_group(event)]
+
+
+def _set_antigravity_hooks(hooks: dict, install: bool) -> bool:
+    """Replace (install) or remove Synth City's entries. Returns whether the document changed."""
+    entries_by_event = {event: _antigravity_event_entries(hooks, event) for event in ANTIGRAVITY_MAIL_HOOKS}
+    changed = False
+    for event, entries in entries_by_event.items():
+        name = ANTIGRAVITY_MAIL_HOOKS[event][0]
+        kept = _antigravity_without_ours(event, entries)
+        if install:
+            kept = kept + _antigravity_hook_group(event)[event]
+        if kept == entries:
+            continue
+        group = dict(hooks.get(name, {}))
+        if kept:
+            group[event] = kept
+        else:
+            group.pop(event, None)
+        if group:
+            hooks[name] = group
+        else:
+            hooks.pop(name, None)
+        changed = True
+    return changed
 
 
 
@@ -1535,10 +1594,11 @@ async def apply_antigravity_install(db: AsyncSession) -> AgentMailInstallStatus:
     # Both files are read and checked before anything is backed up or written.
     mcp = _load_antigravity_mcp()
     hooks = _load_antigravity_hooks()
+    for event in ANTIGRAVITY_MAIL_HOOKS:
+        _antigravity_event_entries(hooks, event)
     await _backup_before_mutation(db, "antigravity")
     mcp.setdefault("mcpServers", {})[MCP_SERVER_NAME] = _antigravity_mcp_entry()
-    for event, (name, _slug, _matcher) in ANTIGRAVITY_MAIL_HOOKS.items():
-        hooks[name] = _antigravity_hook_group(event)
+    _set_antigravity_hooks(hooks, install=True)
     _write_antigravity_json(antigravity_mcp_config_path(), mcp)
     _write_antigravity_json(antigravity_hooks_path(), hooks)
     return await get_install_status()
@@ -1550,10 +1610,11 @@ async def uninstall_antigravity(db: AsyncSession) -> AgentMailInstallStatus:
         return await get_install_status()
     mcp = _load_antigravity_mcp()
     hooks = _load_antigravity_hooks()
+    for event in ANTIGRAVITY_MAIL_HOOKS:
+        _antigravity_event_entries(hooks, event)
     await _backup_before_mutation(db, "antigravity")
     if mcp.get("mcpServers", {}).pop(MCP_SERVER_NAME, None) is not None:
         _write_antigravity_json(antigravity_mcp_config_path(), mcp)
-    removed = [name for name, *_rest in ANTIGRAVITY_MAIL_HOOKS.values() if hooks.pop(name, None) is not None]
-    if removed:
+    if _set_antigravity_hooks(hooks, install=False):
         _write_antigravity_json(antigravity_hooks_path(), hooks)
     return await get_install_status()

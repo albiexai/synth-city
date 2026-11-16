@@ -216,3 +216,92 @@ def test_lifecycle_hooks_print_nothing_even_when_the_backend_answers(monkeypatch
                           post=lambda url: httpx.Response(200, json=answer, request=httpx.Request("POST", url)))
     # agy rejects Claude-style output (#736 P1), so nothing is printed.
     assert out == ""
+
+
+# --- V1 review 5918275928 corrections --------------------------------------------------------
+
+USER_ENTRY = {"type": "command", "command": "/usr/bin/my-session-logger", "timeout": 3}
+
+
+@pytest.mark.asyncio
+async def test_user_entries_inside_synth_city_groups_are_kept(gemini):
+    _mcp, hooks, _scopes = gemini
+    hooks.parent.mkdir(parents=True)
+    user_question = {"matcher": "write_file", "hooks": [dict(USER_ENTRY)]}
+    hooks.write_text(json.dumps({
+        "albiex-synth-city-mail-session-start": {"SessionStart": [dict(USER_ENTRY)], "Stop": [dict(USER_ENTRY)]},
+        "albiex-synth-city-mail-question": {"PreToolUse": [user_question]},
+    }))
+    await svc.apply_antigravity_install(None)
+    await svc.apply_antigravity_install(None)  # idempotent: Synth City's entries are not duplicated
+    doc = json.loads(hooks.read_text())
+    session = doc["albiex-synth-city-mail-session-start"]
+    assert session["Stop"] == [USER_ENTRY]
+    assert session["SessionStart"][0] == USER_ENTRY and len(session["SessionStart"]) == 2
+    question = doc["albiex-synth-city-mail-question"]["PreToolUse"]
+    assert question[0] == user_question and len(question) == 2
+    assert sorted(svc.installed_antigravity_hooks()) == ["PreInvocation", "PreToolUse", "SessionStart"]
+    await svc.uninstall_antigravity(None)
+    assert json.loads(hooks.read_text()) == {
+        "albiex-synth-city-mail-session-start": {"SessionStart": [USER_ENTRY], "Stop": [USER_ENTRY]},
+        "albiex-synth-city-mail-question": {"PreToolUse": [user_question]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_user_hook_inside_the_question_matcher_group_is_kept(gemini):
+    _mcp, hooks, _scopes = gemini
+    await svc.apply_antigravity_install(None)
+    doc = json.loads(hooks.read_text())
+    doc["albiex-synth-city-mail-question"]["PreToolUse"][0]["hooks"].append(dict(USER_ENTRY))
+    hooks.write_text(json.dumps(doc))
+    await svc.apply_antigravity_install(None)
+    groups = json.loads(hooks.read_text())["albiex-synth-city-mail-question"]["PreToolUse"]
+    assert sum(USER_ENTRY in group.get("hooks", []) for group in groups) == 1
+    assert "PreToolUse" in svc.installed_antigravity_hooks()
+    await svc.uninstall_antigravity(None)
+    assert json.loads(hooks.read_text()) == {
+        "albiex-synth-city-mail-question": {"PreToolUse": [{"matcher": "ask_question", "hooks": [USER_ENTRY]}]}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [
+    {"albiex-synth-city-mail-session-start": {"SessionStart": "not a list"}},
+    {"albiex-synth-city-mail-question": {"PreToolUse": {"matcher": "ask_question"}}},
+    {"albiex-synth-city-mail-question": {"PreToolUse": [{"matcher": "ask_question", "hooks": "x"}]}},
+])
+async def test_unsafe_shapes_in_synth_city_groups_are_refused_before_writing(gemini, content):
+    mcp, hooks, scopes = gemini
+    hooks.parent.mkdir(parents=True)
+    hooks.write_text(json.dumps(content))
+    with pytest.raises(ValueError):
+        await svc.apply_antigravity_install(None)
+    with pytest.raises(ValueError):
+        await svc.uninstall_antigravity(None)
+    assert json.loads(hooks.read_text()) == content and not mcp.exists() and scopes == []
+
+
+@pytest.mark.parametrize("entry", [
+    {"command": "python3", "args": None},
+    {"command": "python3", "args": "agent_mail_server.py"},
+    {"command": "python3", "args": 7},
+    "not an object",
+    None,
+])
+def test_malformed_mcp_entry_is_not_installed_and_does_not_raise(gemini, entry):
+    mcp, _hooks, _scopes = gemini
+    mcp.parent.mkdir(parents=True)
+    mcp.write_text(json.dumps({"mcpServers": {"albiex-synth-city-mail": entry}}))
+    assert svc.antigravity_mcp_installed() is False
+
+
+@pytest.mark.parametrize("slot,logged", [(7, True), (None, False), (0, False), (-1, False), ("x", False)])
+def test_question_denial_is_logged_only_for_a_team_member(caplog, slot, logged):
+    import asyncio
+    from app.api.v1.agent_mail import hook_pre_tool_use
+    payload = {"provider": "antigravity-cli", "conversationId": "c-1", "toolCall": {"name": "ask_question"}}
+    if slot is not None:
+        payload["team_slot_id"] = slot
+    with caplog.at_level(logging.INFO):
+        assert asyncio.run(hook_pre_tool_use(None, payload, None)) == {"guard": "allow"}
+    assert ("antigravity_question_denied" in caplog.text) is logged
