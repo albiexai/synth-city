@@ -10,7 +10,8 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta
 
 import httpx
-from sqlalchemy import exists, func, inspect, select, update
+from sqlalchemy import JSON, and_, exists, func, inspect, or_, select, update
+from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -24,6 +25,7 @@ from app.models.database import (
     GithubWorkItem,
     GithubWorkspace,
     MailMessage,
+    MailTeamMember,
     TeamGithubScope,
 )
 from app.services.github_app_auth_service import github_app_auth_service
@@ -100,6 +102,30 @@ _SETTLEMENT_ITEM_IDENTITY = (
     "attempt_phase", "pr_number", "dispatch_head_ref", "dispatch_base_ref", "handoff_state",
 )
 _SETTLEMENT_SCOPE_IDENTITY = ("id", "preset_id", "repo_owner", "repo_name", "github_auth_mode", "enabled")
+# What the superseded-revision merge (#972) must find unchanged at its last local read before the merge call.
+_MERGE_FENCE_ITEM = (
+    "id", "scope_id", "dispatch_status", "dispatch_nonce", "launch_id", "owner_slot_id", "active_scope_revision",
+    "attempt_phase", "pr_number", "dispatch_head_ref", "dispatch_base_ref", "last_verified_sha",
+    "approval_round_count", "ack_approval_round", "ack_enforcement_epoch", "ack_approver_member_id",
+)
+_MERGE_FENCE_NOTE_IDENTITY = (
+    "id", "scope_id", "dispatch_status", "dispatch_nonce", "owner_slot_id", "active_scope_revision", "pr_number",
+)
+_MERGE_FENCE_SCOPE = ("id", "preset_id", "repo_owner", "repo_name", "github_auth_mode", "delivery_policy_revision")
+
+
+def _latest_member(slot_id):
+    """The id of the member currently occupying a slot: the latest by update time, then id (as the slot lookups do)."""
+    other = aliased(MailTeamMember)
+    return (select(other.id).where(other.team_slot_id == slot_id)
+            .order_by(other.updated_at.desc(), other.id.desc()).limit(1).scalar_subquery())
+
+
+def _same_value(column, value):
+    """A null-safe equality; a JSON column holds a missing value as SQL NULL or as a JSON null."""
+    if value is None:
+        return or_(column.is_(None), column == JSON.NULL) if isinstance(column.type, JSON) else column.is_(None)
+    return column == value
 
 
 class GithubVerificationService:
@@ -1043,6 +1069,9 @@ class GithubVerificationService:
                 # stops the whole round. It cannot advance old source through CI,
                 # but a merged PR is an external fact that the stopped round must not hide.
                 await self._settle_merged_while_round_stopped(db, scope, item, client)
+                if inspect(item).unloaded:  # the merge check rolled back and expired the item
+                    await db.refresh(item)
+                await self._observe_superseded_revision(db, scope, item, client)
                 continue
             try:
                 if item.dispatch_status in ("dispatched", "verifying"):
@@ -1052,6 +1081,8 @@ class GithubVerificationService:
                             settled = await self._settled_revision(db, item)
                             if settled is not None:
                                 await self._observe_settled_revision(db, scope, item, client, settled)
+                            elif await self._superseded_revision(db, item) is not None:
+                                await self._observe_superseded_revision(db, scope, item, client)
                             else:
                                 self._log_inconsistent_once(item)
                             continue
@@ -1083,6 +1114,8 @@ class GithubVerificationService:
                         client,
                         revision=revision,
                     )
+                elif await self._superseded_revision(db, item) is not None:
+                    await self._observe_superseded_revision(db, scope, item, client)
                 else:
                     await self._process_review_item(db, scope, item, client)
                 # Repeated failed-head reads can return without another state write.
@@ -1661,6 +1694,75 @@ class GithubVerificationService:
             await db.refresh(scope)
             self._log_inconsistent_once(None, f"a PR response failed the identity check ({exc})", snapshot=snapshot)
 
+    async def _superseded_revision(
+        self, db: AsyncSession, item: GithubWorkItem,
+    ) -> GithubAttemptScopeRevision | None:
+        """The superseded implementation revision an item with an open-PR candidate is still on, if it is one (#972).
+
+        A Leader settlement of a negative review ends the submitted revision as superseded and leaves the item
+        'dispatched' with no owner acknowledgement. The owner can then push a head that the reviewer accepts, but
+        no amendment is left to carry it. Any other shape, a handoff included, is not this one.
+        """
+        if (item.dispatch_status not in ("dispatched", "verifying", "ready_for_review", "awaiting_human_review")
+                or item.issue_type != "code" or item.active_scope_revision <= 0 or item.pr_number is None
+                or item.handoff_state is not None):
+            return None
+        revision = (
+            await db.execute(
+                select(GithubAttemptScopeRevision)
+                .where(
+                    GithubAttemptScopeRevision.work_item_id == item.id,
+                    GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce,
+                    GithubAttemptScopeRevision.revision == item.active_scope_revision,
+                )
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if (revision is None or revision.status != "superseded" or revision.phase != "implementation"
+                or item.attempt_phase != revision.phase):
+            return None
+        return revision
+
+    async def _observe_superseded_revision(
+        self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, client: GithubClient,
+    ) -> None:
+        """An open PR on a superseded revision: promote it on an exact-head acceptance, or say why not (#972).
+
+        A superseded revision alone grants nothing. The promotion needs a current verifier's active acceptance of
+        the exact PR head, every required check green, and the PR ready, and then runs the same fenced path as a
+        settled revision, so the hold label, the Leader approval, the cap, the hold and pause codes and the merge
+        policy all apply unchanged. A promoted item is then carried by this observer too, because the stopped round
+        would otherwise skip it. A merged or closed PR keeps its current handling.
+        Everything here is contained to this item; a failed GitHub read changes nothing.
+        """
+        snapshot = self._state_snapshot(item)  # a rollback expires the item
+        try:
+            revision = await self._superseded_revision(db, item)
+            if revision is None:
+                return
+            if item.dispatch_status in ("ready_for_review", "awaiting_human_review"):
+                await self._process_review_item(db, scope, item, client, superseded_ok=True)
+                return
+            pull = await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
+            if self._classify_pull(pull) == "open":
+                await self._promote_settled_revision(db, scope, item, client, revision, pull)
+        except TerminalRevisionContextChanged:
+            await db.rollback()
+            await db.refresh(scope)
+            logger.info("Terminal attempt changed; no promotion recorded")
+        except (httpx.HTTPError, GithubClientResponseError):
+            await db.rollback()
+            await db.refresh(scope)
+        except ValueError as exc:
+            await db.rollback()
+            await db.refresh(scope)
+            self._log_inconsistent_once(None, f"a PR response failed the identity check ({exc})", snapshot=snapshot)
+        except Exception:
+            logger.warning("Superseded-revision check failed for work item %s; the item stays as it is",
+                           snapshot[0], exc_info=True)
+            await db.rollback()
+            await db.refresh(scope)
+
     async def _promote_settled_revision(
         self,
         db: AsyncSession,
@@ -1685,13 +1787,17 @@ class GithubVerificationService:
         head = self._head_sha(pull)
         if not isinstance(head, str) or not head:
             return
+        # A superseded revision (#972) is promoted on the exact-head acceptance alone: it records no submitted head to
+        # compare with, and it grants no authority of its own. Its row must stay exactly as it was read.
+        superseded = revision.status == "superseded"
+        label = "Superseded" if superseded else "Settled"
         # What the decision rests on is captured before any awaited read and compared again under the terminal
         # writer, so a context withdrawn while GitHub was awaited is never promoted.
         item_before = {name: getattr(item, name) for name in _SETTLEMENT_ITEM_IDENTITY}
         scope_before = {name: getattr(scope, name) for name in _SETTLEMENT_SCOPE_IDENTITY}
         revision_before = {column.name: getattr(revision, column.name) for column in revision.__table__.columns}
         reason = None
-        if head != revision.submitted_head_sha:
+        if not superseded and head != revision.submitted_head_sha:
             reason = (f"Settled revision not promoted: the PR head {head[:7]} is not the settled head "
                       f"{str(revision.submitted_head_sha)[:7]}.")
         else:
@@ -1699,9 +1805,13 @@ class GithubVerificationService:
 
             acceptance_note = await acceptance.gate_note(db, scope, item, head)
             if acceptance_note is not None:
-                reason = f"Settled revision not promoted: {acceptance_note}"
+                reason = f"{label} revision not promoted: {acceptance_note}"
             elif not await self._head_is_green(scope, client, head, item=item):
-                reason = f"Settled revision not promoted: the required checks are not all green at {head[:7]}."
+                reason = f"{label} revision not promoted: the required checks are not all green at {head[:7]}."
+            elif superseded:
+                refusal = await self._capture_superseded_fence(db, scope, item, head)
+                if isinstance(refusal, str):
+                    reason = f"Superseded revision not promoted: {refusal}"
         context = (item_before, scope_before, revision_before)
         if reason is not None:
             await self._record_settled_note(db, scope, item, revision, context, reason)
@@ -1724,7 +1834,10 @@ class GithubVerificationService:
             return
         # No network call from here to the commit: the writer is held only for the compare and the write.
         await self._fence_settled_context(db, scope, item, revision, context)
-        if revision.status != "completed" or revision.completed_at is None or revision.submitted_head_sha != head:
+        if superseded:
+            if revision.status != "superseded" or item.handoff_state is not None:
+                raise TerminalRevisionContextChanged("terminal_revision_context_changed")
+        elif revision.status != "completed" or revision.completed_at is None or revision.submitted_head_sha != head:
             raise TerminalRevisionContextChanged("terminal_revision_context_changed")
         item.last_verified_sha = head
         item.dispatch_status = "ready_for_review"
@@ -1733,7 +1846,7 @@ class GithubVerificationService:
         if scope.merge_policy == "human":
             await self._notify_code_pr_ready_for_review(db, item)
         await db.commit()
-        await self._process_review_item(db, scope, item, client, pull=fresh)
+        await self._process_review_item(db, scope, item, client, pull=fresh, superseded_ok=superseded)
 
     async def _fence_settled_context(
         self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem,
@@ -1794,7 +1907,7 @@ class GithubVerificationService:
 
     @staticmethod
     async def _settled_context_note(db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem,
-                                    head: str, expected: dict | None) -> str | None:
+                                    head: str, expected: dict | None, *, superseded_ok: bool = False) -> str | None:
         """Why a merge must not go ahead because the settlement or the scope it rested on changed, or ``None``.
 
         ``expected`` is the snapshot the operation began with. The row is read again, fresh and column by column,
@@ -1810,9 +1923,16 @@ class GithubVerificationService:
             select(GithubAttemptScopeRevision.__table__).where(GithubAttemptScopeRevision.id == began["id"])
         )).mappings().first()
         enabled = await db.scalar(select(TeamGithubScope.enabled).where(TeamGithubScope.id == scope.id))
-        if (row is None or dict(row) != began or enabled is not True or enabled != expected["enabled"]
-                or row["status"] != "completed" or row["completed_at"] is None
-                or (began["phase"] == "implementation" and row["submitted_head_sha"] != head)):
+        if superseded_ok and began["status"] == "superseded" and began["phase"] == "implementation":
+            # #972: only the superseded-revision observer asks for this. Its promotion rests on the exact-head
+            # acceptance, which the merge gates read again; here the row has to be the very one the promotion saw,
+            # and the scope must still be enabled. Any other operation still treats a superseded row as withdrawn.
+            ended = row is not None and dict(row) == began and row["status"] == "superseded"
+        else:
+            ended = (row is not None and dict(row) == began and row["status"] == "completed"
+                     and row["completed_at"] is not None
+                     and not (began["phase"] == "implementation" and row["submitted_head_sha"] != head))
+        if not ended or enabled is not True or enabled != expected["enabled"]:
             return ("Auto-merge blocked: the settled revision or the scope changed since promotion; "
                     "verifying the current state.")
         return None
@@ -2638,9 +2758,19 @@ class GithubVerificationService:
         item: GithubWorkItem,
         client: GithubClient,
         pull: dict | None = None,
+        *,
+        superseded_ok: bool = False,
     ) -> None:
         # Before any awaited read: the merge boundary compares the settled revision with this, not with its state then.
         settled_began = await self._settled_snapshot(db, scope, item)
+        fence = None
+        if superseded_ok:
+            began = {name: getattr(item, name) for name in _MERGE_FENCE_NOTE_IDENTITY}
+            fence = await self._capture_superseded_fence(db, scope, item)
+            if isinstance(fence, str):  # a refusal: say why once and stop
+                if item.status_note != fence:
+                    await self._record_fenced_note(db, item, began, fence)
+                return
         ci_context = await github_ci_watch_service.capture(db, scope, item)
         pull = pull or await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
         if not await self._validate_polled_pull_identity(
@@ -2842,7 +2972,7 @@ class GithubVerificationService:
         ):
             return
         if self._classify_pull(fresh_pull) != "open":
-            await self._process_review_item(db, scope, item, client, pull=fresh_pull)
+            await self._process_review_item(db, scope, item, client, pull=fresh_pull, superseded_ok=superseded_ok)
             return
         if self._head_sha(fresh_pull) != current_head:
             item.dispatch_status = "verifying"
@@ -2867,10 +2997,22 @@ class GithubVerificationService:
                 db, item, "Auto-merge blocked: distinct current-round leader approval is "
                 f"required ({approval_reason}).")
             return
-        withdrawn = await self._settled_context_note(db, scope, item, current_head, settled_began)
+        withdrawn = await self._settled_context_note(
+            db, scope, item, current_head, settled_began, superseded_ok=superseded_ok)
         if withdrawn is not None:
             await self._record_readiness_hold(db, item, withdrawn)
             return
+        if fence is not None:
+            # The last await before the merge call is this one statement; the HOLD read and the call follow with none.
+            if not await db.scalar(select(self._superseded_fence_holds(scope, item, fence))):
+                await db.rollback()
+                await db.refresh(scope)
+                logger.info("Authority changed before the superseded-revision merge; nothing was merged")
+                return
+            from app.services.github_coordination_service import hold_code
+            if hold_code():
+                await db.rollback()
+                return
         try:
             await client.merge_pull(
                 scope.repo_owner,
@@ -2906,6 +3048,142 @@ class GithubVerificationService:
         item.auto_merged_at = datetime.utcnow()
         await db.commit()
         await self._notify_blocker_merged(db, scope, item)
+
+    async def _capture_superseded_fence(
+        self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, head: str | None = None,
+    ) -> dict | str:
+        """What the superseded-revision merge rests on, read before any awaited GitHub read, or why it cannot go ahead (#972).
+
+        The item, the scope target, the preset's Leader slot, the exact revision row, the accepting review and the
+        workspace lease are read as plain columns. The canonical Leader settlement keeps the lease and clears the
+        escalation reason, so a missing lease or a set escalation reason is not that path and is refused precisely.
+        """
+        item_row = (await db.execute(
+            select(*(getattr(GithubWorkItem, name) for name in _MERGE_FENCE_ITEM),
+                   GithubWorkItem.handoff_state, GithubWorkItem.escalation_reason,
+                   GithubWorkItem.delivery_policy, GithubWorkItem.delivery_policy_revision)
+            .where(GithubWorkItem.id == item.id)
+        )).mappings().first()
+        if item_row is None:
+            return "Auto-merge blocked: the work item could not be read."
+        if item_row["handoff_state"] is not None or item_row["escalation_reason"] is not None:
+            return "Auto-merge blocked: the item is in a handoff or an escalation, which this path does not cover."
+        scope_row = (await db.execute(
+            select(*(getattr(TeamGithubScope, name) for name in _MERGE_FENCE_SCOPE))
+            .where(TeamGithubScope.id == scope.id))).mappings().first()
+        revision = (await db.execute(
+            select(GithubAttemptScopeRevision.__table__)
+            .where(GithubAttemptScopeRevision.work_item_id == item.id,
+                   GithubAttemptScopeRevision.dispatch_nonce == item_row["dispatch_nonce"],
+                   GithubAttemptScopeRevision.revision == item_row["active_scope_revision"],
+                   GithubAttemptScopeRevision.status == "superseded",
+                   GithubAttemptScopeRevision.phase == "implementation")
+        )).mappings().first()
+        if scope_row is None or revision is None:
+            return "Auto-merge blocked: the superseded revision or the scope could not be read."
+        lease = (await db.execute(
+            select(GithubWorkspace.id, GithubWorkspace.lease_token, GithubWorkspace.leased_at)
+            .where(GithubWorkspace.id == revision["expected_workspace_id"], GithubWorkspace.leased_item_id == item.id,
+                   GithubWorkspace.scope_id == scope.id, GithubWorkspace.enabled.is_(True))
+        )).mappings().first()
+        if lease is None or not lease["lease_token"]:
+            return ("Auto-merge blocked: the item's workspace lease is missing, released or replaced; "
+                    "a superseded revision is promoted only while its owner still holds the lease.")
+        if not (isinstance(revision["expected_lease_token_hash"], str)
+                and github_approval_service.lease_token_matches(lease["lease_token"],
+                                                                revision["expected_lease_token_hash"])):
+            return ("Auto-merge blocked: the workspace was acquired again and its lease is not the one this revision "
+                    "was approved with; a superseded revision is promoted only while its owner holds that lease.")
+        leader_slot_id = await db.scalar(select(AgentTeamPreset.leader_slot_id)
+                                         .where(AgentTeamPreset.id == scope_row["preset_id"]))
+        review = (await db.execute(
+            select(GithubHeadReview.id, GithubHeadReview.reviewer_member_id).where(
+                GithubHeadReview.work_item_id == item.id, GithubHeadReview.dispatch_nonce == item_row["dispatch_nonce"],
+                GithubHeadReview.pr_number == item_row["pr_number"], GithubHeadReview.status == "active",
+                GithubHeadReview.head_sha == (head or item_row["last_verified_sha"]),
+                GithubHeadReview.verdict == "accepted",
+            ).order_by(GithubHeadReview.id.desc()).limit(1))).mappings().first()
+        if review is None:
+            return "Auto-merge blocked: no active acceptance of the verified head could be read."
+        return {"item": dict(item_row), "scope": dict(scope_row), "revision": dict(revision), "lease": dict(lease),
+                "leader_slot_id": leader_slot_id, "review": dict(review)}
+
+    @staticmethod
+    def _superseded_fence_holds(scope: TeamGithubScope, item: GithubWorkItem, fence: dict):
+        """One statement that is true only while everything captured is unchanged and no pause or approval is open.
+
+        A single SQL statement is coherent where several awaited reads are not, so a change cannot fall between its
+        parts. It adds what the captured values do not say: the auto policy and autonomy on, the Leader slot still
+        enabled, the accepting reviewer still the current verifier, and no waiting or paused observation or pending
+        approval request.
+        """
+        began = fence["item"]
+        item_ok = exists(select(GithubWorkItem.id).where(
+            *(_same_value(getattr(GithubWorkItem, name), began[name]) for name in _MERGE_FENCE_ITEM),
+            GithubWorkItem.handoff_state.is_(None), GithubWorkItem.escalation_reason.is_(None),
+            *policy_context_conditions((began["delivery_policy_revision"], began["delivery_policy"])),
+        ))
+        scope_ok = exists(select(TeamGithubScope.id).join(
+            AgentTeamPreset, AgentTeamPreset.id == TeamGithubScope.preset_id).where(
+            *(_same_value(getattr(TeamGithubScope, name), fence["scope"][name]) for name in _MERGE_FENCE_SCOPE),
+            TeamGithubScope.enabled.is_(True), TeamGithubScope.merge_policy == "auto",
+            AgentTeamPreset.autonomy_enabled.is_(True),
+            _same_value(AgentTeamPreset.leader_slot_id, fence["leader_slot_id"]),
+        ))
+        leader_ok = exists(select(AgentTeamSlot.id).where(
+            AgentTeamSlot.id == fence["leader_slot_id"], AgentTeamSlot.enabled.is_(True)))
+        revision_ok = exists(select(GithubAttemptScopeRevision.id).where(
+            GithubAttemptScopeRevision.status == "superseded",
+            *(_same_value(column, fence["revision"][column.name]) for column in GithubAttemptScopeRevision.__table__.columns)))
+        lease = fence["lease"]
+        lease_ok = exists(select(GithubWorkspace.id).where(
+            GithubWorkspace.id == lease["id"], GithubWorkspace.leased_item_id == item.id,
+            GithubWorkspace.scope_id == scope.id, GithubWorkspace.enabled.is_(True),
+            GithubWorkspace.lease_token == lease["lease_token"], _same_value(GithubWorkspace.leased_at, lease["leased_at"])))
+        review_ok = exists(
+            select(GithubHeadReview.id)
+            .join(MailTeamMember, MailTeamMember.id == GithubHeadReview.reviewer_member_id)
+            .join(AgentTeamSlot, AgentTeamSlot.id == MailTeamMember.team_slot_id)
+            .where(GithubHeadReview.id == fence["review"]["id"], GithubHeadReview.status == "active",
+                   GithubHeadReview.verdict == "accepted", AgentTeamSlot.enabled.is_(True),
+                   MailTeamMember.team_preset_id == scope.preset_id, AgentTeamSlot.preset_id == scope.preset_id,
+                   func.lower(func.trim(AgentTeamSlot.role)) == "verifier",
+                   AgentTeamSlot.id != began["owner_slot_id"],
+                   AgentTeamSlot.id != fence["leader_slot_id"],
+                   # the accepting member is still the current occupant of its slot
+                   MailTeamMember.id == _latest_member(MailTeamMember.team_slot_id)))
+        # the approver is the current Leader-slot member, the owner slot is enabled with a current member, and the
+        # two are distinct people
+        occupants_ok = exists(select(GithubWorkItem.id).where(
+            GithubWorkItem.id == item.id,
+            GithubWorkItem.ack_approver_member_id == _latest_member(fence["leader_slot_id"]),
+            _latest_member(GithubWorkItem.owner_slot_id).is_not(None),
+            GithubWorkItem.ack_approver_member_id != _latest_member(GithubWorkItem.owner_slot_id),
+            exists(select(AgentTeamSlot.id).where(
+                AgentTeamSlot.id == GithubWorkItem.owner_slot_id, AgentTeamSlot.enabled.is_(True),
+                AgentTeamSlot.preset_id == scope.preset_id)),
+        ))
+        quiet = ~exists(select(GithubOwnerObservationPause.id).where(
+            GithubOwnerObservationPause.work_item_id == item.id,
+            GithubOwnerObservationPause.status.in_(("waiting", "paused"))))
+        no_pending = ~exists(select(GithubApprovalRequest.id).where(
+            GithubApprovalRequest.work_item_id == item.id, GithubApprovalRequest.status == "pending"))
+        return and_(item_ok, scope_ok, leader_ok, revision_ok, lease_ok, review_ok, occupants_ok, quiet, no_pending)
+
+    @staticmethod
+    async def _record_fenced_note(db: AsyncSession, item: GithubWorkItem, began: dict, note: str) -> None:
+        """Write a refusal note only while the attempt it was read for is still the one on the item (#972).
+
+        The note is decided after awaited reads; a new dispatch that replaced the item meanwhile keeps its own note.
+        """
+        claim = await db.execute(update(GithubWorkItem).where(
+            *(_same_value(getattr(GithubWorkItem, name), value) for name, value in began.items()),
+        ).values(status_note=note, updated_at=datetime.utcnow()).execution_options(synchronize_session=False))
+        if claim.rowcount != 1:
+            await db.rollback()
+            return
+        await db.commit()
+        await db.refresh(item)
 
     @staticmethod
     def _draft_readiness_note(item: GithubWorkItem, pull: dict) -> str | None:
