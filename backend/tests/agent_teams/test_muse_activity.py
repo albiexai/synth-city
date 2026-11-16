@@ -611,3 +611,35 @@ def test_a_scanned_start_after_the_tail_events_is_invalid(tmp_path):
     data = (b"".join(lines[:start]) + late + _filler_after(lines[start], m._TAIL_BYTES + 4096)
             + b"".join(lines[start + 1:]))
     assert _write_and_read(tmp_path, data)[0] == "unknown"
+
+
+# V1 review 5915400053: an unfinished tail stays incomplete even when it fills the whole
+# tail, and any malformed or non-object row met by the scan stops it, typed or not.
+def _observe_written(tmp_path, monkeypatch, data):
+    import os
+    import app.services.muse_activity_service as m
+    _cli, owner_home = _owner(monkeypatch, tmp_path)
+    folder = owner_home / ".local" / "share" / "muse" / "sessions" / "2026" / "10" / "14" / SID
+    folder.mkdir(parents=True)
+    (folder / "session.jsonl").write_bytes(data)
+    monkeypatch.setattr(m, "_identity", lambda pid, session_id, cwd: True)
+    monkeypatch.setattr(m, "_process_uid", lambda pid: os.getuid())
+    return m.observe_muse(4100, SID, CWD, NOW, START)[:2]
+
+
+@pytest.mark.parametrize("name", ["tool_turn_working", "turn_completed"])
+def test_an_unfinished_record_larger_than_the_tail_stays_incomplete(tmp_path, monkeypatch, name):
+    import app.services.muse_activity_service as m
+    lines = _fixture(name)
+    unfinished = b'{"payload_type": "runtime.session", "payload": {"event": {"kind": "output", "text": "' + b"z" * (2 * m._TAIL_BYTES)
+    assert _observe_written(tmp_path, monkeypatch, b"".join(lines) + unfinished) == ("unknown", "observation_incomplete")
+
+
+@pytest.mark.parametrize("row", [b"{bad json}\n", b"[1, 2]\n", b'{"schema_version": 1, "payload_type":\n'])
+def test_a_tagless_malformed_row_in_the_scan_stays_unknown(tmp_path, row):
+    import app.services.muse_activity_service as m
+    lines = _fixture("tool_turn_working")
+    start = _prompted_start(lines)
+    data = (b"".join(lines[:start + 1]) + row + _filler_after(lines[start], m._TAIL_BYTES + 4096)
+            + b"".join(lines[start + 1:]))
+    assert _write_and_read(tmp_path, data)[0] == "unknown"

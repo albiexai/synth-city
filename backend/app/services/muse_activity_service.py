@@ -160,7 +160,11 @@ def _read_lines(path: Path, uid: int) -> tuple[list[bytes] | None, int, str | No
         carried: list[bytes] = []
         if offset:
             first, lines = (lines[0], lines[1:]) if lines else (b"", [])  # the first line of a tail may be partial
-            if not any(_turn_record(line) in {"start", "end"} for line in lines):
+            if not data.endswith(b"\n"):
+                # An unfinished append: keep it even when it fills the whole tail, so the
+                # parser reports the observation as incomplete. Nothing to scan for.
+                lines = lines or [first]
+            elif not any(_turn_record(line) in {"start", "end"} for line in lines):
                 carried = _scan_for_turn(stream, offset, first)
         after = os.fstat(stream.fileno())
     current = path.stat(follow_symlinks=False)
@@ -180,11 +184,9 @@ def _read_at(stream, offset: int, size: int) -> bytes:
 def _turn_record(line: bytes) -> str | None:
     """Classify a complete record: a turn start, a turn end, a question event, or neither.
 
-    A record that names runtime.session but cannot be read is "invalid": it might be
-    the turn boundary the scan is looking for, so the scan must not pass over it.
+    A row that is not a readable JSON object is "invalid", whatever it contains: it
+    might be the turn boundary the scan is looking for, so the scan must not pass over it.
     """
-    if not line.endswith(b"\n") or b'"runtime.session"' not in line:
-        return None
     try:
         row = json.loads(line)
     except ValueError:
