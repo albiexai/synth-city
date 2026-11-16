@@ -178,3 +178,50 @@ def test_the_probe_writes_nothing_and_signals_nothing():
     for forbidden in ("os.kill", "signal.", "subprocess", "socket", "urllib", "requests", 'open(', "write(", "unlink",
                       "os.remove", "shutil", "os.system"):
         assert forbidden not in source, forbidden
+
+
+# --- #1014 review 5928160001: no traceback, and so no path or session name, can leave the probe -----------------------
+
+def test_a_symlink_loop_in_a_lock_target_never_escapes_main(probe, tmp_path, monkeypatch, capsys):
+    """A real loop of symlinks in a descriptor target, driven through main()."""
+    first, second = tmp_path / "loop-a", tmp_path / "loop-b"
+    first.symlink_to(second)
+    second.symlink_to(first)
+    _process(tmp_path, monkeypatch, first / SID / ".session.lock")
+    assert probe.main(["--pid", "4100", "--cwd", CWD, "--expect-session-id", SID]) == 0
+    out = capsys.readouterr().out
+    parsed = json.loads(out)
+    for secret in (str(tmp_path), "loop-a", "loop-b", SID, CWD, ".session.lock", "Traceback"):
+        assert secret not in out
+    assert parsed["discovered"] is False and parsed["fd_listable"] is True
+
+
+def test_an_unexpected_error_while_counting_locks_is_reported_by_kind_with_conservative_facts(
+        probe, tmp_path, monkeypatch, capsys):
+    _process(tmp_path, monkeypatch)
+
+    def explode(entries, root):
+        raise RuntimeError("secret /proc/9/fd " + SID)
+
+    monkeypatch.setattr(probe, "_count_locks", explode)
+    facts = probe.observe(4100, CWD)
+    assert facts["lock_count_error"] == "RuntimeError"
+    assert facts["lock_descriptors"] == 0 and facts["locks_under_sessions_root"] == 0
+    assert "secret" not in json.dumps(facts) and SID not in json.dumps(facts)
+
+
+def test_main_prints_a_fixed_shape_object_and_exits_zero_when_observe_itself_fails(probe, monkeypatch, capsys):
+    def explode(pid, cwd, expect=None):
+        raise RuntimeError("secret /proc/9/fd " + SID)
+
+    monkeypatch.setattr(probe, "observe", explode)
+    assert probe.main(["--pid", "4100", "--cwd", CWD]) == 0
+    out = capsys.readouterr().out
+    assert json.loads(out) == {"probe_error": "RuntimeError", "version": 1}
+    assert "secret" not in out and SID not in out and "Traceback" not in out
+
+
+def test_main_has_no_unguarded_observation_call(probe):
+    import inspect
+    source = inspect.getsource(probe.main)
+    assert "except Exception" in source and source.index("except Exception") > source.index("observe(")

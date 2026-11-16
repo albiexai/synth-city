@@ -92,7 +92,10 @@ def observe(pid: int, cwd: str, expect_session_id: str | None = None) -> dict:
     try:
         with _scandir(muse._process_fd_dir(pid)) as entries:
             facts["fd_listable"] = True
-            facts["lock_descriptors"], facts["locks_under_sessions_root"] = _count_locks(entries, root)
+            try:
+                facts["lock_descriptors"], facts["locks_under_sessions_root"] = _count_locks(entries, root)
+            except Exception as error:  # a symlink loop, say: report the kind only, with conservative counts
+                facts["lock_count_error"] = type(error).__name__
     except PermissionError:
         facts["fd_failure"] = "permission_denied"
     except FileNotFoundError:
@@ -116,7 +119,11 @@ def main(argv=None) -> int:
     parser.add_argument("--cwd", required=True, help="the workspace directory of that pane")
     parser.add_argument("--expect-session-id", default=None, help="report only whether the discovered id matches it")
     args = parser.parse_args(argv)
-    print(json.dumps(observe(args.pid, args.cwd, args.expect_session_id), sort_keys=True))
+    try:
+        facts = observe(args.pid, args.cwd, args.expect_session_id)
+    except Exception as error:  # nothing but a fixed-shape object may leave: a traceback would carry paths and names
+        facts = {"version": 1, "probe_error": type(error).__name__}
+    print(json.dumps(facts, sort_keys=True))
     return 0
 
 
