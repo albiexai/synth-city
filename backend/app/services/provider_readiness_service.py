@@ -8,6 +8,14 @@ from app.models.provider_operations_schemas import Check, Configuration
 OPENCODE_VERSION_REASON = "OpenCode 2 or later is required"
 OPENCODE_VERSION_CODE = "opencode_version_unsupported"
 
+# Antigravity CLI launch gates that stay closed until their evidence exists, in order. Agent Mail for
+# agy is installed by #736. Onboarding (terms and data-use choices) belongs to the user: no completion
+# signal is proven (#952), so it is never read, guessed or preset here.
+ANTIGRAVITY_UNPROVEN_GATES = (
+    "Agent Mail for Antigravity CLI is not installed yet",
+    "Complete Antigravity CLI onboarding (terms and data-use choices) once as this user before launching agents",
+)
+
 
 class _VersionAccepted:
     """Install status view that leaves the OpenCode version to its own check."""
@@ -43,8 +51,8 @@ def agent_mail_ready_reason(provider: str, install_status: Any) -> str | None:
     if provider == "antigravity-cli":
         if not getattr(install_status, "antigravity_cli_available", False):
             return "Antigravity CLI is not available on this machine"
-        # Fail closed: Agent Mail for agy is installed by #736, so no member is ready before then.
-        return "Agent Mail for Antigravity CLI is not installed yet"
+        # Fail closed: no member is ready while any gate is unproven.
+        return ANTIGRAVITY_UNPROVEN_GATES[0] if ANTIGRAVITY_UNPROVEN_GATES else None
     if provider == "codex-cli":
         if not install_status.codex_cli_available:
             return "Codex CLI is not available on this machine"
