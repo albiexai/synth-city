@@ -6,9 +6,13 @@
 - agy rejects Claude-style hook output, but a `PreToolUse` hook printing
   `{"decision": "deny", "reason": ...}` blocks the tool call.
 """
+import asyncio
+import importlib.util
 import io
 import json
 import logging
+from pathlib import Path
+import re
 
 import httpx
 import pytest
@@ -42,7 +46,7 @@ async def test_install_keeps_other_servers_and_groups_and_uninstall_removes_only
     status = await svc.apply_antigravity_install(None)
     servers = json.loads(mcp.read_text())["mcpServers"]
     assert servers["mine"] == mine
-    entry = servers["albiex-synth-city-mail"]
+    entry = servers["synth-city-mail"]
     # The plain shape agy loaded in #736 P1: no "type" or "transport".
     assert set(entry) == {"command", "args", "env"}
     assert entry["env"]["SYNTH_CITY_PROVIDER"] == "antigravity-cli"
@@ -82,7 +86,7 @@ async def test_empty_or_missing_files_mean_no_servers_and_no_groups(gemini):
     mcp.parent.mkdir(parents=True)
     mcp.write_text("")
     await svc.apply_antigravity_install(None)
-    assert list(json.loads(mcp.read_text())["mcpServers"]) == ["albiex-synth-city-mail"]
+    assert list(json.loads(mcp.read_text())["mcpServers"]) == ["synth-city-mail"]
     assert hooks.exists()
 
 
@@ -332,3 +336,112 @@ async def test_empty_question_group_is_kept_by_install_and_uninstall(gemini):
     assert "PreToolUse" in svc.installed_antigravity_hooks()
     await svc.uninstall_antigravity(None)
     assert json.loads(hooks.read_text()) == {"albiex-synth-city-mail-question": {"PreToolUse": [EMPTY_QUESTION]}}
+
+
+# --- #991: agy-safe server key ----------------------------------------------------------------
+
+AGY_TOOL_NAME = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")  # agy 1.5.9 rejects any other mcp_<server>_<tool>
+OLD_KEY, NEW_KEY = "albiex-synth-city-mail", "synth-city-mail"
+
+
+def _shim_tools(monkeypatch):
+    monkeypatch.setenv("SYNTH_CITY_PROVIDER", "antigravity-cli")
+    location = Path(__file__).resolve().parents[2] / "mcp_shim/agent_mail_server.py"
+    spec = importlib.util.spec_from_file_location("antigravity_name_check", location)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return [tool.name for tool in asyncio.run(module.mcp.list_tools())]
+
+
+def test_every_mail_tool_name_fits_the_agy_limit(monkeypatch):
+    assert svc.ANTIGRAVITY_MCP_SERVER_KEY == NEW_KEY
+    names = _shim_tools(monkeypatch)
+    assert len(names) >= 47
+    too_long = [name for name in names if not AGY_TOOL_NAME.fullmatch(f"mcp_{NEW_KEY}_{name}")]
+    assert too_long == []
+    # The shared key that agy reported as invalid for four tools (#980 P1) would not fit.
+    assert [n for n in names if not AGY_TOOL_NAME.fullmatch(f"mcp_{OLD_KEY}_{n}")]
+
+
+def _ours():
+    return {"command": "/venv/bin/python", "args": [svc.shim_path()], "env": {"SYNTH_CITY_PROVIDER": "antigravity-cli"}}
+
+
+USER_SERVER = {"command": "/usr/bin/someone-else", "args": ["--serve"]}
+
+
+@pytest.mark.asyncio
+async def test_install_migrates_only_our_old_entry(gemini):
+    mcp, _hooks, _scopes = gemini
+    mcp.parent.mkdir(parents=True)
+    mcp.write_text(json.dumps({"mcpServers": {OLD_KEY: _ours(), "mine": USER_SERVER}}))
+    status = await svc.apply_antigravity_install(None)
+    servers = json.loads(mcp.read_text())["mcpServers"]
+    assert OLD_KEY not in servers and set(servers) == {NEW_KEY, "mine"}
+    assert servers["mine"] == USER_SERVER and status.antigravity_mcp_installed
+
+
+@pytest.mark.asyncio
+async def test_install_keeps_a_users_entry_under_the_old_key(gemini):
+    mcp, _hooks, _scopes = gemini
+    mcp.parent.mkdir(parents=True)
+    mcp.write_text(json.dumps({"mcpServers": {OLD_KEY: USER_SERVER}}))
+    await svc.apply_antigravity_install(None)
+    servers = json.loads(mcp.read_text())["mcpServers"]
+    assert servers[OLD_KEY] == USER_SERVER and NEW_KEY in servers
+
+
+@pytest.mark.asyncio
+async def test_install_refuses_a_users_entry_under_the_new_key_without_writing(gemini):
+    mcp, hooks, scopes = gemini
+    mcp.parent.mkdir(parents=True)
+    original = json.dumps({"mcpServers": {NEW_KEY: USER_SERVER}})
+    mcp.write_text(original)
+    with pytest.raises(ValueError):
+        await svc.apply_antigravity_install(None)
+    assert mcp.read_text() == original and not hooks.exists() and scopes == []
+
+
+@pytest.mark.parametrize("servers,installed", [
+    ({NEW_KEY: "ours"}, True),
+    ({OLD_KEY: "ours"}, True),
+    ({NEW_KEY: "user"}, False),
+    ({OLD_KEY: "user"}, False),
+    ({}, False),
+])
+def test_status_reads_both_keys_and_only_our_entries(gemini, servers, installed):
+    mcp, _hooks, _scopes = gemini
+    mcp.parent.mkdir(parents=True)
+    doc = {key: (_ours() if who == "ours" else USER_SERVER) for key, who in servers.items()}
+    mcp.write_text(json.dumps({"mcpServers": doc}))
+    assert svc.antigravity_mcp_installed() is installed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_owner", ["ours", "user"])
+async def test_uninstall_removes_our_entries_under_both_keys_only(gemini, old_owner):
+    mcp, _hooks, _scopes = gemini
+    mcp.parent.mkdir(parents=True)
+    old = _ours() if old_owner == "ours" else USER_SERVER
+    mcp.write_text(json.dumps({"mcpServers": {OLD_KEY: old, NEW_KEY: _ours(), "mine": USER_SERVER}}))
+    await svc.uninstall_antigravity(None)
+    servers = json.loads(mcp.read_text())["mcpServers"]
+    expected = {"mine": USER_SERVER} if old_owner == "ours" else {OLD_KEY: USER_SERVER, "mine": USER_SERVER}
+    assert servers == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [None, "x", 1, [], {}, {"command": "/usr/bin/other", "args": ["--serve"]}])
+async def test_any_value_already_under_the_new_key_that_is_not_ours_is_refused(gemini, value):
+    # Review 5924741712: a present key with JSON null must count as a collision too.
+    mcp, hooks, scopes = gemini
+    mcp.parent.mkdir(parents=True)
+    original = json.dumps({"mcpServers": {NEW_KEY: value, OLD_KEY: _ours()}})
+    mcp.write_text(original)
+    hooks.write_text('{"user-group": {"Stop": []}}')
+    hooks_before = hooks.read_bytes()
+    with pytest.raises(ValueError):
+        await svc.apply_antigravity_install(None)
+    assert mcp.read_text() == original  # our old-key entry is not removed either
+    assert hooks.read_bytes() == hooks_before
+    assert scopes == []

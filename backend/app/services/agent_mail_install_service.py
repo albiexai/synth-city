@@ -1010,6 +1010,18 @@ def antigravity_hook_command(slug: str) -> str:
     return provider_hook_command("antigravity-cli", slug)
 
 
+# agy names an MCP tool mcp_<server key>_<tool> and rejects names outside ^[a-zA-Z0-9_-]{1,64}$.
+# With the shared MCP_SERVER_NAME, four Mail tools exceeded that (#980 P1), so Antigravity uses a
+# shorter key. The previous key is still read, migrated and removed when it holds our own entry.
+ANTIGRAVITY_MCP_SERVER_KEY = "synth-city-mail"
+_ANTIGRAVITY_MCP_KEYS = (ANTIGRAVITY_MCP_SERVER_KEY, MCP_SERVER_NAME)
+
+
+def _is_our_antigravity_entry(entry: object) -> bool:
+    args = entry.get("args") if isinstance(entry, dict) else None
+    return isinstance(args, list) and shim_path() in args
+
+
 def _antigravity_mcp_entry() -> dict:
     # The plain stdio shape agy loaded in #736 P1: no "type" or "transport" field.
     return {"command": sys.executable, "args": [shim_path()],
@@ -1060,11 +1072,10 @@ def _write_antigravity_json(path: Path, doc: dict) -> None:
 
 def antigravity_mcp_installed() -> bool:
     try:
-        entry = _load_antigravity_mcp().get("mcpServers", {}).get(MCP_SERVER_NAME)
+        servers = _load_antigravity_mcp().get("mcpServers", {})
     except ValueError:
         return False
-    args = entry.get("args") if isinstance(entry, dict) else None
-    return isinstance(args, list) and shim_path() in args
+    return any(_is_our_antigravity_entry(servers.get(key)) for key in _ANTIGRAVITY_MCP_KEYS)
 
 
 # Synth City owns only its own command entries inside its named groups. A user's entry, event
@@ -1604,8 +1615,16 @@ async def apply_antigravity_install(db: AsyncSession) -> AgentMailInstallStatus:
     hooks = _load_antigravity_hooks()
     for event in ANTIGRAVITY_MAIL_HOOKS:
         _antigravity_event_entries(hooks, event)
+    servers = mcp.get("mcpServers", {})
+    # Key presence, not its value, decides a collision: even a JSON null is someone else's entry.
+    if ANTIGRAVITY_MCP_SERVER_KEY in servers and not _is_our_antigravity_entry(servers[ANTIGRAVITY_MCP_SERVER_KEY]):
+        raise ValueError(f"The Antigravity CLI MCP server '{ANTIGRAVITY_MCP_SERVER_KEY}' is not Synth City's; "
+                         "rename or remove it before setting up Agent Mail")
     await _backup_before_mutation(db, "antigravity")
-    mcp.setdefault("mcpServers", {})[MCP_SERVER_NAME] = _antigravity_mcp_entry()
+    servers = mcp.setdefault("mcpServers", {})
+    if _is_our_antigravity_entry(servers.get(MCP_SERVER_NAME)):
+        del servers[MCP_SERVER_NAME]
+    servers[ANTIGRAVITY_MCP_SERVER_KEY] = _antigravity_mcp_entry()
     _set_antigravity_hooks(hooks, install=True)
     _write_antigravity_json(antigravity_mcp_config_path(), mcp)
     _write_antigravity_json(antigravity_hooks_path(), hooks)
@@ -1621,7 +1640,11 @@ async def uninstall_antigravity(db: AsyncSession) -> AgentMailInstallStatus:
     for event in ANTIGRAVITY_MAIL_HOOKS:
         _antigravity_event_entries(hooks, event)
     await _backup_before_mutation(db, "antigravity")
-    if mcp.get("mcpServers", {}).pop(MCP_SERVER_NAME, None) is not None:
+    servers = mcp.get("mcpServers", {})
+    ours = [key for key in _ANTIGRAVITY_MCP_KEYS if _is_our_antigravity_entry(servers.get(key))]
+    for key in ours:
+        del servers[key]
+    if ours:
         _write_antigravity_json(antigravity_mcp_config_path(), mcp)
     if _set_antigravity_hooks(hooks, install=False):
         _write_antigravity_json(antigravity_hooks_path(), hooks)
