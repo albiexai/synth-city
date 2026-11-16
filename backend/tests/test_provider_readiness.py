@@ -409,3 +409,21 @@ def test_antigravity_onboarding_check_never_opens_sign_in_files_or_writes(agy_ho
     assert opened and all(path.endswith("onboarding.json") for path in opened)
     assert not any("oauth" in path or "credential" in path for path in opened)
     assert sorted(str(p) for p in agy_home.parent.parent.parent.rglob("*")) == before
+
+
+# Review 5926506377: a deeply nested JSON document under the size cap makes the decoder recurse.
+NESTED = "[" * 30000 + "]" * 30000
+
+
+def test_antigravity_onboarding_signal_survives_a_recursion_bomb(agy_home):
+    from app.services.providers.antigravity_cli import antigravity_onboarding_complete
+    (agy_home / "onboarding.json").write_text(NESTED)
+    assert len(NESTED) < 65536
+    assert antigravity_onboarding_complete() is False
+
+
+def test_antigravity_readiness_stays_blocked_for_a_recursion_bomb(agy_home, monkeypatch):
+    monkeypatch.setattr(provider_readiness_service, "ANTIGRAVITY_UNPROVEN_GATES", ())
+    (agy_home / "onboarding.json").write_text(NESTED)
+    assert agent_mail_ready_reason("antigravity-cli", configured()) == ONBOARDING
+    assert configuration_readiness("antigravity-cli", "Antigravity CLI", True, configured()).state == "blocked"

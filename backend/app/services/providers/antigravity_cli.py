@@ -56,7 +56,7 @@ def antigravity_onboarding_complete() -> bool:
         return False
     try:
         document = json.loads(data)
-    except ValueError:
+    except (ValueError, RecursionError):  # a deeply nested document under the size cap recurses
         return False
     return isinstance(document, dict) and document.get("onboardingComplete") is True
 
