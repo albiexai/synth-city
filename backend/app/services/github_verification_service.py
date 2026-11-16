@@ -1043,6 +1043,9 @@ class GithubVerificationService:
                 # stops the whole round. It cannot advance old source through CI,
                 # but a merged PR is an external fact that the stopped round must not hide.
                 await self._settle_merged_while_round_stopped(db, scope, item, client)
+                if inspect(item).unloaded:  # the merge check rolled back and expired the item
+                    await db.refresh(item)
+                await self._observe_superseded_revision(db, scope, item, client)
                 continue
             try:
                 if item.dispatch_status in ("dispatched", "verifying"):
@@ -1052,6 +1055,8 @@ class GithubVerificationService:
                             settled = await self._settled_revision(db, item)
                             if settled is not None:
                                 await self._observe_settled_revision(db, scope, item, client, settled)
+                            elif await self._superseded_revision(db, item) is not None:
+                                await self._observe_superseded_revision(db, scope, item, client)
                             else:
                                 self._log_inconsistent_once(item)
                             continue
@@ -1083,6 +1088,8 @@ class GithubVerificationService:
                         client,
                         revision=revision,
                     )
+                elif await self._superseded_revision(db, item) is not None:
+                    await self._observe_superseded_revision(db, scope, item, client)
                 else:
                     await self._process_review_item(db, scope, item, client)
                 # Repeated failed-head reads can return without another state write.
@@ -1661,6 +1668,75 @@ class GithubVerificationService:
             await db.refresh(scope)
             self._log_inconsistent_once(None, f"a PR response failed the identity check ({exc})", snapshot=snapshot)
 
+    async def _superseded_revision(
+        self, db: AsyncSession, item: GithubWorkItem,
+    ) -> GithubAttemptScopeRevision | None:
+        """The superseded implementation revision an item with an open-PR candidate is still on, if it is one (#972).
+
+        A Leader settlement of a negative review ends the submitted revision as superseded and leaves the item
+        'dispatched' with no owner acknowledgement. The owner can then push a head that the reviewer accepts, but
+        no amendment is left to carry it. Any other shape, a handoff included, is not this one.
+        """
+        if (item.dispatch_status not in ("dispatched", "verifying", "ready_for_review", "awaiting_human_review")
+                or item.issue_type != "code" or item.active_scope_revision <= 0 or item.pr_number is None
+                or item.handoff_state is not None):
+            return None
+        revision = (
+            await db.execute(
+                select(GithubAttemptScopeRevision)
+                .where(
+                    GithubAttemptScopeRevision.work_item_id == item.id,
+                    GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce,
+                    GithubAttemptScopeRevision.revision == item.active_scope_revision,
+                )
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if (revision is None or revision.status != "superseded" or revision.phase != "implementation"
+                or item.attempt_phase != revision.phase):
+            return None
+        return revision
+
+    async def _observe_superseded_revision(
+        self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, client: GithubClient,
+    ) -> None:
+        """An open PR on a superseded revision: promote it on an exact-head acceptance, or say why not (#972).
+
+        A superseded revision alone grants nothing. The promotion needs a current verifier's active acceptance of
+        the exact PR head, every required check green, and the PR ready, and then runs the same fenced path as a
+        settled revision, so the hold label, the Leader approval, the cap, the hold and pause codes and the merge
+        policy all apply unchanged. A promoted item is then carried by this observer too, because the stopped round
+        would otherwise skip it. A merged or closed PR keeps its current handling.
+        Everything here is contained to this item; a failed GitHub read changes nothing.
+        """
+        snapshot = self._state_snapshot(item)  # a rollback expires the item
+        try:
+            revision = await self._superseded_revision(db, item)
+            if revision is None:
+                return
+            if item.dispatch_status in ("ready_for_review", "awaiting_human_review"):
+                await self._process_review_item(db, scope, item, client, superseded_ok=True)
+                return
+            pull = await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
+            if self._classify_pull(pull) == "open":
+                await self._promote_settled_revision(db, scope, item, client, revision, pull)
+        except TerminalRevisionContextChanged:
+            await db.rollback()
+            await db.refresh(scope)
+            logger.info("Terminal attempt changed; no promotion recorded")
+        except (httpx.HTTPError, GithubClientResponseError):
+            await db.rollback()
+            await db.refresh(scope)
+        except ValueError as exc:
+            await db.rollback()
+            await db.refresh(scope)
+            self._log_inconsistent_once(None, f"a PR response failed the identity check ({exc})", snapshot=snapshot)
+        except Exception:
+            logger.warning("Superseded-revision check failed for work item %s; the item stays as it is",
+                           snapshot[0], exc_info=True)
+            await db.rollback()
+            await db.refresh(scope)
+
     async def _promote_settled_revision(
         self,
         db: AsyncSession,
@@ -1685,13 +1761,17 @@ class GithubVerificationService:
         head = self._head_sha(pull)
         if not isinstance(head, str) or not head:
             return
+        # A superseded revision (#972) is promoted on the exact-head acceptance alone: it records no submitted head to
+        # compare with, and it grants no authority of its own. Its row must stay exactly as it was read.
+        superseded = revision.status == "superseded"
+        label = "Superseded" if superseded else "Settled"
         # What the decision rests on is captured before any awaited read and compared again under the terminal
         # writer, so a context withdrawn while GitHub was awaited is never promoted.
         item_before = {name: getattr(item, name) for name in _SETTLEMENT_ITEM_IDENTITY}
         scope_before = {name: getattr(scope, name) for name in _SETTLEMENT_SCOPE_IDENTITY}
         revision_before = {column.name: getattr(revision, column.name) for column in revision.__table__.columns}
         reason = None
-        if head != revision.submitted_head_sha:
+        if not superseded and head != revision.submitted_head_sha:
             reason = (f"Settled revision not promoted: the PR head {head[:7]} is not the settled head "
                       f"{str(revision.submitted_head_sha)[:7]}.")
         else:
@@ -1699,9 +1779,9 @@ class GithubVerificationService:
 
             acceptance_note = await acceptance.gate_note(db, scope, item, head)
             if acceptance_note is not None:
-                reason = f"Settled revision not promoted: {acceptance_note}"
+                reason = f"{label} revision not promoted: {acceptance_note}"
             elif not await self._head_is_green(scope, client, head, item=item):
-                reason = f"Settled revision not promoted: the required checks are not all green at {head[:7]}."
+                reason = f"{label} revision not promoted: the required checks are not all green at {head[:7]}."
         context = (item_before, scope_before, revision_before)
         if reason is not None:
             await self._record_settled_note(db, scope, item, revision, context, reason)
@@ -1724,7 +1804,10 @@ class GithubVerificationService:
             return
         # No network call from here to the commit: the writer is held only for the compare and the write.
         await self._fence_settled_context(db, scope, item, revision, context)
-        if revision.status != "completed" or revision.completed_at is None or revision.submitted_head_sha != head:
+        if superseded:
+            if revision.status != "superseded" or item.handoff_state is not None:
+                raise TerminalRevisionContextChanged("terminal_revision_context_changed")
+        elif revision.status != "completed" or revision.completed_at is None or revision.submitted_head_sha != head:
             raise TerminalRevisionContextChanged("terminal_revision_context_changed")
         item.last_verified_sha = head
         item.dispatch_status = "ready_for_review"
@@ -1733,7 +1816,7 @@ class GithubVerificationService:
         if scope.merge_policy == "human":
             await self._notify_code_pr_ready_for_review(db, item)
         await db.commit()
-        await self._process_review_item(db, scope, item, client, pull=fresh)
+        await self._process_review_item(db, scope, item, client, pull=fresh, superseded_ok=superseded)
 
     async def _fence_settled_context(
         self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem,
@@ -1794,7 +1877,7 @@ class GithubVerificationService:
 
     @staticmethod
     async def _settled_context_note(db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem,
-                                    head: str, expected: dict | None) -> str | None:
+                                    head: str, expected: dict | None, *, superseded_ok: bool = False) -> str | None:
         """Why a merge must not go ahead because the settlement or the scope it rested on changed, or ``None``.
 
         ``expected`` is the snapshot the operation began with. The row is read again, fresh and column by column,
@@ -1810,9 +1893,16 @@ class GithubVerificationService:
             select(GithubAttemptScopeRevision.__table__).where(GithubAttemptScopeRevision.id == began["id"])
         )).mappings().first()
         enabled = await db.scalar(select(TeamGithubScope.enabled).where(TeamGithubScope.id == scope.id))
-        if (row is None or dict(row) != began or enabled is not True or enabled != expected["enabled"]
-                or row["status"] != "completed" or row["completed_at"] is None
-                or (began["phase"] == "implementation" and row["submitted_head_sha"] != head)):
+        if superseded_ok and began["status"] == "superseded" and began["phase"] == "implementation":
+            # #972: only the superseded-revision observer asks for this. Its promotion rests on the exact-head
+            # acceptance, which the merge gates read again; here the row has to be the very one the promotion saw,
+            # and the scope must still be enabled. Any other operation still treats a superseded row as withdrawn.
+            ended = row is not None and dict(row) == began and row["status"] == "superseded"
+        else:
+            ended = (row is not None and dict(row) == began and row["status"] == "completed"
+                     and row["completed_at"] is not None
+                     and not (began["phase"] == "implementation" and row["submitted_head_sha"] != head))
+        if not ended or enabled is not True or enabled != expected["enabled"]:
             return ("Auto-merge blocked: the settled revision or the scope changed since promotion; "
                     "verifying the current state.")
         return None
@@ -2638,6 +2728,8 @@ class GithubVerificationService:
         item: GithubWorkItem,
         client: GithubClient,
         pull: dict | None = None,
+        *,
+        superseded_ok: bool = False,
     ) -> None:
         # Before any awaited read: the merge boundary compares the settled revision with this, not with its state then.
         settled_began = await self._settled_snapshot(db, scope, item)
@@ -2842,7 +2934,7 @@ class GithubVerificationService:
         ):
             return
         if self._classify_pull(fresh_pull) != "open":
-            await self._process_review_item(db, scope, item, client, pull=fresh_pull)
+            await self._process_review_item(db, scope, item, client, pull=fresh_pull, superseded_ok=superseded_ok)
             return
         if self._head_sha(fresh_pull) != current_head:
             item.dispatch_status = "verifying"
@@ -2867,7 +2959,8 @@ class GithubVerificationService:
                 db, item, "Auto-merge blocked: distinct current-round leader approval is "
                 f"required ({approval_reason}).")
             return
-        withdrawn = await self._settled_context_note(db, scope, item, current_head, settled_began)
+        withdrawn = await self._settled_context_note(
+            db, scope, item, current_head, settled_began, superseded_ok=superseded_ok)
         if withdrawn is not None:
             await self._record_readiness_hold(db, item, withdrawn)
             return
