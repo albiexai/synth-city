@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import re
 import unicodedata
@@ -19,10 +20,20 @@ _PRIVATE_TEXT = re.compile(
 )
 
 
+def public_generation(work_item_id: int, nonce: str) -> str:
+    """A public, non-authorizing reference that changes with every replacement dispatch.
+
+    It is a plain one-way digest, not a secret and not a MAC: no endpoint accepts it as a capability and every
+    authority check still compares the raw private nonce. It lets a published report name the dispatch it was
+    written for without carrying the nonce itself.
+    """
+    return hashlib.sha256(f"synth-city/report-generation/v1|{int(work_item_id)}|{nonce}".encode()).hexdigest()
+
+
 class ReportContext(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     work_item_id: int = Field(gt=0)
-    attempt: int = Field(ge=0, le=1000)  # a public counter (the item's retry count), never an authority value
+    generation: str = Field(pattern=r"^[0-9a-f]{64}$")  # public reference of one dispatch, never an authority value
     owner_slot_id: int = Field(gt=0)
     scope_revision: int = Field(ge=0)
     source_sha: str = Field(pattern=r"^[0-9a-f]{40}$")

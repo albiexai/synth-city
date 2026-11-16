@@ -13,6 +13,7 @@ from app.services.github_client import github_client
 from app.services.github_coordination_service import CoordinationError, github_coordination_service
 from app.services.github_summary_publication_service import SummaryUnavailable, github_summary_publication_service
 from app.services.github_work_progress_service import _TERMINAL_REPORT_STATUSES, github_work_progress_service
+from mcp_shim.work_remaining_protocol import public_generation
 
 router = APIRouter()
 
@@ -44,23 +45,33 @@ async def remaining_work_context(item_id: int, response: Response,
     try:
         await github_coordination_service.require_leader(db, scope_id, principal)
         result = await work_progress(item_id, response, db)
-        # Progress observation ends its DB snapshot. Recheck current membership
-        # and scope after its asynchronous source reads.
+        # Progress observation ends its DB snapshot. Recheck current membership and scope after its asynchronous
+        # source reads: the FINAL awaited Leader check comes first, then ONE coherent joined projection of the item
+        # and its workspace lease, then only synchronous comparisons and the return. Nothing awaits after the
+        # projection, so no later change can slip between a check and the answer.
         current = await db.get(MailAgentSession, principal_id, populate_existing=True)
-        item = await db.get(GithubWorkItem, item_id, populate_existing=True)
-        if current is None or item is None or item.scope_id != scope_id:
+        if current is None:
             raise HTTPException(status_code=409, detail="progress_context_changed")
         await github_coordination_service.require_leader(db, scope_id, current)
-        if (result.dispatch_nonce != item.dispatch_nonce or result.owner_slot_id != item.owner_slot_id
-                or result.remaining_work_context is None
-                or result.remaining_work_context.scope_revision != item.active_scope_revision):
+        row = (await db.execute(
+            select(GithubWorkItem.scope_id, GithubWorkItem.dispatch_nonce, GithubWorkItem.owner_slot_id,
+                   GithubWorkItem.active_scope_revision, GithubWorkItem.dispatch_status,
+                   GithubWorkItem.last_verified_sha, GithubWorkspace.id.label("leased_workspace_id"))
+            .select_from(GithubWorkItem)
+            .outerjoin(GithubWorkspace, GithubWorkspace.leased_item_id == GithubWorkItem.id)
+            .where(GithubWorkItem.id == item_id))).first()
+        context = result.remaining_work_context
+        if row is None or row.scope_id != scope_id:
+            raise HTTPException(status_code=409, detail="progress_context_changed")
+        if (context is None or result.dispatch_nonce != row.dispatch_nonce or result.owner_slot_id != row.owner_slot_id
+                or context.owner_slot_id != row.owner_slot_id or context.scope_revision != row.active_scope_revision
+                or context.generation != public_generation(item_id, row.dispatch_nonce or "")
+                or result.remaining_work_context_status != row.dispatch_status):
             raise HTTPException(status_code=409, detail="progress_context_unavailable")
-        if result.remaining_work_context_basis == "recorded_head":
-            # A terminal context rests on recorded facts: check them again against the item as it is now.
-            leased = await db.scalar(select(GithubWorkspace.id).where(GithubWorkspace.leased_item_id == item.id))
-            if (item.dispatch_status not in _TERMINAL_REPORT_STATUSES or leased is not None
-                    or item.last_verified_sha != result.remaining_work_context.source_sha):
-                raise HTTPException(status_code=409, detail="progress_context_unavailable")
+        if result.remaining_work_context_basis == "recorded_head" and (
+                row.dispatch_status not in _TERMINAL_REPORT_STATUSES or row.leased_workspace_id is not None
+                or row.last_verified_sha != context.source_sha):
+            raise HTTPException(status_code=409, detail="progress_context_unavailable")
         # The nonce binds this check privately; the response the Leader receives never carries it.
         return result.model_copy(update={"dispatch_nonce": None})
     except CoordinationError as error:

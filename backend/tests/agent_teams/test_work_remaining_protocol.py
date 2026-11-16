@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from mcp_shim.work_remaining_protocol import RemainingReport, ReportContext, parse_report, report_reason
 
 NOW = datetime(2026, 10, 6, 20, tzinfo=timezone.utc)
-CONTEXT = dict(work_item_id=1, attempt=0, owner_slot_id=2,
+CONTEXT = dict(work_item_id=1, generation="a" * 64, owner_slot_id=2,
                scope_revision=0, source_sha="a" * 40, phase="implementation")
 
 
@@ -53,7 +53,7 @@ def test_rejects_duplicate_tampered_or_private_blocks():
     assert parse_report(report(remaining="private-lease-value").markdown(), ("private-lease-value",)) is None
 
 
-@pytest.mark.parametrize("key,value", [("work_item_id", 3), ("attempt", 1), ("owner_slot_id", 3),
+@pytest.mark.parametrize("key,value", [("work_item_id", 3), ("generation", "b" * 64), ("owner_slot_id", 3),
     ("scope_revision", 1), ("source_sha", "b" * 40), ("phase", "review")])
 def test_context_change_is_historical(key, value):
     changed = ReportContext(**{**CONTEXT, key: value})
@@ -70,3 +70,10 @@ def test_missing_source_expiry_and_future_time():
     payload["reported_at"] = "2026-10-06T20:00:00"
     with pytest.raises(ValidationError):
         RemainingReport.model_validate_json(json.dumps(payload))
+
+
+def test_the_public_generation_is_separated_by_work_item_and_by_nonce():
+    from mcp_shim.work_remaining_protocol import public_generation
+    base = public_generation(1, "same-nonce")
+    assert len(base) == 64 and base != public_generation(2, "same-nonce") and base != public_generation(1, "other-nonce")
+    assert "same-nonce" not in base

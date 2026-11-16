@@ -23,7 +23,7 @@ from app.models.github_work_progress import GithubWorkProgressSnapshot
 from app.models.github_work_progress_schemas import (
     GithubPublicationObservation, GithubWorkProgressResponse, GithubWorkRemainingView,
 )
-from mcp_shim.work_remaining_protocol import RemainingReport, ReportContext, parse_report, report_reason
+from mcp_shim.work_remaining_protocol import RemainingReport, ReportContext, parse_report, public_generation, report_reason
 from app.services.github_client import GithubClientResponseError, github_client
 from app.services.github_coordination_service import hold_code
 from app.services.github_work_progress_observation import (
@@ -414,7 +414,7 @@ class GithubWorkProgressService:
                 and publication.local_sha == publication.published_sha
                 and item.dispatch_nonce and item.owner_slot_id
                 and _base_identity(item, scope) == started_identity):
-            context = ReportContext(work_item_id=item_id, attempt=item.retry_count,
+            context = ReportContext(work_item_id=item_id, generation=public_generation(item_id, item.dispatch_nonce),
                 owner_slot_id=item.owner_slot_id, scope_revision=item.active_scope_revision,
                 source_sha=publication.local_sha, phase=phase)
             basis = "workspace"
@@ -423,7 +423,7 @@ class GithubWorkProgressService:
                 and _base_identity(item, scope) == started_identity):
             # A merged or closed item has no workspace to observe, so the local-sha rule above can never hold.
             # Its report is bound to the recorded verified head instead; every other binding is unchanged.
-            context = ReportContext(work_item_id=item_id, attempt=item.retry_count,
+            context = ReportContext(work_item_id=item_id, generation=public_generation(item_id, item.dispatch_nonce),
                 owner_slot_id=item.owner_slot_id, scope_revision=item.active_scope_revision,
                 source_sha=check_head, phase=phase)
             basis = "recorded_head"
@@ -444,6 +444,7 @@ class GithubWorkProgressService:
                 seconds=settings.github_dispatch_interval_seconds)) if polled_at else None,
             last_check_head=check_head, publication=publication, required_checks=required_checks,
             remaining_work=remaining, remaining_work_context=context, remaining_work_context_basis=basis,
+            remaining_work_context_status=item.dispatch_status if context is not None else None,
         )
 
 
