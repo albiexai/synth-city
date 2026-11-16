@@ -379,19 +379,36 @@ def authority_window_minutes(scope=None) -> float:
     return settings.github_continuation_proposal_expiry_seconds / 60
 
 
-def estimate_upper_bound(estimate):
-    """The largest minutes the estimate allows, or ``None`` when it is not a usable estimate."""
-    def number(value):
-        return (not isinstance(value, bool) and isinstance(value, (int, float))
-                and math.isfinite(value) and value > 0)
+def _usable_minutes(value) -> bool:
+    """A positive, finite number of minutes of any size. Integers are never converted to a float."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value > 0
+    return isinstance(value, float) and math.isfinite(value) and value > 0
 
+
+def estimate_upper_bound(estimate):
+    """The largest minutes the estimate allows, or ``None`` when it is not a usable estimate.
+
+    The number keeps its own type: converting an integer of any size to a float can overflow.
+    """
     if isinstance(estimate, dict):
-        if set(estimate) - {"low", "high"} or "high" not in estimate or not number(estimate["high"]):
+        if set(estimate) - {"low", "high"} or "high" not in estimate or not _usable_minutes(estimate["high"]):
             return None
-        if "low" in estimate and (not number(estimate["low"]) or estimate["low"] > estimate["high"]):
+        if "low" in estimate and (not _usable_minutes(estimate["low"]) or estimate["low"] > estimate["high"]):
             return None
-        return float(estimate["high"])
-    return float(estimate) if number(estimate) else None
+        return estimate["high"]
+    return estimate if _usable_minutes(estimate) else None
+
+
+def _minutes_text(value) -> str:
+    """A short, safe text for a number of minutes, however large."""
+    if isinstance(value, int) and value > 10 ** 6:
+        return "more than 1000000"
+    if isinstance(value, float) and value > 1e6:
+        return "more than 1000000"
+    return f"{value:g}"
 
 
 def estimate_problems(estimate, scope=None):
@@ -404,10 +421,10 @@ def estimate_problems(estimate, scope=None):
     window = authority_window_minutes(scope)
     if upper > window:
         return [problem("estimate_exceeds_window",
-                        message=f"The estimate's upper bound is {upper:g} minutes; the current authority window is {window:g}.")], []
+                        message=f"The estimate's upper bound is {_minutes_text(upper)} minutes; the current authority window is {window:g}.")], []
     if upper > window - WINDOW_WARNING_MARGIN_MINUTES:
         return [], [problem("estimate_near_window",
-                            message=f"The estimate's upper bound is {upper:g} minutes of a {window:g}-minute window.")]
+                            message=f"The estimate's upper bound is {_minutes_text(upper)} minutes of a {window:g}-minute window.")]
     return [], []
 
 

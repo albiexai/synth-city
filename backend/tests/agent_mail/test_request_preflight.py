@@ -710,3 +710,119 @@ async def test_the_route_reports_a_non_string_summary_as_a_problem(client, db, v
     assert response.status_code == 200, response.text
     answer = response.json()
     assert answer["passed"] is False and "summary" in {p["field"] for p in answer["problems"]}
+
+
+# --- Review batch 3 (#955): a number of any size is a problem or a pass, never an exception ----
+
+import json as _json  # noqa: E402
+
+HUGE = 10 ** 400
+NUMERIC_VALUES = [
+    HUGE, -HUGE, 10 ** 308, 10 ** 309, 2 ** 1024, 10 ** 18, 1e308, 1.7976931348623157e308, 0.1, 1, 59, 60, 61,
+    5e-324, 1e-320, 0, -0, 0.0, -0.0, -1, -1.5, _json.loads("1e400"), _json.loads("-1e400"),
+    float("nan"), float("inf"), float("-inf"),
+]
+EXCEEDS = {HUGE, 10 ** 308, 10 ** 309, 2 ** 1024, 10 ** 18, 1e308, 1.7976931348623157e308, 61}
+
+
+def _estimate_codes(estimate, kind="continuation"):
+    values = continuation(estimate=estimate) if kind == "continuation" else amendment_values(estimate=estimate)
+    result = request_preflight.preflight(kind, **values)
+    return [problem.code for problem in result.problems], result
+
+
+@pytest.mark.parametrize("kind", ["continuation", "scope_amendment"])
+@pytest.mark.parametrize("value", NUMERIC_VALUES, ids=lambda v: f"{type(v).__name__}-{str(v)[:12]}")
+def test_a_number_of_any_size_as_the_estimate_never_raises(kind, value):
+    found, result = _estimate_codes(value, kind)
+    if value in EXCEEDS:
+        assert found == ["estimate_exceeds_window"], found
+    elif isinstance(value, float) and value != value or value in (float("inf"), float("-inf")) or value <= 0:
+        assert found == ["estimate_invalid"], found
+    elif value in (0.1, 1, 59, 60, 5e-324, 1e-320):
+        assert "estimate_invalid" not in found and "estimate_exceeds_window" not in found, found
+    assert "e+" not in str(result.as_dict()) or value not in EXCEEDS or len(str(result.as_dict())) < 3000
+    assert len(_json.dumps(result.as_dict())) < 5000, "a huge number must not be echoed digit for digit"
+
+
+@pytest.mark.parametrize("position", ["high", "low", "both"])
+@pytest.mark.parametrize("value", [HUGE, -HUGE, 10 ** 309, _json.loads("1e400"), _json.loads("-1e400"), 5e-324])
+def test_a_number_of_any_size_in_a_range_never_raises(position, value):
+    estimate = {"high": value} if position == "high" else {"low": value, "high": 30}
+    if position == "both":
+        estimate = {"low": value, "high": value}
+    found, _ = _estimate_codes(estimate)
+    assert len(found) <= 1
+    if position == "high" and value in (HUGE, 10 ** 309):
+        assert found == ["estimate_exceeds_window"]
+    if position == "high" and value in (-HUGE, _json.loads("-1e400"), _json.loads("1e400")):
+        assert found == ["estimate_invalid"]
+
+
+def test_a_huge_low_above_a_small_high_is_invalid_not_an_error():
+    assert _estimate_codes({"low": HUGE, "high": 30})[0] == ["estimate_invalid"]
+
+
+def test_the_comparison_with_the_window_is_exact_for_integers():
+    window = request_preflight.authority_window_minutes(SCOPE)
+    assert _estimate_codes(int(window))[0] == []
+    assert _estimate_codes(int(window) + 1)[0] == ["estimate_exceeds_window"]
+    assert _estimate_codes(HUGE)[0] == ["estimate_exceeds_window"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["single", "high"])
+async def test_the_route_answers_a_structured_problem_for_a_huge_estimate(client, db, shape):
+    item, _members, tokens = await _dispatch_approval_fixture(db)
+    headers = {"X-Synth-City-Session-Token": tokens[1]}
+    estimate = HUGE if shape == "single" else {"low": 5, "high": HUGE}
+    payload = _json.dumps(body(item, estimate_active_minutes=estimate))
+    response = await client.post(URL, headers={**headers, "Content-Type": "application/json"}, content=payload)
+    assert response.status_code == 200, response.text[:300]
+    answer = response.json()
+    assert answer["passed"] is False
+    assert [p["code"] for p in answer["problems"]] == ["estimate_exceeds_window"]
+    assert len(response.text) < 3000
+
+
+@pytest.mark.asyncio
+async def test_the_route_answers_a_structured_problem_for_a_json_infinity(client, db):
+    item, _members, tokens = await _dispatch_approval_fixture(db)
+    headers = {"X-Synth-City-Session-Token": tokens[1], "Content-Type": "application/json"}
+    payload = _json.dumps(body(item, estimate_active_minutes="__INF__")).replace('"__INF__"', "1e400")
+    response = await client.post(URL, headers=headers, content=payload)
+    assert response.status_code == 200, response.text[:300]
+    assert [p["code"] for p in response.json()["problems"]] == ["estimate_invalid"]
+
+
+# A wider hostile-JSON sweep: every field of every kind, with values of every shape and size.
+HOSTILE = [
+    None, True, False, 0, 1, -1, HUGE, -HUGE, 1.5, 1e308, _json.loads("1e400"), float("nan"), "", " ", "x" * 13000,
+    "\u0000", "😀", "../../etc", [], [None], [[]], [[[]]], [HUGE], [1.5, "a", None, {}], {}, {"": 1},
+    {"a": {"b": {"c": []}}}, {"high": HUGE}, {"low": 1, "high": None},
+    [[[[[[[[[[[[[[[[[[[[[[[[["deep"]]]]]]]]]]]]]]]]]]]]]]]]],
+]
+SWEEP_FIELDS = ["summary", "plan_metadata", "phase", "execution_target", "allowed_paths", "allowed_actions",
+                "allowed_commands", "prohibited_actions", "max_failed_heads", "tool_fallbacks", "estimate"]
+
+
+@pytest.mark.parametrize("kind", ["initial_plan", "continuation", "scope_amendment"])
+@pytest.mark.parametrize("field", SWEEP_FIELDS)
+def test_hostile_json_in_any_field_never_makes_preflight_raise(kind, field):
+    for value in HOSTILE:
+        values = dict(summary="Plan", scope=SCOPE, plan_metadata={"allowed_paths": ["src/a.py"]})
+        if kind != "initial_plan":
+            values = amendment_values() if kind == "scope_amendment" else continuation()
+            values["plan_metadata"] = None
+        values[field] = value
+        result = request_preflight.preflight(kind, **values)
+        encoded = _json.dumps(result.as_dict())
+        assert isinstance(result.as_dict()["problems"], list)
+        assert len(encoded) < 8000, (kind, field, str(value)[:30])
+
+
+@pytest.mark.parametrize("value", [HUGE, 10 ** 7, 1e308, 2e6])
+def test_a_very_large_estimate_is_described_briefly(value):
+    _, result = _estimate_codes(value)
+    assert "more than 1000000" in result.problems[0].message
+    assert len(result.problems[0].message) < 200
