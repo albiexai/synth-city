@@ -479,16 +479,16 @@ class MailPreflightRequest(BaseModel):
     work_item_id: int
     dispatch_nonce: str
     summary: str = ""
-    plan_metadata: dict[str, Any] = Field(default_factory=dict)
-    phase: Optional[str] = None
-    execution_target: Optional[str] = None
+    plan_metadata: Any = Field(default_factory=dict)
+    phase: Any = None
+    execution_target: Any = None
     # Typed loosely on purpose: a wrong type is a problem to report, not a 422 that hides the rest.
-    allowed_paths: list[Any] = Field(default_factory=list)
-    allowed_actions: list[Any] = Field(default_factory=list)
-    allowed_commands: list[Any] = Field(default_factory=list)
-    prohibited_actions: list[Any] = Field(default_factory=list)
+    allowed_paths: Any = Field(default_factory=list)
+    allowed_actions: Any = Field(default_factory=list)
+    allowed_commands: Any = Field(default_factory=list)
+    prohibited_actions: Any = Field(default_factory=list)
     max_failed_heads: Any = None
-    tool_fallbacks: dict[str, Any] = Field(default_factory=dict)
+    tool_fallbacks: Any = Field(default_factory=dict)
     estimate_active_minutes: Any = None
     lease_token: Optional[str] = None
 

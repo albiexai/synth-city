@@ -52,6 +52,7 @@ _FIELDS = {
     "stale_nonce": "dispatch_nonce",
     "lease_token_mismatch": "lease_token",
     "companion_paths_added": "allowed_paths",
+    "request_schema_invalid": "request",
 }
 
 _MESSAGES = {
@@ -87,6 +88,7 @@ _MESSAGES = {
     "stale_nonce": "The dispatch nonce is not the current one.",
     "lease_token_mismatch": "The lease token does not match the workspace lease.",
     "companion_paths_added": "The checked-in companion map adds paths the request does not name.",
+    "request_schema_invalid": "The request breaks a limit or type the submit route enforces.",
 }
 
 
@@ -112,7 +114,7 @@ def problem(code: str, status_code: int = 409, *, message: str | None = None, fi
 
 @dataclass
 class Normalized:
-    """The canonical values of a request that has no problem, for the submit method to store."""
+    """The canonical values of a request. A field that failed is ``None`` and the others stay usable."""
 
     paths: list = field(default_factory=list)
     actions: list = field(default_factory=list)
@@ -176,7 +178,8 @@ def continuation_body(
 ):
     """Every problem in a continuation request's paths, actions, commands, fallbacks and limits.
 
-    Returns ``(problems, normalized)``; ``normalized`` is ``None`` when there is a problem.
+    Returns ``(problems, normalized)``. Each field is judged on its own: a field that failed is ``None`` in
+    ``normalized`` and the rest stay usable, so one bad field never hides another field's problem.
     """
     module = _service()
     service = module.github_approval_service
@@ -213,8 +216,6 @@ def continuation_body(
         problems.append(problem("max_failed_heads_invalid", 400))
     elif max_failed_heads > scope.max_failed_heads_per_revision:
         problems.append(problem("continuation_failed_head_limit_exceeded"))
-    if problems:
-        return problems, None
     return problems, Normalized(paths, actions, commands, prohibitions, fallbacks)
 
 
@@ -227,7 +228,7 @@ def amendment_body(
 ):
     """Every problem in an amendment request that needs no database state.
 
-    Returns ``(problems, normalized)``; ``normalized`` is ``None`` when there is a problem.
+    Returns ``(problems, normalized)`` with each field judged on its own, as in ``continuation_body``.
     """
     module = _service()
     service = module.github_approval_service
@@ -252,17 +253,15 @@ def amendment_body(
     if actions is not None and fallbacks is not None and bool(fallbacks) != ("install_hosted_ci_tool" in actions):
         problems.append(problem("hosted_tool_fallback_required", 400))
     # The amendment path has always reported a command overflow with the path code.
-    if paths is not None and commands is not None and (
-        len(paths) > scope.max_scope_paths or len(commands) > scope.max_scope_commands
-    ):
+    if paths is not None and len(paths) > scope.max_scope_paths:
+        problems.append(problem("continuation_path_limit_exceeded"))
+    if commands is not None and len(commands) > scope.max_scope_commands:
         problems.append(problem("continuation_path_limit_exceeded"))
     if not isinstance(summary, str) or not summary.strip():
         problems.append(problem("continuation_summary_required", 400))
     if (type(max_failed_heads) is not int or max_failed_heads < 1
             or max_failed_heads > scope.max_failed_heads_per_revision):
         problems.append(problem("continuation_failed_head_limit_exceeded"))
-    if problems:
-        return problems, None
     return problems, Normalized(paths, actions, commands, prohibitions, fallbacks)
 
 
@@ -314,6 +313,48 @@ def companion_limit_problems(paths, scope) -> list:
     if len(set(paths) | set(extras)) > scope.max_scope_paths:
         return [problem("continuation_path_limit_exceeded",
                         message="With the companion paths the server adds, the request is over the scope's path limit.")]
+    return []
+
+
+def _default(value):
+    return [] if value is None else value
+
+
+def schema_problems(kind, *, summary, plan_metadata=None, phase=None, execution_target=None, allowed_paths=None,
+                    allowed_actions=None, allowed_commands=None, prohibited_actions=None, max_failed_heads=None,
+                    tool_fallbacks=None) -> list:
+    """What the real submit routes would refuse with a 422, judged by the very same request models.
+
+    Only the library's own constraint text is reported, never the submitted value. The nonce and lease are
+    checked by the route, so placeholders stand in for them here.
+    """
+    from pydantic import ValidationError
+
+    from app.models import schemas
+
+    if kind == "initial_plan":
+        model = schemas.MailApprovalRequestCreate
+        values = {"work_item_id": 0, "dispatch_nonce": "x", "summary": summary,
+                  "plan_metadata": plan_metadata if isinstance(plan_metadata, dict) else {}}
+    else:
+        model = (schemas.GithubScopeAmendmentCreate if kind == "scope_amendment"
+                 else schemas.GithubContinuationProposalCreate)
+        values = {"dispatch_nonce": "x", "lease_token": "x", "summary": summary, "phase": phase,
+                  "execution_target": execution_target, "allowed_paths": _default(allowed_paths),
+                  "allowed_actions": _default(allowed_actions), "allowed_commands": _default(allowed_commands),
+                  "prohibited_actions": _default(prohibited_actions), "max_failed_heads": max_failed_heads,
+                  "tool_fallbacks": tool_fallbacks if tool_fallbacks is not None else {}}
+        if kind == "scope_amendment" and phase is None:
+            values.pop("phase")
+    try:
+        model(**values)
+    except ValidationError as error:
+        return [
+            problem("request_schema_invalid", 422, field_name=str(item["loc"][0]) if item["loc"] else "request",
+                    message=f"{'.'.join(str(part) for part in item['loc'][1:]) or str(item['loc'][0])}: {item['msg']}"
+                    if len(item["loc"]) > 1 else f"{item['msg']}")
+            for item in error.errors(include_input=False, include_url=False, include_context=False)
+        ]
     return []
 
 
@@ -370,6 +411,18 @@ def preflight(
     """
     result = PreflightResult()
     paths_named = None
+    raw = dict(
+        summary=summary, plan_metadata=plan_metadata, phase=phase, execution_target=execution_target,
+        allowed_paths=allowed_paths, allowed_actions=allowed_actions, allowed_commands=allowed_commands,
+        prohibited_actions=prohibited_actions, max_failed_heads=max_failed_heads, tool_fallbacks=tool_fallbacks)
+    # A value of the wrong container type is reported by the schema check; the rules see an empty one.
+    if not isinstance(plan_metadata, dict):
+        plan_metadata = {}
+    allowed_paths, allowed_actions, allowed_commands, prohibited_actions = (
+        value if isinstance(value, list) else [] for value in
+        (allowed_paths, allowed_actions, allowed_commands, prohibited_actions))
+    if not isinstance(tool_fallbacks, dict):
+        tool_fallbacks = {}
     if kind == "initial_plan":
         result.problems += initial_plan_problems(summary, plan_metadata)
         listed = _service().github_approval_service.initial_plan_paths(plan_metadata)
@@ -382,7 +435,7 @@ def preflight(
             prohibited_actions=prohibited_actions or [], max_failed_heads=max_failed_heads,
             tool_fallbacks=tool_fallbacks if tool_fallbacks is not None else {}, scope=scope)
         result.problems += problems
-        paths_named = normalized.paths if normalized else None
+        paths_named = normalized.paths
     elif kind == "scope_amendment":
         problems, normalized = amendment_body(
             phase=phase or "implementation", attempt_phase=attempt_phase, execution_target=execution_target,
@@ -391,7 +444,7 @@ def preflight(
             max_failed_heads=max_failed_heads,
             tool_fallbacks=tool_fallbacks if tool_fallbacks is not None else {}, scope=scope)
         result.problems += problems
-        paths_named = normalized.paths if normalized else None
+        paths_named = normalized.paths
     else:
         raise ValueError("unknown request kind")
     if isinstance(summary, str) and companion_paths.TRAILER_HEADER in summary and kind != "initial_plan":
@@ -404,6 +457,13 @@ def preflight(
         problems, warnings = estimate_problems(estimate, scope)
         result.problems += problems
         result.warnings += warnings
+    # A field of the wrong container type is one schema problem; the rules saw an empty one and must not add
+    # a misleading "required" next to it.
+    wrong_type = {name for name in ("allowed_paths", "allowed_actions", "allowed_commands", "prohibited_actions")
+                  if raw[name] is not None and not isinstance(raw[name], list)}
+    result.problems = [item for item in result.problems if item.field not in wrong_type]
+    seen = {item.field for item in result.problems}
+    result.problems += [item for item in schema_problems(kind, **raw) if item.field not in seen]
     if unread_authority_message_id is not None:
         result.problems.append(problem(
             "unread_authority_mail",

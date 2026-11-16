@@ -497,3 +497,154 @@ async def test_the_route_rejects_unknown_fields_and_kinds(client, db):
     headers = {"X-Synth-City-Session-Token": tokens[1]}
     assert (await client.post(URL, headers=headers, json=body(item, kind="other"))).status_code == 422
     assert (await client.post(URL, headers=headers, json=body(item, surprise=1))).status_code == 422
+
+
+# --- Review batch 1 (#955): the submit schemas, and fields judged independently ---------------
+
+SUBMIT = {
+    "continuation": "/api/v1/agent-teams/github-work-items/{}/continuation-requests",
+    "scope_amendment": "/api/v1/agent-teams/github-work-items/{}/scope-amendments",
+}
+INSTALL_ACTIONS = [*IMPLEMENTATION, "install_hosted_ci_tool"]
+
+
+def fallback(package="ruff"):
+    return {"ruff": {**FALLBACK, "package": package}}
+
+
+SCHEMA_CASES = [
+    # (overrides, the real submit route answers 422)
+    (dict(), False),
+    (dict(max_failed_heads=0), True),
+    (dict(max_failed_heads=-1), True),
+    (dict(max_failed_heads=2), False),
+    (dict(summary="x" * 12001), True),
+    (dict(summary="x" * 12000), False),
+    (dict(execution_target="hosted_ci", allowed_actions=INSTALL_ACTIONS, tool_fallbacks=fallback("p" * 201)), True),
+    (dict(execution_target="hosted_ci", allowed_actions=INSTALL_ACTIONS, tool_fallbacks=fallback("p" * 200)), False),
+    (dict(execution_target="hosted_ci", allowed_actions=INSTALL_ACTIONS, tool_fallbacks=fallback("")), True),
+    (dict(allowed_paths=[5]), True),
+    (dict(allowed_actions="push_pr_head"), True),
+    (dict(phase="bogus"), True),
+    (dict(execution_target="nowhere"), True),
+    (dict(tool_fallbacks={"ruff": {**FALLBACK, "extra": 1}}, execution_target="hosted_ci"), True),
+    (dict(tool_fallbacks={"ruff": {**FALLBACK, "target": "workspace"}}, execution_target="hosted_ci"), True),
+]
+
+
+def _submit_body(item, lease="not-the-real-lease", **overrides):
+    values = dict(
+        dispatch_nonce=item.dispatch_nonce, phase="implementation", execution_target="workspace",
+        summary="Apply the approved bounded fix", allowed_paths=["src/example.py"],
+        allowed_actions=list(IMPLEMENTATION), allowed_commands=["pytest -q"], prohibited_actions=["Do not edit CI"],
+        max_failed_heads=1, tool_fallbacks={}, lease_token=lease)
+    values.update(overrides)
+    return values
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["continuation", "scope_amendment"])
+@pytest.mark.parametrize("overrides,refused", SCHEMA_CASES, ids=[
+    ",".join(f"{k}={str(v)[:14]}" for k, v in case.items()) or "valid" for case, _ in SCHEMA_CASES])
+async def test_preflight_passes_exactly_what_the_real_submit_route_does_not_422(client, db, kind, overrides, refused):
+    item, _members, tokens = await _dispatch_approval_fixture(db)
+    headers = {"X-Synth-City-Session-Token": tokens[1]}
+    if kind == "scope_amendment" and overrides.get("phase") == "bogus":
+        pytest.skip("the amendment schema fixes the phase")
+    real = await client.post(SUBMIT[kind].format(item.id), headers=headers, json=_submit_body(item, **overrides))
+    check = await client.post(URL, headers=headers, json={
+        "kind": kind, **{k: v for k, v in _submit_body(item, **overrides).items() if k != "lease_token"},
+        "work_item_id": item.id})
+    assert check.status_code == 200, check.text
+    answer = check.json()
+    if refused:
+        assert real.status_code == 422, real.text
+        assert answer["passed"] is False, answer
+        assert answer["problems"], answer
+        assert all(p["code"] and p["field"] and p["message"] for p in answer["problems"])
+    else:
+        assert real.status_code != 422, real.text
+        assert answer["passed"] is True, answer
+    # A schema problem never echoes the submitted value.
+    assert "x" * 100 not in check.text and "p" * 100 not in check.text
+
+
+@pytest.mark.asyncio
+async def test_schema_problems_name_the_field_and_do_not_duplicate_a_mechanical_problem(client, db):
+    item, _members, tokens = await _dispatch_approval_fixture(db)
+    headers = {"X-Synth-City-Session-Token": tokens[1]}
+    answer = (await client.post(URL, headers=headers, json=body(
+        item, max_failed_heads=0, summary="x" * 12001, phase="bogus"))).json()
+    by_field = {}
+    for problem in answer["problems"]:
+        by_field.setdefault(problem["field"], []).append(problem["code"])
+    assert "request_schema_invalid" in by_field["max_failed_heads"] or "continuation_failed_head_limit_exceeded" in by_field["max_failed_heads"]
+    assert by_field["summary"] == ["request_schema_invalid"]
+    assert by_field["phase"] == ["continuation_phase_invalid"]  # reported once, not again by the schema
+
+
+@pytest.mark.asyncio
+async def test_an_initial_plan_summary_over_the_submit_limit_is_a_problem(client, db):
+    item, _members, tokens = await _dispatch_approval_fixture(db)
+    headers = {"X-Synth-City-Session-Token": tokens[1]}
+    request = dict(kind="initial_plan", work_item_id=item.id, dispatch_nonce=item.dispatch_nonce,
+                   plan_metadata={"allowed_paths": ["src/a.py"]})
+    real = await client.post("/api/v1/agent-mail/approval-requests", headers=headers,
+                             json={k: request[k] for k in ("work_item_id", "dispatch_nonce", "plan_metadata")}
+                             | {"summary": "x" * 12001})
+    assert real.status_code == 422
+    answer = (await client.post(URL, headers=headers, json={**request, "summary": "x" * 12001})).json()
+    assert answer["passed"] is False and "request_schema_invalid" in [p["code"] for p in answer["problems"]]
+    assert (await client.post(URL, headers=headers, json={**request, "summary": "x" * 12000})).json()["passed"] is True
+
+
+COMPANION = lambda paths, mapping=None: ["docs/guide.md"]  # noqa: E731
+
+
+def test_a_bad_action_list_does_not_hide_the_companion_path_limit(monkeypatch):
+    monkeypatch.setattr(request_preflight.companion_paths, "companions_for", COMPANION)
+    tight = SimpleNamespace(max_scope_paths=1, max_scope_commands=16, max_failed_heads_per_revision=2)
+    for kind, values in (("continuation", continuation(allowed_actions=["edit_production"], scope=tight)),
+                         ("scope_amendment", amendment_values(allowed_actions=["edit_tests"], scope=tight))):
+        found = codes(request_preflight.preflight(kind, **values))
+        assert "implementation_completion_actions_required" in found, (kind, found)
+        assert "continuation_path_limit_exceeded" in found, (kind, found)
+
+
+def test_an_invalid_command_list_does_not_hide_an_amendment_path_overflow():
+    tight = SimpleNamespace(max_scope_paths=1, max_scope_commands=16, max_failed_heads_per_revision=2)
+    result = request_preflight.preflight("scope_amendment", **amendment_values(
+        allowed_paths=["src/a.py", "src/b.py"], allowed_commands=[""], scope=tight))
+    assert {"allowed_commands_invalid", "continuation_path_limit_exceeded"} <= set(codes(result))
+
+
+def test_an_invalid_path_list_does_not_hide_a_command_overflow():
+    tight = SimpleNamespace(max_scope_paths=32, max_scope_commands=1, max_failed_heads_per_revision=2)
+    for kind, values in (("continuation", continuation(allowed_paths=["/abs"], allowed_commands=["a", "b"], scope=tight)),
+                         ("scope_amendment", amendment_values(allowed_paths=["/abs"], allowed_commands=["a", "b"],
+                                                              scope=tight))):
+        found = codes(request_preflight.preflight(kind, **values))
+        assert "allowed_paths_invalid" in found, (kind, found)
+        assert ("continuation_command_limit_exceeded" if kind == "continuation" else
+                "continuation_path_limit_exceeded") in found, (kind, found)
+
+
+def test_each_checker_keeps_the_fields_that_validated():
+    problems, normalized = request_preflight.continuation_body(**{
+        key: value for key, value in continuation(allowed_actions=["edit_production"]).items()
+        if key not in {"summary"}})
+    assert problems and normalized is not None
+    assert normalized.paths == ["src/example.py"] and normalized.commands == ["pytest -q"]
+    assert normalized.actions == ["edit_production"]
+    problems, normalized = request_preflight.continuation_body(**{
+        key: value for key, value in continuation(allowed_paths=["/abs"]).items() if key not in {"summary"}})
+    assert normalized.paths is None and normalized.commands == ["pytest -q"]
+
+
+@pytest.mark.parametrize("field", ["allowed_paths", "allowed_actions", "allowed_commands", "prohibited_actions"])
+def test_a_wrong_container_type_is_one_schema_problem_and_no_noise(field):
+    values = continuation()
+    values[field] = "not-a-list"
+    result = request_preflight.preflight("continuation", **values)
+    assert [(p.code, p.field) for p in result.problems] == [("request_schema_invalid", field)]
+    assert "not-a-list" not in str(result.as_dict())
