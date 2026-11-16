@@ -12,6 +12,21 @@ This guide is for the operator of an Albiex Synth City team. Autonomy is off unt
 
 Synth City polls GitHub every 60 seconds by default. The Activity table refreshes every five seconds while open; it does not trigger another GitHub poll. Issues move through queued, dispatched, verifying, and ready for human review or merged. An escalated issue has stopped and needs attention.
 
+### Stuck work and silent background failures
+
+Synth City watches itself for four conditions that used to be found only by hand. Each opens a finding, shows it, tells the Supervisor once, and clears it when the condition ends:
+
+| Reason code | What it means | When it opens |
+|---|---|---|
+| `verifying_after_merge` | A work item is still verifying although GitHub reports its PR merged. | More than 15 minutes after the item last changed; at most 8 PRs are read per poll. |
+| `item_skipped` | Verification skipped the same work item. | 5 polls in a row. |
+| `admission_missing` | An issue carries the dispatch label but has no work item. | 3 polls in a row. |
+| `poll_rolled_back` | A poll of a repository failed, so everything it had not yet committed was discarded. | At the first failed run; it clears at the next good run. |
+
+The thresholds are fixed in code. A finding holds identifiers and counts only, never a prompt, token or raw error. It is stored together with its notice in one transaction, so a failure leaves neither and the next poll tries again; a condition that appears again after it cleared opens a new finding and a new notice. Detection never blocks the poll or the verification it watches.
+
+While a finding is open, `/api/v1/health` reports `"health": "degraded"` with `reasons` (the codes) and `open_findings`, and `/health` adds the same fields. The existing `status` values do not change, because the deploy gate and scripts read them. `/api/v1/health/findings` lists open findings first, then recently resolved ones, and the Overview shows a "Needs a look: operations" card while any is open.
+
 ### When automatic merge does not fire
 
 With Auto policy, an accepted code PR can still wait for a human. Synth City now says why, instead of leaving the PR unmerged without a reason.

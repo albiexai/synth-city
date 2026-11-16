@@ -14,6 +14,7 @@ from app.config import settings
 from app.database import AsyncSessionLocal, init_db
 from app.services.agent_bridge.attachments import agent_bridge_attachment_service
 from app.services.github_dispatch_scheduler import github_dispatch_scheduler
+from app.services.operations_health_service import operations_health_service
 from app.services.test_instance_campaign_service import test_instance_campaign_poller
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,13 @@ async def health():
         "version": settings.app_version,
         "status": "running"
     }
+    # 'status' keeps its value: deploy tooling and the E2E harness read it, and this liveness body keeps its exact
+    # shape while nothing is wrong, and when the findings cannot be read (it must not depend on the database;
+    # /api/v1/health does report that case). While #941 findings are open it adds 'health': 'degraded', the
+    # reason codes and the count.
+    findings = await operations_health_service.health()
+    if findings["reasons"] and findings["reasons"] != ["findings_unreadable"]:
+        body.update(findings)
     if settings.test_instance:
         # The E2E harness checks that this server is its own run's instance.
         body["test_instance"] = {

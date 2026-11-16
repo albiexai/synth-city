@@ -108,6 +108,8 @@ class GithubVerificationService:
         self._escalated_merge_cursors: dict[int, int] = {}
         # Inconsistent continuation states already logged in this process, so a stuck item logs once per state.
         self._logged_inconsistent: set[tuple] = set()
+        # The items verification skipped in the current poll: read by the scheduler for #941's skipped-item detector.
+        self.skipped_item_ids: set[int] = set()
 
     @staticmethod
     def _changed_tree_paths(
@@ -1003,6 +1005,7 @@ class GithubVerificationService:
         recovery_only_attempt: GithubRecoveryOnlyAttempt | None = None,
     ) -> None:
         client = client or github_client
+        self.skipped_item_ids = set()
         await self._repair_exhausted_diagnostic_notifications(
             db, scope, recovery_only_attempt=recovery_only_attempt
         )
@@ -1599,6 +1602,7 @@ class GithubVerificationService:
     ) -> None:
         """Log one warning per (item, attempt, revision, status, phase). A snapshot survives a rollback."""
         snapshot = snapshot or self._state_snapshot(item)
+        self.skipped_item_ids.add(snapshot[0])  # every poll, even when the log line is already written
         key = (*snapshot, reason is not None)
         if key in self._logged_inconsistent:
             return
