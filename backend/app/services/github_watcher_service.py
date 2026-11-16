@@ -18,6 +18,7 @@ from app.services.github_client import GithubClient, github_client
 from app.services.github_dispatch_service import github_dispatch_service
 from app.services.github_dispatch_priority import priority_from_labels
 from app.services.agent_team_campaign_service import agent_team_campaign_service
+from app.services.operations_health_service import operations_health_service
 
 _ACTIVE_STATUSES = ("dispatched", "verifying", "awaiting_human_review")
 _RECOVERABLE_STATUSES = ("failed", "escalated")
@@ -172,12 +173,15 @@ class GithubWatcherService:
         labeled = await client.list_issues_with_label(
             scope.repo_owner, scope.repo_name, scope.dispatch_label
         )
+        scope_id = scope.id
         for issue in labeled:
             await self._upsert_item(db, scope, issue)
         # The admitted items are durable before any per-item completion runs: a later
         # rollback can then only discard that completion's own work, and the poll time
         # below is never written over upserts that were thrown away.
         await db.commit()
+        # #941: a labeled issue still without a work item after its commit, poll after poll, is a finding.
+        await operations_health_service.record_admissions(scope_id, {issue["number"] for issue in labeled})
         await self._recheck_active_items(db, scope, client)
         await self._reconcile_closed_issues(
             db,

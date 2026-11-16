@@ -27,6 +27,7 @@ from app.services.github_recovery_gate import (
 )
 from app.services.github_verification_service import github_verification_service
 from app.services.github_watcher_service import github_watcher_service
+from app.services.operations_health_service import operations_health_service
 
 logger = logging.getLogger(__name__)
 
@@ -109,8 +110,11 @@ class GithubDispatchScheduler:
             async with AsyncSessionLocal() as db:
                 await self.run_repo_once(db, owner, repo)
                 await self.sync_jobs(db)
-        except Exception:
+            await operations_health_service.record_poll_success(owner, repo)
+        except Exception as error:
             logger.exception("Autonomous GitHub dispatch job failed for %s/%s", owner, repo)
+            # #941: the session was discarded with everything it had not committed; say so once.
+            await operations_health_service.record_poll_failure(owner, repo, error)
 
     async def run_repo_once(
         self,
@@ -182,6 +186,11 @@ class GithubDispatchScheduler:
             scope, _slots = await self._reload_scope_context(db, scope.id)
             await self.verification.process_scope(db, scope, client=client)
             await db.commit()
+            # #941: detection runs after the commit, in sessions of its own, and never raises.
+            await operations_health_service.record_verification_skips(
+                scope_id, set(getattr(self.verification, "skipped_item_ids", ())))
+            await operations_health_service.sweep_verifying_after_merge(
+                scope_id, owner, repo, client)
             if not await self._scope_remains_autonomous(db, scope.id):
                 continue
             scope, slots = await self._reload_scope_context(db, scope.id)

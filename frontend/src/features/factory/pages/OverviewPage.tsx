@@ -6,6 +6,7 @@ import type { OverviewResponse } from "@/types/factory";
 import { ActiveWork } from "../components/overview/ActiveWork";
 import { CampaignProgress } from "../components/overview/CampaignProgress";
 import { NeedsYou } from "../components/overview/NeedsYou";
+import { OperationsFindings } from "../components/OperationsFindings";
 import { needsYouRows } from "../components/overview/needsYou";
 import { StatusLine } from "../components/overview/StatusLine";
 import { StatusTiles } from "../components/overview/StatusTiles";
@@ -58,6 +59,8 @@ export function OverviewPage() {
       </div>
       <FactoryFilters />
       <ReadStatus state={state} />
+      {/* Read only after the overview itself loaded, so a failing overview stays one request. */}
+      {state.data && <OperationsFindings />}
       {state.data && (
         <>
           <StatusLine data={state.data} teams={presetList.data ? presets.length : null} />
