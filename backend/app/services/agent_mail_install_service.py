@@ -1090,15 +1090,23 @@ def _antigravity_without_ours(event: str, entries: list) -> list:
     for group in entries:
         if isinstance(group, dict) and group.get("matcher") == matcher:
             hooks = [hook for hook in group["hooks"] if not _codex_hook_matches_event(hook, slug)]
-            if not hooks:
-                continue
-            group = {**group, "hooks": hooks}
+            if len(hooks) != len(group["hooks"]):
+                # Only a group Synth City's hook was removed from is dropped once it is empty.
+                if not hooks:
+                    continue
+                group = {**group, "hooks": hooks}
         kept.append(group)
     return kept
 
 
 def _antigravity_has_ours(event: str, entries: list) -> bool:
-    return _antigravity_without_ours(event, entries) != entries
+    """True only when a Synth City command entry is present for the event."""
+    _name, slug, matcher = ANTIGRAVITY_MAIL_HOOKS[event]
+    if not matcher:
+        return any(_codex_hook_matches_event(entry, slug) for entry in entries)
+    return any(isinstance(group, dict) and group.get("matcher") == matcher
+               and any(_codex_hook_matches_event(hook, slug) for hook in group["hooks"])
+               for group in entries)
 
 
 def installed_antigravity_hooks() -> list[str]:

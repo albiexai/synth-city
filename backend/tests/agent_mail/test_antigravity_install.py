@@ -305,3 +305,30 @@ def test_question_denial_is_logged_only_for_a_team_member(caplog, slot, logged):
     with caplog.at_level(logging.INFO):
         assert asyncio.run(hook_pre_tool_use(None, payload, None)) == {"guard": "allow"}
     assert ("antigravity_question_denied" in caplog.text) is logged
+
+
+# --- V1 review 5918454086: presence needs a Synth City command; other groups are kept as they are ---
+
+EMPTY_QUESTION = {"matcher": "ask_question", "hooks": []}
+
+
+def test_empty_question_group_alone_is_not_installed(gemini):
+    _mcp, hooks, _scopes = gemini
+    hooks.parent.mkdir(parents=True)
+    hooks.write_text(json.dumps({"albiex-synth-city-mail-question": {"PreToolUse": [dict(EMPTY_QUESTION)]},
+                                 "albiex-synth-city-mail-session-start": {"SessionStart": [dict(USER_ENTRY)]}}))
+    assert svc.installed_antigravity_hooks() == []
+
+
+@pytest.mark.asyncio
+async def test_empty_question_group_is_kept_by_install_and_uninstall(gemini):
+    _mcp, hooks, _scopes = gemini
+    hooks.parent.mkdir(parents=True)
+    hooks.write_text(json.dumps({"albiex-synth-city-mail-question": {"PreToolUse": [dict(EMPTY_QUESTION)]}}))
+    await svc.apply_antigravity_install(None)
+    await svc.apply_antigravity_install(None)
+    groups = json.loads(hooks.read_text())["albiex-synth-city-mail-question"]["PreToolUse"]
+    assert groups[0] == EMPTY_QUESTION and len(groups) == 2
+    assert "PreToolUse" in svc.installed_antigravity_hooks()
+    await svc.uninstall_antigravity(None)
+    assert json.loads(hooks.read_text()) == {"albiex-synth-city-mail-question": {"PreToolUse": [EMPTY_QUESTION]}}
