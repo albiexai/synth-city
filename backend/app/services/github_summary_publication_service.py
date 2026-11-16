@@ -310,10 +310,15 @@ class GithubSummaryPublicationService:
         return "updated", await client.update_issue_comment(
             scope.repo_owner, scope.repo_name, int(existing["id"]), text, token=token)
 
-    async def _still_current(self, scope, client, number: int, head: str, token) -> bool:
-        """A fresh read, as close to the write as possible: the head and state are still the rendered ones."""
+    async def _still_current(self, scope, client, number: int, rendered: tuple, token) -> bool:
+        """A fresh read, as close to the write as possible: head, state and draft flag are the ones that were rendered.
+
+        An open pull request that merged, closed or changed its draft flag since the facts were rendered is not
+        written; the next pass renders the new facts. A pull request that was already merged when rendered stays
+        publishable.
+        """
         again = await client.get_pull(scope.repo_owner, scope.repo_name, number, token=token)
-        return str((again.get("head") or {}).get("sha") or "") == head and _state(again) != "closed"
+        return (str((again.get("head") or {}).get("sha") or ""), _state(again), bool(again.get("draft"))) == rendered
 
     async def publish_item(self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, client) -> str:
         """Publish for a tracked pull request. Returns created, updated, unchanged, skipped or unavailable."""
@@ -350,7 +355,7 @@ class GithubSummaryPublicationService:
             try:
                 existing = await self._locate(scope, client, number, fresh.summary_comment_id,
                                               fresh.summary_comment_author, token)
-                if not await self._still_current(scope, client, number, head, token):
+                if not await self._still_current(scope, client, number, (head, facts.state, facts.draft), token):
                     return "skipped"
                 outcome, written = await self._write(scope, client, number, existing, text, token)
                 author = str((written.get("user") or {}).get("login") or settings.github_app_bot_login or "") or None
@@ -388,9 +393,10 @@ class GithubSummaryPublicationService:
                 head = str((pull.get("head") or {}).get("sha") or "")
                 checks = (await client.list_check_runs_for_ref(scope.repo_owner, scope.repo_name, head, token=token)
                           if head else [])
-                text = render_comment(await self._facts(db, scope, None, pull, checks, pull_number))
+                facts = await self._facts(db, scope, None, pull, checks, pull_number)
+                text = render_comment(facts)
                 existing = await self._locate(scope, client, pull_number, None, None, token)
-                if not await self._still_current(scope, client, pull_number, head, token):
+                if not await self._still_current(scope, client, pull_number, (head, facts.state, facts.draft), token):
                     return "skipped"
                 return (await self._write(scope, client, pull_number, existing, text, token))[0]
             except Exception as exc:

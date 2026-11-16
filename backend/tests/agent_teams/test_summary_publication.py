@@ -916,3 +916,43 @@ async def test_an_unchanged_re_read_restarts_the_throttle_so_the_next_pass_makes
     client.calls.clear()
     await _scope_pass(fx, client)
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["tracked", "standalone"])
+@pytest.mark.parametrize("change", ["open_to_merged", "draft_to_ready", "ready_to_draft"])
+async def test_a_state_or_draft_change_during_the_lookup_writes_nothing_in_both_paths(fx, path, change):
+    number = 12 if path == "tracked" else 77
+    client = FakeGithub(number=number, draft=(change == "draft_to_ready"))
+    original = client.list_issue_comments
+
+    async def changing(owner, repo, n, *, token=None):
+        rows = await original(owner, repo, n, token=token)
+        if change == "open_to_merged":
+            client.pull.update(state="closed", merged=True, merge_commit_sha=OTHER)
+        elif change == "draft_to_ready":
+            client.pull["draft"] = False
+        else:
+            client.pull["draft"] = True
+        return rows
+
+    client.list_issue_comments = changing
+    async with fx.maker() as db:
+        scope = await db.get(TeamGithubScope, fx.scope_id)
+        assert await service.publish_pull(db, scope, number, client) == "skipped"
+    assert client.writes() == [] and client.comments == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["tracked", "standalone"])
+async def test_a_pull_that_is_already_merged_when_rendered_is_still_published_as_merged(fx, path):
+    number = 12 if path == "tracked" else 77
+    client = FakeGithub(number=number, state="closed", merged=True, merge_commit_sha=OTHER)
+    async with fx.maker() as db:
+        scope = await db.get(TeamGithubScope, fx.scope_id)
+        if path == "tracked":
+            await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == fx.item_id).values(
+                dispatch_status="merged"))
+            await db.commit()
+        assert await service.publish_pull(db, scope, number, client) == "created"
+    assert f"merged as `{OTHER}`" in next(iter(client.comments.values()))["body"]
