@@ -133,7 +133,11 @@ def explain(error: Exception) -> dict:
     from pydantic import ValidationError
 
     if isinstance(error, ValidationError):
-        fields = sorted({str(item["loc"][0]) if item.get("loc") else "effort_range" for item in error.errors()})
+        # Only names the summary declares are repeated. A key the caller made up (the extra-key refusal names it in
+        # the error location) is reported by a fixed label, so no caller text comes back.
+        declared = set(CurrentSummary.model_fields)
+        fields = sorted({(str(item["loc"][0]) if str(item["loc"][0]) in declared else "unknown_field")
+                         if item.get("loc") else "effort_range" for item in error.errors()})
         return {"code": CODE, "reason": "invalid_summary_field", "fields": fields, "suggestion": _FIELD_SUGGESTION}
     reason = str(error) if isinstance(error, ValueError) and str(error) in _BODY_SUGGESTIONS else None
     if reason is None:

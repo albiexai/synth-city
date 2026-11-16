@@ -154,3 +154,40 @@ def test_the_tool_returns_the_reason_and_keeps_its_old_shape(monkeypatch):
     ok = shim.synth_city_render_github_summary(
         body, fields, expected_body_sha256=hashlib.sha256(body.encode()).hexdigest())
     assert ok["ok"] is True and ok["changed"] is True and "error" not in ok
+
+
+# --- #987 review 5927206088: an unexpected key in the summary dict is never echoed back --------------------------------
+
+def _extra_key_error(**extra):
+    base = dict(goal="Goal.", status="Working", completed="Done.", remaining="Left.", next_action="Next.",
+                human_action="None.", reported_at=datetime(2026, 10, 7, 14, tzinfo=timezone.utc))
+    with pytest.raises(ValidationError) as caught:
+        CurrentSummary.model_validate({**base, **extra})
+    return caught.value
+
+
+@pytest.mark.parametrize("key", ["zzqq_marker_key", "ghp_zzqq", "password=zzqq", "a1b2c3d4e5f6a7b8c9d0"])
+def test_an_unexpected_summary_key_is_reported_by_a_fixed_label_never_by_its_name(key):
+    from mcp_shim.github_summary_protocol import explain
+    refusal = explain(_extra_key_error(**{key: "value"}))
+    assert refusal["reason"] == "invalid_summary_field" and refusal["fields"] == ["unknown_field"]
+    assert "zzqq" not in str(refusal) and "a1b2c3d4" not in str(refusal)
+
+
+def test_declared_and_unexpected_fields_together_name_the_declared_and_label_the_rest():
+    from mcp_shim.github_summary_protocol import explain
+    error = _extra_key_error(goal="password=zzqq", zzqq_one="x", zzqq_two="y")
+    refusal = explain(error)
+    assert refusal["fields"] == ["goal", "unknown_field"]
+    assert "zzqq" not in str(refusal)
+
+
+def test_the_tool_never_echoes_an_unexpected_key(monkeypatch):
+    import mcp_shim.agent_mail_server as shim
+    monkeypatch.setattr(shim, "_ensure_registered", lambda: {"ok": True})
+    fields = dict(goal="Goal.", status="Working", completed="Done.", remaining="Left.", next_action="Next.",
+                  human_action="None.", zzqq_secret_key="x")
+    refused = shim.synth_city_render_github_summary("Human requirements.\n", fields)
+    assert refused["ok"] is False and refused["error"]["reason"] == "invalid_summary_field"
+    assert refused["error"]["fields"] == ["unknown_field"]
+    assert "zzqq" not in str(refused)
