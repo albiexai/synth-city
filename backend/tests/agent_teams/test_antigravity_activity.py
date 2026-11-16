@@ -740,3 +740,136 @@ def test_results_inside_the_deadline_are_kept(home, monkeypatch):
     monkeypatch.setattr(ag, "time", _Clock())
     assert observe(home) == ("waiting_input", "native_question_open")
     assert ag.discover_antigravity_conversation(4242, home["ws"]) == CID
+
+
+# --- Review 5921913278 corrections ----------------------------------------------------------
+
+def _scene(home, records, steps, summary):
+    """Rewrite the fake agy home: the transcript (raw records), the live steps and the summary row."""
+    home["transcript"].write_text("".join(json.dumps(r) + "\n" for r in records))
+    os.chmod(home["transcript"], 0o600)
+    home["conversation"].execute("delete from steps")
+    home["conversation"].executemany("insert into steps values (?, ?, ?)", steps)
+    home["conversation"].commit()
+    home["summaries"].execute("update conversation_summaries set status=?, not_fully_idle=?, step_count=?",
+                              (summary["status"], summary["not_fully_idle"], len(steps)))
+    home["summaries"].commit()
+
+
+def _raw_planner(i, calls, s=1):
+    record = {"step_index": i, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": at(s)}
+    record["tool_calls"] = calls
+    return record
+
+
+IDLE_STEPS = [(0, 14, 3), (1, 15, 3)]
+TOOL_DONE_STEPS = [(0, 14, 3), (1, 15, 3), (2, 132, 3)]
+SYSTEM_STEPS = [(0, 14, 3), (1, 15, 3), (2, 101, 3)]
+
+
+@pytest.mark.parametrize("calls", [{"name": "run_command"}, "run_command", 3, None, [["run_command"]], ["run_command"]])
+def test_a_present_but_malformed_tool_call_value_is_never_idle(home, calls):
+    _scene(home, [user(0), _raw_planner(1, calls)], IDLE_STEPS, IDLE)
+    assert observe(home) == ("unknown", "observation_invalid")
+
+
+@pytest.mark.parametrize("name", [True, 7, ["run_command"], {"n": "run_command"}, None])
+def test_a_tool_call_without_a_string_name_is_never_working(home, name):
+    _scene(home, [user(0), _raw_planner(1, [{"name": name}])], TOOL_DONE_STEPS, RUNNING)
+    assert observe(home) == ("unknown", "observation_invalid")
+
+
+@pytest.mark.parametrize("change", [{"step_index": "1"}, {"step_index": True}, {"step_index": None},
+                                    {"type": 15}, {"source": ["MODEL"]}, {"created_at": 5}])
+@pytest.mark.parametrize("branch", ["idle", "system_progress"])
+def test_a_malformed_current_turn_record_is_never_skipped(home, change, branch):
+    if branch == "idle":
+        records = [user(0), {**planner(1), **change}]
+        _scene(home, records, IDLE_STEPS, IDLE)
+    else:
+        records = [user(0), {**planner(1, tools=["run_command"]), **change}, system(2)]
+        _scene(home, records, SYSTEM_STEPS, RUNNING)
+    assert observe(home) == ("unknown", "observation_invalid")
+
+
+def test_the_well_formed_scenes_still_classify(home):
+    _scene(home, [user(0), planner(1)], IDLE_STEPS, IDLE)
+    assert observe(home) == ("idle", "native_turn_completed")
+    _scene(home, [user(0), planner(1, tools=["run_command"]), system(2)], SYSTEM_STEPS, RUNNING)
+    assert observe(home) == ("working", "native_progress")
+
+
+def test_malformed_live_step_rows_are_unknown():
+    records = [user(0), planner(1)]
+    assert state(IDLE, [(0, 14, 3), (1, "15", 3)], records)[0] == "unknown"
+    assert state(IDLE, [(0, 14, 3), (True, 15, 3)], records)[0] == "unknown"
+
+
+HELD = ["", ".gemini", ".gemini/antigravity-cli", ".gemini/antigravity-cli/conversations",
+        ".gemini/antigravity-cli/presence", f".gemini/antigravity-cli/brain/{CID}/.system_generated/logs"]
+
+
+@pytest.mark.parametrize("rel", HELD)
+def test_a_directory_made_world_writable_in_place_during_the_read_is_refused(home, monkeypatch, rel):
+    target = home["home"] / rel if rel else home["home"]
+
+    def loosen(attempt):
+        os.chmod(target, 0o777)
+    monkeypatch.setattr(ag, "_between_rounds", loosen)
+    # Held before the change: refused by the final recheck. The transcript directory is opened after
+    # the copy rounds, so there it is refused when held (its post-parse change is tested below).
+    expected = "session_mismatch" if rel.endswith("/logs") else "binding_changed"
+    assert observe(home) == ("unknown", expected)
+    os.chmod(target, 0o700)
+    if rel in ("", ".gemini", ".gemini/antigravity-cli", ".gemini/antigravity-cli/presence"):  # held by discovery
+        assert ag.discover_antigravity_conversation(4242, home["ws"]) is None
+
+
+def test_the_transcript_directory_loosened_after_parsing_is_refused(home, monkeypatch):
+    logs = home["root"] / "brain" / CID / ".system_generated" / "logs"
+    parse = ag.read_transcript_records
+
+    def parse_then_loosen(*args, **kwargs):
+        result = parse(*args, **kwargs)
+        os.chmod(logs, 0o777)
+        return result
+    monkeypatch.setattr(ag, "read_transcript_records", parse_then_loosen)
+    assert observe(home) == ("unknown", "binding_changed")
+
+
+@pytest.mark.parametrize("view", ["held", "named"])
+def test_a_directory_owner_change_during_the_read_is_refused(home, monkeypatch, view):
+    # Tests cannot chown; report a different owner for the conversations directory after the hold.
+    import types
+    conversations = home["root"] / "conversations"
+    ident = (conversations.stat().st_dev, conversations.stat().st_ino)
+    fake = types.SimpleNamespace(**{name: getattr(os, name) for name in dir(os) if not name.startswith("__")})
+    held = {"done": False}
+
+    def chowned(info):
+        values = list(info)
+        values[4] = info.st_uid + 1
+        return os.stat_result(values)
+
+    def fstat(fd):
+        info = os.fstat(fd)
+        if view == "held" and held["done"] and (info.st_dev, info.st_ino) == ident:
+            return chowned(info)
+        return info
+
+    def lstat(path, *args, **kwargs):
+        info = os.lstat(path, *args, **kwargs)
+        if view == "named" and held["done"] and (info.st_dev, info.st_ino) == ident:
+            return chowned(info)
+        return info
+    fake.fstat, fake.lstat = fstat, lstat
+    monkeypatch.setattr(ag, "os", fake)
+    monkeypatch.setattr(ag, "_between_rounds", lambda attempt: held.update(done=True))
+    assert observe(home) == ("unknown", "binding_changed")
+
+
+def test_a_record_after_the_input_must_also_follow_it_by_index():
+    # In transcript order after U, but not after U by index: the turn is not a plain sequence.
+    records = [user(1), planner(0), planner(2)]
+    assert state(IDLE, [(1, 14, 3), (2, 15, 3)], records)[0] == "unknown"
+    assert state(IDLE, [(1, 14, 3), (2, 15, 3)], [user(1), planner(2)])[0] == "idle"

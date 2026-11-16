@@ -161,14 +161,20 @@ class _Tree:
         """A directory below ``antigravity-cli``."""
         return self.dir(".gemini/antigravity-cli" + (f"/{rel}" if rel else ""))
 
+    def _trusted(self, info: os.stat_result, ident: tuple) -> bool:
+        return (stat.S_ISDIR(info.st_mode) and info.st_uid == self.uid and not info.st_mode & stat.S_IWOTH
+                and (info.st_dev, info.st_ino) == ident)
+
     def unchanged(self) -> bool:
+        """Every held directory, by descriptor and by name, is still the same trusted directory."""
         home = self.root.parent.parent
         for rel, ident in self.ids.items():
             try:
-                info = os.lstat(home / rel if rel else home)
+                held = os.fstat(self.fds[rel])
+                named = os.lstat(home / rel if rel else home)
             except OSError:
                 return False
-            if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != ident:
+            if not self._trusted(held, ident) or not self._trusted(named, ident):
                 return False
         return True
 
@@ -345,6 +351,14 @@ def _summary(rows: list, cwd: str) -> dict | None:
 # --- Transcript: structure and tool names only ----------------------------------------------
 
 _KEEP = ("step_index", "source", "type", "status", "created_at")
+# A ``tool_calls`` value that is present but not a list of objects with a string name.
+MALFORMED = "malformed"
+
+
+def _tool_names(calls: object) -> list[str] | str:
+    if isinstance(calls, list) and all(isinstance(c, dict) and isinstance(c.get("name"), str) for c in calls):
+        return [c["name"] for c in calls]
+    return MALFORMED
 
 
 def _record(line: bytes) -> dict:
@@ -355,9 +369,9 @@ def _record(line: bytes) -> dict:
     if not isinstance(value, dict):
         raise _Unknown("observation_invalid")
     record = {key: value.get(key) for key in _KEEP}
-    calls = value.get("tool_calls")
-    if isinstance(calls, list):
-        record["tools"] = [call.get("name") if isinstance(call, dict) else None for call in calls]
+    # Observed text replies have no ``tool_calls`` key; any present value must be well formed.
+    if "tool_calls" in value:
+        record["tools"] = _tool_names(value["tool_calls"])
     return record
 
 
@@ -422,10 +436,14 @@ def antigravity_state(summary: dict | None, step_count: int, steps: list[tuple[i
     ``skip_permissions`` is True only when the bound process was launched with exactly
     ``--dangerously-skip-permissions``, the only context in which a running ``run_command`` was observed.
     """
-    inputs = [r for r in records if r.get("type") == "USER_INPUT" and r.get("source") == "USER_EXPLICIT"]
-    if not inputs:
+    if not all(isinstance(v, int) and not isinstance(v, bool) for row in steps for v in row) or any(
+            len(row) != 3 for row in steps):
+        return "unknown", "observation_invalid", None
+    positions = [i for i, r in enumerate(records)
+                 if r.get("type") == "USER_INPUT" and r.get("source") == "USER_EXPLICIT"]
+    if not positions:
         return "unknown", "no_native_event", None
-    current = inputs[-1]
+    current = records[positions[-1]]
     start_second = started_at.replace(microsecond=0)
     latest = now + timedelta(seconds=1)
     created = _step_time(current, start_second, latest)
@@ -437,12 +455,15 @@ def antigravity_state(summary: dict | None, step_count: int, steps: list[tuple[i
         return "unknown", "completion_unconfirmed", None
     if summary is None:
         return "unknown", "session_mismatch", None
-    after = [r for r in records if isinstance(r.get("step_index"), int) and not isinstance(r.get("step_index"), bool)
-             and r["step_index"] > current["step_index"]]
-    # Every record of the current turn must be well formed and from U's second up to now.
-    if any(_step_time(r, created, latest) is None for r in after):
+    # The current turn is every record after U in transcript order. Each must be well formed,
+    # follow U and be from U's second up to now; nothing malformed is skipped.
+    after = records[positions[-1] + 1:]
+    if any(_step_time(r, created, latest) is None or r["step_index"] <= current["step_index"]
+           or not isinstance(r.get("type"), str) or not isinstance(r.get("source"), str) for r in after):
         return "unknown", "observation_invalid", None
-    planners = [r for r in after if r.get("type") == "PLANNER_RESPONSE" and r.get("source") == "MODEL"]
+    planners = [r for r in after if r["type"] == "PLANNER_RESPONSE" and r["source"] == "MODEL"]
+    if any(_tools(r) == MALFORMED for r in planners):
+        return "unknown", "observation_invalid", None
     # A reply carries no tool call or exactly one; any other shape was not observed.
     if any(tools is not None and len(tools) != 1 for tools in (_tools(r) for r in planners)):
         return "unknown", "completion_unconfirmed", None
@@ -483,14 +504,14 @@ def antigravity_state(summary: dict | None, step_count: int, steps: list[tuple[i
     return "unknown", "completion_unconfirmed", None
 
 
-def _tools(record: dict) -> list | None:
-    """Tool names of a PLANNER_RESPONSE, from a parsed (``tools``) or raw (``tool_calls``) record."""
+def _tools(record: dict) -> list[str] | str | None:
+    """Tool names of a PLANNER_RESPONSE from a parsed (``tools``) or raw (``tool_calls``) record:
+    None when it has no tool calls, ``MALFORMED`` when the value is not a list of named calls."""
     if "tools" in record:
-        return record["tools"]
-    calls = record.get("tool_calls")
-    if not isinstance(calls, list):
-        return None
-    return [call.get("name") if isinstance(call, dict) else None for call in calls]
+        return record["tools"] if isinstance(record["tools"], list) else MALFORMED
+    if "tool_calls" in record:
+        return _tool_names(record["tool_calls"])
+    return None
 
 
 def _working(at: datetime, now: datetime):
