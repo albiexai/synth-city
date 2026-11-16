@@ -28,6 +28,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.factory_schemas import AgentTeamSummaryResponse
 from app.services.agent_team_summary_service import agent_team_summary_service
+from app.services.github_effort_limit_service import effort_limit_service
 from app.models.database import (
     AgentTeamSlot,
     AgentTeamPreset,
@@ -567,6 +568,7 @@ def _scope_revision_response(
     *,
     include_commands: bool = True,
     approval: GithubApprovalRequest | None = None,
+    effort: dict | None = None,
 ) -> GithubScopeRevisionResponse:
     return GithubScopeRevisionResponse(
         id=revision.id,
@@ -616,6 +618,7 @@ def _scope_revision_response(
         approval_request=(
             _approval_authority_response(approval) if approval is not None else None
         ),
+        effort=effort,
     )
 
 
@@ -1797,6 +1800,7 @@ async def list_github_work_item_scope_revisions(
                 )
             ),
             approval=approval_by_revision_id.get(revision.id),
+            effort=effort_limit_service.effort_view(item, scope),
         )
         for revision in revisions
     ]
@@ -2214,6 +2218,7 @@ async def claim_github_work_item_continuation(
         continuation_block_code = "continuation_budget_exhausted"
     else:
         continuation_block_code = None
+    effort_view = effort_limit_service.effort_view(item, scope)
     result = GithubWorkItemContinuationResponse(
         work_item_id=item.id,
         issue_number=item.issue_number,
@@ -2233,7 +2238,7 @@ async def claim_github_work_item_continuation(
         leader_member_id=leader_member.id if leader_member is not None else None,
         status_note=item.status_note,
         active_revision=(
-            _scope_revision_response(active_revision)
+            _scope_revision_response(active_revision, effort=effort_view)
             if active_revision is not None
             else None
         ),
@@ -2243,7 +2248,7 @@ async def claim_github_work_item_continuation(
             else None
         ),
         pending_revision=(
-            _scope_revision_response(pending_revision)
+            _scope_revision_response(pending_revision, effort=effort_view)
             if pending_revision is not None
             else None
         ),
@@ -2258,6 +2263,7 @@ async def claim_github_work_item_continuation(
             "max_paths": scope.max_scope_paths,
             "max_commands": scope.max_scope_commands,
         },
+        effort=effort_view,
     )
     await db.commit()
     response.headers["Cache-Control"] = "no-store"

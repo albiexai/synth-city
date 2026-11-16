@@ -406,7 +406,7 @@ async def test_the_route_reports_problems_and_writes_nothing(client, db):
     headers = {"X-Synth-City-Session-Token": tokens[1]}
     clean = await client.post(URL, headers=headers, json=body(item, estimate_active_minutes=30))
     assert clean.status_code == 200, clean.text
-    assert clean.json() == {"passed": True, "problems": [], "warnings": []}
+    assert clean.json() == {"passed": True, "problems": [], "warnings": [], "effort": None}
     bad = await client.post(URL, headers=headers, json=body(
         item, phase="bogus", allowed_paths=["/abs"], estimate_active_minutes=150))
     assert bad.status_code == 200

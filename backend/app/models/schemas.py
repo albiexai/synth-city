@@ -2123,6 +2123,17 @@ class GithubRevisionReviewResponse(BaseModel):
     settlement_reason: Optional[str] = None
 
 
+class GithubEffortView(BaseModel):
+    """The recorded estimate and effort limit of a work item (#968): plain minutes, no ledger time and no secret."""
+
+    estimate_minutes: Optional[int] = None
+    limit_minutes: int
+    extension_minutes: int = 0
+    effective_limit_minutes: int
+    ceiling_minutes: Optional[int] = None
+    extension_cap_minutes: int = 0
+
+
 class GithubScopeRevisionResponse(BaseModel):
     id: int
     work_item_id: int
@@ -2169,6 +2180,8 @@ class GithubScopeRevisionResponse(BaseModel):
     expires_at: Optional[datetime] = None
     created_at: datetime
     approval_request: Optional["GithubApprovalRequestResponse"] = None
+    # The item's recorded estimate and limit, shown beside the revision (#968); ``None`` when none is recorded.
+    effort: Optional[GithubEffortView] = None
 
 
 class GithubContinuationRequestResponse(BaseModel):
@@ -2993,6 +3006,8 @@ class GithubWorkItemContinuationResponse(BaseModel):
     continuation_block_code: Optional[str] = None
     review_rework_guidance: Optional[str] = None
     continuation_budget: Dict[str, int] = Field(default_factory=dict)
+    # The recorded estimate, approved effort limit and any extension (#968); ``None`` when none is recorded.
+    effort: Optional[GithubEffortView] = None
 
 
 class AgentTeamLaunchPlanItem(BaseModel):

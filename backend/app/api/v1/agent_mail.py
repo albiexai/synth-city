@@ -68,6 +68,7 @@ from app.services.agent_mail_service import (
     agent_mail_service,
 )
 from app.services.github_dispatch_service import github_dispatch_service
+from app.services.github_effort_limit_service import effort_limit_service
 from app.services.mail_redaction import redact_lease_message, redact_lease_thread
 from app.services.github_approval_service import (
     GithubApprovalError,
@@ -535,7 +536,8 @@ async def preflight_request(
         if (workspace is None or workspace.lease_token is None
                 or not hmac.compare_digest(workspace.lease_token, request.lease_token)):
             result.problems.insert(0, request_preflight.problem("lease_token_mismatch", 403))
-    return result.as_dict()
+    # The recorded estimate and effort limit (#968): read-only numbers, beside the findings and never part of them.
+    return {**result.as_dict(), "effort": effort_limit_service.effort_view(item, scope)}
 
 
 @router.post(
