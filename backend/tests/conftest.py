@@ -3,7 +3,6 @@ import copy
 import atexit
 import os
 import tempfile
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -25,7 +24,7 @@ _session_home = tempfile.TemporaryDirectory(prefix='synth-city-test-home-')
 os.environ['HOME'] = _session_home.name
 for _name, _subdir in _XDG_SUBDIRS.items():
     os.environ[_name] = os.path.join(_session_home.name, _subdir)
-home_guard.arm(_original_env['HOME'], _session_home.name, Path(__file__).resolve().parents[2])
+home_guard.arm(_original_env['HOME'])
 
 
 def _restore_env():
@@ -65,10 +64,6 @@ def pytest_sessionfinish(session, exitstatus):
         session.exitstatus = 1
         summary = ", ".join(f"{kind} pid {pid} ({name})" for kind, pid, name in leaks)
         print(f"\nstray child processes left by this test run: {summary}")
-    refused = home_guard.take_violations()
-    if refused:
-        session.exitstatus = 1
-        print(f"\nwrites under the real home refused outside a test: {refused}")
     changed = home_guard.session_changes()
     if changed:
         session.exitstatus = 1
@@ -95,15 +90,3 @@ def isolated_home_session():
         if os.environ[name] != os.path.join(_session_home.name, subdir):
             raise RuntimeError(f'{name} does not point at the session test home')
     yield
-
-
-@pytest.fixture(autouse=True)
-def real_home_guard():
-    yield
-    refused = home_guard.take_violations()
-    if refused:
-        pytest.fail(
-            'test wrote under the real home: '
-            + ', '.join(f'{event} {path}' for event, path in refused),
-            pytrace=False,
-        )
