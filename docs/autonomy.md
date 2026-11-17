@@ -47,6 +47,10 @@ labels, the lowest number wins. Invalid labels are ignored. Explicit priorities
 come before issues without a valid priority; ties and unprioritized work use
 ascending issue number (oldest first), then work-item ID. GitHub poll order and
 work-item creation time do not decide priority.
+An owner slot that frees while a poll is working through its ranked list goes
+to the highest-ranked waiting item for that slot on the next poll, not to
+whichever item the poll happens to check next. Other slots are not held up, and
+an item whose own prepared attempt holds the slot can still start.
 
 Each poll observes priority labels and clears removed values. Pending issues
 are refreshed again before the dispatch batch is ranked. Existing databases
