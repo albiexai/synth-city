@@ -8,25 +8,45 @@ from unittest.mock import patch
 import pytest
 from pydantic_settings import BaseSettings
 
-from tests import stray_children
+from tests import home_guard, stray_children
 
 
 # A memory database does not suppress independent HOME-resource conversion.
 # Establish isolation before config or child conftests can import application code.
-_original_home = os.environ.get('HOME')
+# First record the real paths and their state; only then move HOME, XDG and the
+# database and attachment settings into a temporary directory (#1122).
+_XDG_SUBDIRS = {
+    'XDG_CONFIG_HOME': '.config',
+    'XDG_DATA_HOME': '.local/share',
+    'XDG_STATE_HOME': '.local/state',
+    'XDG_CACHE_HOME': '.cache',
+}
+_original_env = {
+    name: value for name, value in os.environ.items()
+    if name in home_guard.HOME_NAMES or name.upper() in home_guard.CONFIG_NAMES
+}
+home_guard.arm(os.environ.get('HOME'), dict(os.environ), os.getcwd())
 _session_home = tempfile.TemporaryDirectory(prefix='synth-city-test-home-')
-os.environ['HOME'] = _session_home.name
+_session_env = {
+    'HOME': _session_home.name,
+    **{name: os.path.join(_session_home.name, subdir) for name, subdir in _XDG_SUBDIRS.items()},
+    'DATABASE_URL': f'sqlite+aiosqlite:///{_session_home.name}/synth_city.db',
+    'BRIDGE_ATTACHMENT_DIR': os.path.join(_session_home.name, 'bridge-attachments'),
+    'BRIDGE_ATTACHMENT_AGENT_ROOT': os.path.join(_session_home.name, 'bridge-agent-root'),
+}
+for _name in _original_env:
+    os.environ.pop(_name, None)         # every spelling of a configuration name, whatever its case
+os.environ.update(_session_env)
 
 
-def _restore_home():
-    if _original_home is None:
-        os.environ.pop('HOME', None)
-    else:
-        os.environ['HOME'] = _original_home
+def _restore_env():
+    for name in _session_env:
+        os.environ.pop(name, None)
+    os.environ.update(_original_env)
     _session_home.cleanup()
 
 
-atexit.register(_restore_home)
+atexit.register(_restore_env)
 
 
 _settings_init = BaseSettings.__init__
@@ -54,6 +74,10 @@ def pytest_sessionfinish(session, exitstatus):
         session.exitstatus = 1
         summary = ", ".join(f"{kind} pid {pid} ({name})" for kind, pid, name in leaks)
         print(f"\nstray child processes left by this test run: {summary}")
+    changed = home_guard.session_changes()
+    if changed:
+        session.exitstatus = 1
+        print(f"\nSynth City real-home paths changed or could not be checked during this test run: {', '.join(changed)}")
 
 
 @pytest.fixture(autouse=True)
@@ -66,3 +90,22 @@ def isolated_settings(monkeypatch):
     defaults = Settings()
     for name in Settings.model_fields:
         monkeypatch.setattr(settings, name, copy.deepcopy(getattr(defaults, name)))
+
+
+@pytest.fixture(autouse=True)
+def real_home_environment():
+    """Fail the test that points HOME, XDG or the configuration back at a real path, then put them right.
+
+    The check runs at the start and again at the end of every test, so a change after the session began is named
+    where it happened. It repairs the environment afterwards, so one leak does not fail every later test.
+    """
+    _fail_on_real_paths('before')
+    yield
+    _fail_on_real_paths('after')
+
+
+def _fail_on_real_paths(moment):
+    problems = home_guard.guard().environment_problems()
+    if problems:
+        os.environ.update(_session_env)
+        pytest.fail(f"{moment} this test: {'; '.join(problems)}", pytrace=False)
