@@ -133,7 +133,7 @@ def scope(s: Seeder, scope_id: int, preset_id: int, owner: str, name: str, repo:
         max_build_parallelism=2, github_auth_mode="token", github_app_installation_id=None,
         continuation_enabled=1, max_continuation_revisions=6,
         max_continuation_failed_heads=8, max_failed_heads_per_revision=2,
-        max_scope_paths=32, max_scope_commands=16, enabled=int(enabled),
+        max_scope_paths=32, max_scope_commands=16, max_item_effort_minutes=120, enabled=int(enabled),
         last_polled_at=at(minutes=2), created_at=at(days=20), updated_at=at(days=1),
     )
 
@@ -166,7 +166,8 @@ def item(s: Seeder, item_id: int, scope_id: int, owner: str, repo: str, number: 
         escalation_reason=escalation, status_note=note, auto_merged_at=None,
         active_scope_revision=0, attempt_phase="implementation", diagnostic_retry_count=0,
         diagnostic_last_verified_sha=None, continuation_nudged_at=None,
-        continuation_activated_at=None, created_at=at(days=3), updated_at=updated or at(hours=1),
+        continuation_activated_at=None, effort_elapsed_seconds=0, effort_extension_minutes=0,
+        created_at=at(days=3), updated_at=updated or at(hours=1),
     )
 
 

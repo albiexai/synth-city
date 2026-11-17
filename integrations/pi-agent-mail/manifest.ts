@@ -309,6 +309,38 @@ export const manifest = [
     }
   },
   {
+    "name": "synth_city_extend_effort_limit",
+    "description": "Leader only: extend a work item's effort limit once, by at most 30 minutes or 25 percent of the limit.\n\n    The limit and its ledger are advisory elapsed working time from the system, not the owner's reported active\n    effort. The extension changes no expiry, nonce, lease or status. The owner asks for it by Mail.\n    ",
+    "inputSchema": {
+      "properties": {
+        "work_item_id": {
+          "title": "Work Item Id",
+          "type": "integer"
+        },
+        "dispatch_nonce": {
+          "title": "Dispatch Nonce",
+          "type": "string"
+        },
+        "minutes": {
+          "title": "Minutes",
+          "type": "integer"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "work_item_id",
+        "dispatch_nonce",
+        "minutes",
+        "reason"
+      ],
+      "title": "synth_city_extend_effort_limitArguments",
+      "type": "object"
+    }
+  },
+  {
     "name": "synth_city_get_backlog_coordination",
     "description": "Current Leader: read the assigned backlog, observations and request version.\n\n    Reconcile reviewed dependency/milestone gates and already-landed fixes even for\n    issues without a dispatch-ready label. While ON, this read returns a short-lived\n    snapshot_token for publishing a current assessment without another notification.\n    Read again immediately before reporting; keep the token private. OFF/HOLD reads\n    grant no publication challenge. This tool grants no implementation authority.\n    ",
     "inputSchema": {
@@ -339,6 +371,23 @@ export const manifest = [
         "preset_id"
       ],
       "title": "synth_city_get_operator_action_contextsArguments",
+      "type": "object"
+    }
+  },
+  {
+    "name": "synth_city_get_review_binding",
+    "description": "Assigned reviewer reads the binding needed to record a head or revision review for one item (#999).\n\n    Allowed for the team's current verifier, or the reviewer named on the item's required-check watch for the\n    PR's exact current head. Returns only work_item_id, pr_number, dispatch_nonce and active_scope_revision.\n    The nonce is private: use it only in synth_city_record_head_review or synth_city_record_revision_review,\n    and never publish it.\n    ",
+    "inputSchema": {
+      "properties": {
+        "work_item_id": {
+          "title": "Work Item Id",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "work_item_id"
+      ],
+      "title": "synth_city_get_review_bindingArguments",
       "type": "object"
     }
   },
@@ -420,6 +469,117 @@ export const manifest = [
         "preset_id"
       ],
       "title": "synth_city_launch_teamArguments",
+      "type": "object"
+    }
+  },
+  {
+    "name": "synth_city_leader_cancel_revision",
+    "description": "Current Leader cancels one active or submitted revision with every operator guard.\n\n    Replays with the same operation_id are safe; a different request under the same id is refused.\n    One audit fact and one notice to the bound Supervisor are written. This changes no policy or\n    limit and does not approve, retry, release a lease or merge.\n    ",
+    "inputSchema": {
+      "properties": {
+        "work_item_id": {
+          "title": "Work Item Id",
+          "type": "integer"
+        },
+        "revision_number": {
+          "title": "Revision Number",
+          "type": "integer"
+        },
+        "dispatch_nonce": {
+          "title": "Dispatch Nonce",
+          "type": "string"
+        },
+        "operation_id": {
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "work_item_id",
+        "revision_number",
+        "dispatch_nonce",
+        "operation_id",
+        "reason"
+      ],
+      "title": "synth_city_leader_cancel_revisionArguments",
+      "type": "object"
+    }
+  },
+  {
+    "name": "synth_city_leader_finalize_merged",
+    "description": "Current Leader records a merged PR the poll could not settle, from fresh evidence.\n\n    Call with dry_run true (the default) for the evidence and its digest. Then call with dry_run false,\n    the digest, an operation_id and a reason. It performs no merge and releases nothing. Replay-safe;\n    one notice to the bound Supervisor.\n    ",
+    "inputSchema": {
+      "properties": {
+        "work_item_id": {
+          "title": "Work Item Id",
+          "type": "integer"
+        },
+        "operation_id": {
+          "default": "",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "expected_context_sha256": {
+          "default": "",
+          "title": "Expected Context Sha256",
+          "type": "string"
+        },
+        "reason": {
+          "default": "",
+          "title": "Reason",
+          "type": "string"
+        },
+        "dry_run": {
+          "default": true,
+          "title": "Dry Run",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "work_item_id"
+      ],
+      "title": "synth_city_leader_finalize_mergedArguments",
+      "type": "object"
+    }
+  },
+  {
+    "name": "synth_city_leader_release_workspace",
+    "description": "Current Leader releases a CLEAN workspace of a terminal item.\n\n    Refused when the tree is dirty, has unpushed commits or cannot be inspected, when the item is not\n    terminal, or when the lease changed. Dirty or unknown state is operator-only. One notice to the\n    bound Supervisor; replay-safe.\n    ",
+    "inputSchema": {
+      "properties": {
+        "work_item_id": {
+          "title": "Work Item Id",
+          "type": "integer"
+        },
+        "workspace_id": {
+          "title": "Workspace Id",
+          "type": "integer"
+        },
+        "expected_leased_at": {
+          "title": "Expected Leased At",
+          "type": "string"
+        },
+        "operation_id": {
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "work_item_id",
+        "workspace_id",
+        "expected_leased_at",
+        "operation_id",
+        "reason"
+      ],
+      "title": "synth_city_leader_release_workspaceArguments",
       "type": "object"
     }
   },
@@ -565,6 +725,182 @@ export const manifest = [
     }
   },
   {
+    "name": "synth_city_preflight_request",
+    "description": "Check a request before you submit it. Nothing is created, sent or changed.\n\n    kind is initial_plan (summary and plan_metadata), scope_amendment or continuation (the same\n    fields as synth_city_request_scope_amendment and synth_city_request_continuation). Returns\n    passed, problems and warnings. Each problem has a code, a field and a message; every problem\n    is listed at once. estimate_active_minutes is optional: a number of minutes, or an object\n    with high and optionally low. It is checked against the current authority window and is not\n    stored. Only the item's owner may ask. A request that passes is not refused for these rules.\n    ",
+    "inputSchema": {
+      "properties": {
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "work_item_id": {
+          "title": "Work Item Id",
+          "type": "integer"
+        },
+        "dispatch_nonce": {
+          "title": "Dispatch Nonce",
+          "type": "string"
+        },
+        "summary": {
+          "default": "",
+          "title": "Summary",
+          "type": "string"
+        },
+        "plan_metadata": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Plan Metadata"
+        },
+        "phase": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Phase"
+        },
+        "execution_target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Execution Target"
+        },
+        "allowed_paths": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allowed Paths"
+        },
+        "allowed_actions": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allowed Actions"
+        },
+        "allowed_commands": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allowed Commands"
+        },
+        "prohibited_actions": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prohibited Actions"
+        },
+        "max_failed_heads": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Failed Heads"
+        },
+        "tool_fallbacks": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool Fallbacks"
+        },
+        "estimate_active_minutes": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Estimate Active Minutes"
+        },
+        "lease_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lease Token"
+        }
+      },
+      "required": [
+        "kind",
+        "work_item_id",
+        "dispatch_nonce"
+      ],
+      "title": "synth_city_preflight_requestArguments",
+      "type": "object"
+    }
+  },
+  {
     "name": "synth_city_prepare_operator_action_contexts",
     "description": "Prepare issue records for the current Leader's intended human requests.\n\n    Entries use the backlog assessment schema. Supply only the assigned issues\n    that have intended human_actions. Use required_actor operator. Up to sixteen\n    unique actions and eight PRs are allowed. PRs need their full expected head.\n    Inspection actions require a current stopped attempt.\n\n    Publish the completed templates in the main issue body before requesting\n    input. Preserve other issue facts and other scopes. Clear or supersede old\n    records when the request changes. A PR record must include its target and\n    reviewed head. Do not leave instructions only in Mail or comments.\n    After publication, read fresh backlog coordination and pass its private\n    snapshot_token to the normal assessment tool. This preparation is read-only\n    and grants no approval, lease, retry, merge or milestone authority.\n    ",
     "inputSchema": {
@@ -658,6 +994,28 @@ export const manifest = [
         "next_action"
       ],
       "title": "synth_city_prepare_work_remaining_summaryArguments",
+      "type": "object"
+    }
+  },
+  {
+    "name": "synth_city_publish_pull_summary",
+    "description": "Leader-only: write or refresh the system-owned summary comment of a PR.\n\n    It creates one comment and then edits only that comment by id. It never edits a PR or issue body, an\n    operator record or any other comment, and it grants no approval, review or merge authority.\n    ",
+    "inputSchema": {
+      "properties": {
+        "scope_id": {
+          "title": "Scope Id",
+          "type": "integer"
+        },
+        "pull_number": {
+          "title": "Pull Number",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "scope_id",
+        "pull_number"
+      ],
+      "title": "synth_city_publish_pull_summaryArguments",
       "type": "object"
     }
   },
@@ -782,6 +1140,28 @@ export const manifest = [
         "summary"
       ],
       "title": "synth_city_render_github_summaryArguments",
+      "type": "object"
+    }
+  },
+  {
+    "name": "synth_city_render_pull_summary",
+    "description": "Leader-only, read-only: render the generated Human review summary and Work remaining blocks of a PR.\n\n    Facts come from recorded work, review and check facts, or from GitHub alone for a pull request that is not a\n    dispatched work item (plan, review and effort then read 'not recorded'). Estimate is always Unknown here;\n    the recorded effort limit is shown on its own line and is not an estimate of remaining work.\n    This call writes nothing and grants no approval, review or merge authority.\n    ",
+    "inputSchema": {
+      "properties": {
+        "scope_id": {
+          "title": "Scope Id",
+          "type": "integer"
+        },
+        "pull_number": {
+          "title": "Pull Number",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "scope_id",
+        "pull_number"
+      ],
+      "title": "synth_city_render_pull_summaryArguments",
       "type": "object"
     }
   },

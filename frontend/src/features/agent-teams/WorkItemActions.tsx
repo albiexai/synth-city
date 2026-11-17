@@ -404,7 +404,7 @@ export function WorkItemActions({
                 {revisions.map((revision) => {
                   const approval = revision.approval_request
                   const links = safeEvidenceLinks(revision.evidence)
-                  const sameAttempt = item.dispatch_nonce === revision.dispatch_nonce
+                  const sameAttempt = item.dispatch_generation != null && item.dispatch_generation === revision.dispatch_generation
                     && item.owner_slot_id === revision.owner_slot_id
                   const holdEligible = sameAttempt && item.dispatch_status === 'escalated'
                     && item.escalation_reason === revision.originating_escalation_reason

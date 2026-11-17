@@ -242,7 +242,11 @@ asyncio.run(main())
                     assert after.records[table] == before.records[table]
                 for identity, row in before.records['mail_agent_sessions'].items():
                     if row['id'] == old_id:
-                        assert after.records['mail_agent_sessions'][identity] == row
+                        stopped = after.records['mail_agent_sessions'][identity]
+                        # Every column the pinned row has is compared. A column the current schema added later
+                        # (tool_catalog, #960) is new, not changed: it must exist and stay empty for this old row.
+                        assert {name: stopped[name] for name in row} == row
+                        assert set(stopped) - set(row) <= {'tool_catalog'} and stopped.get('tool_catalog') is None
     finally:
         app.dependency_overrides.clear()
         await engine.dispose()

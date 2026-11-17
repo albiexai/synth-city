@@ -23,6 +23,7 @@ export const harnesses = {
   "opencode-cli": "OpenCode",
   "pi-cli": "Pi",
   "muse-cli": "Muse Code",
+  "antigravity-cli": "Antigravity CLI",
 };
 export function factoryQuery(params: URLSearchParams, category = false) {
   const result = new URLSearchParams();

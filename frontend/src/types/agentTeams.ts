@@ -1,6 +1,6 @@
 import type { AgentStatus } from './agentStatus'
 
-export type AgentTeamProvider = 'claude-code' | 'codex-cli' | 'copilot-cli' | 'opencode-cli' | 'pi-cli' | 'muse-cli'
+export type AgentTeamProvider = 'claude-code' | 'codex-cli' | 'copilot-cli' | 'opencode-cli' | 'pi-cli' | 'muse-cli' | 'antigravity-cli'
 export type AgentTeamLaunchAction = 'reuse' | 'adopt' | 'spawn' | 'skip' | 'blocked'
 export type AgentTeamLaunchStatus =
   | 'ready'
@@ -340,6 +340,7 @@ export interface TeamGithubScope {
   max_concurrent_dispatched: number
   max_verification_retries: number
   max_auto_merges_per_day: number
+  auto_merges_last_24h?: number | null
   base_ref: string
   builds_out_of_tree: boolean
   build_dir_template?: string | null
@@ -447,6 +448,7 @@ export interface GithubScopeRevision {
   id: number
   work_item_id: number
   dispatch_nonce: string
+  dispatch_generation?: string | null
   revision: number
   owner_slot_id: number
   owner_member_id: number
@@ -521,6 +523,7 @@ export interface GithubWorkItem {
   handoff_target_slot_id?: number | null
   approval_round_count: number
   dispatch_nonce?: string | null
+  dispatch_generation?: string | null
   ack_evidence_message_id?: number | null
   dispatch_head_ref?: string | null
   pr_number?: number | null

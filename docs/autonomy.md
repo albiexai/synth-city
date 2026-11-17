@@ -12,6 +12,31 @@ This guide is for the operator of an Albiex Synth City team. Autonomy is off unt
 
 Synth City polls GitHub every 60 seconds by default. The Activity table refreshes every five seconds while open; it does not trigger another GitHub poll. Issues move through queued, dispatched, verifying, and ready for human review or merged. An escalated issue has stopped and needs attention.
 
+### Stuck work and silent background failures
+
+Synth City watches itself for four conditions that used to be found only by hand. Each opens a finding, shows it, tells the Supervisor once, and clears it when the condition ends:
+
+| Reason code | What it means | When it opens |
+|---|---|---|
+| `verifying_after_merge` | A work item is still verifying although GitHub reports its PR merged. | 15 minutes after GitHub's own merge time; at most 8 PRs are read per poll, and the next poll continues where the last stopped. |
+| `item_skipped` | Verification skipped the same work item. | 5 polls in a row, counted per repository scope. |
+| `admission_missing` | An issue carries the dispatch label but has no work item. | 3 polls in a row, per repository scope. |
+| `poll_rolled_back` | A poll of a repository failed, so everything it had not yet committed was discarded. | At the first failed run; it clears at the next good run. |
+
+The thresholds are fixed in code. A finding holds identifiers and counts only, never a prompt, token or raw error. It is stored together with its notice in one transaction, so a failure leaves neither and the next poll tries again; a condition that appears again after it cleared opens a new finding and a new notice. Detection never blocks the poll or the verification it watches.
+
+While a finding is open, `/api/v1/health` reports `"health": "degraded"` with `reasons` (the codes) and `open_findings`, and `/health` adds the same fields. If the findings store itself cannot be read, both report `findings_unreadable`; a database that holds none of the application's tables yet counts as no findings, but an initialized database that lost the findings table does not. The existing `status` values do not change, because the deploy gate and scripts read them. `/api/v1/health/findings` lists open findings first, then recently resolved ones, and the Overview shows a "Needs a look: operations" card while any is open.
+
+### When automatic merge does not fire
+
+With Auto policy, an accepted code PR can still wait for a human. Synth City now says why, instead of leaving the PR unmerged without a reason.
+
+- **Daily cap reached.** The work item note ends with `[auto_merge_cap_reached: n of N automatic merges in the last 24 hours]`. The Leader side gets the existing "Code PR ready for review" notice with the reason in its payload, and the Supervisor gets one notice. Repeated polls send nothing more. The cap is the per-scope setting **Max auto-merges per day**; the repository settings page shows "n of N in the last 24 hours" next to it.
+- **Escalated item.** An accepted, ready, unheld PR on an escalated item records `[item_not_eligible: escalated: <reason>]` and sends the same two notices once.
+- **Settled diagnostic escalation.** An item that is escalated only because of a completed diagnostic revision, whose PR head is unchanged since it was verified and was accepted by the reviewer, goes back to ready for review once for that head. The normal automatic merge path then applies every gate: hold label, reviewer acceptance of the exact head, Leader approval, the daily cap and green checks. Any other escalation stays with a human.
+
+These notices grant no merge authority.
+
 ### Dispatch priority and queue order
 
 The Director can order ready issues with GitHub labels `priority:1` through

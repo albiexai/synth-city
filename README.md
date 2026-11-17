@@ -2,270 +2,111 @@
 
 # Albiex Synth City
 
-**Website**: [albiex.org](https://albiex.org)
+[![Release](https://img.shields.io/github/v/release/albiexai/synth-city)](https://github.com/albiexai/synth-city/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
+[![Docs](https://img.shields.io/badge/docs-albiex.org-green)](https://albiex.org/docs)
 
-A self-hosted workspace to observe and intervene in bounded coding-agent attempts on GitHub issues, with mixed harnesses, visible policies and recovery controls.
+**Run teams of AI coding agents on your GitHub backlog, and stay in charge.**
 
-## Why This Exists
+Synth City is a self-hosted software factory for coding agents. You label GitHub
+issues, and your teams of agents plan, build and review them in your own
+repositories, on your own machine. Run several teams side by side, each on its
+own repositories or issue labels, and mix agents freely: Claude Code, Codex CLI,
+OpenCode, GitHub Copilot CLI, Pi and Muse Code. In every team a Leader agent
+approves each plan, builders work in separate workspaces, and a reviewer agent
+checks every pull request. Nothing merges until the reviewer has accepted that
+exact commit and CI is green. You watch the whole factory in one web UI and
+step in when you want to.
 
-Returning to several agents should make it possible to find queued work, review requests and attempts needing attention. Synth City brings tracking observations across teams together with the existing session, Mail and configuration workflows. GitHub remains the source of issues and PRs. Native configuration and manual sessions are available without enabling automatic dispatch.
+![Synth City Overview: a running team's v4.2 campaign at 37 of 39 items done, with the items that need the Director](screenshots/overview.png)
 
-## Best For
+## What you get
 
-Technical operators with existing repositories, local agent CLIs, native toolchains, tmux sessions and their own model credentials. Teams can mix harnesses; native coverage and operational readiness vary.
+- **A backlog that works itself.** Label an issue and it is planned, built, reviewed and merged, or stopped with a clear reason.
+- **Review built in.** Automatic merge needs the reviewer's acceptance of the exact head, green required checks and no hold label.
+- **Limits you can see.** An effort limit per item, a daily merge cap, hold labels, and stop messages that agents must read before they can edit.
+- **Recovery, not restarts.** Standard actions for stuck items and stale sessions, and an audit trail of who did what.
+- **Agents that talk.** Agent Mail gives every agent an inbox for handoffs, questions and reviews.
+- **Your agent setups in one place.** Edit Claude Code and Codex settings, MCP servers, hooks, permissions, skills and more.
 
-## Trust model
+## Who it's for
 
-- Local control plane and real agent/repository files; no Synth City cloud account.
-- No Synth City telemetry sent elsewhere. GitHub and native CLIs use their configured services and credentials.
-- Protected roster, autonomy and recovery actions use the current browser tab's configured operator credential. It is separate from GitHub polling credentials and authenticated Mail-session authority; this is not cookie login or a remote multi-user isolation boundary.
-- Review real-file changes and retain backups.
+Developers and small teams who already use coding-agent CLIs and want them to work through a backlog with review and limits, not as unattended scripts. Run it on the machine where your agents, credentials and repositories live. Linux is recommended.
 
-> [!WARNING]
-> Synth City reads and writes your real local agent configuration files. Changes made in the UI affect the files Claude Code, Codex CLI, and installed agent integrations actually use. Review changes carefully, and create a backup before major edits.
+## Your machine, your keys
 
-## How a factory is operated
+- Runs locally. No Synth City account, no cloud service, no telemetry.
+- Agents use your own CLI logins and model credentials. GitHub uses your token or GitHub App.
+- Synth City edits your real agent configuration files. Use the built-in Backup & Restore before big changes.
+- It is a single-operator tool, protected by your Director key. For remote access, use a trusted network or tunnel, not the open internet.
 
-A **factory** is a supervisor, the Synth City controller and a team, working together on a GitHub backlog. The **Director** (the human) owns the outcome and the backlog and makes the retained decisions. GitHub is outside the factory: it holds the work and the record.
+## How a factory works
 
-![Hierarchy of roles: the Director at the top; an optional supervisor and grooming helper as staff roles; the Leader; implementers and verifiers; the Synth City controller and GitHub as non-agent systems](docs/public/images/operating-model/hierarchy.svg)
+You are the **Director**: you own the backlog and make the decisions that matter. Each **team** has one **Leader**, who approves plans and coordinates, plus the number of **builders** and **reviewers** you choose. An optional **Supervisor** agent can act for you within the limits you set. Rule-based work (dispatch, workspace leases, Mail delivery, merge gates) is done by Synth City itself, not by an agent. GitHub holds the issues, pull requests and record.
 
-- **Line of command:** Director → Leader → implementers and verifiers. Each team has one Leader. The Director chooses the number of implementers and verifiers.
-- **Staff roles:** an optional supervisor acts for the Director within the recorded delegation and maintains the factory. An optional grooming helper drafts issues. Neither takes the Leader's authority.
-- **Kinds of actor:** AI agents do the work that needs judgment. Non-agent software does the work that a rule can do: dispatch, leases, Mail and the maintenance operation. The Director makes the retained decisions.
+![Roles: the Director at the top; an optional supervisor and grooming helper; the Leader; implementers and verifiers; Synth City and GitHub as non-agent systems](docs/public/images/operating-model/hierarchy.svg)
 
-![The factory: the supervisor, the Synth City controller and the team inside the factory boundary; the Director, the grooming helper and GitHub outside it](docs/public/images/operating-model/factory.svg)
+Read more in the [Factory operating model](docs/guide/operating-model.md), [Autonomous GitHub dispatch](docs/autonomy.md) and the [Supervised factory playbook](docs/guide/supervised-factory-playbook.md).
 
-Green boxes are planned for v3.1 ([#506](https://github.com/albiexai/synth-city/issues/506)). See the [Factory operating model](docs/guide/operating-model.md) for the operating modes, factory maintenance and the planned supervisor heartbeat. Deck 3.0.0 still calls the Director *operator* in the UI and API.
+## Quick start
 
-## Daily operating flow
-
-For delegated backlog delivery, use the [Supervised factory playbook](docs/guide/supervised-factory-playbook.md) and its [supervisor skill](skills/deck-factory-supervisor/SKILL.md). They cover team preparation, goals, independent review, factory maintenance and completion.
-
-1. Read Overview for complete filtered tracking counts and configured versus effective intake.
-2. Open Work or Repositories using explicit team, scope and harness filters.
-3. Inspect an owner, waiting reason, PR and current observations; session/Mail context remains read-only.
-4. Review confirmation, authorization and state before a protected remedy. Agent plan approval, operator intervention and human PR review are separate.
-5. Use Teams for roster/repository policies and finite recovery, or start manually from Live sessions.
-
-Finished is tracking state, not independently reviewed delivery, reliability, cost or time saved. An operator-requested stop can leave a process running and the attempt needing attention.
-
-## Product integration scope
-
-This reference describes the integrated product source candidate. Earlier packaged releases and separately pinned runtime or pilot environments can retain previous navigation and capabilities; integrating source does not upgrade those environments.
-
-[Harnesses](docs/features/harnesses.md) includes the versioned operations/readiness catalog for all six harnesses, bounded local configuration observations and guarded native pages. See the [Providers API](docs/api/providers.md) for the catalog contract. Native adapters remain provider-specific; catalog support does not create an editor or grant authority.
-
-Configuration checks do not verify model access. Credential readiness remains unknown, and generic provider cards do not establish a team-slot session binding. Conditional operating support still requires the current identity, workspace and approval authority.
-
-The integrated source includes guided repository configuration, explicit Leader selection through the team's `leader_slot_id`, and the delivery [audit ledger and metrics](docs/guide/factory-audit-and-metrics.md). Overview, Work and Repositories observations arrived with M1a; the Harnesses operations catalog arrived with M1b. The operator accepted M1b; that decision does not supply missing observations. This source does not establish M2 or M3 acceptance. The manual Bridge trial (V14) is unperformed; pilot participants, the V31/V32 comparisons, human benefit measurements and timing comparisons are unavailable. Promotion, publication, paid execution and deployment require separate authorization.
-
-## Features
-
-Native features vary by harness and registered page access. See [Harnesses](docs/features/harnesses.md) before using the native feature inventory below.
-
-- **Overview** — complete filtered work counts and automation observations; native configuration summaries are under Harnesses.
-- **Harnesses** — guarded native pages and manual entry points for the implemented providers; factory filters remain independent.
-- **Config Editor** — Browse, inspect, and edit Claude Code JSON settings or Codex TOML settings, including Codex profiles, runtime options, and feature flags
-- **MCP Servers** — Add, edit, test, and manage MCP server connections with OAuth support. Browse and install servers from the [MCP Registry](https://registry.modelcontextprotocol.io). View tools, resources, and prompts. Supports stdio, HTTP, and SSE transports
-- **Slash Commands** — Browse, create, and edit custom commands (user and project scope)
-- **Plugins** — Browse installed plugins with detail views and enable/disable toggles; Codex plugins support CLI-backed inventory, install, and remove where the installed Codex CLI exposes safe commands
-- **Hooks** — Configure automation hooks by event type (PreToolUse, PostToolUse, etc.)
-- **Permissions** — Visual allow/deny rule builder for tool access control
-- **Agents** — Create and manage custom agent configurations
-- **Skills** — Browse installed skills and discover new ones from [skills.sh](https://skills.sh)
-- **Memory** — View and edit Claude Code memory files
-- **Output Styles** — Configure response output formats
-- **Status Line** — Customize Claude Code status line display
-- **Agent Bridge** — Discover and monitor Claude Code, Codex CLI, GitHub Copilot CLI, OpenCode CLI, and Pi sessions running in tmux. Attach up to 4 terminals simultaneously in a 2x2 grid with independent read-only/interactive modes, fullscreen toggle, and per-pane controls. Spawn new sessions and manage provider-specific options directly from the UI
-- **Agent Mail** — Coordinate local Claude Code, Codex CLI, GitHub Copilot CLI, OpenCode CLI, and Pi agents through durable per-repo identities, structured context requests, handoffs, and an inspectable team mailbox
-- **Agent Teams** — Save reusable rosters of Claude Code, Codex, Copilot, OpenCode, and Pi agents, launch or reuse their sessions, and keep same-repo roles distinct through Agent Mail slot identities
-- **Session Transcripts** — View conversation history with full message details and tool use
-- **Usage Tracking** — Monitor token usage, costs, and billing blocks with daily/monthly charts
-- **Plan History** — Browse and review Claude Code implementation plans
-- **Backup & Restore** — Create and manage Claude Code backups with selective restore, plus redacted export-only Codex backups
-- **Projects** — Discover and manage project directories
-
-## What's New in 3.0.0
-
-Claude Deck 3.0.0 makes the delivery interface the main product surface:
-
-- Overview, Work and Repositories show complete filtered work counts, owners, waiting reasons, PR context and watched-scope intake across teams.
-- Harnesses shows the operations and readiness catalog for all five harnesses, with guarded native pages.
-- Guided repository configuration keeps draft, saved configuration, reviewed launch and activation separate. Teams sets the Leader explicitly through `leader_slot_id`.
-- The factory audit ledger and delivery metrics record observed actions and outcomes. Coverage starts at the first start after the upgrade.
-- Existing databases upgrade in place. Back up the database first. See [Upgrade and rollback](docs/guide/installation.md#upgrade-and-rollback).
-
-The limits below still apply: cost is unknown, finished is a tracking state, and this release makes no performance or time-saving claim. See the [changelog](CHANGELOG.md) for details.
-
-## What's New in 2.0.1
-
-Claude Deck 2.0.1 is a stabilization release for the 2.x coordination work:
-
-- Claude Code usage dashboards now calculate costs for current Claude model aliases instead of showing `$0.00` when token usage is present.
-- Dashboard cards and links are provider-aware, including Codex configuration, MCP, plugin, feature flag, live session, and plan surfaces.
-- Claude Code Config now exposes more current settings, including advisor model, fallback model chains, Remote Control, notification, checkpointing, theme, and safety/privacy controls.
-- Plugin marketplace, worktree, and sandbox settings now write the JSON shapes expected by current Claude Code.
-
-## What's New in 2.0.0
-
-Claude Deck 2.0.0 shifts the product from single-agent management toward local agent coordination:
-
-- Agent Mail gives Claude Code and Codex CLI sessions durable mail identities, structured context requests, handoffs, replies, inbox state, and one-click install flows for MCP and lifecycle hooks.
-- Agent Teams adds saved rosters for repeatable project, DevOps, release, or same-repo planner/implementer teams, with launch planning and session reuse from Agent Bridge.
-- External local tools such as OpenClaw can use token-bound Agent Mail endpoints to discover participants, send requests, create handoffs, poll for answers, and launch saved teams through the Agent Teams API.
-- Agent Bridge now has a searchable project picker and Codex model/profile selectors when spawning sessions.
-- Presence has been removed from the product. Agent Bridge, Agent Mail, and Agent Teams are now the supported observability and coordination surfaces.
-
-Codex support remains explicit about provider boundaries: usage/context parity and session transcript browsing are not supported for Codex yet; history and model-cache diagnostics avoid prompt text and raw cache payloads; Codex automatic restore is refused because exports intentionally exclude auth, history, cache, and local state.
-
-## Screenshots
-
-These existing screenshots show retained native/session pages; they do not depict the new factory Overview or Work.
-
-| Agent Bridge | Dashboard |
-|--------------|-----------|
-| ![Agent Bridge](screenshots/cc-bridge.png) | ![Dashboard](screenshots/dashboard.png) |
-| Monitor and interact with agent tmux sessions (existing screenshot) | Native configuration summary (existing screenshot) |
-
-| Config | MCP Servers |
-|--------|-------------|
-| ![Config](screenshots/config.png) | ![MCP Servers](screenshots/mcp-servers.png) |
-| Edit safe Codex TOML settings and inspect provider diagnostics | Manage MCP connections, status, and configuration |
-
-| Usage Tracking | Session Transcripts |
-|----------------|---------------------|
-| ![Usage Tracking](screenshots/usage-tracking.png) | ![Session Transcripts](screenshots/sessions.png) |
-| Cost visibility, charts, and billing blocks | Browse conversation history and tool usage details |
-
-| Skills |
-|--------|
-| ![Skills](screenshots/skills.png) |
-| Browse installed skills and discover new ones |
-
-## Tech Stack
-
-| Layer | Technology |
-|-------|------------|
-| Backend | Python 3.11+ with FastAPI |
-| Frontend | React 19 + TypeScript 6 + Vite 7 |
-| UI Components | shadcn/ui + Tailwind CSS |
-| Charts | Recharts (via shadcn/ui) |
-| Database | SQLite (async via SQLAlchemy + aiosqlite) |
-
-## Installation
-
-Synth City must run in the same environment where your agent CLIs and credentials are installed. Use the native install path below; Docker is not supported because containers cannot see host-installed CLIs, tmux sessions, native agent credentials, or your real repository environment.
-
-**Prerequisites**:
-
-- Python 3.11+
-- Node.js 22.12+
-- At least one supported local agent CLI installed on the same host: Claude Code, Codex CLI, GitHub Copilot CLI, OpenCode CLI, or Pi
-- **Linux** for agent-team pane binding. Synth City reads `/proc/net/tcp` and `/proc/<pid>/stat` to derive which tmux pane a registering agent is running in. On macOS or Windows every other feature works, but agents register unbound, and the Agent Mail capability-token enforcement described in `docs/deploy/pr0-capability-tokens-rollout.md` cannot be turned on
-
-Pi integration requires Pi 0.87.1, Node >=22.19.0, and the repository-local Agent Mail extension dependencies. It supports OpenRouter (default model `moonshotai/kimi-k3`), plain launches and exact project-local resume. No global Pi configuration is installed, and Pi tools are not sandboxed by Synth City. See [Pi rollout and team migration](docs/deploy/pi-provider-rollout.md) before deployment or replacing existing team sessions.
+**Prerequisites:** Python 3.11+, Node.js 22.12+, tmux, and at least one supported agent CLI on the same host.
 
 ```bash
 git clone https://github.com/albiexai/synth-city.git
 cd synth-city
 ./scripts/install.sh
-```
-
-> [!WARNING]
-> Synth City is not a mock viewer. It works with your real local agent files, so changes made in the UI can change your working setup.
-
-## Development
-
-```bash
 ./scripts/dev.sh
 ```
 
-This starts:
-- Backend at http://localhost:8000 (API docs at http://localhost:8000/docs)
-- Frontend at http://localhost:5173
+Open http://localhost:5173. Then:
 
-To stop or restart the dev servers for this checkout:
+1. **Harnesses**: check that your agent CLIs are found and configured.
+2. **Repositories → Set up a repository**: connect a GitHub repository and its labels.
+3. **Teams**: choose the Leader, builders and reviewer, and launch the team.
+4. Label an issue as ready, and follow it on **Overview** and **Work**.
 
-```bash
-./scripts/dev.sh stop
-./scripts/dev.sh restart
-```
+See the [Quick start guide](docs/guide/quick-start.md) and [Installation](docs/guide/installation.md) for details, production builds and upgrades.
 
-To make the dev environment reachable from another machine on your LAN or tailnet (e.g. to monitor tmux sessions via Agent Bridge from a different host), pass `--host`:
+> [!NOTE]
+> Run Synth City natively, on the host where your agents run. Docker is not supported: a container cannot see host CLIs, tmux sessions or credentials. Some team features read `/proc` and need Linux; on macOS and Windows everything else works.
 
-```bash
-./scripts/dev.sh --host 0.0.0.0
-```
+## Features
 
-Both servers will then bind to all interfaces.
+**The factory**
 
-Only use this option on a trusted network. Protected roster, autonomy and recovery routes require their documented credentials, while safe observations remain readable. These endpoint checks do not provide remote multi-user isolation. For remote access, prefer a trusted tunnel to the loopback listener. If you intentionally run the Vite dev UI from another origin, set `CORS_ORIGINS` to a JSON list containing that exact origin (for example, `["http://deck-host:5173"]`). Production UI served by Synth City uses the same origin and needs no CORS entry.
+- **Overview and Work**: every team's work items in one place, with owners, waiting reasons, PRs and the next step.
+- **Repositories**: watched repositories, labels, intake, polling and the merge policy.
+- **Teams**: rosters, launch plans, the Leader, autonomy and recovery.
+- **Agent Mail**: inboxes, handoffs and context requests between agents, with an inspectable team mailbox.
+- **Live sessions**: watch and type into up to four agent terminals at once.
+- **Audit and metrics**: a ledger of the factory's actions and outcomes.
 
-Remote use should still be native: run Synth City on the remote host where the agents, credentials, repositories, and tmux sessions exist, then connect from your browser over a trusted tunnel or network route.
+**Agent configuration**
 
-### Naming a Synth City instance
+Harness pages for each supported agent; the Claude Code and Codex settings editors; MCP servers (with the [MCP Registry](https://registry.modelcontextprotocol.io)); slash commands; plugins; hooks; permissions; agents; skills (with [skills.sh](https://skills.sh)); memory; output styles; the status line; session transcripts; usage and cost tracking; plan history; projects; and Backup & Restore.
 
-When running Synth City on several machines, set a display name and accent color so each browser window clearly identifies the backend it controls:
+**Harnesses:** Claude Code, Codex CLI, GitHub Copilot CLI, OpenCode 2, Pi and Muse Code. Antigravity CLI is in preview and can't yet join a team. Support varies by harness; see [Harnesses](docs/features/harnesses.md).
 
-```bash
-SYNTH_CITY_INSTANCE_NAME="Studio Mac" \
-SYNTH_CITY_INSTANCE_ACCENT="blue" \
-./scripts/dev.sh --host 0.0.0.0
-```
+## What's new
 
-Supported accents are `blue`, `green`, `purple`, `orange`, `red`, `pink`, `cyan`, and `slate`. The name appears in the header, browser tab title, Agent Bridge terminal panes, and destructive confirmations.
+Version 4.2 makes the factory explain itself: it reports stuck work and automatic merges that didn't run, records effort limits, and gives the Leader standard recovery actions. See the [changelog](CHANGELOG.md).
 
-To preview the documentation site:
+## Screenshots
 
-```bash
-./scripts/docs-dev.sh
-```
+**Work**: every item across your teams, with its state, owner and pull request.
 
-This starts VitePress at http://localhost:5174/docs/. Use `--host 0.0.0.0` if you need to reach it from another machine.
+![Synth City Work page: the v4.2 team's items, most merged, each with its owner and PR](screenshots/work.png)
 
-For the source-to-website publishing steps, see the [documentation publishing playbook](DOCUMENTATION_PUBLISHING.md).
+## Tech stack
 
-For a release check, `./scripts/build.sh` builds both the app frontend and the documentation site.
-
-## Configuration Files
-
-Synth City reads and writes these Claude Code configuration files:
-
-| File/Directory | Scope | Description |
-|---------------|-------|-------------|
-| `~/.claude.json` | User | OAuth, caches, MCP servers |
-| `~/.claude/settings.json` | User | User settings, permissions, disabled servers |
-| `~/.claude/settings.local.json` | User | Local overrides (not committed) |
-| `~/.claude/commands/` | User | User slash commands |
-| `~/.claude/agents/` | User | User agents |
-| `~/.claude/skills/` | User | User skills |
-| `~/.claude/projects/` | User | Session transcripts & usage data |
-| `.claude/settings.json` | Project | Project settings |
-| `.claude/commands/` | Project | Project slash commands |
-| `.mcp.json` | Project | Project MCP servers |
-| `CLAUDE.md` | Project | Project instructions |
-
-Codex CLI support uses `$CODEX_HOME`, defaulting to `~/.codex`:
-
-| File/Directory | Scope | Description |
-|---------------|-------|-------------|
-| `~/.codex/config.toml` | User | Main Codex TOML configuration |
-| `~/.codex/*.config.toml` | User | Codex profile v2 files |
-| `~/.codex/rules/` | User | Codex rule files |
-| `~/.codex/auth.json` | User | Auth status only; raw contents are never returned |
+FastAPI and SQLite (async SQLAlchemy) on Python 3.11+; React 19, TypeScript 6, Vite 8, shadcn/ui and Tailwind CSS 4 in the browser.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, style, and PR guidelines.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, style and pull request guidelines. API documentation is at http://localhost:8000/docs while the dev server runs. Issues and feature requests are welcome.
 
-API documentation is available at http://localhost:8000/docs when running the dev server.
-
-## Feedback
-
-If you use Claude Code heavily, issues and feature requests are especially welcome.
-
-## Built By
+## Built by
 
 [Adrian](https://github.com/adrirubio) (13) and [Juan](https://github.com/juanrubio) during the 2025 Christmas break as a learning project — to explore open source, Claude Code, and full-stack development together.
 
@@ -274,10 +115,6 @@ If you use Claude Code heavily, issues and feature requests are especially welco
 The session transcript viewer was inspired by and includes code adapted from [claude-code-transcripts](https://github.com/simonw/claude-code-transcripts) by [Simon Willison](https://simonwillison.net/).
 
 The usage tracking feature ports algorithms from [ccusage](https://github.com/ryoppippi/ccusage) by [ryoppippi](https://github.com/ryoppippi), including session block identification, tiered pricing, and burn rate projections.
-
-## Disclaimer
-
-Synth City is a community project and is not affiliated with or endorsed by Anthropic.
 
 ## License
 

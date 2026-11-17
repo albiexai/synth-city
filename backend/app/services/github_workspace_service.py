@@ -661,6 +661,7 @@ class GithubWorkspaceService:
         expected_owner_pid: int | None | object = _UNSET,
         expected_owner_proc_start: str | None | object = _UNSET,
         expected_last_owner_contact_at: datetime | None | object = _UNSET,
+        before_commit=None,
     ) -> bool:
         async with self.config_lock(workspace_id):
             workspace_row = (
@@ -807,6 +808,13 @@ class GithubWorkspaceService:
                 await db.rollback()
                 await observe_release("rejected", "release guard changed before release")
                 return False
+            if before_commit is not None:
+                # A delegated caller's fence runs before any external effect; a refusal rolls the claim back.
+                try:
+                    await before_commit()
+                except BaseException:
+                    await db.rollback()
+                    raise
             # Each external effect is recorded only as far as it is proved.
             credential_effect = "not_attempted"
             config_effect = "not_attempted"
@@ -823,6 +831,8 @@ class GithubWorkspaceService:
                 )
                 credential_effect = "revoked_or_not_held"
                 if snapshot is not None:
+                    if before_commit is not None:
+                        await before_commit()  # the delegated fence again, before the next external mutation
                     config_effect = "unknown"
                     await self.remove_managed_worktree_config(config_workspace)
                     config_effect = "removed"
@@ -838,13 +848,17 @@ class GithubWorkspaceService:
                     operation_id=operation_id,
                     **release_fields,
                 )
+                if before_commit is not None:
+                    await before_commit()  # the same fence again, immediately before the commit
                 await db.commit()
                 return True
             except BaseException as exc:
                 await db.rollback()
                 restore_effect = "not_needed"
                 restore_exc_raised: GithubWorkspaceConfigError | None = None
-                if snapshot is not None:
+                # A delegated fence that stopped the release before the config was touched leaves nothing to restore.
+                config_untouched = before_commit is not None and config_effect == "not_attempted"
+                if snapshot is not None and not config_untouched:
                     try:
                         await self.restore_worktree_config(config_workspace, snapshot)
                         restore_effect = "restored"
@@ -919,6 +933,7 @@ class GithubWorkspaceService:
         actor_scheduler: str | None = None,
         expected_leased_at: datetime,
         lease_token: str | None,
+        before_commit=None,
     ) -> bool:
         """Clear exactly the acquisition described, or nothing at all.
 
@@ -938,6 +953,7 @@ class GithubWorkspaceService:
             item_id=item_id,
             expected_leased_at=expected_leased_at,
             lease_token=lease_token,
+            before_commit=before_commit,
         )
 
     async def get_leased_workspace(
@@ -1013,6 +1029,45 @@ class GithubWorkspaceService:
             lease_token=lease_token,
             owner_slot_id=owner_slot_id,
         )
+
+    async def delegated_release_blocker(
+        self,
+        scope: TeamGithubScope,
+        workspace: GithubWorkspace,
+        item: GithubWorkItem | None = None,
+    ) -> str | None:
+        """Why a delegated (Leader) release must be refused; fail closed for every workspace kind.
+
+        The operator check skips a primary workspace without looking at it. A delegated release needs an
+        inspection that actually ran: the path must exist and be a work tree with a readable status, no
+        change at all (untracked files count), and for a primary checkout no commit outside the base. Any
+        other kind then goes through the same commit-publication check the operator release uses.
+        """
+        if not workspace.path or not os.path.isdir(workspace.path):
+            return "workspace path is missing"
+        return_code, output = await self._runner(
+            ["-C", workspace.path, "rev-parse", "--is-inside-work-tree"]
+        )
+        if return_code != 0 or output.strip() != "true":
+            return "workspace is not a readable work tree"
+        return_code, output = await self._runner(
+            ["-C", workspace.path, "status", "--porcelain", "--untracked-files=all"]
+        )
+        if return_code != 0:
+            return "workspace status could not be determined"
+        if output.strip():
+            return "uncommitted or untracked changes"
+        if workspace.kind == "primary":
+            return_code, output = await self._runner(
+                ["-C", workspace.path, "rev-list", "--count", f"{scope.base_ref}..HEAD"]
+            )
+            count = output.strip()
+            if return_code != 0 or not count.isdecimal():
+                return "commits outside the dispatch base could not be determined"
+            if count != "0":
+                return "unpublished commits in the primary workspace"
+            return None
+        return await self.release_blocker(scope, workspace, item)
 
     async def release_blocker(
         self,

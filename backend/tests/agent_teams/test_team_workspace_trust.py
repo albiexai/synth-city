@@ -161,3 +161,69 @@ def test_claude_primary_checkout_keeps_special_path_characters(monkeypatch, tmp_
     monkeypatch.setattr(trust.subprocess, "run", git)
     assert trust.prepare_workspace_trust("claude-code", str(repo)) is True
     assert list(json.loads((home / ".claude.json").read_text())["projects"]) == [str(primary)]
+
+
+def antigravity_settings(home):
+    return home / ".gemini" / "antigravity-cli" / "settings.json"
+
+
+def test_antigravity_trust_registers_the_workspace_and_keeps_other_settings(monkeypatch, tmp_path):
+    # Observed on agy 1.5.9 (#952): `trustedWorkspaces` in this file registers the workspace
+    # (hook payloads gain workspacePaths and cwd). Suppressing a trust prompt was not observed.
+    trust, home, repo = trust_fixture(monkeypatch, tmp_path)
+    settings = antigravity_settings(home)
+    settings.parent.mkdir(parents=True)
+    original = {"modelProvider": "gemini", "colorScheme": "dark", "trustedWorkspaces": ["/other/repo"]}
+    settings.write_text(json.dumps(original))
+    settings.chmod(0o640)
+    assert trust.prepare_workspace_trust("antigravity-cli", str(repo)) is True
+    saved = json.loads(settings.read_text())
+    assert saved == {**original, "trustedWorkspaces": ["/other/repo", str(repo)]}
+    assert settings.stat().st_mode & 0o777 == 0o640
+    before = settings.read_bytes()
+    assert trust.prepare_workspace_trust("antigravity-cli", str(repo)) is False
+    assert settings.read_bytes() == before
+
+
+def test_antigravity_trust_creates_only_the_trust_entry(monkeypatch, tmp_path):
+    # Onboarding, terms and data-use choices belong to the user; nothing else is preset.
+    trust, home, repo = trust_fixture(monkeypatch, tmp_path)
+    assert trust.prepare_workspace_trust("antigravity-cli", str(repo)) is True
+    assert json.loads(antigravity_settings(home).read_text()) == {"trustedWorkspaces": [str(repo)]}
+    assert sorted(path.relative_to(home).as_posix() for path in home.rglob("*")) == [
+        ".gemini", ".gemini/antigravity-cli", ".gemini/antigravity-cli/settings.json"]
+
+
+def test_antigravity_trust_uses_the_workspace_itself(monkeypatch, tmp_path):
+    # Only a plain workspace directory was observed, so no primary checkout is looked up.
+    trust, home, repo = trust_fixture(monkeypatch, tmp_path)
+    def no_git(*args, **kwargs):
+        raise AssertionError("git is not consulted for Antigravity trust")
+    monkeypatch.setattr(trust.subprocess, "run", no_git)
+    assert trust.prepare_workspace_trust("antigravity-cli", str(repo)) is True
+    assert json.loads(antigravity_settings(home).read_text())["trustedWorkspaces"] == [str(repo.resolve())]
+
+
+@pytest.mark.parametrize("contents", [
+    "{", "[]", "", '{"trustedWorkspaces": "/w"}', '{"trustedWorkspaces": [1]}', '{"trustedWorkspaces": null}',
+])
+def test_invalid_antigravity_settings_are_not_replaced(monkeypatch, tmp_path, contents):
+    trust, home, repo = trust_fixture(monkeypatch, tmp_path)
+    settings = antigravity_settings(home)
+    settings.parent.mkdir(parents=True)
+    settings.write_text(contents)
+    with pytest.raises(ValueError, match="Workspace trust"):
+        trust.prepare_workspace_trust("antigravity-cli", str(repo))
+    assert settings.read_text() == contents
+
+
+def test_antigravity_trust_refuses_symlink_settings(monkeypatch, tmp_path):
+    trust, home, repo = trust_fixture(monkeypatch, tmp_path)
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}")
+    settings = antigravity_settings(home)
+    settings.parent.mkdir(parents=True)
+    settings.symlink_to(outside)
+    with pytest.raises(ValueError, match="Workspace trust"):
+        trust.prepare_workspace_trust("antigravity-cli", str(repo))
+    assert settings.is_symlink() and outside.read_text() == "{}"

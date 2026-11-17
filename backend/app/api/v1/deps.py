@@ -1,7 +1,7 @@
 """Shared route dependencies for capability-token enforcement."""
 
 import hmac
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy import select
@@ -12,6 +12,7 @@ from app.database import get_db
 from app.models.database import MailAgentSession
 from app.services.agent_mail_service import agent_mail_service
 from app.utils import peer_process
+from app.utils.path_utils import resolve_scope_user, set_scope_home, _scope_home
 
 
 def resolve_request_pane_detailed(
@@ -167,6 +168,54 @@ async def require_operator(
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
+def _attribution_session_is_current(session: MailAgentSession) -> bool:
+    """Is this session fresh enough to be named in an audit event? (#945)
+
+    The strict rules, whatever ``mail_capability_tokens_required`` says: the session is not closed, its mailbox is not
+    offline, and a role-bearing (slot-bound) session has a recorded pane that is alive. This is local to attribution. It
+    does not change ``require_current_mail_session`` or any Mail authentication, and it never decides the write.
+    """
+    if session.closed_at is not None or session.mailbox_status == "offline":
+        return False
+    if session.team_slot_id is None:
+        return True
+    if session.bound_pane_pid is None or session.bound_pane_proc_start is None:
+        return False
+    return peer_process.pane_is_alive(session.bound_pane_pid, session.bound_pane_proc_start) is True
+
+
+async def operator_write_context(
+    origin: Optional[str] = Header(default=None),
+    x_synth_city_session_token: Optional[str] = Header(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """How an operator-key write reached the server, for the audit trail (#945).
+
+    Use it AFTER ``require_operator``: the key is the authority and this never grants or refuses anything. A usable Mail
+    session token is the one server-derived fact (``mail_tool``, with the session id read from the session row, never
+    from the request). The other paths are labels from the browser's Origin header: a configured origin reads ``ui``,
+    anything else ``api``. Neither proves who called. A token that is unknown, closed or stale does not refuse the
+    write; it is reported as ``session_invalid`` so the event records the write as unattributed.
+    """
+    session = None
+    invalid = False
+    if x_synth_city_session_token:
+        hashed = agent_mail_service.hash_capability_token(x_synth_city_session_token)
+        rows = await db.execute(
+            select(MailAgentSession).where(MailAgentSession.capability_token_hash.is_not(None)))
+        match = next((row for row in rows.scalars().all()
+                      if hmac.compare_digest(row.capability_token_hash, hashed)), None)
+        if match is not None and _attribution_session_is_current(match):
+            session = match
+        else:
+            invalid = True
+    if session is not None:
+        via = "mail_tool"
+    else:
+        via = "ui" if origin and origin in settings.cors_origins else "api"
+    return {"via": via, "session_id": session.id if session is not None else None, "session_invalid": invalid}
+
+
 async def require_operator_for_writes(
     request: Request,
     x_synth_city_operator_token: str | None = Header(default=None),
@@ -197,3 +246,55 @@ async def require_mail_session_or_operator(
         return await mail_session(x_synth_city_session_token, db)
     await require_operator(x_synth_city_operator_token)
     return None
+
+
+def _permission_error(error: BaseException) -> Optional[PermissionError]:
+    """The PermissionError that caused this error, if one did."""
+    seen = 0
+    while error is not None and seen < 8:
+        if isinstance(error, PermissionError):
+            return error
+        error = error.__cause__ or error.__context__
+        seen += 1
+    return None
+
+
+async def apply_harness_scope(
+    request: Request,
+    x_harness_scope_user: Optional[str] = Header(default=None),
+) -> AsyncIterator[None]:
+    """Show one OS user's global scope for this request, and nothing else.
+
+    The user comes from the X-Harness-Scope-User header and must be one of scope_users(): the controller
+    itself or the configured agent user. With no header the default applies: the agent user when one is
+    configured, otherwise the controller. Other routers never run this, so backups and the controller's
+    own data keep the controller's home.
+
+    A non-controller home that the controller cannot read or write answers 403 and names the directory,
+    instead of a 500.
+    """
+    try:
+        user = resolve_scope_user(x_harness_scope_user)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except LookupError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    token = set_scope_home(user.home)
+    try:
+        yield
+    except (PermissionError, HTTPException) as error:
+        # Most routes turn an OSError into their own 500. Look for the permission error behind it.
+        denied = _permission_error(error)
+        if denied is None or user.is_controller:
+            raise
+        action = "read" if request.method in _READ_METHODS else "write"
+        where = denied.filename or str(user.home / ".claude")
+        raise HTTPException(
+            status_code=403,
+            detail=f"The controller cannot {action} {where}. It belongs to {user.name}.",
+        ) from error
+    finally:
+        try:
+            _scope_home.reset(token)
+        except ValueError:
+            pass

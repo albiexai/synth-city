@@ -7,7 +7,8 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 
 from app.models.database import AgentTeamSlot, MailAgentSession, MailTeamMember
-from app.models.schemas import AgentStatus
+from app.models.schemas import AgentStatusWithCatalog
+from app.services.tool_catalog import STALE_REASON, catalog_state
 
 
 def utc_now():
@@ -16,7 +17,7 @@ def utc_now():
 
 def unknown_status(now=None):
     now = now or utc_now()
-    return AgentStatus(checked_at=now, valid_until=now + timedelta(seconds=15))
+    return AgentStatusWithCatalog(checked_at=now, valid_until=now + timedelta(seconds=15))
 
 
 class AgentStatusService:
@@ -46,10 +47,10 @@ class AgentStatusService:
 
     async def for_snapshot(self, db, members, slots, sessions, bindings, lifecycles, *, now=None):
         """Reuse the factory read snapshot. Native observations do not save identity."""
-        from app.services.agent_activity_service import _inputs_from_rows, _observe
+        from app.services.agent_activity_service import SESSION_ID_PROVIDERS, _inputs_from_rows, _observe
 
         options = (await db.execute(select(AgentTeamSlot.launch_options).where(
-            AgentTeamSlot.provider.in_(["codex-cli", "claude-code"])))).all()
+            AgentTeamSlot.provider.in_(SESSION_ID_PROVIDERS)))).all()
         retired = {identity for identity, retired_at in lifecycles.items() if retired_at is not None}
         bound_rows = [(binding, session) for binding in bindings for session in sessions
                       if session.source == "mcp" and session.closed_at is None
@@ -100,6 +101,11 @@ class AgentStatusService:
                 selected.append(session)
             effective = {agent_mail_service._effective_status(s, naive_now)
                          for s in selected}
+            # Display only: judged over the connected MCP sessions together, conservatively (see tool_catalog).
+            state = catalog_state([s.tool_catalog for s in selected if s.source == "mcp"
+                                   and agent_mail_service._effective_status(s, naive_now) == "connected"])
+            status.tool_catalog_state = state
+            status.tool_catalog_reason = STALE_REASON if state == "stale" else None
             status.session_state = "online" if effective & {"connected", "observed"} else "offline"
             observed = native.get(member.team_slot_id) if slot is not None else None
             if observed is not None:

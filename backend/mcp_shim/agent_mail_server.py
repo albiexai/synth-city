@@ -1,5 +1,6 @@
 """Albiex Synth City Agent Mail MCP server over stdio."""
 import asyncio
+import hashlib
 import os
 import sys
 import threading
@@ -246,6 +247,12 @@ def _bridge_session_path(target: str) -> str:
     return f"/sessions/{quote(target, safe='')}"
 
 
+def tool_catalog_fingerprint() -> str:
+    """A short digest of the tool names this shim registered (the backend computes the same digest of its list)."""
+    names = sorted({tool.name for tool in mcp._tool_manager.list_tools()})
+    return hashlib.sha256("\n".join(names).encode()).hexdigest()[:32]
+
+
 def _ensure_registered() -> dict:
     # Schema verification is registration-free and read-only. Member tools
     # cannot turn this startup probe into a synthetic authenticated session.
@@ -260,6 +267,8 @@ def _ensure_registered() -> dict:
             "cwd": os.getcwd(),
             "session_key": _state["session_key"],
             "pid": os.getppid(),
+            # What this session was started with, so the team view can say when the deployed list has moved on.
+            "tool_catalog": tool_catalog_fingerprint(),
         }
         team_preset_id = _env_int("SYNTH_CITY_TEAM_PRESET_ID")
         team_slot_id = _env_int("SYNTH_CITY_TEAM_SLOT_ID")
@@ -574,6 +583,50 @@ def synth_city_request_work_item_approval(
 
 
 @mcp.tool()
+def synth_city_preflight_request(
+    kind: str,
+    work_item_id: int,
+    dispatch_nonce: str,
+    summary: str = "",
+    plan_metadata: Optional[dict[str, Any]] = None,
+    phase: Optional[str] = None,
+    execution_target: Optional[str] = None,
+    allowed_paths: Optional[list[str]] = None,
+    allowed_actions: Optional[list[str]] = None,
+    allowed_commands: Optional[list[str]] = None,
+    prohibited_actions: Optional[list[str]] = None,
+    max_failed_heads: Optional[int] = None,
+    tool_fallbacks: Optional[dict[str, Any]] = None,
+    estimate_active_minutes: Optional[Any] = None,
+    lease_token: Optional[str] = None,
+) -> dict:
+    """Check a request before you submit it. Nothing is created, sent or changed.
+
+    kind is initial_plan (summary and plan_metadata), scope_amendment or continuation (the same
+    fields as synth_city_request_scope_amendment and synth_city_request_continuation). Returns
+    passed, problems and warnings. Each problem has a code, a field and a message; every problem
+    is listed at once. estimate_active_minutes is optional: a number of minutes, or an object
+    with high and optionally low. It is checked against the current authority window and is not
+    stored. Only the item's owner may ask. A request that passes is not refused for these rules.
+    """
+    err = _guard()
+    if err:
+        return err
+    body: dict[str, Any] = {
+        "kind": kind, "work_item_id": work_item_id, "dispatch_nonce": dispatch_nonce, "summary": summary,
+        "plan_metadata": plan_metadata or {}, "phase": phase, "execution_target": execution_target,
+        "allowed_paths": allowed_paths or [], "allowed_actions": allowed_actions or [],
+        "allowed_commands": allowed_commands or [], "prohibited_actions": prohibited_actions or [],
+        "max_failed_heads": max_failed_heads, "tool_fallbacks": tool_fallbacks or {},
+        "estimate_active_minutes": estimate_active_minutes, "lease_token": lease_token,
+    }
+    result = _request("POST", "/preflight-request", json=body)
+    if not result["ok"]:
+        return result
+    return {"ok": True, **result["data"]}
+
+
+@mcp.tool()
 def synth_city_approve_work_item(
     work_item_id: int,
     dispatch_nonce: str,
@@ -692,6 +745,36 @@ def synth_city_request_scope_amendment(
             "max_failed_heads": max_failed_heads,
             "tool_fallbacks": tool_fallbacks,
             "lease_token": lease_token,
+        },
+    )
+    if not result["ok"]:
+        return result
+    return {"ok": True, **result["data"], **_counts()}
+
+
+@mcp.tool()
+def synth_city_extend_effort_limit(
+    work_item_id: int,
+    dispatch_nonce: str,
+    minutes: int,
+    reason: str,
+) -> dict:
+    """Leader only: extend a work item's effort limit once, by at most 30 minutes or 25 percent of the limit.
+
+    The limit and its ledger are advisory elapsed working time from the system, not the owner's reported active
+    effort. The extension changes no expiry, nonce, lease or status. The owner asks for it by Mail.
+    """
+    err = _guard()
+    if err:
+        return err
+    result = _request(
+        "POST",
+        "/effort-extensions",
+        json={
+            "work_item_id": work_item_id,
+            "dispatch_nonce": dispatch_nonce,
+            "minutes": minutes,
+            "reason": reason,
         },
     )
     if not result["ok"]:
@@ -1174,16 +1257,18 @@ def synth_city_render_github_summary(
     try:
         from datetime import datetime, timezone
         try:
-            from mcp_shim.github_summary_protocol import CurrentSummary, render_summary
+            from mcp_shim.github_summary_protocol import CurrentSummary, explain, render_summary
         except ModuleNotFoundError as error:
             if error.name != "mcp_shim":
                 raise
-            from github_summary_protocol import CurrentSummary, render_summary
+            from github_summary_protocol import CurrentSummary, explain, render_summary
         report = CurrentSummary.model_validate({**summary, "reported_at": datetime.now(timezone.utc)})
         result = render_summary(current_body, report, expected_body_sha256=expected_body_sha256)
-    except (ValueError, TypeError):
-        return {"ok": False, "error": {"code": "invalid_github_summary"},
-                "suggestion": "Use bounded public text, valid markers and a scoped effort range, or Unknown."}
+    except (ValueError, TypeError) as error:
+        # The code stays; the reason and the failing field names (never their values) say what to fix.
+        refusal = explain(error)
+        return {"ok": False, "error": {key: value for key, value in refusal.items() if key != "suggestion"},
+                "suggestion": refusal["suggestion"]}
     return {"ok": True, **result,
             "next_action": "Publish with existing authorized access after reconciling the current body."}
 
@@ -1240,6 +1325,40 @@ def synth_city_prepare_work_remaining_summary(
     return {"ok": True, "body_markdown": report.markdown(),
             "issue_url": result["data"].get("remaining_work", {}).get("source_url"),
             "next_action": "Replace only the marked Work remaining block near the start of the main issue and PR."}
+
+
+@mcp.tool()
+def synth_city_render_pull_summary(scope_id: int, pull_number: int) -> dict:
+    """Leader-only, read-only: render the generated Human review summary and Work remaining blocks of a PR.
+
+    Facts come from recorded work, review and check facts, or from GitHub alone for a pull request that is not a
+    dispatched work item (plan, review and effort then read 'not recorded'). Estimate is always Unknown here;
+    the recorded effort limit is shown on its own line and is not an estimate of remaining work.
+    This call writes nothing and grants no approval, review or merge authority.
+    """
+    identity = _ensure_registered()
+    if not identity.get("ok"):
+        return identity
+    result = _team_request("GET", f"/github-pull-summaries/{scope_id}/{pull_number}")
+    if not result.get("ok"):
+        return result
+    return {"ok": True, **result["data"]}
+
+
+@mcp.tool()
+def synth_city_publish_pull_summary(scope_id: int, pull_number: int) -> dict:
+    """Leader-only: write or refresh the system-owned summary comment of a PR.
+
+    It creates one comment and then edits only that comment by id. It never edits a PR or issue body, an
+    operator record or any other comment, and it grants no approval, review or merge authority.
+    """
+    identity = _ensure_registered()
+    if not identity.get("ok"):
+        return identity
+    result = _team_request("POST", f"/github-pull-summaries/{scope_id}/{pull_number}/publish")
+    if not result.get("ok"):
+        return result
+    return {"ok": True, **result["data"]}
 
 
 @mcp.tool()
@@ -1547,6 +1666,50 @@ def _revision_review_request(path: str, payload: dict) -> dict:
 
 
 @mcp.tool()
+def synth_city_leader_cancel_revision(work_item_id: int, revision_number: int, dispatch_nonce: str,
+    operation_id: str, reason: str) -> dict:
+    """Current Leader cancels one active or submitted revision with every operator guard.
+
+    Replays with the same operation_id are safe; a different request under the same id is refused.
+    One audit fact and one notice to the bound Supervisor are written. This changes no policy or
+    limit and does not approve, retry, release a lease or merge.
+    """
+    return _revision_review_request(f"/github-work-items/{work_item_id}/leader-recovery/cancel-revision",
+        {"revision_number": revision_number, "dispatch_nonce": dispatch_nonce,
+         "operation_id": operation_id, "reason": reason})
+
+
+@mcp.tool()
+def synth_city_leader_finalize_merged(work_item_id: int, operation_id: str = "", expected_context_sha256: str = "",
+    reason: str = "", dry_run: bool = True) -> dict:
+    """Current Leader records a merged PR the poll could not settle, from fresh evidence.
+
+    Call with dry_run true (the default) for the evidence and its digest. Then call with dry_run false,
+    the digest, an operation_id and a reason. It performs no merge and releases nothing. Replay-safe;
+    one notice to the bound Supervisor.
+    """
+    if dry_run:
+        return _revision_review_request(
+            f"/github-work-items/{work_item_id}/leader-recovery/finalize-merged/preview", {})
+    return _revision_review_request(f"/github-work-items/{work_item_id}/leader-recovery/finalize-merged",
+        {"operation_id": operation_id, "expected_context_sha256": expected_context_sha256, "reason": reason})
+
+
+@mcp.tool()
+def synth_city_leader_release_workspace(work_item_id: int, workspace_id: int, expected_leased_at: str,
+    operation_id: str, reason: str) -> dict:
+    """Current Leader releases a CLEAN workspace of a terminal item.
+
+    Refused when the tree is dirty, has unpushed commits or cannot be inspected, when the item is not
+    terminal, or when the lease changed. Dirty or unknown state is operator-only. One notice to the
+    bound Supervisor; replay-safe.
+    """
+    return _revision_review_request(f"/github-work-items/{work_item_id}/leader-recovery/release-workspace",
+        {"workspace_id": workspace_id, "expected_leased_at": expected_leased_at,
+         "operation_id": operation_id, "reason": reason})
+
+
+@mcp.tool()
 def synth_city_record_revision_review(work_item_id: int, revision: int, dispatch_nonce: str,
     head_sha: str, summary: str, evidence_url: str, verdict: str = "changes_required") -> dict:
     """Assigned independent reviewer records CHANGES REQUIRED (default) or ACCEPTED for this exact submitted head.
@@ -1570,6 +1733,24 @@ def synth_city_record_head_review(work_item_id: int, dispatch_nonce: str, head_s
     return _revision_review_request(f"/github-work-items/{work_item_id}/head-reviews",
         {"dispatch_nonce": dispatch_nonce, "head_sha": head_sha, "verdict": verdict,
          "summary": summary, "evidence_url": evidence_url})
+
+
+@mcp.tool()
+def synth_city_get_review_binding(work_item_id: int) -> dict:
+    """Assigned reviewer reads the binding needed to record a head or revision review for one item (#999).
+
+    Allowed for the team's current verifier, or the reviewer named on the item's required-check watch for the
+    PR's exact current head. Returns only work_item_id, pr_number, dispatch_nonce and active_scope_revision.
+    The nonce is private: use it only in synth_city_record_head_review or synth_city_record_revision_review,
+    and never publish it.
+    """
+    err = _guard()
+    if err:
+        return err
+    result = _dispatch_request("GET", f"/github-work-items/{work_item_id}/review-binding")
+    if not result["ok"]:
+        return result
+    return {"ok": True, "binding": result["data"], **_counts()}
 
 
 @mcp.tool()

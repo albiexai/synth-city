@@ -18,7 +18,7 @@ def test_remaining_summary_uses_authenticated_context_and_makes_no_writes(monkey
     import mcp_shim.agent_mail_server as shim
     from mcp_shim.work_remaining_protocol import parse_report
     requests = []
-    context = dict(work_item_id=7, dispatch_nonce="dispatch", owner_slot_id=2,
+    context = dict(work_item_id=7, generation="a" * 64, owner_slot_id=2,
                    scope_revision=0, source_sha="a" * 40, phase="implementation")
     monkeypatch.setattr(shim, "_ensure_registered", lambda: {"ok": True})
     monkeypatch.setitem(shim._state, "member_id", 3)
@@ -105,6 +105,7 @@ def test_ensure_registered_refreshes_cached_member(monkeypatch):
         "cwd": "/tmp/repo",
         "session_key": "mcp:test",
         "pid": 1234,
+        "tool_catalog": shim.tool_catalog_fingerprint(),
         "team_preset_id": 1,
         "team_slot_id": 2,
     }
@@ -1221,7 +1222,7 @@ def test_upgrade_probe_refuses_actual_dispatch_including_direct_http_tools(monke
             types.CallToolRequest(method="tools/call", params=types.CallToolRequestParams(
                 name=name, arguments=arguments)))
         assert wire.root.structuredContent == denied
-        assert len(tools) == 43
+        assert len(tools) == 51
         # Every published tool is refused before validation or execution.
         for tool in tools:
             assert await shim.mcp.call_tool(tool.name, {}) == denied
@@ -1251,7 +1252,7 @@ def test_upgrade_probe_lists_tools_without_registration_and_cannot_call_member_t
     spec.loader.exec_module(shim)
     calls = []
     monkeypatch.setattr(shim, "_request", lambda *args, **kwargs: calls.append((args, kwargs)))
-    assert len(asyncio.run(shim.mcp.list_tools())) == 43
+    assert len(asyncio.run(shim.mcp.list_tools())) == 51
     assert shim._ensure_registered() == {"ok": False, "error": {"code": "upgrade_probe_read_only"}}
     assert shim._state["member_id"] is None and shim._state["capability_token"] is None
     assert calls == []
@@ -1301,6 +1302,20 @@ def test_head_review_tool_sends_an_explicit_verdict_and_binds_server_identity(mo
         assert set(kwargs["json"]) == {"dispatch_nonce", "head_sha", "verdict", "summary", "evidence_url"}
     import inspect
     assert inspect.signature(shim.synth_city_record_head_review).parameters["verdict"].default is inspect.Parameter.empty
+
+
+def test_review_binding_tool_reads_the_authenticated_route(monkeypatch):
+    import mcp_shim.agent_mail_server as shim
+    calls = []
+    binding = {"work_item_id": 19, "pr_number": 5, "dispatch_nonce": "attempt", "active_scope_revision": 0}
+    monkeypatch.setattr(shim, "_guard", lambda: None)
+    monkeypatch.setattr(shim, "_counts", lambda: {})
+    monkeypatch.setattr(shim, "_dispatch_request", lambda method, path, **kwargs:
+        calls.append((method, path, kwargs)) or {"ok": True, "data": binding})
+    assert shim.synth_city_get_review_binding(19) == {"ok": True, "binding": binding}
+    assert calls == [("GET", "/github-work-items/19/review-binding", {})]
+    monkeypatch.setattr(shim, "_dispatch_request", lambda *a, **k: {"ok": False, "error": {"status_code": 403}})
+    assert shim.synth_city_get_review_binding(19)["ok"] is False
 
 
 def test_scope_amendment_and_negative_review_tools_bind_server_identity(monkeypatch):
@@ -1459,3 +1474,55 @@ async def test_shim_does_not_resolve_a_legacy_nested_pending_request(db, monkeyp
     assert result["ok"] is True and result["resolved_request"] is False, result
     assert seen[0]["root"]["id"] == root.id
     assert (await db.get(MailMessage, nested.id)).request_status == "pending"
+
+
+def test_preflight_tool_posts_one_read_only_check_and_returns_its_answer(monkeypatch):
+    import mcp_shim.agent_mail_server as shim
+    calls = []
+    answer = {"passed": False, "problems": [{"code": "allowed_paths_invalid", "field": "allowed_paths",
+                                             "message": "x"}], "warnings": []}
+    monkeypatch.setattr(shim, "_guard", lambda: None)
+    monkeypatch.setattr(shim, "_request", lambda method, path, **kwargs:
+        calls.append((method, path, kwargs)) or {"ok": True, "data": answer})
+    result = shim.synth_city_preflight_request(
+        "continuation", 19, "attempt", "Fix it", phase="implementation", execution_target="workspace",
+        allowed_paths=["/abs"], allowed_actions=["push_pr_head", "request_verification"],
+        max_failed_heads=1, estimate_active_minutes={"low": 10, "high": 30})
+    assert result == {"ok": True, **answer}
+    assert [(method, path) for method, path, _ in calls] == [("POST", "/preflight-request")]
+    sent = calls[0][2]["json"]
+    assert sent["kind"] == "continuation" and sent["work_item_id"] == 19
+    assert sent["estimate_active_minutes"] == {"low": 10, "high": 30}
+    assert sent["allowed_paths"] == ["/abs"] and sent["lease_token"] is None
+    assert set(sent) == {
+        "kind", "work_item_id", "dispatch_nonce", "summary", "plan_metadata", "phase", "execution_target",
+        "allowed_paths", "allowed_actions", "allowed_commands", "prohibited_actions", "max_failed_heads",
+        "tool_fallbacks", "estimate_active_minutes", "lease_token"}
+
+
+def test_preflight_tool_passes_a_server_refusal_through(monkeypatch):
+    import mcp_shim.agent_mail_server as shim
+    refusal = {"ok": False, "error": {"code": "not_item_owner"}}
+    monkeypatch.setattr(shim, "_guard", lambda: None)
+    monkeypatch.setattr(shim, "_request", lambda *args, **kwargs: refusal)
+    assert shim.synth_city_preflight_request("initial_plan", 19, "attempt", "Plan") == refusal
+
+
+def test_the_leader_extension_tool_posts_one_request_and_changes_nothing_else(monkeypatch):
+    """#938: one tool, one POST; the Leader's call carries the nonce, minutes and reason and nothing else."""
+    import mcp_shim.agent_mail_server as shim
+
+    calls = []
+    monkeypatch.setattr(shim, "_guard", lambda: None)
+    monkeypatch.setattr(shim, "_counts", lambda: {})
+
+    def fake_request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"ok": True, "data": {"extension_minutes": 15, "effective_limit_minutes": 75, "repeated": False}}
+
+    monkeypatch.setattr(shim, "_request", fake_request)
+    answer = shim.synth_city_extend_effort_limit(19, "nonce-19", 15, "healthy and close to done")
+    assert answer == {"ok": True, "extension_minutes": 15, "effective_limit_minutes": 75, "repeated": False}
+    assert calls == [("POST", "/effort-extensions", {"json": {
+        "work_item_id": 19, "dispatch_nonce": "nonce-19", "minutes": 15, "reason": "healthy and close to done"}})]
+    assert "not the owner's reported active effort" in " ".join(shim.synth_city_extend_effort_limit.__doc__.split())

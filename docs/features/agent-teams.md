@@ -250,6 +250,8 @@ turn can remain Idle while the same process and identity are still current.
 
 ### Deployment with separate controller and agent users
 
+Set `harness_agent_user` to the agent user's name so that the Harnesses pages show the global scope that the agents load, not the controller's own. See [Which user the Harnesses pages show as "global"](/guide/installation#which-user-the-harnesses-pages-show-as-global).
+
 If the controller cannot read the runtime user's Codex history, labels remain
 steady at Activity unknown. Before enabling observations, arrange read access to
 the dedicated runtime's process descriptors and rollout logs, with directory
@@ -263,6 +265,145 @@ or histories world-readable. This PR does not change live filesystem permissions
 For custom `CODEX_HOME` or `HOME`, the process environment must be readable by the
 controller. When it is not readable, the adapter uses the process owner's default
 Codex home and returns unknown if it cannot find and validate the exact session.
+
+For Muse Code, the observer finds each member's sessions root from the observed
+process, not from the controller. When the process environment is readable, it
+uses the process's own `XDG_DATA_HOME/muse`, then `MUSE_DATA_DIR`, then
+`HOME/.local/share/muse`; otherwise it uses the process owner's
+`~/.local/share/muse`. A relative value is refused. Muse 1.4.20 wrote its sessions
+under `XDG_DATA_HOME/muse` when both variables were set; `MUSE_DATA_DIR` on its own
+has not been observed. A controller-wide `MUSE_DATA_DIR` override is therefore no
+longer needed for observation. The guard keeps its own explicit
+`muse_sessions_root` setting.
+
+Muse writes its session folders with mode `770` and its files with mode `660`, in
+the agent's primary group, so the controller cannot read them by default. To give
+the controller read access:
+
+- Choose a group that both the agent user and the controller user belong to.
+- Give the agent's Muse `sessions` tree that group and set the setgid bit on its
+  directories, so that new date and session folders inherit the group.
+- Keep the tree closed to other users. Do not make the home directory or the
+  sessions world-readable.
+
+When the controller still cannot read a member's session log, its activity shows
+"The controller cannot read this member's native activity log" (reason
+`native_log_unreadable`) instead of a missing log. This change does not alter live
+filesystem permissions.
+
+A first plain Muse launch learns its session id from the process's open
+descriptors: the pane process itself holds its session's `.session.lock`, which
+must be the only one it holds, under that process owner's root, with a session log
+for the pane's working directory. Reading another user's descriptors needs the
+controller service's ptrace read capability (`cap_sys_ptrace`); the production unit
+is reported to grant it, but that has not been verified independently. If the
+controller cannot read the descriptors, set the member's first session id by hand
+and restart the slot in resume mode. The evidence and the route are recorded on
+issue #746.
+
+#### Verify first-session discovery in production (read-only)
+
+`scripts/muse-discovery-probe.py` runs the production discovery function against one process and prints a single
+JSON object of facts. It reports capability names, whether the target belongs to another user, whether its
+descriptor directory can be listed (and, if not, only the kind of failure), counts of the `.session.lock`
+descriptors it holds, and whether discovery returned an id; with `--expect-session-id` it also says whether the
+discovered id matched. It never prints a path, an id, an environment value, a log line or a command line. It writes
+nothing, sends no signal and makes no network call, and it starts and stops no member.
+
+Whether to run it, against which process, and whether any Muse member has to exist for it, is the operator's
+decision. A member started for the check, as the agent user, needs the Supervisor's explicit approval first.
+Run it as the same user and with the same capabilities as the controller service, from the repository root, with the
+backend virtualenv's Python:
+
+```
+setpriv <the service's capability set> backend/venv/bin/python scripts/muse-discovery-probe.py \
+    --pid <the Muse pane process> --cwd <that pane's working directory> [--expect-session-id <the session id>]
+```
+
+Read the result like this:
+
+- `fd_listable: false` with `fd_failure: permission_denied` means the descriptors of another user's process cannot
+  be read with this capability set, so first-launch discovery cannot work there and the manual first session id
+  applies.
+- `lock_descriptors: 1` and `locks_under_sessions_root: 1` with `discovered: true` is the expected result; with
+  `--expect-session-id`, `matches_expected: true` confirms it is the right session.
+- `lock_descriptors` above 1 means the process holds several sessions, so discovery refuses by design.
+- `locks_under_sessions_root: 0` with a lock descriptor means the lock is outside the sessions root the observer
+  derived from the process environment; see the root order above.
+
+Run it once with the capability set, once without it as a control (it should report `permission_denied` for a
+process of another user), and once for a process that sets only `MUSE_DATA_DIR`. The probe checks the read; it does
+not by itself prove the production unit's capabilities, which are only as reported until it has been run there.
+
+### Antigravity CLI members
+
+Antigravity CLI (`agy`) members cannot be launched yet. Readiness stays blocked
+until Agent Mail for `agy` is installed (#736) and until onboarding can be
+confirmed. On first run, `agy` shows its own onboarding, which includes Google's
+Terms of Service and a data-use choice. **Synth City never accepts these terms and
+never presets onboarding settings**: each user completes onboarding once, in their
+own `agy`, as the agent user. Completing onboarding makes `agy` write
+`~/.gemini/antigravity-cli/cache/onboarding.json` with `"onboardingComplete": true`
+(recorded in a human trial, #995). Readiness only reads that file: a missing, unreadable
+or other value counts as not completed, and Synth City never writes it or reads the
+sign-in files. Until Agent Mail through `agy` is proven (#994), readiness stays blocked
+by the Agent Mail gate before onboarding is checked.
+
+When a member launches, Synth City adds the workspace to `trustedWorkspaces` in the
+agent user's `~/.gemini/antigravity-cli/settings.json` and reports
+`workspace_trust_changed`. Issue #952 observed that this registers the workspace
+with `agy` 1.5.9; it did not observe whether it also suppresses a trust prompt.
+Other settings in that file are kept unchanged. A resumed member is launched with
+`agy --conversation <id>` and, if the slot has a prompt, `-i <prompt>`.
+
+#### Antigravity activity (#737)
+
+Synth City reads an `agy` member's activity read-only from the agent user's
+`<passwd home>/.gemini/antigravity-cli` (never from `$HOME`). Every directory from the
+home down must belong to the agent user, must not be a symlink and must not be
+world-writable.
+
+- **Identity.** The live `agy` process holds `presence/<conversation id>.lock` open. On a
+  first plain launch, Synth City takes the id from the single lock the process holds,
+  checks that `conversation_summaries.db` lists the member's workspace, saves the id to
+  the slot and asks for a restart in resume mode. An unknown result never clears a saved
+  id. A conversation id configured on more than one slot is never observed or
+  discovered (`duplicate_native_identity`).
+- **Directories.** Every directory below the home is opened without following symlinks
+  and held open while its files are read; a symlinked, foreign-owned or world-writable
+  directory, or one replaced during the read, gives `unknown`.
+- **Snapshots.** The two SQLite databases and their WAL files are read as bytes only,
+  copied twice and compared (once retried), then queried on a private copy with fixed,
+  limited queries and a step budget. Files over 16 MiB, damaged copies and a file
+  changing between rounds give `unknown`. The live files are never opened by SQLite or
+  changed. That the copied files form one consistent state across both databases is not
+  proven yet (continuation of #737); the checks above only refuse change they detect.
+- **Deadline.** One deadline starts when an observation or discovery starts; a result or
+  conversation id produced after it is refused. The work itself is bounded by the size
+  caps, not interrupted at the deadline.
+- **Transcript.** From `brain/<id>/.system_generated/logs/transcript.jsonl`, only the
+  step index, type, source, time and tool names are read; message text is ignored.
+- **States**, from the shapes observed on `agy` 1.5.9 (the turn is the latest user input,
+  from a later second than the process start and present in the live steps):
+
+  | State | Evidence |
+  |---|---|
+  | working | Summary RUNNING. The last live step is the input, a system message, a finished tool step after a single-tool reply, or a running (`2`) `run_command` step right after its reply when the member was launched with exactly `--dangerously-skip-permissions`. |
+  | waiting for an answer | Summary RUNNING. A single `ask_question` call, then its step waiting (`9`). |
+  | idle | Summary IDLE with matching step counts, and the last live step is a finished reply after the input. |
+  | unknown | Everything else, including other tools running or waiting (`native_wait_unconfirmed`), permission reviews, more than one tool call, and status `6` (seen only after exit). |
+
+  Only `run_command` with `--dangerously-skip-permissions` was observed running, so a
+  running step counts as working only when the bound process's command line has that
+  flag. Other tools, other modes and permission reviews were not observed and stay
+  unknown. Every record of the current turn must be well formed and dated between the
+  input and now.
+- **Not yet available.** The team guard does not yet handle `agy` members, and there is
+  no screen fallback. Both are tracked in a continuation of #737. Readiness stays blocked
+  as described above.
+- **Separate controller and agent users.** The controller must be able to read the
+  agent user's `antigravity-cli` files. Otherwise the status is `native_log_unreadable`.
+  Group access for this setup has not been tested yet.
 
 ## External Local Agents
 

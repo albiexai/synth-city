@@ -27,6 +27,7 @@ function readStoredProvider(): AgentProviderId {
     || stored === 'opencode-cli'
     || stored === 'pi-cli'
     || stored === 'muse-cli'
+    || stored === 'antigravity-cli'
     ? stored
     : DEFAULT_PROVIDER
 }

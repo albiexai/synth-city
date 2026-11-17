@@ -227,8 +227,13 @@ async def test_claude_code_apply_adds_user_scope_hooks_and_mcp(monkeypatch, db):
     post_tool = next(hook for hook in added_hooks if hook.event == "PostToolUse")
     assert post_tool.matcher == install.POST_TOOL_USE_MATCHER
     question = next(hook for hook in added_hooks if hook.event == "PreToolUse")
-    assert question.matcher == "AskUserQuestion"
+    assert question.matcher == install.PRE_TOOL_USE_MATCHER
+    assert set(install.PRE_TOOL_USE_MATCHER.split("|")) >= {
+        "AskUserQuestion", "Edit", "Write", "MultiEdit", "NotebookEdit",
+        "mcp__albiex-synth-city-mail__.*",
+    }
     assert "team_question_hook.py" in question.command
+    assert "--synth-city-url" in question.command
     assert added_servers[0].scope == "user"
     assert added_servers[0].name == install.MCP_SERVER_NAME
 
@@ -574,14 +579,54 @@ async def test_question_hook_install_status_and_remove_preserve_user_hooks(monke
     assert "PreToolUse" in status.claude_code_hooks
     await install.apply_claude_code_install(db)
     installed = json.loads(settings_file.read_text())
-    questions = installed["hooks"]["PreToolUse"][0]["hooks"]
-    assert len(questions) == 2
-    assert questions[0] == original["hooks"]["PreToolUse"][0]["hooks"][0]
+    groups = installed["hooks"]["PreToolUse"]
+    assert groups[0] == original["hooks"]["PreToolUse"][0]
+    managed = [g for g in groups if g["matcher"] == install.PRE_TOOL_USE_MATCHER]
+    assert len(managed) == 1 and len(managed[0]["hooks"]) == 1
     status = await install.uninstall_claude_code(db)
     assert status.claude_code_prompt_block_installed is False
     removed = json.loads(settings_file.read_text())
     assert removed["env"] == original["env"]
     assert removed["hooks"]["PreToolUse"] == original["hooks"]["PreToolUse"]
+
+
+@pytest.mark.asyncio
+async def test_install_upgrades_an_old_question_hook_to_the_edit_guard(monkeypatch, db, tmp_path):
+    import shlex
+    import sys
+    from pathlib import Path
+
+    from app.services import hook_service
+
+    script = Path(install.__file__).resolve().parents[2] / "mcp_shim" / "team_question_hook.py"
+    old_command = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
+    settings_file = tmp_path / ".claude" / "settings.json"
+    settings_file.parent.mkdir()
+    settings_file.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [
+        {"id": "old", "type": "command", "command": old_command}]}]}}))
+    monkeypatch.setattr(hook_service, "get_claude_user_settings_file", lambda: settings_file)
+    monkeypatch.setattr(install, "_backup_before_mutation", AsyncMock())
+    monkeypatch.setattr(install.mcp_service, "get_server", AsyncMock(return_value=SimpleNamespace()))
+
+    before = await install.get_install_status()
+    assert before.claude_code_prompt_block_installed is False
+    await install.apply_claude_code_install(db)
+
+    groups = json.loads(settings_file.read_text())["hooks"]["PreToolUse"]
+    commands = [hook["command"] for group in groups for hook in group["hooks"]]
+    assert [group["matcher"] for group in groups] == [install.PRE_TOOL_USE_MATCHER]
+    assert len(commands) == 1 and commands[0].startswith(old_command)
+    assert commands[0] == install.hook_command("team-question")
+    assert (await install.get_install_status()).claude_code_prompt_block_installed is True
+
+
+def test_question_hook_command_carries_the_synth_city_url(monkeypatch):
+    monkeypatch.setattr(install, "synth_city_base_url", lambda: "http://127.0.0.1:8123")
+    command = install.hook_command("team-question")
+    assert command.endswith("--synth-city-url http://127.0.0.1:8123")
+    assert install._managed_question_command(command)
+    assert not install._managed_question_command(command + " extra")
+    assert not install._managed_question_command(command.replace("--synth-city-url", "--other"))
 
 
 def test_question_hook_marker_does_not_own_unrelated_commands(monkeypatch):

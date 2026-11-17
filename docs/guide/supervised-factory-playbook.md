@@ -235,6 +235,7 @@ Do not treat a configured model card, live pane or HTTP 200 response as proof of
 
 The installed Claude `PreToolUse` hook refuses `AskUserQuestion` only in Synth City team sessions. It checks `SYNTH_CITY_TEAM_SLOT_ID`.
 Its refusal sends questions to Agent Mail. The Leader handles plans. The Supervisor handles incidents. Retained operator decisions require operator action records.
+The same hook refuses edit tools and state-changing Mail tools while a team member has an unread stop or hold message from its Leader, Supervisor or Synth City. Reading the inbox lifts the refusal. It fails open with a visible warning when Synth City is unreachable, so send a stop as Mail with `STOP` or `HOLD` in the subject, and do not rely on the guard alone. See [Agent Mail](../features/agent-mail.md#edit-guard-for-unread-stop-and-hold-mail).
 Removing Agent Mail also removes this managed hook. Other sessions of the same native user keep their question tool.
 
 The checked-in `scripts/product-factory/` supervisor is a historical campaign example. It contains fixed team identities and installation assumptions. It is not a generic team installer. Prepare and review the watcher for the new installation; copying its timer unchanged is insufficient.

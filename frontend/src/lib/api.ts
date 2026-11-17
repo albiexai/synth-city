@@ -15,6 +15,17 @@ export function operatorWriteHeaders(method = 'GET'): Record<string, string> {
 }
 
 /**
+ * The OS user whose global scope a Harnesses page shows. The choice lives in the page URL
+ * (?scope_user=) and goes to the backend as a header, so no page has to pass it on.
+ * Only /harnesses pages send it; the backend ignores it elsewhere.
+ */
+export function scopeUserHeaders(): Record<string, string> {
+  if (typeof window === 'undefined' || !window.location.pathname.startsWith('/harnesses')) return {}
+  const user = new URLSearchParams(window.location.search).get('scope_user')
+  return user ? { 'X-Harness-Scope-User': user } : {}
+}
+
+/**
  * Build an API endpoint URL with optional query parameters.
  * Filters out undefined values automatically.
  */
@@ -99,6 +110,7 @@ export class ApiClient {
         headers: {
           'Content-Type': 'application/json',
           ...operatorWriteHeaders(options?.method),
+          ...scopeUserHeaders(),
           ...options?.headers,
         },
       })
@@ -155,6 +167,7 @@ export async function apiClient<T>(endpoint: string, options?: RequestInit): Pro
       headers: {
         'Content-Type': 'application/json',
         ...operatorWriteHeaders(options?.method),
+          ...scopeUserHeaders(),
         ...options?.headers,
       },
     })

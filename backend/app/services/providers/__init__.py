@@ -1,6 +1,7 @@
 """Provider registry."""
 from __future__ import annotations
 
+from app.services.providers.antigravity_cli import AntigravityCliProvider
 from app.services.providers.base import AgentProvider
 from app.services.providers.claude_code import ClaudeCodeProvider
 from app.services.providers.copilot_cli import CopilotCliProvider
@@ -17,6 +18,7 @@ _PROVIDERS: dict[str, AgentProvider] = {
     "opencode-cli": OpenCodeCliProvider(),
     "pi-cli": PiCliProvider(),
     "muse-cli": MuseCliProvider(),
+    "antigravity-cli": AntigravityCliProvider(),
 }
 
 

@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     # Application settings
     app_name: str = "Albiex Synth City"
-    app_version: str = "4.1.0"
+    app_version: str = "4.2.0"
     debug: bool = False
 
     # API settings
@@ -28,6 +28,10 @@ class Settings(BaseSettings):
 
     # Database settings
     database_url: str = Field(default="sqlite+aiosqlite:///./synth_city.db", repr=False)
+
+    # The OS user whose ~/.claude the Harnesses pages show as "global". Unset: the controller's own user.
+    # Set it on a two-user install (controller and agents run as different users) to the agent user.
+    harness_agent_user: str | None = None
 
     # Agent Bridge attachment settings
     bridge_attachment_dir: str = "~/.albiex-synth-city/bridge-attachments"
@@ -58,6 +62,8 @@ class Settings(BaseSettings):
     github_stale_lease_backstop_seconds: int = 21600
     github_brief_delivery_max_nudges: int = 2
     github_continuation_proposal_expiry_seconds: int = 3600
+    # #940: write the generated summary comment on ready and merge pull requests. Off until an operator enables it.
+    github_publish_summaries_enabled: bool = False
     github_continuation_leader_nudge_cooldown_seconds: int = 180
     github_continuation_owner_ack_nudge_cooldown_seconds: int = 180
     github_recovery_nudge_cooldown_seconds: int = 180

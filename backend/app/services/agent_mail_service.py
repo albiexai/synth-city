@@ -60,7 +60,7 @@ OBSERVED_TTL_SECONDS = 300
 STALE_REQUEST_MINUTES = 15
 AUTO_NUDGE_COOLDOWN_SECONDS = 30
 TMUX_ENTER_DELAY_SECONDS = 0.25
-TMUX_WAKE_PROVIDERS = {"claude-code", "codex-cli", "copilot-cli", "opencode-cli", "pi-cli", "muse-cli"}
+TMUX_WAKE_PROVIDERS = {"claude-code", "codex-cli", "copilot-cli", "opencode-cli", "pi-cli", "muse-cli", "antigravity-cli"}
 LEGACY_SYSTEM_PAYLOAD_KINDS = {
     "github_backlog_reconcile", "github_owner_followup",
     "github_dispatch_assignment", "github_dispatch_handoff",
@@ -124,6 +124,12 @@ class MailWakeError(ValueError):
         self.code = code
         self.status_code = status_code
         super().__init__(code)
+
+
+# A subject that tells the member to stop work, from a sender that holds authority (#930).
+_STOP_HOLD_SUBJECT = re.compile(
+    r"\b(stop|hold|pause|halt|cancel(?:l?ed)?|revoke[ds]?|defer(?:red)?)\b", re.IGNORECASE
+)
 
 
 class AgentMailService:
@@ -327,6 +333,7 @@ class AgentMailService:
         session.provider = request.provider
         session.cwd = request.cwd
         session.pid = request.pid
+        session.tool_catalog = request.tool_catalog
         session.team_preset_id = team_preset_id
         session.team_slot_id = team_slot_id
         try:
@@ -1880,6 +1887,69 @@ class AgentMailService:
             )
         ).scalar_one()
         return unread, pending
+
+    async def blocking_unread_authority(
+        self, db: AsyncSession, member_id: int
+    ) -> Optional[MailMessage]:
+        """The oldest unread stop, hold or decision from this member's own authority (#930).
+
+        Only the member's own receipts count, and only senders that hold authority over the
+        member's team: its Leader, its bound Supervisor, and Synth City itself. A message that
+        names a work item counts only when that item belongs to the member's slot. The caller
+        must treat any error as "no block" so a lookup failure never freezes an agent.
+        """
+        member = await db.get(MailTeamMember, member_id)
+        if member is None or member.team_slot_id is None or member.team_preset_id is None:
+            return None
+        preset = await db.get(AgentTeamPreset, member.team_preset_id)
+        if preset is None:
+            return None
+        sender_filters = [MailMessage.sender_type == "system"]
+        if preset.leader_slot_id is not None:
+            leader_ids = select(MailTeamMember.id).where(
+                MailTeamMember.team_preset_id == preset.id,
+                MailTeamMember.team_slot_id == preset.leader_slot_id,
+            )
+            sender_filters.append(MailMessage.sender_member_id.in_(leader_ids))
+        if preset.supervisor_actor_id is not None:
+            sender_filters.append(MailMessage.sender_actor_id == preset.supervisor_actor_id)
+        candidates = (
+            await db.execute(
+                select(MailMessage)
+                .join(MailReceipt, MailReceipt.message_id == MailMessage.id)
+                .where(
+                    MailReceipt.member_id == member_id,
+                    MailReceipt.read_at.is_(None),
+                    or_(*sender_filters),
+                    or_(MailMessage.sender_member_id.is_(None), MailMessage.sender_member_id != member_id),
+                )
+                .order_by(MailMessage.id)
+            )
+        ).scalars().all()
+        for message in candidates:
+            if not self._message_stops_work(message):
+                continue
+            item_id = (message.payload or {}).get("work_item_id")
+            if item_id is not None:
+                owner_slot = None
+                if isinstance(item_id, int) and not isinstance(item_id, bool):
+                    owner_slot = (
+                        await db.execute(
+                            select(GithubWorkItem.owner_slot_id).where(GithubWorkItem.id == item_id)
+                        )
+                    ).scalar_one_or_none()
+                if owner_slot != member.team_slot_id:
+                    continue
+            return message
+        return None
+
+    @staticmethod
+    def _message_stops_work(message: MailMessage) -> bool:
+        if message.decision:
+            return True
+        if (message.payload or {}).get("block_edits") is True:
+            return True
+        return bool(_STOP_HOLD_SUBJECT.search(message.subject or ""))
 
     async def _has_pending_continuation_ack(
         self, db: AsyncSession, member_id: int, now: datetime

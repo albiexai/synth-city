@@ -63,6 +63,14 @@ with urllib.request.urlopen(request, timeout=10) as response:
 PY
 fi
 
+if [[ "${RUNTIME_KIT_TEST_FAULT:-}" == cli_grandchild ]]; then
+  # #1010: an unrecorded child and grandchild in this pane's process group, as a real OpenCode starts
+  # its server and Agent Mail shim. The child records both pids (its own and the grandchild's).
+  # shellcheck disable=SC2016 # expanded by the child shell
+  bash -c 'sleep 300 & printf "%s %s\n" "$$" "$!" >"$1/members.tmp" && mv "$1/members.tmp" "$1/members"; wait' \
+    _ "$state" </dev/null >/dev/null 2>&1 &
+fi
+
 export FAKE_CLI_NAME="$name"
 # shellcheck disable=SC2016 # expanded by the inner shell
 exec -a "$name" "$BASH" -c 'echo "$FAKE_CLI_NAME runtime-kit fake ready"; while IFS= read -r line; do printf "%s\n" "$line"; done'

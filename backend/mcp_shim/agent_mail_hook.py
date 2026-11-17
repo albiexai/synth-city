@@ -52,6 +52,31 @@ def _provider_hook_output(provider: str, body: dict[str, Any]) -> dict[str, Any]
     return {"additionalContext": context}
 
 
+# agy accepts this flat PreToolUse result and blocks the tool (#736 P1); it rejects Claude-style
+# hookSpecificOutput, so nothing else is ever printed for antigravity-cli.
+ANTIGRAVITY_QUESTION_DENY = {
+    "decision": "deny",
+    "reason": ("Albiex Synth City team members do not use ask_question. Ask the Leader through "
+               "Albiex Synth City Agent Mail instead (synth_city_request_context)."),
+}
+
+
+def _antigravity_tool_name(payload: dict[str, Any]) -> str | None:
+    call = payload.get("toolCall")
+    name = call.get("name") if isinstance(call, dict) else None
+    return name if isinstance(name, str) else None
+
+
+def _antigravity_forwarded(payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop question and prompt content: only the tool name of a tool call is forwarded."""
+    name = _antigravity_tool_name(payload)
+    payload.pop("toolCall", None)
+    payload.pop("lastUserInput", None)
+    if name is not None:
+        payload["toolCall"] = {"name": name}
+    return payload
+
+
 def _env_int(name: str) -> int | None:
     value = os.environ.get(name)
     if not value:
@@ -71,6 +96,16 @@ def main() -> int:
     args = parser.parse_args()
 
     payload = _read_payload()
+    antigravity = args.provider == "antigravity-cli"
+    if antigravity:
+        team_slot = _env_int("SYNTH_CITY_TEAM_SLOT_ID")
+        # A team member's question is denied here, before and independent of any HTTP call, so an
+        # unavailable or wrong backend answer can never let the member stall on a question.
+        if (args.event == "pre-tool-use" and team_slot is not None and team_slot > 0
+                and _antigravity_tool_name(payload) == "ask_question"):
+            _write_hook_output(ANTIGRAVITY_QUESTION_DENY)
+            sys.stdout.flush()
+        payload = _antigravity_forwarded(payload)
     payload.setdefault("cwd", os.getcwd())
     payload["provider"] = args.provider
     payload["session_id"] = _session_id(payload)
@@ -93,6 +128,8 @@ def main() -> int:
     except Exception:
         return 0
 
+    if antigravity:
+        return 0
     _write_hook_output(_provider_hook_output(args.provider, body))
     return 0
 

@@ -373,6 +373,7 @@ async def settle_accepted_revision(db, item, *, review_id, leader_member_id, dis
     from app.services.factory_delivery_policy import effective_policy
     from app.services.github_approval_service import GithubApprovalError, github_approval_service as approval
     from app.services.github_ci_watch_service import check_matrix
+    from app.services.github_check_observation import GithubCheckObservationError
     from app.services.github_client import github_client
     fact = await db.get(GithubRevisionReview, review_id, populate_existing=True)
     if (not fact or fact.work_item_id != item.id or fact.dispatch_nonce != dispatch_nonce
@@ -411,8 +412,14 @@ async def settle_accepted_revision(db, item, *, review_id, leader_member_id, dis
     # digest matches the watch and the runs match that app.
     if not policy.required_checks or any(required.app_slug != 'github-actions' for required in policy.required_checks):
         raise GithubApprovalError('required_checks_not_successful')
-    checks = await github_client.list_check_runs_for_ref(scope.repo_owner, scope.repo_name, fact.head_sha,
-        token=await approval.github_read_token(scope))
+    try:
+        checks = await github_client.list_check_runs_for_ref(scope.repo_owner, scope.repo_name, fact.head_sha,
+            token=await approval.github_read_token(scope))
+    except GithubCheckObservationError as exc:
+        # Checks that GitHub reports inconsistently (#1007) are unavailable, not failed. Nothing has been written, so
+        # the attempt stays as it was and the Leader settles again once the checks read consistently. The code is
+        # the observation's own fixed reason; nothing GitHub sent is repeated.
+        raise GithubApprovalError(f'checks_not_observable:{exc}', status_code=409) from exc
     if any(row['result'] != 'success' for row in check_matrix(policy, checks, fact.head_sha)):
         raise GithubApprovalError('required_checks_not_successful')
     # The check read awaited, so the head and the whole authority are read and claimed again before the write.
@@ -486,7 +493,8 @@ async def finalize_merged_preview(db, item, scope, read_pull):
             "limits": "Read-only evidence. A finalize records the merge and performs no merge, retry, lease or approval."}
 
 
-async def finalize_merged_item(db, item, scope, read_pull, *, expected_context_sha256, operation_id, reason):
+async def finalize_merged_item(db, item, scope, read_pull, *, expected_context_sha256, operation_id, reason,
+                               decided_by="an operator", actor=None, before_commit=None):
     """Record a merge that the poll cannot settle, from fresh merged-PR evidence and one operator decision.
 
     The PR is read again right before the write and must match the evidence the digest was bound to. It performs
@@ -524,6 +532,18 @@ async def finalize_merged_item(db, item, scope, read_pull, *, expected_context_s
     db.add(GithubMaintenanceEvent(operation_id=operation, work_item_id=item_id,
                                   outcome="merged_item_finalized", request_sha256=request_digest))
     await verification._mark_merged_with_fact(db, item, pull, source="factory_maintenance.finalize_merged_item")
-    item.status_note = "Finalized as merged by an operator: " + audit.sanitize_reason(reason)
+    item.status_note = f"Finalized as merged by {decided_by}: " + audit.sanitize_reason(reason)
+    if actor is not None:
+        # One distinct, idempotent action fact naming the authenticated caller; the merge outcome above is not repeated.
+        await audit.record_event(db, event_kind="leader_recovery_finalize", source="github_terminal_revision_service.finalize_merged_item",
+            occurred_at=datetime.utcnow(), actor=actor, scope_id=scope.id, item_id=item_id, action_outcome="applied",
+            sanitized_reason="merged item finalized by the Leader", operation_id=operation,
+            correlation_id=operation)
+    if before_commit is not None:
+        try:
+            await before_commit()  # a delegated caller's authority fence, in this transaction, right before the commit
+        except BaseException:
+            await db.rollback()
+            raise
     await db.commit()
     return {"status": "finalized", "work_item_id": item_id, **_evidence_now}

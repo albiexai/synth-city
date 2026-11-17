@@ -16,10 +16,15 @@ export function isCompleteInstallStatus(value: unknown): value is AgentMailInsta
 
 export type MailSetupState = 'connected' | 'partial' | 'needs_update' | 'not_set_up' | 'automatic_ready' | 'automatic_unavailable' | 'upgrade_incomplete' | 'upgrade_needs_attention'
 
-/** The four harnesses with a managed Set up and Remove action. */
-export type MailActionHarness = 'claude-code' | 'codex-cli' | 'copilot-cli' | 'opencode-cli' | 'muse-cli'
+/** The harnesses with a managed Set up and Remove action. */
+export type MailActionHarness = 'claude-code' | 'codex-cli' | 'copilot-cli' | 'opencode-cli' | 'muse-cli' | 'antigravity-cli'
 
-export const MAIL_ACTION_HARNESSES: MailActionHarness[] = ['claude-code', 'codex-cli', 'copilot-cli', 'opencode-cli', 'muse-cli']
+export const MAIL_ACTION_HARNESSES: MailActionHarness[] = ['claude-code', 'codex-cli', 'copilot-cli', 'opencode-cli', 'muse-cli', 'antigravity-cli']
+
+// #738: Agent Mail setup does not make an Antigravity member launchable (#736, #952).
+// #991: agy limits mcp_<server>_<tool> to 64 characters, so Antigravity uses a shorter server key.
+const ANTIGRAVITY_SERVER = 'synth-city-mail'
+const ANTIGRAVITY_READINESS = 'blocked: a Mail tool call through agy is not proven yet, and the agent user must complete agy onboarding'
 
 export const HARNESS_NAMES: Record<AgentProviderId, string> = {
   'claude-code': 'Claude Code',
@@ -28,6 +33,7 @@ export const HARNESS_NAMES: Record<AgentProviderId, string> = {
   'opencode-cli': 'OpenCode CLI',
   'pi-cli': 'Pi',
   'muse-cli': 'Muse Code',
+  'antigravity-cli': 'Antigravity CLI',
 }
 
 export function hasMailAction(providerId: AgentProviderId): providerId is MailActionHarness {
@@ -61,6 +67,15 @@ export function mailSetupState(providerId: AgentProviderId, status: AgentMailIns
       const installed = status.muse_hooks ?? []
       const whole = Boolean(status.muse_mcp_installed) && missing.length === 0
       const some = Boolean(status.muse_mcp_installed) || installed.length > 0
+      return whole ? 'connected' : some ? 'partial' : 'not_set_up'
+    }
+    case 'antigravity-cli': {
+      const missing = status.antigravity_hooks_missing ?? []
+      const installed = status.antigravity_hooks ?? []
+      const mcp = Boolean(status.antigravity_mcp_installed)
+      // An older status without the Antigravity fields reports nothing installed.
+      const whole = mcp && installed.length > 0 && missing.length === 0
+      const some = mcp || installed.length > 0
       return whole ? 'connected' : some ? 'partial' : 'not_set_up'
     }
     case 'opencode-cli': {
@@ -100,7 +115,7 @@ export function mailSetupActions(state: MailSetupState): { setUp: boolean; remov
 /** The harnesses with a connected setup, for the line on the Agent Mail page. */
 export function connectedHarnessNames(status: AgentMailInstallStatus | null): string[] {
   if (!status) return []
-  const ids: AgentProviderId[] = ['claude-code', 'codex-cli', 'copilot-cli', 'opencode-cli', 'pi-cli', 'muse-cli']
+  const ids: AgentProviderId[] = ['claude-code', 'codex-cli', 'copilot-cli', 'opencode-cli', 'pi-cli', 'muse-cli', 'antigravity-cli']
   return ids
     .filter((id) => {
       const state = mailSetupState(id, status)
@@ -168,6 +183,20 @@ export function mailTechnicalLines(providerId: AgentProviderId, status: AgentMai
         { label: 'Hooks', value: missing.length === 0 ? 'installed' : `${installed.length}/${installed.length + missing.length} installed` },
         { label: 'MCP', value: status.muse_mcp_installed ? 'installed' : 'not installed' },
         { label: 'Question prompt block', value: 'not available: questions are detected and escalated' },
+        ...common,
+      ]
+    }
+    case 'antigravity-cli': {
+      const installed = status.antigravity_hooks ?? []
+      const missing = status.antigravity_hooks_missing ?? []
+      return [
+        { label: 'Antigravity CLI', value: status.antigravity_cli_available ? 'available' : 'missing' },
+        { label: 'MCP file', value: status.antigravity_mcp_config_path || 'unavailable' },
+        { label: 'Hooks file', value: status.antigravity_hooks_path || 'unavailable' },
+        { label: 'Hooks', value: missing.length === 0 && installed.length > 0 ? 'installed' : `${installed.length}/${installed.length + missing.length} installed` },
+        { label: 'MCP', value: status.antigravity_mcp_installed ? 'installed' : 'not installed' },
+        { label: 'Question tool', value: 'denied for team members by the hook' },
+        { label: 'Team launch readiness', value: ANTIGRAVITY_READINESS },
         ...common,
       ]
     }
@@ -279,6 +308,25 @@ export function mailConfirm(harness: MailActionHarness, mode: MailActionMode, st
         description: 'A backup is attempted before Albiex Synth City removes its MCP server and hooks. Other Muse settings stay as they are.',
         mutations: [
           `${status.muse_settings_path || '~/.config/muse/settings.json'}: remove mcpServers.albiex-synth-city-mail and the Agent Mail hook commands`,
+        ],
+      }
+    case 'antigravity-cli:setup':
+      return {
+        title: 'Install Agent Mail for Antigravity CLI',
+        description: 'A backup is attempted before Albiex Synth City adds its MCP server and hooks to the Antigravity CLI user configuration. Team launch readiness stays blocked after setup: a Mail tool call through agy is not proven yet, and the agent user must complete agy onboarding themselves.',
+        mutations: [
+          `${status.antigravity_mcp_config_path || '~/.gemini/config/mcp_config.json'}: add MCP server ${ANTIGRAVITY_SERVER} (an earlier Synth City entry ${server} is replaced)`,
+          `${status.antigravity_hooks_path || '~/.gemini/config/hooks.json'}: add Agent Mail SessionStart, PreInvocation and ask_question PreToolUse hooks`,
+          command,
+        ],
+      }
+    case 'antigravity-cli:remove':
+      return {
+        title: 'Remove Agent Mail from Antigravity CLI',
+        description: 'A backup is attempted before Albiex Synth City removes its MCP server and hooks. Other servers and hooks stay as they are.',
+        mutations: [
+          `${status.antigravity_mcp_config_path || '~/.gemini/config/mcp_config.json'}: remove MCP server ${ANTIGRAVITY_SERVER} and an earlier Synth City entry ${server}`,
+          `${status.antigravity_hooks_path || '~/.gemini/config/hooks.json'}: remove the Agent Mail hook commands`,
         ],
       }
     case 'opencode-cli:setup':

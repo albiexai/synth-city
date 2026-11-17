@@ -140,6 +140,12 @@ export interface AgentMailInstallStatus {
   muse_hooks?: string[]
   muse_hooks_missing?: string[]
   muse_settings_path?: string
+  antigravity_cli_available?: boolean
+  antigravity_mcp_installed?: boolean
+  antigravity_hooks?: string[]
+  antigravity_hooks_missing?: string[]
+  antigravity_mcp_config_path?: string | null
+  antigravity_hooks_path?: string | null
   curl_available: boolean
   shim_path: string
   python_path: string

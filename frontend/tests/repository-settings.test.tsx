@@ -95,6 +95,18 @@ describe('RepositorySettings', () => {
     expect(screen.getByText('Technical details').closest('details')).not.toHaveAttribute('open')
   })
 
+  it('shows automatic merge usage against the daily cap only for automatic merging', () => {
+    const view = render(<RepositorySettings {...settingsProps({ scope: { ...scope, merge_policy: 'auto', auto_merges_last_24h: 3 } })} />)
+    expect(screen.getByText('Automatic merges a day')).toBeInTheDocument()
+    expect(screen.getByText('3 of 5 in the last 24 hours')).toBeInTheDocument()
+    view.rerender(<RepositorySettings {...settingsProps({ scope: { ...scope, merge_policy: 'auto', auto_merges_last_24h: 5 } })} />)
+    expect(screen.getByText('5 of 5 in the last 24 hours')).toBeInTheDocument()
+    view.rerender(<RepositorySettings {...settingsProps({ scope: { ...scope, merge_policy: 'auto' } })} />)
+    expect(screen.getByText('up to 5')).toBeInTheDocument()
+    view.rerender(<RepositorySettings {...settingsProps({ scope: { ...scope, merge_policy: 'human', auto_merges_last_24h: 3 } })} />)
+    expect(screen.queryByText('Automatic merges a day')).not.toBeInTheDocument()
+  })
+
   it('explains the optional build hint in the edit dialog', async () => {
     const user = userEvent.setup()
     render(<RepositorySettings {...settingsProps()} />)

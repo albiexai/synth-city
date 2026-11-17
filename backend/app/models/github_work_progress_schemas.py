@@ -2,9 +2,9 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel as PydanticBaseModel, Field
+from pydantic import BaseModel as PydanticBaseModel, Field, model_validator
 from app.models.api_model import ApiModel as BaseModel
-from mcp_shim.work_remaining_protocol import ReportContext
+from mcp_shim.work_remaining_protocol import ReportContext, public_generation
 
 
 class GithubWorkRemainingView(BaseModel):
@@ -60,6 +60,7 @@ class GithubRequiredCheckProgress(BaseModel):
 class GithubWorkProgressResponse(BaseModel):
     work_item_id: int
     dispatch_nonce: str | None
+    dispatch_generation: str | None = None
     owner_slot_id: int | None
     checked_at: datetime
     valid_until: datetime
@@ -72,3 +73,12 @@ class GithubWorkProgressResponse(BaseModel):
     publication: GithubPublicationObservation
     remaining_work: GithubWorkRemainingView = Field(default_factory=GithubWorkRemainingView)
     remaining_work_context: ReportContext | None = None
+    remaining_work_context_basis: Literal["workspace", "recorded_head"] | None = None
+    remaining_work_context_status: str | None = None  # the item status the context was built under; public, grants nothing
+
+    @model_validator(mode="after")
+    def _public_generation(self):
+        """The public name of the dispatch; the nonce itself never leaves the private store."""
+        if self.dispatch_generation is None and self.dispatch_nonce:
+            self.dispatch_generation = public_generation(self.work_item_id, self.dispatch_nonce)
+        return self
