@@ -103,19 +103,37 @@ async def health():
 frontend_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "frontend", "dist")
 
 
+HASHED_ASSET_CACHE = "public, max-age=31536000, immutable"
+REVALIDATE = "no-cache"
+
+
+class FrontendFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if path.lstrip("/").startswith("assets/"):
+            response.headers["Cache-Control"] = HASHED_ASSET_CACHE
+        else:
+            response.headers["Cache-Control"] = REVALIDATE
+        return response
+
+
 async def spa_not_found_exception_handler(request, exc):
-    """Serve the SPA for UI routes without erasing API error details."""
-    if not request.url.path.startswith(settings.api_v1_prefix):
-        return FileResponse(os.path.join(frontend_path, "index.html"), status_code=200)
-    return JSONResponse(
-        {"detail": exc.detail},
-        status_code=exc.status_code,
-        headers=exc.headers,
+    """Serve the SPA for UI routes without erasing API error details or masking missing assets."""
+    if request.url.path.startswith((settings.api_v1_prefix, "/assets/")):
+        return JSONResponse(
+            {"detail": exc.detail},
+            status_code=exc.status_code,
+            headers=exc.headers,
+        )
+    return FileResponse(
+        os.path.join(frontend_path, "index.html"),
+        status_code=200,
+        headers={"Cache-Control": REVALIDATE},
     )
 
 
 if os.path.exists(frontend_path):
-    app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")
+    app.mount("/", FrontendFiles(directory=frontend_path, html=True), name="frontend")
     app.add_exception_handler(404, spa_not_found_exception_handler)
 else:
     @app.get("/")
