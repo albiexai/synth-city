@@ -1217,7 +1217,10 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         await conn.run_sync(lambda sync_conn: _install_context_key_lifetime_ddl(None, sync_conn))
     # C12: install the stable forward-coverage marker and import the observed
     # work state once. A later run finds the marker and changes nothing.
-    if await _sqlite_columns(conn, "factory_audit_events"):
+    audit_columns = await _sqlite_columns(conn, "factory_audit_events")
+    if audit_columns and "via" not in audit_columns:
+        await conn.execute(text("ALTER TABLE factory_audit_events ADD COLUMN via VARCHAR"))
+    if audit_columns:
         from app.services.factory_audit_service import install_forward_coverage
 
         await install_forward_coverage(conn)

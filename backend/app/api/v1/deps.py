@@ -168,6 +168,54 @@ async def require_operator(
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
+def _attribution_session_is_current(session: MailAgentSession) -> bool:
+    """Is this session fresh enough to be named in an audit event? (#945)
+
+    The strict rules, whatever ``mail_capability_tokens_required`` says: the session is not closed, its mailbox is not
+    offline, and a role-bearing (slot-bound) session has a recorded pane that is alive. This is local to attribution. It
+    does not change ``require_current_mail_session`` or any Mail authentication, and it never decides the write.
+    """
+    if session.closed_at is not None or session.mailbox_status == "offline":
+        return False
+    if session.team_slot_id is None:
+        return True
+    if session.bound_pane_pid is None or session.bound_pane_proc_start is None:
+        return False
+    return peer_process.pane_is_alive(session.bound_pane_pid, session.bound_pane_proc_start) is True
+
+
+async def operator_write_context(
+    origin: Optional[str] = Header(default=None),
+    x_synth_city_session_token: Optional[str] = Header(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """How an operator-key write reached the server, for the audit trail (#945).
+
+    Use it AFTER ``require_operator``: the key is the authority and this never grants or refuses anything. A usable Mail
+    session token is the one server-derived fact (``mail_tool``, with the session id read from the session row, never
+    from the request). The other paths are labels from the browser's Origin header: a configured origin reads ``ui``,
+    anything else ``api``. Neither proves who called. A token that is unknown, closed or stale does not refuse the
+    write; it is reported as ``session_invalid`` so the event records the write as unattributed.
+    """
+    session = None
+    invalid = False
+    if x_synth_city_session_token:
+        hashed = agent_mail_service.hash_capability_token(x_synth_city_session_token)
+        rows = await db.execute(
+            select(MailAgentSession).where(MailAgentSession.capability_token_hash.is_not(None)))
+        match = next((row for row in rows.scalars().all()
+                      if hmac.compare_digest(row.capability_token_hash, hashed)), None)
+        if match is not None and _attribution_session_is_current(match):
+            session = match
+        else:
+            invalid = True
+    if session is not None:
+        via = "mail_tool"
+    else:
+        via = "ui" if origin and origin in settings.cors_origins else "api"
+    return {"via": via, "session_id": session.id if session is not None else None, "session_invalid": invalid}
+
+
 async def require_operator_for_writes(
     request: Request,
     x_synth_city_operator_token: str | None = Header(default=None),
