@@ -516,6 +516,7 @@ export function CCBridgePage() {
                           setLayoutMode(isThisFullscreen ? { kind: 'grid' } : { kind: 'single', target })
                         }
                         onClose={() => removeTarget(target)}
+                        onDetach={() => removeTarget(target)}
                         instance={instance}
                         session={session}
                       />
