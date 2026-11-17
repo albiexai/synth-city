@@ -1,13 +1,13 @@
 import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
-import { TeamSummaryCard } from "@/features/agent-teams/TeamSummaryCard";
+import { TeamSummaries } from "@/features/agent-teams/TeamSummaryCard";
 import type { AgentTeamPresetListResponse, AgentTeamSummary } from "@/types/agentTeams";
-import type { OverviewResponse, RepositoryListResponse, WorkListResponse } from "@/types/factory";
+import type { OverviewResponse } from "@/types/factory";
 import { ActiveWork } from "../components/overview/ActiveWork";
 import { CampaignProgress } from "../components/overview/CampaignProgress";
 import { NeedsYou } from "../components/overview/NeedsYou";
 import { OperationsFindings } from "../components/OperationsFindings";
-import { filterNeedsYouRows, needsYouRows } from "../components/overview/needsYou";
+import { needsYouRows } from "../components/overview/needsYou";
 import { StatusLine } from "../components/overview/StatusLine";
 import { StatusTiles } from "../components/overview/StatusTiles";
 import { ReadStatus } from "../components/ReadStatus";
@@ -18,7 +18,6 @@ import { factoryQuery, workLink } from "../filterHelpers";
 import { FactoryFilters } from "../filters";
 import { useFactoryFilters } from "../filterOptions";
 import { useObservation, useObservations } from "../reads";
-import { teamVisible } from "./overviewFilters";
 
 export function OverviewPage() {
   const { params, ready } = useFactoryFilters();
@@ -29,8 +28,6 @@ export function OverviewPage() {
   const filtered = Boolean(query);
   // The same reads as the team cards below, so they add no request.
   const teamId = params.get("team_id");
-  const scopeId = params.get("scope_id");
-  const provider = params.get("provider");
   const presetList = useObservation<AgentTeamPresetListResponse>("agent-teams/presets");
   const presets = (presetList.data?.presets ?? []).filter(
     (preset) => !teamId || String(preset.id) === teamId,
@@ -39,29 +36,7 @@ export function OverviewPage() {
     presets.map((preset) => `agent-teams/presets/${preset.id}/summary`),
   );
   const summaries = states.map((item) => item.data);
-  const scopeRepos = useObservation<RepositoryListResponse>(
-    ready && scopeId ? `factory/repositories?scope_id=${scopeId}` : null,
-  );
-  const providerWork = useObservation<WorkListResponse>(
-    ready && provider ? `factory/work-items?provider=${encodeURIComponent(provider)}&limit=100` : null,
-  );
-  const scopeTeamIds = scopeId
-    ? new Set((scopeRepos.data?.repositories ?? []).map((repo) => repo.team.id))
-    : null;
-  const visible = presets
-    .map((preset, index) => ({ preset, summary: summaries[index] }))
-    .filter(({ preset }) => teamVisible(preset, { provider, scopeTeamIds }));
-  const visiblePresets = visible.map((entry) => entry.preset);
-  const visibleSummaries = visible.map((entry) => entry.summary);
-  const rows = filterNeedsYouRows(needsYouRows(visiblePresets, visibleSummaries), {
-    scopeId: scopeId ? Number(scopeId) : null,
-    provider: provider
-      ? {
-          workItemIds: new Set((providerWork.data?.items ?? []).map((item) => item.item.id)),
-          complete: providerWork.data !== null && !providerWork.data.has_more,
-        }
-      : null,
-  });
+  const rows = needsYouRows(presets, summaries);
   const summariesLoading =
     presetList.data === null || states.some((item) => item.data === null && item.error === null);
   return (
@@ -90,26 +65,9 @@ export function OverviewPage() {
         <>
           <StatusLine data={state.data} teams={presetList.data ? presets.length : null} />
           <NeedsYou rows={rows} loading={summariesLoading} />
-          <CampaignProgress presets={visiblePresets} summaries={visibleSummaries} />
+          <CampaignProgress presets={presets} summaries={summaries} />
           <StatusTiles counts={state.data.counts} params={params} />
-          <section aria-label="Teams" className="space-y-2">
-            <h3 className="text-lg font-semibold">Teams</h3>
-            <ReadStatus state={presetList} />
-            {presetList.data && visiblePresets.length === 0 && <p>No teams to show.</p>}
-            <div className="grid gap-4 lg:grid-cols-2">
-              {visiblePresets.map((preset) => (
-                <TeamSummaryCard
-                  key={preset.id}
-                  presetId={preset.id}
-                  name={preset.name}
-                  running={preset.autonomy_enabled}
-                  showChecked={false}
-                  compact
-                  slotNames={Object.fromEntries(preset.slots.map((slot) => [slot.id, slot.display_name]))}
-                />
-              ))}
-            </div>
-          </section>
+          <TeamSummaries teamId={teamId} onOverview />
           <ActiveWork query={query} viewAll={workLink(params, "open")} />
           <details className={`${panel} space-y-2 py-3`}>
             <summary className="cursor-pointer font-semibold">Automation details</summary>

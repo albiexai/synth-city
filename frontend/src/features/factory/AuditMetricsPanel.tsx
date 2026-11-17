@@ -467,7 +467,7 @@ export function AuditMetricsPage() {
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const teamOptions = filterOptions("team", contextKeys?.teams ?? []);
   const scopeOptions = filterOptions("scope", contextKeys?.repositories ?? []);
-  const optionsLocked = !contextKeys && eventsState === "locked";
+  const optionsLocked = !contextKeys;
   const filterNames: FilterNames = {
     team: (key) => teamOptions.find((option) => option.value === key)?.label ?? "selected",
     scope: (key) => scopeOptions.find((option) => option.value === key)?.label ?? "selected",
