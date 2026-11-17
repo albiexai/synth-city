@@ -1238,6 +1238,9 @@ class GithubDispatchService:
         pending.sort(key=dispatch_order_key)
         await db.commit()
 
+        # #1081: owner slots a higher-ranked item found busy in this poll. A slot that frees during the walk goes to
+        # the top-ranked waiting item on the next poll, not to whichever item is checked next.
+        busy_slots: set[int] = set()
         for item in pending:
             pending_identity = _item_identity(item)
             issue_labels = issue_labels_by_number.get(item.issue_number, [])
@@ -1302,6 +1305,14 @@ class GithubDispatchService:
                 )
                 await db.commit()
                 continue
+            # A prepared attempt may itself be what holds the slot, so it is never locked out of it.
+            if owner_slot_id in busy_slots and state is not AttemptState.PREPARED:
+                await self._update_current_item(
+                    db, item, pending_identity, owner_slot_id=owner_slot_id, routing_method=method,
+                    pending_reason="queued_slot_busy",
+                )
+                await db.commit()
+                continue
             owner_slot = slots_by_id.get(owner_slot_id)
             ambiguity_note = await self._session_ambiguity_note(db, owner_slot_id)
             if ambiguity_note is not None:
@@ -1317,6 +1328,8 @@ class GithubDispatchService:
                 db, scope, item, owner_slot_id=owner_slot_id,
                 routing_method=method, require_autonomy=require_autonomy,
             ):
+                if item.pending_reason == "queued_slot_busy":
+                    busy_slots.add(owner_slot_id)
                 continue
             start_identity = _item_identity(item)
             workspace = await github_workspace_service.acquire(db, scope, item)

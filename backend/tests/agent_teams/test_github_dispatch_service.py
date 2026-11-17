@@ -8434,3 +8434,111 @@ async def test_claim_refuses_a_padded_mixed_case_role_set_after_routing(db, role
         db, scope, item, owner_slot_id=owner, routing_method=method, require_autonomy=False)
     await db.refresh(item)
     assert item.pending_reason == "no_eligible_owner" and item.owner_slot_id is None
+
+
+# ---- #1081: a slot that frees during a poll's walk goes to the top-ranked waiting item, not the next one checked ----
+
+def _ranked_item(scope, number, priority, created_at=datetime(2026, 11, 17, 10, 11, 29)):
+    return GithubWorkItem(scope_id=scope.id, issue_number=number, issue_title=f"Work {number}",
+        issue_url=f"https://github.com/o/r/issues/{number}", github_updated_at=datetime.utcnow(),
+        dispatch_status="pending", dispatch_priority=priority, created_at=created_at)
+
+
+def _slot_frees_after(monkeypatch, busy_checks):
+    """The slot reads busy for the first `busy_checks` checks of the walk, then its last item releases it."""
+    original = github_dispatch_service.slot_is_busy
+    state = {"checks": 0}
+
+    async def slot_is_busy(db, slot_id, **kwargs):
+        state["checks"] += 1
+        return True if state["checks"] <= busy_checks else await original(db, slot_id, **kwargs)
+
+    monkeypatch.setattr(github_dispatch_service, "slot_is_busy", slot_is_busy)
+    return state
+
+
+async def _poll(db, scope, slots, labels, launched):
+    async def launcher(_db, _preset_id, request):
+        launched.append(request.slot_ids)
+        return SimpleNamespace(launch_id=1081)
+
+    await github_dispatch_service.dispatch_pending(db, scope, slots, launcher=launcher,
+        issue_labels_by_number=labels, issue_details_by_number={number: {"body": "Approved ready work"} for number in labels})
+
+
+async def _dispatched(db, scope):
+    rows = (await db.execute(select(GithubWorkItem).where(
+        GithubWorkItem.scope_id == scope.id, GithubWorkItem.dispatch_status == "dispatched"))).scalars().all()
+    return sorted(row.issue_number for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_a_slot_that_frees_mid_poll_is_not_taken_by_a_lower_ranked_item(db, monkeypatch):
+    _, slots, scope = await _team(db)
+    scope.max_concurrent_dispatched = 3
+    db.add_all([_ranked_item(scope, 901, 1), _ranked_item(scope, 902, 2), _ranked_item(scope, 903, 3)])
+    await db.commit()
+    labels = {n: [scope.dispatch_label, "area:backend", f"priority:{n - 900}"] for n in (901, 902, 903)}
+    launched = []
+    _slot_frees_after(monkeypatch, busy_checks=1)  # busy when the top item is checked, free right after
+    await _poll(db, scope, slots, labels, launched)
+    assert await _dispatched(db, scope) == [] and launched == []
+    await _poll(db, scope, slots, labels, launched)  # the next poll: the freed slot goes to the top-ranked item
+    assert await _dispatched(db, scope) == [901]
+
+
+@pytest.mark.asyncio
+async def test_a_later_admitted_higher_number_never_jumps_the_lane_when_the_slot_frees(db, monkeypatch):
+    _, slots, scope = await _team(db)
+    scope.max_concurrent_dispatched = 3
+    db.add_all([_ranked_item(scope, 1050, 11), _ranked_item(scope, 1052, 13), _ranked_item(scope, 1058, 30),
+                _ranked_item(scope, 1071, 38, created_at=datetime(2026, 11, 17, 10, 26, 29))])
+    await db.commit()
+    priorities = {1050: 11, 1052: 13, 1058: 30, 1071: 38}
+    labels = {n: [scope.dispatch_label, "area:backend", f"priority:{p}"] for n, p in priorities.items()}
+    launched = []
+    slot = _slot_frees_after(monkeypatch, busy_checks=3)  # the live shape: the release lands after the earlier batch
+    await _poll(db, scope, slots, labels, launched)
+    assert 1071 not in await _dispatched(db, scope)
+    slot["checks"] = 3  # the release has happened: every later check reads the slot as it really is
+    await _poll(db, scope, slots, labels, launched)
+    assert await _dispatched(db, scope) == [1050]
+
+
+@pytest.mark.asyncio
+async def test_another_lane_still_dispatches_while_a_busy_lane_waits(db, monkeypatch):
+    preset, slots, scope = await _team(db)
+    scope.max_concurrent_dispatched = 3
+    frontend = AgentTeamSlot(preset_id=preset.id, position=2, display_name="Frontend", provider="codex-cli",
+        repo_id="r", repo_path="/tmp/r", repo_name="r", enabled=True, area_labels=["area:frontend"])
+    db.add(frontend)
+    await db.flush()
+    slots.append(frontend)
+    db.add_all([_ranked_item(scope, 901, 1), _ranked_item(scope, 902, 2), _ranked_item(scope, 903, 3)])
+    await db.commit()
+    labels = {901: [scope.dispatch_label, "area:backend", "priority:1"],
+              902: [scope.dispatch_label, "area:backend", "priority:2"],
+              903: [scope.dispatch_label, "area:frontend", "priority:3"]}
+    launched = []
+    _slot_frees_after(monkeypatch, busy_checks=1)
+    await _poll(db, scope, slots, labels, launched)
+    assert await _dispatched(db, scope) == [903] and launched == [[frontend.id]]
+
+
+@pytest.mark.asyncio
+async def test_a_prepared_item_that_holds_the_slot_still_starts_after_a_higher_item_found_it_busy(db):
+    _, slots, scope = await _team(db)
+    scope.max_concurrent_dispatched = 3
+    owner = slots[1]
+    prepared = _ranked_item(scope, 905, 9)
+    db.add_all([_ranked_item(scope, 904, 1), prepared])
+    await db.flush()
+    await github_workspace_service.acquire(db, scope, prepared)
+    await github_dispatch_service.prepare_attempt(db, prepared, owner_slot_id=owner.id, routing_method="label",
+                                                  base_ref="origin/master")
+    await db.commit()
+    labels = {904: [scope.dispatch_label, "area:backend", "priority:1"],
+              905: [scope.dispatch_label, "area:backend", "priority:9"]}
+    launched = []
+    await _poll(db, scope, slots, labels, launched)  # 904 finds the slot held by 905's prepared attempt
+    assert await _dispatched(db, scope) == [905]  # the holder is not locked out of its own reservation
