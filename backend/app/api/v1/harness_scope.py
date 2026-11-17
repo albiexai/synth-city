@@ -5,7 +5,8 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.utils.path_utils import scope_users
+from app.models.schemas import ScopeInfo
+from app.utils.path_utils import controller_user_name, get_user_home, scope_users
 
 router = APIRouter()
 
@@ -38,6 +39,26 @@ def _describe(name: str, home: Path, is_controller: bool, is_default: bool) -> H
         readable=os.access(probe, os.R_OK | os.X_OK),
         writable=os.access(probe, os.W_OK | os.X_OK),
     )
+
+
+def current_scope(data_dir: Path | None = None) -> ScopeInfo:
+    """Which user's home this request read, and whether what the view reads can be listed (#1066).
+
+    `data_dir` is the folder the view lists (projects, plans, the Codex home), always one derived from the scoped
+    home, never a path the request chose. When it exists but cannot be listed, `readable` is False: the answer is
+    "cannot read", not "empty". The same os.access rule as /harness-scope decides the `.claude` part.
+    """
+    home = get_user_home()
+    claude_dir = home / ".claude"
+    user = next((u.name for u in scope_users() if u.home == home), controller_user_name())
+    try:
+        exists = claude_dir.exists()
+        readable = os.access(claude_dir if exists else home, os.R_OK | os.X_OK)
+        if readable and data_dir is not None and data_dir.exists():
+            readable = os.access(data_dir, os.R_OK | os.X_OK)
+    except OSError:
+        exists, readable = False, False
+    return ScopeInfo(user=user, claude_dir=str(claude_dir), exists=exists, readable=readable)
 
 
 @router.get("/harness-scope", response_model=HarnessScopeResponse)

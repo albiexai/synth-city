@@ -1166,11 +1166,25 @@ class SessionListResponse(BaseModel):
     total: int
 
 
+class ScopeInfo(BaseModel):
+    """Whose home a Harnesses view read, and whether what it read could be listed (#1066).
+
+    `readable` is about the folder the view reads (the projects folder, the plans folder, the Codex home), not only
+    `.claude`, so an empty answer that came from a folder that cannot be listed is told apart from a truly empty one.
+    """
+
+    user: str
+    claude_dir: str
+    exists: bool
+    readable: bool
+
+
 class SessionProjectListResponse(BaseModel):
     """List of projects with session counts."""
 
     projects: List[SessionProject]
     total_sessions: int
+    scope: Optional[ScopeInfo] = None
 
 
 class SessionDetailResponse(BaseModel):
@@ -1336,6 +1350,7 @@ class UsageSummaryResponse(BaseModel):
     """Usage summary response."""
 
     summary: UsageSummary
+    scope: Optional[ScopeInfo] = None
 
 
 # Settings Update Schemas
@@ -1673,6 +1688,7 @@ class ActiveSessionsResponse(BaseModel):
     """List of active sessions with context info."""
 
     sessions: List[ActiveSessionContext]
+    scope: Optional[ScopeInfo] = None
 
 
 # Plan History Browser Schemas
@@ -1753,6 +1769,7 @@ class PlanListResponse(BaseModel):
 
     plans: List[PlanSummary]
     total: int
+    scope: Optional[ScopeInfo] = None
 
 
 class PlanDetailResponse(BaseModel):
