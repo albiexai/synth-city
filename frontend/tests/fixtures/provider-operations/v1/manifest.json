@@ -5,13 +5,13 @@
   "catalog_sha256": "f0e69dd9323aba2c9a26e2f5e0f87735c9d4c5e2750075eadd48d0124cab3e54",
   "source_sha256": {
     "backend/app/models/provider_operations_schemas.py": "53e6e0a3aac830a381e7c06e7157ac3987d60a178e0263859c6792675f101fac",
-    "backend/app/services/provider_readiness_service.py": "c1ede6bec3d4649da764521129f131ab2849e189717f98bd049954e805cecccc",
+    "backend/app/services/provider_readiness_service.py": "fb93f02444281871b24b32f35a517d04687aa275dc05c7ebe6f0dc4700e26db2",
     "backend/app/services/provider_operations_service.py": "6561533b94e35f78267702262012d70bb8d93c43b37267e4608da014a39bc57d",
     "backend/app/api/v1/providers.py": "1568537ef086cd1188e9b641460a6a50d851a53d3aba7e6eeb6370de6933e2fd",
-    "backend/app/services/agent_team_service.py": "23be4d5ff6217b1f360c6345d4c88298148180c4eb42d95ff131c8789d73dbab",
+    "backend/app/services/agent_team_service.py": "a13dd70a1c6f189cbb6f9d0d72b14c443459bcc2e6fa6559be0dc5073b3e7e9f",
     "frontend/tests/fixtures/factory/native-adapters.json": "e1e0cc1994e3c90a399eac8d0005c018aacd263d4efe242d44e3519a14026ff1",
     "backend/tests/test_provider_operations.py": "578a951f41222817bc8b678fd91f70cc3f4228f970508d93835c6cb74aebae2c",
-    "backend/tests/test_provider_readiness.py": "bcf3a5f234cfe22b7524dc36b18e62bc7103d819f696e6260bfdbf385b96cc3a"
+    "backend/tests/test_provider_readiness.py": "16b2ead9acbe655ef393602979d024e28f893a9058275f04e65edd9734cef261"
   },
   "providers": [
     "claude-code",

@@ -2952,10 +2952,11 @@ AGY_CONVERSATION = "6f1c2b8e-4d3a-4b7f-9c2e-1a2b3c4d5e6f"
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["plain", "resume"])
-async def test_antigravity_options_send_the_bootstrap_prompt_only_to_a_new_conversation(db, tmp_path, mode):
-    # The resume prompt rule for `agy --conversation <id>` is not proven (#952), so a resumed member gets none.
+async def test_antigravity_options_send_the_bootstrap_prompt_to_new_and_resumed_conversations(db, tmp_path, mode):
+    # #981: `agy --conversation <id> -i <prompt>` resumes the same conversation and delivers the
+    # prompt (observed on agy 1.5.9, #952), so a resumed member keeps its bootstrap prompt.
     from app.models.database import AgentTeamSlot
-    from app.services.providers.antigravity_cli import AntigravityCliProvider
+    from app.services.providers.antigravity_cli import AntigravityCliProvider, exact_resumed_conversation
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -2967,9 +2968,11 @@ async def test_antigravity_options_send_the_bootstrap_prompt_only_to_a_new_conve
     slot = await db.get(AgentTeamSlot, preset.slots[0].id)
     options = agent_team_service._spawn_options_for_slot(slot, "Custom team startup prompt.")
     command = AntigravityCliProvider().build_spawn_command(options)
+    assert options.prompt == "Custom team startup prompt."
     if mode == "resume":
-        assert options.prompt is None
-        assert command == ["agy", "--conversation", AGY_CONVERSATION]
+        assert command == ["agy", "--conversation", AGY_CONVERSATION, "-i", "Custom team startup prompt."]
+        # The resumed pane is still recognised as this exact conversation.
+        assert exact_resumed_conversation(command) == AGY_CONVERSATION
     else:
         assert command == ["agy", "-i", "Custom team startup prompt."]
 
