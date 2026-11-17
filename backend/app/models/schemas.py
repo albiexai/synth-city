@@ -2095,6 +2095,14 @@ class GithubHeadReviewCreate(BaseModel):
     evidence_url: str = Field(min_length=1, max_length=2000)
 
 
+class GithubReviewBindingResponse(BaseModel):
+    """#999: only what a current reviewer needs to record a head or revision review. Never a lease token."""
+    work_item_id: int
+    pr_number: int
+    dispatch_nonce: str
+    active_scope_revision: int
+
+
 class GithubHeadReviewResponse(BaseModel):
     id: int
     work_item_id: int
