@@ -28,6 +28,7 @@ from app.services.github_recovery_gate import (
 from app.services.github_verification_service import github_verification_service
 from app.services.github_watcher_service import github_watcher_service
 from app.services.operations_health_service import operations_health_service
+from app.services.wake_followup_service import wake_followup_service
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +218,8 @@ class GithubDispatchScheduler:
                     await db.rollback()
                     logger.warning("owner_followup_failed scope=%s error_type=%s",
                                    coordination_scope_id, type(error).__name__)
+        # #1059: a delivered wake with no activity is repeated once. It never fails the poll.
+        await wake_followup_service.tick(db)
 
     async def _run_recovery_only(
         self,
