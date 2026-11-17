@@ -3860,8 +3860,10 @@ async def _named_reviewer_binding(db, item, scope, member_id):
         digest = _digest(effective_policy(item, scope))
     except GithubApprovalError:
         raise _binding_unavailable() from None
-    before = (context['dispatch_nonce'], context['active_scope_revision'], context['pr_number'],
-              context['owner_slot_id'])
+    def fence(values):
+        return (values['dispatch_nonce'], values['active_scope_revision'], values['pr_number'],
+                values['owner_slot_id'], values['team_id'], values['leader_slot_id'])
+    before = fence(context)
     if context['pr_number'] is None:
         raise _binding_unavailable()
     try:
@@ -3876,26 +3878,31 @@ async def _named_reviewer_binding(db, item, scope, member_id):
             or (head.get('repo') or {}).get('full_name') != f'{scope.repo_owner}/{scope.repo_name}'
             or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha)):
         raise _binding_unavailable()
-    # After the remote await: the same attempt, revision, PR and owner, read again.
-    after = await _fresh_item(db, item.id)
-    if after is None or (after.dispatch_nonce, after.active_scope_revision, after.pr_number,
-                         after.owner_slot_id) != before:
+    # After the remote await, the whole authority is read and fenced again (#1027 review): a healthy context,
+    # the same attempt, revision, PR, owner, team and Leader, and the same effective policy. Only these
+    # post-read values are used for the watch and independence checks below.
+    try:
+        context, owner, _leader, _workspace = await github_approval_service.healthy_scope_context(db, item, scope)
+        digest_after = _digest(effective_policy(item, scope))
+    except GithubApprovalError:
+        raise _binding_unavailable() from None
+    if fence(context) != before or digest_after != digest:
         raise _binding_unavailable()
     watch = await db.scalar(select(GithubRequiredCheckWatch).where(
         GithubRequiredCheckWatch.work_item_id == item.id,
-        GithubRequiredCheckWatch.dispatch_nonce == after.dispatch_nonce,
-        GithubRequiredCheckWatch.scope_revision == after.active_scope_revision,
+        GithubRequiredCheckWatch.dispatch_nonce == context['dispatch_nonce'],
+        GithubRequiredCheckWatch.scope_revision == context['active_scope_revision'],
         GithubRequiredCheckWatch.head_sha == sha).execution_options(populate_existing=True))
     member_slot = await db.scalar(select(MailTeamMember.team_slot_id).where(MailTeamMember.id == member_id))
-    if (watch is None or watch.pr_number != after.pr_number or watch.owner_slot_id != after.owner_slot_id
-            or watch.reviewer_member_id != member_id or watch.policy_digest != digest
+    if (watch is None or watch.pr_number != context['pr_number'] or watch.owner_slot_id != context['owner_slot_id']
+            or watch.reviewer_member_id != member_id or watch.policy_digest != digest_after
             or member_id == owner.id or member_slot is None or member_slot == context['leader_slot_id']):
         raise _not_reviewer()
     try:
         await watches._reviewer(db, context, member_id)
     except ValueError:
         raise _not_reviewer() from None
-    return after
+    return await _fresh_item(db, item.id)
 
 
 @router.get('/github-work-items/{item_id}/review-binding', response_model=GithubReviewBindingResponse)

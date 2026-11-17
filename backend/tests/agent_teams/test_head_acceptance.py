@@ -669,3 +669,40 @@ async def test_the_named_reviewer_branch_fails_closed_on_anything_stale(db, subm
     await db.commit()
     code, _detail = await _refused(a.item.id, session, db)
     assert code == status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["leader_is_now_the_caller", "leader_moved", "policy_changed", "scope_disabled",
+                                    "autonomy_off", "lease_removed"])
+async def test_the_named_reviewer_authority_is_fenced_again_after_the_github_read(db, submitted_attempt,
+                                                                                    monkeypatch, change):
+    """#1027 review: what changes while the pull request is read must refuse, never return the binding."""
+    from app.models.database import GithubWorkspace, TeamGithubScope
+    from app.services.github_client import github_client as client
+    a = submitted_attempt
+    session = _reviewer_session(a)
+
+    async def moving_pull(*_args, **_kwargs):
+        if change == "leader_is_now_the_caller":
+            await db.execute(update(AgentTeamPreset).where(AgentTeamPreset.id == a.preset.id)
+                             .values(leader_slot_id=a.reviewer.team_slot_id))
+        elif change == "leader_moved":
+            await db.execute(update(AgentTeamPreset).where(AgentTeamPreset.id == a.preset.id)
+                             .values(leader_slot_id=a.item.owner_slot_id))
+        elif change == "policy_changed":
+            await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == a.item.id)
+                             .values(delivery_policy={"owner_contact": "native"}))
+        elif change == "scope_disabled":
+            await db.execute(update(TeamGithubScope).where(TeamGithubScope.id == a.scope.id).values(enabled=False))
+        elif change == "autonomy_off":
+            await db.execute(update(AgentTeamPreset).where(AgentTeamPreset.id == a.preset.id)
+                             .values(autonomy_enabled=False))
+        else:
+            await db.execute(update(GithubWorkspace).where(GithubWorkspace.id == a.workspace.id)
+                             .values(leased_item_id=None, lease_token=None))
+        await db.commit()
+        return a.pull
+
+    monkeypatch.setattr(client, "get_pull", moving_pull)
+    code, detail = await _refused(a.item.id, session, db)
+    assert (code, detail) in {(409, "review_binding_unavailable"), (403, "current_independent_reviewer_required")}

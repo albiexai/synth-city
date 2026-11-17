@@ -350,9 +350,12 @@ prompt use this wording:
 The caller comes from the authenticated session (no session: 401 `session_token_required`; a session without a team slot: 403 `session_not_slot_bound`). Exactly two callers are allowed, and every check reads fresh values:
 
 - **The team's current verifier**, by the same rule as a head review: the current member of an enabled slot of this team whose role is `verifier`, not the owner or the Leader.
-- **The reviewer named on the item's required-check watch.** The watch must be for the current nonce, the current scope revision, the pull request's **exact current head** (read from GitHub, with the checks used when the watch is registered: open, not merged, the item's branch, this repository) and the **current delivery policy**. The reviewer must still be the current member of an enabled slot of the team, and not the owner or the Leader. The attempt, revision, pull request and owner are read again after the GitHub read.
+- **The reviewer named on the item's required-check watch.** The watch must be for the current nonce, the current scope revision, the pull request's **exact current head** (read from GitHub, with the checks used when the watch is registered: open, not merged, the item's branch, this repository) and the **current delivery policy**. The reviewer must still be the current member of an enabled slot of the team, and not the owner or the Leader. After the GitHub read, the whole authority is checked again: a healthy context, and the same attempt, revision, pull request, owner, team, Leader and delivery policy. The watch and the reviewer are checked against those post-read values.
 
-Everyone else gets 403 `current_independent_reviewer_required`. If the item has no pull request, the context isn't healthy, the GitHub read fails or the pull request doesn't match, the answer is 409 `review_binding_unavailable`; there is no fallback to a stored head.
+Everyone else gets 403 `current_independent_reviewer_required`.
+
+- **For the named reviewer,** 409 `review_binding_unavailable` means: the item has no pull request, the context isn't healthy, the GitHub read fails, the pull request doesn't match, or the authority or policy changed during the read. There is no fallback to a stored head.
+- **For the verifier,** the route uses the head-review authority: the current verifier and the item's fresh attempt. It doesn't require a healthy context and makes no GitHub read. It answers 409 only when the item has no pull request or no attempt nonce. The review tools then enforce their own head and revision rules.
 
 ### Reviewer verdict for the exact head and the auto-merge gate
 
