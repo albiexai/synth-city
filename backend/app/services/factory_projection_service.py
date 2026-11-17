@@ -446,13 +446,15 @@ async def overview(db, filters):
     automation = {name: 0 for name in wire.AutomationSummary.model_fields if name != "runtime"}
     for scope, team in scopes:
         automation["configured_scopes"] += 1
+        # One intake definition for every scope, as the repositories view shows it: a paused scope or team is
+        # intake blocked (#1104).
+        effective = intake(scope, team, runtime)
+        field = {"eligible": "intake_eligible_scopes", "blocked": "intake_blocked_scopes", "unknown": "intake_unknown_scopes"}[effective.state]
+        automation[field] += 1
         if not (scope.enabled and team.autonomy_enabled):
             automation["paused_scopes"] += 1
             continue
         automation["enabled_scopes"] += 1
-        effective = intake(scope, team, runtime)
-        field = {"eligible": "intake_eligible_scopes", "blocked": "intake_blocked_scopes", "unknown": "intake_unknown_scopes"}[effective.state]
-        automation[field] += 1
         freshness = poll(scope, effective, now).freshness
         automation["never_polled_scopes"] += freshness == "never_polled"
         automation["stale_scopes"] += freshness == "stale"
