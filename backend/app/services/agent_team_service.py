@@ -1771,8 +1771,6 @@ class AgentTeamService:
             values["platform"] = self._clean_optional(raw_options.get("platform")) or "openrouter"
         if slot.provider == "muse-cli" and values["mode"] == "resume":
             values["prompt"] = None  # `muse resume <uuid>` takes no prompt; the session keeps its context.
-        if slot.provider == "antigravity-cli" and values["mode"] == "resume":
-            values["prompt"] = None  # The resume prompt rule for `agy --conversation` is not proven yet (#952).
         return SpawnCommandOptions(**values)
 
     async def _bootstrap_prompt(
