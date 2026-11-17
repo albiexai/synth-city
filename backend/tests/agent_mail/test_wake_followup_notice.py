@@ -21,6 +21,9 @@ from app.models.database import (
 )
 from app.services.agent_mail_service import agent_mail_service
 from app.services.agent_status_service import agent_status_service
+from app.services.agent_team_supervisor_service import (
+    is_supervisor_message, require_supervisor_thread, supervisor_inbox,
+)
 from app.services.wake_followup_service import wake_followup_service
 
 NOW = datetime(2026, 11, 17, 12, 0, 0)
@@ -304,3 +307,100 @@ async def test_the_notice_can_be_switched_off(db, native, no_wakes, monkeypatch)
     await wake_followup_service.tick(db, NOW)
 
     assert await notices(db) == []
+
+
+async def written_supervisor_notice(db, native):
+    t = await team(db)
+    await delivered_rewake(db, t.builder.id)
+    native[t.builder.id] = idle(aware(REWAKE_AT - timedelta(minutes=10)))
+    await wake_followup_service.tick(db, NOW)
+    row = next(m for m in await notices(db) if m.delivery_key.endswith(":supervisor"))
+    return t, row
+
+
+@pytest.mark.asyncio
+async def test_the_supervisor_notice_reaches_the_bound_supervisors_inbox_and_thread_gate(db, native, no_wakes):
+    """A raw row is not delivery. The Supervisor reads through supervisor_inbox and require_supervisor_thread."""
+    t, row = await written_supervisor_notice(db, native)
+    bound = SimpleNamespace(id=SUPERVISOR_ID)
+
+    inbox = await supervisor_inbox(db, bound)
+
+    assert [m.id for m in inbox if m.id == row.id] == [row.id]
+    assert [m.subject for m in inbox if m.id == row.id] == ["Re-wake without activity"]
+    assert is_supervisor_message(row) is True
+    await require_supervisor_thread(db, bound, row)
+
+
+@pytest.mark.asyncio
+async def test_another_actor_cannot_read_the_notice(db, native, no_wakes):
+    t, row = await written_supervisor_notice(db, native)
+    other = SimpleNamespace(id=SUPERVISOR_ID + 1)
+
+    with pytest.raises(PermissionError):
+        await supervisor_inbox(db, other)
+    with pytest.raises(PermissionError):
+        await require_supervisor_thread(db, other, row)
+
+
+@pytest.mark.asyncio
+async def test_the_supervisor_notice_has_a_fixed_subject_and_an_exact_payload(db, native, no_wakes):
+    t, row = await written_supervisor_notice(db, native)
+
+    assert row.subject == "Re-wake without activity"
+    assert set(row.payload) == {"notice", "member_id", "slot_id", "attempt_id", "issue_number",
+                                "supervisor_actor_id"}
+    assert row.payload["notice"] == "wake_followup_silent"
+    assert row.payload["member_id"] == t.builder.id and row.payload["attempt_id"] == 7
+    assert row.payload["issue_number"] == 1060 and row.payload["supervisor_actor_id"] == SUPERVISOR_ID
+    assert t.builder.display_name in row.body_markdown
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [
+    {"extra_key": True},
+    {"notice": "something_else"},
+    {"subject": "No activity after a re-wake: builder slot"},
+    {"recipient_member_id": "member"},
+    {"sender_actor_id": 6},
+    {"sender_type": "member"},
+    {"member_id": 0},
+    {"member_id": True},
+    {"slot_id": "1"},
+    {"issue_number": "1060"},
+    {"attempt_id": -1},
+    {"supervisor_actor_id": "6"},
+    {"audience_type": "member"},
+])
+async def test_a_changed_shape_is_not_a_supervisor_message(db, native, no_wakes, change):
+    """The gate is not broadened: any deviation from the strict shape is refused."""
+    t, row = await written_supervisor_notice(db, native)
+    payload = dict(row.payload)
+    fields = {"subject": row.subject, "sender_member_id": row.sender_member_id, "sender_actor_id": None,
+              "recipient_member_id": row.recipient_member_id, "sender_type": row.sender_type,
+              "audience_type": row.audience_type}
+    for key, value in change.items():
+        if key == "extra_key":
+            payload["extra"] = 1
+        elif key in payload:
+            payload[key] = value
+        elif key in ("sender_member_id", "recipient_member_id"):
+            fields[key] = t.builder.id
+        else:
+            fields[key] = value
+    if "notice" in change:
+        payload["notice"] = change["notice"]
+    changed = SimpleNamespace(kind="message", thread_root_id=None, payload=payload, **fields)
+
+    assert is_supervisor_message(changed) is False
+
+
+@pytest.mark.asyncio
+async def test_a_notice_without_a_slot_or_work_item_is_still_a_supervisor_message(db, native, no_wakes):
+    t, row = await written_supervisor_notice(db, native)
+    payload = dict(row.payload, slot_id=None, issue_number=None)
+    changed = SimpleNamespace(kind="message", thread_root_id=None, payload=payload, subject=row.subject,
+                              sender_member_id=None, sender_actor_id=None, recipient_member_id=None,
+                              sender_type="system", audience_type="team_preset")
+
+    assert is_supervisor_message(changed) is True

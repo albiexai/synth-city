@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 WAKE_SOURCES = ("auto_nudge", "external_delivery", "manual_operator", "manual_session")
 REWAKE_SOURCE = "rewake"
 NOTICE_KEY = "rewake-notice:{attempt_id}:{who}"
+SUPERVISOR_NOTICE_SUBJECT = "Re-wake without activity"
 # The work items a member can be working on. Same set the dispatch monitor treats as busy.
 ACTIVE_ITEM_STATUSES = ("dispatched", "verifying")
 # An older wake is history, not a member that is still waiting.
@@ -232,9 +233,12 @@ class WakeFollowupService:
         if preset.supervisor_actor_id is not None and supervisor_key not in sent:
             try:
                 async with db.begin_nested():
+                    # The Supervisor reads only strictly shaped system notices (see
+                    # agent_team_supervisor_service.is_supervisor_message): a fixed subject and an
+                    # exact payload. The member and the work item are in the body.
                     db.add(MailMessage(
                         kind="message", audience_type="team_preset", audience_id=str(preset.id),
-                        subject=subject, body_markdown=body, delivery_key=supervisor_key,
+                        subject=SUPERVISOR_NOTICE_SUBJECT, body_markdown=body, delivery_key=supervisor_key,
                         payload={**payload, "supervisor_actor_id": preset.supervisor_actor_id}))
                     await db.flush()
             except IntegrityError:
