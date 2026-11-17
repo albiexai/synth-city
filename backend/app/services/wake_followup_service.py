@@ -18,10 +18,13 @@ that is doing nothing.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import weakref
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import exists, func, insert, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -45,12 +48,24 @@ def _naive_utc(value: datetime) -> datetime:
 
 
 class WakeFollowupService:
+    def __init__(self) -> None:
+        self._locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+    def _sweep_lock(self) -> asyncio.Lock:
+        """One lock per event loop. Every repository job sweeps all members, so sweeps must not overlap."""
+        loop = asyncio.get_running_loop()
+        lock = self._locks.get(loop)
+        if lock is None:
+            lock = self._locks[loop] = asyncio.Lock()
+        return lock
+
     async def tick(self, db: AsyncSession, now: datetime | None = None) -> list[int]:
         """Re-wake the members that stayed silent. Returns their ids. Never raises."""
         if not settings.wake_followup_enabled:
             return []
         try:
-            return await self._tick(db, _naive_utc(now) if now else datetime.utcnow())
+            async with self._sweep_lock():
+                return await self._tick(db, _naive_utc(now) if now else datetime.utcnow())
         except Exception:
             logger.exception("Wake follow-up failed")
             await db.rollback()
@@ -63,11 +78,13 @@ class WakeFollowupService:
             MailWakeAttempt.source.in_(WAKE_SOURCES),
             MailWakeAttempt.member_id.is_not(None),
             MailWakeAttempt.unread_count + MailWakeAttempt.pending_count > 0,
-            MailWakeAttempt.created_at <= now - delay,
             MailWakeAttempt.created_at >= now - timedelta(seconds=MAX_AGE_SECONDS),
-        ).order_by(MailWakeAttempt.id))).all()
-        # The newest delivered wake of a member decides: activity is measured from it.
-        latest = {attempt.member_id: attempt for attempt in attempts}
+        ).order_by(MailWakeAttempt.created_at, MailWakeAttempt.id))).all()
+        # The newest delivered wake of a member decides, then the delay applies to it. An older
+        # unanswered wake must not trigger a follow-up while a newer wake is still inside its delay.
+        newest = {attempt.member_id: attempt for attempt in attempts}
+        latest = {member_id: attempt for member_id, attempt in newest.items()
+                  if attempt.created_at <= now - delay}
         if not latest:
             return []
         done = set((await db.scalars(select(MailWakeAttempt.reason_code).where(
@@ -79,9 +96,10 @@ class WakeFollowupService:
                   if not await self._mail_activity_since(db, member_id, attempt.created_at)]
         if not silent:
             return []
-        members = list((await db.scalars(select(MailTeamMember).where(MailTeamMember.id.in_(silent)))).all())
+        members = {member.id: member for member in (await db.scalars(
+            select(MailTeamMember).where(MailTeamMember.id.in_(silent)))).all()}
         try:
-            statuses = await agent_status_service.for_members(db, members)
+            statuses = await agent_status_service.for_members(db, list(members.values()))
         except (OSError, ValueError):
             logger.warning("Wake follow-up could not read native activity; no member was woken")
             return []
@@ -90,15 +108,55 @@ class WakeFollowupService:
             attempt = pending[member_id]
             if not self._known_idle_before(statuses.get(member_id), attempt.created_at):
                 continue
+            # Claim the attempt before the transport, in one statement that SQLite runs under its
+            # write lock. Another sweep, repository job, process or restart sees the claim, and only
+            # one claimant gets a row. The sweep lock alone covers one process, not several.
+            if not await self._claim(db, member_id, attempt):
+                continue
             try:
                 await agent_mail_service._wake_member(
-                    db, member_id, now, source=REWAKE_SOURCE, reason_code=f"rewake:{attempt.id}")
+                    db, member_id, now, source=REWAKE_SOURCE, reason_code=f"rewake:{attempt.id}",
+                    delivery_guard=self._still_silent(db, members[member_id], attempt.created_at))
             except MailWakeError as error:
-                # The refusal is recorded as a rewake row, so it is not repeated.
+                # The wake records its own refusal. The claim stays, so the refusal is not repeated.
+                if error.code == "wake_session_mismatch":
+                    await db.execute(update(MailWakeAttempt).where(
+                        MailWakeAttempt.source == REWAKE_SOURCE,
+                        MailWakeAttempt.reason_code == f"rewake:{attempt.id}",
+                        MailWakeAttempt.result == "claimed").values(result="cancelled"))
+                    await db.commit()
                 logger.debug("Wake follow-up for member %s refused: %s", member_id, error.code)
                 continue
             woken.append(member_id)
         return woken
+
+    @staticmethod
+    async def _claim(db: AsyncSession, member_id: int, attempt: MailWakeAttempt) -> bool:
+        """Insert the claim row unless a rewake row for this attempt exists. True for the one claimant."""
+        reason = f"rewake:{attempt.id}"
+        taken = exists().where(MailWakeAttempt.source == REWAKE_SOURCE, MailWakeAttempt.reason_code == reason)
+        claim = select(
+            literal(member_id), literal("server"), literal(REWAKE_SOURCE), literal(reason),
+            literal(uuid4().hex), literal(attempt.unread_count), literal(attempt.pending_count),
+            literal("claimed"), literal(datetime.utcnow()),
+        ).where(~taken)
+        result = await db.execute(insert(MailWakeAttempt).from_select(
+            ["member_id", "actor_type", "source", "reason_code", "correlation_id", "unread_count",
+             "pending_count", "result", "created_at"], claim))
+        await db.commit()
+        return result.rowcount == 1
+
+    def _still_silent(self, db: AsyncSession, member: MailTeamMember, since: datetime):
+        """The check made just before the transport: the member still shows no activity."""
+        async def guard() -> bool:
+            if await self._mail_activity_since(db, member.id, since):
+                return False
+            try:
+                fresh = await agent_status_service.for_members(db, [member])
+            except (OSError, ValueError):
+                return False
+            return self._known_idle_before(fresh.get(member.id), since)
+        return guard
 
     @staticmethod
     async def _mail_activity_since(db: AsyncSession, member_id: int, since: datetime) -> bool:

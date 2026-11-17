@@ -3,14 +3,17 @@
 A member is re-woken only on positive evidence of no activity: no Mail read, ack or sent message after
 the wake, and a known native idle state from before the wake. Unknown stays unknown.
 """
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import settings
+from app.database import Base
 from app.models.database import MailMessage, MailReceipt, MailTeamMember, MailWakeAttempt
 from app.services.agent_mail_service import MailWakeError, agent_mail_service
 from app.services.agent_status_service import agent_status_service
@@ -29,12 +32,19 @@ def rewakes(monkeypatch):
     """Replace the transport. The fake writes the audit row the real wake writes."""
     calls = []
 
-    async def fake_wake(db, member_id, now, *args, source="auto_nudge", reason_code=None, **options):
-        calls.append((member_id, source, reason_code))
-        db.add(MailWakeAttempt(
+    async def fake_wake(db, member_id, now, *args, source="auto_nudge", reason_code=None,
+                        delivery_guard=None, **options):
+        row = MailWakeAttempt(
             member_id=member_id, actor_type="server", source=source, reason_code=reason_code or source,
-            correlation_id=uuid4().hex, result="attempted"))
+            correlation_id=uuid4().hex, result="attempted")
+        db.add(row)
         await db.commit()
+        # The real wake asks the guard after the audit row and just before the transport.
+        if delivery_guard is not None and not await delivery_guard():
+            row.result, row.failure_code = "refused", "wake_session_mismatch"
+            await db.commit()
+            raise MailWakeError("wake_session_mismatch")
+        calls.append((member_id, source, reason_code))
         return {"method": "tmux"}
 
     monkeypatch.setattr(agent_mail_service, "_wake_member", fake_wake)
@@ -83,7 +93,9 @@ def idle(since):
 
 
 async def rewake_rows(db):
-    return list((await db.scalars(select(MailWakeAttempt).where(MailWakeAttempt.source == "rewake"))).all())
+    """The re-wakes that reached the wake. A claim row only reserves the attempt."""
+    return list((await db.scalars(select(MailWakeAttempt).where(
+        MailWakeAttempt.source == "rewake", MailWakeAttempt.result != "claimed"))).all())
 
 
 @pytest.mark.asyncio
@@ -287,3 +299,96 @@ async def test_the_scheduler_runs_the_follow_up_after_its_stages(db, monkeypatch
     await GithubDispatchScheduler().run_repo_once(db, "owner", "repo", client=object())
 
     assert ticks == [db]
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_ticks_send_one_follow_up(tmp_path, rewakes, monkeypatch):
+    """Two repo jobs sweep at once. Both see the attempt unclaimed unless the claim is serialized and durable."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/mail.db")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as setup:
+        b2 = await member(setup)
+        await delivered_wake(setup, b2.id)
+
+    async def slow_for_members(db, members, *, activities=None):
+        await asyncio.sleep(0.05)  # lets the other tick reach the same point
+        return {m.id: idle(aware(WAKE_AT - timedelta(minutes=10))) for m in members}
+
+    monkeypatch.setattr(agent_status_service, "for_members", slow_for_members)
+
+    async def sweep():
+        async with maker() as session:
+            return await wake_followup_service.tick(session, NOW)
+
+    await asyncio.gather(sweep(), sweep())
+    await engine.dispose()
+
+    assert rewakes == [(b2.id, "rewake", "rewake:1")]
+
+
+@pytest.mark.asyncio
+async def test_mail_read_while_native_state_is_read_cancels_the_follow_up(db, rewakes, monkeypatch):
+    b2 = await member(db)
+    await delivered_wake(db, b2.id)
+
+    async def reading_member(session, members, *, activities=None):
+        # The member acts while the observation runs.
+        await receipt(session, b2.id, read_at=WAKE_AT + timedelta(seconds=45))
+        return {b2.id: idle(aware(WAKE_AT - timedelta(minutes=10)))}
+
+    monkeypatch.setattr(agent_status_service, "for_members", reading_member)
+
+    await wake_followup_service.tick(db, NOW)
+
+    assert rewakes == []
+
+
+@pytest.mark.asyncio
+async def test_native_work_that_starts_before_delivery_cancels_the_follow_up(db, rewakes, monkeypatch):
+    b2 = await member(db)
+    await delivered_wake(db, b2.id)
+    reads = []
+
+    async def starts_working(session, members, *, activities=None):
+        reads.append(1)
+        if len(reads) == 1:
+            return {b2.id: idle(aware(WAKE_AT - timedelta(minutes=10)))}
+        return {b2.id: SimpleNamespace(activity_state="working", idle_since=None)}
+
+    monkeypatch.setattr(agent_status_service, "for_members", starts_working)
+
+    await wake_followup_service.tick(db, NOW)
+
+    assert len(reads) == 2
+    assert rewakes == []
+
+
+@pytest.mark.asyncio
+async def test_the_newest_wake_sets_the_delay_not_an_older_unanswered_one(db, rewakes, native):
+    b2 = await member(db)
+    await delivered_wake(db, b2.id, at=WAKE_AT)
+    newest = await delivered_wake(db, b2.id, at=NOW - timedelta(seconds=10))
+    native[b2.id] = idle(aware(WAKE_AT - timedelta(minutes=10)))
+
+    await wake_followup_service.tick(db, NOW)
+    assert rewakes == []
+
+    await wake_followup_service.tick(db, NOW + timedelta(seconds=200))
+    assert rewakes == [(b2.id, "rewake", f"rewake:{newest.id}")]
+
+
+@pytest.mark.asyncio
+async def test_a_claim_is_taken_once_even_when_the_first_read_was_stale(db):
+    """Another process can claim between this sweep's read and its claim. Only one claimant gets a row."""
+    b2 = await member(db)
+    wake = await delivered_wake(db, b2.id)
+
+    first = await wake_followup_service._claim(db, b2.id, wake)
+    second = await wake_followup_service._claim(db, b2.id, wake)
+
+    assert (first, second) == (True, False)
+    rows = list((await db.scalars(select(MailWakeAttempt).where(
+        MailWakeAttempt.reason_code == f"rewake:{wake.id}"))).all())
+    assert [row.result for row in rows] == ["claimed"]
