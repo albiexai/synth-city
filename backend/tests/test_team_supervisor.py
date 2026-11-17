@@ -734,3 +734,300 @@ def test_opencode_duplicate_rows_refuse_before_a_second_cell_is_fetched(tmp_path
     with pytest.raises(ValueError, match="opencode_record_malformed"):
         _oc_scan(sup, monkeypatch)
     assert all(n <= 1 for n in payload_rows), payload_rows
+
+
+# --- Antigravity CLI (#984 Part 1) ------------------------------------------------------------
+# Observed record shapes come only from the #737 fixtures (agy 1.5.9, isolated runtime, stub model).
+# Every other shape, including an ERROR step that was never captured, fails closed before the
+# stored offset moves, so the guard can't report a normal state over an unproven record.
+
+AGY_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "antigravity_sessions"
+AGY_ID = "6f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f"
+
+
+def _agy(kind, source, **fields):
+    return {"step_index": 1, "type": kind, "source": source, "status": "DONE",
+            "created_at": "2026-11-16T11:39:25Z", **fields}
+
+
+def test_antigravity_model_reply_notice_is_found():
+    assert ts.notice(_agy("PLANNER_RESPONSE", "MODEL", content=NOTICE)) == "cybersecurity_notice"
+
+
+@pytest.mark.parametrize("record", [
+    _agy("USER_INPUT", "USER_EXPLICIT", content=NOTICE),
+    _agy("SYSTEM_MESSAGE", "SYSTEM", content=NOTICE),
+    _agy("PLANNER_RESPONSE", "MODEL", tool_calls=[{"name": "run_command", "args": {"command": NOTICE}}]),
+], ids=["user_input", "system_message", "tool_call_arguments"])
+def test_antigravity_quoted_or_tool_text_never_creates_a_hold(record):
+    ts.antigravity_record(record)  # observed shapes pass the check
+    assert ts.notice(record) is None
+
+
+@pytest.mark.parametrize("record", [
+    _agy("ERROR", "SYSTEM", content=NOTICE),
+    _agy("ERROR", "MODEL", content="tool failed"),
+    _agy("RUN_COMMAND", "MODEL", content="done"),
+    _agy("PLANNER_RESPONSE", "USER_EXPLICIT", content=NOTICE),
+    _agy("PLANNER_RESPONSE", "MODEL"),
+    _agy("PLANNER_RESPONSE", "MODEL", content=["not", "a", "string"]),
+    _agy("PLANNER_RESPONSE", "MODEL", tool_calls=[]),
+    _agy("PLANNER_RESPONSE", "MODEL", tool_calls=[{"args": {}}]),
+    _agy("PLANNER_RESPONSE", "MODEL", tool_calls="run_command"),
+    _agy("PLANNER_RESPONSE", "MODEL", content="both", tool_calls=[{"name": "run_command"}]),
+    _agy("USER_INPUT", "MODEL", content="x"),
+    {"content": NOTICE},
+], ids=["error_step", "model_error_step", "unknown_type", "planner_from_user", "planner_without_content",
+        "planner_content_not_text", "empty_tool_calls", "tool_call_without_name", "tool_calls_not_a_list",
+        "content_and_tool_calls", "user_input_from_model", "no_type"])
+def test_antigravity_unobserved_record_fails_closed(record):
+    with pytest.raises(ValueError, match="antigravity_record_unobserved"):
+        ts.antigravity_record(record)
+
+
+def _agy_root(tmp_path, records=None, fixture=None, lock=True):
+    root = tmp_path / "agy-data"
+    logs = root / "brain" / AGY_ID / ".system_generated" / "logs"
+    logs.mkdir(parents=True)
+    (root / "presence").mkdir()
+    if lock:
+        (root / "presence" / f"{AGY_ID}.lock").write_bytes(b"")
+    data = (AGY_FIXTURES / fixture).read_bytes() if fixture else b"".join(
+        json.dumps(r).encode() + b"\n" for r in records or [])
+    (logs / "transcript.jsonl").write_bytes(data)
+    return root, logs / "transcript.jsonl"
+
+
+def _agy_supervisor(tmp_path, root, **extra):
+    import os
+    return _supervisor(tmp_path, antigravity_data_root=str(root), agent_uid=os.getuid(), **extra)
+
+
+def _agy_binding(native_id=AGY_ID):
+    return {"provider": "antigravity-cli", "repo_path": "/w/agy",
+            "launch_options": json.dumps({} if native_id is None else {"session_id": native_id})}
+
+
+def _agy_scan(tmp_path, monkeypatch, **root_args):
+    root, transcript = _agy_root(tmp_path, **root_args)
+    sup = _agy_supervisor(tmp_path, root)
+    stopped = []
+    monkeypatch.setattr(sup, "stop", lambda reason, **kw: stopped.append(kw.get("rule")))
+    return sup, transcript, stopped
+
+
+@pytest.mark.parametrize("fixture", ["turn_completed.jsonl", "question_waiting.jsonl",
+                                     "tool_turn_working.jsonl", "resumed.jsonl"])
+def test_antigravity_observed_fixtures_scan_clean(tmp_path, monkeypatch, fixture):
+    sup, transcript, stopped = _agy_scan(tmp_path, monkeypatch, fixture=fixture)
+    assert sup.scan([_agy_binding()]) is True and stopped == []
+    assert sup.state["offsets"][str(transcript)] == transcript.stat().st_size
+
+
+def test_antigravity_reply_notice_stops_the_team(tmp_path, monkeypatch):
+    records = [_agy("USER_INPUT", "USER_EXPLICIT", content="hi"), _agy("PLANNER_RESPONSE", "MODEL", content=NOTICE)]
+    sup, _, stopped = _agy_scan(tmp_path, monkeypatch, records=records)
+    assert sup.scan([_agy_binding()]) is False and stopped == ["cybersecurity_notice"]
+
+
+def test_antigravity_unobserved_record_keeps_the_offset_and_is_read_again(tmp_path, monkeypatch):
+    records = [_agy("USER_INPUT", "USER_EXPLICIT", content="hi"), _agy("ERROR", "SYSTEM", content="boom")]
+    sup, transcript, stopped = _agy_scan(tmp_path, monkeypatch, records=records)
+    for _ in range(2):
+        with pytest.raises(ValueError, match="antigravity_record_unobserved"):
+            sup.scan([_agy_binding()])
+        assert str(transcript) not in sup.state["offsets"] and stopped == []
+
+
+@pytest.mark.parametrize("native_id", [None, "not-a-uuid", AGY_ID.upper(), AGY_ID + "0"],
+                         ids=["missing", "not_uuid", "upper_case", "too_long"])
+def test_antigravity_session_identity_must_be_a_canonical_uuid(tmp_path, monkeypatch, native_id):
+    sup, _, _ = _agy_scan(tmp_path, monkeypatch, fixture="turn_completed.jsonl")
+    with pytest.raises(ValueError, match="native_session_identity_missing"):
+        sup.scan([_agy_binding(native_id)])
+
+
+def test_antigravity_presence_lock_must_exist(tmp_path, monkeypatch):
+    sup, _, _ = _agy_scan(tmp_path, monkeypatch, fixture="turn_completed.jsonl", lock=False)
+    with pytest.raises(FileNotFoundError, match="antigravity_presence_missing"):
+        sup.scan([_agy_binding()])
+
+
+@pytest.mark.parametrize("target", ["lock", "transcript", "logs_dir", "data_root"])
+def test_antigravity_symlinked_files_fail_closed(tmp_path, monkeypatch, target):
+    root, transcript = _agy_root(tmp_path, fixture="turn_completed.jsonl")
+    elsewhere = tmp_path / "elsewhere"
+    path = {"lock": root / "presence" / f"{AGY_ID}.lock", "transcript": transcript,
+            "logs_dir": transcript.parent, "data_root": root}[target]
+    path.rename(elsewhere)
+    path.symlink_to(elsewhere)
+    sup = _agy_supervisor(tmp_path, root)
+    with pytest.raises((ValueError, FileNotFoundError), match="antigravity_"):
+        sup.scan([_agy_binding()])
+
+
+@pytest.mark.parametrize("target", ["lock", "transcript"])
+def test_antigravity_files_of_another_user_fail_closed(tmp_path, monkeypatch, target):
+    import os
+    root, _ = _agy_root(tmp_path, fixture="turn_completed.jsonl")
+    sup = _supervisor(tmp_path, antigravity_data_root=str(root), agent_uid=os.getuid() + 1)
+    with pytest.raises((ValueError, FileNotFoundError), match="antigravity_"):
+        sup.scan([_agy_binding()])
+
+
+def test_antigravity_data_root_defaults_to_the_agent_passwd_home(tmp_path, monkeypatch):
+    import os
+    from types import SimpleNamespace
+    home = tmp_path / "home"
+    root, _ = _agy_root(tmp_path, fixture="turn_completed.jsonl")
+    (home / ".gemini").mkdir(parents=True)
+    root.rename(home / ".gemini" / "antigravity-cli")
+    monkeypatch.setattr(ts.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(home)) if uid == os.getuid() else None)
+    sup = _supervisor(tmp_path, agent_uid=os.getuid())
+    monkeypatch.setattr(sup, "stop", lambda reason, **kw: None)
+    assert sup.scan([_agy_binding()]) is True
+
+
+def test_an_armed_run_over_an_unobserved_record_ends_in_recovery_never_supervising(tmp_path, monkeypatch):
+    records = [_agy("USER_INPUT", "USER_EXPLICIT", content="hi"), _agy("ERROR", "SYSTEM", content="boom")]
+    root, _ = _agy_root(tmp_path, records=records)
+    sup = _agy_supervisor(tmp_path, root, armed_path=str(tmp_path / "ARMED"))
+    sup.state["autonomy_enabled"] = True
+    preset = {"autonomy_enabled": True, "slots": [{"id": i, "enabled": True} for i in (1, 2, 3)]}
+    calls = []
+
+    def api(method, path, body=None):
+        calls.append((method, path, body))
+        if method == "GET":
+            return {**preset, "autonomy_enabled": False} if calls[-1] and any(m == "PATCH" for m, _, _ in calls) else preset
+        return {}
+
+    monkeypatch.setattr(sup, "api", api)
+    monkeypatch.setattr(sup, "bindings", lambda: [_agy_binding()])
+    monkeypatch.setattr(sup, "freeze", lambda: [])
+    ts.run(sup)
+    state = json.loads(Path(sup.state_path).read_text())
+    assert state["mode"] == "RECOVERY_REQUIRED" and state["autonomy_enabled"] is False
+    assert state["incident"]["reason"] == "supervision_ValueError"
+    assert ("PATCH", "/agent-teams/presets/3", {"autonomy_enabled": False}) in calls
+
+
+def test_a_disarmed_run_over_an_unobserved_record_reports_a_startup_gap(tmp_path, monkeypatch):
+    records = [_agy("ERROR", "SYSTEM", content="boom")]
+    root, _ = _agy_root(tmp_path, records=records)
+    sup = _agy_supervisor(tmp_path, root, armed_path=str(tmp_path / "ARMED"))
+    preset = {"autonomy_enabled": False, "slots": [{"id": i, "enabled": True} for i in (1, 2, 3)]}
+    monkeypatch.setattr(sup, "api", lambda method, path, body=None: preset)
+    monkeypatch.setattr(sup, "bindings", lambda: [_agy_binding()])
+    ts.run(sup)
+    state = json.loads(Path(sup.state_path).read_text())
+    assert state["mode"] == "STARTUP_GAP" and state["error_type"] == "ValueError"
+
+
+# --- #1020 review: the checked path and the saved offset must hold through the open -----------
+
+def _armed(tmp_path, monkeypatch, records):
+    root, transcript = _agy_root(tmp_path, records=records)
+    sup = _agy_supervisor(tmp_path, root, armed_path=str(tmp_path / "ARMED"))
+    sup.state["autonomy_enabled"] = True
+    preset = {"autonomy_enabled": True, "slots": [{"id": i, "enabled": True} for i in (1, 2, 3)]}
+    calls = []
+
+    def api(method, path, body=None):
+        calls.append((method, path, body))
+        if path.startswith("/agent-mail/team"):
+            return {"members": [{"team_preset_id": 3, "team_slot_id": i, "status": "connected",
+                                 "wake_state": "wakeable"} for i in (1, 2, 3)]}
+        return {**preset, "autonomy_enabled": not any(m == "PATCH" for m, _, _ in calls)}
+
+    monkeypatch.setattr(sup, "api", api)
+    monkeypatch.setattr(sup, "bindings", lambda: [_agy_binding()])
+    monkeypatch.setattr(sup, "freeze", lambda: [])
+    return sup, transcript
+
+
+def _swap_before_open(monkeypatch, name, swap):
+    """Run swap() once, just before the guard opens `name`, by name or by its last component."""
+    import os
+    original = os.open
+    done = []
+
+    def opener(path, flags, *args, **kwargs):
+        if not done and os.path.basename(str(path)) == name:
+            done.append(True)
+            swap()
+        return original(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(ts.os, "open", opener)
+    return done
+
+
+def _harmless_logs(tmp_path):
+    other = tmp_path / "other-logs"
+    other.mkdir()
+    (other / "transcript.jsonl").write_text(json.dumps(_agy("PLANNER_RESPONSE", "MODEL", content="harmless")) + "\n")
+    return other
+
+
+@pytest.mark.parametrize("moment", ["logs", "transcript.jsonl"])
+def test_a_parent_swapped_during_the_walk_never_hides_a_notice(tmp_path, monkeypatch, moment):
+    sup, transcript = _armed(tmp_path, monkeypatch, [_agy("PLANNER_RESPONSE", "MODEL", content=NOTICE)])
+    other = _harmless_logs(tmp_path)
+
+    def swap():
+        transcript.parent.rename(tmp_path / "bound-logs")
+        transcript.parent.symlink_to(other, target_is_directory=True)
+
+    done = _swap_before_open(monkeypatch, moment, swap)
+    ts.run(sup)
+    assert done and sup.state["mode"] != "SUPERVISING"
+    assert str(transcript) not in sup.state["offsets"]
+    if moment == "transcript.jsonl":
+        # The logs directory was already held: the original transcript is read and its notice found.
+        assert sup.state["mode"] == "WAITING_FOR_USER" and sup.state["incident"]["rule"] == "cybersecurity_notice"
+    else:
+        assert sup.state["mode"] == "RECOVERY_REQUIRED"
+
+
+@pytest.mark.parametrize("replacement", ["shorter", "same_size", "longer"])
+def test_a_replaced_transcript_after_a_saved_offset_fails_closed(tmp_path, monkeypatch, replacement):
+    first = _agy("PLANNER_RESPONSE", "MODEL", content="x" * 512)
+    sup, transcript = _armed(tmp_path, monkeypatch, [first])
+    ts.run(sup)  # the first tick reads the file and saves its offset and identity
+    assert sup.state["mode"] == "SUPERVISING" and sup.state["offsets"][str(transcript)] == transcript.stat().st_size
+    size = transcript.stat().st_size
+    notice = json.dumps(_agy("PLANNER_RESPONSE", "MODEL", content=NOTICE)).encode() + b"\n"
+    body = {"shorter": notice,
+            "same_size": notice.rjust(size - 1, b" ")[: size - 1] + b"\n",
+            "longer": b" " * size + notice}[replacement]
+    other = tmp_path / "replacement.jsonl"
+    other.write_bytes(body)
+    done = _swap_before_open(monkeypatch, "transcript.jsonl", lambda: other.replace(transcript))
+    ts.run(sup)
+    assert done and sup.state["mode"] == "RECOVERY_REQUIRED"
+    assert sup.state["incident"]["reason"] == "supervision_ValueError"
+
+
+def test_a_saved_offset_without_a_saved_identity_fails_closed(tmp_path, monkeypatch):
+    sup, transcript = _armed(tmp_path, monkeypatch, [_agy("PLANNER_RESPONSE", "MODEL", content="x" * 64)])
+    sup.state["offsets"][str(transcript)] = 10
+    ts.run(sup)
+    assert sup.state["mode"] == "RECOVERY_REQUIRED"
+
+
+@pytest.mark.parametrize("component", ["presence", "brain", AGY_ID, ".system_generated", "logs"])
+def test_a_symlinked_directory_at_any_level_fails_closed_in_the_walk(tmp_path, monkeypatch, component):
+    sup, transcript = _armed(tmp_path, monkeypatch, [_agy("PLANNER_RESPONSE", "MODEL", content="hi")])
+    root = Path(sup.config["antigravity_data_root"])
+    target = root / "presence" if component == "presence" else {
+        "brain": root / "brain", AGY_ID: root / "brain" / AGY_ID,
+        ".system_generated": root / "brain" / AGY_ID / ".system_generated", "logs": transcript.parent}[component]
+
+    def swap():
+        moved = tmp_path / ("moved-" + target.name)
+        target.rename(moved)
+        target.symlink_to(moved, target_is_directory=True)
+
+    done = _swap_before_open(monkeypatch, component, swap)
+    ts.run(sup)
+    assert done and sup.state["mode"] == "RECOVERY_REQUIRED"
