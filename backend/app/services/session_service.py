@@ -472,7 +472,7 @@ class SessionService:
             # The cache holds the sessions of every home, one row per session id. Count a row only if it describes
             # the file under the scoped home (#1065). A row built from another home's file, or from this file before
             # it changed, is refreshed from the scoped file first: one streamed scan, as the session list does.
-            cached_entries = []
+            counted = []  # (modified_at, total_messages, project name) of each session under the scoped home
             for entry in result.scalars().all():
                 if (entry.project_folder, entry.session_id) not in present:
                     continue
@@ -483,21 +483,23 @@ class SessionService:
                         summary = await self._scan_summary(entry.session_id, entry.project_folder, path,
                                                            stat.st_mtime, stat.st_size)
                         await self.save_to_cache(summary, path)
-                        await self.db.refresh(entry)
+                        # Count what was just scanned from the scoped file. The row is shared by every home, so
+                        # another request may replace it any moment after the save: it is never read back here.
+                        counted.append((datetime.fromisoformat(summary.modified_at), summary.total_messages,
+                                        summary.project_name or summary.project_folder))
+                        continue
                 except OSError:
                     continue  # the file went away since it was listed
-                cached_entries.append(entry)
+                counted.append((entry.modified_at, entry.total_messages, entry.project_name or entry.project_folder))
 
-            for entry in cached_entries:
-                modified = entry.modified_at
+            for modified, messages, name in counted:
                 if modified.tzinfo is None:
                     modified = modified.replace(tzinfo=timezone.utc)
                 if modified >= today_start:
                     sessions_today += 1
                 if modified >= week_start:
                     sessions_this_week += 1
-                total_messages += entry.total_messages or 0
-                name = entry.project_name or entry.project_folder
+                total_messages += messages or 0
                 project_counts[name] = project_counts.get(name, 0) + 1
 
             if project_counts:

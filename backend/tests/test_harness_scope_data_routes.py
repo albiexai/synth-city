@@ -187,6 +187,39 @@ async def test_a_session_that_grew_since_it_was_cached_is_counted_with_its_curre
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("same_key", [True, False])
+async def test_a_row_overwritten_by_another_request_mid_refresh_cannot_reach_the_statistics(
+        homes, client, monkeypatch, same_key):
+    """The cache row is shared by every home. Another request may replace it between my save and my count."""
+    from app.services.session_service import SessionService
+
+    monkeypatch.setattr(settings, "harness_agent_user", AGENT)
+    controller = path_utils.controller_user_name()
+    write_session(homes.agent, "-same", "dup", 10, pairs=1)
+    assert (await client.get(API + "/sessions", headers={HEADER: AGENT})).status_code == 200   # the row exists
+    if same_key:
+        write_session(homes.controller, "-same", "dup", 10, pairs=1)    # the controller has a 2-message "dup" too
+    else:
+        write_session(homes.controller, "-solo", "solo", 10, pairs=1)   # an unrelated session of the controller
+    write_session(homes.agent, "-same", "dup", 10, pairs=2)              # the agent's file grew: 4 messages, row stale
+
+    original = SessionService.save_to_cache
+    state = {"interleaved": False}
+
+    async def save(self, summary, filepath):
+        await original(self, summary, filepath)
+        if not state["interleaved"]:
+            state["interleaved"] = True
+            # A real request for the other home, right after the agent's scan was saved and committed.
+            assert (await client.get(API + "/sessions", headers={HEADER: controller})).status_code == 200
+
+    monkeypatch.setattr(SessionService, "save_to_cache", save)
+
+    assert await total_messages(client, AGENT) == 4     # the scoped file's messages, whatever the row became meanwhile
+    assert state["interleaved"] is True
+
+
+@pytest.mark.asyncio
 async def test_an_unchanged_session_is_not_scanned_again_by_the_statistics(homes, client, monkeypatch):
     """The refresh costs a scan only for a row whose file changed or belongs to another home."""
     from app.services.session_service import SessionService
