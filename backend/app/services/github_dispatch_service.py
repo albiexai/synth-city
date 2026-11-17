@@ -50,6 +50,7 @@ from app.services.github_approval_service import (
 from app.services.github_client import github_client
 from app.services.github_dispatch_priority import dispatch_order_key, priority_from_labels
 from app.services.github_recovery_gate import GithubRecoveryOnlyAttempt
+from app.services.session_recovery import recover_session
 from app.services.github_workspace_service import (
     _RELEASABLE_STATUSES,
     GithubWorkspaceConfigError,
@@ -2082,8 +2083,9 @@ class GithubDispatchService:
             item.brief_message_id = message.id
             item.brief_delivery_nudge_at = None
             item.brief_delivery_nudge_count = None
-        except Exception:
+        except Exception as caught_error:
             logger.exception("Failed to send autonomous dispatch brief for item %s", item.id)
+            await recover_session(db, caught_error)
 
     async def _session_ambiguity_note(
         self, db: AsyncSession, owner_slot_id: int
@@ -2097,11 +2099,12 @@ class GithubDispatchService:
         )
         try:
             await agent_mail_service.sync_observed_sessions(db, strict=True)
-        except Exception:
+        except Exception as caught_error:
             logger.exception(
                 "session discovery failed while checking slot %s for ambiguity",
                 owner_slot_id,
             )
+            await recover_session(db, caught_error)
             return (
                 "Session discovery failed, so the owning pane could not be "
                 "confirmed. Holding rather than briefing an unknown session."
@@ -2229,11 +2232,12 @@ class GithubDispatchService:
                 None,
                 owner_may_be_active=True,
             )
-        except Exception:
+        except Exception as caught_error:
             logger.exception(
                 "Failed to notify after approval rounds exhausted for item %s",
                 item.id,
             )
+            await recover_session(db, caught_error)
         return True
 
     async def _ack_evidence(
@@ -2455,9 +2459,10 @@ class GithubDispatchService:
                     **notice_fields,
                 )
                 await db.commit()
-            except Exception:
+            except Exception as caught_error:
                 # The notice is already sent; a missing observation never
                 # replays it.
+                await recover_session(db, caught_error)
                 await db.rollback()
 
     async def accept_handoff(
@@ -3214,7 +3219,7 @@ class GithubDispatchService:
                             item,
                             cancelled_revision,
                         )
-                    except Exception:
+                    except Exception as caught_error:
                         logger.exception(
                             "Recovery monitor could not repair active continuation "
                             "cancellation notice for work item %s",
@@ -3228,6 +3233,7 @@ class GithubDispatchService:
                             action="skip",
                             block_code="cancellation_notice_failed",
                         )
+                        await recover_session(db, caught_error)
                         continue
                     self._log_recovery_monitor(
                         item,
@@ -3338,11 +3344,12 @@ class GithubDispatchService:
                         note,
                         owner_may_be_active=False,
                     )
-                except Exception:
+                except Exception as caught_error:
                     logger.exception(
                         "Failed to send continuation budget escalation for item %s",
                         item.id,
                     )
+                    await recover_session(db, caught_error)
                 self._log_recovery_monitor(
                     item,
                     revision=None,
@@ -4038,11 +4045,12 @@ class GithubDispatchService:
             )
             if reason == "dispatch_label_removed":
                 await self._send_label_removed_owner_message(db, item)
-        except Exception:
+        except Exception as caught_error:
             logger.exception(
                 "Failed to send autonomous dispatch escalation notification for item %s",
                 item.id,
             )
+            await recover_session(db, caught_error)
             await db.rollback()
             self._apply_escalation(item, reason, note, preserve_existing_reason=False)
 
@@ -4097,8 +4105,9 @@ class GithubDispatchService:
                 sanitized_reason="abandon notice delivered",
                 operation_id=f"{operation}:notice:applied", **notice_fields)
             await db.commit()
-        except Exception:
+        except Exception as caught_error:
             logger.exception("Failed to send the abandon notification for item %s", item_id)
+            await recover_session(db, caught_error)
             await _audit.record_observation(
                 db, occurred_at=datetime.utcnow(), action_outcome="uncertain",
                 sanitized_reason="abandon notice unsettled after the committed escalation",

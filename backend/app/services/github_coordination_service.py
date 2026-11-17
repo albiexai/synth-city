@@ -33,6 +33,7 @@ from app.services.github_dispatch_service import (
 )
 from app.services.github_recovery_gate import configured_recovery_only_attempt
 from app.utils import peer_process
+from app.services.session_recovery import recover_session
 
 logger = logging.getLogger(__name__)
 _BOOT_ID = uuid4().hex
@@ -499,7 +500,8 @@ class GithubCoordinationService:
         except CoordinationError as exc:
             await self._record_error(db, scope_id, version, exc.code)
             return
-        except Exception:
+        except Exception as caught_error:
+            await recover_session(db, caught_error)
             await self._record_error(db, scope_id, version, "backlog_unavailable")
             return
         row = await self.state(db, scope_id)
@@ -540,9 +542,10 @@ class GithubCoordinationService:
                 pane = await agent_mail_service._nudge_session_for_member(db, leader.member_id, now)
                 if pane.pid != leader.bound_pane_pid:
                     raise CoordinationError("leader_unavailable")
-            except Exception:
+            except Exception as caught_error:
                 values["error_code"] = "leader_unavailable"
                 want_request = False
+                await recover_session(db, caught_error)
         if hold_code():
             await db.rollback()
             return

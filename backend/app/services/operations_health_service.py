@@ -246,13 +246,14 @@ class OperationsHealthService:
 
     # ---- detector 4: a poll whose writes were rolled back -----------------------------------------------
 
-    async def record_poll_failure(self, owner: str, repo: str, error: BaseException) -> None:
+    async def record_poll_failure(self, owner: str, repo: str, error: BaseException, stage: str | None = None) -> None:
         """A repo run raised, so its session was discarded with everything it had not committed."""
+        where = f" in {stage}" if stage else ""
         try:
             async with self._session() as db:
                 await self._open(
                     db, kind=POLL_ROLLED_BACK, subject=f"repo:{owner}/{repo}",
-                    detail=(f"A poll of {owner}/{repo} failed ({type(error).__name__}) and its uncommitted "
+                    detail=(f"A poll of {owner}/{repo} failed{where} ({type(error).__name__}) and its uncommitted "
                             "writes were discarded."))
         except Exception:
             self._failed(f"poll failure record for {owner}/{repo}")

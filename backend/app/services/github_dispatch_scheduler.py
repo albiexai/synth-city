@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from contextvars import ContextVar
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,6 +34,10 @@ from app.services.wake_followup_service import wake_followup_service
 logger = logging.getLogger(__name__)
 
 _JOB_PREFIX = "github-dispatch:"
+
+
+# #1148: the stage a repo run is in, per task, so a poll failure finding says where it failed.
+_poll_stage: ContextVar[str | None] = ContextVar("poll_stage", default=None)
 
 
 class GithubDispatchScheduler:
@@ -107,6 +112,7 @@ class GithubDispatchScheduler:
             )
 
     async def run_repo_job(self, owner: str, repo: str) -> None:
+        _poll_stage.set("start")
         try:
             async with AsyncSessionLocal() as db:
                 await self.run_repo_once(db, owner, repo)
@@ -115,7 +121,7 @@ class GithubDispatchScheduler:
         except Exception as error:
             logger.exception("Autonomous GitHub dispatch job failed for %s/%s", owner, repo)
             # #941: the session was discarded with everything it had not committed; say so once.
-            await operations_health_service.record_poll_failure(owner, repo, error)
+            await operations_health_service.record_poll_failure(owner, repo, error, _poll_stage.get())
 
     async def run_repo_once(
         self,
@@ -150,6 +156,7 @@ class GithubDispatchScheduler:
             if not await self._scope_remains_autonomous(db, scope_id):
                 continue
             scope, _slots = await self._reload_scope_context(db, scope_id)
+            _poll_stage.set("poll_scope")
             await self.watcher.poll_scope(db, scope, client)
             await db.commit()
             if not await self._scope_remains_autonomous(db, scope.id):
@@ -160,6 +167,7 @@ class GithubDispatchScheduler:
                 number: [label["name"] for label in issue.get("labels", []) if "name" in label]
                 for number, issue in issues_by_number.items()
             }
+            _poll_stage.set("dispatch_pending")
             await self.dispatch.dispatch_pending(
                 db,
                 scope,
@@ -175,16 +183,19 @@ class GithubDispatchScheduler:
             if not await self._scope_remains_autonomous(db, scope.id):
                 continue
             scope, slots = await self._reload_scope_context(db, scope.id)
+            _poll_stage.set("monitor_dispatched")
             await self.dispatch.monitor_dispatched(db, scope, slots)
             await db.commit()
             if not await self._scope_remains_autonomous(db, scope.id):
                 continue
             scope, slots = await self._reload_scope_context(db, scope.id)
+            _poll_stage.set("monitor_continuation")
             await self.dispatch.monitor_continuation(db, scope, slots)
             await db.commit()
             if not await self._scope_remains_autonomous(db, scope.id):
                 continue
             scope, _slots = await self._reload_scope_context(db, scope.id)
+            _poll_stage.set("verification")
             await self.verification.process_scope(db, scope, client=client)
             await db.commit()
             # #941: detection runs after the commit, in sessions of its own, and never raises.
@@ -195,11 +206,13 @@ class GithubDispatchScheduler:
             if not await self._scope_remains_autonomous(db, scope.id):
                 continue
             scope, slots = await self._reload_scope_context(db, scope.id)
+            _poll_stage.set("monitor_recovery")
             await self.dispatch.monitor_recovery(db, scope, slots)
             await db.commit()
             if not await self._scope_remains_autonomous(db, scope.id):
                 continue
             scope, _slots = await self._reload_scope_context(db, scope.id)
+            _poll_stage.set("remind_held_leases")
             await self.dispatch.remind_held_leases(db, scope)
             await db.commit()
             # Backlog assessment is advisory and cannot wedge verification/recovery.
@@ -219,6 +232,7 @@ class GithubDispatchScheduler:
                     logger.warning("owner_followup_failed scope=%s error_type=%s",
                                    coordination_scope_id, type(error).__name__)
         # #1059: a delivered wake with no activity is repeated once. It never fails the poll.
+        _poll_stage.set("wake_followup")
         await wake_followup_service.tick(db)
 
     async def _run_recovery_only(
