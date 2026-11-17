@@ -340,10 +340,16 @@ a later attempt that is refused before its own revoker still cannot free the id.
 earlier interim is read the same way. The retry is guarded and can fail: if the revoker refuses, the response is
 its error (503), the id stays bound, the lease stays, and no success notice is sent. Use a new `operation_id` only
 after the operator confirms the earlier attempt's effect.
-A replayed release answers `already_released`, and sends its one keyed notice, only while the ledger row of its
-`operation_id` still holds that exact request. A replay that woke after its id was freed and reused by a corrected
-request is refused (`recovery_context_changed`) and sends nothing, because the committed release belongs to the
-other request.
+A release records its outcome on the id's ledger row. A new release claim is `claimed:r2`; the attempt moves it to
+`executing:<attempt>` before any external step, and the row becomes `done:<attempt>` in the same transaction that
+clears the lease and records the release audit, so a committed release always has its done row. The success notice
+is sent only when the row is that attempt's own done row. A replay (an exact repeat that did not run the release)
+answers `already_released`, with the one keyed notice, only when the row of its `operation_id` holds the exact
+request and is a done row. A plain `claimed` row, which only the earlier interim wrote, may answer the same way
+once the release is committed (the historical exception). An executing row, a clean `claimed:r2` row, a missing
+row or another request is refused (`recovery_context_changed`) and sends nothing. Limit: the committed release
+audit belongs to the lease, so a legacy plain `claimed` row cannot be told apart from a release that another
+operation id made; that row is answered as released.
 
 ### Continuation phases
 

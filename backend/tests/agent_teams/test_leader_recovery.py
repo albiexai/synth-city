@@ -1098,6 +1098,8 @@ async def test_the_executing_marker_is_committed_before_the_revoker_runs(db, rel
         await other.close()
     assert result["status"] == "released"
     assert len(seen) == 1 and seen[0].startswith("executing:") and not seen[0].endswith(":u"), seen
+    final = await _claim_outcome(db)
+    assert final is not None and final.startswith("done:") and final.removeprefix("done:") == seen[0].removeprefix("executing:")
 
 
 @pytest.mark.asyncio
@@ -1227,6 +1229,8 @@ async def test_a_claimant_paused_before_its_marker_answers_as_the_replay_that_re
         first = asyncio.ensure_future(lr.release_workspace(db, a.item, a.leader_session, workspace_id=workspace_id,
             expected_leased_at=leased_at, operation_id="rel-1", reason=REASON))
         await asyncio.wait_for(entered.wait(), 10)   # a missing marker step fails here instead of hanging
+        assert await other.scalar(select(GithubMaintenanceEvent.outcome).where(
+            GithubMaintenanceEvent.operation_id == "leader-recovery:release:rel-1")) == "claimed:r2"   # version 2 clean row
         second = await lr.release_workspace(other, item2, session2, workspace_id=workspace_id,
             expected_leased_at=leased_at, operation_id="rel-1", reason=REASON)
         gate.set()
@@ -1236,7 +1240,7 @@ async def test_a_claimant_paused_before_its_marker_answers_as_the_replay_that_re
     assert second["status"] == "released"
     assert isinstance(outcome, dict) and outcome["status"] == "already_released", outcome
     assert len(await _release_audits(db)) == 1 and len(await _notices(db)) == 1
-    assert (await _claim_outcome(db)).startswith("executing:")      # the binding is never lost
+    assert (await _claim_outcome(db)).startswith("done:")           # the release committed with its done row
 
 
 @pytest.mark.asyncio
@@ -1359,3 +1363,95 @@ async def test_an_old_replay_of_the_same_request_after_a_reuse_answers_with_the_
     outcome = await _stale_replay_across_a_free_and_a_reuse(db, releasable, monkeypatch, corrected_reason=REASON)
     assert isinstance(outcome, dict) and outcome["status"] == "already_released", outcome
     assert len(await _release_audits(db)) == 1 and len(await _notices(db)) == 1   # the keyed notice dedupes
+
+
+@pytest.mark.asyncio
+async def test_repeated_fences_write_one_done_row_and_a_foreign_done_row_stops_the_release(db, releasable, monkeypatch):
+    a = releasable
+    revoker = AsyncMock()
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", revoker)
+    real, state = lr._assert_authority, {"calls": 0}
+
+    async def counting(*args, **kwargs):
+        state["calls"] += 1
+        return await real(*args, **kwargs)
+    monkeypatch.setattr(lr, "_assert_authority", counting)
+    same, item_id = _same_lease(a), a.item.id
+    assert (await _release(db, a, a.leader_session))["status"] == "released"
+    assert state["calls"] >= 2                                 # the fence repeats; the done row is written once
+    outcome = await _claim_outcome(db)
+    assert outcome.startswith("done:") and not outcome.endswith(":u")
+    # A second lease: the repeated fence meets a done row that is not this attempt's own and must refuse.
+    await db.rollback()
+    await db.refresh(a.workspace)
+    a.workspace.leased_item_id, a.workspace.leased_at, a.workspace.lease_token = item_id, a.workspace_leased_at, "synthetic-lease-2"
+    await db.commit()
+    from sqlalchemy import update as sql_update
+    state["calls"] = 0
+
+    async def foreign(*args, **kwargs):
+        state["calls"] += 1
+        result = await real(*args, **kwargs)
+        if state["calls"] == 1:                                # inside the writer transaction, after the first fence
+            await db.execute(sql_update(GithubMaintenanceEvent).where(
+                GithubMaintenanceEvent.operation_id == "leader-recovery:release:rel-2").values(outcome="done:someone-else"))
+        return result
+    monkeypatch.setattr(lr, "_assert_authority", foreign)
+    with pytest.raises(lr.LeaderRecoveryError) as error:
+        await _release(db, a, a.leader_session, operation_id="rel-2", reason=REASON, **{k: v for k, v in same.items()})
+    assert error.value.code == "recovery_context_changed"
+    assert revoker.await_count == 1                            # the second release stopped before its own revoker
+    assert len(await _release_audits(db)) == 1                 # and committed nothing
+    await db.rollback()
+    await db.refresh(a.workspace)
+    assert a.workspace.leased_item_id == item_id
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_plain_claimed_row_with_the_committed_release_answers_with_the_keyed_notice_only(db, releasable, monkeypatch):
+    a = releasable
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", AsyncMock())
+    same = _same_lease(a)
+    assert (await _release(db, a, a.leader_session))["status"] == "released"
+    await db.rollback()
+    row = await db.scalar(select(GithubMaintenanceEvent).where(GithubMaintenanceEvent.operation_id == "leader-recovery:release:rel-1"))
+    row.outcome = "claimed"                                     # the #997 interim wrote only plain 'claimed' rows
+    await db.commit()
+    again = await _again(db, a, same)
+    assert again["status"] == "already_released"
+    assert len(await _notices(db)) == 1 and len(await _release_audits(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_executing_row_whose_lease_was_released_under_another_id_refuses_and_sends_nothing(db, releasable, monkeypatch):
+    from app.services.github_workspace_service import GithubWorkspaceCredentialRevokeError
+    a = releasable
+    same = _same_lease(a)
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token",
+                        AsyncMock(side_effect=GithubWorkspaceCredentialRevokeError("revoke result unknown")))
+    with pytest.raises(lr.LeaderRecoveryError):                 # rel-1: unknown, the row stays executing
+        await _release(db, a, a.leader_session)
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", AsyncMock())
+    assert (await _again(db, a, same, operation_id="rel-2"))["status"] == "released"   # another operation id releases the lease
+    notices_before = len(await _notices(db))
+    with pytest.raises(lr.LeaderRecoveryError) as error:        # the exact retry of rel-1 must not speak for it
+        await _again(db, a, same)
+    assert error.value.code == "recovery_context_changed"
+    assert len(await _notices(db)) == notices_before and len(await _release_audits(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_clean_version_2_row_is_never_answered_as_a_legacy_replay(db, releasable, monkeypatch):
+    a = releasable
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", AsyncMock())
+    same = _same_lease(a)
+    item_id = a.item.id
+    assert (await _again(db, a, same, operation_id="rel-2"))["status"] == "released"   # the lease is released under rel-2
+    digest = lr._digest("release", item_id, same["workspace_id"], same["expected_leased_at"].isoformat(), REASON)
+    db.add(GithubMaintenanceEvent(operation_id="leader-recovery:release:rel-1", work_item_id=item_id,
+                                  outcome="claimed:r2", request_sha256=digest))
+    await db.commit()
+    notices_before = len(await _notices(db))
+    with pytest.raises(lr.LeaderRecoveryError) as error:
+        await _again(db, a, same)
+    assert error.value.code == "recovery_context_changed" and len(await _notices(db)) == notices_before
