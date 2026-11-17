@@ -314,16 +314,17 @@ def companion_warning(paths) -> list:
 
 
 def companion_limit_problems(paths, scope) -> list:
-    """The path limit again, counted with the companions the server adds to the request."""
+    """The companions the server adds, counted on their own bound and not against the scope's path limit (#1039)."""
     if not paths or len(paths) > scope.max_scope_paths:
         return []
     try:
         extras = companion_paths.companions_for(paths)
     except Exception:
         return []
-    if len(set(paths) | set(extras)) > scope.max_scope_paths:
+    if len(set(extras) - set(paths)) > companion_paths.MAX_COMPANION_PATHS:
         return [problem("continuation_path_limit_exceeded",
-                        message="With the companion paths the server adds, the request is over the scope's path limit.")]
+                        message=f"The companion paths the server adds are over their own bound of "
+                                f"{companion_paths.MAX_COMPANION_PATHS}.")]
     return []
 
 
