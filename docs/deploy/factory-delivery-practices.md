@@ -73,6 +73,13 @@ With `broad_checks: hosted`, focused local checks are sufficient before publicat
 Select hosted broad checks only after the full-suite workflow and required-job gate are deployed.
 The shared backend workflow runs all `backend/tests`. The optional Pi integration test uses a disposable tmux socket and skips when its local tools or dependencies are absent.
 Do not replace the full suite with a directory allowlist. Record the reason for any explicit exclusion.
+The workflow runs that suite as four parallel shard jobs (`Backend shard N of 4`, not required checks). A shard runs whole test files that
+`scripts/ci/backend_shards.py` assigns by measured time. The required check `Full backend regression tests` is the gate job that depends on
+every shard. It fails unless all shards succeeded, and then it proves the partition: `scripts/ci/backend_shard_identities.py` compares the test
+identities of the full collection with the identities every shard collected and executed (`backend/tests/ci_shard_identity.py` records each test's
+final outcome once). A dropped, duplicated, skipped-by-mistake or never-run test, a failed or errored test, a missing artifact, or two distinct
+tests that normalise to one identity fails the gate. The gate also runs the active factory fixtures check. When you change the shard count, change
+`BACKEND_SHARDS`, the matrix and the job name together; a test checks that they agree.
 Use the required host resource lock for a heavy local run.
 B4 runs independent checks for changed contracts. Root reads the evidence and source.
 Reuse valid results for unchanged source and dependencies. Keep required hosted checks on the final PR head.
