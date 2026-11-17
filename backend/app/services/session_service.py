@@ -449,10 +449,13 @@ class SessionService:
 
         # Count total sessions from filesystem (fast — no parsing)
         total_sessions = 0
+        present: set[tuple[str, str]] = set()  # (folder, session id) under this request's home
         if self.projects_dir.exists():
             for folder in self.projects_dir.iterdir():
                 if folder.is_dir():
-                    total_sessions += len(list(folder.glob("*.jsonl")))
+                    files = list(folder.glob("*.jsonl"))
+                    total_sessions += len(files)
+                    present.update((folder.name, file.stem) for file in files)
 
         # Query cache DB for stats (avoids parsing files)
         sessions_today = 0
@@ -463,7 +466,9 @@ class SessionService:
 
         if self.db:
             result = await self.db.execute(select(SessionCache))
-            cached_entries = result.scalars().all()
+            # The cache holds the sessions of every home. Count only those under the scoped one (#1065).
+            cached_entries = [entry for entry in result.scalars().all()
+                              if (entry.project_folder, entry.session_id) in present]
 
             for entry in cached_entries:
                 modified = entry.modified_at

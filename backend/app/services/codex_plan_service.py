@@ -15,6 +15,17 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from app.services.providers.codex_cli import get_codex_home
+from app.utils.path_utils import get_user_home
+
+
+def _default_codex_home() -> Path:
+    """The Codex home to read when none is given: the scoped user's, as for every other plan source (#1065).
+
+    The controller's own scope keeps CODEX_HOME and ~/.codex. CODEX_HOME belongs to the controller's environment, so
+    it must not point another user's scope at the controller's plans.
+    """
+    home = get_user_home()
+    return get_codex_home() if home == Path.home() else home / ".codex"
 
 
 PLAN_SOURCE = "codex-cli"
@@ -52,7 +63,7 @@ class CodexPlanService:
     """Surface Codex update_plan snapshots as plan-like records."""
 
     def __init__(self, codex_home: Path | None = None):
-        self.codex_home = (codex_home or get_codex_home()).expanduser()
+        self.codex_home = (codex_home or _default_codex_home()).expanduser()
 
     def list_plans(self, project_path: str | None = None) -> list[dict[str, Any]]:
         plans: list[dict[str, Any]] = []
