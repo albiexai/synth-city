@@ -280,11 +280,25 @@ def _is_operations_finding_notice(root) -> bool:
         and all(isinstance(payload[key], str) and bool(payload[key]) for key in ("subject", "detail")))
 
 
+def _is_wake_followup_notice(root) -> bool:
+    payload = root.payload
+    optional_positive = lambda value: value is None or (type(value) is int and value > 0)
+    return (getattr(root, "sender_type", None) == "system"
+        and root.sender_member_id is None and root.sender_actor_id is None
+        and root.recipient_member_id is None and root.subject == "Re-wake without activity"
+        and isinstance(payload, dict) and set(payload) == {
+            "notice", "member_id", "slot_id", "attempt_id", "issue_number", "supervisor_actor_id"}
+        and payload["notice"] == "wake_followup_silent"
+        and all(type(payload[key]) is int and payload[key] > 0 for key in (
+            "member_id", "attempt_id", "supervisor_actor_id"))
+        and optional_positive(payload["slot_id"]) and optional_positive(payload["issue_number"]))
+
+
 def is_supervisor_message(root) -> bool:
     return (root.kind == "message" and root.audience_type == "team_preset"
             and (root.sender_member_id is not None or _is_native_wait_notice(root)
                  or _is_leader_ack_wait_notice(root) or _is_auto_merge_not_fired_notice(root)
-                 or _is_operations_finding_notice(root))
+                 or _is_operations_finding_notice(root) or _is_wake_followup_notice(root))
             and root.thread_root_id is None
             and isinstance(root.payload, dict) and "supervisor_actor_id" in root.payload)
 
