@@ -731,7 +731,8 @@ class GithubApprovalService:
         extras = [path for path in companion_paths.companions_for(named) if path not in named]
         if extras:
             paths = self._canonical_paths([*named, *extras])
-            if len(paths) > scope.max_scope_paths:
+            # #1039: the named paths keep the scope's limit (checked above); their companions have a bound of their own.
+            if len(extras) > companion_paths.MAX_COMPANION_PATHS:
                 raise GithubApprovalError("continuation_path_limit_exceeded")
         stored_summary = companion_paths.summary_with_trailer(owner_summary, identity, named, extras)
         payload = self.canonical_continuation_payload(phase="implementation",
@@ -749,12 +750,12 @@ class GithubApprovalService:
             GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce,
         ))).all())
         amendments = [row for row in prior if row.origin_kind == "scope_amendment"]
-        previous_added = {path for row in amendments for path in row.amendment_added_paths}
+        previous_added = {path for row in amendments for path in self._named_added(item, row)}
         if sum(1 for row in amendments if row.approved_at is not None) >= MAX_SCOPE_AMENDMENTS:
             raise GithubApprovalError("amendment_count_limit")
         if len(amendments) >= MAX_SCOPE_AMENDMENT_REQUESTS:
             raise GithubApprovalError("amendment_request_limit")
-        if len(previous_added | set(added)) > MAX_AMENDMENT_ADDED_PATHS:
+        if len(previous_added | (set(added) - set(extras))) > MAX_AMENDMENT_ADDED_PATHS:
             raise GithubApprovalError("amendment_added_path_limit")
         if len(prior) >= scope.max_continuation_revisions or (
                 sum(row.failed_head_count for row in prior) + max_failures > scope.max_continuation_failed_heads):
@@ -823,14 +824,35 @@ class GithubApprovalService:
             raise GithubApprovalError("amendment_count_limit")
         if len(amendments) > MAX_SCOPE_AMENDMENT_REQUESTS:
             raise GithubApprovalError("amendment_request_limit")
-        if len({path for row in amendments for path in row.amendment_added_paths}) > MAX_AMENDMENT_ADDED_PATHS:
+        if len({path for row in amendments for path in self._named_added(item, row)}) > MAX_AMENDMENT_ADDED_PATHS:
             raise GithubApprovalError("amendment_added_path_limit")
+        named, companions = self._counted_paths(item, revision)
         if (len(rows) > scope.max_continuation_revisions
                 or sum(row.failed_head_count for row in rows) + revision.max_failed_heads > scope.max_continuation_failed_heads
                 or revision.max_failed_heads > scope.max_failed_heads_per_revision
-                or len(revision.allowed_paths) > scope.max_scope_paths
+                or len(named) > scope.max_scope_paths
+                or len(companions) > companion_paths.MAX_COMPANION_PATHS
                 or len(revision.allowed_commands) > scope.max_scope_commands):
             raise GithubApprovalError("continuation_budget_exhausted")
+
+    @staticmethod
+    def _counted_paths(item, revision) -> tuple[list[str], list[str]]:
+        """``(named, companions)`` of a revision for its path limits (#1039).
+
+        Only an amendment's digest-verified companion trailer earns the separate companion count; anything else
+        counts every allowed path as named.
+        """
+        if revision.origin_kind != "scope_amendment":
+            return list(revision.allowed_paths), []
+        _summary, named, companions = companion_paths.split_summary(
+            revision.summary, (item.id, revision.dispatch_nonce, revision.previous_scope_revision),
+            revision.allowed_paths)
+        return named, companions
+
+    def _named_added(self, item, revision) -> set[str]:
+        """The paths an amendment added for new scope: its added paths without its verified companions (#1039)."""
+        _named, companions = self._counted_paths(item, revision)
+        return set(revision.amendment_added_paths) - set(companions)
 
     @staticmethod
     def amendment_revision_conditions(revision):
