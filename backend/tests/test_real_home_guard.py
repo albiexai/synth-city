@@ -311,18 +311,128 @@ def test_a_subfolder_swapped_for_a_symlink_after_the_metadata_read_is_not_traver
     assert not any("secret.json" in key for key in result)
 
 
-@pytest.mark.parametrize("raw,expected", [
-    ("sqlite+aiosqlite:///x.db # note", "sqlite+aiosqlite:///x.db"),
-    ("sqlite+aiosqlite:///x.db\t# note", "sqlite+aiosqlite:///x.db"),
-    ('"quoted # kept" # trailing', "quoted # kept"),
-    ("'single # kept' # trailing", "single # kept"),
-    ("  padded  ", "padded"),
-    ("no#space#comment", "no#space#comment"),
-    ('"has \\" escaped quote" # c', 'has \\" escaped quote'),
-    ("", ""),
+@pytest.mark.parametrize("swapped_levels_up", [1, 2])
+def test_an_ancestor_of_a_configured_root_swapped_for_a_symlink_is_not_traversed(world, tmp_path, monkeypatch, swapped_levels_up):
+    home, _ = world
+    for behind in (home / ".claude" / "files", home / ".claude" / "mid" / "files"):    # what each swap would expose
+        behind.mkdir(parents=True)
+        (behind / "private-fixture.json").write_text("{}")
+    top = tmp_path / "srv"
+    root = top / "mid" / "files"
+    root.mkdir(parents=True)
+    (root / "inner.txt").write_text("x")
+    swap_target = root.parent if swapped_levels_up == 1 else top
+    guard = guard_for(world, {"BRIDGE_ATTACHMENT_DIR": str(root)})
+    real_stat, swapped = os.stat, []
+
+    def stat_then_swap(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if str(path) == str(root) and not swapped:
+            swapped.append(True)
+            os.rename(swap_target, str(swap_target) + "-moved")
+            os.symlink(home / ".claude", swap_target)
+        return result
+
+    monkeypatch.setattr(home_guard.os, "stat", stat_then_swap)
+
+    result = guard.snapshot()
+
+    assert result["configured attachment dir"] == home_guard.UNREADABLE
+    assert not any("private-fixture" in key for key in result)
+
+
+def test_the_home_itself_swapped_for_a_symlink_after_the_metadata_read_is_not_traversed(world, tmp_path, monkeypatch):
+    home, _ = world
+    root = home / ".albiex-synth-city"
+    root.mkdir()
+    decoy = tmp_path / "decoy"
+    (decoy / ".albiex-synth-city").mkdir(parents=True)
+    (decoy / ".albiex-synth-city" / "private-fixture.json").write_text("{}")
+    guard = guard_for(world)
+    real_stat, swapped = os.stat, []
+
+    def stat_then_swap(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if str(path) == str(root) and not swapped:
+            swapped.append(True)
+            os.rename(home, tmp_path / "home-moved")
+            os.symlink(decoy, home)
+        return result
+
+    monkeypatch.setattr(home_guard.os, "stat", stat_then_swap)
+
+    result = guard.snapshot()
+
+    assert result[str(root)] == home_guard.UNREADABLE
+    assert not any("private-fixture" in key for key in result)
+
+
+@pytest.mark.parametrize("line,expected", [
+    ("DATABASE_URL=sqlite+aiosqlite:///x.db # note", "sqlite+aiosqlite:///x.db"),
+    ("DATABASE_URL=sqlite+aiosqlite:///x.db\t# note", "sqlite+aiosqlite:///x.db"),
+    ('DATABASE_URL="quoted # kept" # trailing', "quoted # kept"),
+    ("DATABASE_URL='single # kept' # trailing", "single # kept"),
+    ("DATABASE_URL=  padded  ", "padded"),
+    ("DATABASE_URL=no#space#comment", "no#space#comment"),
+    ('DATABASE_URL="has \\" escaped quote" # c', 'has " escaped quote'),
+    ("DATABASE_URL='has \\' escaped quote'", "has ' escaped quote"),
+    ('DATABASE_URL="back\\\\slash"', "back\\slash"),
+    ("export DATABASE_URL=exported", "exported"),
+    ("database_url = spaced", "spaced"),
 ])
-def test_a_dotenv_value_is_read_the_way_python_dotenv_reads_it(raw, expected):
-    assert home_guard._dotenv_value(raw) == expected
+def test_a_dotenv_value_is_read_the_way_the_app_reads_it(world, line, expected):
+    _, cwd = world
+    (cwd / ".env").write_text(line + "\n")
+
+    assert home_guard.configured_values({}, str(cwd)) == {"DATABASE_URL": expected}
+
+
+def test_a_dotenv_escaped_quote_in_the_database_path_still_watches_the_real_file(world, tmp_path):
+    _, cwd = world
+    real_db = tmp_path / 'we"ird.db'
+    (cwd / ".env").write_text('DATABASE_URL="sqlite+aiosqlite:///' + str(real_db).replace('"', '\\"') + '" # c\n')
+    guard = guard_for(world)
+    before = guard.snapshot()
+
+    real_db.write_text("db")
+
+    assert home_guard.changed(before, guard.snapshot()) == ["configured database"]
+
+
+def test_a_dotenv_reference_to_another_key_resolves_like_the_app(world, tmp_path):
+    _, cwd = world
+    parent = tmp_path / "parent"
+    (parent / "attachments").mkdir(parents=True)
+    (cwd / ".env").write_text(f"DATA_PARENT={parent}\nBRIDGE_ATTACHMENT_DIR=${{DATA_PARENT}}/attachments\n")
+    guard = guard_for(world)
+    before = guard.snapshot()
+
+    (parent / "attachments" / "upload.bin").write_bytes(b"x")
+
+    assert guard.roots == {"configured attachment dir": os.path.realpath(parent / "attachments")}
+    assert "configured attachment dir/upload.bin" in home_guard.changed(before, guard.snapshot())
+
+
+def test_a_dotenv_reference_to_the_process_environment_resolves_like_the_app(world, tmp_path, monkeypatch):
+    _, cwd = world
+    monkeypatch.setenv("SYNTH_TEST_PARENT_1122", str(tmp_path / "from-process"))
+    (cwd / ".env").write_text("BRIDGE_ATTACHMENT_DIR=${SYNTH_TEST_PARENT_1122}/files\n")
+
+    assert guard_for(world).roots == {"configured attachment dir": os.path.realpath(tmp_path / "from-process" / "files")}
+
+
+def test_a_dotenv_that_cannot_be_decoded_adds_nothing(world):
+    _, cwd = world
+    (cwd / ".env").write_bytes(b"DATABASE_URL=\xff\xfe\n")
+
+    assert home_guard.configured_values({}, str(cwd)) == {}
+
+
+def test_the_dotenv_values_that_are_not_the_three_keys_are_not_kept(world):
+    _, cwd = world
+    (cwd / ".env").write_text("GITHUB_TOKEN=do-not-keep\nDATABASE_URL=sqlite+aiosqlite:///x.db\n")
+
+    assert set(home_guard.configured_values({}, str(cwd))) == {"DATABASE_URL"}
 
 
 def test_a_dotenv_database_line_with_a_trailing_comment_still_watches_the_real_file(world, tmp_path):

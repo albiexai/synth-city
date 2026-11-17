@@ -20,10 +20,10 @@ wrote, and a write that was undone before the end is not seen. It is not a sandb
 """
 import os
 import pwd
-import re
 import stat
 from pathlib import Path
 
+from dotenv import dotenv_values
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
@@ -41,6 +41,20 @@ UNREADABLE = ("unreadable",)
 REFUSED = ("refused",)
 FAILURES = (EXCEEDED, UNREADABLE, REFUSED)
 _DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _open_directory(path):
+    """Open an absolute directory path without following a symlink in ANY component, not only the last one."""
+    descriptor = os.open(os.sep, _DIRECTORY)
+    try:
+        for part in Path(path).parts[1:]:
+            inner = os.open(part, _DIRECTORY, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = inner
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
 
 
 class _BoundExceeded(Exception):
@@ -65,37 +79,19 @@ def _record(st):
     return (st.st_mode, st.st_size, st.st_mtime_ns)
 
 
-def _dotenv_value(raw):
-    """A `.env` value the way python-dotenv reads it: a quoted value ends at its closing quote (a trailing comment
-    after it is ignored); an unquoted one ends at whitespace followed by `#`."""
-    raw = raw.strip()
-    if raw[:1] in ("'", '"'):
-        quote, index = raw[0], 1
-        while index < len(raw):
-            if raw[index] == "\\":
-                index += 2
-            elif raw[index] == quote:
-                return raw[1:index]
-            else:
-                index += 1
-        return raw[1:]
-    return re.sub(r"\s+#.*", "", raw).rstrip()
-
-
 def configured_values(environ, cwd):
-    """The three configuration values as the app would see them: the process environment over a `.env`."""
+    """The three configuration values as the app would see them: the process environment over a `.env`.
+
+    The `.env` is read by python-dotenv itself (what pydantic-settings uses), so quoting, escapes, trailing comments,
+    `export` and `${VAR}` references mean exactly what they mean to the app. Only the three keys are kept."""
     found = {}
     try:
-        lines = (Path(cwd) / ".env").read_text(encoding="utf-8").splitlines()
+        values = dotenv_values(Path(cwd) / ".env", encoding="utf-8")
     except (OSError, UnicodeDecodeError):
-        lines = []
-    for line in lines:
-        key, separator, value = line.partition("=")
-        key = key.strip()
-        if key.startswith("export "):
-            key = key[len("export "):].strip()
-        if separator and key.upper() in CONFIG_NAMES:
-            found[key.upper()] = _dotenv_value(value)
+        values = {}
+    for key, value in values.items():
+        if key.upper() in CONFIG_NAMES and value is not None:
+            found[key.upper()] = value
     for key, value in environ.items():
         if key.upper() in CONFIG_NAMES:
             found[key.upper()] = value
@@ -206,7 +202,7 @@ class Guard:
     def _walk_root(self, label, path, entries):
         found = {}
         try:
-            descriptor = os.open(path, _DIRECTORY)          # a symlink here fails: the root was swapped
+            descriptor = _open_directory(path)              # a symlink in any component fails: something was swapped
         except OSError:
             entries[label] = UNREADABLE
             return
