@@ -1,4 +1,9 @@
-type HarnessStatus = { display_name: string; installed: boolean; version?: string | null; unavailable_reason?: string | null };
+import { scopedVersionBadge } from "../../features/harnesses/versionLine";
+
+type HarnessStatus = {
+  display_name: string; installed: boolean; version?: string | null; unavailable_reason?: string | null;
+  version_user?: string | null; version_source?: string | null; version_unknown_reason?: string | null;
+};
 
 /** One header badge for every harness, so the header keeps one row as harnesses are added. */
 export function harnessSummary(harnesses: HarnessStatus[]) {
@@ -8,11 +13,19 @@ export function harnessSummary(harnesses: HarnessStatus[]) {
     label: missing ? `${missing} of ${harnesses.length} ${noun} missing` : `${harnesses.length} ${noun}`,
     problem: missing > 0,
     title: harnesses
-      .map((harness) =>
-        harness.installed
+      .map((harness) => {
+        // A chosen user's version (or its unknown message) is named whether or not the controller has a claude of its own.
+        const scoped = scopedVersionBadge(harness);
+        if (scoped) {
+          const named = harness.version ? `${scoped} (${harness.version_user})` : scoped;
+          return harness.installed
+            ? `${harness.display_name} ${named}`
+            : `${harness.display_name} ${named}; controller binary missing${harness.unavailable_reason ? `: ${harness.unavailable_reason}` : ""}`;
+        }
+        return harness.installed
           ? `${harness.display_name} ${harness.version ? `v${harness.version}` : "installed"}`
-          : `${harness.display_name} missing${harness.unavailable_reason ? `: ${harness.unavailable_reason}` : ""}`
-      )
+          : `${harness.display_name} missing${harness.unavailable_reason ? `: ${harness.unavailable_reason}` : ""}`;
+      })
       .join("\n"),
   };
 }

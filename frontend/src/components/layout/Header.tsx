@@ -11,6 +11,7 @@ import { MODAL_SIZES } from "@/lib/constants";
 import { cn } from "@/lib/utils";
 import { Link } from "react-router-dom";
 import { harnessSummary } from "./harnessSummary";
+import { withRegistryVersion } from "@/features/harnesses/versionLine";
 
 const CLI_WARNING_LABEL = "Container cannot see host agent CLIs";
 
@@ -21,7 +22,8 @@ export function Header() {
   const accentClasses = getInstanceAccentClasses(instance?.accent);
   const { providers, selectedProviderId, selectedProvider } = useProviderContext();
   const providerStatuses = providers
-    .map((provider) => status?.providers?.[provider.id] ?? provider)
+    // /status carries the controller's Claude Code version; the registry is the one source of it (see withRegistryVersion).
+    .map((provider) => withRegistryVersion(status?.providers?.[provider.id] ?? provider, provider))
     .filter((provider) => provider.installed || provider.id === selectedProviderId);
   const summary = harnessSummary(providerStatuses);
   useInstanceDocumentTitle(instance);
@@ -35,7 +37,7 @@ export function Header() {
     : undefined;
 
   if (providerStatuses.length === 0 && selectedProvider) {
-    providerStatuses.push(status?.providers?.[selectedProviderId] ?? selectedProvider);
+    providerStatuses.push(withRegistryVersion(status?.providers?.[selectedProviderId] ?? selectedProvider, selectedProvider));
   }
 
   return (

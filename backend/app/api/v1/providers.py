@@ -3,18 +3,21 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.deps import apply_harness_scope
 from app.database import get_db
 from app.models.provider_operations_schemas import ProviderOperations
 from app.services import provider_operations_service
 
 from app.models.schemas import CLIExecuteRequest, CLIResult
 from app.services.cli_executor import ProviderCLIExecutor
+from app.services.claude_install_version import UNKNOWN, read_installed_version
 from app.services.codex_history_service import CodexHistoryService
 from app.services.codex_usage_context_service import CodexUsageContextService
 from app.services.providers import get_provider, get_providers
@@ -141,17 +144,40 @@ class CodexPluginMutationRequest(BaseModel):
         return _validate_plugin_marketplace(value)
 
 
-@router.get("/providers")
+def _with_scoped_version(status: dict[str, Any]) -> dict[str, Any]:
+    """Show the chosen user's Claude Code version instead of the controller's (#1069).
+
+    Only for provider claude-code under a non-controller scope; every other status, and the controller's own, is
+    returned as it was. The version is read from disk (see claude_install_version), never by running anything. The
+    controller's `installed` and `binary_path` stay as they are: they describe the controller's binary.
+    """
+    from app.utils.path_utils import controller_user_name, get_user_home, scope_users
+
+    home = get_user_home()
+    if status.get("id") != "claude-code" or home == Path.home():
+        return status
+    user = next((u.name for u in scope_users() if u.home == home), controller_user_name())
+    found = read_installed_version(home)
+    return {
+        **status,
+        "version": found.version,
+        "version_user": user,
+        "version_source": found.source,
+        "version_unknown_reason": None if found.version else UNKNOWN,
+    }
+
+
+@router.get("/providers", dependencies=[Depends(apply_harness_scope)])
 def list_providers():
     providers, environment = annotate_provider_statuses(
         provider.get_status() for provider in get_providers()
     )
-    return {"providers": providers, "count": len(providers), "environment": environment}
+    return {"providers": [_with_scoped_version(p) for p in providers], "count": len(providers), "environment": environment}
 
 
-@router.get("/providers/{provider_id}/status")
+@router.get("/providers/{provider_id}/status", dependencies=[Depends(apply_harness_scope)])
 def get_provider_status(provider_id: str):
-    return _get_provider_or_404(provider_id).get_status()
+    return _with_scoped_version(_get_provider_or_404(provider_id).get_status())
 
 
 @router.get("/providers/{provider_id}/capabilities")
