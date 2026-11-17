@@ -109,6 +109,11 @@ class AgentTeamSummaryService:
         waiting_input, native_fence, native_known = None, {}, False
         native_states, native_ok = {}, False
         expires = [started + timedelta(seconds=15)]
+        # Remaining work is computed from the unfinished items alone (#1107): their coverage, their reports and a
+        # stable snapshot. The human-action, native, pause and dispatch observations feed coverage_complete only, so
+        # an aging coordination observation of a paused team no longer flips a finished team's remaining work.
+        items_complete = total <= self.item_limit and len(items) == total
+        item_expires = [started + timedelta(seconds=15)]
         hold = hold_code()
         if hold:
             attention.append(TeamSummaryAttention(code=hold))
@@ -186,12 +191,14 @@ class AgentTeamSummaryService:
             for item in items[:self.item_limit]:
                 value = await bounded(lambda: self.progress.summary(db, item.id))
                 if value is None:
-                    complete = False
+                    complete = items_complete = False
                     continue
                 observations.append(value)
                 expires.append(_utc(value.valid_until))
+                item_expires.append(_utc(value.valid_until))
                 if value.remaining_work.state == "current" and value.remaining_work.reported_at is not None:
                     expires.append(_utc(value.remaining_work.reported_at) + MAX_AGE)
+                    item_expires.append(_utc(value.remaining_work.reported_at) + MAX_AGE)
                 if value.next_actor in _ACTORS:
                     actors.add(value.next_actor)
             native_current = {entry[0]: entry for entry in await bounded(lambda: _team_inputs(db, preset_id, 256))}
@@ -201,7 +208,7 @@ class AgentTeamSummaryService:
                 native_ok = True
         except (TimeoutError, OSError, ValueError):
             waiting_input = None
-            complete = False
+            complete = items_complete = False  # a failed read may have cut the item reads short
             if db.in_transaction():
                 await db.rollback()
         # Reuse fresh scalar rows after all asynchronous reads. Never use expired ORM attributes.
@@ -213,10 +220,11 @@ class AgentTeamSummaryService:
         changed = final != initial or hold_code() != hold
         now = datetime.now(timezone.utc)
         complete = complete and not changed and min(expires) > now
+        items_complete = items_complete and not changed and min(item_expires) > now
         current = [value for value in observations if value.remaining_work.state == "current"
             and value.remaining_work.reported_at is not None
             and -timedelta(minutes=5) <= now - _utc(value.remaining_work.reported_at) <= MAX_AGE]
-        known = complete and len(current) == total and all(
+        known = items_complete and len(current) == total and all(
             value.remaining_work.effort_low_minutes is not None
             and value.remaining_work.effort_high_minutes is not None
             and value.remaining_work.effort_low_minutes <= value.remaining_work.effort_high_minutes
@@ -228,7 +236,7 @@ class AgentTeamSummaryService:
             effort_low_minutes=sum(value.remaining_work.effort_low_minutes for value in current) if known else None,
             effort_high_minutes=sum(value.remaining_work.effort_high_minutes for value in current) if known else None,
             confidence=confidence, reason="complete" if known else "context_changed" if changed
-            else "observation_incomplete" if not complete else "report_unknown")
+            else "observation_incomplete" if not items_complete else "report_unknown")
         final_team = final[0]
         supervisor = supervisor_observation(final_team, now=now, actor=SimpleNamespace(
             id=final_team.supervisor_actor_id, display_name=final_team.supervisor_display_name)
