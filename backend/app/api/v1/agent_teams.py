@@ -136,9 +136,14 @@ def _operator_actor() -> dict:
     return _audit.derive_actor(actor_kind="operator")
 
 
-def _write_actor(context: dict) -> dict:
-    """#945: the operator key authorized the write; the context says how it arrived (server-derived, see deps)."""
+def _write_actor(context: dict | None) -> dict:
+    """#945: the operator key authorized the write; the context says how it arrived (server-derived, see deps).
+
+    Only the dependency supplies a context. A direct call of the route function has none, and records the plain operator.
+    """
     from app.services import factory_audit_service as _audit
+    if not isinstance(context, dict):
+        return _audit.derive_actor(actor_kind="operator")
     return _audit.derive_actor(
         actor_kind="operator", via=context["via"], session_id=context["session_id"])
 
@@ -166,6 +171,7 @@ async def _observe_refusal(
     item_id: int | None = None,
     revision_id: int | None = None,
     request_id: int | None = None,
+    context_snapshot: dict | None = None,
 ) -> None:
     """C09: record a refused action with its actual resource context.
 
@@ -186,6 +192,7 @@ async def _observe_refusal(
         item_id=item_id,
         revision_id=revision_id,
         request_id=request_id,
+        context_snapshot=context_snapshot,
         action_outcome="rejected",
         sanitized_reason=code,
         correlation_id=f"{event_kind}:rejected:{resource}:{code}",
@@ -2448,15 +2455,17 @@ async def update_preset(
     preset_id: int,
     request: AgentTeamPresetUpdate,
     _operator: None = Depends(require_operator),
-    write_context: dict = Depends(operator_write_context),
     db: AsyncSession = Depends(get_db),
+    write_context: dict | None = Depends(operator_write_context),
 ):
+    # A direct call (no request) leaves write_context as the dependency marker, not a dict: no attribution then.
+    session_invalid = isinstance(write_context, dict) and write_context["session_invalid"]
     try:
         response = await agent_team_service.update_preset(
             db,
             preset_id,
             actor=_write_actor(write_context),
-            session_invalid=write_context["session_invalid"],
+            session_invalid=session_invalid,
             name=request.name,
             description=request.description,
             autonomy_enabled=request.autonomy_enabled,
@@ -2476,6 +2485,7 @@ async def update_preset(
                 source="agent_team_service.update_preset",
                 actor=_write_actor(write_context),
                 code="leader_assignment_required",
+                context_snapshot={"session_invalid": True} if session_invalid else None,
                 team_preset_id=preset_id,
             )
         raise _bad_request(exc) from exc

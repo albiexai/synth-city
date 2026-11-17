@@ -168,6 +168,22 @@ async def require_operator(
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
+def _attribution_session_is_current(session: MailAgentSession) -> bool:
+    """Is this session fresh enough to be named in an audit event? (#945)
+
+    The strict rules, whatever ``mail_capability_tokens_required`` says: the session is not closed, its mailbox is not
+    offline, and a role-bearing (slot-bound) session has a recorded pane that is alive. This is local to attribution. It
+    does not change ``require_current_mail_session`` or any Mail authentication, and it never decides the write.
+    """
+    if session.closed_at is not None or session.mailbox_status == "offline":
+        return False
+    if session.team_slot_id is None:
+        return True
+    if session.bound_pane_pid is None or session.bound_pane_proc_start is None:
+        return False
+    return peer_process.pane_is_alive(session.bound_pane_pid, session.bound_pane_proc_start) is True
+
+
 async def operator_write_context(
     origin: Optional[str] = Header(default=None),
     x_synth_city_session_token: Optional[str] = Header(default=None),
@@ -189,12 +205,9 @@ async def operator_write_context(
             select(MailAgentSession).where(MailAgentSession.capability_token_hash.is_not(None)))
         match = next((row for row in rows.scalars().all()
                       if hmac.compare_digest(row.capability_token_hash, hashed)), None)
-        try:
-            if match is None:
-                raise HTTPException(status_code=401, detail="session_token_invalid")
-            require_current_mail_session(match)
+        if match is not None and _attribution_session_is_current(match):
             session = match
-        except HTTPException:
+        else:
             invalid = True
     if session is not None:
         via = "mail_tool"

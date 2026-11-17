@@ -169,8 +169,12 @@ async def test_a_valid_session_wins_over_the_origin_and_caller_claims_are_never_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("strict", [True, False])
 @pytest.mark.parametrize("case", ["unknown", "closed", "stale"])
-async def test_a_bad_session_token_never_refuses_the_write_and_is_recorded_as_unattributed(client, db, preset, tmp_path, case):
+async def test_a_bad_session_token_never_refuses_the_write_and_is_recorded_as_unattributed(
+        client, db, preset, tmp_path, monkeypatch, case, strict):
+    """The attribution rule does not depend on whether Mail enforces capability tokens (review 5930749403, P2)."""
+    monkeypatch.setattr(settings, "mail_capability_tokens_required", strict)
     changes = {"closed": {"closed_at": datetime.utcnow()}, "stale": {"mailbox_status": "offline"}}.get(case, {})
     await _session(db, tmp_path, **changes)
     token = "not-the-token" if case == "unknown" else SESSION_TOKEN
@@ -182,11 +186,83 @@ async def test_a_bad_session_token_never_refuses_the_write_and_is_recorded_as_un
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("strict", [True, False])
+@pytest.mark.parametrize("pane_alive,expected", [(True, "mail_tool"), (False, "api")])
+async def test_a_role_bearing_session_is_attributed_only_while_its_pane_is_alive(
+        client, db, preset, tmp_path, monkeypatch, strict, pane_alive, expected):
+    """A slot-bound session needs its bound pane alive, under either Mail setting. The pane reader is faked."""
+    from app.api.v1 import deps
+    monkeypatch.setattr(settings, "mail_capability_tokens_required", strict)
+    monkeypatch.setattr(deps.peer_process, "pane_is_alive", lambda pid, start: pane_alive)
+    session = await _session(db, tmp_path, team_slot_id=999, bound_pane_pid=424242, bound_pane_proc_start="fake-start")
+    response = await _campaign(client, preset, **{"X-Synth-City-Session-Token": SESSION_TOKEN})
+    assert response.status_code == 200
+    (event,) = await _events(db, preset)
+    assert event.via == expected
+    assert event.actor_session_id == (session.id if expected == "mail_tool" else None)
+    assert bool((event.context_snapshot or {}).get("session_invalid")) is (expected == "api")
+
+
+@pytest.mark.asyncio
+async def test_a_role_bearing_session_without_a_recorded_pane_is_unattributed(client, db, preset, tmp_path):
+    await _session(db, tmp_path, team_slot_id=999, bound_pane_pid=None, bound_pane_proc_start=None)
+    await _campaign(client, preset, **{"X-Synth-City-Session-Token": SESSION_TOKEN})
+    (event,) = await _events(db, preset)
+    assert (event.via, event.actor_session_id, event.context_snapshot["session_invalid"]) == ("api", None, True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict", [True, False])
+async def test_a_valid_session_is_attributed_under_either_setting(client, db, preset, tmp_path, monkeypatch, strict):
+    monkeypatch.setattr(settings, "mail_capability_tokens_required", strict)
+    session = await _session(db, tmp_path)
+    await _campaign(client, preset, **{"X-Synth-City-Session-Token": SESSION_TOKEN})
+    (event,) = await _events(db, preset)
+    assert (event.via, event.actor_session_id) == ("mail_tool", session.id)
+
+
+@pytest.mark.asyncio
 async def test_a_valid_session_does_not_carry_the_invalid_marker(client, db, preset, tmp_path):
     await _session(db, tmp_path)
     await _campaign(client, preset, **{"X-Synth-City-Session-Token": SESSION_TOKEN})
     (event,) = await _events(db, preset)
     assert not (event.context_snapshot or {}).get("session_invalid")
+
+
+async def _refusals(db, preset):
+    rows = await db.execute(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.team_preset_id == preset.id, FactoryAuditEvent.action_outcome == "rejected")
+        .order_by(FactoryAuditEvent.id))
+    return list(rows.scalars().all())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token,flagged", [("bad-token", True), (SESSION_TOKEN, False)])
+async def test_the_refusal_observation_keeps_the_bounded_invalid_session_flag(
+        client, db, preset, tmp_path, token, flagged):
+    """Review 5930749403, P3: the refused autonomy change records how it arrived; the policy refusal is unchanged."""
+    session = await _session(db, tmp_path)
+    response = await client.patch(f"{PATH}/{preset.id}", json={"autonomy_enabled": True},
+                                  headers={"X-Synth-City-Session-Token": token, "Origin": UI_ORIGIN})
+    assert response.status_code == 400 and "leader_assignment_required" in response.text
+    await db.refresh(preset)
+    assert preset.autonomy_enabled is not True
+    (event,) = await _refusals(db, preset)
+    assert bool((event.context_snapshot or {}).get("session_invalid")) is flagged
+    assert (event.via, event.actor_session_id) == (("ui", None) if flagged else ("mail_tool", session.id))
+    assert token not in json.dumps([str(v) for v in (event.context_snapshot, event.before_values, event.after_values)])
+
+
+@pytest.mark.asyncio
+async def test_the_route_function_still_works_when_called_directly_without_a_context(db, preset):
+    """The hosted suite calls update_preset(id, request, None, db) by position; that call keeps working."""
+    from app.api.v1.agent_teams import update_preset
+    from app.models.schemas import AgentTeamPresetUpdate
+    renamed = await update_preset(preset.id, AgentTeamPresetUpdate(name="Direct"), None, db)
+    assert renamed.name == "Direct"
+    await update_preset(preset.id, AgentTeamPresetUpdate(backlog_milestone="v4.2"), None, db)
+    (event,) = await _events(db, preset)
+    assert (event.actor_kind, event.via, event.actor_session_id) == ("operator", None, None)
 
 
 @pytest.mark.asyncio
