@@ -201,12 +201,25 @@ async def test_under_way_phrases_and_planned_decisions_are_plain(db, monkeypatch
     await db.commit()
     await observe_backlog(db, scope, summary, Backlog([issue(n, f"Work {n}") for n in range(1, 6)]))
     result = await summary.summary(db, team.id)
-    assert result.campaign.under_way_count == 5
+    # #1129 (U27): the escalated item needs attention; it is not under way.
+    assert (result.campaign.under_way_count, result.campaign.attention_count) == (4, 1)
     assert [item.state_phrase for item in result.campaign.under_way] == [
-        "building it", "waiting for checks", "reviewing it", "waiting for you", "waiting for you"]
+        "building it", "waiting for checks", "reviewing it", "waiting for you"]
     assert [(item.text, item.state) for item in result.campaign.decisions_ahead] == [
         ("Decide promotion.", "later"), ("Choose the trial.", "now"), ("Approve the plan.", "done")]
     assert "dispatched" not in result.campaign.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_escalated_and_failed_items_need_attention_and_every_item_has_one_bucket(db, monkeypatch):
+    # #1129 (U27): escalated was counted as under way and failed in no bucket at all.
+    statuses = ("merged", "dispatched", "escalated", "failed", "pending")
+    team, scope, _, summary = await fixed_campaign(db, monkeypatch, statuses)
+    await observe_backlog(db, scope, summary, Backlog([issue(n, f"Work {n}") for n in range(1, 6)]))
+    c = (await summary.summary(db, team.id)).campaign
+    assert (c.done_count, c.under_way_count, c.attention_count, c.queued_count) == (1, 1, 2, 1)
+    assert c.done_count + c.under_way_count + c.attention_count + c.queued_count == len(statuses)
+    assert [item.state_phrase for item in c.under_way] == ["building it"]
 
 
 @pytest.mark.asyncio

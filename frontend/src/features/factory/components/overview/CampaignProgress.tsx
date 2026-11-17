@@ -38,8 +38,10 @@ function More({ count, to }: { count: number; to: string }) {
 function CampaignCard({ preset, summary }: { preset: AgentTeamPreset; summary: AgentTeamSummary }) {
   const c = summary.campaign!;
   const notStarted = c.not_started_count ?? 0;
-  const total = c.done_count + c.under_way_count + c.queued_count + notStarted;
-  const knownTotal = c.done_count + c.under_way_count + c.queued_count;
+  // Escalated or failed items need attention (#1129); older responses omit the count.
+  const attention = c.attention_count ?? 0;
+  const total = c.done_count + c.under_way_count + attention + c.queued_count + notStarted;
+  const knownTotal = c.done_count + c.under_way_count + attention + c.queued_count;
   const parent = summary.parent_issue_url;
   const work = `/work?team_id=${preset.id}`;
   const decisions = c.decisions_ahead.filter((d) => d.state !== "done");
@@ -100,6 +102,17 @@ function CampaignCard({ preset, summary }: { preset: AgentTeamPreset; summary: A
             </p>
           ))}
           <More count={c.under_way_count - c.under_way.length} to={work} />
+          {attention > 0 && (
+            <>
+              <Count label="Needs attention" value={attention} dot="bg-amber-500" />
+              <Link
+                className="text-sm text-muted-foreground underline underline-offset-4"
+                to={`/work?team_id=${preset.id}&category=attention`}
+              >
+                View the {attention} {attention === 1 ? "item that needs" : "items that need"} attention ›
+              </Link>
+            </>
+          )}
         </div>
         <div className="space-y-2">
           <Count label="Still to do" value={c.queued_count + notStarted} dot="bg-muted-foreground/60" />

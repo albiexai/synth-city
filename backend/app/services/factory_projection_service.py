@@ -22,13 +22,13 @@ from app.services.agent_mail_service import MCP_HEARTBEAT_TTL_SECONDS
 from app.services.github_dispatch_scheduler import github_dispatch_scheduler
 from app.services.github_work_item_projection import _load_work_item_authority, _work_item_response
 from app.services.providers import get_providers
-from app.services.work_item_states import DONE_STATUSES
+from app.services.work_item_states import ATTENTION_STATUSES, DONE_STATUSES
 
 
 CATEGORY_STATUSES = {
     "queued": ("pending",), "active": ("dispatched", "verifying"),
     "review": ("awaiting_human_review", "ready_for_review"),
-    "attention": ("escalated", "failed"), "finished": DONE_STATUSES,
+    "attention": ATTENTION_STATUSES, "finished": DONE_STATUSES,
 }
 STATUS_CATEGORY = {status: category for category, statuses in CATEGORY_STATUSES.items() for status in statuses}
 

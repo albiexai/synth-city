@@ -159,6 +159,8 @@ export interface TeamCampaignSummary {
   done_on_other_branch_count?: number
   latest_done: CampaignDoneItem[]
   under_way_count: number
+  /** Escalated or failed items; older responses omit it (#1129). */
+  attention_count?: number
   under_way: CampaignUnderWayItem[]
   queued_count: number
   queued: { title: string }[]
