@@ -543,9 +543,9 @@ class GithubCoordinationService:
                 if pane.pid != leader.bound_pane_pid:
                     raise CoordinationError("leader_unavailable")
             except Exception as caught_error:
+                await recover_session(db, caught_error)
                 values["error_code"] = "leader_unavailable"
                 want_request = False
-                await recover_session(db, caught_error)
         if hold_code():
             await db.rollback()
             return

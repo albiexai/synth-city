@@ -1683,9 +1683,9 @@ class GithubVerificationService:
             await db.refresh(scope)
             logger.info("Terminal attempt changed; no merge transition recorded")
         except Exception as caught_error:
+            await recover_session(db, caught_error)
             logger.warning("Merged-PR check failed for work item %s; the item stays as it is", item_id,
                            exc_info=True)
-            await recover_session(db, caught_error)
             await db.rollback()
             await db.refresh(scope)
 
@@ -1844,9 +1844,9 @@ class GithubVerificationService:
             await db.refresh(scope)
             self._log_inconsistent_once(None, f"a PR response failed the identity check ({exc})", snapshot=snapshot)
         except Exception as caught_error:
+            await recover_session(db, caught_error)
             logger.warning("Superseded-revision check failed for work item %s; the item stays as it is",
                            snapshot[0], exc_info=True)
-            await recover_session(db, caught_error)
             await db.rollback()
             await db.refresh(scope)
 
@@ -2651,11 +2651,11 @@ class GithubVerificationService:
             )
             await db.commit()
         except Exception as caught_error:
+            await recover_session(db, caught_error)
             logger.exception(
                 "Failed to send blocker-merged notification for work item %s",
                 item.id,
             )
-            await recover_session(db, caught_error)
             await db.rollback()
 
     async def _completion_head_is_current(self, db, scope, item, client, head_sha, *, revision=None):

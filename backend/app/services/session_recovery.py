@@ -4,11 +4,12 @@ A caught failure must never leave the session unusable for the next statement: a
 failed flush, the transaction needs a rollback, and anything run on it raises PendingRollbackError (live #1144).
 recover_session rolls back whenever the session cannot be reused. A non-database failure, such as a notification's
 HTTP error, leaves the stage's staged writes in place, so they commit with the stage as before (#920). If the rollback
-itself fails, its error propagates: an unusable session is never handed back for reuse.
+itself fails, its error propagates: an unusable session is never handed back for reuse. After a rollback the objects
+the session still holds are reloaded, so a caller never reads an expired attribute. Call it first in a handler.
 """
 from __future__ import annotations
 
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import InvalidRequestError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -21,5 +22,12 @@ async def recover_session(db: AsyncSession, error: BaseException) -> bool:
     """Roll back when ``db`` cannot be reused after ``error``; return whether it did. A failed rollback raises."""
     if isinstance(error, SQLAlchemyError) or _transaction_unusable(db):
         await db.rollback()
+        # A rollback expires every loaded object; reading one afterwards would lazy-load synchronously
+        # (MissingGreenlet) in the caller (V1 review of #1155). Reload what the session still holds.
+        for instance in list(db.sync_session.identity_map.values()):
+            try:
+                await db.refresh(instance)
+            except InvalidRequestError:
+                db.expunge(instance)  # the row is gone after the rollback; the caller must not use it
         return True
     return False

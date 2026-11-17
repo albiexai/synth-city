@@ -159,9 +159,9 @@ class GithubDispatchScheduler:
             _poll_stage.set("poll_scope")
             await self.watcher.poll_scope(db, scope, client)
             await db.commit()
-            if not await self._scope_remains_autonomous(db, scope.id):
+            if not await self._scope_remains_autonomous(db, scope_id):
                 continue
-            scope, slots = await self._reload_scope_context(db, scope.id)
+            scope, slots = await self._reload_scope_context(db, scope_id)
             issues_by_number = await self._pending_issues_by_number(db, scope, client)
             issue_labels_by_number = {
                 number: [label["name"] for label in issue.get("labels", []) if "name" in label]
@@ -180,21 +180,21 @@ class GithubDispatchScheduler:
                 require_autonomy=True,
             )
             await db.commit()
-            if not await self._scope_remains_autonomous(db, scope.id):
+            if not await self._scope_remains_autonomous(db, scope_id):
                 continue
-            scope, slots = await self._reload_scope_context(db, scope.id)
+            scope, slots = await self._reload_scope_context(db, scope_id)
             _poll_stage.set("monitor_dispatched")
             await self.dispatch.monitor_dispatched(db, scope, slots)
             await db.commit()
-            if not await self._scope_remains_autonomous(db, scope.id):
+            if not await self._scope_remains_autonomous(db, scope_id):
                 continue
-            scope, slots = await self._reload_scope_context(db, scope.id)
+            scope, slots = await self._reload_scope_context(db, scope_id)
             _poll_stage.set("monitor_continuation")
             await self.dispatch.monitor_continuation(db, scope, slots)
             await db.commit()
-            if not await self._scope_remains_autonomous(db, scope.id):
+            if not await self._scope_remains_autonomous(db, scope_id):
                 continue
-            scope, _slots = await self._reload_scope_context(db, scope.id)
+            scope, _slots = await self._reload_scope_context(db, scope_id)
             _poll_stage.set("verification")
             await self.verification.process_scope(db, scope, client=client)
             await db.commit()
@@ -203,21 +203,21 @@ class GithubDispatchScheduler:
                 scope_id, set(getattr(self.verification, "skipped_item_ids", ())))
             await operations_health_service.sweep_verifying_after_merge(
                 scope_id, owner, repo, client)
-            if not await self._scope_remains_autonomous(db, scope.id):
+            if not await self._scope_remains_autonomous(db, scope_id):
                 continue
-            scope, slots = await self._reload_scope_context(db, scope.id)
+            scope, slots = await self._reload_scope_context(db, scope_id)
             _poll_stage.set("monitor_recovery")
             await self.dispatch.monitor_recovery(db, scope, slots)
             await db.commit()
-            if not await self._scope_remains_autonomous(db, scope.id):
+            if not await self._scope_remains_autonomous(db, scope_id):
                 continue
-            scope, _slots = await self._reload_scope_context(db, scope.id)
+            scope, _slots = await self._reload_scope_context(db, scope_id)
             _poll_stage.set("remind_held_leases")
             await self.dispatch.remind_held_leases(db, scope)
             await db.commit()
             # Backlog assessment is advisory and cannot wedge verification/recovery.
-            if await self._scope_remains_autonomous(db, scope.id):
-                coordination_scope_id = scope.id
+            if await self._scope_remains_autonomous(db, scope_id):
+                coordination_scope_id = scope_id
                 try:
                     await github_coordination_service.reconcile(db, coordination_scope_id, client)
                 except Exception as error:
@@ -251,6 +251,7 @@ class GithubDispatchScheduler:
         await agent_mail_service.sync_observed_sessions(db, strict=True)
         await db.commit()
         for stage in ("continuation", "verification", "recovery"):
+            _poll_stage.set(f"recovery_only_{stage}")  # #1148: a recovery-only failure names its stage too
             if not await self._recovery_only_target_current(db, attempt):
                 return
             scope, slots = await self._reload_scope_context(db, attempt.scope_id)

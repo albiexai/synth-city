@@ -117,7 +117,7 @@ async def test_a_failed_rollback_propagates_so_the_session_is_not_reused(maker, 
 
 
 def _handlers_needing_recovery():
-    """Broad handlers whose try body uses `db` but which neither recover it nor re-raise."""
+    """Broad handlers whose try body uses `db` but which neither recover it first nor re-raise."""
     missing = []
     for name in POLL_PATH:
         tree = ast.parse((SERVICES / name).read_text())
@@ -134,8 +134,10 @@ def _handlers_needing_recovery():
                     names = {getattr(t, "id", getattr(t, "attr", "")) for t in types}
                     if handler.type is not None and not names & BROAD:
                         continue
-                    body = ast.unparse(ast.Module(body=handler.body, type_ignores=[]))
-                    if uses_db and "recover_session(db" not in body and not any(
+                    # Recovery comes first: an earlier statement (even a log line reading an expired
+                    # attribute) would run on the unusable session and raise PendingRollbackError.
+                    first = ast.unparse(handler.body[0])
+                    if uses_db and "recover_session(db" not in first and not any(
                             isinstance(s, ast.Raise) for s in handler.body):
                         missing.append(f"{name}:{handler.lineno} {fn.name}")
     return missing
@@ -164,3 +166,50 @@ async def test_a_poll_failure_finding_names_the_failing_stage(monkeypatch):
     monkeypatch.setattr(scheduler_module.GithubDispatchScheduler, "run_repo_once", run_once)
     await scheduler_module.GithubDispatchScheduler().run_repo_job("owner", "repo")
     assert recorded == [("owner", "repo", "OperationalError", "monitor_dispatched")]
+
+
+@pytest.mark.asyncio
+async def test_an_object_loaded_before_the_failure_is_usable_after_recovery(maker):
+    # V1 on #1155: a rollback expires every loaded object, so the caller's next attribute read lazy-loaded
+    # synchronously and raised MissingGreenlet. recover_session reloads what the session still holds.
+    from app.services.session_recovery import recover_session
+
+    async with maker() as db:
+        held = AgentTeamPreset(id=100, name="held by the caller", description="", created_by="test")
+        db.add(held)
+        await db.commit()
+        error = await _poison_with_a_failed_flush(db)
+        assert await recover_session(db, error) is True
+        assert held.name == "held by the caller"
+
+
+@pytest.mark.asyncio
+async def test_a_recovery_only_failure_names_its_stage(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.services import github_dispatch_scheduler as scheduler_module
+
+    scheduler = scheduler_module.GithubDispatchScheduler()
+    scope = SimpleNamespace(id=7)
+    monkeypatch.setattr(scheduler, "recovery_only_attempt", SimpleNamespace(scope_id=7), raising=False)
+
+    async def current(db, attempt):
+        return True
+
+    async def reload(db, scope_id):
+        return scope, []
+
+    async def noop(*args, **kwargs):
+        return None
+
+    async def failing(*args, **kwargs):
+        raise OperationalError("UPDATE", {}, Exception("database is locked"))
+
+    monkeypatch.setattr(scheduler, "_recovery_only_target_current", current)
+    monkeypatch.setattr(scheduler, "_reload_scope_context", reload)
+    monkeypatch.setattr(scheduler_module.agent_mail_service, "sync_observed_sessions", noop)
+    monkeypatch.setattr(scheduler.dispatch, "monitor_continuation", failing)
+    scheduler_module._poll_stage.set("start")
+    with pytest.raises(OperationalError):
+        await scheduler._run_recovery_only(SimpleNamespace(commit=noop), [scope], client=None)
+    assert scheduler_module._poll_stage.get() == "recovery_only_continuation"
