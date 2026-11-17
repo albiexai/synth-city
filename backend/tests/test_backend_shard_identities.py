@@ -182,7 +182,9 @@ def test_the_plugin_records_one_final_outcome_per_test(tmp_path):
                            "-p", "tests.ci_shard_identity", f"--identity-out={out}"],
                           cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120)
     assert done.returncode == 1, done.stdout + done.stderr
-    rows = {row["id"]: row for row in ident.parse_executed(out.read_text(encoding="utf-8"))}
+    parsed, bad = ident.parse_executed(out.read_text(encoding="utf-8"))
+    assert bad == []
+    rows = {row["id"]: row for row in parsed}
     assert {name: row["outcome"] for name, row in rows.items()} == {
         "test_sample.py::test_passed": "passed", "test_sample.py::test_failed": "failed",
         "test_sample.py::test_skipped": "skipped", "test_sample.py::test_xfailed": "xfailed",
@@ -198,3 +200,43 @@ def test_the_plugin_writes_nothing_without_the_option(tmp_path):
     done = subprocess.run([sys.executable, "-m", "pytest", "test_sample.py", "-q", "-p", "no:cacheprovider",
                            "-p", "tests.ci_shard_identity"], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120)
     assert done.returncode == 0 and list(tmp_path.glob("*.jsonl")) == []
+
+
+def test_a_uuid_in_the_file_name_or_the_test_name_is_never_normalised():
+    one = "tests/a/test_11111111-2222-3333-4444-555555555555.py::test_x[case]"
+    two = "tests/a/test_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.py::test_x[case]"
+    assert ident.normalise(one) != ident.normalise(two)
+    assert ident.check([one], {"shard 1": shard([two], executed=[two])})[0]
+    assert ident.normalise("t.py::test_11111111-2222-3333-4444-555555555555") == "t.py::test_11111111-2222-3333-4444-555555555555"
+    assert ident.normalise("t.py::test_x[a-11111111-2222-3333-4444-555555555555]") == "t.py::test_x[a-<uuid>]"
+
+
+def test_an_unknown_outcome_is_refused():
+    for outcome in ("unknown", "", "PASSED"):
+        problems = ident.check(FULL, {"shard 1": shard(FULL[:3], outcome=outcome), "shard 2": shard(FULL[3:])})[0]
+        assert any("outcome" in problem for problem in problems), outcome
+
+
+def test_a_missing_or_non_integer_run_count_is_refused_not_defaulted():
+    rows = ['{"id": "t.py::a", "outcome": "passed"}', '{"id": "t.py::b", "outcome": "passed", "runs": "1"}',
+            '{"id": "t.py::c", "outcome": "passed", "runs": true}', "not json", "[1]",
+            '{"outcome": "passed", "runs": 1}', '{"id": 5, "outcome": "passed", "runs": 1}']
+    parsed, bad = ident.parse_executed("\n".join(rows))
+    assert parsed == [] and len(bad) == len(rows)
+    ok, none = ident.parse_executed('{"id": "t.py::a", "outcome": "passed", "runs": 1}\n\n')
+    assert none == [] and len(ok) == 1
+
+
+def test_a_run_count_other_than_one_in_a_parsed_row_is_a_problem():
+    shards = good()
+    shards["shard 1"]["executed"][0].pop("runs")
+    assert any("ran None" in problem for problem in ident.check(FULL, shards)[0])
+
+
+def test_the_command_reports_malformed_executed_lines(tmp_path):
+    (tmp_path / "art").mkdir()
+    _write_artifacts(tmp_path / "art")
+    path = tmp_path / "art" / "backend-test-timings-1" / "backend-shard-1-executed.jsonl"
+    path.write_text(path.read_text(encoding="utf-8") + "not json\n", encoding="utf-8")
+    done = _run(tmp_path)
+    assert done.returncode != 0 and "is not JSON" in done.stdout

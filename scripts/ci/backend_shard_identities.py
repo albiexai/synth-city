@@ -21,19 +21,37 @@ from pathlib import Path
 
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 FAILING = ("failed", "error")
+ALLOWED = ("passed", "skipped", "xfailed", "xpassed")   # every other outcome, known or not, is a problem
 SHOWN = 20
 
 
 def normalise(node_id: str) -> str:
-    return UUID.sub("<uuid>", node_id)
+    """Replace a uuid only inside the parameter suffix (from the first '['); the path and the test name stay raw."""
+    head, bracket, params = node_id.partition("[")
+    return head + bracket + UUID.sub("<uuid>", params)
 
 
 def parse_collected(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if "::" in line]
 
 
-def parse_executed(text: str) -> list[dict]:
-    return [json.loads(line) for line in text.splitlines() if line.strip()]
+def parse_executed(text: str) -> tuple[list[dict], list[str]]:
+    """Strict records: an object with a string id, a string outcome and an integer run count. Anything else is a problem."""
+    rows, problems = [], []
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            problems.append(f"executed line {number} is not JSON")
+            continue
+        if not (isinstance(row, dict) and isinstance(row.get("id"), str) and isinstance(row.get("outcome"), str)
+                and isinstance(row.get("runs"), int) and not isinstance(row.get("runs"), bool)):
+            problems.append(f"executed line {number} is not an object with a string id, a string outcome and an integer runs")
+            continue
+        rows.append(row)
+    return rows, problems
 
 
 def _diff(expected: Counter, actual: Counter, label: str) -> list[str]:
@@ -60,7 +78,7 @@ def check(full: list[str], shards: dict[str, dict]) -> tuple[list[str], dict]:
     for name, shard in sorted(shards.items()):
         collected = Counter(normalise(item) for item in shard.get("collected", []))
         executed_rows = shard.get("executed", [])
-        executed = Counter(normalise(row["id"]) for row in executed_rows)
+        executed = Counter(normalise(row["id"]) for row in executed_rows if isinstance(row.get("id"), str))
         if not collected:
             problems.append(f"{name}: no collected identities")
         if not executed_rows:
@@ -68,10 +86,12 @@ def check(full: list[str], shards: dict[str, dict]) -> tuple[list[str], dict]:
         problems += _diff(collected, executed, f"{name} executed against collected")
         problems += _diff(executed, collected, f"{name} collected against executed")
         for row in executed_rows:
-            if row.get("runs", 1) != 1:
-                problems.append(f"{name}: {row['id']} ran {row['runs']} times")
+            if row.get("runs") != 1:
+                problems.append(f"{name}: {row.get('id')} ran {row.get('runs')!r} times")
             if row.get("outcome") in FAILING:
                 problems.append(f"{name}: {row['id']} ended as {row['outcome']}")
+            elif row.get("outcome") not in ALLOWED:
+                problems.append(f"{name}: {row.get('id')} has the outcome {row.get('outcome')!r}")
         skipped += sum(1 for row in executed_rows if row.get("outcome") == "skipped")
         junit = shard.get("junit_tests")
         if junit is None:
@@ -117,11 +137,8 @@ def load_shards(artifacts: Path, count: int) -> tuple[dict[str, dict], list[str]
                 problems.append(f"shard {index}: {path.name} is missing or empty")
             elif kind != "junit":
                 text[kind] = path.read_text(encoding="utf-8")
-        try:
-            executed = parse_executed(text.get("executed", ""))
-        except (ValueError, KeyError) as exc:
-            problems.append(f"shard {index}: unreadable executed file: {exc}")
-            executed = []
+        executed, bad_rows = parse_executed(text.get("executed", ""))
+        problems += [f"shard {index}: {message}" for message in bad_rows]
         shards[f"shard {index}"] = {"collected": parse_collected(text.get("collected", "")), "executed": executed,
                                     "junit_tests": _junit_tests(files["junit"]) if files["junit"].is_file() else None}
     return shards, problems
