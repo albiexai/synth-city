@@ -29,6 +29,7 @@ from app.services.github_coordination_service import hold_code
 from app.services.github_work_progress_observation import (
     ProgressObservationError, WorkspaceProgressContext, workspace_progress_observer,
 )
+from app.services.work_item_states import is_done
 
 _SHA = re.compile(r"[0-9a-f]{40}")
 _TERMINAL_REPORT_STATUSES = frozenset({"merged", "completed", "closed"})
@@ -92,7 +93,7 @@ def _historical(snapshot, reason: str) -> GithubPublicationObservation:
 
 
 def _next_step(item, scope, preset, pending, hold: str | None) -> tuple[str, str, str]:
-    if item.dispatch_status in {"merged", "completed"}:
+    if is_done(item.dispatch_status):
         return "complete", "none", "This tracked item is complete."
     if hold:
         return "paused", "operator", "Read the safety hold and its current issue instructions."

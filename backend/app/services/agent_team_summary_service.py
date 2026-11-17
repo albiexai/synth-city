@@ -23,6 +23,7 @@ from app.services.github_work_progress_service import github_work_progress_servi
 from app.services.agent_team_campaign_service import agent_team_campaign_service
 from app.services import required_ci_attention
 from app.services.agent_team_supervisor_service import observe_supervisor, supervisor_observation
+from app.services.work_item_states import DONE_STATUSES
 
 _ACTORS = ("owner", "leader", "operator", "controller", "reviewer")
 _KINDS = {"review_pr", "merge_pr", "inspect_attempt", "inspect_checkpoint", "milestone_acceptance",
@@ -61,7 +62,7 @@ class AgentTeamSummaryService:
             .order_by(TeamGithubScope.id).limit(33))).all())
         selected = (select(GithubWorkItem).join(TeamGithubScope,
             TeamGithubScope.id == GithubWorkItem.scope_id).where(TeamGithubScope.preset_id == preset_id,
-            GithubWorkItem.dispatch_status.not_in(("merged", "completed"))))
+            GithubWorkItem.dispatch_status.not_in(DONE_STATUSES)))
         count = await db.scalar(select(func.count()).select_from(selected.subquery()))
         # Private bindings exist only in the local equality check. Never serialize them.
         items = tuple((await db.execute(selected.with_only_columns(

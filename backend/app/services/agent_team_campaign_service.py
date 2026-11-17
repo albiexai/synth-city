@@ -18,6 +18,7 @@ from app.models.factory_schemas import (
 )
 from app.models.schemas import PlannedCampaignDecision
 from app.services.github_dispatch_priority import dispatch_order_key, effective_priority
+from app.services.work_item_states import is_done
 
 _PARENT = re.compile(r"https://github\.com/([^/]+)/([^/]+)/issues/([1-9][0-9]*)\Z")
 _STATE_PHRASES = {
@@ -179,11 +180,17 @@ class AgentTeamCampaignService:
             if not available or key in backlog:
                 work[key] = row
         done, under_way, queued = [], [], []
+        other_branch = 0
         for row in work.values():
             scope = by_scope[row.scope_id]
-            if (row.dispatch_status == "merged" and _branch(row.dispatch_base_ref)
-                    and _branch(row.dispatch_base_ref) == _branch(scope.base_ref)):
+            if is_done(row.dispatch_status):
+                # One definition of done in every view (#1106). A merge into a branch other than the scope's is still
+                # done; it is disclosed rather than dropped from every bucket. Only a recorded base is evidence of
+                # another branch: rows from before dispatch_base_ref existed have none and are not claimed.
                 done.append(row)
+                merged_base = _branch(row.dispatch_base_ref)
+                if row.dispatch_status == "merged" and merged_base is not None and merged_base != _branch(scope.base_ref):
+                    other_branch += 1
             elif row.dispatch_status in _STATE_PHRASES:
                 under_way.append(CampaignUnderWayItem(title=row.issue_title,
                     owner_short_name=row.display_name.split()[0] if row.display_name and row.display_name.split() else None,
@@ -216,7 +223,7 @@ class AgentTeamCampaignService:
                 continue
             decisions.append(CampaignDecision(text=decision.text, state=decision.state))
         return TeamCampaignSummary(backlog_state="available" if available else "backlog unavailable",
-            done_count=len(done), latest_done=[CampaignDoneItem(title=row.issue_title,
+            done_count=len(done), done_on_other_branch_count=other_branch, latest_done=[CampaignDoneItem(title=row.issue_title,
                 merged_at=row.auto_merged_at) for row in done[:3]],
             under_way_count=len(under_way), under_way=under_way, queued_count=len(queued), queued=queued,
             dispatch_order=dispatch_order,

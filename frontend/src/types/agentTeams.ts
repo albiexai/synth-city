@@ -155,6 +155,8 @@ export interface CampaignDecision { text: string; state: 'later' | 'now' | 'done
 export interface TeamCampaignSummary {
   backlog_state: 'available' | 'backlog unavailable'
   done_count: number
+  /** The part of done_count merged into a branch other than the scope's base (#1106). */
+  done_on_other_branch_count?: number
   latest_done: CampaignDoneItem[]
   under_way_count: number
   under_way: CampaignUnderWayItem[]
