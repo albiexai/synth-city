@@ -84,6 +84,18 @@ def recognize_native_input_wait(provider: str, screen: str) -> str | None:
     return None
 
 
+PROVIDER_REFUSAL = "provider_refusal"
+
+
+def counts_as_external_wait(reason: str) -> bool:
+    """Does a member in this wait count as waiting on someone else?
+
+    A provider refusal does not. The member stays ordinary idle, so idle nudges and the re-wake still try to
+    recover it. Dispatch, the idle service and the team summary all ask this one question (#1091).
+    """
+    return reason != PROVIDER_REFUSAL
+
+
 # The Codex content-filter notice. The three lines are a real capture (#1062): a header at column 0, an indented
 # detail line, and an optional indented "Learn more" line whose URL can change.
 _REFUSAL_HEADER = re.compile(r"^ⓘ\s+This content can[’']t be shown$")
@@ -159,7 +171,9 @@ def _capture_native_input_wait(provider: str, binding: ActivityBinding) -> str |
         state, start = _process(binding.pane_pid)
         if captured.returncode != 0 or before != after or start != binding.pane_start or state in _STOPPED_STATES:
             return None
-        return recognize_native_input_wait(provider, captured.stdout)
+        # A refusal screen also reads as an idle composer ("clear"), so the refusal is tried first.
+        return (recognize_provider_refusal(provider, captured.stdout)
+                or recognize_native_input_wait(provider, captured.stdout))
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
@@ -684,7 +698,7 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
     changed = False
     for entry, details in zip(inputs, metadata):
         reason = details.get("input_wait_reason")
-        if (not details.get("input_wait_known") or reason not in {"question", "trust", "sign_in", "clear"}
+        if (not details.get("input_wait_known") or reason not in {"question", "trust", "sign_in", PROVIDER_REFUSAL, "clear"}
                 or current.get(entry[0]) != entry):
             continue
         matching = [binding for binding in entry[3] if binding.binding_id == details.get("input_wait_binding_id")]
@@ -717,9 +731,13 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
                 waiting_input_started_at=None, waiting_input_notice_id=None, waiting_input_observed_at=now).execution_options(synchronize_session=False))
             changed = changed or result.rowcount == 1
             continue
-        kept = await db.execute(update(AgentPaneBinding).where(*conditions,
-            AgentPaneBinding.waiting_input_reason.is_not(None)).values(waiting_input_observed_at=now)
-            .execution_options(synchronize_session=False))
+        # One continuous episode keeps its first reason (a question may become a trust prompt). A refusal is not
+        # a wait for input, so a change into or out of one is a new episode with its own reason and notice.
+        refused = AgentPaneBinding.waiting_input_reason == PROVIDER_REFUSAL
+        same_kind = refused if reason == PROVIDER_REFUSAL else and_(
+            AgentPaneBinding.waiting_input_reason.is_not(None), ~refused)
+        kept = await db.execute(update(AgentPaneBinding).where(*conditions, same_kind)
+            .values(waiting_input_observed_at=now).execution_options(synchronize_session=False))
         if kept.rowcount == 1:
             changed = True
             continue
@@ -748,7 +766,7 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
                 AgentTeamSlot.id == leader_slot_id, AgentTeamSlot.preset_id == preset_id,
                 AgentTeamSlot.enabled.is_(True)))])
         result = await db.execute(update(AgentPaneBinding).where(*conditions, same_route,
-            AgentPaneBinding.waiting_input_reason.is_(None)).values(waiting_input_reason=reason,
+            or_(AgentPaneBinding.waiting_input_reason.is_(None), ~same_kind)).values(waiting_input_reason=reason,
             waiting_input_started_at=now, waiting_input_observed_at=now).execution_options(synchronize_session=False))
         if result.rowcount != 1:
             continue
@@ -756,7 +774,8 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
         if actor_id is not None:
             payload["supervisor_actor_id"] = actor_id
         message = MailMessage(kind="message", subject="Waiting for input",
-            body_markdown=f"Slot {entry[0]} waits for input. Reason: {reason}.", payload=payload,
+            body_markdown=(f"Slot {entry[0]} is blocked by a provider refusal." if reason == PROVIDER_REFUSAL
+                           else f"Slot {entry[0]} waits for input. Reason: {reason}."), payload=payload,
             audience_type="team_preset" if actor_id is not None else None,
             audience_id=str(preset_id) if actor_id is not None else None, recipient_member_id=recipient)
         db.add(message)

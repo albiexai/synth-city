@@ -1842,11 +1842,35 @@ MAIL_MESSAGE_KINDS = ["message", "broadcast", "context_request", "handoff", "ans
 MAIL_REQUEST_KINDS = ["context_request", "handoff"]
 
 
+# The label a wait carries is fixed by its reason. A provider refusal is a block, not a wait for input (#1091).
+WAIT_LABELS = {
+    "question": "Waiting for input", "trust": "Waiting for input", "sign_in": "Waiting for input",
+    "provider_refusal": "Blocked: provider refusal",
+}
+
+
+def wait_label_from_reason(values):
+    """Fill a missing label from the reason and refuse a label that does not match it."""
+    if not isinstance(values, dict):
+        return values
+    expected = WAIT_LABELS.get(values.get("reason"))
+    if expected is None:
+        return values  # an unknown reason is refused by the Literal
+    label = values.get("label")
+    if label is None:
+        return {**values, "label": expected}
+    if label != expected:
+        raise ValueError("The label does not match the reason")
+    return values
+
+
 class NativeInputWait(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    reason: Literal["question", "trust", "sign_in"]
-    label: Literal["Waiting for input"] = "Waiting for input"
+    reason: Literal["question", "trust", "sign_in", "provider_refusal"]
+    label: Literal["Waiting for input", "Blocked: provider refusal"] = "Waiting for input"
     observed_at: datetime
+
+    _label_follows_reason = model_validator(mode="before")(classmethod(lambda cls, values: wait_label_from_reason(values)))
 
 
 class AgentStatus(BaseModel):

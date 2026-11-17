@@ -136,7 +136,7 @@ class AgentTeamSummaryService:
                 await db.rollback()
 
         try:
-            from app.services.agent_activity_service import observe_team, _team_inputs
+            from app.services.agent_activity_service import counts_as_external_wait, observe_team, _team_inputs
             native = await bounded(lambda: observe_team(db, preset_id, include_agent_status=False,
                 persist_identities=False, max_input_rows=256, input_fence=native_fence), stall_deadline)
             native_known = all(entry.state != "unknown" for entry in native.slots)
@@ -242,8 +242,9 @@ class AgentTeamSummaryService:
         try:
             idle = await bounded(lambda: github_team_idle_service.observe(db, preset_id, now=now,
                 coverage_complete=complete and waiting_input is not None and native_known,
-                external_wait=bool(waiting_input) or any(a.state not in {"resolved", "historical"}
-                                                        for a in human_actions)))
+                # The summary lists a provider refusal, but it is not a wait on someone else (#1091).
+                external_wait=any(counts_as_external_wait(w.reason) for w in (waiting_input or []))
+                or any(a.state not in {"resolved", "historical"} for a in human_actions)))
             if await self._snapshot(db, preset_id) != final or hold_code() != hold:
                 idle = []
             for entry in idle:

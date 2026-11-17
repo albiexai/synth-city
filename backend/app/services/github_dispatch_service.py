@@ -3776,7 +3776,10 @@ class GithubDispatchService:
                 return False
             if pane_is_alive_strict(binding.pane_pid, binding.pane_start) is not True:
                 return False
-            if observed.waiting_input is not None or observed.state == "stopped":
+            # A provider refusal is not a wait on someone else: the Leader stays ordinary idle (#1091).
+            waiting = (observed.waiting_input is not None
+                       and activity.counts_as_external_wait(observed.waiting_input.reason))
+            if waiting or observed.state == "stopped":
                 return False
             recent = now - timedelta(seconds=fresh_seconds) <= session.last_seen_at <= now
             observed_at = observed.observed_at

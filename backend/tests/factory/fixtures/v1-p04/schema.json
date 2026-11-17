@@ -1046,8 +1046,11 @@
           "additionalProperties": false,
           "properties": {
             "label": {
-              "const": "Waiting for input",
               "default": "Waiting for input",
+              "enum": [
+                "Waiting for input",
+                "Blocked: provider refusal"
+              ],
               "title": "Label",
               "type": "string"
             },
@@ -1055,7 +1058,8 @@
               "enum": [
                 "question",
                 "trust",
-                "sign_in"
+                "sign_in",
+                "provider_refusal"
               ],
               "title": "Reason",
               "type": "string"
@@ -2606,8 +2610,11 @@
           "additionalProperties": false,
           "properties": {
             "label": {
-              "const": "Waiting for input",
               "default": "Waiting for input",
+              "enum": [
+                "Waiting for input",
+                "Blocked: provider refusal"
+              ],
               "title": "Label",
               "type": "string"
             },
@@ -2620,7 +2627,8 @@
               "enum": [
                 "question",
                 "trust",
-                "sign_in"
+                "sign_in",
+                "provider_refusal"
               ],
               "title": "Reason",
               "type": "string"
@@ -3618,8 +3626,11 @@
           "additionalProperties": false,
           "properties": {
             "label": {
-              "const": "Waiting for input",
               "default": "Waiting for input",
+              "enum": [
+                "Waiting for input",
+                "Blocked: provider refusal"
+              ],
               "title": "Label",
               "type": "string"
             },
@@ -3632,7 +3643,8 @@
               "enum": [
                 "question",
                 "trust",
-                "sign_in"
+                "sign_in",
+                "provider_refusal"
               ],
               "title": "Reason",
               "type": "string"

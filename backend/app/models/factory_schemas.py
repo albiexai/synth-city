@@ -2,9 +2,9 @@
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, ConfigDict, Field
+from pydantic import AfterValidator, ConfigDict, Field, model_validator
 from app.models.api_model import ApiModel as BaseModel
-from app.models.schemas import AgentStatus, RequiredCIUnreadableSignal, SupervisorObservation
+from app.models.schemas import AgentStatus, RequiredCIUnreadableSignal, SupervisorObservation, wait_label_from_reason
 
 
 def _utc(value: datetime) -> datetime:
@@ -380,8 +380,10 @@ class TeamRequiredCIUnreadable(RequiredCIUnreadableSignal):
 
 class TeamWaitingInput(FactoryModel):
     slot_id: PositiveId
-    reason: Literal["question", "trust", "sign_in"]
-    label: Literal["Waiting for input"] = "Waiting for input"
+    reason: Literal["question", "trust", "sign_in", "provider_refusal"]
+    label: Literal["Waiting for input", "Blocked: provider refusal"] = "Waiting for input"
+
+    _label_follows_reason = model_validator(mode="before")(classmethod(lambda cls, values: wait_label_from_reason(values)))
 
 
 class AgentTeamSummaryResponse(FactoryModel):
