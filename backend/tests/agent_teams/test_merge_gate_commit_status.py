@@ -100,3 +100,26 @@ async def test_a_failed_aggregate_whose_contexts_are_not_listed_is_still_refused
     await case.tick()
     assert case.client.merge_calls == 0 and case.item.dispatch_status != "merged"
     assert named in case.item.status_note
+
+
+def _script(client, successes):
+    """The status reads GitHub answers: `successes` reads report success, every later read reports pending."""
+    reads = {"n": 0}
+
+    async def read(*_args, **_kwargs):
+        reads["n"] += 1
+        return _status("success" if reads["n"] <= successes else "pending")
+    client.get_combined_status_for_ref = read
+    return reads
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("path", "successes"), [("ordinary", 1), ("settled", 2), ("superseded", 2)])
+async def test_a_status_that_turns_pending_before_the_final_green_read_is_not_merged(db, monkeypatch, path, successes):
+    """V1's transition (review 5940028996): the merge wait saw success, then the green check itself reads pending."""
+    case = await _case(db, monkeypatch, path)
+    reads = _script(case.client, successes)
+    for _ in range(2):
+        await case.tick()
+    assert reads["n"] > successes  # the pending answer was actually read
+    assert case.client.merge_calls == 0 and case.item.dispatch_status != "merged"

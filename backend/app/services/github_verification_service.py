@@ -4252,13 +4252,19 @@ class GithubVerificationService:
             return False
         if not all(check.get("conclusion") in _SUCCESS_CONCLUSIONS for check in checks):
             return False
-        # #1076: a finished failure or error commit status is neither pending nor a check run; it is not green.
-        return not await self._failed_commit_statuses(scope, client, head_sha)
+        # #1076: this one status read decides. A failed, errored, pending or unobserved commit status is not green,
+        # even when an earlier read saw success; an empty aggregate (no statuses at all) is.
+        status = await client.get_combined_status_for_ref(scope.repo_owner, scope.repo_name, head_sha)
+        return not (self._failed_status_contexts(status) or self._pending_merge_checks([], status, head_sha))
+
+    async def _failed_commit_statuses(self, scope: TeamGithubScope, client: GithubClient, head_sha: str) -> list[str]:
+        """Read the head's commit statuses and name the contexts that ended in failure or error, for a note (#1076)."""
+        return self._failed_status_contexts(
+            await client.get_combined_status_for_ref(scope.repo_owner, scope.repo_name, head_sha))
 
     @staticmethod
-    async def _failed_commit_statuses(scope: TeamGithubScope, client: GithubClient, head_sha: str) -> list[str]:
-        """The head's commit-status contexts that ended in failure or error (#1076); fails closed on a hidden one."""
-        status = await client.get_combined_status_for_ref(scope.repo_owner, scope.repo_name, head_sha)
+    def _failed_status_contexts(status: dict) -> list[str]:
+        """The contexts in failure or error (#1076); a failed aggregate with no listed context fails closed."""
         contexts = status.get("statuses") or []
         failed = [
             str(context.get("context") or "unnamed commit status")
