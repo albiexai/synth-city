@@ -38,8 +38,10 @@ async def test_runtime_intake_polling_partitions(factory_client, factory_store, 
     automation = response.json()["automation"]
     assert len(calls) == 1
     assert automation["configured_scopes"] == automation["enabled_scopes"] + automation["paused_scopes"] == 3
-    assert automation["enabled_scopes"] == sum(automation[f"intake_{s}_scopes"] for s in ("eligible", "blocked", "unknown")) == 2
-    assert automation[f"intake_{intake_state}_scopes"] == 2
+    # #1104: intake is counted for every configured scope; the paused scope's intake is blocked (scope_paused).
+    assert automation["configured_scopes"] == sum(automation[f"intake_{s}_scopes"] for s in ("eligible", "blocked", "unknown")) == 3
+    assert automation[f"intake_{intake_state}_scopes"] == (3 if intake_state == "blocked" else 2)
+    assert automation["intake_blocked_scopes"] == (3 if intake_state == "blocked" else 1)
     assert automation["runtime"]["observed_at"] != response.json()["generated_at"]
     if intake_state != "eligible":
         assert automation["never_polled_scopes"] == automation["stale_scopes"] == 0
@@ -53,6 +55,24 @@ async def test_runtime_intake_polling_partitions(factory_client, factory_store, 
     assert all(r["intake"]["reason_code"] == reason for r in enabled)
     assert all(r["poll"]["freshness"] == "suspended" for r in enabled) if intake_state == "blocked" else True
     assert all(r["poll"]["freshness"] == "unknown" for r in enabled) if intake_state == "unknown" else True
+
+
+@pytest.mark.parametrize("team_paused", [False, True])
+async def test_overview_intake_counts_equal_the_repositories_intake_tally(factory_client, factory_store, team_paused):
+    """#1104 (U10): one definition of intake per scope. With the team paused every scope is blocked (team_paused)."""
+    if team_paused:
+        async with factory_store.maker() as db:
+            await db.execute(update(AgentTeamPreset).values(autonomy_enabled=False))
+            await db.commit()
+    automation = (await factory_client.get("/api/v1/factory/overview")).json()["automation"]
+    repos = (await factory_client.get("/api/v1/factory/repositories")).json()["repositories"]
+    tally = {state: sum(r["intake"]["state"] == state for r in repos) for state in ("eligible", "blocked", "unknown")}
+    assert {state: automation[f"intake_{state}_scopes"] for state in tally} == tally
+    if team_paused:
+        assert automation["paused_scopes"] == automation["intake_blocked_scopes"] == len(repos) == 3
+        assert {r["intake"]["reason_code"] for r in repos} == {"team_paused"}
+    # Poll freshness is still counted only for switched-on scopes.
+    assert automation["never_polled_scopes"] == (0 if team_paused else 1)
 
 
 async def test_runtime_observer_never_initializes_scheduler_or_exposes_gate(monkeypatch):

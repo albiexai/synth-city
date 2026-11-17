@@ -8,7 +8,7 @@
       "automation": {
         "configured_scopes": 3,
         "enabled_scopes": 2,
-        "intake_blocked_scopes": 0,
+        "intake_blocked_scopes": 1,
         "intake_eligible_scopes": 2,
         "intake_unknown_scopes": 0,
         "never_polled_scopes": 1,
@@ -50,7 +50,7 @@
       "automation": {
         "configured_scopes": 3,
         "enabled_scopes": 2,
-        "intake_blocked_scopes": 2,
+        "intake_blocked_scopes": 3,
         "intake_eligible_scopes": 0,
         "intake_unknown_scopes": 0,
         "never_polled_scopes": 0,
@@ -92,7 +92,7 @@
       "automation": {
         "configured_scopes": 3,
         "enabled_scopes": 2,
-        "intake_blocked_scopes": 0,
+        "intake_blocked_scopes": 1,
         "intake_eligible_scopes": 2,
         "intake_unknown_scopes": 0,
         "never_polled_scopes": 1,
@@ -134,7 +134,7 @@
       "automation": {
         "configured_scopes": 3,
         "enabled_scopes": 2,
-        "intake_blocked_scopes": 2,
+        "intake_blocked_scopes": 3,
         "intake_eligible_scopes": 0,
         "intake_unknown_scopes": 0,
         "never_polled_scopes": 0,
@@ -178,7 +178,7 @@
       "automation": {
         "configured_scopes": 2,
         "enabled_scopes": 1,
-        "intake_blocked_scopes": 0,
+        "intake_blocked_scopes": 1,
         "intake_eligible_scopes": 1,
         "intake_unknown_scopes": 0,
         "never_polled_scopes": 0,
@@ -220,7 +220,7 @@
       "automation": {
         "configured_scopes": 3,
         "enabled_scopes": 2,
-        "intake_blocked_scopes": 0,
+        "intake_blocked_scopes": 1,
         "intake_eligible_scopes": 0,
         "intake_unknown_scopes": 2,
         "never_polled_scopes": 0,
