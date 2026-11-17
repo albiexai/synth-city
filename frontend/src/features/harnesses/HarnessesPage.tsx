@@ -45,6 +45,16 @@ function harnessStatus(metadata: AgentProviderStatus | undefined, catalog: Provi
   return catalog ? { kind: "unchecked", label: "Not checked yet" } : null;
 }
 
+// A pending observation is re-read soon, so the list and the page converge without waiting for the cache window.
+const PENDING_OBSERVATION_RETRY_MS = 5_000
+function usePendingObservationRetry(catalog: ProviderOperations | null, refresh: () => Promise<void>) {
+  useEffect(() => {
+    if (catalog?.readiness.probe_state !== "pending") return;
+    const timer = setTimeout(() => { void refresh() }, PENDING_OBSERVATION_RETRY_MS);
+    return () => clearTimeout(timer);
+  }, [catalog, refresh]);
+}
+
 // Green for ready, amber only for needs setup, neutral grey for not installed. Each colour has a light and a dark value.
 const statusClass: Record<HarnessStatus["kind"], string> = {
   ready: "border-emerald-600/40 text-emerald-700 dark:text-emerald-400",
@@ -150,9 +160,10 @@ function Tiles({ id, metadata, catalog, withCounts }: { id: AgentProviderId; met
 }
 
 function HarnessPage({ id, metadata, registryLoading }: { id: AgentProviderId; metadata?: AgentProviderStatus; registryLoading: boolean }) {
-  const { state, catalog } = useProviderOperations(id);
+  const { state, catalog, refresh } = useProviderOperations(id);
   const mail = useAgentMailSetup();
   useDocumentTitle(`${harnesses[id]} · Albiex Synth City`);
+  usePendingObservationRetry(catalog, refresh);
   const summaryAccess = catalog ? nativeAccess(id, "summary", metadata, catalog) : null;
   if (registryLoading || state === "idle" || state === "loading") return <HarnessCardSkeleton id={id} />;
   const status = harnessStatus(metadata, catalog);
@@ -183,7 +194,8 @@ function HarnessPage({ id, metadata, registryLoading }: { id: AgentProviderId; m
 }
 
 function HarnessCard({ id, metadata, registryLoading, teamCount }: { id: AgentProviderId; metadata?: AgentProviderStatus; registryLoading: boolean; teamCount: number | null }) {
-  const { state, catalog } = useProviderOperations(id);
+  const { state, catalog, refresh } = useProviderOperations(id);
+  usePendingObservationRetry(catalog, refresh);
   const navigate = useNavigate();
   if (registryLoading || state === "idle" || state === "loading") return <HarnessCardSkeleton id={id} />;
   const status = harnessStatus(metadata, catalog);
