@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.config import settings
 from app.database import Base
 from app.models.database import (
-    FactoryAuditEvent, GithubApprovalRequest, GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace,
+    AgentTeamPreset, FactoryAuditEvent, GithubApprovalRequest, GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace,
     MailMessage, TeamGithubScope,
 )
 from app.services.agent_mail_service import agent_mail_service
@@ -857,3 +857,125 @@ async def test_another_connection_cannot_write_between_the_read_and_the_update(f
     _after_activity_read(monkeypatch, second_connection_writes)
     assert (await _extend(fx, 10))["extension_minutes"] == 10
     assert outcome["blocked"] is True
+
+
+# --- the Supervisor notice beyond the ceiling (#1102) ---------------------------------------------------------------
+
+
+async def _bind_supervisor(fx, actor_id=6):
+    async with fx.maker() as db:
+        preset_id = (await db.get(TeamGithubScope, fx.scope_id)).preset_id
+        await db.execute(update(AgentTeamPreset).where(AgentTeamPreset.id == preset_id)
+                         .values(supervisor_actor_id=actor_id))
+        await db.commit()
+
+
+async def _ceiling_notices(fx):
+    async with fx.maker() as db:
+        return (await db.scalars(select(MailMessage).where(MailMessage.subject == "Effort ceiling reached"))).all()
+
+
+@pytest.mark.asyncio
+async def test_a_request_beyond_the_ceiling_notifies_the_bound_supervisor_once_per_attempt(fx, caplog):
+    from app.services.agent_team_supervisor_service import supervisor_inbox
+
+    await _limited(fx, limit=60)
+    await _scope_ceiling(fx, 70)
+    await _bind_supervisor(fx)
+    assert await _code(_extend(fx, 15)) == "extension_exceeds_ceiling"  # the refusal itself is unchanged
+    caplog.clear()
+    assert await _code(_extend(fx, 12)) == "extension_exceeds_ceiling"  # the same attempt: no second notice
+    assert not [r for r in caplog.records if "effort ceiling notice" in r.getMessage()]  # found, not refused
+    notices = await _ceiling_notices(fx)
+    assert len(notices) == 1
+    notice = notices[0]
+    assert notice.payload == {
+        "notice": "effort_ceiling_reached", "work_item_id": fx.item_id, "issue_number": notice.payload["issue_number"],
+        "limit_minutes": 60, "extension_minutes": 0, "ceiling_minutes": 70, "requested_minutes": 15,
+        "supervisor_actor_id": 6}
+    assert fx.nonce not in str(notice.payload) and fx.nonce not in notice.body_markdown
+    assert "beyond it, the Supervisor decides" in notice.body_markdown and "10 minutes" in notice.body_markdown
+    async with fx.maker() as db:
+        seen = await supervisor_inbox(db, SimpleNamespace(id=6))
+        assert [row.id for row in seen] == [notice.id]
+        db.add(AgentTeamPreset(name="Other", description="", created_by="t", supervisor_actor_id=7))
+        await db.commit()
+        assert await supervisor_inbox(db, SimpleNamespace(id=7)) == []  # another team's Supervisor sees nothing
+    # A new attempt is a new decision for the Supervisor.
+    await _set(fx, dispatch_nonce="the-next-attempt")
+    assert await _code(_extend(fx, 15, nonce="the-next-attempt")) == "extension_exceeds_ceiling"
+    assert len(await _ceiling_notices(fx)) == 2
+
+
+@pytest.mark.asyncio
+async def test_no_ceiling_notice_without_a_bound_supervisor(fx):
+    await _limited(fx, limit=60)
+    await _scope_ceiling(fx, 70)
+    assert await _code(_extend(fx, 15)) == "extension_exceeds_ceiling"
+    assert await _ceiling_notices(fx) == []
+
+
+@pytest.mark.asyncio
+async def test_other_refusals_send_no_ceiling_notice(fx):
+    await _limited(fx, limit=60)
+    await _scope_ceiling(fx, 70)
+    await _bind_supervisor(fx)
+    assert await _code(_extend(fx, 16)) == "extension_exceeds_cap"  # the per-step cap is the Leader's own bound
+    assert await _code(_extend(fx, 10, expected=5)) == "effort_extension_total_changed"
+    await _set(fx, dispatch_status="escalated")  # an attempt that is not live
+    assert await _code(_extend(fx, 15)) == "extension_exceeds_ceiling"
+    assert await _ceiling_notices(fx) == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_notice_write_still_refuses_and_records_nothing(fx, monkeypatch):
+    await _limited(fx, limit=60)
+    await _scope_ceiling(fx, 70)
+    await _bind_supervisor(fx)
+
+    async def broken(*_args, **_kwargs):
+        raise RuntimeError("mail store down")
+
+    monkeypatch.setattr(service, "_add_ceiling_notice", broken)
+    assert await _code(_extend(fx, 15)) == "extension_exceeds_ceiling"
+    assert await _ceiling_notices(fx) == []
+
+
+def _ceiling_root(**changes):
+    payload = {"notice": "effort_ceiling_reached", "work_item_id": 3, "issue_number": 1102, "limit_minutes": 60,
+               "extension_minutes": 0, "ceiling_minutes": 70, "requested_minutes": 15, "supervisor_actor_id": 6}
+    payload.update(changes.pop("payload", {}))
+    for key in changes.pop("drop", ()):
+        payload.pop(key)
+    root = dict(kind="message", audience_type="team_preset", thread_root_id=None, sender_type="system",
+                sender_member_id=None, sender_actor_id=None, recipient_member_id=None,
+                subject="Effort ceiling reached", payload=payload)
+    root.update(changes)
+    return SimpleNamespace(**root)
+
+
+@pytest.mark.parametrize("changes,recognised", [
+    ({}, True),
+    ({"payload": {"extension_minutes": 15}}, True),
+    ({"payload": {"extra": 1}}, False),
+    ({"drop": ("requested_minutes",)}, False),
+    ({"payload": {"work_item_id": "3"}}, False),
+    ({"payload": {"extension_minutes": -1}}, False),
+    ({"payload": {"ceiling_minutes": True}}, False),
+    ({"payload": {"notice": "something_else"}}, False),
+    ({"subject": "Effort limit reached"}, False),
+    ({"sender_type": "member"}, False),
+    ({"recipient_member_id": 4}, False),
+])
+def test_the_supervisor_recognises_exactly_the_ceiling_notice(changes, recognised):
+    from app.services.agent_team_supervisor_service import _is_effort_ceiling_notice
+
+    assert _is_effort_ceiling_notice(_ceiling_root(**changes)) is recognised
+
+
+def test_the_charter_line_says_the_leader_extends_within_the_ceiling():
+    from app.services.factory_delivery_policy import policy_guidance, scope_policy
+
+    text = policy_guidance(scope_policy(SimpleNamespace(delivery_policy=None)), None)
+    assert "the Leader extends within the scope ceiling; beyond it, the Supervisor decides" in text
+    assert "Ask the operator at the limit" not in text

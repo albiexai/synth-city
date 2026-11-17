@@ -306,6 +306,7 @@ class GithubEffortLimitService:
             raise EffortLimitError("extension_exceeds_cap", status_code=400)
         # Read everything needed before any rollback: a rollback expires the loaded row.
         limit, used, scope_id = item.effort_limit_minutes, item.effort_extension_minutes, item.scope_id
+        status, issue_number = item.dispatch_status, item.issue_number
         # Read as it is now: the session may hold an older copy of the scope row (V1 review 5925693104).
         scope = (await db.execute(select(TeamGithubScope).where(TeamGithubScope.id == item.scope_id)
                                   .execution_options(populate_existing=True))).scalar_one_or_none()
@@ -320,7 +321,19 @@ class GithubEffortLimitService:
                 f"One extension is at most {step_cap} minutes for a limit of {limit} minutes."))
         room = self.ceiling_room(limit, used, ceiling)
         if room is not None and minutes > room:
+            preset_id = getattr(scope, "preset_id", None)
             await db.rollback()
+            if status in _EXTENDABLE_STATUSES and preset_id is not None:
+                # Beyond the ceiling the Supervisor decides (#1102): tell them once for this attempt.
+                try:
+                    await self._add_ceiling_notice(
+                        db, preset_id=preset_id, work_item_id=work_item_id, dispatch_nonce=dispatch_nonce,
+                        issue_number=issue_number, limit=limit, used=used, ceiling=ceiling, requested=minutes,
+                        room=room)
+                    await db.commit()
+                except Exception:  # the unique delivery key also refuses a concurrent second notice
+                    await db.rollback()
+                    logger.exception("Could not record the effort ceiling notice for work item %s", work_item_id)
             raise EffortLimitError("extension_exceeds_ceiling", status_code=400, message=(
                 f"{room} minutes of room are left: the limit of {limit} minutes plus the extensions of {used} minutes "
                 f"may not pass the scope ceiling of {ceiling} minutes (max_item_effort_minutes)."))
@@ -363,6 +376,36 @@ class GithubEffortLimitService:
         await db.commit()
         await db.refresh(item)
         return self._result(item)
+
+    async def _add_ceiling_notice(self, db: AsyncSession, *, preset_id: int, work_item_id: int, dispatch_nonce: str,
+                                  issue_number: int, limit: int, used: int, ceiling: int, requested: int,
+                                  room: int) -> None:
+        """Add (never commit) the Supervisor's notice for a request beyond the ceiling: one per item and attempt.
+
+        Built like the auto-merge notice (#939): a system row to the team with no member receipts, which only the
+        bound Supervisor's inbox shows through its exact payload shape. No team Supervisor means no row.
+        """
+        from app.models.database import AgentTeamPreset, MailMessage
+
+        supervisor = await db.scalar(select(AgentTeamPreset.supervisor_actor_id).where(AgentTeamPreset.id == preset_id))
+        if supervisor is None:
+            return
+        key = f"github-effort-ceiling:{work_item_id}:{dispatch_nonce}:operator"
+        if await db.scalar(select(MailMessage.id).where(MailMessage.delivery_key == key)) is not None:
+            return
+        db.add(MailMessage(
+            kind="message", sender_type="system", audience_type="team_preset", audience_id=str(preset_id),
+            subject="Effort ceiling reached",
+            body_markdown=(
+                f"Issue #{issue_number}: the Leader asked to extend the effort limit by {requested} minutes, beyond "
+                f"the scope ceiling of {ceiling} minutes (limit {limit}, extensions so far {used}, {room} minutes of "
+                "room left). The Leader extends within the ceiling; beyond it, the Supervisor decides: raise the "
+                "scope's max_item_effort_minutes, split the issue, or stop the work. This notice grants no extension."),
+            payload={"notice": "effort_ceiling_reached", "work_item_id": work_item_id, "issue_number": issue_number,
+                     "limit_minutes": limit, "extension_minutes": used, "ceiling_minutes": ceiling,
+                     "requested_minutes": requested, "supervisor_actor_id": supervisor},
+            delivery_key=key,
+        ))
 
     @staticmethod
     def _total_changed(recorded: int) -> EffortLimitError:
