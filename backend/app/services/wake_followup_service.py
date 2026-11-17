@@ -25,10 +25,14 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from sqlalchemy import exists, insert, literal, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models.database import MailMessage, MailReceipt, MailTeamMember, MailWakeAttempt
+from app.models.database import (
+    AgentTeamPreset, GithubWorkItem, MailMessage, MailReceipt, MailTeamMember, MailWakeAttempt,
+)
+from app.models.schemas import MailMessageCreate
 from app.services.agent_mail_service import MailWakeError, agent_mail_service
 from app.services.agent_status_service import agent_status_service
 
@@ -37,6 +41,9 @@ logger = logging.getLogger(__name__)
 # The wakes that tell a member to act: after a message, a decision, an approval or a direct request.
 WAKE_SOURCES = ("auto_nudge", "external_delivery", "manual_operator", "manual_session")
 REWAKE_SOURCE = "rewake"
+NOTICE_KEY = "rewake-notice:{attempt_id}:{who}"
+# The work items a member can be working on. Same set the dispatch monitor treats as busy.
+ACTIVE_ITEM_STATUSES = ("dispatched", "verifying")
 # An older wake is history, not a member that is still waiting.
 MAX_AGE_SECONDS = 3600
 
@@ -72,6 +79,11 @@ class WakeFollowupService:
             return []
 
     async def _tick(self, db: AsyncSession, now: datetime) -> list[int]:
+        woken = await self._rewake(db, now)
+        await self._notify_silent_rewakes(db, now)
+        return woken
+
+    async def _rewake(self, db: AsyncSession, now: datetime) -> list[int]:
         delay = timedelta(seconds=settings.wake_followup_delay_seconds)
         attempts = (await db.scalars(select(MailWakeAttempt).where(
             MailWakeAttempt.result == "delivered",
@@ -129,6 +141,105 @@ class WakeFollowupService:
                 continue
             woken.append(member_id)
         return woken
+
+    async def _notify_silent_rewakes(self, db: AsyncSession, now: datetime) -> None:
+        """Tell the Leader and the Supervisor, once each, about a re-wake that also got no activity.
+
+        The evidence rule is the one for the re-wake: no Mail activity since the re-wake and a known
+        native idle state from before it. Unknown stays unknown and sends nothing. A notice wakes
+        nobody, so it cannot start another follow-up and chain.
+        """
+        delay = timedelta(seconds=settings.wake_followup_delay_seconds)
+        rows = (await db.scalars(select(MailWakeAttempt).where(
+            MailWakeAttempt.source == REWAKE_SOURCE,
+            MailWakeAttempt.result == "delivered",
+            MailWakeAttempt.member_id.is_not(None),
+            MailWakeAttempt.created_at >= now - timedelta(seconds=MAX_AGE_SECONDS),
+        ).order_by(MailWakeAttempt.created_at, MailWakeAttempt.id))).all()
+        newest = {row.member_id: row for row in rows}
+        due = {}
+        for member_id, row in newest.items():
+            _, _, original = (row.reason_code or "").partition(":")
+            if original.isdigit() and row.created_at <= now - delay:
+                due[member_id] = (row, int(original))
+        if not due:
+            return
+        keys = {NOTICE_KEY.format(attempt_id=original, who=who)
+                for _, original in due.values() for who in ("leader", "supervisor")}
+        sent = set((await db.scalars(select(MailMessage.delivery_key).where(
+            MailMessage.delivery_key.in_(keys)))).all())
+        todo = {member_id: (row, original) for member_id, (row, original) in due.items()
+                if not {NOTICE_KEY.format(attempt_id=original, who="leader"),
+                        NOTICE_KEY.format(attempt_id=original, who="supervisor")} <= sent}
+        silent = [member_id for member_id, (row, _) in todo.items()
+                  if not await self._mail_activity_since(db, member_id, row.created_at)]
+        if not silent:
+            return
+        members = {member.id: member for member in (await db.scalars(
+            select(MailTeamMember).where(MailTeamMember.id.in_(silent)))).all()}
+        try:
+            statuses = await agent_status_service.for_members(db, list(members.values()))
+        except (OSError, ValueError):
+            logger.warning("Wake follow-up could not read native activity; no notice was sent")
+            return
+        for member_id in silent:
+            row, original = todo[member_id]
+            member = members.get(member_id)
+            if member is None or not self._known_idle_before(statuses.get(member_id), row.created_at):
+                continue
+            # The native read awaited. A member that read Mail meanwhile gets no notice.
+            if await self._mail_activity_since(db, member_id, row.created_at):
+                continue
+            await self._send_notices(db, member, row, original, sent)
+
+    async def _send_notices(self, db: AsyncSession, member: MailTeamMember, rewake: MailWakeAttempt,
+                            original: int, sent: set[str]) -> None:
+        preset = await db.get(AgentTeamPreset, member.team_preset_id) if member.team_preset_id else None
+        if preset is None:
+            return  # not on a team: there is nobody to tell
+        item = None
+        if member.team_slot_id is not None:
+            item = (await db.scalars(select(GithubWorkItem).where(
+                GithubWorkItem.owner_slot_id == member.team_slot_id,
+                GithubWorkItem.dispatch_status.in_(ACTIVE_ITEM_STATUSES),
+            ).order_by(GithubWorkItem.id.desc()).limit(1))).first()
+        work = (f"issue #{item.issue_number} ({item.issue_title})" if item is not None
+                else "no active work item")
+        subject = f"No activity after a re-wake: {member.display_name}"
+        body = (
+            f"{member.display_name} did not act after a wake and a re-wake.\n\n"
+            f"- Work: {work}\n"
+            f"- Re-woken at {rewake.created_at:%Y-%m-%d %H:%M:%S} UTC\n"
+            "- Seen: no Mail read, ack or sent message since the re-wake, and the native state was idle "
+            "from before it.\n\n"
+            "This is a best-effort observation, not proof. This notice grants no authority and wakes nobody."
+        )
+        payload = {"notice": "wake_followup_silent", "member_id": member.id, "slot_id": member.team_slot_id,
+                   "attempt_id": original, "issue_number": item.issue_number if item is not None else None}
+        leader_key = NOTICE_KEY.format(attempt_id=original, who="leader")
+        supervisor_key = NOTICE_KEY.format(attempt_id=original, who="supervisor")
+        leader = None
+        if preset.leader_slot_id is not None and leader_key not in sent:
+            leader = (await db.scalars(select(MailTeamMember).where(
+                MailTeamMember.team_preset_id == preset.id,
+                MailTeamMember.team_slot_id == preset.leader_slot_id,
+            ).order_by(MailTeamMember.updated_at.desc(), MailTeamMember.id.desc()).limit(1))).first()
+        if leader is not None:
+            await agent_mail_service.send_message(db, MailMessageCreate(
+                recipient_member_id=leader.id, audience_type="member", audience_id=str(leader.id),
+                subject=subject, body_markdown=body, payload=payload),
+                sender_type="system", commit=False, auto_nudge=False, delivery_key=leader_key)
+        if preset.supervisor_actor_id is not None and supervisor_key not in sent:
+            try:
+                async with db.begin_nested():
+                    db.add(MailMessage(
+                        kind="message", audience_type="team_preset", audience_id=str(preset.id),
+                        subject=subject, body_markdown=body, delivery_key=supervisor_key,
+                        payload={**payload, "supervisor_actor_id": preset.supervisor_actor_id}))
+                    await db.flush()
+            except IntegrityError:
+                pass  # another sweep or process wrote it first: exactly one is kept
+        await db.commit()
 
     @staticmethod
     async def _claim(db: AsyncSession, member_id: int, attempt: MailWakeAttempt) -> bool:
