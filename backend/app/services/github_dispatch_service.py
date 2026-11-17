@@ -2462,8 +2462,7 @@ class GithubDispatchService:
             except Exception as caught_error:
                 # The notice is already sent; a missing observation never
                 # replays it.
-                await recover_session(db, caught_error)
-                await db.rollback()
+                await recover_session(db, caught_error, discard=True)
 
     async def accept_handoff(
         self,
@@ -4046,12 +4045,11 @@ class GithubDispatchService:
             if reason == "dispatch_label_removed":
                 await self._send_label_removed_owner_message(db, item)
         except Exception as caught_error:
-            await recover_session(db, caught_error)
+            await recover_session(db, caught_error, discard=True)
             logger.exception(
                 "Failed to send autonomous dispatch escalation notification for item %s",
                 item.id,
             )
-            await db.rollback()
             self._apply_escalation(item, reason, note, preserve_existing_reason=False)
 
     async def abandon_by_operator(

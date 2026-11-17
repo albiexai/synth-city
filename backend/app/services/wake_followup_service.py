@@ -76,9 +76,8 @@ class WakeFollowupService:
             async with self._sweep_lock():
                 return await self._tick(db, _naive_utc(now) if now else datetime.utcnow())
         except Exception as caught_error:
-            await recover_session(db, caught_error)
+            await recover_session(db, caught_error, discard=True)
             logger.exception("Wake follow-up failed")
-            await db.rollback()
             return []
 
     async def _tick(self, db: AsyncSession, now: datetime) -> list[int]:

@@ -1228,8 +1228,7 @@ class GithubVerificationService:
 
             await github_summary_publication_service.publish_scope(db, scope, client)
         except Exception as exc:
-            await recover_session(db, exc)
-            await db.rollback()
+            await recover_session(db, exc, discard=True)
             logger.warning("summary_publication_failed error_type=%s", type(exc).__name__)
 
     async def _reconcile_escalated_merges(
@@ -1683,10 +1682,9 @@ class GithubVerificationService:
             await db.refresh(scope)
             logger.info("Terminal attempt changed; no merge transition recorded")
         except Exception as caught_error:
-            await recover_session(db, caught_error)
+            await recover_session(db, caught_error, discard=True)
             logger.warning("Merged-PR check failed for work item %s; the item stays as it is", item_id,
                            exc_info=True)
-            await db.rollback()
             await db.refresh(scope)
 
     async def _settled_revision(
@@ -1844,10 +1842,9 @@ class GithubVerificationService:
             await db.refresh(scope)
             self._log_inconsistent_once(None, f"a PR response failed the identity check ({exc})", snapshot=snapshot)
         except Exception as caught_error:
-            await recover_session(db, caught_error)
+            await recover_session(db, caught_error, discard=True)
             logger.warning("Superseded-revision check failed for work item %s; the item stays as it is",
                            snapshot[0], exc_info=True)
-            await db.rollback()
             await db.refresh(scope)
 
     async def _promote_settled_revision(
@@ -2651,12 +2648,11 @@ class GithubVerificationService:
             )
             await db.commit()
         except Exception as caught_error:
-            await recover_session(db, caught_error)
+            await recover_session(db, caught_error, discard=True)
             logger.exception(
                 "Failed to send blocker-merged notification for work item %s",
                 item.id,
             )
-            await db.rollback()
 
     async def _completion_head_is_current(self, db, scope, item, client, head_sha, *, revision=None):
         """Check remote identity again after fetching checks, before publishing a handoff."""

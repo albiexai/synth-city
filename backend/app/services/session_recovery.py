@@ -18,9 +18,11 @@ def _transaction_unusable(db: AsyncSession) -> bool:
     return transaction is not None and not transaction.is_active
 
 
-async def recover_session(db: AsyncSession, error: BaseException) -> bool:
+async def recover_session(db: AsyncSession, error: BaseException, *, discard: bool = False) -> bool:
     """Roll back when ``db`` cannot be reused after ``error``; return whether it did. A failed rollback raises."""
-    if isinstance(error, SQLAlchemyError) or _transaction_unusable(db):
+    # discard=True: the handler drops the stage's writes for any error, as it did before #1148; it must not
+    # roll back again itself, because a second rollback would expire the objects reloaded here.
+    if discard or isinstance(error, SQLAlchemyError) or _transaction_unusable(db):
         await db.rollback()
         # A rollback expires every loaded object; reading one afterwards would lazy-load synchronously
         # (MissingGreenlet) in the caller (V1 review of #1155). Reload what the session still holds.

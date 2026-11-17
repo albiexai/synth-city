@@ -200,10 +200,9 @@ class GithubWatcherService:
             # A34: a later-result read never blocks the poll. It runs after the
             # poll commit, so a failure here discards nothing else; its
             # results stay unresolved until a later poll.
-            await recover_session(db, caught_error)
+            await recover_session(db, caught_error, discard=True)
             logger.info("Later-result reconciliation unavailable for scope %s", scope.id,
                         exc_info=True)
-            await db.rollback()
             await db.refresh(scope)
 
         # This cached read changes no dispatch, retry, eligibility or merge decision.
@@ -211,9 +210,8 @@ class GithubWatcherService:
         try:
             await agent_team_campaign_service.refresh_scope(db, scope, client)
         except Exception as caught_error:
-            await recover_session(db, caught_error)
+            await recover_session(db, caught_error, discard=True)
             logger.info("Campaign backlog unavailable for scope %s", scope_id)
-            await db.rollback()
             await db.refresh(scope)
 
     async def _upsert_item(self, db: AsyncSession, scope: TeamGithubScope, issue: dict) -> None:
@@ -586,11 +584,10 @@ class GithubWatcherService:
                     continue
                 await db.commit()
             except Exception as caught_error:
-                await recover_session(db, caught_error)
+                await recover_session(db, caught_error, discard=True)
                 logger.info("Later result unavailable for attempt %s", state["attempt"],
                             exc_info=True)
                 try:
-                    await db.rollback()
                     await db.refresh(scope)
                 except Exception as caught_error:
                     await recover_session(db, caught_error)
@@ -813,7 +810,7 @@ class GithubWatcherService:
             )
             await db.commit()
         except Exception as caught_error:
-            await recover_session(db, caught_error)
+            await recover_session(db, caught_error, discard=True)
             logger.exception(
                 "Failed to send blocker-merged notification for work item %s",
                 captured_item_id,
@@ -829,7 +826,6 @@ class GithubWatcherService:
                 session_factory=getattr(self, "observer_session_factory", None),
             )
             try:
-                await db.rollback()
                 # Callers keep using the scope after this entry.
                 await db.refresh(scope)
             except Exception as caught_error:

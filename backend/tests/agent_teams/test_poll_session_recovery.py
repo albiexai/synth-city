@@ -140,6 +140,11 @@ def _handlers_needing_recovery():
                     if uses_db and "recover_session(db" not in first and not any(
                             isinstance(s, ast.Raise) for s in handler.body):
                         missing.append(f"{name}:{handler.lineno} {fn.name}")
+                    # A later rollback would expire the objects recovery reloaded (V1 on #1155); a handler
+                    # that discards the stage's writes passes discard=True instead.
+                    if "recover_session(db" in first and any(
+                            ast.unparse(n) == "await db.rollback()" for st in handler.body[1:] for n in ast.walk(st)):
+                        missing.append(f"{name}:{handler.lineno} {fn.name} rolls back after recovery")
     return missing
 
 
@@ -213,3 +218,21 @@ async def test_a_recovery_only_failure_names_its_stage(monkeypatch):
     with pytest.raises(OperationalError):
         await scheduler._run_recovery_only(SimpleNamespace(commit=noop), [scope], client=None)
     assert scheduler_module._poll_stage.get() == "recovery_only_continuation"
+
+
+@pytest.mark.asyncio
+async def test_a_discarding_handler_drops_staged_writes_and_keeps_held_objects_usable(maker):
+    # The handlers that always discarded the stage's writes now do it inside recover_session, so the objects
+    # it reloads are not expired again by a second rollback (V1's second review of #1155).
+    from app.services.session_recovery import recover_session
+
+    async with maker() as db:
+        held = AgentTeamPreset(id=200, name="held", description="", created_by="test")
+        db.add(held)
+        await db.commit()
+        db.add(_preset("staged before a notification failed"))
+        await db.flush()
+        assert await recover_session(db, httpx.ConnectError("refused"), discard=True) is True
+        assert held.name == "held"
+        names = (await db.execute(select(AgentTeamPreset.name))).scalars().all()
+        assert names == ["held"]
