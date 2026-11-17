@@ -27,6 +27,10 @@ Pi has additional requirements:
 
 Agent Mail has no Pi install action. Its **Pi Agent Mail** card on the Install tab only checks whether the extension is ready.
 
+Pi supports OpenRouter (default model `moonshotai/kimi-k3`), plain launches and exact project-local resume. No global Pi configuration is installed, and Synth City does not sandbox Pi tools. Read [Pi rollout and team migration](https://github.com/albiexai/synth-city/blob/master/docs/deploy/pi-provider-rollout.md) before deploying Pi or replacing existing team sessions.
+
+**Linux for team pane binding.** Synth City reads `/proc/net/tcp` and `/proc/<pid>/stat` to find the tmux pane a registering agent runs in. On macOS and Windows every other feature works, but agents register unbound, and Agent Mail capability-token enforcement ([rollout notes](https://github.com/albiexai/synth-city/blob/master/docs/deploy/pr0-capability-tokens-rollout.md)) cannot be turned on.
+
 ### Steps
 
 1. Clone the repository:

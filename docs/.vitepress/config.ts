@@ -2,7 +2,7 @@ import { defineConfig } from 'vitepress'
 
 export default defineConfig({
   title: 'Albiex Synth City',
-  description: 'Documentation for Albiex Synth City — observe and intervene in bounded coding-agent work on GitHub',
+  description: 'Documentation for Albiex Synth City — run teams of AI coding agents on your GitHub backlog, with review built in',
   appearance: 'force-dark',
   base: '/docs/',
   srcExclude: [
