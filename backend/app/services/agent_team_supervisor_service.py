@@ -236,7 +236,7 @@ def _is_native_wait_notice(root) -> bool:
         and root.recipient_member_id is None and root.subject == "Waiting for input"
         and isinstance(payload, dict) and set(payload) == {"notice", "slot_id", "reason", "supervisor_actor_id"}
         and payload["notice"] == "native_input_wait" and type(payload["slot_id"]) is int and payload["slot_id"] > 0
-        and payload["reason"] in {"question", "trust", "sign_in", "provider_refusal"})
+        and payload["reason"] in {"question", "trust", "sign_in"})
 
 
 def _is_leader_ack_wait_notice(root) -> bool:
@@ -294,11 +294,26 @@ def _is_wake_followup_notice(root) -> bool:
         and optional_positive(payload["slot_id"]) and optional_positive(payload["issue_number"]))
 
 
+def _is_provider_refusal_notice(root) -> bool:
+    payload = root.payload
+    optional_positive = lambda value: value is None or (type(value) is int and value > 0)
+    return (getattr(root, "sender_type", None) == "system"
+        and root.sender_member_id is None and root.sender_actor_id is None
+        and root.recipient_member_id is None and root.subject == "Provider refusal"
+        and isinstance(payload, dict) and set(payload) == {
+            "notice", "member_id", "slot_id", "work_item_id", "issue_number", "supervisor_actor_id"}
+        and payload["notice"] == "provider_refusal"
+        and all(type(payload[key]) is int and payload[key] > 0 for key in (
+            "member_id", "slot_id", "supervisor_actor_id"))
+        and optional_positive(payload["work_item_id"]) and optional_positive(payload["issue_number"]))
+
+
 def is_supervisor_message(root) -> bool:
     return (root.kind == "message" and root.audience_type == "team_preset"
             and (root.sender_member_id is not None or _is_native_wait_notice(root)
                  or _is_leader_ack_wait_notice(root) or _is_auto_merge_not_fired_notice(root)
-                 or _is_operations_finding_notice(root) or _is_wake_followup_notice(root))
+                 or _is_operations_finding_notice(root) or _is_wake_followup_notice(root)
+                 or _is_provider_refusal_notice(root))
             and root.thread_root_id is None
             and isinstance(root.payload, dict) and "supervisor_actor_id" in root.payload)
 
