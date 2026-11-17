@@ -290,3 +290,59 @@ async def test_incomplete_pagination_is_unavailable(case):
         return httpx.Response(200, request=request, headers=headers, json={"total_count": count, "check_runs": rows})
     with pytest.raises(GithubCheckObservationError):
         await observe(handler)
+
+
+# --- #1125: a superseded attempt's inconsistent row -----------------------------------------------------------------
+
+# The #1007 shapes: neither pending without a conclusion nor completed with a known one.
+INCONSISTENT = {"in_progress_with_a_conclusion": ("in_progress", "success"),
+                "completed_without_a_conclusion": ("completed", None)}
+
+
+async def _refusal(api):
+    with pytest.raises(GithubCheckObservationError) as caught:
+        await observe(api)
+    return str(caught.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", sorted(INCONSISTENT))
+async def test_a_superseded_attempts_inconsistent_row_does_not_block_its_green_rerun(shape):
+    # Live on #1121: attempt 1 of "Changed Python undefined names" kept in_progress/success after its workflow
+    # completed; the rerun (attempt 2, the same suite) is completed/success and the job history proves 100 old.
+    status, conclusion = INCONSISTENT[shape]
+    stale, rerun = check(status=status, conclusion=conclusion), check(101)
+    api = API([stale, rerun], [run(attempt=2)], {10: [job(101, attempt=2)]},
+              {10: [job(status=status, conclusion=conclusion), job(101, attempt=2)]}, latest=[rerun])
+    result = await observe(api)
+    assert {row.get("id") for row in result} == {101, None}  # the rerun's job check and the workflow row
+    assert all(row["status"] == "completed" and row["conclusion"] == "success" for row in result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", sorted(INCONSISTENT))
+async def test_a_latest_attempt_that_is_itself_inconsistent_is_still_refused(shape):
+    status, conclusion = INCONSISTENT[shape]
+    current = check(101, status=status, conclusion=conclusion)
+    api = API([check(), current], [run(attempt=2)], {10: [job(101, attempt=2, status=status, conclusion=conclusion)]},
+              {10: [job(), job(101, attempt=2, status=status, conclusion=conclusion)]}, latest=[current])
+    assert await _refusal(api) == "invalid_execution_state"  # #1007 stays strict for the current run
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempt", [1, 2])
+async def test_an_inconsistent_row_not_proven_to_be_superseded_is_still_refused(attempt):
+    # The row is left out of the current jobs, but nothing proves it belongs to an older attempt.
+    api = API([check(status="in_progress", conclusion="success"), check(101)], [run(attempt=attempt)],
+              {10: [job(101, attempt=attempt)]}, {10: [job(101, attempt=attempt)]})
+    assert await _refusal(api) == "unresolved_current_checks"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", sorted(INCONSISTENT))
+async def test_an_external_superseded_inconsistent_row_is_ignored_and_a_latest_one_refused(shape):
+    status, conclusion = INCONSISTENT[shape]
+    current = check(101, app=2)
+    assert await observe(API([check(app=2, status=status, conclusion=conclusion), current], latest=[current])) == [current]
+    bad = check(101, app=2, status=status, conclusion=conclusion)
+    assert await _refusal(API([check(app=2), bad], latest=[bad])) == "invalid_execution_state"
