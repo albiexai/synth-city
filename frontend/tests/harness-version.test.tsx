@@ -109,12 +109,15 @@ describe('the harness page shows the chosen user\'s Claude Code version', () => 
   it('shows the exact unknown message in the page header and in Technical details, installed or not', async () => {
     await openPage({ ...AGENT_UNKNOWN, installed: false })
 
-    expect(screen.getAllByText(UNKNOWN).length).toBeGreaterThanOrEqual(2)             // the header line and the details line
+    // The header line is exactly the message. The details line is one text node that begins with its label, so an exact
+    // match finds the header line only; the details line is checked by its full text.
+    expect(screen.getAllByText(UNKNOWN)).toHaveLength(1)
     expect(screen.getByText(`Selected user's Claude Code: ${UNKNOWN}`)).toBeInTheDocument()
     cleanup(); resetProviderOperations()
 
     await openPage(AGENT_UNKNOWN)
-    expect(screen.getAllByText(UNKNOWN).length).toBeGreaterThanOrEqual(2)
+    expect(screen.getAllByText(UNKNOWN)).toHaveLength(1)
+    expect(screen.getByText(`Selected user's Claude Code: ${UNKNOWN}`)).toBeInTheDocument()
   })
 
   it('keeps today\'s header for the controller\'s own scope', async () => {
