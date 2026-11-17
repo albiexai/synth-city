@@ -567,6 +567,7 @@ export interface GithubWorkItem {
 
 export interface GithubWorkItemListResponse {
   items: GithubWorkItem[]
+  total?: number | null
 }
 
 export interface GithubWorkspace {
