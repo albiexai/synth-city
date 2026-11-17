@@ -586,3 +586,87 @@ async def test_finalize_refuses_when_only_the_second_read_differs(db):
     assert len(reads) == 2
     await db.refresh(item)
     assert item.dispatch_status == "verifying"
+
+
+# ---- #1078: a dispatched item whose PR merged while its revision was still active ----
+
+async def _dispatched_active(db, *, pull_head="accepted-head", accepted=True, pull=None, client_class=_Client):
+    """A dispatched item on an active implementation revision (no submitted head) and a PR that GitHub reports as given."""
+    scope = await _scope(db)
+    slot, member = await _owner(db, scope)
+    item = await _item(db, scope, dispatch_status="dispatched", pr_number=5, owner_slot_id=slot.id,
+                       dispatch_nonce="attempt-1", active_scope_revision=1, attempt_phase="implementation",
+                       ack_received_at=datetime.utcnow())
+    revision, _workspace = await _implementation_revision(db, scope, item, slot, member, status="active")
+    if accepted:
+        db.add(GithubHeadReview(work_item_id=item.id, dispatch_nonce="attempt-1", pr_number=5, head_sha=pull_head,
+                                scope_revision=1, reviewer_member_id=1, verdict="accepted", summary="ok",
+                                evidence_url="https://github.com/o/r/pull/5#pullrequestreview-1"))
+        await db.commit()
+    client = client_class()
+    client.pull.update(pull or MERGED)
+    client.pull["head"] = dict(client.pull["head"], sha=pull_head)
+    return scope, item, revision, client
+
+
+async def _settlements(db):
+    return (await db.execute(select(FactoryAuditEvent).where(FactoryAuditEvent.event_kind == "merged_settlement"))
+            ).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_a_dispatched_item_merged_at_an_accepted_head_settles_with_its_active_revision(db):
+    scope, item, revision, client = await _dispatched_active(db)
+    await _tick(db, scope, client, item, revision)
+    assert item.dispatch_status == "merged"
+    assert revision.status == "completed" and revision.completed_at is not None
+    events = await _settlements(db)
+    assert [(e.item_id, e.revision_id, e.sanitized_reason) for e in events] == [
+        (item.id, revision.id, "pr_merged_with_active_revision")]
+    await _tick(db, scope, client, item, revision)  # a later poll records nothing more
+    assert len(await _settlements(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_dispatched_item_merged_at_an_unaccepted_head_escalates_for_the_operator(db):
+    scope, item, revision, client = await _dispatched_active(db, pull_head="unreviewed-head", accepted=False)
+    await _tick(db, scope, client, item, revision)
+    assert item.dispatch_status == "escalated" and item.escalation_reason == "continuation_invalid_state"
+    assert "unreviewed-head" in item.status_note and "no merge was recorded" in item.status_note
+    assert revision.status == "superseded"
+    assert await _settlements(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_lost_fence_while_the_merge_is_read_again_changes_nothing(db):
+    class _ChangingClient(_Client):
+        reads = 0
+
+        async def get_pull(self, owner, repo, number):
+            self.reads += 1
+            if self.reads == 2:  # the settlement's final read: the revision changes meanwhile
+                await db.execute(update(GithubAttemptScopeRevision).values(summary="changed meanwhile"))
+                await db.commit()
+            return await super().get_pull(owner, repo, number)
+
+    scope, item, revision, client = await _dispatched_active(db, client_class=_ChangingClient)
+    await _tick(db, scope, client, item, revision)
+    assert client.reads >= 2
+    assert item.dispatch_status == "dispatched" and revision.status == "active"
+    assert await _settlements(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_dispatched_item_with_an_open_pr_is_left_as_it_is(db):
+    scope, item, revision, client = await _dispatched_active(db, pull=dict(state="open", merged=False, merged_at=None))
+    await _tick(db, scope, client, item, revision)
+    assert item.dispatch_status == "dispatched" and revision.status == "active"
+    assert await _settlements(db) == []
+
+
+@pytest.mark.asyncio
+async def test_the_submitted_settlement_records_the_shared_reason_once(db):
+    scope, item, revision, workspace, client = await _submitted(db, unacknowledged_amendment=False)
+    await _tick(db, scope, client, item, revision)
+    assert item.dispatch_status == "merged"
+    assert [e.sanitized_reason for e in await _settlements(db)] == ["pr_merged_with_submitted_revision"]
