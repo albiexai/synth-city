@@ -176,7 +176,7 @@ describe("delivery read authority and filters", () => {
       screen.getByText(/Recovery-only mode blocks normal intake/),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/Intake: 0 ready · 2 blocked/),
+      screen.getByText(/Intake: 0 ready · 3 blocked/),
     ).toBeInTheDocument();
   });
   it("keeps configuration-only empty factories useful", async () => {
