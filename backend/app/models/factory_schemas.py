@@ -361,6 +361,8 @@ class CampaignDecision(FactoryModel):
 class TeamCampaignSummary(FactoryModel):
     backlog_state: Literal["available", "backlog unavailable"]
     done_count: int = Field(ge=0)
+    # The part of done_count merged into a branch other than the scope's current base (#1106).
+    done_on_other_branch_count: int = Field(default=0, ge=0)
     latest_done: list[CampaignDoneItem]
     under_way_count: int = Field(ge=0)
     under_way: list[CampaignUnderWayItem]
