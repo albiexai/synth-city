@@ -32,7 +32,7 @@ from app.models.schemas import (
     UsageSummaryResponse,
 )
 from app.services.pricing_service import PricingService
-from app.utils.path_utils import get_claude_projects_dir, get_project_display_name, convert_path_to_folder_name
+from app.utils.path_utils import get_claude_projects_dir, get_user_home, get_project_display_name, convert_path_to_folder_name
 
 
 @dataclass
@@ -80,6 +80,11 @@ class UsageService:
     ) -> str:
         """Generate cache key for query."""
         key_parts = [cache_type, f"pricing:{self.pricing.PRICING_VERSION}"]
+        # Another user's home has a key of its own. The controller's own home keeps today's key, so an existing
+        # single-user cache stays valid (the same rule as the MCP cache, #969).
+        home = get_user_home()
+        if home != Path.home():
+            key_parts.append(f"home:{home}")
         if project_path:
             key_parts.append(f"project:{project_path}")
         for k, v in sorted(params.items()):
