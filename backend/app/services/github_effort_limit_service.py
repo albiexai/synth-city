@@ -26,6 +26,8 @@ MAX_TICK_SECONDS = 300
 EXTENSION_CAP_MINUTES = 30
 EXTENSION_CAP_PERCENT = 25
 _REASON_LIMIT = 500
+# An extension serves the working attempt and its review corrections: a PR under review is "verifying" (#1059).
+_EXTENDABLE_STATUSES = ("dispatched", "verifying")
 _UNSET = object()
 
 
@@ -81,24 +83,30 @@ class GithubEffortLimitService:
         """The most one Leader extension may add: the smaller of 30 minutes and 25 percent of the limit."""
         return max(0, min(EXTENSION_CAP_MINUTES, limit_minutes * EXTENSION_CAP_PERCENT // 100))
 
-    @classmethod
-    def extension_cap_for(cls, limit_minutes: int, ceiling_minutes) -> int:
-        """The extension cap under the scope ceiling (#968): limit plus extension never passes ``max_item_effort_minutes``.
+    @staticmethod
+    def ceiling_room(limit_minutes: int, extension_minutes: int, ceiling_minutes) -> int | None:
+        """The minutes the limit and its extensions leave under ``max_item_effort_minutes``, or ``None`` unread."""
+        if isinstance(ceiling_minutes, int) and not isinstance(ceiling_minutes, bool):
+            return max(0, ceiling_minutes - limit_minutes - extension_minutes)
+        return None
 
-        The ordinary cap, clamped to the room the limit leaves under the ceiling and never below zero. A ceiling
-        that cannot be read leaves the ordinary cap.
+    @classmethod
+    def extension_cap_for(cls, limit_minutes: int, ceiling_minutes, extension_minutes: int = 0) -> int:
+        """The most the next extension may add (#968, #1101): the per-step cap, clamped to the room under the ceiling.
+
+        The per-step cap comes from the original limit, so repeated steps never grow it. A ceiling that cannot be
+        read leaves the per-step cap.
         """
         cap = cls.extension_cap(limit_minutes)
-        if isinstance(ceiling_minutes, int) and not isinstance(ceiling_minutes, bool):
-            cap = min(cap, max(0, ceiling_minutes - limit_minutes))
-        return cap
+        room = cls.ceiling_room(limit_minutes, extension_minutes, ceiling_minutes)
+        return cap if room is None else min(cap, room)
 
     @classmethod
     def effort_view(cls, item, scope) -> dict | None:
         """What an item's recorded estimate, limit and extension look like in a view, or ``None`` without a limit.
 
         Plain numbers only: no ledger time, no nonce, no lease. ``extension_cap_minutes`` is the most the Leader may
-        still add, under the ceiling, and is zero once the extension was used.
+        add with the next extension: the per-step cap within the room left under the ceiling (#1101).
         """
         limit = getattr(item, "effort_limit_minutes", None)
         if limit is None:
@@ -111,7 +119,7 @@ class GithubEffortLimitService:
             "extension_minutes": extension,
             "effective_limit_minutes": limit + extension,
             "ceiling_minutes": ceiling,
-            "extension_cap_minutes": 0 if extension else cls.extension_cap_for(limit, ceiling),
+            "extension_cap_minutes": cls.extension_cap_for(limit, ceiling, extension),
         }
 
     # -- ledger -----------------------------------------------------------------------------------------------------
@@ -208,8 +216,8 @@ class GithubEffortLimitService:
                 f"{item.effort_extension_minutes}). This is not the owner's reported active effort. Nothing was "
                 "stopped or expired. The ledger is an approximation: a round trip between two ticks that leaves no "
                 "trace on the row can add at most one tick gap, capped at 300 seconds. The Leader may extend the "
-                "limit once with synth_city_extend_effort_limit, or stop the work; the owner reports the active "
-                "effort and says if the work needs more.")
+                "limit with synth_city_extend_effort_limit, and extend again up to the scope ceiling, or stop the "
+                "work; the owner reports the active effort and says if the work needs more.")
         for role, member in (("leader", leader), ("owner", owner)):
             if member is None:
                 continue
@@ -220,7 +228,7 @@ class GithubEffortLimitService:
                          "limit_minutes": item.effort_limit_minutes, "extension_minutes": item.effort_extension_minutes},
                 delivery_key=f"github-effort:{item.id}:{item.dispatch_nonce}:{item.effort_extension_minutes}:{role}")
 
-    # -- the one Leader extension -----------------------------------------------------------------------------------
+    # -- Leader extensions ----------------------------------------------------------------------------------------
 
     async def _read_activity(self, db: AsyncSession, item: GithubWorkItem, scope, now: datetime):
         """Why an extension must be refused for want of recent owner activity, as ``(code, contact)``.
@@ -252,7 +260,10 @@ class GithubEffortLimitService:
     async def extend(self, db: AsyncSession, *, work_item_id: int, dispatch_nonce: str, leader_member_id: int,
                      minutes, reason, expected_extension_minutes=None, evidence=None,
                      now: datetime | None = None) -> dict:
-        """Grant the item's one extension. A single guarded update decides; a loser changes nothing.
+        """Grant one Leader extension step (#1101). A single guarded update decides; a loser changes nothing.
+
+        The Leader may extend repeatedly: each step is within the per-step cap of the original limit, and the limit
+        plus every extension stays within the scope ceiling.
 
         The caller states the extension total it saw (#1100). A call whose total is no longer the recorded one is
         refused, so a replayed or concurrent call never grants twice.
@@ -299,21 +310,20 @@ class GithubEffortLimitService:
         scope = (await db.execute(select(TeamGithubScope).where(TeamGithubScope.id == item.scope_id)
                                   .execution_options(populate_existing=True))).scalar_one_or_none()
         ceiling = getattr(scope, "max_item_effort_minutes", None)
-        cap = self.extension_cap_for(limit, ceiling)
+        step_cap = self.extension_cap(limit)
         if used != expected:
             await db.rollback()
             raise self._total_changed(used)
-        if used:
+        if minutes > step_cap:
             await db.rollback()
-            raise EffortLimitError("effort_extension_already_used")
-        if minutes > cap:
+            raise EffortLimitError("extension_exceeds_cap", status_code=400, message=(
+                f"One extension is at most {step_cap} minutes for a limit of {limit} minutes."))
+        room = self.ceiling_room(limit, used, ceiling)
+        if room is not None and minutes > room:
             await db.rollback()
-            if cap < self.extension_cap(limit):
-                message = (f"The extension is at most {cap} minutes: a limit of {limit} minutes plus the extension "
-                           f"may not pass the scope ceiling of {ceiling} minutes (max_item_effort_minutes).")
-            else:
-                message = f"The extension is at most {cap} minutes for a limit of {limit} minutes."
-            raise EffortLimitError("extension_exceeds_cap", status_code=400, message=message)
+            raise EffortLimitError("extension_exceeds_ceiling", status_code=400, message=(
+                f"{room} minutes of room are left: the limit of {limit} minutes plus the extensions of {used} minutes "
+                f"may not pass the scope ceiling of {ceiling} minutes (max_item_effort_minutes)."))
         refusal, contact = await self._read_activity(db, item, scope, now)
         if refusal is not None:
             await db.rollback()
@@ -323,13 +333,14 @@ class GithubEffortLimitService:
         # read alone.
         result = await db.execute(update(GithubWorkItem).where(
             GithubWorkItem.id == work_item_id, GithubWorkItem.dispatch_nonce == dispatch_nonce,
-            GithubWorkItem.dispatch_status == "dispatched", GithubWorkItem.effort_limit_minutes.is_not(None),
+            GithubWorkItem.dispatch_status.in_(_EXTENDABLE_STATUSES), GithubWorkItem.effort_limit_minutes.is_not(None),
             GithubWorkItem.effort_extension_minutes == expected, GithubWorkItem.ack_received_at.is_not(None),
             ~self._pause_exists(work_item_id),
             exists(select(GithubWorkspace.id).where(
                 GithubWorkspace.leased_item_id == work_item_id,
                 GithubWorkspace.lease_last_owner_contact_at == contact)),
-        ).values(effort_extension_minutes=minutes, effort_extension_decided_at=now, effort_extension_reason=reason)
+        ).values(effort_extension_minutes=expected + minutes, effort_extension_decided_at=now,
+                 effort_extension_reason=reason)
             .execution_options(synchronize_session=False))
         if result.rowcount != 1:
             # The writer is held, so another connection cannot have granted in between: a concurrent call waits and

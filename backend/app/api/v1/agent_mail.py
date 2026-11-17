@@ -775,7 +775,7 @@ async def extend_effort_limit(
     session: MailAgentSession = Depends(require_mail_session),
     db: AsyncSession = Depends(get_db),
 ):
-    """The Leader's one extension of an item's effort limit (#938), guarded by the expected total (#1100)."""
+    """One Leader extension step of an item's effort limit (#938, #1101), guarded by the expected total (#1100)."""
     from app.services.github_effort_limit_service import EffortLimitError, effort_limit_service
 
     try:
