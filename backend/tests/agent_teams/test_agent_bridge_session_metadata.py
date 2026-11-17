@@ -251,7 +251,7 @@ async def test_agent_bridge_mail_projection_marks_stale_binding_without_mutation
     assert projected[0]["mail_wake_reason"] == "wake_target_stale"
     assert projected[0]["agent_status"]["session_state"] == "online"
     assert projected[0]["agent_status"]["wake_state"] == "cannot_wake"
-    assert projected[0]["agent_status"]["wake_reason"] == "wake_target_stale"
+    assert projected[0]["agent_status"]["wake_reason"] == "wake_target_unbound"
     assert projected[0]["mail_mcp_session_id"] is None
     assert projected[0]["mail_wake_target"] is None
     assert observed.last_seen_at == before
