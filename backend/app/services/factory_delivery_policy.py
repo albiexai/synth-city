@@ -136,5 +136,5 @@ def policy_guidance(policy: FactoryDeliveryPolicy, revision: int | None) -> str:
     if policy.regression_proof_required:
         lines.append("For each regression, show an assertion failure on its known defective source and a pass on the candidate.")
         lines.append("Keep the baseline production code intact. Import and fixture errors are not regression proof.")
-    lines.append("The work-item plan owns effort limits and acceptance criteria. Record work and wait intervals. Ask the operator at the limit.")
+    lines.append("The work-item plan owns effort limits and acceptance criteria. Record work and wait intervals. At the limit, ask the Leader: the Leader extends within the scope ceiling; beyond it, the Supervisor decides.")
     return "\n".join(lines)

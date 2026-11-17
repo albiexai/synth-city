@@ -765,7 +765,8 @@ def synth_city_extend_effort_limit(
 
     Each step adds at most 30 minutes or 25 percent of the original limit, whichever is smaller. The limit plus all
     extensions may not pass the scope ceiling (max_item_effort_minutes); a step beyond it is refused with
-    extension_exceeds_ceiling. The item's effort shows the room left as extension_cap_minutes.
+    extension_exceeds_ceiling and notifies the Supervisor once per attempt, because beyond the ceiling the Supervisor
+    decides. The item's effort shows the room left as extension_cap_minutes.
 
     The limit and its ledger are advisory elapsed working time from the system, not the owner's reported active
     effort. The extension changes no expiry, nonce, lease or status. The owner asks for it by Mail.

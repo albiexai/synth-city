@@ -1530,4 +1530,5 @@ def test_the_leader_extension_tool_posts_one_request_and_changes_nothing_else(mo
     doc = " ".join(shim.synth_city_extend_effort_limit.__doc__.split())
     assert "expected_extension_minutes" in doc and "evidence" in doc
     assert "effort limit once" not in doc and "up to the scope ceiling" in doc  # #1101
+    assert "notifies the Supervisor once per attempt" in doc  # #1102
     assert "not the owner's reported active effort" in " ".join(shim.synth_city_extend_effort_limit.__doc__.split())

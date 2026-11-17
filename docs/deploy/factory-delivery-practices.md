@@ -45,7 +45,7 @@ Ownership, approvals, lease expiry, finite budgets, and host resource locks rema
 
 Keep effort limits and caller inventories in each work-item plan.
 Record active work and waiting intervals. Do not infer active effort from wall time, Mail volume, or native liveness.
-At the agreed limit, stop scope work and request the operator's decision. Do not split acceptance criteria automatically.
+At the agreed limit, stop scope work and ask the Leader. The Leader extends the limit within the scope ceiling (`max_item_effort_minutes`); beyond it, the Supervisor decides, and the factory notifies the Supervisor once per attempt. Do not split acceptance criteria automatically.
 
 ## Complete a correction batch before review
 

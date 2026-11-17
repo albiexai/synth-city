@@ -266,6 +266,21 @@ def _is_auto_merge_not_fired_notice(root) -> bool:
         and (payload["head_sha"] is None or isinstance(payload["head_sha"], str)))
 
 
+def _is_effort_ceiling_notice(root) -> bool:
+    payload = root.payload
+    return (getattr(root, "sender_type", None) == "system"
+        and root.sender_member_id is None and root.sender_actor_id is None
+        and root.recipient_member_id is None and root.subject == "Effort ceiling reached"
+        and isinstance(payload, dict) and set(payload) == {
+            "notice", "work_item_id", "issue_number", "limit_minutes", "extension_minutes", "ceiling_minutes",
+            "requested_minutes", "supervisor_actor_id"}
+        and payload["notice"] == "effort_ceiling_reached"
+        and all(type(payload[key]) is int and payload[key] > 0 for key in (
+            "work_item_id", "issue_number", "limit_minutes", "ceiling_minutes", "requested_minutes",
+            "supervisor_actor_id"))
+        and type(payload["extension_minutes"]) is int and payload["extension_minutes"] >= 0)
+
+
 def _is_operations_finding_notice(root) -> bool:
     payload = root.payload
     return (getattr(root, "sender_type", None) == "system"
@@ -312,7 +327,7 @@ def is_supervisor_message(root) -> bool:
     return (root.kind == "message" and root.audience_type == "team_preset"
             and (root.sender_member_id is not None or _is_native_wait_notice(root)
                  or _is_leader_ack_wait_notice(root) or _is_auto_merge_not_fired_notice(root)
-                 or _is_operations_finding_notice(root) or _is_wake_followup_notice(root)
+                 or _is_effort_ceiling_notice(root) or _is_operations_finding_notice(root) or _is_wake_followup_notice(root)
                  or _is_provider_refusal_notice(root))
             and root.thread_root_id is None
             and isinstance(root.payload, dict) and "supervisor_actor_id" in root.payload)
