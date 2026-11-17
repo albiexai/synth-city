@@ -8,6 +8,8 @@ from unittest.mock import patch
 import pytest
 from pydantic_settings import BaseSettings
 
+from tests import stray_children
+
 
 # A memory database does not suppress independent HOME-resource conversion.
 # Establish isolation before config or child conftests can import application code.
@@ -44,6 +46,14 @@ def _isolated_settings_init(self, **values):
 # construction before child conftests import the application and its database.
 with patch.object(BaseSettings, "__init__", _isolated_settings_init):
     from app.config import Settings, settings
+
+
+def pytest_sessionfinish(session, exitstatus):
+    leaks = stray_children.close_run()
+    if leaks:
+        session.exitstatus = 1
+        summary = ", ".join(f"{kind} pid {pid} ({name})" for kind, pid, name in leaks)
+        print(f"\nstray child processes left by this test run: {summary}")
 
 
 @pytest.fixture(autouse=True)
