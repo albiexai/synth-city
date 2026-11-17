@@ -1128,7 +1128,9 @@ class GithubVerificationService:
                 # A proposed, rejected or approved-but-unacknowledged amendment
                 # stops the whole round. It cannot advance old source through CI,
                 # but a merged PR is an external fact that the stopped round must not hide.
-                await self._settle_merged_while_round_stopped(db, scope, item, client)
+                await self._settle_merged_revision(
+                    db, scope, item, client, statuses=("submitted",),
+                    source="github_verification_service._settle_merged_while_round_stopped")
                 if inspect(item).unloaded:  # the merge check rolled back and expired the item
                     await db.refresh(item)
                 await self._observe_superseded_revision(db, scope, item, client)
@@ -1166,6 +1168,8 @@ class GithubVerificationService:
                             )
                             continue
                         if item.dispatch_status == "dispatched":
+                            # The revision's work is not submitted, but a merged PR is an external fact (#1078).
+                            await self._settle_merged_revision(db, scope, item, client, statuses=("active",))
                             continue
                     await self._verify_item(
                         db,
@@ -1629,20 +1633,24 @@ class GithubVerificationService:
             raise
         await db.refresh(item)
 
-    async def _settle_merged_while_round_stopped(
-        self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, client: GithubClient
+    async def _settle_merged_revision(
+        self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, client: GithubClient, *,
+        statuses: tuple[str, ...],
+        source: str = "github_verification_service._settle_merged_revision",
     ) -> None:
-        """Record a merge that happened while an unacknowledged amendment stopped the round.
+        """Record a merge on an item whose round does not otherwise read its PR: an unacknowledged amendment stopped
+        it, or its active revision is not submitted yet (#1078).
 
-        Only a merged PR changes anything here; an open or closed pull leaves the stopped round as it is.
-        A failure for this item is logged and isolated, and never stops the other items.
+        Only a merged PR changes anything here; an open or closed pull leaves the item as it is. ``statuses`` are the
+        revision states this caller may settle. A failure for this item is logged and isolated, and never stops the
+        other items.
         """
         item_id = item.id
         try:
             if item.dispatch_status not in ("dispatched", "verifying") or item.active_scope_revision <= 0:
                 return
             revision = await self._active_scope_revision(db, item)
-            if revision is None or revision.status != "submitted" or revision.phase != "implementation":
+            if revision is None or revision.status not in statuses or revision.phase != "implementation":
                 return
             pull = await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
             if self._classify_pull(pull) != "merged" or pull.get("merged") is not True:
@@ -1650,9 +1658,7 @@ class GithubVerificationService:
             expected_base = await self.normalize_base_ref(
                 scope, client, token=None, base_ref=item.dispatch_base_ref)
             self._verify_pull_identity(pull, scope, item, expected_base=expected_base)
-            await self._settle_merged_submitted(
-                db, scope, item, client, revision, pull,
-                source="github_verification_service._settle_merged_while_round_stopped")
+            await self._settle_merged_submitted(db, scope, item, client, revision, pull, source=source)
         except TerminalRevisionContextChanged:
             await db.rollback()
             await db.refresh(scope)
@@ -2071,11 +2077,13 @@ class GithubVerificationService:
         *,
         source: str,
     ) -> None:
-        """A PR merged while a revision is submitted or positively settled: settle only at a head someone submitted or accepted.
+        """A PR merged while a revision is active, submitted or positively settled: settle only at a head someone
+        submitted or accepted.
 
-        The merged head must equal the revision's submitted head or the head of an active accepted review.
-        Then a submitted revision completes (a settled one already is, and keeps its status, its time and its
-        one outcome record) and the item is merged. Any other merged head escalates with a note naming
+        The merged head must equal the revision's submitted head or the head of an active accepted review; an active
+        revision has no submitted head, so only an accepted review authorizes it (#1078). Then an active or submitted
+        revision completes (a settled one already is, and keeps its status, its time and its one outcome record), the
+        item is merged and one merged_settlement audit event names the state it settled from. Any other merged head escalates with a note naming
         both heads and records no merge; a settled revision stays as it was. Everything the decision rests on is captured before the awaited reads.
         The PR is read again and must pass the full identity check; then the terminal writer is taken and the
         captured item, scope and exact revision must still be what they were, so BOTH outcomes are fenced and a
@@ -2112,7 +2120,7 @@ class GithubVerificationService:
         if ({name: getattr(item, name) for name in _SETTLEMENT_ITEM_IDENTITY} != item_before
                 or {name: getattr(scope, name) for name in _SETTLEMENT_SCOPE_IDENTITY} != scope_before
                 or {column.name: getattr(revision, column.name) for column in revision.__table__.columns} != revision_before
-                or revision.status not in ("submitted", "completed")):
+                or revision.status not in ("active", "submitted", "completed")):
             raise TerminalRevisionContextChanged("terminal_revision_context_changed")
         settled = revision.status == "completed"
         authorized = head == revision.submitted_head_sha or bool(await db.scalar(select(exists().where(
@@ -2130,7 +2138,7 @@ class GithubVerificationService:
             GithubAttemptScopeRevision.work_item_id == item_id,
             GithubAttemptScopeRevision.dispatch_nonce == nonce,
             GithubAttemptScopeRevision.revision == item.active_scope_revision,
-            GithubAttemptScopeRevision.status == ("completed" if settled else "submitted"),
+            GithubAttemptScopeRevision.status == revision_before["status"],
         ).values(**values).execution_options(synchronize_session=False))
         if claim.rowcount != 1:
             raise TerminalRevisionContextChanged("terminal_revision_context_changed")
@@ -2140,11 +2148,16 @@ class GithubVerificationService:
         if not authorized:
             await github_dispatch_service.escalate_without_notification(
                 db, item, "continuation_invalid_state",
-                f"PR #{pr_number} merged at head {head}, which is not the submitted revision head "
-                f"{revision_before['submitted_head_sha']} or an accepted head; no merge was recorded. An operator "
-                "must review and finalize this item.")
+                f"PR #{pr_number} merged at head {head}, which is not "
+                + (f"the submitted revision head {revision_before['submitted_head_sha']}"
+                   if revision_before["submitted_head_sha"] else "a submitted head (the revision was still active)")
+                + " or an accepted head; no merge was recorded. An operator must review and finalize this item.")
             return
         await self._mark_merged_with_fact(db, item, current, source=source)
+        from app.services import factory_audit_service as _audit
+        await _audit.record_merged_settlement(
+            db, item_id=item_id, revision_id=revision.id,
+            reason=f"pr_merged_with_{revision_before['status']}_revision", source=source)
         await db.commit()
         await self._notify_blocker_merged(db, scope, item)
 

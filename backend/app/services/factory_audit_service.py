@@ -719,6 +719,20 @@ async def record_revision_outcome(
         operation_id=operation_id, correlation_id=correlation_id or operation_id, context_snapshot=snapshot)
 
 
+async def record_merged_settlement(
+    db: AsyncSession, *, item_id: int, revision_id: int, reason: str, source: str,
+) -> FactoryAuditEvent:
+    """#1038: why a merged PR settled its work item, in the settlement transaction.
+
+    Every fenced settlement of a merged PR records this one event; ``reason`` names the state it settled from.
+    """
+    return await record_event(
+        db, event_kind="merged_settlement", source=source, occurred_at=datetime.utcnow(),
+        actor=derive_actor(actor_kind="scheduler", scheduler="github_dispatch_scheduler"),
+        item_id=item_id, revision_id=revision_id, after_values={"dispatch_status": "merged"},
+        action_outcome="applied", sanitized_reason=reason)
+
+
 def replay_key_for(
     operation_id: str,
     event_kind: str,

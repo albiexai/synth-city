@@ -1966,7 +1966,7 @@ async def test_dispatched_implementation_continuation_waits_for_completion_repor
 
     await db.refresh(item)
     await db.refresh(revision)
-    assert client.pull_calls == 0
+    assert client.pull_calls == 1  # #1078: one read, only to see whether the PR merged
     assert item.dispatch_status == "dispatched"
     assert revision.status == "active"
 
