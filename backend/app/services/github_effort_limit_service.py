@@ -250,8 +250,13 @@ class GithubEffortLimitService:
             GithubOwnerObservationPause.status.in_(("waiting", "paused"))))
 
     async def extend(self, db: AsyncSession, *, work_item_id: int, dispatch_nonce: str, leader_member_id: int,
-                     minutes, reason, now: datetime | None = None) -> dict:
-        """Grant the item's one extension. A single guarded update decides; a loser changes nothing."""
+                     minutes, reason, expected_extension_minutes=None, evidence=None,
+                     now: datetime | None = None) -> dict:
+        """Grant the item's one extension. A single guarded update decides; a loser changes nothing.
+
+        The caller states the extension total it saw (#1100). A call whose total is no longer the recorded one is
+        refused, so a replayed or concurrent call never grants twice.
+        """
         now = now or datetime.utcnow()
         # Take the writer first so two concurrent calls serialize instead of upgrading a read lock.
         await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == work_item_id)
@@ -274,6 +279,14 @@ class GithubEffortLimitService:
         if not reason:
             await db.rollback()
             raise EffortLimitError("extension_reason_required", status_code=400)
+        evidence = (evidence or "").strip()[:_REASON_LIMIT] if isinstance(evidence, str) else ""
+        if not evidence:
+            await db.rollback()
+            raise EffortLimitError("extension_evidence_required", status_code=400)
+        expected = expected_extension_minutes
+        if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+            await db.rollback()
+            raise EffortLimitError("expected_extension_minutes_required", status_code=400)
         if item.effort_limit_minutes is None:
             await db.rollback()
             raise EffortLimitError("effort_limit_not_set")
@@ -281,17 +294,17 @@ class GithubEffortLimitService:
             await db.rollback()
             raise EffortLimitError("extension_exceeds_cap", status_code=400)
         # Read everything needed before any rollback: a rollback expires the loaded row.
-        limit, used = item.effort_limit_minutes, item.effort_extension_minutes
-        recorded = self._result(item, repeated=True)
+        limit, used, scope_id = item.effort_limit_minutes, item.effort_extension_minutes, item.scope_id
         # Read as it is now: the session may hold an older copy of the scope row (V1 review 5925693104).
         scope = (await db.execute(select(TeamGithubScope).where(TeamGithubScope.id == item.scope_id)
                                   .execution_options(populate_existing=True))).scalar_one_or_none()
         ceiling = getattr(scope, "max_item_effort_minutes", None)
         cap = self.extension_cap_for(limit, ceiling)
+        if used != expected:
+            await db.rollback()
+            raise self._total_changed(used)
         if used:
             await db.rollback()
-            if used == minutes:
-                return recorded
             raise EffortLimitError("effort_extension_already_used")
         if minutes > cap:
             await db.rollback()
@@ -311,7 +324,7 @@ class GithubEffortLimitService:
         result = await db.execute(update(GithubWorkItem).where(
             GithubWorkItem.id == work_item_id, GithubWorkItem.dispatch_nonce == dispatch_nonce,
             GithubWorkItem.dispatch_status == "dispatched", GithubWorkItem.effort_limit_minutes.is_not(None),
-            GithubWorkItem.effort_extension_minutes == 0, GithubWorkItem.ack_received_at.is_not(None),
+            GithubWorkItem.effort_extension_minutes == expected, GithubWorkItem.ack_received_at.is_not(None),
             ~self._pause_exists(work_item_id),
             exists(select(GithubWorkspace.id).where(
                 GithubWorkspace.leased_item_id == work_item_id,
@@ -319,27 +332,41 @@ class GithubEffortLimitService:
         ).values(effort_extension_minutes=minutes, effort_extension_decided_at=now, effort_extension_reason=reason)
             .execution_options(synchronize_session=False))
         if result.rowcount != 1:
+            # The writer is held, so another connection cannot have granted in between: a concurrent call waits and
+            # is refused above by the expected total. A refused update means this transaction's own row changed.
             await db.rollback()
-            fresh = (await db.execute(select(GithubWorkItem).where(GithubWorkItem.id == work_item_id)
-                                      .execution_options(populate_existing=True))).scalar_one_or_none()
-            winner = self._result(fresh, repeated=True) if fresh is not None and fresh.effort_extension_minutes else None
-            await db.rollback()
-            if winner is not None:
-                if winner["extension_minutes"] == minutes:
-                    return winner
-                raise EffortLimitError("effort_extension_already_used")
             raise EffortLimitError("effort_extension_stale")
+        from app.services import factory_audit_service as audit
+
+        try:
+            # One record per granted extension, in the extension's own transaction (#1100).
+            await audit.record_event(
+                db, event_kind="effort_extension", source="github_effort_limit_service.extend", occurred_at=now,
+                actor=audit.derive_actor(actor_kind="member", member_id=leader_member_id),
+                action_outcome="granted", scope_id=scope_id, item_id=work_item_id,
+                sanitized_reason=(f"Extended by {minutes} minutes to an effective limit of {limit + expected + minutes}"
+                                  f" minutes. Reason: {reason[:150]} Evidence: {evidence}"))
+        except Exception:
+            await db.rollback()
+            raise
         await db.commit()
         await db.refresh(item)
-        return self._result(item, repeated=False)
+        return self._result(item)
 
     @staticmethod
-    def _result(item: GithubWorkItem, *, repeated: bool) -> dict:
+    def _total_changed(recorded: int) -> EffortLimitError:
+        return EffortLimitError("effort_extension_total_changed", message=(
+            f"The recorded extension total is {recorded} minutes, not the expected total. Read the item's effort "
+            f"again and decide from the current total."))
+
+    @staticmethod
+    def _result(item: GithubWorkItem) -> dict:
         return {
             "work_item_id": item.id, "limit_minutes": item.effort_limit_minutes,
             "extension_minutes": item.effort_extension_minutes,
             "effective_limit_minutes": item.effort_limit_minutes + item.effort_extension_minutes,
-            "decided_at": item.effort_extension_decided_at, "repeated": repeated,
+            # A repeated call is now refused by the expected total, so a result is always a fresh grant.
+            "decided_at": item.effort_extension_decided_at, "repeated": False,
         }
 
 

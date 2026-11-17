@@ -310,7 +310,7 @@ export const manifest = [
   },
   {
     "name": "synth_city_extend_effort_limit",
-    "description": "Leader only: extend a work item's effort limit once, by at most 30 minutes or 25 percent of the limit.\n\n    The limit and its ledger are advisory elapsed working time from the system, not the owner's reported active\n    effort. The extension changes no expiry, nonce, lease or status. The owner asks for it by Mail.\n    ",
+    "description": "Leader only: extend a work item's effort limit once, by at most 30 minutes or 25 percent of the limit.\n\n    The limit and its ledger are advisory elapsed working time from the system, not the owner's reported active\n    effort. The extension changes no expiry, nonce, lease or status. The owner asks for it by Mail.\n\n    expected_extension_minutes is the extension total you saw in the item's effort (0 before any extension). A call\n    whose total is no longer the recorded one is refused with effort_extension_total_changed and grants nothing, so a\n    repeated call never extends twice. evidence is the work so far that supports the extension; it is recorded with\n    the reason.\n    ",
     "inputSchema": {
       "properties": {
         "work_item_id": {
@@ -328,13 +328,23 @@ export const manifest = [
         "reason": {
           "title": "Reason",
           "type": "string"
+        },
+        "expected_extension_minutes": {
+          "title": "Expected Extension Minutes",
+          "type": "integer"
+        },
+        "evidence": {
+          "title": "Evidence",
+          "type": "string"
         }
       },
       "required": [
         "work_item_id",
         "dispatch_nonce",
         "minutes",
-        "reason"
+        "reason",
+        "expected_extension_minutes",
+        "evidence"
       ],
       "title": "synth_city_extend_effort_limitArguments",
       "type": "object"

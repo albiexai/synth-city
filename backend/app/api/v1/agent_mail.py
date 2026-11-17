@@ -765,6 +765,8 @@ class MailEffortExtensionRequest(BaseModel):
     dispatch_nonce: str
     minutes: Any = None
     reason: Any = None
+    expected_extension_minutes: Any = None
+    evidence: Any = None
 
 
 @router.post("/effort-extensions")
@@ -773,13 +775,14 @@ async def extend_effort_limit(
     session: MailAgentSession = Depends(require_mail_session),
     db: AsyncSession = Depends(get_db),
 ):
-    """The Leader's one extension of an item's effort limit (#938). It never changes an expiry."""
+    """The Leader's one extension of an item's effort limit (#938), guarded by the expected total (#1100)."""
     from app.services.github_effort_limit_service import EffortLimitError, effort_limit_service
 
     try:
         result = await effort_limit_service.extend(
             db, work_item_id=request.work_item_id, dispatch_nonce=request.dispatch_nonce,
-            leader_member_id=session.member_id, minutes=request.minutes, reason=request.reason)
+            leader_member_id=session.member_id, minutes=request.minutes, reason=request.reason,
+            expected_extension_minutes=request.expected_extension_minutes, evidence=request.evidence)
     except EffortLimitError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
     return result

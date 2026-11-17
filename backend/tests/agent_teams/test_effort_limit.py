@@ -17,8 +17,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.config import settings
 from app.database import Base
 from app.models.database import (
-    GithubApprovalRequest, GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace, MailMessage,
-    TeamGithubScope,
+    FactoryAuditEvent, GithubApprovalRequest, GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace,
+    MailMessage, TeamGithubScope,
 )
 from app.services.agent_mail_service import agent_mail_service
 from app.services.github_approval_service import GithubApprovalError, github_approval_service
@@ -341,11 +341,12 @@ def test_the_extension_cap_is_the_smaller_of_30_minutes_and_25_percent(limit, ca
     assert service.extension_cap(limit) == cap
 
 
-async def _extend(fx, minutes=15, *, leader=None, nonce=None, reason="healthy"):
+async def _extend(fx, minutes=15, *, leader=None, nonce=None, reason="healthy", expected=0,
+                  evidence="tests pass; two files left"):
     async with fx.maker() as db:
         return await service.extend(db, work_item_id=fx.item_id, dispatch_nonce=nonce or fx.nonce,
                                     leader_member_id=leader or fx.leader, minutes=minutes, reason=reason,
-                                    now=T0)
+                                    expected_extension_minutes=expected, evidence=evidence, now=T0)
 
 
 async def _code(coro):
@@ -398,12 +399,63 @@ async def test_an_item_without_a_limit_is_refused(fx):
 
 
 @pytest.mark.asyncio
-async def test_a_second_extension_is_refused_and_the_same_call_repeats_its_result(fx):
+async def test_a_replayed_extension_is_refused_by_the_expected_total_and_grants_nothing(fx):
     await _limited(fx)
     first = await _extend(fx, 10)
-    again = await _extend(fx, 10)
-    assert again["extension_minutes"] == 10 and again["repeated"] is True and first["repeated"] is False
-    assert await _code(_extend(fx, 5)) == "effort_extension_already_used"
+    assert first["extension_minutes"] == 10 and first["repeated"] is False
+    # The replay still says it saw a total of 0; the recorded total is now 10 (#1100).
+    assert await _code(_extend(fx, 10)) == "effort_extension_total_changed"
+    # A caller that saw the new total meets today's one-extension rule (#1101 lifts it).
+    assert await _code(_extend(fx, 5, expected=10)) == "effort_extension_already_used"
+    async with fx.maker() as db:
+        assert (await _item(fx, db)).effort_extension_minutes == 10
+
+
+@pytest.mark.asyncio
+async def test_an_expected_total_that_differs_from_the_recorded_one_is_refused(fx):
+    await _limited(fx)
+    with pytest.raises(EffortLimitError) as caught:
+        await _extend(fx, 10, expected=5)
+    assert caught.value.code == "effort_extension_total_changed" and caught.value.status_code == 409
+    assert "0 minutes" in str(caught.value)  # names the recorded total the caller should have seen
+    async with fx.maker() as db:
+        item = await _item(fx, db)
+        assert item.effort_extension_minutes == 0 and item.effort_extension_decided_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected", [None, -1, True, "0", 1.0])
+async def test_the_expected_total_is_required(fx, expected):
+    await _limited(fx)
+    with pytest.raises(EffortLimitError) as caught:
+        await _extend(fx, 10, expected=expected)
+    assert (caught.value.code, caught.value.status_code) == ("expected_extension_minutes_required", 400)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence", [None, "", "   ", 7])
+async def test_evidence_is_required(fx, evidence):
+    await _limited(fx)
+    with pytest.raises(EffortLimitError) as caught:
+        await _extend(fx, 10, evidence=evidence)
+    assert (caught.value.code, caught.value.status_code) == ("extension_evidence_required", 400)
+    async with fx.maker() as db:
+        assert (await _item(fx, db)).effort_extension_minutes == 0
+
+
+@pytest.mark.asyncio
+async def test_a_granted_extension_records_one_audit_event_with_its_reason_and_evidence(fx):
+    await _limited(fx)
+    assert await _code(_extend(fx, 10, expected=3)) == "effort_extension_total_changed"
+    await _extend(fx, 10, reason="close to done", evidence="4 of 5 tests green")
+    async with fx.maker() as db:
+        events = (await db.scalars(select(FactoryAuditEvent).where(
+            FactoryAuditEvent.event_kind == "effort_extension"))).all()
+    assert len(events) == 1  # the refusal recorded nothing
+    event = events[0]
+    assert (event.item_id, event.actor_kind, event.actor_member_id, event.action_outcome) == (
+        fx.item_id, "member", fx.leader, "granted")
+    assert "close to done" in event.sanitized_reason and "4 of 5 tests green" in event.sanitized_reason
 
 
 @pytest.mark.asyncio
@@ -412,7 +464,7 @@ async def test_two_concurrent_extensions_one_wins(fx):
     outcomes = await asyncio.gather(_extend(fx, 10, reason="a"), _extend(fx, 12, reason="b"), return_exceptions=True)
     wins = [outcome for outcome in outcomes if isinstance(outcome, dict)]
     losses = [outcome for outcome in outcomes if isinstance(outcome, EffortLimitError)]
-    assert len(wins) == 1 and len(losses) == 1 and losses[0].code == "effort_extension_already_used"
+    assert len(wins) == 1 and len(losses) == 1 and losses[0].code == "effort_extension_total_changed"
     async with fx.maker() as db:
         assert (await _item(fx, db)).effort_extension_minutes == wins[0]["extension_minutes"]
 
@@ -504,7 +556,8 @@ async def test_the_route_grants_the_leaders_extension_and_maps_refusals(fx):
     await _limited(fx, limit=60)
     await _workspace_set(fx, lease_last_owner_contact_at=datetime.utcnow())  # the route reads the real clock
     leader, owner = SimpleNamespace(member_id=fx.leader), SimpleNamespace(member_id=fx.owner)
-    request = MailEffortExtensionRequest(work_item_id=fx.item_id, dispatch_nonce=fx.nonce, minutes=15, reason="ok")
+    request = MailEffortExtensionRequest(work_item_id=fx.item_id, dispatch_nonce=fx.nonce, minutes=15, reason="ok",
+                                         expected_extension_minutes=0, evidence="three tests left")
     async with fx.maker() as db:
         with pytest.raises(HTTPException) as caught:
             await agent_mail.extend_effort_limit(request, session=owner, db=db)
@@ -514,8 +567,19 @@ async def test_the_route_grants_the_leaders_extension_and_maps_refusals(fx):
         assert granted["effective_limit_minutes"] == 75 and granted["repeated"] is False
     async with fx.maker() as db:
         with pytest.raises(HTTPException) as caught:
-            await agent_mail.extend_effort_limit(request.model_copy(update={"minutes": 14}), session=leader, db=db)
+            await agent_mail.extend_effort_limit(request, session=leader, db=db)
+        assert (caught.value.status_code, caught.value.detail) == (409, "effort_extension_total_changed")
+    async with fx.maker() as db:
+        with pytest.raises(HTTPException) as caught:
+            await agent_mail.extend_effort_limit(
+                request.model_copy(update={"minutes": 14, "expected_extension_minutes": 15}), session=leader, db=db)
         assert (caught.value.status_code, caught.value.detail) == (409, "effort_extension_already_used")
+    async with fx.maker() as db:
+        with pytest.raises(HTTPException) as caught:
+            await agent_mail.extend_effort_limit(MailEffortExtensionRequest(
+                work_item_id=fx.item_id, dispatch_nonce=fx.nonce, minutes=5, reason="ok", evidence="x"),
+                session=leader, db=db)
+        assert (caught.value.status_code, caught.value.detail) == (400, "expected_extension_minutes_required")
 
 
 @pytest.mark.asyncio
@@ -662,11 +726,11 @@ async def test_a_resolved_observation_pause_does_not_refuse(fx):
 
 
 @pytest.mark.asyncio
-async def test_a_repeat_of_a_granted_extension_still_returns_its_record_without_fresh_contact(fx):
+async def test_a_repeat_of_a_granted_extension_is_refused_by_the_expected_total_without_fresh_contact(fx):
     await _limited(fx)
     await _extend(fx, 10)
     await _workspace_set(fx, lease_last_owner_contact_at=T0 - timedelta(days=2))
-    assert (await _extend(fx, 10))["repeated"] is True
+    assert await _code(_extend(fx, 10)) == "effort_extension_total_changed"
 
 
 # The writer is held from the first statement, so another connection cannot change contact or a pause between the
@@ -686,7 +750,7 @@ def _after_activity_read(monkeypatch, change):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["contact", "pause", "ack"])
+@pytest.mark.parametrize("change", ["contact", "pause", "ack", "total"])
 async def test_the_guarded_update_refuses_a_change_made_after_the_activity_read(fx, monkeypatch, change):
     await _limited(fx)
 
@@ -698,6 +762,9 @@ async def test_the_guarded_update_refuses_a_change_made_after_the_activity_read(
             db.add(GithubOwnerObservationPause(work_item_id=fx.item_id, wait_key="w", authority_sha256="x",
                                                status="paused", deadline=T0 + timedelta(hours=1)))
             await db.flush()
+        elif change == "total":  # the guarded update keys on the expected total (#1100)
+            await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == fx.item_id)
+                             .values(effort_extension_minutes=7))
         else:
             await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == fx.item_id).values(ack_received_at=None))
 

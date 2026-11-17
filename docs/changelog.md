@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The Leader's effort-limit extension states the total it saw and the evidence for it.** `synth_city_extend_effort_limit` now requires `expected_extension_minutes`, the extension total the Leader read in the item's effort (0 before any extension), and `evidence`, the work so far that supports the extension. A call whose total is no longer the recorded one is refused with `effort_extension_total_changed` and grants nothing, so a repeated or concurrent call never extends twice; before, a repeat with the same minutes returned the earlier result. Each granted extension records one `effort_extension` audit event with its reason and evidence. The one-extension rule and the per-step cap are unchanged ([#1100](https://github.com/albiexai/synth-city/issues/1100), split from [#1040](https://github.com/albiexai/synth-city/issues/1040)).
+
 ### Fixed
 
 - **Ready issues are dispatched in priority order even when an owner slot frees during a poll.** A poll ranks the waiting issues once and then checks each one's owner slot in turn. When the slot freed partway through, the next issue checked took it, so a newer, higher-numbered issue could start ahead of older, lower-numbered ones in the same lane (seen live: `priority:38` ahead of `priority:11`). A slot found busy for a higher-ranked issue now stays reserved for the rest of that poll, and the next poll gives it to the top-ranked issue; other slots are not held up ([#1081](https://github.com/albiexai/synth-city/issues/1081)).
