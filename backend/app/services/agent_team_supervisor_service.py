@@ -236,7 +236,7 @@ def _is_native_wait_notice(root) -> bool:
         and root.recipient_member_id is None and root.subject == "Waiting for input"
         and isinstance(payload, dict) and set(payload) == {"notice", "slot_id", "reason", "supervisor_actor_id"}
         and payload["notice"] == "native_input_wait" and type(payload["slot_id"]) is int and payload["slot_id"] > 0
-        and payload["reason"] in {"question", "trust", "sign_in"})
+        and payload["reason"] in {"question", "trust", "sign_in", "provider_refusal"})
 
 
 def _is_leader_ack_wait_notice(root) -> bool:

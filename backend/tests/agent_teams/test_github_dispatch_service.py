@@ -7859,6 +7859,8 @@ async def test_new_lease_and_release_reset_the_reminder_budget(db):
     ('no_capability', False), ('wrong_provider', False), ('duplicate_binding', False),
     ('duplicate_native_identity', False), ('waiting_input', False), ('dead_process', False),
     ('binding_changed', False), ('native_timeout', False), ('native_future', False),
+    # A provider refusal is not a wait on someone else: the Leader stays ordinary idle (#1091).
+    ('provider_refusal', True),
 ])
 async def test_leader_activity_requires_current_authenticated_bound_evidence(db, monkeypatch, case, expected):
     from app.services import agent_activity_service as activity
@@ -7906,10 +7908,11 @@ async def test_leader_activity_requires_current_authenticated_bound_evidence(db,
     state = 'working' if case in {'native', 'native_future'} else 'unknown'
     observed_at = now + timedelta(minutes=1) if case == 'native_future' else now - timedelta(minutes=15)
     observation = SimpleNamespace(state=state, observed_at=observed_at,
-        waiting_input=object() if case == 'waiting_input' else None)
+        waiting_input=(SimpleNamespace(reason='question') if case == 'waiting_input'
+                       else SimpleNamespace(reason='provider_refusal') if case == 'provider_refusal' else None))
     monkeypatch.setattr(activity, '_observe', lambda *_args, **_kwargs: observation)
     monkeypatch.setattr(peer_process, 'pane_is_alive_strict', lambda *_args: case != 'dead_process')
-    if case == 'waiting_input':
+    if case in {'waiting_input', 'provider_refusal'}:
         session.last_seen_at = now
         await db.commit()
     if case == 'binding_changed':
