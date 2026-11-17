@@ -720,7 +720,7 @@ async def record_revision_outcome(
 
 
 async def record_merged_settlement(
-    db: AsyncSession, *, item_id: int, revision_id: int, reason: str, source: str,
+    db: AsyncSession, *, item_id: int, revision_id: int | None, reason: str, source: str,
 ) -> FactoryAuditEvent:
     """#1038: why a merged PR settled its work item, in the settlement transaction.
 

@@ -1324,28 +1324,21 @@ class GithubVerificationService:
         ))
         if await db.scalar(select(pending_approval)):
             return
-        revision = await self._active_scope_revision(db, item)
-        if item.active_scope_revision and (
-            revision is None or revision.phase != "implementation"
-            or revision.status != "submitted"
-        ):
+        # #1079: an escalated attempt's revision may be active, submitted or exhausted when its PR merges.
+        revision = await self._escalated_merge_revision(db, item) if item.active_scope_revision else None
+        if item.active_scope_revision and revision is None:
             return
-        revision_guard = ()
-        if revision is not None:
-            revision_guard = (exists(select(GithubAttemptScopeRevision.id).where(
-                GithubAttemptScopeRevision.id == revision.id,
-                GithubAttemptScopeRevision.work_item_id == item.id,
-                GithubAttemptScopeRevision.dispatch_nonce == expected["dispatch_nonce"],
-                GithubAttemptScopeRevision.owner_slot_id == expected["owner_slot_id"],
-                GithubAttemptScopeRevision.revision == expected["active_scope_revision"],
-                GithubAttemptScopeRevision.phase == "implementation",
-                GithubAttemptScopeRevision.status == "submitted",
-                GithubAttemptScopeRevision.submitted_head_sha == revision.submitted_head_sha,
-            )),)
         workspace = None
         lease_snapshot = None
         revision_snapshot = ({column.name: getattr(revision, column.name)
             for column in revision.__table__.columns} if revision is not None else {})
+        revision_guard = ()
+        if revision is not None:  # the exact revision the decision is made on, whatever its status
+            revision_guard = (exists(select(GithubAttemptScopeRevision.id).where(
+                GithubAttemptScopeRevision.owner_slot_id == expected["owner_slot_id"],
+                *(_same_value(getattr(GithubAttemptScopeRevision, key), value)
+                  for key, value in revision_snapshot.items()),
+            )),)
         closed_policy_guard = policy_context(item)
         if revision is not None:
             workspace = await db.scalar(select(GithubWorkspace).where(
@@ -1366,7 +1359,8 @@ class GithubVerificationService:
                     guards=(enabled_scope, ~pending_approval),
                 )
             return
-        closed_submitted = verdict == "closed_unmerged" and revision is not None
+        # Only a submitted revision is superseded by a closed PR; an active or exhausted one is left as it is.
+        closed_submitted = verdict == "closed_unmerged" and revision is not None and revision.status == "submitted"
         if not closed_submitted and (verdict != "merged" or pull.get("merged") is not True):
             return
         if self._pull_number(pull) != expected["pr_number"]:
@@ -1374,8 +1368,13 @@ class GithubVerificationService:
         head_sha = self._head_sha(pull)
         if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
             raise ValueError("merged PR head SHA is unavailable")
-        if revision is not None and head_sha != revision.submitted_head_sha:
-            return
+        if revision is not None and head_sha != revision.submitted_head_sha and not (
+                verdict == "merged" and await db.scalar(select(exists().where(
+                    GithubHeadReview.work_item_id == item.id,
+                    GithubHeadReview.dispatch_nonce == expected["dispatch_nonce"],
+                    GithubHeadReview.pr_number == expected["pr_number"], GithubHeadReview.head_sha == head_sha,
+                    GithubHeadReview.verdict == "accepted", GithubHeadReview.status == "active")))):
+            return  # nobody submitted or accepted this head: it stays escalated for the operator (#1038 Q1)
         expected_base = await self.normalize_base_ref(
             scope, client, token=None, base_ref=expected["dispatch_base_ref"]
         )
@@ -1445,12 +1444,18 @@ class GithubVerificationService:
             return
         await self._mark_merged_with_fact(
             db, item, pull, source="github_verification_service._reconcile_escalated_merge")
-        if revision is not None:
-            revision.status = "completed"
+        if revision is not None and revision_snapshot["status"] in ("active", "submitted"):
+            revision.status = "completed"  # an exhausted revision stays exhausted (#1038 Q2)
             revision.completed_at = datetime.utcnow()
             await self._record_revision_outcome(
                 db, item, revision, "completed",
                 source="github_verification_service._reconcile_escalated_merge")
+        from app.services import factory_audit_service as _audit
+        await _audit.record_merged_settlement(
+            db, item_id=item.id, revision_id=revision.id if revision is not None else None,
+            reason=("pr_merged_while_escalated" if revision is None
+                    else f"pr_merged_while_escalated_with_{revision_snapshot['status']}_revision"),
+            source="github_verification_service._reconcile_escalated_merge")
         await db.commit()
         if notify:
             await self._notify_blocker_merged(db, scope, item)
@@ -2160,6 +2165,23 @@ class GithubVerificationService:
             reason=f"pr_merged_with_{revision_before['status']}_revision", source=source)
         await db.commit()
         await self._notify_blocker_merged(db, scope, item)
+
+    async def _escalated_merge_revision(
+        self, db: AsyncSession, item: GithubWorkItem,
+    ) -> GithubAttemptScopeRevision | None:
+        """The escalated attempt's current implementation revision when a merge may settle it (#1079).
+
+        Unlike the active-revision lookup, an exhausted revision is returned too; any other status is not.
+        """
+        revision = await db.scalar(select(GithubAttemptScopeRevision).where(
+            GithubAttemptScopeRevision.work_item_id == item.id,
+            GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce,
+            GithubAttemptScopeRevision.revision == item.active_scope_revision,
+        ).execution_options(populate_existing=True))
+        if (revision is None or revision.phase != "implementation" or item.attempt_phase != revision.phase
+                or revision.status not in ("active", "submitted", "exhausted")):
+            return None
+        return revision
 
     async def _active_scope_revision(
         self,
