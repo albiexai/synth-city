@@ -120,7 +120,7 @@ export function KillSessionDialog({
               value={operatorTokenInput}
               onChange={(event) => setOperatorTokenInput(event.target.value)}
             />
-            <p className="text-xs text-muted-foreground">Use the token configured in backend/.env; an agent session token cannot terminate another session.</p>
+            <p className="text-xs text-muted-foreground">Use the token configured in the <a className="underline" href="https://github.com/albiexai/synth-city/blob/master/docs/guide/installation.md#configuration" target="_blank" rel="noreferrer">backend environment file</a>; an agent session token cannot terminate another session.</p>
           </div>
         )}
 

@@ -232,7 +232,7 @@ export function AutonomyPanel({
           <div className="rounded-lg border p-5 text-sm text-muted-foreground">
             <h3 className="font-semibold text-foreground">Before you enable autonomy</h3>
             <ol className="mt-2 list-decimal space-y-1 pl-5">
-              <li>Add <code>github_token</code> to <code>backend/.env</code> for GitHub polling, then restart Synth City. For App-backed dispatch, also configure the GitHub App settings. Synth City selects the dispatch mode when work becomes eligible.</li>
+              <li>Add <code>github_token</code> to the <a className="underline" href="https://github.com/albiexai/synth-city/blob/master/docs/guide/installation.md#configuration" target="_blank" rel="noreferrer">backend environment file</a> for GitHub polling, then restart Synth City. For App-backed dispatch, also configure the GitHub App settings. Synth City selects the dispatch mode when work becomes eligible.</li>
               <li>Add a repository with an existing primary checkout under your home directory and labels to watch. Use Add a repository above.</li>
               <li>In Roster, assign and launch the Leader slot. It approves plans.</li>
               <li>On GitHub, label an issue for dispatch; add an area label to route it to a particular owner.</li>
