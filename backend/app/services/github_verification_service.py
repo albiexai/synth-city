@@ -1146,7 +1146,13 @@ class GithubVerificationService:
                             elif await self._superseded_revision(db, item) is not None:
                                 await self._observe_superseded_revision(db, scope, item, client)
                             else:
-                                self._log_inconsistent_once(item)
+                                # #1080: a completed revision that is not a positive settlement still settles a merged
+                                # PR; the item counts as skipped only while it stays verifying.
+                                snapshot = self._state_snapshot(item)
+                                await self._settle_merged_revision(db, scope, item, client, statuses=("completed",))
+                                if await db.scalar(select(GithubWorkItem.dispatch_status).where(
+                                        GithubWorkItem.id == snapshot[0])) == "verifying":
+                                    self._log_inconsistent_once(None, snapshot=snapshot)
                             continue
                         if revision.phase == "diagnostic":
                             if item.dispatch_status != "dispatched":
@@ -1654,8 +1660,14 @@ class GithubVerificationService:
         try:
             if item.dispatch_status not in ("dispatched", "verifying") or item.active_scope_revision <= 0:
                 return
-            revision = await self._active_scope_revision(db, item)
-            if revision is None or revision.status not in statuses or revision.phase != "implementation":
+            # The current revision by number, in one of the caller's states (#1080: a completed one too).
+            revision = await db.scalar(select(GithubAttemptScopeRevision).where(
+                GithubAttemptScopeRevision.work_item_id == item.id,
+                GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce,
+                GithubAttemptScopeRevision.revision == item.active_scope_revision,
+            ).execution_options(populate_existing=True))
+            if (revision is None or revision.status not in statuses or revision.phase != "implementation"
+                    or item.attempt_phase != revision.phase):
                 return
             pull = await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
             if self._classify_pull(pull) != "merged" or pull.get("merged") is not True:

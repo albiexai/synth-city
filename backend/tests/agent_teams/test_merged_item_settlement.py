@@ -766,3 +766,66 @@ async def test_an_escalated_merge_is_still_refused_without_authority_or_on_a_cha
     assert _row_values(item) == item_before
     assert _row_values(revision) == revision_before
     assert await _settlements(db) == []
+
+
+# ---- #1080: a verifying item on a completed revision that is not a positive settlement ----
+
+async def _verifying_completed(db, *, submitted=None, completed=True, accepted=None, pull_head="accepted-head",
+                               pull=None):
+    """A verifying item whose current revision is completed but fails the settled shape, so the poll skips it."""
+    scope = await _scope(db)
+    slot, member = await _owner(db, scope)
+    item = await _item(db, scope, dispatch_status="verifying", pr_number=5, owner_slot_id=slot.id,
+                       dispatch_nonce="attempt-1", active_scope_revision=1, attempt_phase="implementation",
+                       ack_received_at=datetime.utcnow())
+    revision, _workspace = await _implementation_revision(db, scope, item, slot, member, status="submitted")
+    revision.status = "completed"
+    revision.submitted_head_sha = submitted
+    revision.completed_at = datetime(2026, 11, 16, 9, 30) if completed else None
+    if accepted:
+        db.add(GithubHeadReview(work_item_id=item.id, dispatch_nonce="attempt-1", pr_number=5, head_sha=accepted,
+                                scope_revision=1, reviewer_member_id=1, verdict="accepted", summary="ok",
+                                evidence_url="https://github.com/o/r/pull/5#pullrequestreview-1"))
+    await db.commit()
+    client = _Client()
+    client.pull.update(pull or MERGED)
+    client.pull["head"] = dict(client.pull["head"], sha=pull_head)
+    return scope, item, revision, client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["no_submitted_head", "no_completed_time"])
+async def test_a_skipped_verifying_item_on_a_completed_revision_settles_its_merge(db, shape):
+    if shape == "no_submitted_head":  # authorized by an accepted review
+        scope, item, revision, client = await _verifying_completed(db, accepted="accepted-head")
+    else:  # authorized by its own submitted head
+        scope, item, revision, client = await _verifying_completed(db, submitted="sha", completed=False, pull_head="sha")
+    completed_at = revision.completed_at
+    await _tick(db, scope, client, item, revision)
+    assert item.dispatch_status == "merged"
+    assert revision.status == "completed" and revision.completed_at == completed_at  # its history is kept (Q2)
+    assert [(e.item_id, e.sanitized_reason) for e in await _settlements(db)] == [
+        (item.id, "pr_merged_with_completed_revision")]
+    assert item.id not in github_verification_service.skipped_item_ids
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_verifying_item_merged_at_an_unauthorized_head_escalates_for_the_operator(db):
+    scope, item, revision, client = await _verifying_completed(db, pull_head="unreviewed-head")
+    revision_before = _row_values(revision)
+    await _tick(db, scope, client, item, revision)
+    assert item.dispatch_status == "escalated" and item.escalation_reason == "continuation_invalid_state"
+    assert "no merge was recorded" in item.status_note
+    assert _row_values(revision) == revision_before
+    assert await _settlements(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_verifying_item_with_an_open_pr_is_still_skipped(db):
+    scope, item, revision, client = await _verifying_completed(
+        db, accepted="accepted-head", pull=dict(state="open", merged=False, merged_at=None))
+    revision_before = _row_values(revision)
+    await _tick(db, scope, client, item, revision)
+    assert item.dispatch_status == "verifying" and _row_values(revision) == revision_before
+    assert item.id in github_verification_service.skipped_item_ids  # still a stuck item for #941
+    assert await _settlements(db) == []
