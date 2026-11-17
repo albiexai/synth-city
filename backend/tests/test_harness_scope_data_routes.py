@@ -228,6 +228,28 @@ async def test_an_unreadable_plans_folder_answers_403_and_names_it(data, client,
 
 
 @pytest.mark.asyncio
+async def test_only_the_homes_own_plans_folder_is_opened_never_a_configured_one(data, client, tmp_path):
+    """A plansDirectory setting points at a folder the request's settings chose. It is read as before, not probed."""
+    if os.geteuid() == 0:
+        pytest.skip("root can read everywhere")
+    elsewhere = tmp_path / "configured-plans"
+    elsewhere.mkdir()
+    (elsewhere / "cfg-one.md").write_text("# Plan: cfg-one\n\nBody.\n", encoding="utf-8")
+    settings_file = data.agent / ".claude" / "settings.json"
+    config = json.loads(settings_file.read_text())
+    config["plansDirectory"] = str(elsewhere)
+    settings_file.write_text(json.dumps(config))
+    plans = data.agent / ".claude" / "plans"
+    plans.chmod(0o000)          # the home's own folder is unreadable, but it is not the one that is configured
+    try:
+        response = await client.get(API + "/plans", headers={HEADER: AGENT})
+        assert response.status_code == 200, response.text
+        assert [p["slug"] for p in response.json()["plans"]] == ["cfg-one"]
+    finally:
+        plans.chmod(0o755)
+
+
+@pytest.mark.asyncio
 async def test_the_controllers_own_unreadable_plans_folder_behaves_as_before(data, client):
     """No change for the controller: an unreadable folder of its own still lists as empty."""
     if os.geteuid() == 0:
