@@ -706,3 +706,29 @@ async def test_the_named_reviewer_authority_is_fenced_again_after_the_github_rea
     monkeypatch.setattr(client, "get_pull", moving_pull)
     code, detail = await _refused(a.item.id, session, db)
     assert (code, detail) in {(409, "review_binding_unavailable"), (403, "current_independent_reviewer_required")}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["scope_repo_renamed", "scope_owner_renamed", "head_ref_changed"])
+async def test_the_observed_pull_request_is_bound_to_the_refreshed_repository_and_branch(db, submitted_attempt,
+                                                                                         monkeypatch, change):
+    """#1027 review: a repository or branch change during the read must refuse, even with stale cached rows."""
+    from app.models.database import TeamGithubScope
+    from app.services.github_client import github_client as client
+    a = submitted_attempt
+    session = _reviewer_session(a)
+
+    async def moving_pull(*_args, **_kwargs):
+        if change == "scope_repo_renamed":
+            statement = update(TeamGithubScope).where(TeamGithubScope.id == a.scope.id).values(repo_name="renamed")
+        elif change == "scope_owner_renamed":
+            statement = update(TeamGithubScope).where(TeamGithubScope.id == a.scope.id).values(repo_owner="moved")
+        else:
+            statement = update(GithubWorkItem).where(GithubWorkItem.id == a.item.id).values(
+                dispatch_head_ref="deck/slot-9/issue-9/elsewhere")
+        await db.execute(statement.execution_options(synchronize_session=False))  # keep the cached value stale
+        await db.commit()
+        return a.pull
+
+    monkeypatch.setattr(client, "get_pull", moving_pull)
+    assert await _refused(a.item.id, session, db) == (409, "review_binding_unavailable")

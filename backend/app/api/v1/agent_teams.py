@@ -3861,8 +3861,10 @@ async def _named_reviewer_binding(db, item, scope, member_id):
     except GithubApprovalError:
         raise _binding_unavailable() from None
     def fence(values):
+        # The PR's identity too (#1027 review): the item's branch and the scope's repository.
         return (values['dispatch_nonce'], values['active_scope_revision'], values['pr_number'],
-                values['owner_slot_id'], values['team_id'], values['leader_slot_id'])
+                values['owner_slot_id'], values['team_id'], values['leader_slot_id'], values['dispatch_head_ref'],
+                values['scope']['repo_owner'], values['scope']['repo_name'])
     before = fence(context)
     if context['pr_number'] is None:
         raise _binding_unavailable()
@@ -3870,23 +3872,24 @@ async def _named_reviewer_binding(db, item, scope, member_id):
         pull = await watches._read_pull(scope, context['pr_number'])
     except Exception:
         raise _binding_unavailable() from None
-    head = (pull.get('head') or {}) if isinstance(pull, dict) else {}
-    sha = head.get('sha')
-    if (type(pull.get('number')) is not int or pull['number'] != context['pr_number']
-            or pull.get('merged_at', True) is not None or pull.get('state') != 'open'
-            or head.get('ref') != item.dispatch_head_ref
-            or (head.get('repo') or {}).get('full_name') != f'{scope.repo_owner}/{scope.repo_name}'
-            or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha)):
-        raise _binding_unavailable()
     # After the remote await, the whole authority is read and fenced again (#1027 review): a healthy context,
-    # the same attempt, revision, PR, owner, team and Leader, and the same effective policy. Only these
-    # post-read values are used for the watch and independence checks below.
+    # the same attempt, revision, PR, owner, team, Leader, branch and repository, and the same effective policy.
+    # Only these post-read values are used below, starting with the observed pull request.
     try:
         context, owner, _leader, _workspace = await github_approval_service.healthy_scope_context(db, item, scope)
         digest_after = _digest(effective_policy(item, scope))
     except GithubApprovalError:
         raise _binding_unavailable() from None
     if fence(context) != before or digest_after != digest:
+        raise _binding_unavailable()
+    head = (pull.get('head') or {}) if isinstance(pull, dict) else {}
+    sha = head.get('sha')
+    if (not isinstance(pull, dict) or type(pull.get('number')) is not int or pull['number'] != context['pr_number']
+            or pull.get('merged_at', True) is not None or pull.get('state') != 'open'
+            or head.get('ref') != context['dispatch_head_ref']
+            or (head.get('repo') or {}).get('full_name')
+            != f"{context['scope']['repo_owner']}/{context['scope']['repo_name']}"
+            or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha)):
         raise _binding_unavailable()
     watch = await db.scalar(select(GithubRequiredCheckWatch).where(
         GithubRequiredCheckWatch.work_item_id == item.id,
