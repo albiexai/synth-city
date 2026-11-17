@@ -13,6 +13,9 @@ from app.utils.path_utils import convert_path_to_folder_name
 
 _TAIL_BYTES = 1_048_576
 _MAX_HISTORY_BYTES = 8 * _TAIL_BYTES
+# System events of these subtypes, validated like every other row, leave the activity state unchanged (#1072).
+# Any other subtype still reads as unknown: only these two are known to be harmless.
+_STATE_KEEPING_SYSTEM_SUBTYPES = frozenset({"compact_boundary", "informational"})
 _PROC = Path("/proc")
 
 
@@ -144,6 +147,11 @@ def _state(path: Path, uid: int, session_id: str, cwd: str, now: datetime,
             return "unknown", "session_mismatch", None
         if observed_at and timestamp < observed_at:
             return "unknown", "observation_invalid", None
+        if kind == "system" and row.get("subtype") in _STATE_KEEPING_SYSTEM_SUBTYPES:
+            # A compaction record or a notice says nothing about the turn. Keep the state, the completion and
+            # observed_at as they are: a notice must not look like member activity, and the idle time must not
+            # move. A long compaction in a working turn can still reach the staleness rule below.
+            continue
         if kind == "system" and row.get("subtype") != "turn_duration":
             state, reason, terminal = "unknown", "native_event_unsupported", None
             observed_at = timestamp
