@@ -184,12 +184,20 @@ def _privileged_job():
 
 
 def test_the_full_suite_ignores_only_the_privileged_file_and_the_other_jobs_are_unchanged():
+    """The suite runs as shards (#1013): the shard assignment and the gate's full collection both leave out only the file."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("backend_shards", ROOT / "scripts" / "ci" / "backend_shards.py")
+    shards = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shards)
+    assert tuple(shards.IGNORED) == (PRIVILEGED_FILE,), "the shard assignment leaves out only the privileged file"
+    assert PRIVILEGED_FILE not in shards.test_files()
     jobs = _workflow()["jobs"]
-    suite = next(step for step in jobs["backend"]["steps"] if step.get("name") == "Run the full backend suite")
-    assert f"--ignore={PRIVILEGED_FILE}" in suite["run"]
-    assert suite["run"].count("--ignore") == 1
-    assert jobs["backend"]["name"] == "Full backend regression tests"
-    assert jobs["backend"]["runs-on"] == "ubuntu-latest"
+    collect = next(step for step in jobs["backend-gate"]["steps"] if step.get("name") == "Collect the full backend suite")
+    assert f"--ignore={PRIVILEGED_FILE}" in collect["run"]
+    assert collect["run"].count("--ignore") == 1
+    assert jobs["backend-gate"]["name"] == "Full backend regression tests"
+    assert jobs["backend-gate"]["runs-on"] == "ubuntu-latest"
+    assert jobs["backend"]["name"] != "Full backend regression tests"
 
 
 def test_the_dedicated_job_runs_on_the_ubuntu_2404_runner_and_executes_the_privileged_file():

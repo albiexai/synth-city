@@ -1,6 +1,6 @@
-"""The hosted backend job reports its own timings and keeps them after a failure (#866).
+"""The hosted backend shards report their own timings and keep them after a failure (#866, #1013).
 
-The job prints the slowest tests and writes a JUnit file with the time of every
+Each shard prints the slowest tests and writes a JUnit file with the time of every
 test case. A later change to make the suite faster needs those numbers from the
 real runner, so the report must not disappear and the file must be uploaded even
 when the suite fails. These tests read the workflow, then run pytest with the
@@ -26,13 +26,18 @@ def _backend_steps() -> list[dict]:
 
 
 def _suite_step() -> dict:
-    steps = [step for step in _backend_steps() if "pytest tests " in step.get("run", "")]
+    steps = [step for step in _backend_steps() if "--junitxml" in step.get("run", "")]
     assert len(steps) == 1, "the backend job must have one step that runs the suite"
     return steps[0]
 
 
+def _shard(text: str) -> str:
+    """The shard number is a workflow expression; use shard 1 to read the flags and names."""
+    return text.replace("${{ matrix.shard }}", "1")
+
+
 def _reporting_flags() -> list[str]:
-    return [token for token in shlex.split(_suite_step()["run"])
+    return [token for token in shlex.split(_shard(_suite_step()["run"]))
             if token.startswith(("--durations", "--junitxml"))]
 
 
@@ -58,7 +63,7 @@ def test_the_junit_file_is_uploaded_even_when_the_suite_fails():
     upload = uploads[0]
     # The suite runs in the working directory the workflow names; the upload path is from the repository root.
     suite_dir = suite["working-directory"]
-    assert upload["with"]["path"] == f"{suite_dir}/{_junit_name()}"
+    assert f"{suite_dir}/{_junit_name()}" in _shard(upload["with"]["path"]).split()
     assert "always()" in upload["if"], "without always() a failed suite would keep no timings"
     steps = _backend_steps()
     assert steps.index(upload) > steps.index(suite)
