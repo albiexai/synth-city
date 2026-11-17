@@ -500,6 +500,8 @@ This operation needs the accepted integration PR, exact tip, required checks and
 
 On conflict, preserve commits and conflict files. Coordinate the outcome instead of resetting or force-pushing. A continuation directory permission needs a trailing slash, such as `docs/`; `docs` permits only that exact path.
 
+When the attempt policy has `accepted_base_update: disabled` and a PR needs a change that is already on its base branch, such as a required CI fix, the Supervisor uses GitHub's **Update branch** on the PR. It is a conflict-free merge of the current base into the PR branch. The owner then reports `continuation_completed` at the new head as usual. Files the base merge brought in are not scope growth: completion counts a path outside the revision's paths only when the PR's own diff changes it, at the baseline or at the head, relative to its merge base with the current base. An edit outside the paths in the PR's own changes is still refused, and a merge base that can't be read makes completion inconclusive. On conflict, don't resolve it in the PR; coordinate as above.
+
 ### Check and resume
 
 Before releasing maintenance holds:

@@ -1825,6 +1825,7 @@ async def _active_completion_context(db, tmp_path, *, allowed_actions=None):
     item.escalation_reason = None
     item.active_scope_revision = 1
     item.attempt_phase = "implementation"
+    item.dispatch_base_ref = "origin/master"  # a dispatched item always has its prepared base
     revision = GithubAttemptScopeRevision(
         work_item_id=item.id,
         dispatch_nonce=item.dispatch_nonce,
@@ -1876,10 +1877,13 @@ async def _active_completion_context(db, tmp_path, *, allowed_actions=None):
 
 def _stub_completion_github(monkeypatch, *, extra_current=()):
     async def get_pull(*_args, **_kwargs):
-        return {"state": "open", "head": {"sha": "d" * 40}}
+        return {"state": "open", "head": {"sha": "d" * 40}, "base": {"ref": "master", "sha": "9" * 40}}
 
-    async def get_commit_snapshot(*_args, **_kwargs):
-        return GithubCommitSnapshot(sha="d" * 40, tree_sha="e" * 40)
+    async def get_commit_snapshot(_owner, _repo, sha, **_kwargs):
+        return GithubCommitSnapshot(sha=sha, tree_sha="b" * 40 if sha == "a" * 40 else "e" * 40)
+
+    async def get_merge_base(*_args, **_kwargs):
+        return "a" * 40  # the baseline's own fork point: no base-side change to subtract
 
     baseline = [
         GithubTreeEntry(
@@ -1927,6 +1931,7 @@ def _stub_completion_github(monkeypatch, *, extra_current=()):
 
     monkeypatch.setattr(github_client, "get_pull", get_pull)
     monkeypatch.setattr(github_client, "get_commit_snapshot", get_commit_snapshot)
+    monkeypatch.setattr(github_client, "get_merge_base", get_merge_base, raising=False)
     monkeypatch.setattr(github_client, "get_recursive_tree", get_recursive_tree)
 
 
@@ -2023,6 +2028,88 @@ async def test_continuation_completion_requires_explicit_directory_authority(
         assert response.json()["detail"] == "continuation_paths_out_of_scope"
         assert item.dispatch_status == "dispatched"
         assert revision.status == "active"
+
+
+def _stub_base_merge_github(monkeypatch, case):
+    """#1030: the PR head is a conflict-free merge of the current base tip into the revision's work.
+
+    Base tip 9.., head d.. (tree e..). The baseline head a.. forked from the base at 5.. (tree 6..); the head's merge
+    base with the base tip is the tip itself, 7.. (tree 8..). ci/shard.py came in with the base; src/example.py is the
+    revision's own in-scope edit.
+    """
+    def entry(path, sha):
+        return GithubTreeEntry(path, "100644", "blob", sha)
+
+    fork = {"src/example.py": "c" * 40, "README.md": "0" * 40, "docs/old.md": "1" * 40}
+    baseline = dict(fork)
+    tip = {**fork, "ci/shard.py": "3" * 40}
+    head = {**tip, "src/example.py": "4" * 40}
+    if case == "own_outside_edit":  # the PR itself edits a file outside its paths, on top of the base merge
+        head["README.md"] = "f" * 40
+    if case == "revert_outside":  # the PR changed docs/old.md before the baseline and now reverts it to the base
+        baseline["docs/old.md"] = "2" * 40
+    trees = {"b" * 40: baseline, "6" * 40: fork, "8" * 40: tip, "e" * 40: head}
+    commits = {"d" * 40: "e" * 40, "5" * 40: "6" * 40, "7" * 40: "8" * 40}
+    calls = []
+
+    async def get_pull(*_args, **_kwargs):
+        ref = "other" if case == "foreign_base" else "master"
+        base = {} if case == "missing_base" else {"base": {"ref": ref, "sha": "9" * 40}}
+        return {"state": "open", "head": {"sha": "d" * 40}, **base}
+
+    async def get_commit_snapshot(_owner, _repo, sha, **_kwargs):
+        return GithubCommitSnapshot(sha=sha, tree_sha=commits[sha])
+
+    async def get_merge_base(_owner, _repo, base, head_sha, **_kwargs):
+        calls.append((base, head_sha))
+        if case == "unreadable":
+            raise GithubClientResponseError("GitHub comparison identities changed")
+        return {"a" * 40: "5" * 40, "d" * 40: "7" * 40}[head_sha]
+
+    async def get_recursive_tree(_owner, _repo, tree_sha, **_kwargs):
+        return {path: entry(path, sha) for path, sha in trees[tree_sha].items()}
+
+    monkeypatch.setattr(github_client, "get_pull", get_pull)
+    monkeypatch.setattr(github_client, "get_commit_snapshot", get_commit_snapshot)
+    monkeypatch.setattr(github_client, "get_merge_base", get_merge_base, raising=False)
+    monkeypatch.setattr(github_client, "get_recursive_tree", get_recursive_tree)
+    return calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("case", "expected"), [
+    ("base_merge", None),  # files the base merge brought in are not scope growth
+    ("own_outside_edit", "continuation_paths_out_of_scope"),
+    ("revert_outside", "continuation_paths_out_of_scope"),
+    ("unreadable", "continuation_diff_inconclusive"),
+    ("missing_base", "continuation_diff_inconclusive"),
+    ("foreign_base", "continuation_diff_inconclusive"),
+])
+async def test_continuation_completion_does_not_count_a_base_merge_as_scope(
+    client, db, tmp_path, monkeypatch, case, expected
+):
+    monkeypatch.setattr(settings, "mail_capability_tokens_required", True)
+    _scope, item, workspace, revision, session = await _active_completion_context(db, tmp_path)
+    revision.allowed_paths = ["src/example.py"]
+    await db.commit()
+    calls = _stub_base_merge_github(monkeypatch, case)
+
+    async def authenticated_session():
+        return session
+
+    app.dependency_overrides[mail_session] = authenticated_session
+    response = await client.post("/api/v1/agent-teams/dispatch-status", json=_completion_report(item))
+    await db.refresh(item)
+    await db.refresh(revision)
+    await db.refresh(workspace)
+    assert workspace.lease_token == "lease-secret" and item.retry_count == 0
+    if expected is None:
+        assert response.status_code == 200, response.text
+        assert item.dispatch_status == "verifying" and revision.status == "submitted"
+        assert sorted(calls) == [("9" * 40, "a" * 40), ("9" * 40, "d" * 40)]
+    else:
+        assert response.status_code == 409 and response.json()["detail"] == expected
+        assert item.dispatch_status == "dispatched" and revision.status == "active"
 
 
 @pytest.mark.asyncio
@@ -3171,9 +3258,11 @@ async def _accepted_import_context(db, tmp_path, monkeypatch):
     await db.flush()
     revision.approval_request_id = approval.id
     await db.commit()
+    scope.base_ref = item.dispatch_base_ref  # one real branch for the scope, the item and the PR (#1030)
+    await db.commit()
     imported = GithubTreeEntry("scripts/run.sh", "100755", "blob", "9" * 40)
     _stub_completion_github(monkeypatch, extra_current=(imported,))
-    base = {"ref": scope.base_ref.removeprefix("origin/"),
+    base = {"ref": scope.base_ref.removeprefix("origin/"), "sha": "9" * 40,
             "repo": {"full_name": scope.repo_owner + "/" + scope.repo_name}}
 
     async def get_pull(_owner, _repo, number, **_kwargs):

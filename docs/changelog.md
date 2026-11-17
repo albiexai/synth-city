@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A base update no longer counts as scope growth when a revision completes.** After GitHub's **Update branch** on a PR, `continuation_completed` returned `continuation_paths_out_of_scope` for every file the base merge brought in. Completion now counts an outside path only when the PR's own diff changes it, compared with its merge base with the current base; an outside edit in the PR is still refused, and an unreadable merge base is inconclusive. The Supervised factory playbook describes the update-branch route for attempts whose policy disables accepted base updates ([#1030](https://github.com/albiexai/synth-city/issues/1030)).
 - **An accepted PR is no longer left for a human by a cause that has cleared.** A PR that fell back to human merge because of the daily cap, or because checks stalled, goes back to the automatic merge path once usage is below the cap or the same head's checks have finished green; every merge gate still applies. A check run again later on the same head no longer counts the earlier wait, so it no longer reports a false 60-minute stall ([#1037](https://github.com/albiexai/synth-city/issues/1037)).
 
 ## [4.2.0] - 2026-11-17
