@@ -84,6 +84,46 @@ def recognize_native_input_wait(provider: str, screen: str) -> str | None:
     return None
 
 
+# The Codex content-filter notice. The three lines are a real capture (#1062): a header at column 0, an indented
+# detail line, and an optional indented "Learn more" line whose URL can change.
+_REFUSAL_HEADER = re.compile(r"^ⓘ\s+This content can[’']t be shown$")
+_REFUSAL_DETAIL = "  We take extra care with some cybersecurity requests."
+_REFUSAL_MORE = re.compile(r"^ {2}Learn more: \S+$")
+
+
+def recognize_provider_refusal(provider: str, screen: str) -> str | None:
+    """Recognize a provider refusal or content-filter notice that is the current state of a pane.
+
+    Returns "provider_refusal" or None. None means the screen is unknown, not that no refusal happened.
+    Codex only: there is no real Claude Code capture yet, so Claude Code is not recognized and no fixture text
+    is invented for it.
+
+    The last notice block counts only when nothing happened after it. Every non-blank line after the block
+    must be indented (composer continuation, footer, elapsed time) or start with the composer glyph. A new
+    top-level line (assistant output, a work item, another notice) means the member moved on. Only the three
+    notice lines are real capture, not the layout around them, so a miss is preferred to marking a working
+    member as blocked.
+    """
+    if provider != "codex-cli" or not screen or len(screen) > 65536:
+        return None
+    plain = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", screen)
+    plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", plain)
+    lines = [line.rstrip() for line in plain.splitlines()]
+    headers = [index for index, line in enumerate(lines) if _REFUSAL_HEADER.match(line)]
+    if not headers:
+        return None
+    start = headers[-1]
+    if start + 1 >= len(lines) or lines[start + 1] != _REFUSAL_DETAIL:
+        return None
+    end = start + 2
+    if end < len(lines) and _REFUSAL_MORE.match(lines[end]):
+        end += 1
+    for line in lines[end:]:
+        if line.strip() and not line.startswith(("›", " ")):
+            return None
+    return "provider_refusal"
+
+
 @dataclass(frozen=True)
 class ActivityBinding:
     pane_pid: int
