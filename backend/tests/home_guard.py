@@ -20,6 +20,7 @@ wrote, and a write that was undone before the end is not seen. It is not a sandb
 """
 import os
 import pwd
+import re
 import stat
 from pathlib import Path
 
@@ -39,6 +40,7 @@ EXCEEDED = ("bound-exceeded",)
 UNREADABLE = ("unreadable",)
 REFUSED = ("refused",)
 FAILURES = (EXCEEDED, UNREADABLE, REFUSED)
+_DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
 class _BoundExceeded(Exception):
@@ -63,6 +65,23 @@ def _record(st):
     return (st.st_mode, st.st_size, st.st_mtime_ns)
 
 
+def _dotenv_value(raw):
+    """A `.env` value the way python-dotenv reads it: a quoted value ends at its closing quote (a trailing comment
+    after it is ignored); an unquoted one ends at whitespace followed by `#`."""
+    raw = raw.strip()
+    if raw[:1] in ("'", '"'):
+        quote, index = raw[0], 1
+        while index < len(raw):
+            if raw[index] == "\\":
+                index += 2
+            elif raw[index] == quote:
+                return raw[1:index]
+            else:
+                index += 1
+        return raw[1:]
+    return re.sub(r"\s+#.*", "", raw).rstrip()
+
+
 def configured_values(environ, cwd):
     """The three configuration values as the app would see them: the process environment over a `.env`."""
     found = {}
@@ -76,7 +95,7 @@ def configured_values(environ, cwd):
         if key.startswith("export "):
             key = key[len("export "):].strip()
         if separator and key.upper() in CONFIG_NAMES:
-            found[key.upper()] = value.strip().strip("\"'")
+            found[key.upper()] = _dotenv_value(value)
     for key, value in environ.items():
         if key.upper() in CONFIG_NAMES:
             found[key.upper()] = value
@@ -162,59 +181,83 @@ class Guard:
                 problems.append(f"{name} points at a watched real path")
         return problems
 
-    def _walk(self, directory, label, depth, found, counter):
-        with os.scandir(directory) as listing:
-            children = list(listing)
-        if children and depth > MAX_DEPTH:
-            raise _BoundExceeded
-        for child in children:
-            if child.name in PROTECTED_NAMES:
-                continue
-            counter[0] += 1
-            if counter[0] > MAX_ENTRIES:
-                raise _BoundExceeded
-            st = os.stat(child.path, follow_symlinks=False)
-            found[label + "/" + child.name] = _record(st)
-            if stat.S_ISDIR(st.st_mode):
-                self._walk(child.path, label + "/" + child.name, depth + 1, found, counter)
+    def _walk(self, descriptor, label, depth, found, counter):
+        """List the directory behind an already opened descriptor. The bounds are tested while scanning, so a huge
+        folder is never read whole, and a subfolder is opened relative to its parent without following a symlink,
+        so a swap after the metadata read is not traversed."""
+        with os.scandir(descriptor) as listing:
+            for child in listing:
+                if depth > MAX_DEPTH:
+                    raise _BoundExceeded
+                if child.name in PROTECTED_NAMES:
+                    continue
+                counter[0] += 1
+                if counter[0] > MAX_ENTRIES:
+                    raise _BoundExceeded
+                st = os.stat(child.name, dir_fd=descriptor, follow_symlinks=False)
+                found[label + "/" + child.name] = _record(st)
+                if stat.S_ISDIR(st.st_mode):
+                    inner = os.open(child.name, _DIRECTORY, dir_fd=descriptor)
+                    try:
+                        self._walk(inner, label + "/" + child.name, depth + 1, found, counter)
+                    finally:
+                        os.close(inner)
 
     def _walk_root(self, label, path, entries):
         found = {}
         try:
-            self._walk(path, label, 1, found, [0])
+            descriptor = os.open(path, _DIRECTORY)          # a symlink here fails: the root was swapped
+        except OSError:
+            entries[label] = UNREADABLE
+            return
+        try:
+            self._walk(descriptor, label, 1, found, [0])
         except _BoundExceeded:
             entries[label] = EXCEEDED
         except OSError:
             entries[label] = UNREADABLE
         else:
             entries.update(found)
+        finally:
+            os.close(descriptor)
 
     def snapshot(self):
         entries = {label: REFUSED for label in self.refused}
+
+        def look(label, path):
+            """The metadata of a path, None when it is simply not there; any other failure is recorded, not skipped."""
+            try:
+                return os.stat(path, follow_symlinks=False)
+            except (FileNotFoundError, NotADirectoryError):
+                return None
+            except OSError:
+                entries[label] = UNREADABLE
+                return None
+
         for home in self.homes:
             try:
                 with os.scandir(home) as listing:
                     names = [entry.name for entry in listing if entry.name.startswith(PREFIXES)]
+            except (FileNotFoundError, NotADirectoryError):
+                continue
             except OSError:
+                entries[home] = UNREADABLE
                 continue
             for name in names:
                 path = os.path.join(home, name)
-                try:
-                    st = os.stat(path, follow_symlinks=False)
-                except OSError:
+                st = look(path, path)
+                if st is None:
                     continue
                 entries[path] = _record(st)
                 if name in PREFIXES and stat.S_ISDIR(st.st_mode):
                     self._walk_root(path, path, entries)
         for label, path in self.files.items():
-            try:
-                entries[label] = _record(os.stat(path, follow_symlinks=False))
-            except OSError:
-                pass
+            st = look(label, path)
+            if st is not None:
+                entries[label] = _record(st)
         for label, path in self.roots.items():
-            try:
-                st = os.stat(path, follow_symlinks=False)
-            except OSError:
+            st = look(label, path)
+            if st is None:
                 continue
             entries[label] = _record(st)
             if stat.S_ISDIR(st.st_mode):

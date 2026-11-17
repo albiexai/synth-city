@@ -216,6 +216,165 @@ def test_a_failure_at_the_end_of_the_run_is_reported_even_when_the_baseline_had_
     assert str(root) in home_guard.session_changes()
 
 
+# ---- the four review findings (#1138): bounds while scanning, no-follow traversal, .env comments, an unreadable home ---------
+
+
+class CountingScandir:
+    """os.scandir that counts how many entries are actually pulled from the listings."""
+
+    def __init__(self, real):
+        self.real, self.pulled = real, 0
+
+    def __call__(self, target):
+        owner = self
+        listing = self.real(target)
+
+        class Wrapped:
+            def __enter__(self):
+                listing.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return listing.__exit__(*exc)
+
+            def __iter__(self):
+                for entry in listing:
+                    owner.pulled += 1
+                    yield entry
+        return Wrapped()
+
+
+def test_the_entry_bound_is_tested_while_scanning_not_after_the_whole_folder_is_read(world, monkeypatch):
+    home, _ = world
+    root = home / ".albiex-synth-city"
+    root.mkdir()
+    for index in range(9):
+        (root / f"f{index}").write_text("x")
+    monkeypatch.setattr(home_guard, "MAX_ENTRIES", 3)
+    counting = CountingScandir(os.scandir)
+    monkeypatch.setattr(home_guard.os, "scandir", counting)
+
+    result = guard_for(world).snapshot()
+
+    assert result[str(root)] == home_guard.EXCEEDED
+    # the home listing reads 2 entries (the watched root and an unrelated file); the walk reads 3 allowed plus the
+    # one that trips the bound; the other five entries of the folder are never read
+    assert counting.pulled <= 2 + 4
+
+
+def test_a_watched_root_swapped_for_a_symlink_after_the_metadata_read_is_not_traversed(world, monkeypatch):
+    home, _ = world
+    (home / ".claude").mkdir()
+    (home / ".claude" / "secret.json").write_text("{}")
+    root = home / ".albiex-synth-city"
+    root.mkdir()
+    (root / "inner.txt").write_text("x")
+    real_stat, swapped = os.stat, []
+
+    def stat_then_swap(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if str(path) == str(root) and not swapped:
+            swapped.append(True)
+            os.rename(root, home / "moved-away")
+            os.symlink(home / ".claude", root)
+        return result
+
+    monkeypatch.setattr(home_guard.os, "stat", stat_then_swap)
+
+    result = guard_for(world).snapshot()
+
+    assert result[str(root)] == home_guard.UNREADABLE
+    assert not any("secret.json" in key or ".claude/" in key for key in result)
+
+
+def test_a_subfolder_swapped_for_a_symlink_after_the_metadata_read_is_not_traversed(world, monkeypatch):
+    home, _ = world
+    (home / ".claude").mkdir()
+    (home / ".claude" / "secret.json").write_text("{}")
+    root = home / ".albiex-synth-city"
+    (root / "sub").mkdir(parents=True)
+    real_stat, swapped = os.stat, []
+
+    def stat_then_swap(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if path == "sub" and kwargs.get("dir_fd") is not None and not swapped:
+            swapped.append(True)
+            os.rename(root / "sub", home / "sub-moved")
+            os.symlink(home / ".claude", root / "sub")
+        return result
+
+    monkeypatch.setattr(home_guard.os, "stat", stat_then_swap)
+
+    result = guard_for(world).snapshot()
+
+    assert result[str(root)] == home_guard.UNREADABLE
+    assert not any("secret.json" in key for key in result)
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("sqlite+aiosqlite:///x.db # note", "sqlite+aiosqlite:///x.db"),
+    ("sqlite+aiosqlite:///x.db\t# note", "sqlite+aiosqlite:///x.db"),
+    ('"quoted # kept" # trailing', "quoted # kept"),
+    ("'single # kept' # trailing", "single # kept"),
+    ("  padded  ", "padded"),
+    ("no#space#comment", "no#space#comment"),
+    ('"has \\" escaped quote" # c', 'has \\" escaped quote'),
+    ("", ""),
+])
+def test_a_dotenv_value_is_read_the_way_python_dotenv_reads_it(raw, expected):
+    assert home_guard._dotenv_value(raw) == expected
+
+
+def test_a_dotenv_database_line_with_a_trailing_comment_still_watches_the_real_file(world, tmp_path):
+    _, cwd = world
+    real_db = tmp_path / "elsewhere.db"
+    (cwd / ".env").write_text(f"DATABASE_URL=sqlite+aiosqlite:///{real_db}   # the real one\n")
+    guard = guard_for(world)
+    before = guard.snapshot()
+
+    real_db.write_text("db")
+
+    assert home_guard.changed(before, guard.snapshot()) == ["configured database"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read any folder")
+def test_an_unreadable_home_is_reported_not_skipped(world):
+    home, _ = world
+    guard = guard_for(world)
+    home.chmod(0)
+    try:
+        assert guard.snapshot()[str(home.resolve())] == home_guard.UNREADABLE
+    finally:
+        home.chmod(0o700)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read any folder")
+def test_an_unreadable_home_fails_the_run_even_when_it_was_unreadable_at_both_ends(world, monkeypatch):
+    home, _ = world
+    guard = guard_for(world)
+    home.chmod(0)
+    try:
+        monkeypatch.setattr(home_guard, "_guard", guard)
+        monkeypatch.setattr(home_guard, "_baseline", guard.snapshot())          # unreadable at the start ...
+
+        assert home_guard.session_changes() == [str(home.resolve())]            # ... and at the end
+    finally:
+        home.chmod(0o700)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read any folder")
+def test_a_named_file_in_an_unreadable_folder_is_reported_and_a_missing_one_is_not(world):
+    _, cwd = world
+    guard = guard_for(world)
+    assert not any(value == home_guard.UNREADABLE for value in guard.snapshot().values())     # absent: nothing to report
+    cwd.chmod(0)
+    try:
+        result = guard.snapshot()
+    finally:
+        cwd.chmod(0o700)
+    assert result["working directory/synth_city.db"] == home_guard.UNREADABLE
+
+
 # ---- the database file outside the home, and its sidecars --------------------------------------------------------------------
 
 
