@@ -60,7 +60,8 @@ for (const theme of ['light', 'dark'] as Theme[]) {
     await expect(card).toBeVisible()
     const bar = card.getByRole('img')
     await expect(bar).toBeVisible()
-    await expect(bar).toHaveAttribute('aria-label', /^\d+ done, \d+ under way, \d+ still to do, backlog unknown$/)
+    // An escalated or failed item adds "N need attention" (#1129); the rest of the label is unchanged.
+    await expect(bar).toHaveAttribute('aria-label', /^\d+ done, \d+ under way, (\d+ need attention, )?\d+ still to do, backlog unknown$/)
     await expect(card.getByText('backlog unknown', { exact: true })).toBeVisible()
     await expect(card.getByText(/known items? done/)).toBeVisible()
     await expect(bar.getByTestId('unknown-remainder')).toBeVisible()
@@ -82,7 +83,9 @@ for (const theme of ['light', 'dark'] as Theme[]) {
     const segments = await bar.locator(':scope > span').evaluateAll(elements => elements.map(element => element.getBoundingClientRect().width))
     const width = await bar.evaluate(element => element.getBoundingClientRect().width)
     expect(segments.reduce((sum, value) => sum + value, 0)).toBeCloseTo(width, 0)
-    expect(segments[2]).toBeCloseTo(width, 0)
+    // The still-to-do segment fills the bar; it is found by identity, not position (#1129 added a segment).
+    const todo = await bar.getByTestId('campaign-bar-todo').evaluate(element => element.getBoundingClientRect().width)
+    expect(todo).toBeCloseTo(width, 0)
     expect(await contrastFailures(card)).toEqual([])
   })
 }

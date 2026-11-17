@@ -18,7 +18,7 @@ from app.models.factory_schemas import (
 )
 from app.models.schemas import PlannedCampaignDecision
 from app.services.github_dispatch_priority import dispatch_order_key, effective_priority
-from app.services.work_item_states import is_done
+from app.services.work_item_states import is_done, needs_attention
 
 _PARENT = re.compile(r"https://github\.com/([^/]+)/([^/]+)/issues/([1-9][0-9]*)\Z")
 _STATE_PHRASES = {
@@ -26,7 +26,6 @@ _STATE_PHRASES = {
     "verifying": "waiting for checks",
     "ready_for_review": "reviewing it",
     "awaiting_human_review": "waiting for you",
-    "escalated": "waiting for you",
 }
 _DECISION_TEXT = {
     "review_pr": "Review the pull request.",
@@ -180,7 +179,7 @@ class AgentTeamCampaignService:
             if not available or key in backlog:
                 work[key] = row
         done, under_way, queued = [], [], []
-        other_branch = 0
+        other_branch = attention = 0
         for row in work.values():
             scope = by_scope[row.scope_id]
             if is_done(row.dispatch_status):
@@ -191,6 +190,9 @@ class AgentTeamCampaignService:
                 merged_base = _branch(row.dispatch_base_ref)
                 if row.dispatch_status == "merged" and merged_base is not None and merged_base != _branch(scope.base_ref):
                     other_branch += 1
+            elif needs_attention(row.dispatch_status):
+                # Escalated or failed: someone must act, so it is never under way (#1129), as on the tiles.
+                attention += 1
             elif row.dispatch_status in _STATE_PHRASES:
                 under_way.append(CampaignUnderWayItem(title=row.issue_title,
                     owner_short_name=row.display_name.split()[0] if row.display_name and row.display_name.split() else None,
@@ -225,7 +227,7 @@ class AgentTeamCampaignService:
         return TeamCampaignSummary(backlog_state="available" if available else "backlog unavailable",
             done_count=len(done), done_on_other_branch_count=other_branch, latest_done=[CampaignDoneItem(title=row.issue_title,
                 merged_at=row.auto_merged_at) for row in done[:3]],
-            under_way_count=len(under_way), under_way=under_way, queued_count=len(queued), queued=queued,
+            under_way_count=len(under_way), under_way=under_way, attention_count=attention, queued_count=len(queued), queued=queued,
             dispatch_order=dispatch_order,
             not_started_count=sum(groups.values()) if available else None,
             not_started_groups=[CampaignAreaGroup(area=area, count=count) for area, count in sorted(groups.items())],

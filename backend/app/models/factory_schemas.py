@@ -366,6 +366,8 @@ class TeamCampaignSummary(FactoryModel):
     latest_done: list[CampaignDoneItem]
     under_way_count: int = Field(ge=0)
     under_way: list[CampaignUnderWayItem]
+    # Escalated or failed items: they need someone's attention and are never under way (#1129).
+    attention_count: int = Field(default=0, ge=0)
     queued_count: int = Field(ge=0)
     queued: list[CampaignQueuedItem]
     dispatch_order: list[CampaignDispatchItem] = Field(default_factory=list)

@@ -10,7 +10,7 @@ from sqlalchemy import select
 from app.models.database import GithubWorkItem
 from app.services import factory_projection_service as projection
 from app.services.github_work_progress_service import _next_step
-from app.services.work_item_states import DONE_STATUSES, is_done
+from app.services.work_item_states import ATTENTION_STATUSES, DONE_STATUSES, is_done, needs_attention
 from tests.agent_teams.test_agent_team_campaign import Backlog, fixed_campaign, issue, observe_backlog
 from tests.agent_teams.test_agent_team_summary import db  # noqa: F401  (the summary's database fixture)
 
@@ -45,3 +45,23 @@ async def test_every_view_counts_the_same_done_items(db, monkeypatch):
     await db.refresh(team)
     complete = {row.id for row in rows if _next_step(row, scope, team, None, None)[0] == "complete"}
     assert complete == done
+
+
+def test_needing_attention_is_escalated_or_failed():
+    assert ATTENTION_STATUSES == ("escalated", "failed")
+    assert projection.CATEGORY_STATUSES["attention"] == ATTENTION_STATUSES
+    assert needs_attention("escalated") and needs_attention("failed") and not needs_attention("dispatched")
+
+
+@pytest.mark.asyncio
+async def test_the_campaign_and_the_tiles_count_the_same_items_as_needing_attention(db, monkeypatch):
+    # #1129 (U27): the same item set, read by Campaign Progress and by the tiles.
+    statuses = ("merged", "escalated", "failed", "dispatched")
+    team, scope, items, summary = await fixed_campaign(db, monkeypatch, statuses)
+    await observe_backlog(db, scope, summary, Backlog([issue(n, f"Issue {n}") for n in range(1, 5)]))
+    campaign = (await summary.summary(db, team.id)).campaign
+    counts = await projection.counts(db, select(GithubWorkItem).where(GithubWorkItem.scope_id == scope.id))
+    assert campaign.attention_count == counts.attention == 2
+    assert campaign.under_way_count == counts.active == 1
+    assert campaign.done_count == counts.finished == 1
+

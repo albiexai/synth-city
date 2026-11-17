@@ -274,6 +274,27 @@ describe('Progress', () => {
     expect(within(card).getByRole('link', { name: 'Parent issue #490 ›' })).toHaveAttribute('href', 'https://github.com/o/r/issues/490')
   })
 
+  it('counts escalated and failed items as needing attention, never under way (#1129)', async () => {
+    run({ attention_count: 2 })
+    await open()
+    const card = screen.getByRole('article', { name: /Progress: Release Deck v3.0.1/ })
+    // Every item has one bucket: the two needing attention join the campaign total.
+    expect(within(card).getByText('of 14 done', { exact: false })).toBeInTheDocument()
+    expect(within(card).getByRole('img')).toHaveAttribute(
+      'aria-label', '6 done, 2 under way, 2 need attention, 4 still to do, backlog known')
+    expect(within(card).getByRole('heading', { name: /^Needs attention/ })).toHaveTextContent('2')
+    expect(within(card).getByRole('link', { name: 'View the 2 items that need attention ›' }))
+      .toHaveAttribute('href', '/work?team_id=1&category=attention')
+  })
+
+  it('reads a response without attention_count as none needing attention', async () => {
+    run({ attention_count: undefined })
+    await open()
+    const card = screen.getByRole('article', { name: /Progress: Release Deck v3.0.1/ })
+    expect(within(card).getByText('of 12 done', { exact: false })).toBeInTheDocument()
+    expect(within(card).queryByRole('heading', { name: /^Needs attention/ })).not.toBeInTheDocument()
+  })
+
   it('says the team is paused when its autonomy is off', async () => {
     run({ under_way_count: 0, under_way: [] }, false)
     await open()
