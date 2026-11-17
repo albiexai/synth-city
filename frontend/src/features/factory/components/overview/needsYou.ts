@@ -10,6 +10,13 @@ export interface NeedsYouRow {
   team: string;
   href: string;
   cta: string;
+  scopeId: number | null;
+  workItemId: number | null;
+}
+
+export interface NeedsYouFilters {
+  scopeId: number | null;
+  provider: { workItemIds: ReadonlySet<number>; complete: boolean } | null;
 }
 
 // Each row is one thing that a team summary reports as waiting for the Director.
@@ -34,6 +41,8 @@ export function needsYouRows(
         team: preset.name,
         href: action.work_item_id ? `/work/${action.work_item_id}` : fallback,
         cta: `Open #${action.issue_number}`,
+        scopeId: action.scope_id,
+        workItemId: action.work_item_id ?? null,
       });
     }
     for (const item of summary.attention) {
@@ -48,6 +57,8 @@ export function needsYouRows(
         team: preset.name,
         href: item.work_item_id ? `/work/${item.work_item_id}` : fallback,
         cta: `Open #${item.issue_number}`,
+        scopeId: item.scope_id ?? null,
+        workItemId: item.work_item_id ?? null,
       });
     }
     // A member waits at an interactive screen. Only the fixed reason is shown.
@@ -60,6 +71,8 @@ export function needsYouRows(
         team: preset.name,
         href: "/agent-bridge",
         cta: "Open live sessions",
+        scopeId: null,
+        workItemId: null,
       });
     }
     const overdue = summary.supervisor_observation?.attention;
@@ -71,10 +84,15 @@ export function needsYouRows(
         team: preset.name,
         href: `/teams/${preset.id}`,
         cta: "Open the team",
+        scopeId: null,
+        workItemId: null,
       });
     }
     // One row for each unanswered-reminder signal. The wire is parsed defensively.
     for (const row of parseReminders(summary.reminder_attention)) {
+      const scopeId = summary.reminder_attention?.find(
+        (item) => item.work_item_id != null && item.work_item_id === row.workItemId,
+      )?.scope_id;
       rows.push({
         key: `${preset.id}-reminder-${row.kind}-${row.workItemId ?? row.issueNumbers.join("-")}`,
         title: reminderSentence(row),
@@ -82,6 +100,8 @@ export function needsYouRows(
         team: preset.name,
         href: row.kind === "workspace_release" && row.workItemId ? `/work/${row.workItemId}` : `/teams/${preset.id}`,
         cta: row.kind === "workspace_release" && row.issueNumber ? `Open #${row.issueNumber}` : "Open the team",
+        scopeId: scopeId ?? null,
+        workItemId: row.workItemId,
       });
     }
     for (const item of summary.required_ci_unreadable ?? []) {
@@ -92,8 +112,33 @@ export function needsYouRows(
         team: preset.name,
         href: `/work/${item.work_item_id}`,
         cta: `Open #${item.issue_number}`,
+        scopeId: item.scope_id,
+        workItemId: item.work_item_id,
       });
     }
   });
   return rows;
+}
+
+// A row with no repository is team-level, so it stays and is labelled. A row
+// whose work item the provider list does not show is dropped only when that
+// list is complete; otherwise it stays and is labelled unconfirmed.
+export function filterNeedsYouRows(rows: NeedsYouRow[], filters: NeedsYouFilters): NeedsYouRow[] {
+  const kept: NeedsYouRow[] = [];
+  for (const row of rows) {
+    let detail = row.detail;
+    if (filters.scopeId !== null) {
+      if (row.scopeId === null) detail = `${detail} · team-wide`;
+      else if (row.scopeId !== filters.scopeId) continue;
+    }
+    if (filters.provider) {
+      const listed = row.workItemId !== null && filters.provider.workItemIds.has(row.workItemId);
+      if (!listed) {
+        if (row.workItemId !== null && filters.provider.complete) continue;
+        detail = `${detail} · provider not confirmed`;
+      }
+    }
+    kept.push(detail === row.detail ? row : { ...row, detail });
+  }
+  return kept;
 }
