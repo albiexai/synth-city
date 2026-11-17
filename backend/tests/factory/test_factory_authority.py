@@ -259,3 +259,26 @@ async def test_representative_existing_mutations_persist_update_timestamp(factor
         await github_verification_service._promote_verified_item(db, scope, item, client, pull, "a" * 40)
         await db.refresh(item)
         assert item.updated_at > original_time and item.dispatch_status == "ready_for_review"
+
+
+@pytest.mark.parametrize("condition", ["mismatched_pane", "retired_pane"])
+async def test_an_online_owner_without_a_verified_pane_stays_unknown_and_carries_its_agent_status(
+        factory_client, factory_store, condition):
+    """#1073: "bound" stays strict (it feeds offline_slot and the owner_offline escalation). The Work page words the
+    owner's session from the agent status that is already on the same object, so an online owner that has no verified
+    pane is shown as that, not as a bare "unknown". The wire carries both, and adds no value."""
+    ids = factory_store.ids
+    async with factory_store.maker() as db:
+        session = (await db.execute(select(MailAgentSession).where(MailAgentSession.team_slot_id == ids.owners[1]))).scalar_one()
+        if condition == "mismatched_pane": session.bound_pane_proc_start = "wrong-start"
+        if condition == "retired_pane":
+            db.add(MailPaneLifecycle(pane_pid=session.bound_pane_pid,
+                                    pane_proc_start=session.bound_pane_proc_start, retired_at=NOW.replace(tzinfo=None)))
+        await db.commit()
+    body = (await factory_client.get(f"/api/v1/factory/work-items/{ids.items[1]}")).json()["work_item"]
+    assert body["session"]["state"] == "unknown"
+    assert body["session"]["bridge_target"] is None and body["links"]["bridge_target"] is None
+    # offline_slot stays strict: the owner is not offline, so no launch hint names the owner's slot (the offline
+    # Leader's own hint, if any, is a different slot)
+    assert (body["links"]["launch_plan"] or {}).get("slot_id") != ids.owners[1]
+    assert body["session"]["agent_status"]["session_state"] == "online"
