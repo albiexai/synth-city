@@ -240,6 +240,62 @@ async def test_a_malformed_package_file_is_unknown(scoped, client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("package_json", ["[]", "5", "null", '"2.1.350"', "true", '["2.1.350"]'])
+async def test_a_package_file_that_is_valid_json_but_not_an_object_is_unknown_and_not_an_error(scoped, client, package_json):
+    launcher = npm_install(scoped.agent, "2.1.350")
+    (launcher.parent.parent / "lib" / "node_modules" / "@anthropic-ai" / "claude-code" / "package.json").write_text(package_json)
+
+    for status in (await claude_status(client), await listed_claude(client)):      # 200 with the message, never a server error
+        assert status["version"] is None
+        assert status["version_unknown_reason"] == UNKNOWN_TEXT
+
+
+@pytest.mark.asyncio
+async def test_an_empty_package_object_is_unknown(scoped, client):
+    launcher = npm_install(scoped.agent, "2.1.350")
+    (launcher.parent.parent / "lib" / "node_modules" / "@anthropic-ai" / "claude-code" / "package.json").write_text("{}")
+
+    assert (await claude_status(client))["version_unknown_reason"] == UNKNOWN_TEXT
+
+
+# ---- two supported launchers: only an agreement is a version ---------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_two_launchers_that_disagree_are_unknown(scoped, client):
+    """Two symlinks alone do not say which one runs, so neither version is asserted (the search order is arbitrary)."""
+    native_install(scoped.agent, "2.1.400")
+    npm_install(scoped.agent, "2.0.1")
+
+    status = await claude_status(client)
+
+    assert status["version"] is None and status["version_source"] is None
+    assert status["version_unknown_reason"] == UNKNOWN_TEXT
+    assert "2.1.400" not in json.dumps(status) and "2.0.1" not in json.dumps(status)
+
+
+@pytest.mark.asyncio
+async def test_two_launchers_that_agree_are_that_version(scoped, client):
+    native_install(scoped.agent, "2.1.400")
+    npm_install(scoped.agent, "2.1.400")
+
+    status = await claude_status(client)
+
+    assert status["version"] == "2.1.400"
+    assert status["version_unknown_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_live_launcher_whose_version_cannot_be_read_next_to_a_valid_one_is_unknown(scoped, client):
+    """The unreadable launcher might be the one that runs, so the valid one is not asserted either."""
+    native_install(scoped.agent, "2.1.400")
+    launcher = npm_install(scoped.agent, "2.0.1")
+    (launcher.parent.parent / "lib" / "node_modules" / "@anthropic-ai" / "claude-code" / "package.json").write_text("[]")
+
+    assert (await claude_status(client))["version_unknown_reason"] == UNKNOWN_TEXT
+
+
+@pytest.mark.asyncio
 async def test_an_agent_user_without_an_install_is_unknown_with_the_exact_message(scoped, client):
     status = await claude_status(client)
 

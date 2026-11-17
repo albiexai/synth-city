@@ -55,14 +55,23 @@ def _npm(launcher: Path) -> str | None:
             package = root / "package.json"
             if package.stat().st_size > _PACKAGE_FILE_LIMIT:
                 return None
-            version = json.loads(package.read_text(encoding="utf-8")).get("version")
+            metadata = json.loads(package.read_text(encoding="utf-8"))
+            if not isinstance(metadata, dict):          # valid JSON that is not an object (a list, a number, null) names nothing
+                return None
+            version = metadata.get("version")
             return version if _is_version(version) else None
     return None
 
 
 def read_installed_version(home: Path) -> InstalledVersion:
-    """The Claude Code version the user at `home` actually launches, or unknown. It never raises and never executes."""
+    """The Claude Code version the user at `home` actually launches, or unknown. It never raises and never executes.
+
+    Every supported launcher that is a live symlink is read. Two launchers do not say which one runs, so the version is
+    known only when all of them agree; a launcher whose version cannot be read, or two that disagree, is unknown.
+    A path that is not a symlink (a wrapper script, nothing at all) is not a launcher and is passed over.
+    """
     unknown = InstalledVersion(None, None)
+    found: list[InstalledVersion] = []
     try:
         for prefix in _NPM_PREFIXES:
             launcher = home / prefix / "bin" / "claude"
@@ -70,10 +79,14 @@ def read_installed_version(home: Path) -> InstalledVersion:
                 continue
             native = _native(launcher)
             if native is not None:
-                return InstalledVersion(native, "native")
+                found.append(InstalledVersion(native, "native"))
+                continue
             npm = _npm(launcher)
-            if npm is not None:
-                return InstalledVersion(npm, "npm")
+            if npm is None:
+                return unknown
+            found.append(InstalledVersion(npm, "npm"))
     except (OSError, ValueError, RuntimeError):
         return unknown
-    return unknown
+    if len({installed.version for installed in found}) != 1:
+        return unknown
+    return found[0]
