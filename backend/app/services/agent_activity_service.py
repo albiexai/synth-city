@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import pwd
 import re
@@ -24,6 +25,7 @@ from pathlib import Path
 from uuid import UUID
 
 from sqlalchemy import JSON, and_, exists, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import (
@@ -38,6 +40,8 @@ from app.services.provider_refusal_notice_service import send_provider_refusal_n
 from app.services.claude_activity_service import observe_claude
 from app.services.muse_activity_service import discover_muse_session, observe_muse
 from app.services.antigravity_activity_service import discover_antigravity_conversation, observe_antigravity
+
+logger = logging.getLogger(__name__)
 
 _TAIL_BYTES = 1_048_576
 _MAX_PROCESS_DESCRIPTORS = 256
@@ -758,7 +762,7 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
                 continue
         same_route = exists(select(AgentTeamPreset.id).where(AgentTeamPreset.id == preset_id,
             AgentTeamPreset.supervisor_actor_id.is_(None) if actor_id is None else AgentTeamPreset.supervisor_actor_id == actor_id,
-            AgentTeamPreset.leader_slot_id == leader_slot_id if actor_id is None else True))
+            AgentTeamPreset.leader_slot_id == leader_slot_id if actor_id is None or reason == PROVIDER_REFUSAL else True))
         if recipient is not None:
             leader_current = (select(MailTeamMember.id).where(MailTeamMember.team_preset_id == preset_id,
                 MailTeamMember.team_slot_id == leader_slot_id).order_by(MailTeamMember.updated_at.desc(),
@@ -766,20 +770,31 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
             conditions.extend([leader_current == recipient, exists(select(AgentTeamSlot.id).where(
                 AgentTeamSlot.id == leader_slot_id, AgentTeamSlot.preset_id == preset_id,
                 AgentTeamSlot.enabled.is_(True)))])
-        result = await db.execute(update(AgentPaneBinding).where(*conditions, same_route,
+        claim = update(AgentPaneBinding).where(*conditions, same_route,
             or_(AgentPaneBinding.waiting_input_reason.is_(None), ~same_kind)).values(waiting_input_reason=reason,
-            waiting_input_started_at=now, waiting_input_observed_at=now).execution_options(synchronize_session=False))
-        if result.rowcount != 1:
-            continue
+            waiting_input_started_at=now, waiting_input_observed_at=now).execution_options(synchronize_session=False)
         if reason == PROVIDER_REFUSAL:
             # A refusal is not a wait for input: it has its own notices, to the Leader and the Supervisor (#1092).
-            notice_id = await send_provider_refusal_notices(db, preset_id=preset_id, slot_id=entry[0],
-                binding_id=binding.binding_id, started_at=now, supervisor_actor_id=actor_id,
-                leader_slot_id=leader_slot_id)
-            if notice_id is not None:
-                await db.execute(update(AgentPaneBinding).where(AgentPaneBinding.id == binding.binding_id)
-                    .values(waiting_input_notice_id=notice_id).execution_options(synchronize_session=False))
+            # The claim and both notices are one unit. A failure that is not a duplicate delivery rolls all of it
+            # back, so an incomplete delivery is never latched as complete and the next observation retries it.
+            try:
+                async with db.begin_nested():
+                    if (await db.execute(claim)).rowcount != 1:
+                        continue
+                    notice_id = await send_provider_refusal_notices(db, preset_id=preset_id, slot_id=entry[0],
+                        binding_id=binding.binding_id, started_at=now, supervisor_actor_id=actor_id,
+                        leader_slot_id=leader_slot_id)
+                    if notice_id is not None:
+                        await db.execute(update(AgentPaneBinding).where(AgentPaneBinding.id == binding.binding_id)
+                            .values(waiting_input_notice_id=notice_id).execution_options(synchronize_session=False))
+            except IntegrityError:
+                logger.warning("A provider-refusal notice could not be stored; the episode will be retried",
+                               exc_info=True)
+                continue
             changed = True
+            continue
+        result = await db.execute(claim)
+        if result.rowcount != 1:
             continue
         payload = {"notice": "native_input_wait", "slot_id": entry[0], "reason": reason}
         if actor_id is not None:

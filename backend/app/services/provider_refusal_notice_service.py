@@ -35,6 +35,7 @@ async def send_provider_refusal_notices(db: AsyncSession, *, preset_id: int, slo
 
     The Supervisor's notice is kept when there is one, because it is the one a human reads first; otherwise the
     Leader's. A recipient whose key already exists is skipped, so calling this twice for one episode adds nothing.
+    Any other integrity failure is raised.
     """
     member = (await db.scalars(select(MailTeamMember).where(
         MailTeamMember.team_preset_id == preset_id, MailTeamMember.team_slot_id == slot_id)
@@ -88,7 +89,12 @@ async def send_provider_refusal_notices(db: AsyncSession, *, preset_id: int, slo
 
 
 async def _write(db: AsyncSession, message: MailMessage, *, receipt_for: int | None = None) -> MailMessage | None:
-    """Insert one notice. A unique-key conflict means another writer already sent it: exactly one is kept."""
+    """Insert one notice. Return None only when another writer already sent this delivery key.
+
+    Any other integrity failure (a receipt that cannot be stored, for example) is not a delivered duplicate: it is
+    raised, so the caller can roll the whole episode back instead of latching an incomplete delivery.
+    """
+    key = message.delivery_key
     try:
         async with db.begin_nested():
             db.add(message)
@@ -97,5 +103,7 @@ async def _write(db: AsyncSession, message: MailMessage, *, receipt_for: int | N
                 db.add(MailReceipt(message_id=message.id, member_id=receipt_for))
                 await db.flush()
     except IntegrityError:
-        return None
+        if await db.scalar(select(MailMessage.id).where(MailMessage.delivery_key == key)) is not None:
+            return None  # exactly one is kept: another writer wrote this episode first
+        raise
     return message

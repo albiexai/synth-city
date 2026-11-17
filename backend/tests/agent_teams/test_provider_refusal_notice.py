@@ -422,3 +422,68 @@ async def test_a_wait_for_input_still_gets_the_generic_notice_and_no_refusal_not
     generic = await generic_notices(db)
     assert len(generic) == 1 and generic[0].subject == "Waiting for input" and generic[0].payload["reason"] == reason
     assert await refusal_notices(db) == []
+
+
+# ---- the claim fences the whole route, and a failed delivery is not latched (V1's review of #1103) ----------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change,supervised", [("leader", True), ("leader", False), ("supervisor", True)])
+async def test_a_route_change_between_the_read_and_the_claim_sends_nothing(db, monkeypatch, change, supervised):
+    """The Leader is a recipient on every team now, so the claim must fence it on supervised teams too."""
+    from sqlalchemy import update
+    from app.models.database import AgentTeamPreset
+    team, actor, slot, binding, _, leader = await wait_team(db, supervised=supervised)
+    original = db.execute
+
+    async def execute(statement, *args, **kwargs):
+        if getattr(statement, "is_update", False) and statement.compile().params.get("waiting_input_reason") == REFUSAL:
+            values = {"leader_slot_id": slot.id} if change == "leader" else {"supervisor_actor_id": None}
+            await original(update(AgentTeamPreset).where(AgentTeamPreset.id == team.id).values(**values))
+        return await original(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, "execute", execute)
+
+    await record_wait(db, team, slot, binding, REFUSAL)
+    await db.refresh(binding)
+
+    assert await refusal_notices(db) == [] and binding.waiting_input_reason is None
+
+
+def break_the_receipt(monkeypatch):
+    """A failure that is not a duplicate key: the Leader's receipt has no message (NOT NULL), whatever the FK mode."""
+    from app.services import provider_refusal_notice_service as service
+    real = service.MailReceipt
+    monkeypatch.setattr(service, "MailReceipt", lambda **kw: real(message_id=None, member_id=kw["member_id"]))
+    return lambda: monkeypatch.setattr(service, "MailReceipt", real)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supervised", [True, False])
+async def test_a_failed_delivery_is_rolled_back_and_retried_not_latched_as_complete(db, monkeypatch, supervised):
+    team, actor, slot, binding, _, _ = await wait_team(db, supervised=supervised)
+    repair = break_the_receipt(monkeypatch)
+
+    await record_wait(db, team, slot, binding, REFUSAL)
+    await db.refresh(binding)
+    assert await refusal_notices(db) == []            # not even the Supervisor's half of the pair is kept
+    assert binding.waiting_input_reason is None and binding.waiting_input_notice_id is None
+
+    repair()
+    await record_wait(db, team, slot, binding, REFUSAL)   # the next observation retries the whole episode
+    await db.refresh(binding)
+    assert binding.waiting_input_reason == REFUSAL
+    assert len(await refusal_notices(db)) == (2 if supervised else 1)
+
+
+@pytest.mark.asyncio
+async def test_a_failure_that_is_not_a_duplicate_key_is_not_taken_for_a_delivered_duplicate(db, monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+    from app.services.provider_refusal_notice_service import send_provider_refusal_notices
+    team, actor, slot, binding, _, _ = await wait_team(db, supervised=False)
+    break_the_receipt(monkeypatch)
+
+    with pytest.raises(IntegrityError):
+        await send_provider_refusal_notices(db, preset_id=team.id, slot_id=slot.id, binding_id=binding.id,
+                                            started_at=datetime(2026, 11, 17, 12, 0, 0), supervisor_actor_id=None,
+                                            leader_slot_id=team.leader_slot_id)
