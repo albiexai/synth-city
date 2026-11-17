@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import settings
@@ -417,3 +417,50 @@ async def test_mail_read_during_the_guards_own_native_read_cancels_the_follow_up
     claims = list((await db.scalars(select(MailWakeAttempt).where(
         MailWakeAttempt.reason_code == f"rewake:{wake.id}", MailWakeAttempt.result == "cancelled"))).all())
     assert len(claims) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_mail_activity_check_is_one_statement_over_receipts_and_messages(db):
+    """Two statements leave a gap: a read committed between them is missed. One statement has none."""
+    b2 = await member(db)
+    seen = []
+
+    def record(connection, cursor, statement, parameters, context, executemany):
+        seen.append(statement)
+
+    event.listen(db.bind.sync_engine, "before_cursor_execute", record)
+    try:
+        await wake_followup_service._mail_activity_since(db, b2.id, WAKE_AT)
+    finally:
+        event.remove(db.bind.sync_engine, "before_cursor_execute", record)
+
+    assert len(seen) == 1
+    assert "mail_receipts" in seen[0] and "mail_messages" in seen[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setup,expected", [
+    ("nothing", False),
+    ("read_after", True),
+    ("acked_after", True),
+    ("sent_after", True),
+    ("read_before_only", False),
+    ("sent_by_other_member", False),
+])
+async def test_the_mail_activity_check_answers_each_kind_of_activity(db, setup, expected):
+    b2 = await member(db)
+    other = await member(db, "b1")
+    if setup == "read_after":
+        await receipt(db, b2.id, read_at=WAKE_AT + timedelta(seconds=5))
+    elif setup == "acked_after":
+        await receipt(db, b2.id, acked_at=WAKE_AT + timedelta(seconds=5))
+    elif setup == "sent_after":
+        db.add(MailMessage(body_markdown="Update.", sender_member_id=b2.id, created_at=WAKE_AT + timedelta(seconds=5)))
+        await db.commit()
+    elif setup == "read_before_only":
+        await receipt(db, b2.id, read_at=WAKE_AT - timedelta(seconds=5))
+    elif setup == "sent_by_other_member":
+        db.add(MailMessage(body_markdown="Update.", sender_member_id=other.id, created_at=WAKE_AT + timedelta(seconds=5)))
+        await db.commit()
+
+    assert await wake_followup_service._mail_activity_since(db, b2.id, WAKE_AT) is expected

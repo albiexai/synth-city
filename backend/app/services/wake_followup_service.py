@@ -24,7 +24,7 @@ import weakref
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from sqlalchemy import exists, func, insert, literal, or_, select, update
+from sqlalchemy import exists, insert, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -164,15 +164,17 @@ class WakeFollowupService:
 
     @staticmethod
     async def _mail_activity_since(db: AsyncSession, member_id: int, since: datetime) -> bool:
-        """The member read or acked mail, or sent a message, at or after the wake."""
-        read = await db.scalar(select(func.count(MailReceipt.id)).where(
-            MailReceipt.member_id == member_id,
-            or_(MailReceipt.read_at >= since, MailReceipt.acked_at >= since)))
-        if read:
-            return True
-        sent = await db.scalar(select(func.count(MailMessage.id)).where(
-            MailMessage.sender_member_id == member_id, MailMessage.created_at >= since))
-        return bool(sent)
+        """The member read or acked mail, or sent a message, at or after the wake.
+
+        One statement observes receipts and sent messages together. Two statements would leave a gap
+        in which a read committed after the first one is missed.
+        """
+        activity = select(or_(
+            exists().where(MailReceipt.member_id == member_id,
+                           or_(MailReceipt.read_at >= since, MailReceipt.acked_at >= since)),
+            exists().where(MailMessage.sender_member_id == member_id, MailMessage.created_at >= since),
+        ))
+        return bool(await db.scalar(activity))
 
     @staticmethod
     def _known_idle_before(status, since: datetime) -> bool:
