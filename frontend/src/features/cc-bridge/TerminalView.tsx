@@ -30,6 +30,7 @@ interface TerminalViewProps {
   focused?: boolean
   onToggleFullscreen?: () => void
   onClose?: () => void
+  onDetach?: () => void
   onLeaderNavigate?: (sourceTarget: string, direction: LeaderNavigationDirection) => void
   onLeaderStateChange?: (sourceTarget: string, active: boolean) => void
   instance?: InstanceIdentity | null
@@ -76,6 +77,7 @@ export function TerminalView({
   focused,
   onToggleFullscreen,
   onClose,
+  onDetach,
   onLeaderNavigate,
   onLeaderStateChange,
   instance,
@@ -361,7 +363,10 @@ export function TerminalView({
               </Button>
             )}
             {connected ? (
-              <Button variant="outline" size="sm" onClick={detach}>
+              <Button variant="outline" size="sm" onClick={() => {
+                detach()
+                onDetach?.()
+              }}>
                 Detach
               </Button>
             ) : (
