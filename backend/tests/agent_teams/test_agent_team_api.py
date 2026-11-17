@@ -767,6 +767,78 @@ async def test_github_scope_create_missing_preset_returns_404(client, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_github_work_item_feed_total_counts_items_beyond_page(client, db, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    async def make_preset_with_scope(name):
+        preset = await agent_team_service.create_preset(
+            db,
+            AgentTeamPresetCreate(
+                name=name,
+                slots=[
+                    AgentTeamSlotCreate(
+                        display_name="Backend SME",
+                        provider="codex-cli",
+                        repo_path=str(repo),
+                    )
+                ],
+            ),
+        )
+        scope = TeamGithubScope(
+            preset_id=preset.id,
+            repo_owner="adrirubio",
+            repo_name="snazzyemail",
+            repo_path=str(repo),
+        )
+        db.add(scope)
+        await db.flush()
+        return preset, scope
+
+    paged, paged_scope = await make_preset_with_scope("Paged team")
+    other, other_scope = await make_preset_with_scope("Other team")
+    db.add_all(
+        [
+            GithubWorkItem(
+                scope_id=paged_scope.id,
+                issue_number=number,
+                issue_title=f"Paged item {number}",
+                issue_url=f"https://github.com/adrirubio/snazzyemail/issues/{number}",
+                github_updated_at=datetime.utcnow(),
+                dispatch_status="dispatched",
+            )
+            for number in (30, 31, 32)
+        ]
+        + [
+            GithubWorkItem(
+                scope_id=other_scope.id,
+                issue_number=40,
+                issue_title="Other team item",
+                issue_url="https://github.com/adrirubio/snazzyemail/issues/40",
+                github_updated_at=datetime.utcnow(),
+                dispatch_status="dispatched",
+            )
+        ]
+    )
+    await db.commit()
+
+    page = await client.get(
+        f"/api/v1/agent-teams/presets/{paged.id}/github-work-items",
+        params={"limit": 1},
+    )
+    assert page.status_code == 200
+    assert len(page.json()["items"]) == 1
+    assert page.json()["total"] == 3
+
+    full = await client.get(f"/api/v1/agent-teams/presets/{paged.id}/github-work-items")
+    assert len(full.json()["items"]) == 3
+    assert full.json()["total"] == 3
+
+    other_feed = await client.get(f"/api/v1/agent-teams/presets/{other.id}/github-work-items")
+    assert other_feed.json()["total"] == 1
+
+
+@pytest.mark.asyncio
 async def test_github_work_item_feed_and_retry_guard(client, db, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

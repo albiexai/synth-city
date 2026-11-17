@@ -3055,7 +3055,12 @@ async def list_github_work_items(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     rows = (
         await db.execute(
-            select(GithubWorkItem, TeamGithubScope, GithubWorkspace.path)
+            select(
+                GithubWorkItem,
+                TeamGithubScope,
+                GithubWorkspace.path,
+                func.count().over().label("total"),
+            )
             .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
             .outerjoin(GithubWorkspace, GithubWorkspace.leased_item_id == GithubWorkItem.id)
             .where(TeamGithubScope.preset_id == preset_id)
@@ -3065,7 +3070,7 @@ async def list_github_work_items(
     ).all()
     authority_by_item = await _load_work_item_authority(
         db,
-        [item for item, _scope, _workspace_path in rows],
+        [item for item, _scope, _workspace_path, _total in rows],
     )
     return GithubWorkItemListResponse(
         items=[
@@ -3079,8 +3084,9 @@ async def list_github_work_items(
                 continuation_revision_count=authority_by_item[item.id].revision_count,
                 continuation_failed_head_count=authority_by_item[item.id].failed_head_count,
             ).model_copy(update={"dispatch_nonce": None})  # unauthenticated read: the public generation names the dispatch
-            for item, scope, workspace_path in rows
-        ]
+            for item, scope, workspace_path, _total in rows
+        ],
+        total=rows[0].total if rows else 0,
     )
 
 

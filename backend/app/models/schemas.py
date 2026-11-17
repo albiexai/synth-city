@@ -3060,6 +3060,7 @@ class GithubWorkItemResponse(BaseModel):
 
 class GithubWorkItemListResponse(BaseModel):
     items: List[GithubWorkItemResponse] = Field(default_factory=list)
+    total: int | None = None
 
 
 class GithubWorkItemContinuationResponse(BaseModel):
