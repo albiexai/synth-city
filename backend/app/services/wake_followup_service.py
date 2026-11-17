@@ -35,6 +35,7 @@ from app.models.database import (
 from app.models.schemas import MailMessageCreate
 from app.services.agent_mail_service import MailWakeError, agent_mail_service
 from app.services.agent_status_service import agent_status_service
+from app.services.session_recovery import recover_session
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +75,9 @@ class WakeFollowupService:
         try:
             async with self._sweep_lock():
                 return await self._tick(db, _naive_utc(now) if now else datetime.utcnow())
-        except Exception:
+        except Exception as caught_error:
+            await recover_session(db, caught_error, discard=True)
             logger.exception("Wake follow-up failed")
-            await db.rollback()
             return []
 
     async def _tick(self, db: AsyncSession, now: datetime) -> list[int]:
