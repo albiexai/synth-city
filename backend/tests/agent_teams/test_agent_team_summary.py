@@ -311,7 +311,10 @@ async def test_human_actions_preserve_pending_details_and_drop_private_fields(db
     summary, _ = service(monkeypatch, attention=Existing())
     result = await summary.summary(db, team.id)
     assert result.human_actions[0].state == "context_pending"
-    assert result.remaining_work.state == "unknown"
+    # #1107: incomplete human-action coverage is reported as coverage, not as unknown remaining work. This team has no
+    # unfinished items, so its remaining work is known and zero.
+    assert result.coverage_complete is False
+    assert (result.remaining_work.state, result.remaining_work.unfinished_items) == ("known", 0)
     assert result.next_actors == ["operator"]
     assert "private-" not in result.model_dump_json()
 
@@ -488,3 +491,59 @@ async def test_capped_release_reminder_is_one_safe_current_attention(db, monkeyp
     await db.commit()
     assert (await summary.summary(db, team_id)).reminder_attention == []
     assert (await overview(db, FactoryFilters(team_id=team_id))).reminder_attention == []
+
+
+# --- #1107 (U7): remaining work depends only on the unfinished items ------------------------------------------------
+
+
+class AgingAttention(Attention):
+    """The human-action observation of a paused team: current after a coordination poll, stale 120 s later."""
+
+    def __init__(self, stale_reads):
+        self.stale_reads = list(stale_reads)
+
+    async def summary(self, db, preset_id):
+        stale = self.stale_reads.pop(0) if self.stale_reads else False
+        now = datetime.now(timezone.utc)
+        return {"coverage_complete": not stale, "actions": [],
+                "observation_expires_at": now - timedelta(seconds=1) if stale else now + timedelta(seconds=60)}
+
+
+@pytest.mark.asyncio
+async def test_a_finished_paused_team_reads_the_same_remaining_work_on_every_read(db, monkeypatch):
+    team, _, _ = await seed(db, ("merged", "completed"), enabled=False)
+    pattern = [False, True, False, True, True, False]
+    summary, _ = service(monkeypatch, attention=AgingAttention(pattern))
+    reads = [await summary.summary(db, team.id) for _ in pattern]
+    assert {(r.remaining_work.state, r.remaining_work.reason, r.remaining_work.unfinished_items,
+             r.remaining_work.effort_low_minutes, r.remaining_work.effort_high_minutes) for r in reads} == {
+        ("known", "complete", 0, 0, 0)}
+    # The stale human-action observation is still reported where it belongs.
+    assert [r.coverage_complete for r in reads] == [not stale for stale in pattern]
+
+
+@pytest.mark.asyncio
+async def test_an_active_teams_remaining_work_ignores_a_stale_human_action_observation(db, monkeypatch):
+    team, _, items = await seed(db, ("dispatched", "merged"))
+    summary, _ = service(monkeypatch, {items[0].id: progress(items[0].id, low=10, high=20, confidence="high")},
+                         attention=AgingAttention([True]))
+    result = await summary.summary(db, team.id)
+    assert (result.remaining_work.state, result.remaining_work.effort_low_minutes,
+            result.remaining_work.effort_high_minutes) == ("known", 10, 20)
+    assert result.coverage_complete is False
+
+
+@pytest.mark.asyncio
+async def test_an_expired_item_report_still_makes_remaining_work_unknown(db, monkeypatch):
+    team, _, items = await seed(db, ("dispatched",))
+    summary, _ = service(monkeypatch, {items[0].id: progress(items[0].id, expired=True)})
+    result = await summary.summary(db, team.id)
+    assert (result.remaining_work.state, result.remaining_work.reason) == ("unknown", "observation_incomplete")
+
+
+@pytest.mark.asyncio
+async def test_a_missing_item_report_still_makes_remaining_work_unknown(db, monkeypatch):
+    team, _, items = await seed(db, ("dispatched",))
+    summary, _ = service(monkeypatch, {items[0].id: None})
+    result = await summary.summary(db, team.id)
+    assert (result.remaining_work.state, result.remaining_work.reason) == ("unknown", "observation_incomplete")
