@@ -49,7 +49,7 @@ async def test_an_extension_that_would_pass_the_ceiling_is_refused_naming_the_ce
     await _ceiling(fx, 110)
     with pytest.raises(EffortLimitError) as caught:
         await _extend(fx, 11)
-    assert caught.value.code == "extension_exceeds_cap" and caught.value.status_code == 400
+    assert caught.value.code == "extension_exceeds_ceiling" and caught.value.status_code == 400  # own code (#1101)
     assert "110" in str(caught.value) and "max_item_effort_minutes" in str(caught.value)
     async with fx.maker() as db:
         item = await _item(fx, db)
@@ -67,7 +67,7 @@ async def test_an_extension_up_to_the_room_under_the_ceiling_is_granted(fx):
 @pytest.mark.asyncio
 async def test_a_limit_at_the_ceiling_cannot_be_extended(fx):
     await _limited(fx, limit=120)
-    assert await _code(_extend(fx, 1)) == "extension_exceeds_cap"
+    assert await _code(_extend(fx, 1)) == "extension_exceeds_ceiling"
 
 
 @pytest.mark.asyncio
@@ -110,10 +110,18 @@ def test_the_view_shows_the_estimate_the_limit_and_the_room_under_the_ceiling():
                     "effective_limit_minutes": 60, "ceiling_minutes": 120, "extension_cap_minutes": 15}
 
 
-def test_the_view_shows_an_extension_and_no_further_room():
+def test_the_view_shows_an_extension_and_the_room_still_left():
     view = service.effort_view(_row(estimate=60, limit=60, extension=15), SimpleNamespace(max_item_effort_minutes=120))
     assert view["extension_minutes"] == 15 and view["effective_limit_minutes"] == 75
-    assert view["extension_cap_minutes"] == 0 and set(view) == VIEW_KEYS
+    # #1101: another step of up to the per-step cap fits under the ceiling.
+    assert view["extension_cap_minutes"] == 15 and set(view) == VIEW_KEYS
+
+
+@pytest.mark.parametrize("extension,room", [(50, 10), (60, 0)])
+def test_the_view_clamps_the_next_step_to_the_room_left_under_the_ceiling(extension, room):
+    view = service.effort_view(_row(estimate=60, limit=60, extension=extension),
+                               SimpleNamespace(max_item_effort_minutes=120))
+    assert view["extension_cap_minutes"] == room
 
 
 def test_the_view_applies_the_ceiling_clamp_to_the_room_it_shows():
@@ -254,7 +262,7 @@ async def test_a_ceiling_lowered_by_another_connection_after_the_scope_was_loade
             await service.extend(session, work_item_id=fx.item_id, dispatch_nonce=fx.nonce, leader_member_id=fx.leader,
                                  minutes=15, reason="healthy",
                                  expected_extension_minutes=0, evidence="tests pass", now=T0)
-    assert caught.value.code == "extension_exceeds_cap" and "110" in str(caught.value)
+    assert caught.value.code == "extension_exceeds_ceiling" and "110" in str(caught.value)
     async with fx.maker() as db:
         item = await _item(fx, db)
         assert item.effort_extension_minutes == 0 and item.effort_extension_decided_at is None

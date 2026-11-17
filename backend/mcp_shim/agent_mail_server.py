@@ -761,7 +761,11 @@ def synth_city_extend_effort_limit(
     expected_extension_minutes: int,
     evidence: str,
 ) -> dict:
-    """Leader only: extend a work item's effort limit once, by at most 30 minutes or 25 percent of the limit.
+    """Leader only: extend a work item's effort limit, and extend again up to the scope ceiling.
+
+    Each step adds at most 30 minutes or 25 percent of the original limit, whichever is smaller. The limit plus all
+    extensions may not pass the scope ceiling (max_item_effort_minutes); a step beyond it is refused with
+    extension_exceeds_ceiling. The item's effort shows the room left as extension_cap_minutes.
 
     The limit and its ledger are advisory elapsed working time from the system, not the owner's reported active
     effort. The extension changes no expiry, nonce, lease or status. The owner asks for it by Mail.
