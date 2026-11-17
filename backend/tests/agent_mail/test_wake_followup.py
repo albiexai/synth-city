@@ -392,3 +392,28 @@ async def test_a_claim_is_taken_once_even_when_the_first_read_was_stale(db):
     rows = list((await db.scalars(select(MailWakeAttempt).where(
         MailWakeAttempt.reason_code == f"rewake:{wake.id}"))).all())
     assert [row.result for row in rows] == ["claimed"]
+
+
+@pytest.mark.asyncio
+async def test_mail_read_during_the_guards_own_native_read_cancels_the_follow_up(db, rewakes, monkeypatch):
+    """The guard awaits a second native read. Mail read during it must still cancel the follow-up."""
+    b2 = await member(db)
+    wake = await delivered_wake(db, b2.id)
+    await receipt(db, b2.id)  # other unread Mail stays, so an empty inbox cannot mask the activity
+    reads = []
+
+    async def reads_mail_during_second_read(session, members, *, activities=None):
+        reads.append(1)
+        if len(reads) == 2:
+            await receipt(session, b2.id, read_at=WAKE_AT + timedelta(seconds=60))
+        return {b2.id: idle(aware(WAKE_AT - timedelta(minutes=10)))}
+
+    monkeypatch.setattr(agent_status_service, "for_members", reads_mail_during_second_read)
+
+    await wake_followup_service.tick(db, NOW)
+
+    assert len(reads) == 2
+    assert rewakes == []
+    claims = list((await db.scalars(select(MailWakeAttempt).where(
+        MailWakeAttempt.reason_code == f"rewake:{wake.id}", MailWakeAttempt.result == "cancelled"))).all())
+    assert len(claims) == 1

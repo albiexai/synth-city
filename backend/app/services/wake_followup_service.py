@@ -155,7 +155,11 @@ class WakeFollowupService:
                 fresh = await agent_status_service.for_members(db, [member])
             except (OSError, ValueError):
                 return False
-            return self._known_idle_before(fresh.get(member.id), since)
+            if not self._known_idle_before(fresh.get(member.id), since):
+                return False
+            # The native read awaited. The member can have read or acked Mail meanwhile, so the last
+            # word before the transport is the Mail check. Nothing awaits between this and the send.
+            return not await self._mail_activity_since(db, member.id, since)
         return guard
 
     @staticmethod
