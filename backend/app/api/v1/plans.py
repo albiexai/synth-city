@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query
 from app.services.codex_plan_service import CodexPlanService
 from app.services.plan_service import PlanService
 from app.utils.path_utils import get_claude_plans_dir, get_user_home
+from app.api.v1.harness_scope import current_scope
 from app.models.schemas import (
     PlanDetailResponse,
     PlanListResponse,
@@ -60,11 +61,17 @@ async def list_plans(
     try:
         provider = _validate_provider(provider)
         if provider == "codex-cli":
-            plans = CodexPlanService().list_plans(project_path)
+            codex = CodexPlanService()
+            plans = codex.list_plans(project_path)
+            data_dir = codex.codex_home
         else:
             plans_dir = _claude_plans_dir(project_path)
             plans = PlanService.list_plans(plans_dir)
-        return {"plans": plans, "total": len(plans)}
+            # Judge readability by the home's own plans folder only, never by a configured one (see _claude_plans_dir).
+            # The folder handed on is the home's own, not plans_dir: plans_dir can come from the request.
+            home_plans = get_claude_plans_dir()
+            data_dir = home_plans if plans_dir == home_plans else None
+        return {"plans": plans, "total": len(plans), "scope": current_scope(data_dir)}
     except HTTPException:
         raise
     except Exception as e:
