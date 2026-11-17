@@ -23,7 +23,7 @@ from app.services.agent_mail_service import agent_mail_service
 from app.services.agent_team_supervisor_service import is_supervisor_message, supervisor_inbox
 from app.services.github_verification_service import github_verification_service as service
 from tests.agent_teams.test_github_verification_service import (  # noqa: F401  (fixtures and helpers)
-    _HoldClient, _diagnostic_revision, _item, _scope, capability_enforcement, db,
+    _HoldClient, _diagnostic_revision, _http_error, _item, _scope, capability_enforcement, db,
 )
 
 HEAD = "a" * 40
@@ -483,3 +483,187 @@ async def test_a_failure_at_any_boundary_leaves_nothing_half_done_and_the_next_p
         assert len(_leader_side(notices, state)) == 1
     else:
         assert len(await _ready_notices(db)) == 1
+
+
+# ---- #1037: an accepted, green, unheld PR is not left for a human by a cause that has cleared ----
+
+PENDING = {"name": "optional", "status": "in_progress", "conclusion": None}
+DONE = {"name": "optional", "status": "completed", "conclusion": "success"}
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    import app.services.github_verification_service as verification_module
+
+    class Clock(datetime):
+        now = datetime(2026, 11, 17, 12, 0, 0)
+
+        @classmethod
+        def utcnow(cls):
+            return cls.now
+
+    monkeypatch.setattr(verification_module, "datetime", Clock)
+    return Clock
+
+
+async def _ready_messages(db):
+    """Every "Code PR ready for review" message, whether or not it carries a not-fired reason."""
+    rows = (await db.execute(select(MailMessage))).scalars().all()
+    return [m for m in rows if m.subject == "Code PR ready for review"]
+
+
+async def _ready(db, *, cap=5):
+    scope = await _scope(db, merge_policy="auto", max_auto_merges_per_day=cap, review_hold_label="review-hold")
+    item = await _item(db, scope, dispatch_status="ready_for_review", pr_number=5, last_verified_sha=HEAD)
+    return scope, item, _Client(head=HEAD)
+
+
+async def _stalled(db, clock):
+    """An item whose merge wait ran out: a check stayed pending on the verified head for 60 minutes."""
+    scope, item, client = await _ready(db)
+    client.check_runs = SUCCESS + [PENDING]
+    started = clock.now
+    for elapsed in (0, 60):
+        clock.now = started + timedelta(minutes=elapsed)
+        await _poll(db, scope, client)
+    await db.refresh(item)
+    assert item.status_note.startswith("Auto-merge blocked: GitHub checks stalled")
+    assert len(await _ready_messages(db)) == 1
+    return scope, item, client
+
+
+@pytest.mark.asyncio
+async def test_a_check_rerun_long_after_an_earlier_wait_gets_a_fresh_wait_not_a_false_stall(db, clock):
+    scope, item, client = await _ready(db)
+    started = clock.now
+    client.check_runs = SUCCESS + [PENDING]
+    await _poll(db, scope, client)  # the first wait on this head
+    clock.now = started + timedelta(minutes=20)
+    client.check_runs = SUCCESS + [DONE]
+    client.merge_error = _http_error(409)
+    await _poll(db, scope, client)  # the checks finished; GitHub refused the merge for now
+    await db.refresh(item)
+    assert item.status_note.startswith("Transient merge failure")
+    clock.now = started + timedelta(minutes=90)
+    client.check_runs = SUCCESS + [PENDING]  # a check on the same head is run again
+    await _poll(db, scope, client)
+    await db.refresh(item)
+    assert "stalled" not in item.status_note
+    assert "waiting for checks" in item.status_note
+    assert item.dispatch_status == "ready_for_review"
+    assert await _ready_messages(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_capped_item_merges_once_capacity_returns_and_is_not_notified_again(db):
+    scope, item, client = await _ready(db, cap=1)
+    preset = await db.get(AgentTeamPreset, scope.preset_id)
+    preset.supervisor_actor_id = 6
+    earlier = await _item(db, scope, issue_number=2, dispatch_status="merged", pr_number=4,
+                          auto_merged_at=datetime.utcnow() - timedelta(minutes=5))
+    await _poll(db, scope, client, times=2)
+    await db.refresh(item)
+    assert "[auto_merge_cap_reached: 1 of 1" in item.status_note and client.merge_calls == 0
+
+    earlier.auto_merged_at = datetime.utcnow() - timedelta(hours=25)  # the 24-hour window has moved on
+    await db.commit()
+    await _poll(db, scope, client)
+    await db.refresh(item)
+    assert item.dispatch_status == "merged" and client.merge_head_shas == [HEAD]
+    assert len(await _ready_messages(db)) == 1
+    assert len(_to_operator(await _notices(db))) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_capped_item_still_passes_every_gate_when_offered_again(db):
+    scope, item, client = await _ready(db, cap=1)
+    earlier = await _item(db, scope, issue_number=2, dispatch_status="merged", pr_number=4,
+                          auto_merged_at=datetime.utcnow() - timedelta(minutes=5))
+    await _poll(db, scope, client)
+    earlier.auto_merged_at = datetime.utcnow() - timedelta(hours=25)
+    await db.commit()
+    client.issue["labels"] = [{"name": "review-hold"}]
+    await _poll(db, scope, client)
+    await db.refresh(item)
+    assert client.merge_calls == 0
+    assert "held for independent review" in item.status_note  # the note names the cause that applies now
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_item_merges_once_the_same_heads_checks_are_green(db, clock):
+    scope, item, client = await _stalled(db, clock)
+    note = item.status_note
+    clock.now += timedelta(minutes=5)
+    await _poll(db, scope, client)  # still pending: stays with a human, nothing new is sent
+    await db.refresh(item)
+    assert item.status_note == note and client.merge_calls == 0
+    client.check_runs = SUCCESS + [DONE]
+    clock.now += timedelta(minutes=5)
+    await _poll(db, scope, client)
+    await db.refresh(item)
+    assert item.dispatch_status == "merged" and client.merge_head_shas == [HEAD]
+    assert len(await _ready_messages(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_item_with_a_pending_commit_status_stays_with_a_human(db, clock):
+    scope, item, client = await _stalled(db, clock)
+    note = item.status_note
+    client.check_runs = SUCCESS + [DONE]
+    client.combined_status = {"state": "pending", "statuses": [{"context": "external", "state": "pending"}]}
+    clock.now += timedelta(minutes=5)
+    await _poll(db, scope, client, times=2)
+    await db.refresh(item)
+    assert item.status_note == note and client.merge_calls == 0
+    assert len(await _ready_messages(db)) == 1
+
+
+@pytest.mark.parametrize("state", ["failure", "error", "success"])
+@pytest.mark.asyncio
+async def test_a_stalled_item_is_offered_again_only_when_its_commit_statuses_succeeded(db, clock, state):
+    scope, item, client = await _stalled(db, clock)
+    note = item.status_note
+    client.check_runs = SUCCESS + [DONE]
+    client.combined_status = {
+        "state": state, "total_count": 1, "statuses": [{"context": "external-security", "state": state}]}
+    clock.now += timedelta(minutes=5)
+    await _poll(db, scope, client, times=2)
+    await db.refresh(item)
+    if state == "success":
+        assert item.dispatch_status == "merged" and client.merge_head_shas == [HEAD]
+    else:  # a red status is not a cause that cleared: the fallback stays, with no merge and no new notice
+        assert item.status_note == note and client.merge_calls == 0
+        assert not item.status_note.startswith("Auto-merge offered again")
+    assert len(await _ready_messages(db)) == 1
+
+
+@pytest.mark.parametrize("moved", ["pull", "verified"])
+@pytest.mark.asyncio
+async def test_a_stalled_item_whose_head_moved_is_not_offered_again(db, clock, moved):
+    scope, item, client = await _stalled(db, clock)
+    note = item.status_note
+    client.pull["head"]["sha"] = OTHER
+    if moved == "verified":  # a later head was verified, but the stall was recorded for the earlier one
+        item.last_verified_sha = OTHER
+        await db.commit()
+    client.check_runs = list(SUCCESS)
+    await _poll(db, scope, client)
+    await db.refresh(item)
+    assert item.status_note == note and client.merge_calls == 0
+
+
+@pytest.mark.parametrize("note", [
+    "Auto-merge blocked: distinct current-round leader approval is required (approval is missing).",
+    "Auto-merge blocked by repository policy; requires human merge.",
+    "Auto-merge failed with GitHub status 500; requires human merge.",
+    "Auto-merge retry budget exhausted after transient merge failure: mergeable_state=blocked",
+])
+@pytest.mark.asyncio
+async def test_other_human_merge_fallbacks_stay_with_a_human(db, note):
+    scope, item, client = await _ready(db)
+    item.status_note = note
+    await db.commit()
+    await _poll(db, scope, client, times=2)
+    await db.refresh(item)
+    assert item.status_note == note and client.merge_calls == 0
+    assert await _ready_messages(db) == []

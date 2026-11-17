@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An accepted PR is no longer left for a human by a cause that has cleared.** A PR that fell back to human merge because of the daily cap, or because checks stalled, goes back to the automatic merge path once usage is below the cap or the same head's checks have finished green; every merge gate still applies. A check run again later on the same head no longer counts the earlier wait, so it no longer reports a false 60-minute stall ([#1037](https://github.com/albiexai/synth-city/issues/1037)).
+
 ## [4.2.0] - 2026-11-17
 
 Albiex Synth City 4.2.0 makes the factory explain itself and gives the Leader standard ways to recover. The factory now reports stuck work items, silent background failures and automatic merges that did not run. Owners can check a request before they submit it. Work items record an effort limit, and the Leader has three standard recoveries. Claude Code members can't edit files while an unread stop or hold message waits. The backend CI suite runs as four parallel shards. This release also adds the Antigravity CLI provider, but Antigravity members can't yet be launched in a team.

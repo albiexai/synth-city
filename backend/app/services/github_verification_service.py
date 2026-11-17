@@ -72,6 +72,9 @@ _HUMAN_MERGE_NOTE_PREFIXES = (
     "Auto-merge failed",
     "Auto-merge retry budget exhausted",
 )
+# The two human-merge fallbacks whose cause can clear without a person (#1037).
+_CAP_FALLBACK_PREFIX = "Auto-merge budget exhausted"
+_STALL_FALLBACK_PREFIX = "Auto-merge blocked: GitHub checks stalled"
 _MERGE_TRANSIENT_STATUS_CODES = {405, 409, 422}
 # Escalations a late PR legitimately resolves: the agent said it was stuck, or Albiex Synth City
 # inferred it from a timer. Anything not listed stays rejected by default.
@@ -2894,7 +2897,14 @@ class GithubVerificationService:
         if item.issue_type == "design" or scope.merge_policy != "auto":
             return
         if item.status_note and item.status_note.startswith(_HUMAN_MERGE_NOTE_PREFIXES):
-            return
+            cleared_note = await self._cleared_fallback_note(db, scope, item, client, pull)
+            if cleared_note is None:
+                return
+            item.status_note = cleared_note
+            item.merge_wait_head_sha = None
+            item.merge_wait_started_at = None
+            item.updated_at = datetime.utcnow()
+            await db.commit()
         readiness_note = self._draft_readiness_note(item, pull)
         if readiness_note is not None:
             await self._record_readiness_hold(db, item, readiness_note)
@@ -3362,6 +3372,33 @@ class GithubVerificationService:
             scope.repo_owner, scope.repo_name, head_sha,
         )
         required_ci_attention.note_readable(item)
+        pending = self._pending_merge_checks(checks, status, head_sha)
+        if not pending:
+            # A later pending period on this head starts its own wait (#1037).
+            item.merge_wait_head_sha = None
+            item.merge_wait_started_at = None
+            return False
+        now = datetime.utcnow()
+        if item.merge_wait_head_sha != head_sha or item.merge_wait_started_at is None:
+            item.merge_wait_head_sha = head_sha
+            item.merge_wait_started_at = now
+        names = ", ".join(pending)
+        if now - item.merge_wait_started_at >= _MERGE_CHECK_WAIT_LIMIT:
+            await self._fallback_to_human_merge(
+                db,
+                item,
+                f"Auto-merge blocked: GitHub checks stalled for 60 minutes on head {head_sha}. "
+                f"Pending checks: {names}.",
+            )
+        else:
+            item.status_note = f"Auto-merge waiting for checks on head {head_sha}: {names}."
+            item.updated_at = now
+        await db.commit()
+        return True
+
+    @staticmethod
+    def _pending_merge_checks(checks: list[dict], status: dict, head_sha: str) -> list[str]:
+        """The names of the head's check runs and commit statuses that have not finished."""
         pending = [
             str(check.get("name") or check.get("id") or "unnamed check")
             for check in checks
@@ -3383,25 +3420,38 @@ class GithubVerificationService:
             pending.append("pending commit status contexts")
         elif total_contexts > len(contexts) and status.get("state") != "success":
             pending.append("unobserved commit status contexts")
-        if not pending:
-            return False
-        now = datetime.utcnow()
-        if item.merge_wait_head_sha != head_sha or item.merge_wait_started_at is None:
-            item.merge_wait_head_sha = head_sha
-            item.merge_wait_started_at = now
-        names = ", ".join(pending)
-        if now - item.merge_wait_started_at >= _MERGE_CHECK_WAIT_LIMIT:
-            await self._fallback_to_human_merge(
-                db,
-                item,
-                f"Auto-merge blocked: GitHub checks stalled for 60 minutes on head {head_sha}. "
-                f"Pending checks: {names}.",
-            )
-        else:
-            item.status_note = f"Auto-merge waiting for checks on head {head_sha}: {names}."
-            item.updated_at = now
-        await db.commit()
-        return True
+        return pending
+
+    async def _cleared_fallback_note(
+        self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, client: GithubClient, pull: dict,
+    ) -> str | None:
+        """The note for a human-merge fallback whose cause has cleared, or ``None`` while it stays with a human (#1037).
+
+        Only two causes clear by themselves: the daily cap, once usage is below it, and a check stall, once every check
+        and status on the same verified head has finished green. Every other fallback needs a person. A cleared item
+        goes back through every gate of the automatic merge path.
+        """
+        note = item.status_note or ""
+        if note.startswith(_CAP_FALLBACK_PREFIX):
+            used, cap = await self._auto_merge_usage(db, scope)
+            if used < cap:
+                return f"Auto-merge offered again: {used} of {cap} automatic merges in the last 24 hours."
+            return None
+        if note.startswith(_STALL_FALLBACK_PREFIX):
+            head = self._head_sha(pull)
+            if not head or head != item.merge_wait_head_sha:
+                return None
+            checks = await client.list_check_runs_for_ref(scope.repo_owner, scope.repo_name, head)
+            status = await client.get_combined_status_for_ref(scope.repo_owner, scope.repo_name, head)
+            if self._pending_merge_checks(checks, status, head):
+                return None
+            # A finished red status is neither pending nor a check run; any status present must have succeeded.
+            if (status.get("total_count") or status.get("statuses")) and status.get("state") != "success":
+                return None
+            if not await self._head_is_green(scope, client, head, item=item):
+                return None
+            return f"Auto-merge offered again: the checks on head {head} finished."
+        return None
 
     async def _record_transient_merge_failure(
         self,
