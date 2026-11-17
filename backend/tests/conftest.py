@@ -67,7 +67,7 @@ def pytest_sessionfinish(session, exitstatus):
     changed = home_guard.session_changes()
     if changed:
         session.exitstatus = 1
-        print(f"\nreal home changed during this test run: {', '.join(changed)}")
+        print(f"\nreal home check failed during this test run: {', '.join(changed)}")
 
 
 @pytest.fixture(autouse=True)
