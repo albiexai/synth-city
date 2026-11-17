@@ -1890,7 +1890,11 @@ class GithubVerificationService:
             if acceptance_note is not None:
                 reason = f"{label} revision not promoted: {acceptance_note}"
             elif not await self._head_is_green(scope, client, head, item=item):
-                reason = f"{label} revision not promoted: the required checks are not all green at {head[:7]}."
+                failed_statuses = await self._failed_commit_statuses(scope, client, head)
+                reason = (
+                    f"{label} revision not promoted: commit status failed at {head[:7]}: "
+                    f"{', '.join(failed_statuses)}." if failed_statuses else
+                    f"{label} revision not promoted: the required checks are not all green at {head[:7]}.")
             elif superseded:
                 refusal = await self._capture_superseded_fence(db, scope, item, head)
                 if isinstance(refusal, str):
@@ -3066,8 +3070,12 @@ class GithubVerificationService:
             # Preserve the wait bound if another check started during this read.
             if await self._wait_for_merge_checks(db, scope, item, client, current_head):
                 return
+            failed_statuses = await self._failed_commit_statuses(scope, client, current_head)
             item.dispatch_status = "verifying"
             item.status_note = (
+                f"Auto-merge did not fire: commit status failed on head {current_head}: "
+                f"{', '.join(failed_statuses)}. Re-verifying before auto-merge."
+                if failed_statuses else
                 "Head changed or is no longer green since promotion; re-verifying "
                 "before auto-merge."
             )
@@ -4242,7 +4250,30 @@ class GithubVerificationService:
             for check in checks
         ):
             return False
-        return all(check.get("conclusion") in _SUCCESS_CONCLUSIONS for check in checks)
+        if not all(check.get("conclusion") in _SUCCESS_CONCLUSIONS for check in checks):
+            return False
+        # #1076: this one status read decides. A failed, errored, pending or unobserved commit status is not green,
+        # even when an earlier read saw success; an empty aggregate (no statuses at all) is.
+        status = await client.get_combined_status_for_ref(scope.repo_owner, scope.repo_name, head_sha)
+        return not (self._failed_status_contexts(status) or self._pending_merge_checks([], status, head_sha))
+
+    async def _failed_commit_statuses(self, scope: TeamGithubScope, client: GithubClient, head_sha: str) -> list[str]:
+        """Read the head's commit statuses and name the contexts that ended in failure or error, for a note (#1076)."""
+        return self._failed_status_contexts(
+            await client.get_combined_status_for_ref(scope.repo_owner, scope.repo_name, head_sha))
+
+    @staticmethod
+    def _failed_status_contexts(status: dict) -> list[str]:
+        """The contexts in failure or error (#1076); a failed aggregate with no listed context fails closed."""
+        contexts = status.get("statuses") or []
+        failed = [
+            str(context.get("context") or "unnamed commit status")
+            for context in contexts
+            if isinstance(context, dict) and context.get("state") in _STATUS_FAILURE_STATES
+        ]
+        if not failed and status.get("state") in _STATUS_FAILURE_STATES:
+            failed.append("failed commit status contexts")  # the aggregate failed, but its contexts were not listed
+        return failed
 
 
 github_verification_service = GithubVerificationService()
