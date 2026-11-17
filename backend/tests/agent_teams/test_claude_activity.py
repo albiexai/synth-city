@@ -463,3 +463,51 @@ def test_claude_a_kept_event_does_not_refresh_a_stale_working_turn(native, subty
     native["write"]([native["user"], _shaped(native, subtype, -1)])
     with patch.object(activity, "_process_started_at", return_value=native["now"] - timedelta(seconds=300)):
         assert native["observe"]().reason == "native_event_stale"
+
+
+# ---- the ordering fence includes kept events (review 5940065622) ----------------------------------------
+
+
+def test_claude_a_kept_event_then_an_earlier_kept_event_is_out_of_order(native):
+    """V1's first sequence: prompt, a kept event at a later time, then another kept event at an earlier time."""
+    rows = [native["user"], _shaped(native, "compact_boundary", -1), _shaped(native, "informational", -2)]
+    result, _ = _observed(native, rows)
+
+    assert (result.state, result.reason) == ("unknown", "observation_invalid")
+
+
+def test_claude_a_kept_event_then_an_earlier_real_event_is_out_of_order(native):
+    """V1's second sequence: prompt, a kept event at a later time, then an assistant event at an earlier time."""
+    rows = [native["user"], _shaped(native, "compact_boundary", -1), native["tool"]]  # user -4, kept -1, tool -3
+    result, _ = _observed(native, rows)
+
+    assert (result.state, result.reason) == ("unknown", "observation_invalid")
+
+
+@pytest.mark.parametrize("first,second", [("compact_boundary", "informational"), ("informational", "compact_boundary")])
+def test_claude_two_kept_events_out_of_order_are_invalid_in_either_order(native, first, second):
+    rows = native["records"][:3] + [_shaped(native, first, -1.5), _shaped(native, second, -1.7)]
+    result, _ = _observed(native, rows)
+
+    assert (result.state, result.reason) == ("unknown", "observation_invalid")
+
+
+@pytest.mark.parametrize("subtype", _KEEPING)
+def test_claude_a_real_event_after_a_kept_event_in_order_still_passes(native, subtype):
+    """The fence only refuses going backward. A later row after a kept row is fine and keeps the state."""
+    records = native["records"]
+    plain, _ = _observed(native, records[:3])
+    rows = records[:2] + [_shaped(native, subtype, -2.5), records[2]]  # user -4, tool -3, kept -2.5, result -2
+    result, _ = _observed(native, rows)
+
+    assert _view(result) == _view(plain)
+
+
+@pytest.mark.parametrize("subtype", _KEEPING)
+def test_claude_a_kept_event_with_the_same_time_as_the_last_real_event_is_in_order(native, subtype):
+    records = native["records"]
+    plain, _ = _observed(native, records[:4])
+    same_time = _shaped(native, subtype, -1)  # the final answer is at -1
+    result, _ = _observed(native, records[:4] + [same_time])
+
+    assert _view(result) == _view(plain)
