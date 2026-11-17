@@ -60,7 +60,6 @@ async def list_plans(
     """List all plan files sorted by modification time (newest first)."""
     try:
         provider = _validate_provider(provider)
-        data_only = provider == "codex-cli"      # the Codex plans never read .claude
         if provider == "codex-cli":
             codex = CodexPlanService()
             plans = codex.list_plans(project_path)
@@ -72,7 +71,7 @@ async def list_plans(
             # The folder handed on is the home's own, not plans_dir: plans_dir can come from the request.
             home_plans = get_claude_plans_dir()
             data_dir = home_plans if plans_dir == home_plans else None
-        return {"plans": plans, "total": len(plans), "scope": current_scope(data_dir, data_only=data_only)}
+        return {"plans": plans, "total": len(plans), "scope": current_scope(data_dir)}
     except HTTPException:
         raise
     except Exception as e:

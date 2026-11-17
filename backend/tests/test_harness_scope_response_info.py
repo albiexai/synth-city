@@ -190,6 +190,54 @@ async def test_the_claude_plans_view_still_depends_on_the_claude_folder(data, cl
     assert response.status_code == 500
 
 
+HAS_DATA = {
+    "/sessions/projects": lambda body: bool(body["projects"]),
+    "/usage/summary": lambda body: body["summary"]["total_input_tokens"] > 0,
+    "/context/active": lambda body: bool(body["sessions"]),
+    "/plans": lambda body: bool(body["plans"]),
+    "/plans?provider=codex-cli": lambda body: bool(body["plans"]),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("who", ["controller", "agent"])
+@pytest.mark.parametrize("route", ROUTES)
+async def test_a_search_only_claude_folder_with_readable_data_is_reported_readable(data, client, route, who):
+    """V1's finding: .claude at mode 0111 can be traversed, the views return their data, and so it is readable."""
+    if os.geteuid() == 0:
+        pytest.skip("root can read everywhere")
+    user = path_utils.controller_user_name() if who == "controller" else AGENT
+    home = data.controller if who == "controller" else data.agent
+    claude = home / ".claude"
+    claude.chmod(0o111)
+    try:
+        body = await read(client, route, user)
+    finally:
+        claude.chmod(0o755)
+
+    assert HAS_DATA[route](body), (route, body)                  # the response carries real data ...
+    assert body["scope"] == expected_scope(user, home)           # ... so the folder it came from is readable
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route,missing", [("/sessions/projects", "projects"), ("/usage/summary", "projects"),
+                                           ("/context/active", "projects"), ("/plans", "plans")])
+async def test_a_missing_data_folder_under_a_search_only_claude_folder_is_empty_and_readable(
+        data, client, route, missing):
+    if os.geteuid() == 0:
+        pytest.skip("root can read everywhere")
+    claude = data.controller / ".claude"
+    shutil.rmtree(claude / missing)
+    claude.chmod(0o111)
+    try:
+        body = await read(client, route, path_utils.controller_user_name())
+    finally:
+        claude.chmod(0o755)
+
+    assert not HAS_DATA[route](body)
+    assert body["scope"] == expected_scope(path_utils.controller_user_name(), data.controller)
+
+
 # ---- what existed before is unchanged ----------------------------------------------------------------------------------------
 
 
