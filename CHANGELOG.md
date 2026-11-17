@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A settings change now records how it was made (#945, first part).** An audit event for a team settings change on `PATCH /api/v1/agent-teams/presets/{id}` stores `via`: `mail_tool` (a Mail session the server validated), `ui` or `api` (labels from the browser Origin header, not proof of the caller). A Mail session token that is unknown, closed or stale does not refuse the write; the event is recorded as unattributed with `session_invalid`. A campaign change on that route now records an event too, and the audit service can record an `external_actor` by actor id. The other operator routes follow in #1025 ([#945](https://github.com/albiexai/synth-city/issues/945)).
 - **The team view flags members whose Mail tool list is out of date (first part of #960).** The Mail server reports a digest of the tools each session started with, and each member's status now carries `tool_catalog_state` (`current`, `stale` or `unknown`) judged over its connected sessions, with the reason "tool catalog stale: restart in resume mode" when stale. It is a display fact only and changes no wake, delivery or approval rule; restart a stale member in resume mode to load the new list. The roster badge and the `tools/list_changed` notification are separate follow-ups ([#960](https://github.com/albiexai/synth-city/issues/960)).
 
 ### Fixed

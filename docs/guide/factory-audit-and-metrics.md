@@ -88,6 +88,22 @@ Each section names the filters, page and observation time of the data it shows. 
 
 The event list uses the operator token for this browser tab. If no token is stored, the page asks for one once. A 401 response removes the refused token, and the next read asks for a replacement. A 503 response means the backend has no configured operator token. In both cases the safe metrics stay available.
 
+## How a settings change was made
+
+The operator key is still the only authority for a settings change. A recorded event now also says how the change reached the server. The field is `via`, and it is stored on the event. It is not part of the factory API response.
+
+| `via` | Meaning |
+| --- | --- |
+| `mail_tool` | The request carried a Mail session token that the server validated. The server reads the session from its own record and stores that session id. The event shows no member and no session text from the request. |
+| `ui` | No usable Mail session. The request had a browser `Origin` header that matches a configured CORS origin. |
+| `api` | Anything else: no `Origin` header, or an origin that is not configured. |
+
+Only `mail_tool` is a fact the server derives. `ui` and `api` are labels from a header that the caller sets. They do not prove who called. A caller that holds the operator key and sends no session token is recorded as `ui` or `api`. Treat the field as attribution for the honest path, not as a control against a determined key holder.
+
+A Mail session token that is unknown, closed or stale does not refuse the write. The operator key authorizes it as before. The event is recorded as unattributed: it keeps the `ui` or `api` label, stores no session, and carries `session_invalid` in its context. The token itself is never stored.
+
+Slice 1 applies this to `PATCH /api/v1/agent-teams/presets/{id}`. That route now also records one `policy_change` event for a campaign change (the milestone title and the number of planned decisions, never the decision text). Other operator routes keep their current actor until a later change. The event kind `external_actor` exists and records an external actor by its actor id, but no route uses it yet.
+
 ## Limits
 
 - Facts before the coverage marker are not available and are not reconstructed.

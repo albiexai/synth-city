@@ -168,6 +168,41 @@ async def require_operator(
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
+async def operator_write_context(
+    origin: Optional[str] = Header(default=None),
+    x_synth_city_session_token: Optional[str] = Header(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """How an operator-key write reached the server, for the audit trail (#945).
+
+    Use it AFTER ``require_operator``: the key is the authority and this never grants or refuses anything. A usable Mail
+    session token is the one server-derived fact (``mail_tool``, with the session id read from the session row, never
+    from the request). The other paths are labels from the browser's Origin header: a configured origin reads ``ui``,
+    anything else ``api``. Neither proves who called. A token that is unknown, closed or stale does not refuse the
+    write; it is reported as ``session_invalid`` so the event records the write as unattributed.
+    """
+    session = None
+    invalid = False
+    if x_synth_city_session_token:
+        hashed = agent_mail_service.hash_capability_token(x_synth_city_session_token)
+        rows = await db.execute(
+            select(MailAgentSession).where(MailAgentSession.capability_token_hash.is_not(None)))
+        match = next((row for row in rows.scalars().all()
+                      if hmac.compare_digest(row.capability_token_hash, hashed)), None)
+        try:
+            if match is None:
+                raise HTTPException(status_code=401, detail="session_token_invalid")
+            require_current_mail_session(match)
+            session = match
+        except HTTPException:
+            invalid = True
+    if session is not None:
+        via = "mail_tool"
+    else:
+        via = "ui" if origin and origin in settings.cors_origins else "api"
+    return {"via": via, "session_id": session.id if session is not None else None, "session_invalid": invalid}
+
+
 async def require_operator_for_writes(
     request: Request,
     x_synth_city_operator_token: str | None = Header(default=None),

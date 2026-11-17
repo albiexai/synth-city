@@ -1,0 +1,255 @@
+"""#945 slice 1: an audited settings change records how it was made, not only that the operator made it.
+
+The operator key stays the authority for the write. ``via`` is attribution: ``mail_tool`` is a fact the server derives from a
+validated Mail session; ``ui`` and ``api`` are labels from the browser's Origin header and are not proof of who called. A bad
+session token never refuses an otherwise authorized write; the event records it as unattributed with ``session_invalid``.
+"""
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime
+
+import httpx
+import pytest
+import pytest_asyncio
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from app.config import settings
+from app.database import Base, get_db
+from app.main import app
+from app.models.database import AgentTeamPreset, FactoryAuditEvent, MailAgentSession
+from app.models.schemas import MailAgentRegisterRequest
+from app.services import factory_audit_service as audit
+from app.services.agent_mail_service import agent_mail_service
+
+OPERATOR_KEY = "audit-via-test-operator-key"
+SESSION_TOKEN = "audit-via-test-session-token"
+UI_ORIGIN = "http://localhost:5173"
+PATH = "/api/v1/agent-teams/presets"
+
+
+@pytest_asyncio.fixture
+async def db():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        yield session
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def client(db, monkeypatch):
+    monkeypatch.setattr(settings, "operator_token", OPERATOR_KEY)
+
+    async def _override():
+        yield db
+
+    app.dependency_overrides[get_db] = _override
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test",
+                                 headers={"X-Synth-City-Operator-Token": OPERATOR_KEY}) as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def preset(db):
+    row = AgentTeamPreset(name="Audit via")
+    db.add(row)
+    await db.commit()
+    return row
+
+
+async def _session(db, tmp_path, **changes) -> MailAgentSession:
+    request = MailAgentRegisterRequest(source="mcp", provider="pi-cli", cwd=str(tmp_path),
+                                       session_key="mcp:audit-via", pid=os.getpid())
+    _member, session = await agent_mail_service.register_session(db, request)
+    session.capability_token_hash = agent_mail_service.hash_capability_token(SESSION_TOKEN)
+    for name, value in changes.items():
+        setattr(session, name, value)
+    await db.commit()
+    return session
+
+
+async def _events(db, preset, kind="policy_change"):
+    rows = await db.execute(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.team_preset_id == preset.id, FactoryAuditEvent.event_kind == kind)
+        .order_by(FactoryAuditEvent.id))
+    return list(rows.scalars().all())
+
+
+async def _campaign(client, preset, milestone="v4.2", **headers):
+    return await client.patch(f"{PATH}/{preset.id}", json={"backlog_milestone": milestone}, headers=headers)
+
+
+# --- derive_actor ---------------------------------------------------------------------------------------------------------
+
+
+def test_the_operator_actor_keeps_its_shape_when_no_access_path_is_given():
+    assert audit.derive_actor(actor_kind="operator") == {
+        "actor_kind": "operator", "actor_member_id": None, "actor_session_id": None,
+        "actor_reference": "shared-operator-credential"}
+
+
+def test_the_access_path_is_recorded_and_only_known_paths_are_accepted():
+    for via in ("ui", "mail_tool", "api"):
+        assert audit.derive_actor(actor_kind="operator", via=via)["via"] == via
+    with pytest.raises(ValueError):
+        audit.derive_actor(actor_kind="operator", via="curl")
+
+
+def test_an_operator_never_asserts_a_member_and_asserts_a_session_only_through_a_mail_tool():
+    with pytest.raises(ValueError, match="operator_role_cannot_assert_identity"):
+        audit.derive_actor(actor_kind="operator", member_id=3)
+    with pytest.raises(ValueError, match="operator_role_cannot_assert_identity"):
+        audit.derive_actor(actor_kind="operator", session_id=9, via="ui")
+    actor = audit.derive_actor(actor_kind="operator", session_id=9, via="mail_tool")
+    assert actor["actor_session_id"] == 9 and actor["actor_member_id"] is None
+
+
+def test_an_external_actor_records_its_kind_and_actor_id_and_nothing_else():
+    actor = audit.derive_actor(actor_kind="external_actor", external_actor_id=6)
+    assert actor == {"actor_kind": "external_actor", "actor_member_id": None, "actor_session_id": None,
+                     "actor_reference": "external_actor:6"}
+    with pytest.raises(ValueError):
+        audit.derive_actor(actor_kind="external_actor")
+    with pytest.raises(ValueError):
+        audit.derive_actor(actor_kind="external_actor", external_actor_id=6, member_id=1)
+
+
+@pytest.mark.asyncio
+async def test_an_external_actor_event_is_stored_with_the_actor_id(db, preset):
+    await audit.record_event(
+        db, event_kind="policy_change", source="test", occurred_at=datetime.utcnow(),
+        actor=audit.derive_actor(actor_kind="external_actor", external_actor_id=6), team_preset_id=preset.id)
+    await db.commit()
+    (event,) = await _events(db, preset)
+    assert (event.actor_kind, event.actor_reference, event.via) == ("external_actor", "external_actor:6", None)
+
+
+# --- the route records how a change was made ------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers,expected", [
+    ({"Origin": UI_ORIGIN}, "ui"),
+    ({}, "api"),
+    ({"Origin": "https://not-configured.example"}, "api"),
+])
+async def test_a_campaign_change_records_the_label_from_the_origin(client, db, preset, headers, expected):
+    response = await _campaign(client, preset, **headers)
+    assert response.status_code == 200
+    (event,) = await _events(db, preset)
+    assert (event.via, event.actor_kind, event.actor_session_id) == (expected, "operator", None)
+    assert event.after_values["backlog_milestone"] == "v4.2" and event.before_values["backlog_milestone"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_same_change_through_a_ui_and_through_a_mail_session_records_different_paths(client, db, preset, tmp_path):
+    session = await _session(db, tmp_path)
+    await _campaign(client, preset, "v4.2", Origin=UI_ORIGIN)
+    await _campaign(client, preset, "v4.3", **{"X-Synth-City-Session-Token": SESSION_TOKEN})
+    ui, tool = await _events(db, preset)
+    assert (ui.via, ui.actor_session_id) == ("ui", None)
+    assert (tool.via, tool.actor_session_id, tool.actor_member_id, tool.actor_kind) == ("mail_tool", session.id, None, "operator")
+
+
+@pytest.mark.asyncio
+async def test_a_valid_session_wins_over_the_origin_and_caller_claims_are_never_read(client, db, preset, tmp_path):
+    session = await _session(db, tmp_path)
+    response = await client.patch(
+        f"{PATH}/{preset.id}", json={"backlog_milestone": "v4.2", "actor_session_id": 999, "via": "ui"},
+        headers={"X-Synth-City-Session-Token": SESSION_TOKEN, "Origin": UI_ORIGIN, "X-Synth-City-Session-Id": "999"})
+    assert response.status_code == 200
+    (event,) = await _events(db, preset)
+    assert (event.via, event.actor_session_id) == ("mail_tool", session.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["unknown", "closed", "stale"])
+async def test_a_bad_session_token_never_refuses_the_write_and_is_recorded_as_unattributed(client, db, preset, tmp_path, case):
+    changes = {"closed": {"closed_at": datetime.utcnow()}, "stale": {"mailbox_status": "offline"}}.get(case, {})
+    await _session(db, tmp_path, **changes)
+    token = "not-the-token" if case == "unknown" else SESSION_TOKEN
+    response = await _campaign(client, preset, Origin=UI_ORIGIN, **{"X-Synth-City-Session-Token": token})
+    assert response.status_code == 200 and response.json()["backlog_milestone"] == "v4.2"
+    (event,) = await _events(db, preset)
+    assert (event.via, event.actor_kind, event.actor_session_id, event.actor_member_id) == ("ui", "operator", None, None)
+    assert event.context_snapshot["session_invalid"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_valid_session_does_not_carry_the_invalid_marker(client, db, preset, tmp_path):
+    await _session(db, tmp_path)
+    await _campaign(client, preset, **{"X-Synth-City-Session-Token": SESSION_TOKEN})
+    (event,) = await _events(db, preset)
+    assert not (event.context_snapshot or {}).get("session_invalid")
+
+
+@pytest.mark.asyncio
+async def test_the_operator_key_is_still_required_whatever_the_session_says(client, db, preset, tmp_path):
+    await _session(db, tmp_path)
+    response = await client.patch(f"{PATH}/{preset.id}", json={"backlog_milestone": "v4.2"},
+                                  headers={"X-Synth-City-Operator-Token": "wrong", "X-Synth-City-Session-Token": SESSION_TOKEN})
+    assert response.status_code == 401 and response.json()["detail"] == "operator_token_invalid"
+    assert await _events(db, preset) == []
+
+
+@pytest.mark.asyncio
+async def test_a_campaign_change_records_one_event_only_when_a_field_changes(client, db, preset):
+    await _campaign(client, preset, "v4.2")
+    await _campaign(client, preset, "v4.2")
+    assert len(await _events(db, preset)) == 1
+    await client.patch(f"{PATH}/{preset.id}", json={"planned_decisions": [{"text": "Ship slice 1", "state": "now"}]})
+    events = await _events(db, preset)
+    assert len(events) == 2 and events[1].after_values["planned_decisions_count"] == 1
+    assert "Ship slice 1" not in json.dumps(events[1].after_values)
+
+
+@pytest.mark.asyncio
+async def test_the_autonomy_event_also_records_the_path(client, db, preset):
+    response = await client.patch(f"{PATH}/{preset.id}", json={"autonomy_enabled": False}, headers={"Origin": UI_ORIGIN})
+    assert response.status_code == 200
+    (event,) = await _events(db, preset)
+    assert event.after_values == {"autonomy_enabled": False} and event.via == "ui"
+
+
+@pytest.mark.asyncio
+async def test_no_key_token_or_hash_appears_in_any_audit_row(client, db, preset, tmp_path):
+    await _session(db, tmp_path)
+    await _campaign(client, preset, "v4.2", **{"X-Synth-City-Session-Token": SESSION_TOKEN})
+    await _campaign(client, preset, "v4.3", **{"X-Synth-City-Session-Token": "bad-" + SESSION_TOKEN})
+    rows = (await db.execute(text("SELECT * FROM factory_audit_events"))).all()
+    dump = json.dumps([[str(value) for value in row] for row in rows])
+    for secret in (OPERATOR_KEY, SESSION_TOKEN, "bad-" + SESSION_TOKEN, agent_mail_service.hash_capability_token(SESSION_TOKEN)):
+        assert secret not in dump
+
+
+@pytest.mark.asyncio
+async def test_the_response_does_not_gain_the_new_field(client, db, preset):
+    body = (await _campaign(client, preset)).json()
+    assert "via" not in body
+    from app.models import schemas
+    assert not any("via" in getattr(model, "model_fields", {}) for model in vars(schemas).values()
+                   if isinstance(model, type) and model.__name__.startswith("FactoryAudit"))
+
+
+# --- storage ----------------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_old_database_without_the_column_is_migrated(tmp_path):
+    from app.database import _run_sqlite_compat_migrations, _sqlite_columns
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'old.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("ALTER TABLE factory_audit_events DROP COLUMN via"))
+    async with engine.begin() as conn:
+        await _run_sqlite_compat_migrations(conn)
+    async with engine.begin() as conn:
+        columns = await _sqlite_columns(conn, "factory_audit_events")
+    await engine.dispose()
+    assert "via" in columns

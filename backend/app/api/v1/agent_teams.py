@@ -20,6 +20,7 @@ from sqlalchemy.orm import aliased
 from app.api.v1.deps import (
     mail_session,
     require_mail_session_or_operator,
+    operator_write_context,
     require_operator,
     require_session_slot,
     resolve_request_pane_detailed,
@@ -133,6 +134,13 @@ def _operator_actor() -> dict:
     """C08: the shared operator credential is a role, never a named person."""
     from app.services import factory_audit_service as _audit
     return _audit.derive_actor(actor_kind="operator")
+
+
+def _write_actor(context: dict) -> dict:
+    """#945: the operator key authorized the write; the context says how it arrived (server-derived, see deps)."""
+    from app.services import factory_audit_service as _audit
+    return _audit.derive_actor(
+        actor_kind="operator", via=context["via"], session_id=context["session_id"])
 
 
 def _session_actor(session) -> dict:
@@ -2440,12 +2448,15 @@ async def update_preset(
     preset_id: int,
     request: AgentTeamPresetUpdate,
     _operator: None = Depends(require_operator),
+    write_context: dict = Depends(operator_write_context),
     db: AsyncSession = Depends(get_db),
 ):
     try:
         response = await agent_team_service.update_preset(
             db,
             preset_id,
+            actor=_write_actor(write_context),
+            session_invalid=write_context["session_invalid"],
             name=request.name,
             description=request.description,
             autonomy_enabled=request.autonomy_enabled,
@@ -2463,7 +2474,7 @@ async def update_preset(
                 db,
                 event_kind="policy_change",
                 source="agent_team_service.update_preset",
-                actor=_operator_actor(),
+                actor=_write_actor(write_context),
                 code="leader_assignment_required",
                 team_preset_id=preset_id,
             )
