@@ -18,6 +18,8 @@ checks every pull request. Nothing merges until the reviewer has accepted that
 exact commit and CI is green. You watch the whole factory in one web UI and
 step in when you want to.
 
+![Synth City Overview: a running team's v4.2 campaign at 37 of 39 items done, with the items that need the Director](screenshots/overview.png)
+
 ## What you get
 
 - **A backlog that works itself.** Label an issue and it is planned, built, reviewed and merged, or stopped with a clear reason.
@@ -92,13 +94,9 @@ Version 4.2 makes the factory explain itself: it reports stuck work and automati
 
 ## Screenshots
 
-| Live sessions | Dashboard |
-|--------------|-----------|
-| ![Live sessions](screenshots/cc-bridge.png) | ![Dashboard](screenshots/dashboard.png) |
+**Work**: every item across your teams, with its state, owner and pull request.
 
-| MCP Servers | Usage Tracking |
-|-------------|----------------|
-| ![MCP Servers](screenshots/mcp-servers.png) | ![Usage Tracking](screenshots/usage-tracking.png) |
+![Synth City Work page: the v4.2 team's items, most merged, each with its owner and PR](screenshots/work.png)
 
 ## Tech stack
 
