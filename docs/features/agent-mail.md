@@ -138,6 +138,31 @@ Without this setup, the page can still show install status, but agents cannot ex
 - External callers should only use the API from the same trusted machine until a broader Synth City auth model exists.
 - Agent Mail is coordination state, not source control. Handoffs should still reference files, branches, issues, or commits when durable provenance matters.
 
+## When a running agent's Mail tool list is out of date
+
+An agent loads its Mail tool list when its session starts. After a factory deploy that adds or changes a Mail tool,
+a member that was already running keeps the list it started with, so the new tool is not there for it.
+
+The Mail server now tells the backend which list each session started with, as a short digest of the tool names. The
+team view compares it with the deployed list and shows one of three states for each member:
+
+- **current**: every connected Mail session of the member started with the deployed list;
+- **stale**: at least one connected session started with another list. The reason reads "tool catalog stale: restart
+  in resume mode";
+- **unknown**: the member has no connected Mail session, or a connected session never reported its list (an older
+  Mail server does not). Unknown is not stale: nothing shows the list is out of date.
+
+With several connected sessions the state is judged together and conservatively. It is `current` only when every
+connected session reported the deployed list, `stale` when any reported another list, and otherwise `unknown`. A closed
+session is ignored.
+
+The state is a display fact only. It grants no authority and changes no wake, delivery or approval rule, and a stale
+member keeps working with the tools it has. **The restart fallback:** restart the member in resume mode. It then loads
+the new list and keeps its conversation.
+
+This is the first part of #960. Telling a running client with a `tools/list_changed` notification, and the badge in the
+roster, are separate follow-ups, so for now the member keeps its old list until it is restarted.
+
 ## Install Details
 
 Open **Agent Mail** in Synth City and use the **Install** tab.

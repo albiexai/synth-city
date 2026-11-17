@@ -105,6 +105,7 @@ def test_ensure_registered_refreshes_cached_member(monkeypatch):
         "cwd": "/tmp/repo",
         "session_key": "mcp:test",
         "pid": 1234,
+        "tool_catalog": shim.tool_catalog_fingerprint(),
         "team_preset_id": 1,
         "team_slot_id": 2,
     }

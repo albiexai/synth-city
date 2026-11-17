@@ -744,6 +744,8 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         await conn.execute(
             text("ALTER TABLE mail_agent_sessions ADD COLUMN bound_pane_proc_start TEXT")
         )
+    if session_columns and "tool_catalog" not in session_columns:
+        await conn.execute(text("ALTER TABLE mail_agent_sessions ADD COLUMN tool_catalog VARCHAR"))
     if session_columns and "wake_enabled" not in session_columns:
         await conn.execute(
             text("ALTER TABLE mail_agent_sessions ADD COLUMN wake_enabled BOOLEAN DEFAULT 0 NOT NULL")

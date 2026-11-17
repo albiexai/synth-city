@@ -1863,6 +1863,17 @@ class AgentStatus(BaseModel):
     valid_until: datetime
 
 
+class AgentStatusWithCatalog(AgentStatus):
+    """The shared display facts plus whether the member's Mail tool list is the deployed one (#960).
+
+    A separate model on purpose: the frozen factory contract embeds ``AgentStatus`` and stays unchanged, while the
+    Mail and roster views embed this one. It grants no authority.
+    """
+
+    tool_catalog_state: Literal["current", "stale", "unknown"] = "unknown"
+    tool_catalog_reason: Optional[str] = None
+
+
 class MailSessionResponse(BaseModel):
     """One live/observed agent session attached to a member."""
 
@@ -1988,7 +1999,7 @@ class MailMemberResponse(BaseModel):
     wake_state: str = "delivered_waiting"
     last_inbox_checked_at: Optional[datetime] = None
     sessions: List[MailSessionResponse] = Field(default_factory=list)
-    agent_status: Optional[AgentStatus] = None
+    agent_status: Optional[AgentStatusWithCatalog] = None
 
 
 class TeamListResponse(BaseModel):
@@ -2381,6 +2392,8 @@ class MailAgentRegisterRequest(BaseModel):
     pid: Optional[int] = None
     team_preset_id: Optional[int] = None
     team_slot_id: Optional[int] = None
+    # A digest of the Mail tool names the session started with (#960). Display only.
+    tool_catalog: Optional[str] = Field(default=None, max_length=64)
 
 
 class MailAgentRegisterResponse(BaseModel):
@@ -2904,7 +2917,7 @@ class AgentActivityObservation(BaseModel):
 
 
 class AgentActivityDisplayObservation(AgentActivityObservation):
-    agent_status: Optional[AgentStatus] = None
+    agent_status: Optional[AgentStatusWithCatalog] = None
 
 
 class AgentTeamActivityResponse(BaseModel):
