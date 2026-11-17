@@ -24,17 +24,21 @@ def _stamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def write_session(home: Path, folder: str, session_id: str, tokens: int) -> None:
+def write_session(home: Path, folder: str, session_id: str, tokens: int, pairs: int = 1) -> None:
+    """One transcript of `pairs` user and assistant messages (so 2 * pairs messages)."""
     directory = home / ".claude" / "projects" / folder
     directory.mkdir(parents=True, exist_ok=True)
-    rows = [
-        {"type": "user", "timestamp": _stamp(), "sessionId": session_id, "cwd": "/synthetic/project",
-         "message": {"role": "user", "content": f"hello from {session_id}"}},
-        {"type": "assistant", "timestamp": _stamp(), "sessionId": session_id,
-         "message": {"role": "assistant", "model": "claude-sonnet-4-5", "content": [{"type": "text", "text": "hi"}],
-                     "usage": {"input_tokens": tokens, "output_tokens": 1, "cache_creation_input_tokens": 0,
-                               "cache_read_input_tokens": 0}}},
-    ]
+    rows = []
+    for index in range(pairs):
+        rows += [
+            {"type": "user", "timestamp": _stamp(), "sessionId": session_id, "cwd": "/synthetic/project",
+             "message": {"role": "user", "content": f"hello {index} from {session_id}"}},
+            {"type": "assistant", "timestamp": _stamp(), "sessionId": session_id,
+             "message": {"role": "assistant", "model": "claude-sonnet-4-5",
+                         "content": [{"type": "text", "text": "hi"}],
+                         "usage": {"input_tokens": tokens, "output_tokens": 1, "cache_creation_input_tokens": 0,
+                                   "cache_read_input_tokens": 0}}},
+        ]
     (directory / f"{session_id}.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
 
 
@@ -145,6 +149,99 @@ async def test_a_user_outside_the_allowed_list_is_refused_on_each_route(data, cl
     response = await client.get(API + route, headers={HEADER: "somebody-else"})
 
     assert response.status_code == 400, response.text
+
+
+# ---- a cached session row is used only for the file it was built from (V1's review of #1110) ------------------------
+
+
+async def total_messages(client, user) -> int:
+    response = await client.get(API + "/sessions/dashboard/stats", headers={HEADER: user})
+    assert response.status_code == 200, response.text
+    return response.json()["total_messages"]
+
+
+@pytest.mark.asyncio
+async def test_the_statistics_never_use_another_homes_cached_row_for_the_same_session_id(homes, client, monkeypatch):
+    """The same folder and session id in two homes, with different transcripts: one cache row, never the wrong home's."""
+    monkeypatch.setattr(settings, "harness_agent_user", AGENT)
+    controller = path_utils.controller_user_name()
+    write_session(homes.controller, "-same", "dup", 10, pairs=1)      # 2 messages
+    write_session(homes.agent, "-same", "dup", 10, pairs=2)           # 4 messages
+    assert (await client.get(API + "/sessions", headers={HEADER: controller})).status_code == 200  # warm only this one
+
+    assert await total_messages(client, AGENT) == 4          # not the controller's cached 2
+    assert await total_messages(client, controller) == 2     # and back: the row now describes the other file again
+    assert await total_messages(client, AGENT) == 4
+
+
+@pytest.mark.asyncio
+async def test_a_session_that_grew_since_it_was_cached_is_counted_with_its_current_messages(homes, client, monkeypatch):
+    monkeypatch.setattr(settings, "harness_agent_user", None)
+    write_session(homes.controller, "-grow", "g1", 10, pairs=1)
+    assert (await client.get(API + "/sessions")).status_code == 200
+    assert await total_messages(client, path_utils.controller_user_name()) == 2
+
+    write_session(homes.controller, "-grow", "g1", 10, pairs=3)       # the same file, now longer
+
+    assert await total_messages(client, path_utils.controller_user_name()) == 6
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_session_is_not_scanned_again_by_the_statistics(homes, client, monkeypatch):
+    """The refresh costs a scan only for a row whose file changed or belongs to another home."""
+    from app.services.session_service import SessionService
+
+    monkeypatch.setattr(settings, "harness_agent_user", None)
+    write_session(homes.controller, "-calm", "c1", 10, pairs=1)
+    assert (await client.get(API + "/sessions")).status_code == 200
+    scans = []
+    original = SessionService.scan_for_listing
+
+    async def counting(self, path):
+        scans.append(path)
+        return await original(self, path)
+
+    monkeypatch.setattr(SessionService, "scan_for_listing", counting)
+
+    assert await total_messages(client, path_utils.controller_user_name()) == 2
+    assert scans == []
+
+
+# ---- a Plans folder that cannot be listed answers 403, not an empty list (V1's review of #1110) ------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["/plans", "/plans/stats", "/plans/search?q=agt", "/plans/agt-one.md"])
+async def test_an_unreadable_plans_folder_answers_403_and_names_it(data, client, route):
+    if os.geteuid() == 0:
+        pytest.skip("root can read everywhere")
+    plans = data.agent / ".claude" / "plans"
+    plans.chmod(0o000)
+    try:
+        response = await client.get(API + route, headers={HEADER: AGENT})
+        assert response.status_code == 403, (route, response.status_code, response.text)
+        detail = response.json()["detail"]
+        assert detail.startswith("The controller cannot read ") and detail.endswith(f"It belongs to {AGENT}."), detail
+        assert str(plans) in detail
+    finally:
+        plans.chmod(0o755)
+
+
+@pytest.mark.asyncio
+async def test_the_controllers_own_unreadable_plans_folder_behaves_as_before(data, client):
+    """No change for the controller: an unreadable folder of its own still lists as empty."""
+    if os.geteuid() == 0:
+        pytest.skip("root can read everywhere")
+    plans = data.controller / ".claude" / "plans"
+    plans.chmod(0o000)
+    try:
+        headers = {HEADER: path_utils.controller_user_name()}
+        for route in ("/plans", "/plans/stats"):
+            response = await client.get(API + route, headers=headers)
+            assert response.status_code == 200, (route, response.status_code, response.text)
+        assert (await client.get(API + "/plans", headers=headers)).json()["total"] == 0
+    finally:
+        plans.chmod(0o755)
 
 
 # ---- authorization is as it was ---------------------------------------------------------------------------------------

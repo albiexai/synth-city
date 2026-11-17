@@ -301,6 +301,21 @@ class SessionService:
         projects = sorted(projects_map.values(), key=lambda p: p.most_recent, reverse=True)
         return SessionProjectListResponse(projects=projects, total_sessions=total_sessions)
 
+    async def _scan_summary(self, session_id: str, folder_name: str, jsonl_file: Path, mtime: float,
+                            size: int) -> SessionSummary:
+        """Summarise one transcript with the lightweight scan (it streams the file, never loads it whole)."""
+        scan = await self.scan_for_listing(jsonl_file)
+        return SessionSummary(
+            id=session_id,
+            project_folder=folder_name,
+            project_name=get_project_display_name(folder_name),
+            summary=scan["summary"],
+            modified_at=datetime.fromtimestamp(mtime).isoformat(),
+            size_bytes=size,
+            total_messages=scan["total_messages"],
+            total_tool_calls=scan["total_tool_calls"],
+        )
+
     async def list_sessions(
         self,
         project_folder: Optional[str] = None,
@@ -362,20 +377,8 @@ class SessionService:
                 sessions.append(cached)
                 continue
 
-            # Use lightweight scan — streams file without loading it all into memory
             jsonl_file = entry["path"]
-            scan = await self.scan_for_listing(jsonl_file)
-
-            summary = SessionSummary(
-                id=session_id,
-                project_folder=folder_name,
-                project_name=get_project_display_name(folder_name),
-                summary=scan["summary"],
-                modified_at=datetime.fromtimestamp(entry["mtime"]).isoformat(),
-                size_bytes=entry["size"],
-                total_messages=scan["total_messages"],
-                total_tool_calls=scan["total_tool_calls"],
-            )
+            summary = await self._scan_summary(session_id, folder_name, jsonl_file, entry["mtime"], entry["size"])
 
             sessions.append(summary)
             await self.save_to_cache(summary, jsonl_file)
@@ -466,9 +469,24 @@ class SessionService:
 
         if self.db:
             result = await self.db.execute(select(SessionCache))
-            # The cache holds the sessions of every home. Count only those under the scoped one (#1065).
-            cached_entries = [entry for entry in result.scalars().all()
-                              if (entry.project_folder, entry.session_id) in present]
+            # The cache holds the sessions of every home, one row per session id. Count a row only if it describes
+            # the file under the scoped home (#1065). A row built from another home's file, or from this file before
+            # it changed, is refreshed from the scoped file first: one streamed scan, as the session list does.
+            cached_entries = []
+            for entry in result.scalars().all():
+                if (entry.project_folder, entry.session_id) not in present:
+                    continue
+                path = self.projects_dir / entry.project_folder / f"{entry.session_id}.jsonl"
+                try:
+                    if await self.get_file_hash(path) != entry.file_hash:
+                        stat = path.stat()
+                        summary = await self._scan_summary(entry.session_id, entry.project_folder, path,
+                                                           stat.st_mtime, stat.st_size)
+                        await self.save_to_cache(summary, path)
+                        await self.db.refresh(entry)
+                except OSError:
+                    continue  # the file went away since it was listed
+                cached_entries.append(entry)
 
             for entry in cached_entries:
                 modified = entry.modified_at
