@@ -259,3 +259,89 @@ async def test_the_summary_lists_a_refusal_but_does_not_treat_it_as_an_external_
 
     assert [(w.slot_id, w.reason, w.label) for w in summary.waiting_input] == [(first_slot, reason, label)]
     assert seen["external_wait"] is external_wait
+
+
+# ---- a change into or out of a refusal is a new episode (V1's review of #1096) ------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first,second", [("question", REFUSAL), ("trust", REFUSAL), ("sign_in", REFUSAL),
+                                          (REFUSAL, "question"), (REFUSAL, "sign_in")])
+@pytest.mark.parametrize("supervised", [True, False])
+async def test_a_change_into_or_out_of_a_refusal_stores_the_new_reason_and_one_new_notice(db, supervised, first, second):
+    """No clear observation in between: the periodic observation can go straight from one screen to the other."""
+    team, actor, slot, binding, _, _ = await wait_team(db, supervised=supervised)
+
+    await record_wait(db, team, slot, binding, first)
+    await db.refresh(binding)
+    first_notice = binding.waiting_input_notice_id
+    await record_wait(db, team, slot, binding, second)
+    await db.refresh(binding)
+
+    assert binding.waiting_input_reason == second
+    assert binding.waiting_input_notice_id not in (None, first_notice)
+    notices = (await db.scalars(select(MailMessage).order_by(MailMessage.id))).all()
+    assert [n.payload["reason"] for n in notices] == [first, second]
+    assert notices[-1].id == binding.waiting_input_notice_id
+    wording = "provider refusal" in notices[-1].body_markdown
+    assert wording is (second == REFUSAL)
+    assert "waits for input" not in notices[-1].body_markdown or second != REFUSAL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first,second", [("question", REFUSAL), (REFUSAL, "question")])
+async def test_a_repeat_after_a_category_change_adds_no_notice(db, first, second):
+    team, actor, slot, binding, _, _ = await wait_team(db, supervised=True)
+    for reason in (first, second, second, second):
+        await record_wait(db, team, slot, binding, reason)
+
+    assert len((await db.scalars(select(MailMessage))).all()) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_category_change_and_back_is_a_new_episode_each_time(db):
+    team, actor, slot, binding, _, _ = await wait_team(db, supervised=True)
+    for reason in ("question", REFUSAL, "question"):
+        await record_wait(db, team, slot, binding, reason)
+
+    assert [n.payload["reason"] for n in (await db.scalars(select(MailMessage).order_by(MailMessage.id))).all()] == [
+        "question", REFUSAL, "question"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first,second", [("question", "trust"), ("trust", "sign_in"), ("sign_in", "question")])
+async def test_a_change_between_external_waits_still_keeps_the_first_reason_and_notice(db, first, second):
+    """The existing contract: one continuous external wait is one episode, whatever it asks."""
+    team, actor, slot, binding, _, _ = await wait_team(db, supervised=True)
+    await record_wait(db, team, slot, binding, first)
+    await record_wait(db, team, slot, binding, second)
+    await db.refresh(binding)
+
+    assert binding.waiting_input_reason == first
+    assert len((await db.scalars(select(MailMessage))).all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_notice_after_a_category_change_reaches_the_supervisors_real_inbox_and_thread_gate(db):
+    team, actor, slot, binding, _, _ = await wait_team(db, supervised=True)
+    await record_wait(db, team, slot, binding, "question")
+    await record_wait(db, team, slot, binding, REFUSAL)
+    notice = (await db.scalars(select(MailMessage).order_by(MailMessage.id.desc()))).first()
+
+    assert notice.payload["reason"] == REFUSAL
+    assert notice.id in [m.id for m in await supervisor_inbox(db, actor)]
+    assert is_supervisor_message(notice) is True
+    await require_supervisor_thread(db, actor, notice)
+
+
+@pytest.mark.asyncio
+async def test_a_stale_observation_cannot_change_the_category(db):
+    """The observed-at fence still applies: an older observation does not rewrite a newer record."""
+    team, actor, slot, binding, _, _ = await wait_team(db, supervised=True)
+    now = datetime.now(timezone.utc)
+    await record_wait(db, team, slot, binding, "question", now=now)
+    await record_wait(db, team, slot, binding, REFUSAL, now=now - timedelta(seconds=30))
+    await db.refresh(binding)
+
+    assert binding.waiting_input_reason == "question"
+    assert len((await db.scalars(select(MailMessage))).all()) == 1

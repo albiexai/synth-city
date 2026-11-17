@@ -731,9 +731,13 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
                 waiting_input_started_at=None, waiting_input_notice_id=None, waiting_input_observed_at=now).execution_options(synchronize_session=False))
             changed = changed or result.rowcount == 1
             continue
-        kept = await db.execute(update(AgentPaneBinding).where(*conditions,
-            AgentPaneBinding.waiting_input_reason.is_not(None)).values(waiting_input_observed_at=now)
-            .execution_options(synchronize_session=False))
+        # One continuous episode keeps its first reason (a question may become a trust prompt). A refusal is not
+        # a wait for input, so a change into or out of one is a new episode with its own reason and notice.
+        refused = AgentPaneBinding.waiting_input_reason == PROVIDER_REFUSAL
+        same_kind = refused if reason == PROVIDER_REFUSAL else and_(
+            AgentPaneBinding.waiting_input_reason.is_not(None), ~refused)
+        kept = await db.execute(update(AgentPaneBinding).where(*conditions, same_kind)
+            .values(waiting_input_observed_at=now).execution_options(synchronize_session=False))
         if kept.rowcount == 1:
             changed = True
             continue
@@ -762,7 +766,7 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
                 AgentTeamSlot.id == leader_slot_id, AgentTeamSlot.preset_id == preset_id,
                 AgentTeamSlot.enabled.is_(True)))])
         result = await db.execute(update(AgentPaneBinding).where(*conditions, same_route,
-            AgentPaneBinding.waiting_input_reason.is_(None)).values(waiting_input_reason=reason,
+            or_(AgentPaneBinding.waiting_input_reason.is_(None), ~same_kind)).values(waiting_input_reason=reason,
             waiting_input_started_at=now, waiting_input_observed_at=now).execution_options(synchronize_session=False))
         if result.rowcount != 1:
             continue
