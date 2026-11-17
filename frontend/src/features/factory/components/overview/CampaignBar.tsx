@@ -23,7 +23,7 @@ export function CampaignBar({ campaign: c }: { campaign: TeamCampaignSummary }) 
       <span className="bg-primary" style={{ width: width(c.done_count) }} />
       <span className="bg-violet-500" style={{ width: width(c.under_way_count) }} />
       <span className="bg-amber-500" style={{ width: width(attention) }} />
-      <span className="bg-muted-foreground/50" style={{ width: width(todo) }} />
+      <span data-testid="campaign-bar-todo" className="bg-muted-foreground/50" style={{ width: width(todo) }} />
       {!known && (
         <span
           data-testid="unknown-remainder"
