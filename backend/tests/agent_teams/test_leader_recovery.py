@@ -1455,3 +1455,60 @@ async def test_a_clean_version_2_row_is_never_answered_as_a_legacy_replay(db, re
     with pytest.raises(lr.LeaderRecoveryError) as error:
         await _again(db, a, same)
     assert error.value.code == "recovery_context_changed" and len(await _notices(db)) == notices_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("db", ["concurrent"], indirect=True)
+async def test_an_attempt_that_completes_after_its_committed_marker_was_adopted_sends_one_notice(db, releasable, monkeypatch):
+    """A commits its marker and stops before its lease write; B adopts it and is refused before its revoker; A completes."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.models.database import GithubWorkItem
+    a = releasable
+    revoker = AsyncMock()
+    monkeypatch.setattr(lr.github_workspace_service, "revoke_push_token", revoker)
+    workspace_id, leased_at, item_id, session_id = a.workspace.id, a.workspace_leased_at, a.item.id, a.leader_session.id
+    real_release, real_fence = lr.github_workspace_service.force_release_acquisition, lr._assert_authority
+    entered, gate, state = asyncio.Event(), asyncio.Event(), {"release": 0, "fence": 0}
+
+    async def release(*args, **kwargs):
+        state["release"] += 1
+        if state["release"] == 1:         # A: its marker is committed; it stops before its lease write opens
+            entered.set()
+            await gate.wait()
+        return await real_release(*args, **kwargs)
+
+    async def fence(*args, **kwargs):
+        state["fence"] += 1
+        if state["fence"] == 1:           # the first fence call is B's: B is refused before its own revoker
+            raise lr.LeaderRecoveryError("operator_hold")
+        return await real_fence(*args, **kwargs)
+    monkeypatch.setattr(lr.github_workspace_service, "force_release_acquisition", release)
+    monkeypatch.setattr(lr, "_assert_authority", fence)
+    other = async_sessionmaker(db.bind, expire_on_commit=False)()
+    call = lambda d, i, s: lr.release_workspace(d, i, s, workspace_id=workspace_id, expected_leased_at=leased_at,
+                                               operation_id="rel-1", reason=REASON)
+    try:
+        item2 = await other.get(GithubWorkItem, item_id)
+        session2 = await other.get(MailAgentSession, session_id)
+        first = asyncio.ensure_future(call(db, a.item, a.leader_session))
+        await asyncio.wait_for(entered.wait(), 10)
+        a_marker = await other.scalar(select(GithubMaintenanceEvent.outcome).where(
+            GithubMaintenanceEvent.operation_id == "leader-recovery:release:rel-1"))
+        assert a_marker.startswith("executing:") and not a_marker.endswith(":u")
+        with pytest.raises(lr.LeaderRecoveryError) as refused:           # B adopts A's marker, then is refused at its fence
+            await call(other, item2, session2)
+        assert refused.value.code == "operator_hold"
+        assert (await other.scalar(select(GithubMaintenanceEvent.outcome).where(
+            GithubMaintenanceEvent.operation_id == "leader-recovery:release:rel-1"))).endswith(":u")   # B's adoption stands
+        gate.set()
+        completed = (await asyncio.gather(first, return_exceptions=True))[0]
+        assert isinstance(completed, dict) and completed["status"] == "released", completed
+        item2 = await other.get(GithubWorkItem, item_id, populate_existing=True)
+        session2 = await other.get(MailAgentSession, session_id, populate_existing=True)
+        replay = await call(other, item2, session2)                      # a later exact replay
+    finally:
+        await other.close()
+    assert replay["status"] == "already_released"
+    assert revoker.await_count == 1                                      # only A's revoker ran
+    assert len(await _release_audits(db)) == 1 and len(await _notices(db)) == 1
+    assert await _claim_outcome(db) == "done:" + a_marker.removeprefix("executing:")   # A's own done row
