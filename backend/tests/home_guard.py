@@ -199,10 +199,10 @@ class Guard:
                     finally:
                         os.close(inner)
 
-    def _walk_root(self, label, path, entries):
+    def _walk_root(self, label, open_root, entries):
         found = {}
         try:
-            descriptor = _open_directory(path)              # a symlink in any component fails: something was swapped
+            descriptor = open_root()                        # a symlink in any component fails: something was swapped
         except OSError:
             entries[label] = UNREADABLE
             return
@@ -217,11 +217,44 @@ class Guard:
         finally:
             os.close(descriptor)
 
+    def _snapshot_home(self, home, entries):
+        """The Synth City names in one real home. The home is opened once without following a symlink in any
+        component; it is listed, and every entry is read and opened relative to that descriptor, never by path."""
+        try:
+            home_descriptor = _open_directory(home)
+        except FileNotFoundError:                           # no such home; a symlink or a file in its place is reported
+            return
+        except OSError:
+            entries[home] = UNREADABLE
+            return
+        try:
+            with os.scandir(home_descriptor) as listing:
+                names = [entry.name for entry in listing if entry.name.startswith(PREFIXES)]
+            for name in names:
+                path = os.path.join(home, name)
+                try:
+                    st = os.stat(name, dir_fd=home_descriptor, follow_symlinks=False)
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                except OSError:
+                    entries[path] = UNREADABLE
+                    continue
+                entries[path] = _record(st)
+                if name in PREFIXES and stat.S_ISDIR(st.st_mode):
+                    self._walk_root(path, lambda name=name: os.open(name, _DIRECTORY, dir_fd=home_descriptor), entries)
+        except OSError:
+            entries[home] = UNREADABLE
+        finally:
+            os.close(home_descriptor)
+
     def snapshot(self):
         entries = {label: REFUSED for label in self.refused}
 
         def look(label, path):
-            """The metadata of a path, None when it is simply not there; any other failure is recorded, not skipped."""
+            """The metadata of a path, None when it is simply not there; any other failure is recorded, not skipped.
+
+            This is the one path-based call left, and it only reads the metadata of a named file or of a configured
+            root; nothing is listed or opened through it. Every directory that is listed is opened by descriptor."""
             try:
                 return os.stat(path, follow_symlinks=False)
             except (FileNotFoundError, NotADirectoryError):
@@ -231,22 +264,7 @@ class Guard:
                 return None
 
         for home in self.homes:
-            try:
-                with os.scandir(home) as listing:
-                    names = [entry.name for entry in listing if entry.name.startswith(PREFIXES)]
-            except (FileNotFoundError, NotADirectoryError):
-                continue
-            except OSError:
-                entries[home] = UNREADABLE
-                continue
-            for name in names:
-                path = os.path.join(home, name)
-                st = look(path, path)
-                if st is None:
-                    continue
-                entries[path] = _record(st)
-                if name in PREFIXES and stat.S_ISDIR(st.st_mode):
-                    self._walk_root(path, path, entries)
+            self._snapshot_home(home, entries)
         for label, path in self.files.items():
             st = look(label, path)
             if st is not None:
@@ -257,7 +275,7 @@ class Guard:
                 continue
             entries[label] = _record(st)
             if stat.S_ISDIR(st.st_mode):
-                self._walk_root(label, path, entries)
+                self._walk_root(label, lambda path=path: _open_directory(path), entries)
         return entries
 
 

@@ -273,7 +273,7 @@ def test_a_watched_root_swapped_for_a_symlink_after_the_metadata_read_is_not_tra
 
     def stat_then_swap(path, *args, **kwargs):
         result = real_stat(path, *args, **kwargs)
-        if str(path) == str(root) and not swapped:
+        if path == ".albiex-synth-city" and kwargs.get("dir_fd") is not None and not swapped:
             swapped.append(True)
             os.rename(root, home / "moved-away")
             os.symlink(home / ".claude", root)
@@ -341,20 +341,68 @@ def test_an_ancestor_of_a_configured_root_swapped_for_a_symlink_is_not_traversed
     assert not any("private-fixture" in key for key in result)
 
 
-def test_the_home_itself_swapped_for_a_symlink_after_the_metadata_read_is_not_traversed(world, tmp_path, monkeypatch):
+def test_a_home_swapped_for_a_symlink_before_the_listing_is_never_listed(world, monkeypatch):
+    """The review probe: the home is renamed and replaced by a link to its own .claude before snapshot()."""
     home, _ = world
-    root = home / ".albiex-synth-city"
-    root.mkdir()
+    (home / ".claude").mkdir()
+    (home / ".claude" / "private-fixture.json").write_text("{}")
+    guard = guard_for(world)
+    os.rename(home, home.parent / "moved-home")
+    os.symlink(home.parent / "moved-home" / ".claude", home)
+    counting = CountingScandir(os.scandir)
+    monkeypatch.setattr(home_guard.os, "scandir", counting)
+
+    result = guard.snapshot()
+
+    assert result[guard.homes[0]] == home_guard.UNREADABLE
+    assert not any("private-fixture" in key for key in result)
+    assert counting.pulled == 0                           # not one entry of the protected folder was read
+
+
+def _decoy(tmp_path):
     decoy = tmp_path / "decoy"
     (decoy / ".albiex-synth-city").mkdir(parents=True)
-    (decoy / ".albiex-synth-city" / "private-fixture.json").write_text("{}")
+    (decoy / ".albiex-synth-city" / "decoy-only.json").write_text("{}")
+    (decoy / ".albiex-synth-city-decoy-only").write_text("x")
+    return decoy
+
+
+def test_the_home_listing_comes_from_the_directory_that_was_opened_not_from_the_path_at_listing_time(world, tmp_path, monkeypatch):
+    home, _ = world
+    (home / ".albiex-synth-city").mkdir()
+    (home / ".albiex-synth-city-original-only").write_text("x")      # only the opened directory has this name
+    decoy = _decoy(tmp_path)
+    guard = guard_for(world)
+    real_scandir, swapped = os.scandir, []
+
+    def swap_then_scandir(target):
+        if not swapped:
+            swapped.append(True)                                   # the path is swapped just before the listing
+            os.rename(home, tmp_path / "home-moved")
+            os.symlink(decoy, home)
+        return real_scandir(target)
+
+    monkeypatch.setattr(home_guard.os, "scandir", swap_then_scandir)
+
+    result = guard.snapshot()
+
+    assert str(home / ".albiex-synth-city") in result
+    assert str(home / ".albiex-synth-city-original-only") in result          # listed from the opened directory
+    assert not any("decoy-only" in key for key in result)
+
+
+def test_a_home_entry_is_opened_from_the_home_descriptor_even_if_the_home_path_is_swapped_after_the_listing(world, tmp_path, monkeypatch):
+    home, _ = world
+    (home / ".albiex-synth-city").mkdir()
+    (home / ".albiex-synth-city" / "inner.txt").write_text("x")
+    decoy = _decoy(tmp_path)
     guard = guard_for(world)
     real_stat, swapped = os.stat, []
 
     def stat_then_swap(path, *args, **kwargs):
         result = real_stat(path, *args, **kwargs)
-        if str(path) == str(root) and not swapped:
-            swapped.append(True)
+        if path == ".albiex-synth-city" and kwargs.get("dir_fd") is not None and not swapped:
+            swapped.append(True)                                   # after the listing, before the root is opened
             os.rename(home, tmp_path / "home-moved")
             os.symlink(decoy, home)
         return result
@@ -363,8 +411,8 @@ def test_the_home_itself_swapped_for_a_symlink_after_the_metadata_read_is_not_tr
 
     result = guard.snapshot()
 
-    assert result[str(root)] == home_guard.UNREADABLE
-    assert not any("private-fixture" in key for key in result)
+    assert str(home / ".albiex-synth-city" / "inner.txt") in result          # read from the directory that was opened
+    assert not any("decoy-only" in key for key in result)
 
 
 @pytest.mark.parametrize("line,expected", [
