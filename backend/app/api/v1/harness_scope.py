@@ -41,21 +41,28 @@ def _describe(name: str, home: Path, is_controller: bool, is_default: bool) -> H
     )
 
 
-def current_scope(data_dir: Path | None = None) -> ScopeInfo:
+def current_scope(data_dir: Path | None = None, *, data_only: bool = False) -> ScopeInfo:
     """Which user's home this request read, and whether what the view reads can be listed (#1066).
 
     `data_dir` is the folder the view lists (projects, plans, the Codex home), always one derived from the scoped
     home, never a path the request chose. When it exists but cannot be listed, `readable` is False: the answer is
     "cannot read", not "empty". The same os.access rule as /harness-scope decides the `.claude` part.
+
+    `data_only` is for a view that does not read `.claude` at all (the Codex plans): its readability is the data
+    folder's alone, with the home as the probe while that folder does not exist yet. `claude_dir` and `exists` still
+    describe the user's `.claude`.
     """
     home = get_user_home()
     claude_dir = home / ".claude"
     user = next((u.name for u in scope_users() if u.home == home), controller_user_name())
     try:
         exists = claude_dir.exists()
-        readable = os.access(claude_dir if exists else home, os.R_OK | os.X_OK)
-        if readable and data_dir is not None and data_dir.exists():
-            readable = os.access(data_dir, os.R_OK | os.X_OK)
+        if data_only and data_dir is not None:
+            readable = os.access(data_dir if data_dir.exists() else home, os.R_OK | os.X_OK)
+        else:
+            readable = os.access(claude_dir if exists else home, os.R_OK | os.X_OK)
+            if readable and data_dir is not None and data_dir.exists():
+                readable = os.access(data_dir, os.R_OK | os.X_OK)
     except OSError:
         exists, readable = False, False
     return ScopeInfo(user=user, claude_dir=str(claude_dir), exists=exists, readable=readable)

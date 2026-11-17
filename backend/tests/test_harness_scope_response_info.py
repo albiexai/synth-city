@@ -147,6 +147,49 @@ async def test_a_configured_plans_folder_that_cannot_be_listed_is_never_inspecte
     assert body["scope"] == expected_scope(path_utils.controller_user_name(), data.controller)   # not judged: readable
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("who", ["controller", "agent"])
+async def test_codex_plans_are_judged_by_the_codex_folder_not_by_an_unrelated_claude_folder(data, client, who):
+    """V1's finding: readable Codex data was reported unreadable because .claude, which that view never reads, was not."""
+    if os.geteuid() == 0:
+        pytest.skip("root can read everywhere")
+    user = path_utils.controller_user_name() if who == "controller" else AGENT
+    home = data.controller if who == "controller" else data.agent
+    claude = home / ".claude"
+    claude.chmod(0o000)
+    try:
+        body = await read(client, "/plans?provider=codex-cli", user)
+    finally:
+        claude.chmod(0o755)
+
+    assert [p["title"] for p in body["plans"]] != []                       # the response carries real Codex plans
+    assert body["scope"] == expected_scope(user, home, exists=True, readable=True)   # so they are readable
+
+
+@pytest.mark.asyncio
+async def test_a_missing_codex_folder_is_empty_and_readable_not_unreadable(data, client):
+    shutil.rmtree(data.controller / ".codex")
+
+    body = await read(client, "/plans?provider=codex-cli", path_utils.controller_user_name())
+
+    assert body["plans"] == [] and body["scope"]["readable"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_claude_plans_view_still_depends_on_the_claude_folder(data, client):
+    """No change to the four Claude-side views: their data lives under .claude, so an unreadable one still fails."""
+    if os.geteuid() == 0:
+        pytest.skip("root can read everywhere")
+    claude = data.controller / ".claude"
+    claude.chmod(0o000)
+    try:
+        response = await client.get(API + "/plans", headers={HEADER: path_utils.controller_user_name()})
+    finally:
+        claude.chmod(0o755)
+
+    assert response.status_code == 500
+
+
 # ---- what existed before is unchanged ----------------------------------------------------------------------------------------
 
 
