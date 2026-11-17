@@ -289,7 +289,7 @@ u._write = cut
     assert len(paths) == len(set(paths)) == len(list((install.home / '.albiex-synth-city/backups').glob('provider-upgrade-*.zip')))
 
 
-@pytest.mark.parametrize("defect", ["server_name", "missing_tool", "extra_tool", "duplicate_tool"])
+@pytest.mark.parametrize("defect", ["server_name", "missing_tool", "extra_tool", "duplicate_tool", "changed_schema"])
 def test_t_i1_protocol_failure_is_incomplete_until_the_actual_shipped_shim_verifies(tmp_path, defect):
     install = provision(tmp_path / "install")
     shim = install.app_dir / "mcp_shim/agent_mail_server.py"
@@ -302,6 +302,11 @@ def test_t_i1_protocol_failure_is_incomplete_until_the_actual_shipped_shim_verif
         broken = original.replace('if __name__ == "__main__":',
             '@mcp.tool()\ndef synth_city_unexpected_probe_tool():\n    return {"ok": False}\n\n'
             'if __name__ == "__main__":')
+    elif defect == "changed_schema":
+        # #1146: the same names and count, but one parameter's type differs from the deployed snapshot.
+        broken = original.replace(
+            'def synth_city_extend_effort_limit(\n    work_item_id: int,\n    dispatch_nonce: str,\n    minutes: int,',
+            'def synth_city_extend_effort_limit(\n    work_item_id: int,\n    dispatch_nonce: str,\n    minutes: str,')
     else:
         # Preserve the exact set while duplicating a wire entry. The count
         # guard must independently refuse this actual tools/list response.

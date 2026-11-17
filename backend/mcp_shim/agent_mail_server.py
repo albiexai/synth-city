@@ -1,6 +1,7 @@
 """Albiex Synth City Agent Mail MCP server over stdio."""
 import asyncio
 import hashlib
+import json
 import os
 import sys
 import threading
@@ -248,9 +249,14 @@ def _bridge_session_path(target: str) -> str:
 
 
 def tool_catalog_fingerprint() -> str:
-    """A short digest of the tool names this shim registered (the backend computes the same digest of its list)."""
-    names = sorted({tool.name for tool in mcp._tool_manager.list_tools()})
-    return hashlib.sha256("\n".join(names).encode()).hexdigest()[:32]
+    """A short digest of the public tools this shim registered and their input schemas (#1146).
+
+    The same digest as the backend's tool_catalog.catalog_fingerprint: one sorted "name<TAB>canonical schema JSON" line
+    per tool, so a parameter changed under an unchanged name makes a session that loaded the older schema stale.
+    """
+    lines = sorted(f"{tool.name}\t{json.dumps(tool.parameters, sort_keys=True, separators=(',', ':'))}"
+                   for tool in mcp._tool_manager.list_tools() if tool.name.startswith("synth_city_"))
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()[:32]
 
 
 def _ensure_registered() -> dict:
