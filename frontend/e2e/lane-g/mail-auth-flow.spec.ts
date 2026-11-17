@@ -75,10 +75,23 @@ test('@active Agent Mail waits for the shared Director key, and asks only when t
   await expect(page.getByText('Enter the Director key to see Agent Mail')).toBeVisible()
   await expect(page.getByRole('dialog', { name: /Director key/i })).toBeHidden()
   expect(reads).toEqual([])
-  await page.getByRole('button', { name: 'Enter key' }).click()
   await enterDirectorKey(page)
   await expect(page.getByRole('tab', { name: 'Team', exact: true })).toBeVisible()
   await expect.poll(() => reads.length).toBeGreaterThan(0)
+})
+
+test('@active Agent Mail key dialog stays closed while the status is delayed, and opens only through the helper', async ({ page }) => {
+  const dialog = page.getByRole('dialog', { name: /Director key/i })
+  await page.route('**/api/v1/agent-mail/authentication-status', async route => {
+    await new Promise<void>(resolve => { setTimeout(resolve, 2000) })
+    await route.continue()
+  })
+  await page.goto('/agent-mail')
+  await expect(dialog).toBeHidden()
+  await expect(page.getByText('Enter the Director key to see Agent Mail')).toBeVisible()
+  await expect(dialog).toBeHidden()
+  await enterDirectorKey(page)
+  await expect(page.getByRole('tab', { name: 'Team', exact: true })).toBeVisible()
 })
 
 
