@@ -116,10 +116,6 @@ The session transcript viewer was inspired by and includes code adapted from [cl
 
 The usage tracking feature ports algorithms from [ccusage](https://github.com/ryoppippi/ccusage) by [ryoppippi](https://github.com/ryoppippi), including session block identification, tiered pricing, and burn rate projections.
 
-## Disclaimer
-
-Synth City is a community project and is not affiliated with or endorsed by Anthropic.
-
 ## License
 
 MIT License
