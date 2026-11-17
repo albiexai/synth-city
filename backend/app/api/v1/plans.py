@@ -68,7 +68,9 @@ async def list_plans(
             plans_dir = _claude_plans_dir(project_path)
             plans = PlanService.list_plans(plans_dir)
             # Judge readability by the home's own plans folder only, never by a configured one (see _claude_plans_dir).
-            data_dir = plans_dir if plans_dir == get_claude_plans_dir() else None
+            # The folder handed on is the home's own, not plans_dir: plans_dir can come from the request.
+            home_plans = get_claude_plans_dir()
+            data_dir = home_plans if plans_dir == home_plans else None
         return {"plans": plans, "total": len(plans), "scope": current_scope(data_dir)}
     except HTTPException:
         raise
