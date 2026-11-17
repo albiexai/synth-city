@@ -618,6 +618,25 @@ async def test_a_stalled_item_with_a_pending_commit_status_stays_with_a_human(db
     assert len(await _ready_messages(db)) == 1
 
 
+@pytest.mark.parametrize("state", ["failure", "error", "success"])
+@pytest.mark.asyncio
+async def test_a_stalled_item_is_offered_again_only_when_its_commit_statuses_succeeded(db, clock, state):
+    scope, item, client = await _stalled(db, clock)
+    note = item.status_note
+    client.check_runs = SUCCESS + [DONE]
+    client.combined_status = {
+        "state": state, "total_count": 1, "statuses": [{"context": "external-security", "state": state}]}
+    clock.now += timedelta(minutes=5)
+    await _poll(db, scope, client, times=2)
+    await db.refresh(item)
+    if state == "success":
+        assert item.dispatch_status == "merged" and client.merge_head_shas == [HEAD]
+    else:  # a red status is not a cause that cleared: the fallback stays, with no merge and no new notice
+        assert item.status_note == note and client.merge_calls == 0
+        assert not item.status_note.startswith("Auto-merge offered again")
+    assert len(await _ready_messages(db)) == 1
+
+
 @pytest.mark.parametrize("moved", ["pull", "verified"])
 @pytest.mark.asyncio
 async def test_a_stalled_item_whose_head_moved_is_not_offered_again(db, clock, moved):

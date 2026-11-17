@@ -3445,6 +3445,9 @@ class GithubVerificationService:
             status = await client.get_combined_status_for_ref(scope.repo_owner, scope.repo_name, head)
             if self._pending_merge_checks(checks, status, head):
                 return None
+            # A finished red status is neither pending nor a check run; any status present must have succeeded.
+            if (status.get("total_count") or status.get("statuses")) and status.get("state") != "success":
+                return None
             if not await self._head_is_green(scope, client, head, item=item):
                 return None
             return f"Auto-merge offered again: the checks on head {head} finished."
