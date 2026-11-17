@@ -75,7 +75,7 @@ export function useAgentMailAuthenticationStatus() {
 /** The Agent Mail install status, the fallback snippets on demand, and the Set up and Remove actions. */
 export function useAgentMailSetup() {
   const { directorKeyConfigured, requiresDirectorKey, readAuthenticationStatus } = useAgentMailAuthenticationStatus()
-  const { requestToken, tokenDialog } = useOperatorTokenFlow('Agent Mail requires the Director key.')
+  const { requestToken, tokenDialog } = useOperatorTokenFlow('to set up Agent Mail')
   const protectedReadsBlocked = useRef(false)
   const refusedKey = useRef<string | null>(null)
   const loadPromise = useRef<Promise<void> | null>(null)

@@ -71,16 +71,18 @@ function renderPage() {
 }
 
 describe('Agent Mail Team list while the Director key is needed', () => {
-  it('names the Director key while the dialog is open, not a loading label', async () => {
+  it('names the Director key on load without opening a dialog, not a loading label', async () => {
     renderPage()
-    await screen.findByRole('dialog', { name: 'Director key' })
-    expect(screen.getByText(KEY_MESSAGE)).toBeInTheDocument()
+    expect(await screen.findByText(KEY_MESSAGE)).toBeInTheDocument()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     expect(screen.queryByText(LOADING_LABEL)).not.toBeInTheDocument()
     expect(fetchAgentMailTeam).not.toHaveBeenCalled()
   })
 
   it('keeps the key message after the dialog is dismissed, with a button that reopens it', async () => {
     renderPage()
+    await screen.findByText(KEY_MESSAGE)
+    fireEvent.click(screen.getByRole('button', { name: 'Enter the Director key' }))
     const dialog = await screen.findByRole('dialog', { name: 'Director key' })
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     await waitFor(() => expect(dialog).not.toBeInTheDocument())
@@ -95,9 +97,8 @@ describe('Agent Mail Team list while the Director key is needed', () => {
 
   it('loads the participants and drops the key message once a key is supplied', async () => {
     renderPage()
-    await screen.findByRole('dialog', { name: 'Director key' })
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Enter the Director key' }))
+    await screen.findByText(KEY_MESSAGE)
+    fireEvent.click(screen.getByRole('button', { name: 'Enter the Director key' }))
     const dialog = await screen.findByRole('dialog', { name: 'Director key' })
     fireEvent.change(dialog.querySelector('input')!, { target: { value: 'fresh-director-key' } })
     fireEvent.click(screen.getByRole('button', { name: 'Use key' }))
@@ -119,11 +120,12 @@ describe('Agent Mail Team list while the Director key is needed', () => {
 
 describe('Agent Mail loading state after an early return', () => {
   it('leaves loading false when the protected reads return early', async () => {
-    setOperatorToken('director-key-for-the-first-check')
     vi.mocked(useOperatorTokenFlow).mockImplementation(() => flowThatLosesTheKey)
     renderPage()
-    // The key is gone when the reads start, so loadOperationalData and loadInstallData return early.
-    expect(await screen.findByText('No participants match the current filters.')).toBeInTheDocument()
+    const enter = await screen.findByRole('button', { name: 'Enter the Director key' })
+    // The key is cleared as it is given, so refreshAll returns before any protected read starts.
+    await act(async () => { fireEvent.click(enter) })
+    expect(screen.getByText(KEY_MESSAGE)).toBeInTheDocument()
     expect(screen.queryByText(LOADING_LABEL)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled()
     expect(fetchAgentMailTeam).not.toHaveBeenCalled()
