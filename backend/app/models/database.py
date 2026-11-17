@@ -1133,6 +1133,8 @@ class FactoryAuditEvent(Base):
     actor_member_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     actor_session_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     actor_reference: Mapped[str | None] = mapped_column(String, nullable=True)
+    # #945: how an operator-key write reached the server (ui, mail_tool or api); empty for older events.
+    via: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # Deletion-safe live references. ON DELETE SET NULL keeps the event and
     # its snapshots after guard-permitted deletion; events never cascade

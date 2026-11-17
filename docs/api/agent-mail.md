@@ -329,9 +329,27 @@ merge, and dirty or unknown-state releases remain operator-only. These tools gra
 A refused cancel or finalize that committed nothing frees its `operation_id` for a corrected request. The id is
 freed by one statement that also proves no effect committed, and every execution that rests on the id re-checks
 inside its own transaction that the id still holds its request, so a refused caller cannot erase a winner's record
-or let a conflicting request commit. A HOLD that arrives during these checks stops the action. A release keeps its
-id once it passed the final check, because the credential revoker may have run; repeat the same request to
-replay it, and use a new `operation_id` for a corrected request.
+or let a conflicting request commit. A HOLD that arrives during these checks stops the action.
+
+A release commits an execution marker on its id before any external effect can start. The id is freed for a
+corrected request only when that attempt provably never started the credential revoker, that is, the final
+authority check refused it before the first external step. Once the revoker may have run (it failed, its result
+is unknown, or the process stopped), the id stays bound to the exact request: a corrected request is refused as
+`operation_conflict` and the same request retries. A retry that adopts such a marker inherits its uncertainty, so
+a later attempt that is refused before its own revoker still cannot free the id. A plain legacy claim from the
+earlier interim is read the same way. The retry is guarded and can fail: if the revoker refuses, the response is
+its error (503), the id stays bound, the lease stays, and no success notice is sent. Use a new `operation_id` only
+after the operator confirms the earlier attempt's effect.
+A release records its outcome on the id's ledger row. A new release claim is `claimed:r2`; the attempt moves it to
+`executing:<attempt>` before any external step, and the row becomes `done:<attempt>` in the same transaction that
+clears the lease and records the release audit, so a committed release always has its done row. The success notice
+is sent only when the row is that attempt's own done row. A replay (an exact repeat that did not run the release)
+answers `already_released`, with the one keyed notice, only when the row of its `operation_id` holds the exact
+request and is a done row. A plain `claimed` row, which only the earlier interim wrote, may answer the same way
+once the release is committed (the historical exception). An executing row, a clean `claimed:r2` row, a missing
+row or another request is refused (`recovery_context_changed`) and sends nothing. Limit: the committed release
+audit belongs to the lease, so a legacy plain `claimed` row cannot be told apart from a release that another
+operation id made; that row is answered as released.
 
 ### Continuation phases
 
