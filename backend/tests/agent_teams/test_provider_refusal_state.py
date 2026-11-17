@@ -23,6 +23,7 @@ from app.services.agent_team_supervisor_service import (
 )
 
 from tests.agent_teams.test_native_input_wait import record_wait, wait_team
+from tests.agent_teams.test_provider_refusal_notice import generic_notices, refusal_notices
 
 SCREENS = Path(__file__).resolve().parents[1] / "fixtures/native_screens"
 REFUSAL = "provider_refusal"
@@ -122,53 +123,28 @@ def test_an_unknown_reason_and_an_extra_field_are_still_refused(model):
 @pytest.mark.parametrize("supervised", [True, False])
 async def test_the_refusal_is_recorded_once_per_episode_and_clears_with_the_screen(db, supervised):
     team, actor, slot, binding, _, leader = await wait_team(db, supervised=supervised)
+    per_episode = 2 if supervised else 1                      # Leader and Supervisor, or the Leader alone
 
     await record_wait(db, team, slot, binding, REFUSAL)
     await db.refresh(binding)
     assert binding.waiting_input_reason == REFUSAL
-    first = (await db.scalars(select(MailMessage))).all()
-    assert len(first) == 1
-    notice = first[0]
-    assert notice.subject == "Waiting for input" and notice.payload["reason"] == REFUSAL
-    assert "provider refusal" in notice.body_markdown and "waits for input" not in notice.body_markdown
-    assert "synthetic/project" not in notice.body_markdown
+    first = await refusal_notices(db)
+    assert len(first) == per_episode
+    for notice in first:                                      # the refusal has its own notice, not the generic one
+        assert notice.subject == "Provider refusal" and notice.payload["notice"] == REFUSAL
+        assert "provider refusal" in notice.body_markdown and "waits for input" not in notice.body_markdown
+        assert "synthetic/project" not in notice.body_markdown
+    assert await generic_notices(db) == []
 
     await record_wait(db, team, slot, binding, REFUSAL)              # the same episode: no second notice
-    assert len((await db.scalars(select(MailMessage))).all()) == 1
+    assert len(await refusal_notices(db)) == per_episode
 
     await record_wait(db, team, slot, binding, "clear")              # the screen moved on
     await db.refresh(binding)
     assert binding.waiting_input_reason is None
 
     await record_wait(db, team, slot, binding, REFUSAL)              # a new episode
-    assert len((await db.scalars(select(MailMessage))).all()) == 2
-
-
-@pytest.mark.asyncio
-async def test_the_refusal_notice_reaches_the_bound_supervisors_real_inbox_and_thread_gate(db):
-    """A raw row is not delivery. The Supervisor reads through supervisor_inbox and require_supervisor_thread."""
-    team, actor, slot, binding, _, _ = await wait_team(db, supervised=True)
-    await record_wait(db, team, slot, binding, REFUSAL)
-    notice = (await db.scalars(select(MailMessage))).one()
-
-    inbox = await supervisor_inbox(db, actor)
-
-    assert [m.id for m in inbox if m.id == notice.id] == [notice.id]
-    assert is_supervisor_message(notice) is True
-    await require_supervisor_thread(db, actor, notice)
-    with pytest.raises(PermissionError):
-        await supervisor_inbox(db, SimpleNamespace(id=actor.id + 99))
-
-
-@pytest.mark.asyncio
-async def test_the_widened_notice_gate_accepts_no_other_reason(db):
-    team, actor, slot, binding, _, _ = await wait_team(db, supervised=True)
-    await record_wait(db, team, slot, binding, REFUSAL)
-    notice = (await db.scalars(select(MailMessage))).one()
-    other = SimpleNamespace(**{**{c.name: getattr(notice, c.name) for c in notice.__table__.columns},
-                               "payload": {**notice.payload, "reason": "something_else"}})
-
-    assert is_supervisor_message(other) is False
+    assert len(await refusal_notices(db)) == 2 * per_episode
 
 
 # ---- a refusal-blocked member stays ordinary idle -------------------------------------------------------------
@@ -271,6 +247,7 @@ async def test_the_summary_lists_a_refusal_but_does_not_treat_it_as_an_external_
 async def test_a_change_into_or_out_of_a_refusal_stores_the_new_reason_and_one_new_notice(db, supervised, first, second):
     """No clear observation in between: the periodic observation can go straight from one screen to the other."""
     team, actor, slot, binding, _, _ = await wait_team(db, supervised=supervised)
+    per_episode = 2 if supervised else 1
 
     await record_wait(db, team, slot, binding, first)
     await db.refresh(binding)
@@ -280,12 +257,14 @@ async def test_a_change_into_or_out_of_a_refusal_stores_the_new_reason_and_one_n
 
     assert binding.waiting_input_reason == second
     assert binding.waiting_input_notice_id not in (None, first_notice)
-    notices = (await db.scalars(select(MailMessage).order_by(MailMessage.id))).all()
-    assert [n.payload["reason"] for n in notices] == [first, second]
-    assert notices[-1].id == binding.waiting_input_notice_id
-    wording = "provider refusal" in notices[-1].body_markdown
-    assert wording is (second == REFUSAL)
-    assert "waits for input" not in notices[-1].body_markdown or second != REFUSAL
+    generic, refused = await generic_notices(db), await refusal_notices(db)
+    # A refusal has its own pair of notices; a wait for input has the generic one. Each episode wrote its own.
+    assert [n.payload["reason"] for n in generic] == [r for r in (first, second) if r != REFUSAL]
+    assert len(refused) == per_episode
+    newest = refused if second == REFUSAL else generic
+    assert binding.waiting_input_notice_id in [n.id for n in newest]
+    assert all("provider refusal" in n.body_markdown for n in refused)
+    assert all("waits for input" in n.body_markdown for n in generic)
 
 
 @pytest.mark.asyncio
@@ -295,7 +274,7 @@ async def test_a_repeat_after_a_category_change_adds_no_notice(db, first, second
     for reason in (first, second, second, second):
         await record_wait(db, team, slot, binding, reason)
 
-    assert len((await db.scalars(select(MailMessage))).all()) == 2
+    assert len(await generic_notices(db)) == 1 and len(await refusal_notices(db)) == 2
 
 
 @pytest.mark.asyncio
@@ -304,8 +283,8 @@ async def test_a_category_change_and_back_is_a_new_episode_each_time(db):
     for reason in ("question", REFUSAL, "question"):
         await record_wait(db, team, slot, binding, reason)
 
-    assert [n.payload["reason"] for n in (await db.scalars(select(MailMessage).order_by(MailMessage.id))).all()] == [
-        "question", REFUSAL, "question"]
+    assert [n.payload["reason"] for n in await generic_notices(db)] == ["question", "question"]
+    assert len(await refusal_notices(db)) == 2
 
 
 @pytest.mark.asyncio
@@ -322,13 +301,13 @@ async def test_a_change_between_external_waits_still_keeps_the_first_reason_and_
 
 
 @pytest.mark.asyncio
-async def test_the_notice_after_a_category_change_reaches_the_supervisors_real_inbox_and_thread_gate(db):
+async def test_the_notice_after_a_change_out_of_a_refusal_reaches_the_supervisors_real_inbox_and_thread_gate(db):
     team, actor, slot, binding, _, _ = await wait_team(db, supervised=True)
-    await record_wait(db, team, slot, binding, "question")
     await record_wait(db, team, slot, binding, REFUSAL)
-    notice = (await db.scalars(select(MailMessage).order_by(MailMessage.id.desc()))).first()
+    await record_wait(db, team, slot, binding, "question")
+    notice = (await generic_notices(db))[0]
 
-    assert notice.payload["reason"] == REFUSAL
+    assert notice.payload["reason"] == "question"
     assert notice.id in [m.id for m in await supervisor_inbox(db, actor)]
     assert is_supervisor_message(notice) is True
     await require_supervisor_thread(db, actor, notice)
