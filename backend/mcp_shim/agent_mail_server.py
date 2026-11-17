@@ -758,11 +758,18 @@ def synth_city_extend_effort_limit(
     dispatch_nonce: str,
     minutes: int,
     reason: str,
+    expected_extension_minutes: int,
+    evidence: str,
 ) -> dict:
     """Leader only: extend a work item's effort limit once, by at most 30 minutes or 25 percent of the limit.
 
     The limit and its ledger are advisory elapsed working time from the system, not the owner's reported active
     effort. The extension changes no expiry, nonce, lease or status. The owner asks for it by Mail.
+
+    expected_extension_minutes is the extension total you saw in the item's effort (0 before any extension). A call
+    whose total is no longer the recorded one is refused with effort_extension_total_changed and grants nothing, so a
+    repeated call never extends twice. evidence is the work so far that supports the extension; it is recorded with
+    the reason.
     """
     err = _guard()
     if err:
@@ -775,6 +782,8 @@ def synth_city_extend_effort_limit(
             "dispatch_nonce": dispatch_nonce,
             "minutes": minutes,
             "reason": reason,
+            "expected_extension_minutes": expected_extension_minutes,
+            "evidence": evidence,
         },
     )
     if not result["ok"]:

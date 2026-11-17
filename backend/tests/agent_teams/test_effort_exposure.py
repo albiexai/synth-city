@@ -252,7 +252,8 @@ async def test_a_ceiling_lowered_by_another_connection_after_the_scope_was_loade
         await _ceiling(fx, 110)  # a second connection, committed before the extension starts
         with pytest.raises(EffortLimitError) as caught:
             await service.extend(session, work_item_id=fx.item_id, dispatch_nonce=fx.nonce, leader_member_id=fx.leader,
-                                 minutes=15, reason="healthy", now=T0)
+                                 minutes=15, reason="healthy",
+                                 expected_extension_minutes=0, evidence="tests pass", now=T0)
     assert caught.value.code == "extension_exceeds_cap" and "110" in str(caught.value)
     async with fx.maker() as db:
         item = await _item(fx, db)
@@ -268,5 +269,6 @@ async def test_a_ceiling_raised_by_another_connection_after_the_scope_was_loaded
         assert cached.max_item_effort_minutes == 110
         await _ceiling(fx, 480)
         result = await service.extend(session, work_item_id=fx.item_id, dispatch_nonce=fx.nonce,
-                                      leader_member_id=fx.leader, minutes=15, reason="healthy", now=T0)
+                                      leader_member_id=fx.leader, minutes=15, reason="healthy",
+                                 expected_extension_minutes=0, evidence="tests pass", now=T0)
     assert result["effective_limit_minutes"] == 115

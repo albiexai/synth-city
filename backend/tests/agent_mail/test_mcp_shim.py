@@ -1521,8 +1521,12 @@ def test_the_leader_extension_tool_posts_one_request_and_changes_nothing_else(mo
         return {"ok": True, "data": {"extension_minutes": 15, "effective_limit_minutes": 75, "repeated": False}}
 
     monkeypatch.setattr(shim, "_request", fake_request)
-    answer = shim.synth_city_extend_effort_limit(19, "nonce-19", 15, "healthy and close to done")
+    answer = shim.synth_city_extend_effort_limit(19, "nonce-19", 15, "healthy and close to done", 0,
+                                                 "4 of 5 tests green")
     assert answer == {"ok": True, "extension_minutes": 15, "effective_limit_minutes": 75, "repeated": False}
     assert calls == [("POST", "/effort-extensions", {"json": {
-        "work_item_id": 19, "dispatch_nonce": "nonce-19", "minutes": 15, "reason": "healthy and close to done"}})]
+        "work_item_id": 19, "dispatch_nonce": "nonce-19", "minutes": 15, "reason": "healthy and close to done",
+        "expected_extension_minutes": 0, "evidence": "4 of 5 tests green"}})]
+    doc = " ".join(shim.synth_city_extend_effort_limit.__doc__.split())
+    assert "expected_extension_minutes" in doc and "evidence" in doc
     assert "not the owner's reported active effort" in " ".join(shim.synth_city_extend_effort_limit.__doc__.split())
