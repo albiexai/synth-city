@@ -167,6 +167,20 @@ async def test_other_branch_merge_is_done_and_disclosed_and_parent_is_never_coun
 
 
 @pytest.mark.asyncio
+async def test_a_merge_without_a_recorded_base_is_done_but_not_claimed_as_another_branch(db, monkeypatch):
+    # dispatch_base_ref was added without a backfill, so historical merged rows can have none. Such a row is done,
+    # and only a recorded base that differs is evidence of another branch (V1 review 5945503487).
+    team, scope, items, summary = await fixed_campaign(db, monkeypatch, ("merged", "completed", "merged"))
+    items[0].dispatch_base_ref = None
+    items[2].dispatch_base_ref = "origin/known-other"
+    await db.commit()
+    await observe_backlog(db, scope, summary, Backlog([issue(1, "No base"), issue(2, "Completed"), issue(3, "Other")]))
+    result = await summary.summary(db, team.id)
+    assert result.campaign.done_count == 3
+    assert result.campaign.done_on_other_branch_count == 1
+
+
+@pytest.mark.asyncio
 async def test_a_completed_item_counts_as_done(db, monkeypatch):
     # #1106 (U9): deck-website-plan's completed item was in no campaign bucket.
     team, scope, items, summary = await fixed_campaign(db, monkeypatch, ("completed", "merged", "pending"))

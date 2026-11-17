@@ -185,9 +185,11 @@ class AgentTeamCampaignService:
             scope = by_scope[row.scope_id]
             if is_done(row.dispatch_status):
                 # One definition of done in every view (#1106). A merge into a branch other than the scope's is still
-                # done; it is disclosed rather than dropped from every bucket.
+                # done; it is disclosed rather than dropped from every bucket. Only a recorded base is evidence of
+                # another branch: rows from before dispatch_base_ref existed have none and are not claimed.
                 done.append(row)
-                if row.dispatch_status == "merged" and _branch(row.dispatch_base_ref) != _branch(scope.base_ref):
+                merged_base = _branch(row.dispatch_base_ref)
+                if row.dispatch_status == "merged" and merged_base is not None and merged_base != _branch(scope.base_ref):
                     other_branch += 1
             elif row.dispatch_status in _STATE_PHRASES:
                 under_way.append(CampaignUnderWayItem(title=row.issue_title,
