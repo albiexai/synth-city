@@ -646,3 +646,45 @@ async def test_detection_does_not_wait_on_the_polls_own_open_transaction(ops):
         await caller.commit()  # the scheduler commits before it calls detection
         await ops.service.record_admissions(seeded.scope_id, {9})
     assert await _findings(ops) == []
+
+
+# ---- #1080: a skipped verifying item clears both findings on its own once its PR merges ----
+
+@pytest.mark.asyncio
+async def test_a_skipped_item_whose_pr_merges_settles_and_both_findings_clear_on_their_own(ops):
+    from tests.agent_teams.test_github_verification_service import (
+        _Client as _PullClient, _implementation_revision, _item, _owner, _scope,
+    )
+    async with ops.maker() as db:
+        scope = await _scope(db)
+        slot, member = await _owner(db, scope)
+        item = await _item(db, scope, dispatch_status="verifying", pr_number=5, owner_slot_id=slot.id,
+                           dispatch_nonce="attempt-1", active_scope_revision=1, attempt_phase="implementation",
+                           ack_received_at=datetime.utcnow())
+        revision, _workspace = await _implementation_revision(db, scope, item, slot, member, status="submitted")
+        revision.status = "completed"  # WI190's shape: completed, but not a positive settlement (no completed time)
+        revision.completed_at = None
+        await db.commit()
+        scope_id, item_id = scope.id, item.id
+    client = _PullClient()
+    client.pull.update(state="open", merged=False, merged_at=None)
+
+    async def poll():
+        async with ops.maker() as db:
+            await github_verification_service.process_scope(db, await db.get(TeamGithubScope, scope_id), client=client)
+        await ops.service.record_verification_skips(scope_id, set(github_verification_service.skipped_item_ids))
+        await ops.service.sweep_verifying_after_merge(scope_id, "o", "r", client)
+
+    for _ in range(SKIPPED_POLLS):  # an open PR: the item is genuinely stuck and skipped poll after poll
+        await poll()
+    assert [f.work_item_id for f in await _findings(ops, ITEM_SKIPPED, "open")] == [item_id]
+
+    client.pull.update(state="closed", merged=True, merged_at="2026-11-14T04:12:07Z")  # merged at its submitted head
+    await ops.service.sweep_verifying_after_merge(scope_id, "o", "r", client)
+    assert [f.work_item_id for f in await _findings(ops, VERIFYING_AFTER_MERGE, "open")] == [item_id]
+
+    await poll()  # the next poll settles the merge, and both findings resolve with no operator action
+    async with ops.maker() as db:
+        assert await db.scalar(select(GithubWorkItem.dispatch_status).where(GithubWorkItem.id == item_id)) == "merged"
+    assert await _findings(ops, status="open") == []
+    assert {f.kind for f in await _findings(ops, status="resolved")} == {ITEM_SKIPPED, VERIFYING_AFTER_MERGE}
