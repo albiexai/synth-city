@@ -127,6 +127,7 @@ class FakePane:
     def __init__(self, monkeypatch, screens):
         self.calls, self.screens = [], list(screens)
         self.identity, self.alive = "%8|41000", True
+        self.after_capture, self.captures = {}, 0
         monkeypatch.setattr(unsent.subprocess, "run", self.run)
         monkeypatch.setattr(unsent.peer_process, "pane_is_alive", lambda pid, start: self.alive)
         monkeypatch.setattr(unsent.time, "sleep", lambda seconds: None)
@@ -138,7 +139,11 @@ class FakePane:
         if args[1] == "capture-pane":
             if isinstance(self.screens[0], Exception):
                 raise self.screens.pop(0)
-            return SimpleNamespace(returncode=0, stdout=self.screens.pop(0) if len(self.screens) > 1 else self.screens[0])
+            shown = self.screens.pop(0) if len(self.screens) > 1 else self.screens[0]
+            self.captures += 1
+            if self.captures in self.after_capture:
+                self.after_capture[self.captures]()  # the pane changes while the capture runs
+            return SimpleNamespace(returncode=0, stdout=shown)
         return SimpleNamespace(returncode=0, stdout="")
 
     @property
@@ -167,7 +172,7 @@ def test_the_identity_is_checked_before_each_capture_and_before_the_enter(monkey
     submit_unsent_wake_prompt(SESSION, pane_start="27")
 
     assert [call[1] for call in pane.calls] == [
-        "display-message", "capture-pane", "display-message", "capture-pane", "send-keys"]
+        "display-message", "capture-pane", "display-message", "capture-pane", "display-message", "send-keys"]
 
 
 @pytest.mark.parametrize("provider,idle", [("claude-code", CLAUDE_IDLE), ("codex-cli", CODEX_IDLE)])
@@ -263,3 +268,85 @@ def test_an_input_box_that_has_scrolled_up_is_not_the_active_box(provider, text)
     """Lots of output below it means the box is scrollback, not the input line the member would send."""
     scrolled = text.rstrip("\n") + "\n" + "\n".join(f"output line {n}" for n in range(12)) + "\n"
     assert unsent_wake_prompt_visible(provider, scrolled) is False
+
+
+# ---- review 5939012062 on 146a06ab -------------------------------------------
+
+
+def test_a_pane_process_that_changes_during_the_second_capture_gets_no_enter(monkeypatch):
+    pane = FakePane(monkeypatch, [CLAUDE_UNSENT, CLAUDE_UNSENT])
+    pane.after_capture[2] = lambda: setattr(pane, "identity", "%8|52000")
+
+    assert submit_unsent_wake_prompt(SESSION, pane_start="27") is False
+    assert pane.keys == []
+
+
+def test_a_pane_that_dies_during_the_second_capture_gets_no_enter(monkeypatch):
+    pane = FakePane(monkeypatch, [CLAUDE_UNSENT, CLAUDE_UNSENT])
+    pane.after_capture[2] = lambda: setattr(pane, "alive", False)
+
+    assert submit_unsent_wake_prompt(SESSION, pane_start="27") is False
+    assert pane.keys == []
+
+
+def test_a_transport_guard_withdrawn_during_the_second_capture_gets_no_enter(monkeypatch):
+    pane = FakePane(monkeypatch, [CLAUDE_UNSENT, CLAUDE_UNSENT])
+    asked = []
+
+    def guard():
+        asked.append(1)
+        return len(asked) < 3  # allowed before each capture, withdrawn after the second one
+
+    assert submit_unsent_wake_prompt(SESSION, pane_start="27", transport_guard=guard) is False
+    assert len(asked) == 3
+    assert pane.keys == []
+
+
+def codex_history_without_composer() -> str:
+    """V1's counterexample: the submitted prompt, the response and the elapsed-time line, no composer."""
+    lines = screen("codex-submitted-wake-prompt-in-history.txt").split("\n")
+    cut = next(i for i, line in enumerate(lines) if line.startswith("› Ask Codex"))
+    return "\n".join(lines[:cut]).rstrip("\n") + "\n"
+
+
+def test_a_codex_screen_without_an_active_composer_is_not_detected():
+    assert unsent_wake_prompt_visible("codex-cli", codex_history_without_composer()) is False
+
+
+@pytest.mark.parametrize("name,screen_text", [
+    ("no footer", "\n".join(CODEX_UNSENT.split("\n")[:-2]) + "\n"),
+    ("extra line after the footer", CODEX_UNSENT.rstrip("\n") + "\n  one more status line\n"),
+    ("output after the box", CODEX_UNSENT.replace("\n\n  GPT-6-Astra", "\n\n• Working\n\n  GPT-6-Astra")),
+    ("a footer that is not a status line", CODEX_UNSENT.replace("  GPT-6-Astra high · /home/…  ⚠ 1 warning · f2 to view", "just some text")),
+    ("no blank line before the footer", CODEX_UNSENT.replace("\n\n  GPT-6-Astra", "\n  GPT-6-Astra")),
+], ids=["no-footer", "extra-line-after-footer", "output-after-box", "footer-not-a-status-line", "no-blank-before-footer"])
+def test_an_incomplete_or_unknown_codex_screen_fails_closed(name, screen_text):
+    assert screen_text != CODEX_UNSENT
+    assert unsent_wake_prompt_visible("codex-cli", screen_text) is False
+
+
+def test_a_claude_box_with_a_long_tail_is_not_the_active_box():
+    tail = "\n".join(f"  line {n}" for n in range(4))
+    assert unsent_wake_prompt_visible("claude-code", CLAUDE_UNSENT.rstrip("\n") + "\n" + tail + "\n") is False
+
+
+@pytest.mark.parametrize("provider,text,marker", [
+    pytest.param("claude-code", CLAUDE_UNSENT, "✻ Thinking… (esc to interrupt)", id="claude-thinking"),
+    pytest.param("claude-code", CLAUDE_UNSENT, "· Working (12s · Esc to interrupt)", id="claude-working-capital-esc"),
+    pytest.param("codex-cli", CODEX_UNSENT, "• Working (3s • esc to interrupt)", id="codex-working"),
+])
+def test_a_busy_screen_fails_closed(provider, text, marker):
+    lines = text.split("\n")
+    box = max(i for i, line in enumerate(lines) if line.startswith(("❯", "›")))
+    top = box - 1 if provider == "claude-code" else box
+    busy = "\n".join(lines[:top] + [marker] + lines[top:])
+
+    assert unsent_wake_prompt_visible(provider, text) is True
+    assert unsent_wake_prompt_visible(provider, busy) is False
+
+
+@pytest.mark.parametrize("provider,text", [
+    pytest.param("claude-code", CLAUDE_UNSENT, id="claude"), pytest.param("codex-cli", CODEX_UNSENT, id="codex")])
+def test_an_old_busy_line_far_up_the_scrollback_does_not_block_detection(provider, text):
+    old = "✻ Thinking… (esc to interrupt)\n" + "\n".join(f"history {n}" for n in range(30)) + "\n"
+    assert unsent_wake_prompt_visible(provider, old + text) is True

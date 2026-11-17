@@ -32,10 +32,13 @@ RECHECK_DELAY_SECONDS = 0.25
 _OSC = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 _CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _RULE = re.compile(r"^[─━]{10,}$")
-# Below the Claude Code input box sit a few status lines. Anything deeper is scrollback.
-_CLAUDE_STATUS_LINES = 6
-# Below the Codex input box sit a blank line and a status line.
-_CODEX_STATUS_LINES = 4
+# The Codex footer: two spaces, then a status text with " · " in it (model and folder).
+_CODEX_FOOTER = re.compile(r"^ {2}\S.*\s·\s\S")
+# A working harness shows "esc to interrupt" near the input box. A busy screen is not read: fail closed.
+_BUSY = re.compile(r"esc to interrupt", re.IGNORECASE)
+_BUSY_LOOKBACK_LINES = 15
+# Below the Claude Code input box sit at most a few status lines. Anything deeper is not the active box.
+_CLAUDE_STATUS_LINES = 3
 
 
 def _collapse(text: str) -> str:
@@ -73,8 +76,11 @@ def _codex_box_text(lines: list[str]) -> str | None:
     end = start + 1
     while end < len(lines) and lines[end].strip() and lines[end].startswith("  "):
         end += 1
-    if len(lines) - end > _CODEX_STATUS_LINES:
-        return None  # the last prompt line is in the scrollback
+    # Positive evidence of an active composer: the box, one blank line, one footer line, nothing else.
+    # Anything else (history, output, a missing or unknown footer) is not an input box. Fail closed.
+    tail = lines[end:]
+    if len(tail) != 2 or tail[0].strip() or not _CODEX_FOOTER.match(tail[1]):
+        return None
     return " ".join([lines[start][1:]] + [line.strip() for line in lines[start + 1:end]])
 
 
@@ -83,6 +89,8 @@ def unsent_wake_prompt_visible(provider: str, screen: str, prompt: str = INBOX_C
     if provider not in SUPPORTED_PROVIDERS or not screen or len(screen) > MAX_SCREEN_CHARS:
         return False
     lines = _plain_lines(screen)
+    if any(_BUSY.search(line) for line in lines[-_BUSY_LOOKBACK_LINES:]):
+        return False
     text = _claude_box_text(lines) if provider == "claude-code" else _codex_box_text(lines)
     return text is not None and bool(_collapse(prompt)) and _collapse(text) == _collapse(prompt)
 
@@ -101,7 +109,8 @@ def submit_unsent_wake_prompt(
     """Press Enter once if the wake prompt is still unsent in the pane. True only if the Enter was sent.
 
     Nothing is sent unless the pane is the exact bound process, the guard allows it, and two captures a
-    moment apart both show the exact wake text in the input box. Any failure sends nothing.
+    moment apart both show the exact wake text in the input box, and the identity and the guard hold once
+    more right before the Enter. Any failure sends nothing.
     """
     provider = getattr(session, "provider", None)
     if provider not in SUPPORTED_PROVIDERS:
@@ -126,6 +135,9 @@ def submit_unsent_wake_prompt(
             return False
         time.sleep(RECHECK_DELAY_SECONDS)
         if not same_pane() or not prompt_unsent():
+            return False
+        # A capture can take seconds. The pane and the guard are checked again right before the Enter.
+        if not same_pane():
             return False
         _tmux(["send-keys", "-t", session.pane_id, "Enter"])
     except (OSError, subprocess.SubprocessError):
