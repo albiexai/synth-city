@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     # A pending context request or handoff older than this, addressed to an idle member, is shown
     # as unanswered on the team summary and the Supervisor check-in (#752).
     mail_request_unanswered_seconds: int = Field(default=1200, ge=60, le=86400)
+    # A delivered wake with no sign of activity after this delay is repeated once (#1059).
+    wake_followup_enabled: bool = True
+    wake_followup_delay_seconds: int = Field(default=120, ge=30, le=3600)
     github_nudge_grace_seconds: int = 180
     github_min_available_memory_mb: int = 3000
     github_stale_lease_backstop_seconds: int = 21600
