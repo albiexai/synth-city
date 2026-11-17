@@ -263,14 +263,15 @@ def start_attach_like(owned, argv):
     return master, process
 
 
-def wait_for_pid(path, timeout=5.0):
+def adopt_inner(owned, path, timeout=5.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        text = path.read_text() if path.exists() else ""
-        if text.strip():
-            return int(text)
+        text = path.read_text().strip() if path.exists() else ""
+        if text:
+            pid = int(text)
+            return owned.adopt(pid) if stray_children.start_identity(pid) is not None else None
         time.sleep(0.02)
-    raise AssertionError(f"timed out waiting for {path}")
+    return None
 
 
 def read_until(fd, needle: bytes, timeout=5.0) -> bytes:
@@ -359,13 +360,13 @@ def test_resize_reaches_a_command_behind_a_second_pty(monkeypatch, owned, tmp_pa
     master, _ = start_attach_like(owned, [sys.executable, "-c", SUDO_LIKE, WINCH_SHELL, str(pid_file)])
     try:
         read_until(master, b"ready")
-        owned.adopt(wait_for_pid(pid_file))
         never_signal(monkeypatch)
         for rows, cols in ((45, 160), (24, 80)):
             pty_relay.resize_pty(master, rows, cols)
             read_until(master, f"WINCH:{rows} {cols}".encode())
     finally:
         monkeypatch.undo()
+        adopt_inner(owned, pid_file)
         os.close(master)
 
 
@@ -379,8 +380,8 @@ def test_orphaned_inner_shell_is_reaped_when_sighup_is_ignored(owned, tmp_path):
         signal.signal(signal.SIGHUP, previous)
     try:
         read_until(master, b"ready")
-        inner = owned.adopt(wait_for_pid(pid_file))
     finally:
+        inner = adopt_inner(owned, pid_file)
         os.close(master)
     killed = owned.reap()
     assert inner in killed and process.pid in killed

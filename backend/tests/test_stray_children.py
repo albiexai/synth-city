@@ -42,6 +42,18 @@ class Recorder:
         self.calls.append((pid, sig))
 
 
+class Failing(Recorder):
+    def __init__(self, pid, error):
+        super().__init__()
+        self.pid = pid
+        self.error = error
+
+    def __call__(self, pid, sig):
+        super().__call__(pid, sig)
+        if pid == self.pid:
+            raise self.error
+
+
 def wait_until(predicate, timeout=5.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -108,13 +120,60 @@ def test_close_run_reports_a_fake_leak_without_signalling_it(tmp_path):
     assert leaks == [("unregistered", 500, "?")]
 
 
+def test_close_run_reports_a_replaced_pid_without_signalling_it(tmp_path):
+    write_proc(tmp_path, 600, ppid=1, start=12000, token=FAKE_TOKEN)
+    kill = Recorder()
+    owned = stray_children.Owned(FAKE_TOKEN, proc=tmp_path, kill=kill)
+    owned.adopt(600)
+    (tmp_path / "600" / "stat").write_text("600 (proc) S 1 " + " ".join(["0"] * 17) + " 12001\n")
+    leaks = stray_children.close_run(owners=[owned], token=FAKE_TOKEN, proc=tmp_path)
+    assert leaks == [("unregistered", 600, "?")]
+    assert kill.calls == []
+
+
+def test_an_exit_race_does_not_stop_the_rest_of_the_reap(tmp_path):
+    for pid in (700, 701):
+        write_proc(tmp_path, pid, ppid=1, start=13000 + pid, token=FAKE_TOKEN)
+    kill = Failing(700, ProcessLookupError(3, "gone"))
+    owned = stray_children.Owned(FAKE_TOKEN, proc=tmp_path, kill=kill)
+    owned.adopt(700)
+    owned.adopt(701)
+    assert owned.reap(timeout=0.1) == [700, 701]
+    assert {pid for pid, _ in kill.calls} == {700, 701}
+    assert owned.failures == []
+
+
+def test_a_failed_signal_is_reported_and_other_owners_are_still_reaped(tmp_path):
+    write_proc(tmp_path, 800, ppid=1, start=14800, token=FAKE_TOKEN)
+    write_proc(tmp_path, 801, ppid=1, start=14801, token=FAKE_TOKEN)
+    kill = Failing(800, PermissionError(1, "denied"))
+    first = stray_children.Owned(FAKE_TOKEN, proc=tmp_path, kill=kill)
+    first.adopt(800)
+    second = stray_children.Owned(FAKE_TOKEN, proc=tmp_path, kill=kill)
+    second.adopt(801)
+    leaks = stray_children.close_run(owners=[first, second], token=FAKE_TOKEN, proc=tmp_path)
+    assert ("unsignalled", 800, "?") in leaks
+    assert (801, signal.SIGTERM) in kill.calls
+
+
+def test_a_child_that_outlives_reap_is_reported_as_unwaited(tmp_path):
+    child = subprocess.Popen(["sleep", "60"])
+    try:
+        write_proc(tmp_path, child.pid, ppid=1, start=15000, token=FAKE_TOKEN)
+        owned = stray_children.Owned(FAKE_TOKEN, proc=tmp_path, kill=Recorder())
+        owned.adopt(child)
+        owned.reap(timeout=0.1)
+        assert ("unwaited", child.pid) in owned.failures
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
 def test_a_real_reparented_orphan_is_found_and_reaped(tmp_path):
     pid_file = tmp_path / "orphan.pid"
     launcher = subprocess.Popen([sys.executable, "-c", ORPHAN_LAUNCHER, str(pid_file)])
     launcher.wait(timeout=10)
-    deadline = time.monotonic() + 5
-    while not pid_file.read_text().strip() and time.monotonic() < deadline:
-        time.sleep(0.02)
+    wait_until(lambda: pid_file.exists() and pid_file.read_text().strip())
     orphan = int(pid_file.read_text())
     owned = stray_children.Owned()
     owned.adopt(orphan)

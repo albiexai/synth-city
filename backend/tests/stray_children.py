@@ -84,6 +84,7 @@ class Owned:
         self.proc = proc
         self._kill = kill
         self._entries = []
+        self.failures = []
         if proc is PROC:
             _owners.append(self)
 
@@ -106,41 +107,55 @@ class Owned:
                 return
             time.sleep(0.05)
 
+    def _send(self, pid, sig):
+        try:
+            self._kill(pid, sig)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            self.failures.append(("unsignalled", pid))
+
     def reap(self, timeout=5.0):
         killed = []
         for pid, identity, _ in self._entries:
             if self._is_ours(pid, identity):
-                self._kill(pid, signal.SIGTERM)
+                self._send(pid, signal.SIGTERM)
                 killed.append(pid)
         self._wait_gone(timeout)
         for pid, identity, _ in self._entries:
             if self._is_ours(pid, identity):
-                self._kill(pid, signal.SIGKILL)
+                self._send(pid, signal.SIGKILL)
         self._wait_gone(timeout)
-        for _, _, popen in self._entries:
+        for pid, _, popen in self._entries:
             if popen is not None:
-                popen.wait(timeout=timeout)
+                try:
+                    popen.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    self.failures.append(("unwaited", pid))
                 if popen.stderr:
                     popen.stderr.close()
         return killed
 
 
 def close_run(owners=None, token=TOKEN, proc=PROC):
-    """Return (kind, pid) for each leak. Registered survivors are reaped; the rest are report-only."""
+    """Return (kind, pid, name) for each leak. Registered survivors are reaped; the rest are report-only."""
     own_pid = os.getpid()
     leaks = []
     registered = set()
     for owner in (_owners if owners is None else owners):
         for pid, identity, _ in owner._entries:
-            registered.add(pid)
+            registered.add((pid, identity))
             if owner._is_ours(pid, identity):
                 leaks.append(("registered", pid, command_name(pid, proc)))
         owner.reap()
+        leaks.extend((kind, pid, command_name(pid, proc)) for kind, pid in owner.failures)
     token_pids = set(tokened(token, proc))
-    for pid in sorted(token_pids - registered - {own_pid}):
-        if start_identity(pid, proc) is not None:
+    for pid in sorted(token_pids - {own_pid}):
+        identity = start_identity(pid, proc)
+        if identity is not None and (pid, identity) not in registered:
             leaks.append(("unregistered", pid, command_name(pid, proc)))
     for pid in descendants(own_pid, proc):
-        if pid not in token_pids | registered and start_identity(pid, proc) is not None:
+        identity = start_identity(pid, proc)
+        if identity is not None and pid not in token_pids and (pid, identity) not in registered:
             leaks.append(("descendant", pid, command_name(pid, proc)))
     return leaks
