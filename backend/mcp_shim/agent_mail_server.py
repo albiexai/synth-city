@@ -1736,6 +1736,24 @@ def synth_city_record_head_review(work_item_id: int, dispatch_nonce: str, head_s
 
 
 @mcp.tool()
+def synth_city_get_review_binding(work_item_id: int) -> dict:
+    """Assigned reviewer reads the binding needed to record a head or revision review for one item (#999).
+
+    Allowed for the team's current verifier, or the reviewer named on the item's required-check watch for the
+    PR's exact current head. Returns only work_item_id, pr_number, dispatch_nonce and active_scope_revision.
+    The nonce is private: use it only in synth_city_record_head_review or synth_city_record_revision_review,
+    and never publish it.
+    """
+    err = _guard()
+    if err:
+        return err
+    result = _dispatch_request("GET", f"/github-work-items/{work_item_id}/review-binding")
+    if not result["ok"]:
+        return result
+    return {"ok": True, "binding": result["data"], **_counts()}
+
+
+@mcp.tool()
 def synth_city_withdraw_revision_review(work_item_id: int, review_id: int, dispatch_nonce: str) -> dict:
     """Withdraw your active negative review disposition. History is retained."""
     return _revision_review_request(f"/github-work-items/{work_item_id}/revision-reviews/{review_id}/withdraw",

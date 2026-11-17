@@ -343,6 +343,17 @@ prompt use this wording:
 - **Example, `diagnostic`:** add a temporary log line to a probe script and read the hosted run's output. The PR returns to its approved baseline with `revert_diagnostic_changes` before the attempt can continue.
 - **Example, `implementation`:** re-add a test that an earlier revision removed. The test is a permanent change, so the revision allows `push_pr_head` and `request_verification`, and the test stays in the PR.
 
+### Reviewer binding (#999)
+
+`synth_city_get_review_binding`, or `GET /github-work-items/{id}/review-binding`, gives an assigned reviewer exactly what it needs to record a head or revision review, and nothing more: `work_item_id`, `pr_number`, `dispatch_nonce` and `active_scope_revision`. It never returns the lease token, the owner binding, the plan, the workspace or Mail history. The nonce is private: use it only in the review tools and never publish it.
+
+The caller comes from the authenticated session (no session: 401 `session_token_required`; a session without a team slot: 403 `session_not_slot_bound`). Exactly two callers are allowed, and every check reads fresh values:
+
+- **The team's current verifier**, by the same rule as a head review: the current member of an enabled slot of this team whose role is `verifier`, not the owner or the Leader.
+- **The reviewer named on the item's required-check watch.** The watch must be for the current nonce, the current scope revision, the pull request's **exact current head** (read from GitHub, with the checks used when the watch is registered: open, not merged, the item's branch, this repository) and the **current delivery policy**. The reviewer must still be the current member of an enabled slot of the team, and not the owner or the Leader. The attempt, revision, pull request and owner are read again after the GitHub read.
+
+Everyone else gets 403 `current_independent_reviewer_required`. If the item has no pull request, the context isn't healthy, the GitHub read fails or the pull request doesn't match, the answer is 409 `review_binding_unavailable`; there is no fallback to a stored head.
+
 ### Reviewer verdict for the exact head and the auto-merge gate
 
 `synth_city_record_head_review`, or `POST /github-work-items/{id}/head-reviews`, records an explicit

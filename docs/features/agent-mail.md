@@ -203,6 +203,8 @@ A push after the acceptance waits for a new acceptance, an owner or non-verifier
 the work view shows `Waiting for reviewer acceptance` or `Head changed since acceptance`. The review hold
 label keeps working as an extra control. See the API workflow for the exact rules.
 
+The reviewer gets the attempt binding it needs for those reviews from `synth_city_get_review_binding`. Only the team's current verifier, or the reviewer named on the required-check watch for the pull request's exact current head, can read it, and it never includes the lease token.
+
 Cancelled and timed-out CI runs remain blocked and visible without consuming a failed-head unit.
 Closing an unmerged submitted PR on an escalated attempt supersedes that revision without
 implicitly authorizing a retry or releasing the workspace. See the [API workflow](../api/agent-mail.md#healthy-scope-amendments-and-submitted-review-settlement)

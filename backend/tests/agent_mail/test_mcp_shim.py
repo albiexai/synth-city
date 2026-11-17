@@ -1222,7 +1222,7 @@ def test_upgrade_probe_refuses_actual_dispatch_including_direct_http_tools(monke
             types.CallToolRequest(method="tools/call", params=types.CallToolRequestParams(
                 name=name, arguments=arguments)))
         assert wire.root.structuredContent == denied
-        assert len(tools) == 50
+        assert len(tools) == 51
         # Every published tool is refused before validation or execution.
         for tool in tools:
             assert await shim.mcp.call_tool(tool.name, {}) == denied
@@ -1252,7 +1252,7 @@ def test_upgrade_probe_lists_tools_without_registration_and_cannot_call_member_t
     spec.loader.exec_module(shim)
     calls = []
     monkeypatch.setattr(shim, "_request", lambda *args, **kwargs: calls.append((args, kwargs)))
-    assert len(asyncio.run(shim.mcp.list_tools())) == 50
+    assert len(asyncio.run(shim.mcp.list_tools())) == 51
     assert shim._ensure_registered() == {"ok": False, "error": {"code": "upgrade_probe_read_only"}}
     assert shim._state["member_id"] is None and shim._state["capability_token"] is None
     assert calls == []
@@ -1302,6 +1302,20 @@ def test_head_review_tool_sends_an_explicit_verdict_and_binds_server_identity(mo
         assert set(kwargs["json"]) == {"dispatch_nonce", "head_sha", "verdict", "summary", "evidence_url"}
     import inspect
     assert inspect.signature(shim.synth_city_record_head_review).parameters["verdict"].default is inspect.Parameter.empty
+
+
+def test_review_binding_tool_reads_the_authenticated_route(monkeypatch):
+    import mcp_shim.agent_mail_server as shim
+    calls = []
+    binding = {"work_item_id": 19, "pr_number": 5, "dispatch_nonce": "attempt", "active_scope_revision": 0}
+    monkeypatch.setattr(shim, "_guard", lambda: None)
+    monkeypatch.setattr(shim, "_counts", lambda: {})
+    monkeypatch.setattr(shim, "_dispatch_request", lambda method, path, **kwargs:
+        calls.append((method, path, kwargs)) or {"ok": True, "data": binding})
+    assert shim.synth_city_get_review_binding(19) == {"ok": True, "binding": binding}
+    assert calls == [("GET", "/github-work-items/19/review-binding", {})]
+    monkeypatch.setattr(shim, "_dispatch_request", lambda *a, **k: {"ok": False, "error": {"status_code": 403}})
+    assert shim.synth_city_get_review_binding(19)["ok"] is False
 
 
 def test_scope_amendment_and_negative_review_tools_bind_server_identity(monkeypatch):

@@ -48,7 +48,7 @@ from app.services.github_leader_recovery_service import (
 from app.models.schemas import (
     GithubScopeAmendmentCreate, GithubRevisionReviewCreate, GithubRevisionReviewWithdraw,
     GithubSubmittedRevisionEnd, GithubRevisionReviewResponse,
-    GithubHeadReviewCreate, GithubHeadReviewResponse,
+    GithubHeadReviewCreate, GithubHeadReviewResponse, GithubReviewBindingResponse,
     AgentTeamActivityResponse,
     AgentTeamCreateFromBridgeRequest,
     AgentTeamCreateFromMailRequest,
@@ -3825,6 +3825,106 @@ async def record_github_revision_review(item_id: int, request: GithubRevisionRev
     except GithubApprovalError as exc:
         await db.rollback()
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+def _binding_unavailable():
+    return HTTPException(status_code=409, detail='review_binding_unavailable')
+
+
+def _not_reviewer():
+    return HTTPException(status_code=403, detail='current_independent_reviewer_required')
+
+
+async def _named_reviewer_binding(db, item, scope, member_id):
+    """#999: the reviewer named on the watch for the PR's exact current head and the current policy, or refuse.
+
+    Every check runs on fresh values, the current PR is read the way register() reads it, a failed read fails
+    closed, and the authority is checked again after that remote await.
+    """
+    import re
+    from app.models.database import GithubRequiredCheckWatch
+    from app.services.factory_delivery_policy import effective_policy
+    from app.services.github_approval_service import GithubApprovalError, github_approval_service
+    from app.services.github_ci_watch_service import _digest, github_ci_watch_service as watches
+    from app.services.github_head_acceptance_service import _fresh_item
+    fresh = await _fresh_item(db, item.id)
+    named = fresh is not None and await db.scalar(select(GithubRequiredCheckWatch.id).where(
+        GithubRequiredCheckWatch.work_item_id == item.id,
+        GithubRequiredCheckWatch.dispatch_nonce == fresh.dispatch_nonce,
+        GithubRequiredCheckWatch.scope_revision == fresh.active_scope_revision,
+        GithubRequiredCheckWatch.reviewer_member_id == member_id).limit(1))
+    if not named:
+        raise _not_reviewer()  # not named for this attempt and revision: no remote read for a stranger
+    try:
+        context, owner, _leader, _workspace = await github_approval_service.healthy_scope_context(db, item, scope)
+        digest = _digest(effective_policy(item, scope))
+    except GithubApprovalError:
+        raise _binding_unavailable() from None
+    before = (context['dispatch_nonce'], context['active_scope_revision'], context['pr_number'],
+              context['owner_slot_id'])
+    if context['pr_number'] is None:
+        raise _binding_unavailable()
+    try:
+        pull = await watches._read_pull(scope, context['pr_number'])
+    except Exception:
+        raise _binding_unavailable() from None
+    head = (pull.get('head') or {}) if isinstance(pull, dict) else {}
+    sha = head.get('sha')
+    if (type(pull.get('number')) is not int or pull['number'] != context['pr_number']
+            or pull.get('merged_at', True) is not None or pull.get('state') != 'open'
+            or head.get('ref') != item.dispatch_head_ref
+            or (head.get('repo') or {}).get('full_name') != f'{scope.repo_owner}/{scope.repo_name}'
+            or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha)):
+        raise _binding_unavailable()
+    # After the remote await: the same attempt, revision, PR and owner, read again.
+    after = await _fresh_item(db, item.id)
+    if after is None or (after.dispatch_nonce, after.active_scope_revision, after.pr_number,
+                         after.owner_slot_id) != before:
+        raise _binding_unavailable()
+    watch = await db.scalar(select(GithubRequiredCheckWatch).where(
+        GithubRequiredCheckWatch.work_item_id == item.id,
+        GithubRequiredCheckWatch.dispatch_nonce == after.dispatch_nonce,
+        GithubRequiredCheckWatch.scope_revision == after.active_scope_revision,
+        GithubRequiredCheckWatch.head_sha == sha).execution_options(populate_existing=True))
+    member_slot = await db.scalar(select(MailTeamMember.team_slot_id).where(MailTeamMember.id == member_id))
+    if (watch is None or watch.pr_number != after.pr_number or watch.owner_slot_id != after.owner_slot_id
+            or watch.reviewer_member_id != member_id or watch.policy_digest != digest
+            or member_id == owner.id or member_slot is None or member_slot == context['leader_slot_id']):
+        raise _not_reviewer()
+    try:
+        await watches._reviewer(db, context, member_id)
+    except ValueError:
+        raise _not_reviewer() from None
+    return after
+
+
+@router.get('/github-work-items/{item_id}/review-binding', response_model=GithubReviewBindingResponse)
+async def get_github_review_binding(item_id: int, session: MailAgentSession | None = Depends(mail_session),
+    db: AsyncSession = Depends(get_db)):
+    """#999: the binding a current reviewer needs to record a head or revision review, and nothing more.
+
+    Allowed: the team's current verifier (the same rule as head reviews), or the reviewer named on the item's
+    required-check watch for the PR's exact current head, revision and policy. Everyone else is refused. The
+    nonce is private: it is returned to the reviewer only and must never be published.
+    """
+    from app.services.github_head_acceptance_service import _fresh_item, current_reviewer
+    if session is None:
+        raise HTTPException(status_code=401, detail='session_token_required')
+    require_session_slot(session)
+    item = await db.get(GithubWorkItem, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail='work_item_not_found')
+    scope = await db.get(TeamGithubScope, item.scope_id)
+    if scope is None:
+        raise _binding_unavailable()
+    if await current_reviewer(db, scope, item, session.member_id) == session.member_id:
+        fresh = await _fresh_item(db, item.id)
+    else:
+        fresh = await _named_reviewer_binding(db, item, scope, session.member_id)
+    if fresh is None or fresh.pr_number is None or not fresh.dispatch_nonce:
+        raise _binding_unavailable()
+    return GithubReviewBindingResponse(work_item_id=item.id, pr_number=fresh.pr_number,
+        dispatch_nonce=fresh.dispatch_nonce, active_scope_revision=fresh.active_scope_revision)
 
 
 @router.post('/github-work-items/{item_id}/head-reviews', response_model=GithubHeadReviewResponse)

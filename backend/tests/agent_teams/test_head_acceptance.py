@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -514,3 +515,157 @@ async def test_the_gate_reports_a_mismatch_between_the_operation_identity_and_th
     for identity in ((6, "nonce-1", scope_id), (5, "other", scope_id), (5, "nonce-1", scope_id + 1)):
         note = await acceptance.gate_note(db, case.scope, case.item, HEAD_A, identity=identity)
         assert "changed during verification" in note.lower()
+
+
+# --- #999: a reviewer reads only the binding it needs, through an authenticated route ---------
+
+from tests.agent_teams.test_scope_amendments import healthy_attempt, submitted_attempt  # noqa: E402,F401
+
+BINDING_KEYS = {"work_item_id", "pr_number", "dispatch_nonce", "active_scope_revision"}
+
+
+async def _binding(item_id, session, db):
+    from app.api.v1 import agent_teams
+    return (await agent_teams.get_github_review_binding(item_id, session, db)).model_dump()
+
+
+async def _refused(item_id, session, db):
+    from fastapi import HTTPException
+    from app.api.v1 import agent_teams
+    with pytest.raises(HTTPException) as refused:
+        await agent_teams.get_github_review_binding(item_id, session, db)
+    return refused.value.status_code, refused.value.detail
+
+
+@pytest.mark.asyncio
+async def test_the_current_verifier_reads_exactly_the_review_binding(db, monkeypatch):
+    case = await make_case(db, monkeypatch)
+    binding = await _binding(case.item.id, FakeSession(case.verifier), db)
+    assert set(binding) == BINDING_KEYS
+    assert binding == {"work_item_id": case.item.id, "pr_number": 5, "dispatch_nonce": "nonce-1",
+                       "active_scope_revision": case.item.active_scope_revision}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("who,status,detail", [
+    ("owner", 403, "current_independent_reviewer_required"),
+    ("leader", 403, "current_independent_reviewer_required"),
+    ("builder", 403, "current_independent_reviewer_required"),
+    ("other_team_verifier", 403, "current_independent_reviewer_required"),
+    ("lost_role", 403, "current_independent_reviewer_required"),
+    ("anonymous", 401, "session_token_required"),
+    ("unbound", 403, "session_not_slot_bound"),
+    ("missing_item", 404, "work_item_not_found"),
+    ("no_pr", 409, "review_binding_unavailable"),
+])
+async def test_the_verifier_branch_refuses_everyone_else(db, monkeypatch, who, status, detail):
+    case = await make_case(db, monkeypatch)
+    slots = {slot.display_name: slot for slot in (await db.execute(
+        select(AgentTeamSlot).where(AgentTeamSlot.preset_id == case.scope.preset_id))).scalars().all()}
+
+    async def member_of(name):
+        return (await db.execute(select(MailTeamMember).where(
+            MailTeamMember.team_slot_id == slots[name].id))).scalars().first()
+
+    item_id, session = case.item.id, FakeSession(case.verifier)
+    if who == "owner":
+        session = FakeSession((await db.execute(select(MailTeamMember).where(
+            MailTeamMember.team_slot_id == case.item.owner_slot_id))).scalars().first())
+    elif who == "leader":
+        session = FakeSession(await member_of("Leader"))
+    elif who == "builder":
+        _, builder = await slot_member(db, case.scope, role="builder", name="B9")
+        session = FakeSession(builder)
+    elif who == "other_team_verifier":
+        other = await _scope(db, merge_policy="auto")
+        _, stranger = await slot_member(db, other, role="verifier", name="V9")
+        session = FakeSession(stranger)
+    elif who == "lost_role":
+        await db.execute(update(AgentTeamSlot).where(AgentTeamSlot.id == case.verifier.team_slot_id)
+                         .values(role="builder"))
+        await db.commit()
+    elif who == "anonymous":
+        session = None
+    elif who == "unbound":
+        session.team_slot_id = None
+    elif who == "missing_item":
+        item_id = 999999
+    elif who == "no_pr":
+        case.item.pr_number = None
+        await db.commit()
+    assert await _refused(item_id, session, db) == (status, detail)
+
+
+def _reviewer_session(a):
+    from app.models.database import MailAgentSession
+    return MailAgentSession(member_id=a.reviewer.id, provider="codex-cli", source="mcp",
+        session_key="synthetic-binding-reviewer", cwd=str(a.repo), team_preset_id=a.preset.id,
+        team_slot_id=a.reviewer.team_slot_id, mailbox_status="connected",
+        capability_token_hash="synthetic-binding-token", bound_pane_pid=1004, bound_pane_proc_start="start-4")
+
+
+@pytest.mark.asyncio
+async def test_the_reviewer_named_on_the_current_watch_reads_exactly_the_binding(db, submitted_attempt):
+    a = submitted_attempt
+    binding = await _binding(a.item.id, _reviewer_session(a), db)
+    assert binding == {"work_item_id": a.item.id, "pr_number": 5, "dispatch_nonce": a.item.dispatch_nonce,
+                       "active_scope_revision": a.revision.revision}
+    assert "lease" not in str(binding) and a.workspace.lease_token not in str(binding)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change,status", [
+    ("old_head", 403), ("stale_policy", 403), ("reassigned", 403), ("rebound", 403), ("disabled", 403),
+    ("leader_named", 403), ("owner_named", 403), ("old_revision", 403), ("old_nonce", 403),
+    ("read_fails", 409), ("pr_closed", 409), ("pr_merged", 409), ("other_ref", 409), ("other_repo", 409),
+    ("no_pr", 409), ("owner_changes_during_read", 409),
+])
+async def test_the_named_reviewer_branch_fails_closed_on_anything_stale(db, submitted_attempt, monkeypatch,
+                                                                          change, status):
+    from app.services.github_client import github_client as client
+    a = submitted_attempt
+    session = _reviewer_session(a)
+    if change == "old_head":
+        a.pull["head"] = dict(a.pull["head"], sha="c" * 40)
+    elif change == "stale_policy":
+        a.watch.policy_digest = "0" * 64
+    elif change == "reassigned":
+        a.watch.reviewer_member_id = a.leader.id
+    elif change == "rebound":
+        db.add(MailTeamMember(identity_key=f"reviewer2:{a.reviewer.team_slot_id}", repo_id="approval",
+            repo_path=str(a.repo), repo_name="approval", display_name="Reviewer 2", participant_kind="team_slot",
+            team_preset_id=a.preset.id, team_slot_id=a.reviewer.team_slot_id))
+    elif change == "disabled":
+        await db.execute(update(AgentTeamSlot).where(AgentTeamSlot.id == a.reviewer.team_slot_id).values(enabled=False))
+    elif change == "leader_named":
+        a.watch.reviewer_member_id = a.leader.id
+        session = _reviewer_session(SimpleNamespace(reviewer=a.leader, repo=a.repo, preset=a.preset))
+    elif change == "owner_named":
+        a.watch.reviewer_member_id = a.owner.id
+        session = _reviewer_session(SimpleNamespace(reviewer=a.owner, repo=a.repo, preset=a.preset))
+    elif change == "old_revision":
+        a.watch.scope_revision = a.revision.revision - 1
+    elif change == "old_nonce":
+        a.watch.dispatch_nonce = "old-nonce"
+    elif change == "read_fails":
+        monkeypatch.setattr(client, "get_pull", AsyncMock(side_effect=RuntimeError("github unavailable")))
+    elif change == "pr_closed":
+        a.pull["state"] = "closed"
+    elif change == "pr_merged":
+        a.pull["merged_at"] = "2026-11-17T00:00:00Z"
+    elif change == "other_ref":
+        a.pull["head"] = dict(a.pull["head"], ref="someone/else")
+    elif change == "other_repo":
+        a.pull["head"] = dict(a.pull["head"], repo={"full_name": "fork/approval"})
+    elif change == "no_pr":
+        a.item.pr_number = None
+    elif change == "owner_changes_during_read":
+        async def moving_pull(*_args, **_kwargs):
+            await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == a.item.id)
+                             .values(owner_slot_id=a.reviewer.team_slot_id))
+            await db.commit()
+            return a.pull
+        monkeypatch.setattr(client, "get_pull", moving_pull)
+    await db.commit()
+    code, _detail = await _refused(a.item.id, session, db)
+    assert code == status
