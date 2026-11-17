@@ -141,6 +141,58 @@ class GithubVerificationService:
         self.skipped_item_ids: set[int] = set()
 
     @staticmethod
+    def _same_tree_entry(
+        left: Mapping[str, GithubTreeEntry], right: Mapping[str, GithubTreeEntry], path: str,
+    ) -> bool:
+        a, b = left.get(path), right.get(path)
+        if a is None or b is None:
+            return a is None and b is None
+        return (a.mode, a.object_type, a.sha) == (b.mode, b.object_type, b.sha)
+
+    async def _base_side_paths(
+        self,
+        scope: TeamGithubScope,
+        item: GithubWorkItem,
+        revision: GithubAttemptScopeRevision,
+        client: GithubClient,
+        token: str,
+        pull: dict,
+        head_sha: str,
+        baseline_tree: Mapping[str, GithubTreeEntry],
+        current_tree: Mapping[str, GithubTreeEntry],
+        paths: set[str],
+    ) -> set[str]:
+        """The given paths that only a base update changed, so they are not scope growth (#1030).
+
+        A path is base-side when the PR's own diff leaves it untouched both at the revision's baseline and at the
+        head: each matches its merge base with the PR's current base tip. An edit of that path in the PR, before or
+        after the baseline, is still the PR's own change. Any missing, foreign or unreadable evidence is inconclusive.
+        """
+        base = pull.get("base")
+        base_ref = base.get("ref") if isinstance(base, dict) else None
+        base_sha = base.get("sha") if isinstance(base, dict) else None
+        try:
+            expected_ref = await self.normalize_base_ref(scope, client, token=token, base_ref=item.dispatch_base_ref)
+            if base_ref != expected_ref:
+                raise ValueError("the PR base is not the item's dispatch base")
+            merge_trees = []
+            for commit_sha in (revision.baseline_head_sha, head_sha):
+                merge_base = await client.get_merge_base(
+                    scope.repo_owner, scope.repo_name, base_sha, commit_sha, token=token)
+                snapshot = await client.get_commit_snapshot(
+                    scope.repo_owner, scope.repo_name, merge_base, token=token)
+                merge_trees.append(await client.get_recursive_tree(
+                    scope.repo_owner, scope.repo_name, snapshot.tree_sha, token=token))
+        except (ValueError, GithubClientResponseError, httpx.HTTPError) as exc:
+            raise ContinuationCompletionError("continuation_diff_inconclusive") from exc
+        at_baseline, at_head = merge_trees
+        return {
+            path for path in paths
+            if self._same_tree_entry(baseline_tree, at_baseline, path)
+            and self._same_tree_entry(current_tree, at_head, path)
+        }
+
+    @staticmethod
     def _changed_tree_paths(
         baseline: Mapping[str, GithubTreeEntry],
         current: Mapping[str, GithubTreeEntry],
@@ -271,6 +323,11 @@ class GithubVerificationService:
             path for path in changed_paths
             if not github_approval_service.path_is_allowed(path, revision.allowed_paths)
         }
+        if outside_paths:
+            outside_paths -= await self._base_side_paths(
+                scope, item, revision, client, token, pull, current_head_sha,
+                baseline_tree, current_tree, outside_paths,
+            )
         import_conditions = []
         if outside_paths:
             import_conditions = source_import_claim_conditions(item, revision, workspace, scope)
