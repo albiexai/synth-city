@@ -1,0 +1,1798 @@
+{
+  "synth_city_ack_continuation": {
+    "properties": {
+      "dispatch_nonce": {
+        "title": "Dispatch Nonce",
+        "type": "string"
+      },
+      "lease_token": {
+        "title": "Lease Token",
+        "type": "string"
+      },
+      "revision": {
+        "title": "Revision",
+        "type": "integer"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "revision",
+      "dispatch_nonce",
+      "lease_token"
+    ],
+    "title": "synth_city_ack_continuationArguments",
+    "type": "object"
+  },
+  "synth_city_ack_message": {
+    "properties": {
+      "message_id": {
+        "title": "Message Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "message_id"
+    ],
+    "title": "synth_city_ack_messageArguments",
+    "type": "object"
+  },
+  "synth_city_approve_work_item": {
+    "properties": {
+      "approval_request_id": {
+        "title": "Approval Request Id",
+        "type": "integer"
+      },
+      "decision": {
+        "title": "Decision",
+        "type": "string"
+      },
+      "dispatch_nonce": {
+        "title": "Dispatch Nonce",
+        "type": "string"
+      },
+      "reason": {
+        "title": "Reason",
+        "type": "string"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "dispatch_nonce",
+      "decision",
+      "reason",
+      "approval_request_id"
+    ],
+    "title": "synth_city_approve_work_itemArguments",
+    "type": "object"
+  },
+  "synth_city_attach_image_to_bridge_session": {
+    "properties": {
+      "file_path": {
+        "title": "File Path",
+        "type": "string"
+      },
+      "prompt": {
+        "default": "",
+        "title": "Prompt",
+        "type": "string"
+      },
+      "submit": {
+        "default": false,
+        "title": "Submit",
+        "type": "boolean"
+      },
+      "target": {
+        "title": "Target",
+        "type": "string"
+      }
+    },
+    "required": [
+      "target",
+      "file_path"
+    ],
+    "title": "synth_city_attach_image_to_bridge_sessionArguments",
+    "type": "object"
+  },
+  "synth_city_check_inbox": {
+    "properties": {
+      "limit": {
+        "default": 20,
+        "title": "Limit",
+        "type": "integer"
+      },
+      "unread_only": {
+        "default": true,
+        "title": "Unread Only",
+        "type": "boolean"
+      }
+    },
+    "title": "synth_city_check_inboxArguments",
+    "type": "object"
+  },
+  "synth_city_create_handoff": {
+    "properties": {
+      "files": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Files"
+      },
+      "next_steps": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Next Steps"
+      },
+      "summary": {
+        "title": "Summary",
+        "type": "string"
+      },
+      "to_member_id": {
+        "title": "To Member Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "to_member_id",
+      "summary"
+    ],
+    "title": "synth_city_create_handoffArguments",
+    "type": "object"
+  },
+  "synth_city_create_team": {
+    "properties": {
+      "description": {
+        "default": "",
+        "title": "Description",
+        "type": "string"
+      },
+      "name": {
+        "title": "Name",
+        "type": "string"
+      },
+      "parent_issue_url": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Parent Issue Url"
+      },
+      "slots": {
+        "anyOf": [
+          {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Slots"
+      }
+    },
+    "required": [
+      "name"
+    ],
+    "title": "synth_city_create_teamArguments",
+    "type": "object"
+  },
+  "synth_city_decide_continuation": {
+    "properties": {
+      "approval_request_id": {
+        "title": "Approval Request Id",
+        "type": "integer"
+      },
+      "decision": {
+        "title": "Decision",
+        "type": "string"
+      },
+      "dispatch_nonce": {
+        "title": "Dispatch Nonce",
+        "type": "string"
+      },
+      "reason": {
+        "title": "Reason",
+        "type": "string"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "approval_request_id",
+      "work_item_id",
+      "dispatch_nonce",
+      "decision",
+      "reason"
+    ],
+    "title": "synth_city_decide_continuationArguments",
+    "type": "object"
+  },
+  "synth_city_end_submitted_revision": {
+    "properties": {
+      "dispatch_nonce": {
+        "title": "Dispatch Nonce",
+        "type": "string"
+      },
+      "reason": {
+        "title": "Reason",
+        "type": "string"
+      },
+      "review_id": {
+        "title": "Review Id",
+        "type": "integer"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "review_id",
+      "dispatch_nonce",
+      "reason"
+    ],
+    "title": "synth_city_end_submitted_revisionArguments",
+    "type": "object"
+  },
+  "synth_city_extend_effort_limit": {
+    "properties": {
+      "dispatch_nonce": {
+        "title": "Dispatch Nonce",
+        "type": "string"
+      },
+      "evidence": {
+        "title": "Evidence",
+        "type": "string"
+      },
+      "expected_extension_minutes": {
+        "title": "Expected Extension Minutes",
+        "type": "integer"
+      },
+      "minutes": {
+        "title": "Minutes",
+        "type": "integer"
+      },
+      "reason": {
+        "title": "Reason",
+        "type": "string"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "dispatch_nonce",
+      "minutes",
+      "reason",
+      "expected_extension_minutes",
+      "evidence"
+    ],
+    "title": "synth_city_extend_effort_limitArguments",
+    "type": "object"
+  },
+  "synth_city_get_backlog_coordination": {
+    "properties": {
+      "scope_id": {
+        "title": "Scope Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "scope_id"
+    ],
+    "title": "synth_city_get_backlog_coordinationArguments",
+    "type": "object"
+  },
+  "synth_city_get_operator_action_contexts": {
+    "properties": {
+      "preset_id": {
+        "title": "Preset Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "preset_id"
+    ],
+    "title": "synth_city_get_operator_action_contextsArguments",
+    "type": "object"
+  },
+  "synth_city_get_review_binding": {
+    "properties": {
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id"
+    ],
+    "title": "synth_city_get_review_bindingArguments",
+    "type": "object"
+  },
+  "synth_city_get_team_summary": {
+    "properties": {
+      "preset_id": {
+        "title": "Preset Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "preset_id"
+    ],
+    "title": "synth_city_get_team_summaryArguments",
+    "type": "object"
+  },
+  "synth_city_get_work_item_context": {
+    "properties": {
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id"
+    ],
+    "title": "synth_city_get_work_item_contextArguments",
+    "type": "object"
+  },
+  "synth_city_launch_team": {
+    "properties": {
+      "confirm_plan_hash": {
+        "default": "",
+        "title": "Confirm Plan Hash",
+        "type": "string"
+      },
+      "force_without_plan": {
+        "default": false,
+        "title": "Force Without Plan",
+        "type": "boolean"
+      },
+      "preset_id": {
+        "title": "Preset Id",
+        "type": "integer"
+      },
+      "reuse_existing": {
+        "default": true,
+        "title": "Reuse Existing",
+        "type": "boolean"
+      },
+      "slot_ids": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Slot Ids"
+      }
+    },
+    "required": [
+      "preset_id"
+    ],
+    "title": "synth_city_launch_teamArguments",
+    "type": "object"
+  },
+  "synth_city_leader_cancel_revision": {
+    "properties": {
+      "dispatch_nonce": {
+        "title": "Dispatch Nonce",
+        "type": "string"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "reason": {
+        "title": "Reason",
+        "type": "string"
+      },
+      "revision_number": {
+        "title": "Revision Number",
+        "type": "integer"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "revision_number",
+      "dispatch_nonce",
+      "operation_id",
+      "reason"
+    ],
+    "title": "synth_city_leader_cancel_revisionArguments",
+    "type": "object"
+  },
+  "synth_city_leader_finalize_merged": {
+    "properties": {
+      "dry_run": {
+        "default": true,
+        "title": "Dry Run",
+        "type": "boolean"
+      },
+      "expected_context_sha256": {
+        "default": "",
+        "title": "Expected Context Sha256",
+        "type": "string"
+      },
+      "operation_id": {
+        "default": "",
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "reason": {
+        "default": "",
+        "title": "Reason",
+        "type": "string"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id"
+    ],
+    "title": "synth_city_leader_finalize_mergedArguments",
+    "type": "object"
+  },
+  "synth_city_leader_release_workspace": {
+    "properties": {
+      "expected_leased_at": {
+        "title": "Expected Leased At",
+        "type": "string"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "reason": {
+        "title": "Reason",
+        "type": "string"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      },
+      "workspace_id": {
+        "title": "Workspace Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "workspace_id",
+      "expected_leased_at",
+      "operation_id",
+      "reason"
+    ],
+    "title": "synth_city_leader_release_workspaceArguments",
+    "type": "object"
+  },
+  "synth_city_list_bridge_attachments": {
+    "properties": {
+      "target": {
+        "title": "Target",
+        "type": "string"
+      }
+    },
+    "required": [
+      "target"
+    ],
+    "title": "synth_city_list_bridge_attachmentsArguments",
+    "type": "object"
+  },
+  "synth_city_list_scope_revisions": {
+    "properties": {
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id"
+    ],
+    "title": "synth_city_list_scope_revisionsArguments",
+    "type": "object"
+  },
+  "synth_city_list_team": {
+    "properties": {},
+    "title": "synth_city_list_teamArguments",
+    "type": "object"
+  },
+  "synth_city_list_teams": {
+    "properties": {},
+    "title": "synth_city_list_teamsArguments",
+    "type": "object"
+  },
+  "synth_city_list_work_items": {
+    "properties": {
+      "limit": {
+        "default": 100,
+        "title": "Limit",
+        "type": "integer"
+      },
+      "status": {
+        "default": "escalated",
+        "title": "Status",
+        "type": "string"
+      }
+    },
+    "title": "synth_city_list_work_itemsArguments",
+    "type": "object"
+  },
+  "synth_city_paste_bridge_attachment": {
+    "properties": {
+      "attachment_id": {
+        "title": "Attachment Id",
+        "type": "integer"
+      },
+      "submit": {
+        "default": false,
+        "title": "Submit",
+        "type": "boolean"
+      },
+      "target": {
+        "title": "Target",
+        "type": "string"
+      }
+    },
+    "required": [
+      "target",
+      "attachment_id"
+    ],
+    "title": "synth_city_paste_bridge_attachmentArguments",
+    "type": "object"
+  },
+  "synth_city_plan_team_launch": {
+    "properties": {
+      "include_disabled": {
+        "default": false,
+        "title": "Include Disabled",
+        "type": "boolean"
+      },
+      "preset_id": {
+        "title": "Preset Id",
+        "type": "integer"
+      },
+      "reuse_existing": {
+        "default": true,
+        "title": "Reuse Existing",
+        "type": "boolean"
+      },
+      "slot_ids": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Slot Ids"
+      }
+    },
+    "required": [
+      "preset_id"
+    ],
+    "title": "synth_city_plan_team_launchArguments",
+    "type": "object"
+  },
+  "synth_city_preflight_request": {
+    "properties": {
+      "allowed_actions": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Allowed Actions"
+      },
+      "allowed_commands": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Allowed Commands"
+      },
+      "allowed_paths": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Allowed Paths"
+      },
+      "dispatch_nonce": {
+        "title": "Dispatch Nonce",
+        "type": "string"
+      },
+      "estimate_active_minutes": {
+        "anyOf": [
+          {},
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Estimate Active Minutes"
+      },
+      "execution_target": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Execution Target"
+      },
+      "kind": {
+        "title": "Kind",
+        "type": "string"
+      },
+      "lease_token": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Lease Token"
+      },
+      "max_failed_heads": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Max Failed Heads"
+      },
+      "phase": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Phase"
+      },
+      "plan_metadata": {
+        "anyOf": [
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Plan Metadata"
+      },
+      "prohibited_actions": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Prohibited Actions"
+      },
+      "summary": {
+        "default": "",
+        "title": "Summary",
+        "type": "string"
+      },
+      "tool_fallbacks": {
+        "anyOf": [
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Tool Fallbacks"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "kind",
+      "work_item_id",
+      "dispatch_nonce"
+    ],
+    "title": "synth_city_preflight_requestArguments",
+    "type": "object"
+  },
+  "synth_city_prepare_operator_action_contexts": {
+    "properties": {
+      "entries": {
+        "items": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "title": "Entries",
+        "type": "array"
+      },
+      "scope_id": {
+        "title": "Scope Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "scope_id",
+      "entries"
+    ],
+    "title": "synth_city_prepare_operator_action_contextsArguments",
+    "type": "object"
+  },
+  "synth_city_prepare_work_remaining_summary": {
+    "properties": {
+      "assumptions": {
+        "default": "",
+        "title": "Assumptions",
+        "type": "string"
+      },
+      "completed": {
+        "default": "",
+        "title": "Completed",
+        "type": "string"
+      },
+      "confidence": {
+        "default": "unknown",
+        "title": "Confidence",
+        "type": "string"
+      },
+      "effort_high_minutes": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Effort High Minutes"
+      },
+      "effort_low_minutes": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Effort Low Minutes"
+      },
+      "effort_scope": {
+        "default": "",
+        "title": "Effort Scope",
+        "type": "string"
+      },
+      "next_action": {
+        "title": "Next Action",
+        "type": "string"
+      },
+      "remaining": {
+        "title": "Remaining",
+        "type": "string"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "remaining",
+      "next_action"
+    ],
+    "title": "synth_city_prepare_work_remaining_summaryArguments",
+    "type": "object"
+  },
+  "synth_city_publish_pull_summary": {
+    "properties": {
+      "pull_number": {
+        "title": "Pull Number",
+        "type": "integer"
+      },
+      "scope_id": {
+        "title": "Scope Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "scope_id",
+      "pull_number"
+    ],
+    "title": "synth_city_publish_pull_summaryArguments",
+    "type": "object"
+  },
+  "synth_city_record_head_review": {
+    "properties": {
+      "dispatch_nonce": {
+        "title": "Dispatch Nonce",
+        "type": "string"
+      },
+      "evidence_url": {
+        "title": "Evidence Url",
+        "type": "string"
+      },
+      "head_sha": {
+        "title": "Head Sha",
+        "type": "string"
+      },
+      "summary": {
+        "title": "Summary",
+        "type": "string"
+      },
+      "verdict": {
+        "title": "Verdict",
+        "type": "string"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "dispatch_nonce",
+      "head_sha",
+      "verdict",
+      "summary",
+      "evidence_url"
+    ],
+    "title": "synth_city_record_head_reviewArguments",
+    "type": "object"
+  },
+  "synth_city_record_revision_review": {
+    "properties": {
+      "dispatch_nonce": {
+        "title": "Dispatch Nonce",
+        "type": "string"
+      },
+      "evidence_url": {
+        "title": "Evidence Url",
+        "type": "string"
+      },
+      "head_sha": {
+        "title": "Head Sha",
+        "type": "string"
+      },
+      "revision": {
+        "title": "Revision",
+        "type": "integer"
+      },
+      "summary": {
+        "title": "Summary",
+        "type": "string"
+      },
+      "verdict": {
+        "default": "changes_required",
+        "title": "Verdict",
+        "type": "string"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "revision",
+      "dispatch_nonce",
+      "head_sha",
+      "summary",
+      "evidence_url"
+    ],
+    "title": "synth_city_record_revision_reviewArguments",
+    "type": "object"
+  },
+  "synth_city_render_github_summary": {
+    "properties": {
+      "current_body": {
+        "title": "Current Body",
+        "type": "string"
+      },
+      "expected_body_sha256": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Expected Body Sha256"
+      },
+      "summary": {
+        "additionalProperties": true,
+        "title": "Summary",
+        "type": "object"
+      }
+    },
+    "required": [
+      "current_body",
+      "summary"
+    ],
+    "title": "synth_city_render_github_summaryArguments",
+    "type": "object"
+  },
+  "synth_city_render_pull_summary": {
+    "properties": {
+      "pull_number": {
+        "title": "Pull Number",
+        "type": "integer"
+      },
+      "scope_id": {
+        "title": "Scope Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "scope_id",
+      "pull_number"
+    ],
+    "title": "synth_city_render_pull_summaryArguments",
+    "type": "object"
+  },
+  "synth_city_reply": {
+    "properties": {
+      "body": {
+        "title": "Body",
+        "type": "string"
+      },
+      "thread_root_id": {
+        "title": "Thread Root Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "thread_root_id",
+      "body"
+    ],
+    "title": "synth_city_replyArguments",
+    "type": "object"
+  },
+  "synth_city_report_backlog_assessment": {
+    "properties": {
+      "entries": {
+        "items": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "title": "Entries",
+        "type": "array"
+      },
+      "generation": {
+        "title": "Generation",
+        "type": "integer"
+      },
+      "request_sequence": {
+        "title": "Request Sequence",
+        "type": "integer"
+      },
+      "scope_id": {
+        "title": "Scope Id",
+        "type": "integer"
+      },
+      "snapshot_token": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Snapshot Token"
+      }
+    },
+    "required": [
+      "scope_id",
+      "generation",
+      "request_sequence",
+      "entries"
+    ],
+    "title": "synth_city_report_backlog_assessmentArguments",
+    "type": "object"
+  },
+  "synth_city_report_dispatch_status": {
+    "properties": {
+      "current_head_sha": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Current Head Sha"
+      },
+      "dispatch_nonce": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Dispatch Nonce"
+      },
+      "evidence": {
+        "anyOf": [
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Evidence"
+      },
+      "head_ref": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Head Ref"
+      },
+      "lease_token": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Lease Token"
+      },
+      "note": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Note"
+      },
+      "pr_number": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Pr Number"
+      },
+      "reassign_to_slot_id": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Reassign To Slot Id"
+      },
+      "revision": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Revision"
+      },
+      "status": {
+        "title": "Status",
+        "type": "string"
+      },
+      "summary": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Summary"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "status"
+    ],
+    "title": "synth_city_report_dispatch_statusArguments",
+    "type": "object"
+  },
+  "synth_city_report_owner_followup": {
+    "properties": {
+      "action": {
+        "title": "Action",
+        "type": "string"
+      },
+      "expected_sequence": {
+        "title": "Expected Sequence",
+        "type": "integer"
+      },
+      "followup_token": {
+        "title": "Followup Token",
+        "type": "string"
+      },
+      "reason": {
+        "title": "Reason",
+        "type": "string"
+      },
+      "scope_id": {
+        "title": "Scope Id",
+        "type": "integer"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "scope_id",
+      "work_item_id",
+      "action",
+      "reason",
+      "expected_sequence",
+      "followup_token"
+    ],
+    "title": "synth_city_report_owner_followupArguments",
+    "type": "object"
+  },
+  "synth_city_request_context": {
+    "properties": {
+      "dispatch_nonce": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Dispatch Nonce"
+      },
+      "files_or_symbols": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Files Or Symbols"
+      },
+      "to_member_id": {
+        "title": "To Member Id",
+        "type": "integer"
+      },
+      "topic": {
+        "title": "Topic",
+        "type": "string"
+      },
+      "why_needed": {
+        "default": "",
+        "title": "Why Needed",
+        "type": "string"
+      },
+      "work_item_id": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Work Item Id"
+      }
+    },
+    "required": [
+      "to_member_id",
+      "topic"
+    ],
+    "title": "synth_city_request_contextArguments",
+    "type": "object"
+  },
+  "synth_city_request_continuation": {
+    "properties": {
+      "allowed_actions": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Allowed Actions",
+        "type": "array"
+      },
+      "allowed_commands": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Allowed Commands",
+        "type": "array"
+      },
+      "allowed_paths": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Allowed Paths",
+        "type": "array"
+      },
+      "dispatch_nonce": {
+        "title": "Dispatch Nonce",
+        "type": "string"
+      },
+      "execution_target": {
+        "title": "Execution Target",
+        "type": "string"
+      },
+      "lease_token": {
+        "title": "Lease Token",
+        "type": "string"
+      },
+      "max_failed_heads": {
+        "title": "Max Failed Heads",
+        "type": "integer"
+      },
+      "phase": {
+        "title": "Phase",
+        "type": "string"
+      },
+      "prohibited_actions": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Prohibited Actions",
+        "type": "array"
+      },
+      "summary": {
+        "title": "Summary",
+        "type": "string"
+      },
+      "tool_fallbacks": {
+        "additionalProperties": true,
+        "title": "Tool Fallbacks",
+        "type": "object"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "dispatch_nonce",
+      "phase",
+      "execution_target",
+      "summary",
+      "allowed_paths",
+      "allowed_actions",
+      "allowed_commands",
+      "prohibited_actions",
+      "max_failed_heads",
+      "tool_fallbacks",
+      "lease_token"
+    ],
+    "title": "synth_city_request_continuationArguments",
+    "type": "object"
+  },
+  "synth_city_request_scope_amendment": {
+    "properties": {
+      "allowed_actions": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Allowed Actions",
+        "type": "array"
+      },
+      "allowed_commands": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Allowed Commands",
+        "type": "array"
+      },
+      "allowed_paths": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Allowed Paths",
+        "type": "array"
+      },
+      "dispatch_nonce": {
+        "title": "Dispatch Nonce",
+        "type": "string"
+      },
+      "execution_target": {
+        "title": "Execution Target",
+        "type": "string"
+      },
+      "lease_token": {
+        "title": "Lease Token",
+        "type": "string"
+      },
+      "max_failed_heads": {
+        "title": "Max Failed Heads",
+        "type": "integer"
+      },
+      "prohibited_actions": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Prohibited Actions",
+        "type": "array"
+      },
+      "summary": {
+        "title": "Summary",
+        "type": "string"
+      },
+      "tool_fallbacks": {
+        "additionalProperties": true,
+        "title": "Tool Fallbacks",
+        "type": "object"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "dispatch_nonce",
+      "execution_target",
+      "summary",
+      "allowed_paths",
+      "allowed_actions",
+      "allowed_commands",
+      "prohibited_actions",
+      "max_failed_heads",
+      "tool_fallbacks",
+      "lease_token"
+    ],
+    "title": "synth_city_request_scope_amendmentArguments",
+    "type": "object"
+  },
+  "synth_city_request_work_item_approval": {
+    "properties": {
+      "dispatch_nonce": {
+        "title": "Dispatch Nonce",
+        "type": "string"
+      },
+      "plan_metadata": {
+        "anyOf": [
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Plan Metadata"
+      },
+      "summary": {
+        "title": "Summary",
+        "type": "string"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "dispatch_nonce",
+      "summary"
+    ],
+    "title": "synth_city_request_work_item_approvalArguments",
+    "type": "object"
+  },
+  "synth_city_retry_work_item": {
+    "properties": {
+      "reason": {
+        "default": "",
+        "title": "Reason",
+        "type": "string"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id"
+    ],
+    "title": "synth_city_retry_work_itemArguments",
+    "type": "object"
+  },
+  "synth_city_send_message": {
+    "properties": {
+      "body": {
+        "default": "",
+        "title": "Body",
+        "type": "string"
+      },
+      "subject": {
+        "default": "",
+        "title": "Subject",
+        "type": "string"
+      },
+      "to_member_id": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "To Member Id"
+      },
+      "to_supervisor_actor_id": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "To Supervisor Actor Id"
+      }
+    },
+    "title": "synth_city_send_messageArguments",
+    "type": "object"
+  },
+  "synth_city_settle_accepted_revision": {
+    "properties": {
+      "dispatch_nonce": {
+        "title": "Dispatch Nonce",
+        "type": "string"
+      },
+      "reason": {
+        "title": "Reason",
+        "type": "string"
+      },
+      "review_id": {
+        "title": "Review Id",
+        "type": "integer"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "review_id",
+      "dispatch_nonce",
+      "reason"
+    ],
+    "title": "synth_city_settle_accepted_revisionArguments",
+    "type": "object"
+  },
+  "synth_city_supervisor_checkin": {
+    "properties": {
+      "next_check_at": {
+        "title": "Next Check At",
+        "type": "string"
+      },
+      "note": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Note"
+      },
+      "preset_id": {
+        "title": "Preset Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "preset_id",
+      "next_check_at"
+    ],
+    "title": "synth_city_supervisor_checkinArguments",
+    "type": "object"
+  },
+  "synth_city_update_team_campaign": {
+    "properties": {
+      "backlog_milestone": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "title": "Backlog Milestone"
+      },
+      "director_key": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Director Key"
+      },
+      "planned_decisions": {
+        "anyOf": [
+          {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "title": "Planned Decisions"
+      },
+      "preset_id": {
+        "title": "Preset Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "preset_id",
+      "backlog_milestone",
+      "planned_decisions"
+    ],
+    "title": "synth_city_update_team_campaignArguments",
+    "type": "object"
+  },
+  "synth_city_update_team_parent_issue": {
+    "properties": {
+      "parent_issue_url": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "title": "Parent Issue Url"
+      },
+      "preset_id": {
+        "title": "Preset Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "preset_id",
+      "parent_issue_url"
+    ],
+    "title": "synth_city_update_team_parent_issueArguments",
+    "type": "object"
+  },
+  "synth_city_watch_required_checks": {
+    "properties": {
+      "dispatch_nonce": {
+        "title": "Dispatch Nonce",
+        "type": "string"
+      },
+      "head_sha": {
+        "title": "Head Sha",
+        "type": "string"
+      },
+      "reviewer_member_id": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "title": "Reviewer Member Id"
+      },
+      "scope_revision": {
+        "title": "Scope Revision",
+        "type": "integer"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "dispatch_nonce",
+      "scope_revision",
+      "head_sha",
+      "reviewer_member_id"
+    ],
+    "title": "synth_city_watch_required_checksArguments",
+    "type": "object"
+  },
+  "synth_city_whoami": {
+    "properties": {},
+    "title": "synth_city_whoamiArguments",
+    "type": "object"
+  },
+  "synth_city_withdraw_revision_review": {
+    "properties": {
+      "dispatch_nonce": {
+        "title": "Dispatch Nonce",
+        "type": "string"
+      },
+      "review_id": {
+        "title": "Review Id",
+        "type": "integer"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "review_id",
+      "dispatch_nonce"
+    ],
+    "title": "synth_city_withdraw_revision_reviewArguments",
+    "type": "object"
+  }
+}

@@ -365,6 +365,11 @@ async def _protocol(entry, provider):
                     if initialized.serverInfo.name != a.NEW or {tool.name for tool in tools.tools} != {
                             "synth_city_" + suffix for suffix in _SUFFIXES} or len(tools.tools) != len(_SUFFIXES):
                         raise a.Incomplete("protocol_unverified")
+                    # #1146: the parameters too must be the deployed ones, not only the names.
+                    from app.services.tool_catalog import catalog_fingerprint, current_catalog_fingerprint
+                    if catalog_fingerprint({tool.name: tool.inputSchema for tool in tools.tools}) != \
+                            current_catalog_fingerprint():
+                        raise a.Incomplete("protocol_unverified")
 
 
 async def _resume(record):
