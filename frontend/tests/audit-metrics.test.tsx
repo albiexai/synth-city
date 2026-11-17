@@ -414,6 +414,56 @@ describe("AuditMetricsPage at the HTTP boundary", () => {
     expect(stub.audit()).toHaveLength(0);
   });
 
+  it("keeps the Team and Repository selects locked while the first read is pending", async () => {
+    const stub = stubFetch();
+    render(<AuditMetricsPage />);
+    await waitFor(() => expect(stub.metrics()).toHaveLength(1));
+    expect(screen.getByLabelText("Team")).toBeDisabled();
+    expect(screen.getByLabelText("Repository")).toBeDisabled();
+    expect(screen.getByText("Unlock events to choose a team or repository.")).toBeInTheDocument();
+  });
+
+  it("keeps the Team and Repository selects locked after a cancelled key request", async () => {
+    const stub = stubFetch();
+    render(<AuditMetricsPage />);
+    await waitFor(() => expect(stub.metrics()).toHaveLength(1));
+    stub.metrics()[0].respond(windowBody("mount"));
+    fireEvent.click(await screen.findByRole("button", { name: "Unlock events" }));
+    await waitFor(() => expect(stub.metrics()).toHaveLength(2));
+    stub.metrics()[1].respond(windowBody("again"));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    await screen.findByText(/Events are not shown\. The Director key request was cancelled\./);
+    expect(screen.getByLabelText("Team")).toBeDisabled();
+    expect(screen.getByLabelText("Repository")).toBeDisabled();
+    expect(screen.getByText("Unlock events to choose a team or repository.")).toBeInTheDocument();
+  });
+
+  it("keeps the Team and Repository selects locked after a refused key", async () => {
+    const stub = stubFetch();
+    setOperatorToken("synthetic-refused");
+    render(<AuditMetricsPage />);
+    await waitFor(() => expect(stub.metrics()).toHaveLength(1));
+    stub.metrics()[0].respond(windowBody("mount"));
+    await waitFor(() => expect(stub.audit()).toHaveLength(1));
+    stub.audit()[0].respond({ detail: "operator_token_invalid" }, 401);
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(
+      "The Director key was rejected. Clear it and enter a valid key."));
+    expect(screen.getByLabelText("Team")).toBeDisabled();
+    expect(screen.getByLabelText("Repository")).toBeDisabled();
+  });
+
+  it("enables the Team and Repository selects once the key options have loaded", async () => {
+    const stub = stubFetch();
+    setOperatorToken("synthetic-operator");
+    await mountWith(stub);
+    await screen.findByRole("option", { name: "Team A" }, { timeout: 3000 });
+    expect(screen.getByLabelText("Team")).toBeEnabled();
+    expect(screen.getByLabelText("Repository")).toBeEnabled();
+    expect(screen.queryByText("Unlock events to choose a team or repository.")).not.toBeInTheDocument();
+  });
+
   it("opens with a stored key and loads the events with no dialog (#515)", async () => {
     const stub = stubFetch();
     setOperatorToken("synthetic-operator");

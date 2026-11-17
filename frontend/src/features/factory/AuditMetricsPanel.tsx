@@ -467,6 +467,7 @@ export function AuditMetricsPage() {
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const teamOptions = filterOptions("team", contextKeys?.teams ?? []);
   const scopeOptions = filterOptions("scope", contextKeys?.repositories ?? []);
+  const optionsLocked = !contextKeys;
   const filterNames: FilterNames = {
     team: (key) => teamOptions.find((option) => option.value === key)?.label ?? "selected",
     scope: (key) => scopeOptions.find((option) => option.value === key)?.label ?? "selected",
@@ -514,7 +515,7 @@ export function AuditMetricsPage() {
         {/* R10: selects stay inside the card at narrow widths. */}
         <div className="w-full min-w-0 text-sm sm:w-auto">
           <label htmlFor="audit-filter-team" className={labelClass}>Team</label>
-          <select id="audit-filter-team" ref={teamSelectRef} value={applied.teamKey}
+          <select id="audit-filter-team" ref={teamSelectRef} value={applied.teamKey} disabled={optionsLocked}
             onChange={(event) => void applyReads({ ...applied, teamKey: event.target.value }, 1)}
             className="mt-1 w-full rounded-md border bg-background px-3 py-2 sm:w-64">
             <option value="">All teams</option>
@@ -523,12 +524,13 @@ export function AuditMetricsPage() {
         </div>
         <div className="w-full min-w-0 text-sm sm:w-auto">
           <label htmlFor="audit-filter-scope" className={labelClass}>Repository</label>
-          <select id="audit-filter-scope" value={applied.scopeKey}
+          <select id="audit-filter-scope" value={applied.scopeKey} disabled={optionsLocked}
             onChange={(event) => void applyReads({ ...applied, scopeKey: event.target.value }, 1)}
             className="mt-1 w-full rounded-md border bg-background px-3 py-2 sm:w-64">
             <option value="">All repositories</option>
             {scopeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
           </select>
+          {optionsLocked && <p className="mt-1 text-xs text-muted-foreground">Unlock events to choose a team or repository.</p>}
         </div>
         <div className="w-full min-w-0 text-sm sm:w-auto">
           <label htmlFor="audit-filter-window" className={labelClass}>Window</label>
