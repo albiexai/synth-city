@@ -66,14 +66,16 @@ test('@active Mail reads and actor creation require the correct credential', asy
   expect((await me.json()).actor_key).toBe('e2e-mail-auth-flow')
 })
 
-test('@active Agent Mail asks for the shared Director key before reading', async ({ page }) => {
+test('@active Agent Mail waits for the shared Director key, and asks only when the person chooses', async ({ page }) => {
   const reads: string[] = []
   page.on('request', request => {
     if (/\/api\/v1\/agent-mail\/(team|messages)/.test(request.url())) reads.push(request.url())
   })
   await page.goto('/agent-mail')
-  await expect(page.getByRole('dialog', { name: /Director key/i })).toBeVisible()
+  await expect(page.getByText('Enter the Director key to see Agent Mail')).toBeVisible()
+  await expect(page.getByRole('dialog', { name: /Director key/i })).toBeHidden()
   expect(reads).toEqual([])
+  await page.getByRole('button', { name: 'Enter key' }).click()
   await enterDirectorKey(page)
   await expect(page.getByRole('tab', { name: 'Team', exact: true })).toBeVisible()
   await expect.poll(() => reads.length).toBeGreaterThan(0)

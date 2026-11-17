@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { BookOpen, Inbox, Mail, MessageSquarePlus, Plug, Terminal, Users } from 'lucide-react'
+import { BookOpen, Inbox, KeyRound, Mail, MessageSquarePlus, Plug, Terminal, Users } from 'lucide-react'
 import { toast } from 'sonner'
 import { ApiHttpError } from '@/lib/api'
 import { clearOperatorToken, getOperatorToken } from '@/features/agent-teams/operatorAuth'
@@ -70,9 +70,11 @@ function CountLink({ label, onClick, children }: { label: string; onClick: () =>
 
 export function AgentMailPage() {
   const { directorKeyConfigured, requiresDirectorKey, readAuthenticationStatus } = useAgentMailAuthenticationStatus()
-  const { requestToken, tokenDialog } = useOperatorTokenFlow('Agent Mail requires the Director key.')
+  const { requestToken, tokenDialog } = useOperatorTokenFlow('to see Agent Mail')
   const protectedReadsBlocked = useRef(false)
   const pollingEnabled = useRef(false)
+  // The installation requires the Director key and none is held, or the key was refused. Nothing is read until it is entered.
+  const [directorKeyNeeded, setDirectorKeyNeeded] = useState(false)
 
   const stopRefusedReads = useCallback(async (error: unknown) => {
     if (error instanceof ApiHttpError && (error.status === 503 || (error.status >= 400 && error.status < 500))) {
@@ -80,6 +82,7 @@ export function AgentMailPage() {
       pollingEnabled.current = false
       if (error.status === 401) {
         clearOperatorToken()
+        setDirectorKeyNeeded(true)
         try { await readAuthenticationStatus(true) } catch { /* Keep protected reads stopped. */ }
       }
     }
@@ -89,8 +92,6 @@ export function AgentMailPage() {
   const [installStatus, setInstallStatus] = useState<AgentMailInstallStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [installLoading, setInstallLoading] = useState(true)
-  // The installation requires the Director key and the browser has none. The Team list says so.
-  const [directorKeyNeeded, setDirectorKeyNeeded] = useState(false)
   const [activeTab, setActiveTab] = useState('team')
   const [teamSearch, setTeamSearch] = useState('')
   const [teamStatus, setTeamStatus] = useState<TeamStatusFilter>('all')
@@ -160,25 +161,23 @@ export function AgentMailPage() {
       toast.error(error instanceof Error ? error.message : 'Mail authentication status is unavailable.')
       return
     }
-    // The key dialog waits for the person. Until it is answered nothing is loading.
+    // The key is asked for only when the person chooses to enter it, never on load.
     const keyNeeded = configured && !getOperatorToken()
     setDirectorKeyNeeded(keyNeeded)
     if (keyNeeded) {
-      setLoading(false)
-      setInstallLoading(false)
-    }
-    if (configured && !await requestToken()) {
       protectedReadsBlocked.current = true
-      setDirectorKeyNeeded(true)
       setLoading(false)
       setInstallLoading(false)
       return
     }
-    setDirectorKeyNeeded(false)
     protectedReadsBlocked.current = false
     pollingEnabled.current = true
     await Promise.all([loadOperationalData(), loadInstallData()])
-  }, [loadInstallData, loadOperationalData, requestToken, readAuthenticationStatus])
+  }, [loadInstallData, loadOperationalData, readAuthenticationStatus])
+
+  const enterDirectorKey = useCallback(async () => {
+    if (await requestToken()) await refreshAll()
+  }, [refreshAll, requestToken])
 
   useEffect(() => {
     let cancelled = false
@@ -241,7 +240,8 @@ export function AgentMailPage() {
   )
   const hasConfiguredIntegration = claudeReady || codexReady || copilotReady || opencodeReady
   const setUpNames = connectedHarnessNames(installStatus)
-  const showSetupNotice = !installLoading && (!hasConfiguredIntegration || members.length === 0)
+  const showSetupNotice = !installLoading && !directorKeyNeeded && installStatus !== null
+    && (!hasConfiguredIntegration || members.length === 0)
   const showCodexRegistrationNotice = !installLoading && codexReady
     && !members.some((member) => member.status === 'connected') && members.some((member) => member.status === 'observed')
 
@@ -344,6 +344,21 @@ export function AgentMailPage() {
         </div>
       </div>
 
+      {directorKeyNeeded && (
+        <Alert className="border-amber-300 bg-amber-50/60 dark:bg-amber-950/20">
+          <KeyRound className="h-4 w-4" />
+          <AlertTitle>Enter the Director key to see Agent Mail</AlertTitle>
+          <AlertDescription>
+            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <p>This installation requires the Director key for Agent Mail. Until it is entered, no agent state is loaded and nothing is reported as missing.</p>
+              <Button size="sm" variant="outline" className="shrink-0" onClick={() => void enterDirectorKey()}>
+                Enter key
+              </Button>
+            </div>
+          </AlertDescription>
+        </Alert>
+      )}
+
       {showSetupNotice && (
         <Alert className="border-amber-300 bg-amber-50/60 dark:bg-amber-950/20">
           <Plug className="h-4 w-4" />
@@ -354,7 +369,7 @@ export function AgentMailPage() {
             <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
               <p>
                 {!hasConfiguredIntegration
-                  ? 'Install the Agent Mail MCP server for Claude Code, Codex, GitHub Copilot CLI, or OpenCode CLI before agents can send, receive, or answer mailbox requests.'
+                  ? 'Set up Agent Mail for each agent harness you use in Harnesses before agents can send, receive, or answer mailbox requests.'
                   : 'Start or resume an agent in a repository, then have it call synth_city_whoami once so Synth City can attach it to a participant.'}
               </p>
               <div className="flex shrink-0 flex-wrap gap-2">
@@ -442,7 +457,7 @@ export function AgentMailPage() {
             members={teamMembers}
             loading={loading}
             directorKeyNeeded={directorKeyNeeded}
-            onEnterDirectorKey={() => void refreshAll()}
+            onEnterDirectorKey={() => void enterDirectorKey()}
             repoSearch={teamSearch}
             statusFilter={teamStatus}
             onRepoSearchChange={setTeamSearch}

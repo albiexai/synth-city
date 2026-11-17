@@ -46,13 +46,18 @@ export function AgentMailHelpDialog({ open, onOpenChange }: AgentMailHelpDialogP
             </p>
             <div className="flex flex-wrap gap-2">
               <Badge variant="outline">Claude Code: MCP + hooks</Badge>
-              <Badge variant="outline">Codex CLI: MCP + hooks</Badge>
+              <Badge variant="outline">Codex: MCP + hooks</Badge>
+              <Badge variant="outline">GitHub Copilot CLI: MCP + hooks</Badge>
+              <Badge variant="outline">OpenCode CLI: MCP + plugin</Badge>
+              <Badge variant="outline">Muse Code: MCP + hooks</Badge>
+              <Badge variant="outline">Antigravity CLI: set up, launch not proven</Badge>
+              <Badge variant="outline">Pi: automatic when Synth City launches it</Badge>
             </div>
           </HelpSection>
 
           <HelpSection icon={CheckCircle2} title="First run checklist">
             <ol className="list-decimal space-y-1 pl-5">
-              <li>Use the Install tab to configure Claude Code or Codex.</li>
+              <li>Open Harnesses and set up Agent Mail for each harness you use.</li>
               <li>Restart or resume the affected agent sessions.</li>
               <li>Have each agent call <code>synth_city_whoami</code> once from its repo.</li>
               <li>Ask agents to check <code>synth_city_check_inbox</code> before and after major work.</li>
