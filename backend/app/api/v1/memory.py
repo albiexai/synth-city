@@ -195,9 +195,10 @@ async def list_rules(
     from app.utils.path_utils import get_project_claude_dir
 
     rules = MemoryService.list_rules(project_path)
-    rules_dir = get_project_claude_dir(project_path) / "rules"
+    # No project chosen: there is no rules folder to name (not the backend's working directory) (#1068).
+    rules_dir = str(get_project_claude_dir(project_path) / "rules") if project_path else ""
 
-    return RulesListResponse(rules=rules, rules_dir=str(rules_dir))
+    return RulesListResponse(rules=rules, rules_dir=rules_dir)
 
 
 @router.post("/rules", response_model=SaveMemoryResponse)
