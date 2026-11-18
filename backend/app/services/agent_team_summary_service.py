@@ -7,7 +7,7 @@ from functools import partial
 from types import SimpleNamespace
 from typing import get_args
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, tuple_
 from sqlalchemy.exc import OperationalError
 from mcp_shim.work_remaining_protocol import MAX_AGE
 
@@ -28,7 +28,7 @@ from app.services.github_work_progress_service import github_work_progress_servi
 from app.services.agent_team_campaign_service import agent_team_campaign_service
 from app.services import required_ci_attention
 from app.services.agent_team_supervisor_service import observe_supervisor, supervisor_observation, team_needs_no_supervision
-from app.services.work_item_states import ATTENTION_STATUSES, DONE_STATUSES
+from app.services.work_item_states import ATTENTION_STATUSES, FINISHED_STATUSES
 
 _ACTORS = ("owner", "leader", "operator", "controller", "reviewer")
 _KINDS = {"review_pr", "merge_pr", "inspect_attempt", "inspect_checkpoint", "milestone_acceptance",
@@ -116,7 +116,7 @@ class AgentTeamSummaryService:
             .order_by(TeamGithubScope.id).limit(33))).all())
         selected = (select(GithubWorkItem).join(TeamGithubScope,
             TeamGithubScope.id == GithubWorkItem.scope_id).where(TeamGithubScope.preset_id == preset_id,
-            GithubWorkItem.dispatch_status.not_in(DONE_STATUSES)))
+            GithubWorkItem.dispatch_status.not_in(FINISHED_STATUSES)))
         # #1142: a repository or harness filter narrows the unfinished items themselves, so remaining work, next
         # actors and coverage are computed over the same work. A harness keeps only owned work.
         if scope_id is not None:
@@ -267,6 +267,8 @@ class AgentTeamSummaryService:
                 if code and (matcher is None or matcher.visible(action["scope_id"], action.get("work_item_id"))):
                     attention.append(TeamSummaryAttention(code=code, work_item_id=action.get("work_item_id"),
                         scope_id=action["scope_id"], issue_number=action["issue_number"]))
+                    if kind in {"inspect_attempt", "inspect_checkpoint"}:
+                        actors.add("operator")
             source = "pauses"
             pauses = await bounded(lambda: self._pauses(db, preset_id))
             if len(pauses) > 64:
@@ -344,6 +346,8 @@ class AgentTeamSummaryService:
             if db.in_transaction():
                 await db.rollback()
         human_actions = []
+        stopped_items = {(item.scope_id, item.issue_number) for item in items[:self.item_limit]
+                         if item.dispatch_status in ATTENTION_STATUSES}
         for action in visible_actions:
             # Existing action data also contains private context and prose. Use a narrow allowlist.
             kind, state = action["kind"], action["state"]
@@ -358,7 +362,9 @@ class AgentTeamSummaryService:
                 kind=kind, state=state, source=action.get("source") if action.get("source") in {"leader", "dispatch"}
                 else "unknown", assessment_current=assessment_current,
                 pull_request_number=action.get("pull_request_number"), escalation_reason=reason))
-            if state != "resolved":
+            stopped_inspection = (kind in {"inspect_attempt", "inspect_checkpoint"}
+                                  and (action_scope_id, issue_number) in stopped_items)
+            if state not in {"resolved", "historical"} and not stopped_inspection:
                 actors.add("operator")
         changed = final != initial or hold_code() != hold
         now = datetime.now(timezone.utc)
@@ -494,6 +500,48 @@ class AgentTeamSummaryService:
             supervisor_observation=supervisor, waiting_input=waiting_input if not changed else None,
             remaining_work=remaining, next_actors=[actor for actor in _ACTORS if actor in actors],
             next_actor_coverage_complete=complete and len(observations) == total, campaign=campaign)
+
+    async def for_work_item(self, db, preset_id, work_item_id):
+        """Keep the item's and unbound blockers over the same team observation."""
+        tracked_items = select(GithubWorkItem.id, GithubWorkItem.scope_id, GithubWorkItem.issue_number).join(
+            TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id).where(
+                TeamGithubScope.preset_id == preset_id)
+        if (await db.execute(tracked_items.where(GithubWorkItem.id == work_item_id))).one_or_none() is None:
+            return None
+        result = await self.summary(db, preset_id)
+        if result is None:
+            return None
+        # A Leader-reported action can carry a tracked issue's identity before it carries the work item id.
+        unbound = {(row.scope_id, row.issue_number) for row in (*result.human_actions, *result.attention)
+                   if row.work_item_id is None and row.scope_id is not None and row.issue_number is not None}
+        bindings = {}
+        if unbound:
+            rows = await db.execute(tracked_items.where(tuple_(GithubWorkItem.scope_id, GithubWorkItem.issue_number)
+                                                       .in_(unbound)))
+            bindings = {(row.scope_id, row.issue_number): row.id for row in rows}
+
+        def relevant(row):
+            return (row.work_item_id or bindings.get((row.scope_id, row.issue_number))) in (None, work_item_id)
+
+        updates = {"attention": [row for row in result.attention if relevant(row)],
+                   "human_actions": [row for row in result.human_actions if relevant(row)]}
+        # Binding an issue to a work item may await after the team observation. Preserve its timestamp
+        # and fail closed if the coverage expired or the hold changed while the bindings were read.
+        current_hold = hold_code()
+        hold_changed = current_hold != result.hold_code
+        window_expired = _utc(result.valid_until) <= datetime.now(timezone.utc)
+        if hold_changed or window_expired:
+            coverage = list(result.coverage_reason)
+            existing_codes = {reason.code for reason in coverage}
+            if hold_changed and "source_changed" not in existing_codes:
+                coverage.append(TeamSummaryCoverageReason(code="source_changed"))
+            if window_expired and "window_expired" not in existing_codes:
+                coverage.append(TeamSummaryCoverageReason(code="window_expired"))
+            updates.update(coverage_complete=False, coverage_reason=coverage,
+                           next_actor_coverage_complete=False, waiting_input=None)
+            if current_hold is not None:
+                updates["hold_code"] = current_hold
+        return result.model_copy(update=updates)
 
     async def needs_you(self, db, preset_id, *, scope_id=None, provider=None):
         """The summary narrowed to a repository and an assigned harness (#1141, #1142).

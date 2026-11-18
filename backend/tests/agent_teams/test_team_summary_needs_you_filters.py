@@ -15,7 +15,8 @@ from app.database import get_db
 from app.main import app
 from app.models.database import AgentTeamPreset, AgentTeamSlot, GithubWorkItem, TeamGithubScope
 from app.models.factory_schemas import (
-    ReminderAttention, TeamRequiredCIUnreadable, TeamSummaryAttention, TeamSummaryHumanAction, TeamWaitingInput,
+    ReminderAttention, TeamRequiredCIUnreadable, TeamSummaryAttention, TeamSummaryCoverageReason, TeamSummaryHumanAction,
+    TeamWaitingInput,
 )
 from app.models.schemas import SupervisorObservation
 from app.services.agent_team_summary_service import AgentTeamSummaryService, agent_team_summary_service
@@ -260,6 +261,115 @@ async def test_the_filter_reaches_the_summary_and_the_trim_only_touches_the_team
 async def test_an_unknown_preset_stays_none(db, world, monkeypatch):
     service, _ = await _service(db, world, monkeypatch)
     assert await service.needs_you(db, 999999, scope_id=world.ids["a1"]) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("own_attention", [False, True])
+async def test_pr_guard_ignores_other_items_and_keeps_team_coverage(db, world, client, monkeypatch, own_attention):
+    ids, items = world.ids, world.items
+    world.i1.pr_number = 101
+    world.i2.dispatch_status = "escalated"
+    await db.commit()
+    _, full = await _service(db, world, monkeypatch)
+    actions = [full.human_actions[1], full.human_actions[2].model_copy(update={"work_item_id": None})]
+    attention = [full.attention[1]]
+    if own_attention:
+        actions.append(full.human_actions[0])
+        attention.append(full.attention[0])
+    observed_at = datetime.now(timezone.utc)
+    full = full.model_copy(update={"coverage_complete": True, "coverage_reason": [], "waiting_input": [],
+                                  "hold_code": None, "checked_at": observed_at,
+                                  "valid_until": observed_at + timedelta(seconds=30),
+                                  "human_actions": actions, "attention": attention})
+
+    async def summary(db, preset_id, **filters):
+        return full
+
+    monkeypatch.setattr(agent_team_summary_service, "summary", summary)
+    url = f"/api/v1/agent-teams/presets/{ids['team']}/summary"
+    plain = (await client.get(url)).json()
+    scoped_response = await client.get(url, params={"work_item_id": items["i1"]})
+    assert scoped_response.status_code == 200
+    scoped = scoped_response.json()
+    assert scoped["attention"] == ([plain["attention"][-1]] if own_attention else [])
+    assert scoped["human_actions"] == ([plain["human_actions"][-1]] if own_attention else [])
+    for field in ("coverage_complete", "next_actor_coverage_complete", "valid_until", "hold_code", "waiting_input"):
+        assert scoped[field] == plain[field]
+    assert (await client.get(url, params={"work_item_id": items["ib"]})).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_pr_guard_preserves_global_hold_waits_and_unknown_coverage(db, world, monkeypatch):
+    service, full = await _service(db, world, monkeypatch)
+    full = full.model_copy(update={"coverage_complete": False, "hold_code": "hold",
+                                  "valid_until": datetime.now(timezone.utc) + timedelta(seconds=30)})
+    monkeypatch.setattr("app.services.agent_team_summary_service.hold_code", lambda: "hold")
+
+    async def summary(db, preset_id):
+        return full
+
+    monkeypatch.setattr(service, "summary", summary)
+    scoped = await service.for_work_item(db, world.ids["team"], world.items["i1"])
+    assert scoped.coverage_complete is False and scoped.hold_code == "hold"
+    assert scoped.waiting_input == full.waiting_input
+    assert [row.code for row in scoped.attention] == ["attempt_stopped", "human_review", "hold"]
+    assert [row.kind for row in scoped.human_actions] == ["review_pr", "pilot_decision"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("hold_starts", "expires", "prior_codes", "new_codes"), [
+    (True, False, (), ("source_changed",)),
+    (False, True, (), ("window_expired",)),
+    (True, True, ("native_unknown", "source_changed"), ("window_expired",)),
+])
+async def test_pr_guard_explains_changes_during_action_binding(db, world, monkeypatch, hold_starts,
+                                                       expires, prior_codes, new_codes):
+    service, full = await _service(db, world, monkeypatch)
+    unbound = full.human_actions[1].model_copy(update={"work_item_id": None})
+    observed_at = datetime.now(timezone.utc)
+    clock = observed_at
+    deadline = observed_at + timedelta(seconds=30)
+    prior = [TeamSummaryCoverageReason(code=code) for code in prior_codes]
+    full = full.model_copy(update={"coverage_complete": not prior, "coverage_reason": prior,
+                                  "waiting_input": [], "hold_code": None,
+                                  "checked_at": observed_at, "valid_until": deadline,
+                                  "human_actions": [unbound], "attention": []})
+    hold = None
+    original_execute = db.execute
+    summary_returned = False
+
+    async def summary(db, preset_id):
+        nonlocal summary_returned
+        summary_returned = True
+        return full
+
+    async def execute(statement, *args, **kwargs):
+        nonlocal hold, clock
+        result = await original_execute(statement, *args, **kwargs)
+        if summary_returned:
+            if hold_starts:
+                hold = "hold"
+            if expires:
+                clock = deadline
+        return result
+
+    class ObservationClock(datetime):
+        @classmethod
+        def now(cls, tz):
+            return clock.astimezone(tz)
+
+    monkeypatch.setattr(service, "summary", summary)
+    monkeypatch.setattr(db, "execute", execute)
+    monkeypatch.setattr("app.services.agent_team_summary_service.hold_code", lambda: hold)
+    monkeypatch.setattr("app.services.agent_team_summary_service.datetime", ObservationClock)
+    scoped = await service.for_work_item(db, world.ids["team"], world.items["i1"])
+    assert scoped.human_actions == []
+    assert scoped.hold_code == ("hold" if hold_starts else None)
+    assert not scoped.coverage_complete
+    assert not scoped.next_actor_coverage_complete
+    assert scoped.waiting_input is None
+    assert scoped.checked_at == observed_at and scoped.valid_until == deadline
+    assert scoped.coverage_reason == prior + [TeamSummaryCoverageReason(code=code) for code in new_codes]
 
 
 @pytest_asyncio.fixture

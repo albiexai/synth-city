@@ -16,11 +16,11 @@ from app.models.database import (AgentTeamPreset, FactoryAuditEvent,
 from app.services.factory_audit_service import sanitize_text
 from app.services.github_coordination_service import hold_code
 from app.services.github_ci_watch_service import github_ci_watch_service
+from app.services.work_item_states import FINISHED_STATUSES
 
 _MUTATIONS = {'owner_status_report', 'approval_decision', 'handoff_reassignment', 'handoff_acceptance',
     'continuation_decision', 'continuation_request', 'prepared_attempt_resume', 'recovery_cancellation',
     'request_cancellation', 'workspace_release', 'review_acceptance_declared'}
-_TERMINAL = ('merged', 'completed')
 
 
 def _utc(value):
@@ -74,7 +74,7 @@ class GithubTeamIdleService:
             return []
         rows = (await db.execute(select(GithubWorkItem, TeamGithubScope).join(TeamGithubScope,
             TeamGithubScope.id == GithubWorkItem.scope_id).where(TeamGithubScope.preset_id == preset_id,
-            GithubWorkItem.dispatch_status.not_in(_TERMINAL)).order_by(GithubWorkItem.id).limit(65)
+            GithubWorkItem.dispatch_status.not_in(FINISHED_STATUSES)).order_by(GithubWorkItem.id).limit(65)
             .execution_options(populate_existing=True))).all()
         if len(rows) > 64 or not coverage_complete:
             return await self._unavailable(db, preset_id, now)

@@ -240,7 +240,7 @@ The existing progress service can refresh its derived observation cache.
 
 The summary limits observations to eight seconds and 64 unfinished tracked items.
 The existing human-actions read also limits coverage to 32 repository scopes.
-It excludes `merged` and `completed` items from effort totals.
+It excludes `merged`, `completed` and `cancelled` items from effort totals.
 The total is known only when every included report is current and has validated numeric bounds.
 Incomplete, stale, unknown, expired, or changed-context observations keep the whole estimate Unknown.
 The total excludes waiting time. Its confidence is the lowest reported confidence.
@@ -249,6 +249,10 @@ An empty complete observation has zero remaining effort.
 Consumers must check `valid_until` and coverage. These observations grant no execution authority.
 
 MCP tools: `synth_city_get_team_summary` reads the summary.
+For a PR's final hold check, pass its tracked `work_item_id` to that tool or to the summary route.
+The response keeps attention and human actions for that item and signals with no work-item binding.
+It uses the same team coverage, freshness deadline, HOLD and native waiting evidence as the unfiltered read.
+The selected item must belong to the preset. This selector is separate from the repository and harness filters.
 `synth_city_update_team_parent_issue` changes only the link. Its required nullable argument clears the link with `null`.
 `synth_city_create_team` accepts `parent_issue_url`. Existing preset reads return the link.
 
@@ -430,6 +434,18 @@ Attempt snapshots follow these rules:
 - History returns up to 100 events for the scope, newest first. Attempt adoptions appear with `work_item_id` set.
 
 ### Maintenance
+
+`POST /api/v1/agent-teams/presets/{preset_id}/work-items/{item_id}/end-stopped` ends an escalated or failed item.
+Send `operation_id`, `expected_dispatch_generation`, `expected_scope_revision`, `outcome` and `reason`.
+Read the generation and revision from the item list. Send a null generation when the item has no generation.
+For `deferred`, supply `target_milestone`. For `superseded`, supply `superseding_pr_number` for the delivering PR
+in the same repository and target branch. The route verifies the PR merge.
+
+The current Leader can use `synth_city_leader_end_stopped` with the same fields and the tracked `work_item_id`.
+The service records the reason and destination in the audit, releases any verified clean lease and retires the item's
+current attention. The item's dispatch state becomes `cancelled`. A dirty or unpublished workspace, a changed attempt,
+or a hold refuses the action. An identical operation can be replayed with the same ID. GitHub issues and milestones
+remain under their existing repository workflows.
 
 | Route | Behavior |
 | --- | --- |

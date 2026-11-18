@@ -315,10 +315,9 @@ A real failed check in the same observation still charges the head once.
 
 ### Leader-run standard recoveries
 
-Three recoveries that only the operator API offered are also available to the current Leader, through
-`synth_city_leader_cancel_revision`, `synth_city_leader_finalize_merged` and
-`synth_city_leader_release_workspace` (routes under `POST /github-work-items/{id}/leader-recovery/`:
-`cancel-revision`, `finalize-merged/preview`, `finalize-merged` and `release-workspace`). Each one calls the
+The current Leader can use `synth_city_leader_cancel_revision`, `synth_city_leader_finalize_merged`,
+`synth_city_leader_release_workspace` and `synth_city_leader_end_stopped`. Their routes are under
+`POST /github-work-items/{id}/leader-recovery/`. Each one calls the
 operator service, so it keeps every operator guard, and adds these checks: the caller is the current Leader
 and differs from the owner, there is no pause or HOLD, and a Supervisor is bound.
 
@@ -332,6 +331,9 @@ and differs from the owner, there is no pause or HOLD, and a Supervisor is bound
   lease in place and returns only the work item ID, workspace ID, and UTC lease start.
   Release requires a terminal item and a clean, readable tree. Commits outside the local base must
   match the head, branch and source repository of the recorded PR, including a closed unmerged PR.
+- **End stopped work** uses the generation and scope revision from `synth_city_list_work_items`. It records
+  `deferred` with a target milestone or `superseded` with the delivering merged PR. It releases a verified clean
+  lease and clears the stopped item's current attention. See [Maintenance](agent-teams.md#maintenance).
 
 Every request carries an `operation_id`. The same request again is a replay and never repeats the action; a
 different request under the same id is refused as `operation_conflict`. The action keeps its existing audit

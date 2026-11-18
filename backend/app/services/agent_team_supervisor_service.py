@@ -78,10 +78,10 @@ async def team_needs_no_supervision(db, team) -> bool:
     if team.autonomy_enabled:
         return False
     from app.models.database import GithubWorkItem, TeamGithubScope
-    from app.services.work_item_states import DONE_STATUSES
+    from app.services.work_item_states import FINISHED_STATUSES
     unfinished = await db.scalar(select(GithubWorkItem.id).join(
         TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id).where(
-        TeamGithubScope.preset_id == team.id, GithubWorkItem.dispatch_status.not_in(DONE_STATUSES)).limit(1))
+        TeamGithubScope.preset_id == team.id, GithubWorkItem.dispatch_status.not_in(FINISHED_STATUSES)).limit(1))
     return unfinished is None
 
 

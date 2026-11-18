@@ -1,4 +1,4 @@
-"""The Leader runs three standard recoveries with the operator guards, one audit fact and one Supervisor notice."""
+"""Leader recoveries keep the operator guards, audit facts and Supervisor notices."""
 import asyncio
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -16,6 +16,8 @@ from app.models.database import (
     FactoryAuditEvent, GithubMaintenanceEvent, GithubWorkspace, MailAgentSession, MailExternalActor, MailMessage,
 )
 from app.services import github_leader_recovery_service as lr
+from app.services.github_end_stopped_item_service import EndStoppedItemRequest
+from mcp_shim.work_remaining_protocol import public_generation
 from tests.agent_teams.test_scope_amendments import db, healthy_attempt, submitted  # noqa: F401
 
 try:
@@ -61,6 +63,26 @@ async def ready(db, healthy_attempt):
     a.leader_session = await _session(db, a.leader)
     a.owner_session = await _session(db, a.owner)
     return a
+
+
+@pytest.mark.asyncio
+async def test_only_current_leader_ends_stopped_work_and_sends_one_notice(db, ready, monkeypatch):
+    attempt = ready
+    attempt.item.dispatch_status = "escalated"
+    await db.commit()
+    monkeypatch.setattr(lr.github_workspace_service, "delegated_release_blocker", AsyncMock(return_value=None))
+    request = EndStoppedItemRequest(operation_id="end-stopped", expected_scope_revision=attempt.item.active_scope_revision,
+        expected_dispatch_generation=public_generation(attempt.item.id, attempt.nonce), outcome="deferred",
+        target_milestone="vNext", reason="Work moved to the next milestone.")
+    with pytest.raises(lr.LeaderRecoveryError, match="leader_only"):
+        await lr.end_stopped(db, attempt.item, attempt.owner_session, request)
+    first = await lr.end_stopped(db, attempt.item, attempt.leader_session, request)
+    assert first["status"] == "ended" and first["notice"] == "sent"
+    await db.refresh(attempt.revision)
+    assert attempt.revision.status == "cancelled"
+    again = await lr.end_stopped(db, attempt.item, attempt.leader_session, request)
+    assert again["status"] == "already_ended" and again["notice"] == "already_sent"
+    assert len(await _notices(db)) == 1
 
 
 # --- cancel ---------------------------------------------------------------------------------------------------
@@ -506,6 +528,7 @@ RECOVERY_ROUTES = [
         ("POST", "finalize-merged"),
         ("POST", "release-workspace"),
         ("GET", "release-workspace/context"),
+        ("POST", "end-stopped"),
     )
 ]
 
@@ -544,12 +567,12 @@ def test_operator_only_actions_are_not_exposed_to_the_leader():
     from app.main import app
     from mcp_shim import agent_mail_server as shim
     names = {n for n in dir(shim) if n.startswith("synth_city_leader_")}
-    assert names == {"synth_city_leader_cancel_revision", "synth_city_leader_finalize_merged",
+    assert names == {"synth_city_leader_cancel_revision", "synth_city_leader_end_stopped", "synth_city_leader_finalize_merged",
                      "synth_city_leader_release_workspace"}
     source = inspect.getsource(lr)
     for forbidden in ("max_continuation", "continuation_enabled", "github_publish", "settings.", "approve("):
         assert forbidden not in source  # no policy, limit or approval setter is reachable from the Leader service
-    # The app exposes exactly the approved recovery actions and lease context read.
+    # The exact recovery routes and lease context read the app exposes, all behind the Leader session guard.
     _assert_recovery_exposure(app.routes, RECOVERY_ROUTES)
     # The test must have looked at the operator-protected group: every delivery route is among the effective routes,
     # under the agent-teams prefix, and depends on require_operator.

@@ -403,12 +403,24 @@ export const manifest = [
   },
   {
     "name": "synth_city_get_team_summary",
-    "description": "Read a team's outcome, parent link, existing attention signals, effort total and next actors.\n\n    Unknown or incomplete observations keep the total Unknown. This read grants no execution authority.\n    ",
+    "description": "Read a team's outcome, parent link, existing attention signals, effort total and next actors.\n\n    For a PR's final hold check, pass its tracked work_item_id. Attention and human actions then keep\n    only that item and unbound signals. Team coverage, HOLD, and native waiting signals still apply.\n    Unknown or incomplete observations keep the total Unknown. This read grants no execution authority.\n    ",
     "inputSchema": {
       "properties": {
         "preset_id": {
           "title": "Preset Id",
           "type": "integer"
+        },
+        "work_item_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Work Item Id"
         }
       },
       "required": [
@@ -521,6 +533,83 @@ export const manifest = [
         "reason"
       ],
       "title": "synth_city_leader_cancel_revisionArguments",
+      "type": "object"
+    }
+  },
+  {
+    "name": "synth_city_leader_end_stopped",
+    "description": "Current Leader ends one stopped work item and safely releases any clean workspace.\n\n    Read dispatch_generation and active_scope_revision from list_work_items. Use null generation only if the\n    item has none. Supply a target milestone for deferred or the delivering PR number for superseded.\n    A matching operation_id replay is safe. HOLD, a changed attempt or an unsafe lease refuses the action.\n    ",
+    "inputSchema": {
+      "properties": {
+        "work_item_id": {
+          "title": "Work Item Id",
+          "type": "integer"
+        },
+        "expected_dispatch_generation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expected Dispatch Generation"
+        },
+        "expected_scope_revision": {
+          "title": "Expected Scope Revision",
+          "type": "integer"
+        },
+        "operation_id": {
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "outcome": {
+          "enum": [
+            "deferred",
+            "superseded"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        },
+        "target_milestone": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Milestone"
+        },
+        "superseding_pr_number": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Superseding Pr Number"
+        }
+      },
+      "required": [
+        "work_item_id",
+        "expected_dispatch_generation",
+        "expected_scope_revision",
+        "operation_id",
+        "outcome",
+        "reason"
+      ],
+      "title": "synth_city_leader_end_stoppedArguments",
       "type": "object"
     }
   },

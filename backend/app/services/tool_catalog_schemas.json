@@ -354,6 +354,18 @@
       "preset_id": {
         "title": "Preset Id",
         "type": "integer"
+      },
+      "work_item_id": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Work Item Id"
       }
     },
     "required": [
@@ -454,6 +466,79 @@
       "reason"
     ],
     "title": "synth_city_leader_cancel_revisionArguments",
+    "type": "object"
+  },
+  "synth_city_leader_end_stopped": {
+    "properties": {
+      "expected_dispatch_generation": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "title": "Expected Dispatch Generation"
+      },
+      "expected_scope_revision": {
+        "title": "Expected Scope Revision",
+        "type": "integer"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "outcome": {
+        "enum": [
+          "deferred",
+          "superseded"
+        ],
+        "title": "Outcome",
+        "type": "string"
+      },
+      "reason": {
+        "title": "Reason",
+        "type": "string"
+      },
+      "superseding_pr_number": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Superseding Pr Number"
+      },
+      "target_milestone": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Target Milestone"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "expected_dispatch_generation",
+      "expected_scope_revision",
+      "operation_id",
+      "outcome",
+      "reason"
+    ],
+    "title": "synth_city_leader_end_stoppedArguments",
     "type": "object"
   },
   "synth_city_leader_finalize_merged": {

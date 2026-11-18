@@ -44,6 +44,7 @@ SAFE_VALUE_FIELDS = {
     "supervisor_actor_id", "supervisor_grace_seconds", "supervisor_status",
     "origin_kind", "previous_scope_revision", "review_id", "reviewer_member_id",
     "head_sha", "verdict", "outcome",
+    "target_milestone", "superseding_pr_number", "merge_commit_sha",
     # #945: a campaign change stores the milestone title and only the number of planned decisions.
     "backlog_milestone", "planned_decisions_count",
 }

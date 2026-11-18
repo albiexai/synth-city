@@ -303,6 +303,10 @@ Push a useful checkpoint after a coherent substep and before a handoff or long w
 
 Keep one current summary near the start of the main issue and PR. Use one responsible publisher. Refresh the marked summary sections and preserve requirements, other scopes' records and historical evidence. Do not append competing current-status paragraphs.
 
+Before changing a PR's review hold, read `synth_city_get_team_summary` with its tracked `work_item_id`.
+Check the item's attention and human actions along with the team-wide HOLD, coverage, freshness and native waits.
+Use the unfiltered summary for team coordination and the configured merge policy for the merge decision.
+
 Use three simple lines for remaining work:
 
 ```text
