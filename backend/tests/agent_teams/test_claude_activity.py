@@ -513,12 +513,12 @@ def test_claude_a_kept_event_with_the_same_time_as_the_last_real_event_is_in_ord
     assert _view(result) == _view(plain)
 
 
-def _split_final_message(native, *, second_message_id="msg-final"):
+def _split_final_message(native, *, second_message_id="msg-final", first_message_id="msg-final", second_stop="end_turn"):
     """The final message written as two rows, one per content block (#1205, Claude Code 2.1.292)."""
     thinking = native["row"]("assistant", -1, message={
-        "id": "msg-final", "role": "assistant", "stop_reason": "end_turn", "content": [{"type": "thinking"}]})
+        "id": first_message_id, "role": "assistant", "stop_reason": "end_turn", "content": [{"type": "thinking"}]})
     text = native["row"]("assistant", -.8, parentUuid=thinking["uuid"], message={
-        "id": second_message_id, "role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text"}]})
+        "id": second_message_id, "role": "assistant", "stop_reason": second_stop, "content": [{"type": "text"}]})
     duration = native["row"]("system", -.5, subtype="turn_duration", parentUuid=text["uuid"])
     native["write"]([native["user"], native["tool"], native["result"], thinking, text, duration])
 
@@ -547,3 +547,14 @@ def test_claude_split_final_message_keeps_one_settlement_identity(native):
     native["write"](head); native["observe"](provenance=first)
     native["write"](head + [text]); native["observe"](provenance=second)
     assert first["event_id"] == second["event_id"]
+
+
+@pytest.mark.parametrize("change", [
+    {"second_stop": "tool_use"},                             # the next block does not end the turn
+    {"first_message_id": "", "second_message_id": ""},       # no usable message identity
+    {"first_message_id": 7, "second_message_id": 7},
+])
+def test_claude_continuation_must_be_an_end_turn_block_of_an_identified_message(native, change):
+    # #1205 review: only another end_turn block of the same, identified message keeps the completion.
+    _split_final_message(native, **change)
+    assert native["observe"]().state != "idle"

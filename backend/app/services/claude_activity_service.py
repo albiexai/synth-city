@@ -187,7 +187,8 @@ def _state(path: Path, uid: int, session_id: str, cwd: str, now: datetime,
         elif kind == "assistant":
             if not isinstance(message, dict) or message.get("role") != "assistant":
                 return "unknown", "observation_invalid", None
-            if (state == "idle" and terminal is not None and message.get("id") is not None
+            if (state == "idle" and terminal is not None and message.get("stop_reason") == "end_turn"
+                    and isinstance(terminal_message, str) and terminal_message
                     and message.get("id") == terminal_message and row.get("parentUuid") == terminal_last):
                 # Another content block of the final message, not new activity: keep the completion.
                 if not isinstance(row.get("uuid"), str) or not row["uuid"]:
