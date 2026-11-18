@@ -9,8 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.3.0] - 2026-11-18
+
+Albiex Synth City 4.3.0 is a correctness release: it makes existing features work as they say. The factory now observes long Codex turns and split Claude Code replies, so team coverage and merge guards stop stalling; stopped work can be ended as deferred or superseded; the merge guard ignores other items' problems; GitHub rate limits are reported and backed off; and the harness pages say whose data they read. It also completes the OpenCode runtime-kit teardown and the Antigravity fail-closed checks, and verifies Muse first-session discovery across users.
+
+**Not in this release (planned for 4.4):** routing work between teams by milestone; capability-aware routing; workspace provisioning that makes a new slot work on first launch; campaign retrospectives in Insights; TypeScript 7 and mcp 2.3. The Antigravity Agent Mail gate stays closed: `agy` still doesn't declare `call_mcp_tool` to the model (verified in #994).
+
+### Added
+
+- **A member that doesn't react to a wake is woken once more, and the Leader and the Supervisor are told if it still doesn't.** A delivered wake with no observed activity gets one re-wake, never a second. If the re-wake also gets no activity, the Leader and the Supervisor each receive one notice naming the member and its work item (#1059, #1060).
+- **A wake prompt left unsent in a pane's input box is submitted.** Synth City recognises the unsent text and presses Enter only; it never types other text (#1061).
+- **Provider refusals are recognised and shown.** A Codex pane showing a provider refusal or content-filter notice is recorded as a blocked state on the member. The Leader and the Supervisor are notified once, and Teams shows "Blocked: provider refusal" on the member card (#1062, #1091, #1092, #1064).
+- **A stopped work item can be ended as deferred or superseded.** The operator route and the Leader tool `end-stopped` end an item with outcome `deferred` (naming the target milestone) or `superseded` (naming the delivering PR). It releases a verified clean workspace and clears the item's attention. A PR's final hold guard now ignores attention that belongs to other work items (#1219).
+
 ### Changed
 
+- **Sessions, Usage, Context and Plans read the harness user's data, and say whose.** The four pages are scoped to the selected harness user, name the user and folder they read, and tell unreadable data apart from empty data (#1065, #1066, #1067).
+- **The harness pages tell the truth about the agent user's install.** Claude Code's version is the agent user's, not the controller's; a missing CLI reads as "not installed" on both the Harnesses list and its pages; Memory has no project scope when no project is chosen; the project selector lists only the current harness's members' folders (#1068, #1069, #1070).
+- **Codex session history is shown as not available yet,** and harness names and "Director key" wording are consistent across pages (#1165).
+- **Agent Mail asks for the Director key when it's needed,** instead of reporting Agent Mail as uninstalled or opening the dialog on load.
+- **Help text names "the backend environment file"** and links to the Installation guide, instead of the source path `backend/.env`.
+- **Dependencies:** FastAPI 0.162 with Starlette 1.10 (#1160); jsdom 31 and `@testing-library/jest-dom` 7 (#1158); `actions/upload-artifact` and `actions/setup-python` v7 (#1157); a batch of minor and patch upgrades (#1058).
 - **A Leader's extension request beyond the scope ceiling now reaches the Supervisor.** The request is still refused with `extension_exceeds_ceiling`. While the attempt is live (`dispatched` or `verifying`) and the team has a bound Supervisor, the factory also sends one "Effort ceiling reached" notice per item and attempt, which only the bound Supervisor's inbox shows. It names the request and the room left and grants no extension. Other refusals send nothing. The delivery policy text, the delivery practices and the extension tool's description now say the Leader extends within the scope ceiling and the Supervisor decides beyond it, instead of "ask the operator at the limit" ([#1102](https://github.com/albiexai/synth-city/issues/1102), split from [#1040](https://github.com/albiexai/synth-city/issues/1040)).
 - **The Leader may extend an item's effort limit again, up to the scope ceiling, including while its PR is under review.** Each step is still at most the per-step cap (the smaller of 30 minutes and 25 percent of the original limit), and the limit plus all extensions may not pass `max_item_effort_minutes`. A step beyond the ceiling is refused with its own code, `extension_exceeds_ceiling`, naming the room left; `effort_extension_already_used` is gone. An extension is now accepted while the item is `verifying`. Before, every extension for a review correction was refused as `effort_extension_stale`, which is why two live extensions on #1059 needed the Supervisor. The item's effort view reports the room for the next step in `extension_cap_minutes`, which is no longer 0 after the first extension. The limit notice and the tool description say the Leader may extend again up to the ceiling. Each step keeps its own `effort_extension` audit event ([#1101](https://github.com/albiexai/synth-city/issues/1101), split from [#1040](https://github.com/albiexai/synth-city/issues/1040)).
 - **The Leader's effort-limit extension states the total it saw and the evidence for it.** `synth_city_extend_effort_limit` now requires `expected_extension_minutes`, the extension total the Leader read in the item's effort (0 before any extension), and `evidence`, the work so far that supports the extension. A call whose total is no longer the recorded one is refused with `effort_extension_total_changed` and grants nothing, so a repeated or concurrent call never extends twice; before, a repeat with the same minutes returned the earlier result. Each granted extension records one `effort_extension` audit event with its reason and evidence. The one-extension rule and the per-step cap are unchanged ([#1100](https://github.com/albiexai/synth-city/issues/1100), split from [#1040](https://github.com/albiexai/synth-city/issues/1040)).
@@ -18,6 +37,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Codex member in a long turn reads "working", not "unknown".** When a turn's start was more than 1 MiB back in its rollout log, the member read unknown, which made team coverage incomplete and stalled every merge guard. Synth City now reads earlier parts of the log, within an 8 MiB bound (#1201).
+- **A Claude Code member that finished its turn reads "idle".** A final message written as several rows (thinking, then text) read as an unconfirmed completion (#1205).
+- **The Autonomy tab shows a team's full work item count,** and its notification counter and the Audit coverage wording are correct (#1057).
+- **Overview's Repository and Assigned-harness filters apply to Needs you, Progress and Teams,** including remaining work and next actors (#1141, #1142).
+- **Team reads wait until the scope names are confirmed,** so the Overview no longer requests team summaries for an unknown scope (#1207).
+- **The Work page shows the owner's agent status** when its session isn't bound to a verified pane, instead of a bare "unknown session" (#1073).
+- **The Work and Repositories tables stay inside their box at 390 px** (#1166, #1230).
+- **Detach removes a pane from the watch grid** and updates the watch count.
+- **Backup URLs, unknown routes and Audit filters work,** and a missing asset returns a real 404 instead of a stale UI shell.
+- **V1 can record a verdict on a submitted continuation revision** (no more 409 `amendment_context_unavailable`) (#1217).
+- **The Leader can reject a pending initial plan on an escalated item** (#1190).
+- **Antigravity native reads are bounded,** and activity needs overlapping snapshots; unseen screens and records fail closed (#1021, #1215).
+- **The OpenCode runtime kit runs in its own PID namespace,** so `down` ends every process it started (#1018).
+- **CI:** a failed-jobs rerun now passes the backend gate, because the gate uses the newest attempt's shard results (#1199); backend shards are rebalanced (#1029).
 - **Completed work can release a clean workspace after its PR is closed unmerged.** The workspace HEAD must match the recorded PR's pushed head, branch and source repository. The Leader can read the exact lease identity before requesting release ([#1123](https://github.com/albiexai/synth-city/issues/1123)).
 - **Concurrent Leader cancellation requests can finish when SQLite locks the owner notice.** The cancellation commits once. A bounded retry refreshes the cancellation context and settles the same keyed notice, so the caller that cancelled the revision can report success and the duplicate can report a replay. Owner and Supervisor notices each remain unique ([#1208](https://github.com/albiexai/synth-city/issues/1208)).
 - **Guided repository setup can configure automatic merge.** Choosing automatic merge creates an enabled verifier for a new team or requires one for an existing team, and sets a daily cap of five. Repositories flags automatic scopes whose teams lack an enabled verifier separate from the Leader ([#1112](https://github.com/albiexai/synth-city/issues/1112)).
