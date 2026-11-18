@@ -22,7 +22,7 @@ from app.services.github_operator_attention_service import github_operator_atten
 from app.services.github_work_progress_service import github_work_progress_service
 from app.services.agent_team_campaign_service import agent_team_campaign_service
 from app.services import required_ci_attention
-from app.services.agent_team_supervisor_service import observe_supervisor, supervisor_observation
+from app.services.agent_team_supervisor_service import observe_supervisor, supervisor_observation, team_needs_no_supervision
 from app.services.work_item_states import DONE_STATUSES
 
 _ACTORS = ("owner", "leader", "operator", "controller", "reviewer")
@@ -296,7 +296,8 @@ class AgentTeamSummaryService:
         final_team = final[0]
         supervisor = supervisor_observation(final_team, now=now, actor=SimpleNamespace(
             id=final_team.supervisor_actor_id, display_name=final_team.supervisor_display_name)
-            if final_team.supervisor_actor_id is not None else None)
+            if final_team.supervisor_actor_id is not None else None,
+            quiet=await team_needs_no_supervision(db, final_team))  # unfiltered, whatever the summary's filter
         if supervisor["next_check_at"] is not None:
             boundary = supervisor["next_check_at"]
             if supervisor["status"] == "late":

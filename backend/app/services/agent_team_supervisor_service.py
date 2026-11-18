@@ -40,8 +40,12 @@ def supervisor_address(actor) -> dict | None:
             "display_name": clean_note(actor.display_name)}
 
 
-def supervisor_observation(team, *, now: datetime | None = None, actor=None) -> dict:
-    """Derive health from the controller clock and the stored promise."""
+def supervisor_observation(team, *, now: datetime | None = None, actor=None, quiet: bool = False) -> dict:
+    """Derive health from the controller clock and the stored promise.
+
+    ``quiet``: the team is paused with no remaining work (#1132), so a late or absent check-in raises no attention.
+    The status itself stays truthful.
+    """
     current = utc_datetime(now or datetime.now(timezone.utc))
     actor_id = team.supervisor_actor_id
     if actor is not None and actor.id != actor_id:
@@ -66,7 +70,19 @@ def supervisor_observation(team, *, now: datetime | None = None, actor=None) -> 
     return {"status": status, "actor_id": actor_id,
             "address": supervisor_address(actor), "checked_at": checked, "next_check_at": promised,
             "grace_seconds": grace, "note": clean_note(team.supervisor_note) if actor_id is not None else None,
-            "attention": "Supervisor check-in overdue" if status in {"late", "absent"} else None}
+            "attention": "Supervisor check-in overdue" if status in {"late", "absent"} and not quiet else None}
+
+
+async def team_needs_no_supervision(db, team) -> bool:
+    """A paused team with no unfinished work item in any of its scopes, whatever filter a reader applies (#1132)."""
+    if team.autonomy_enabled:
+        return False
+    from app.models.database import GithubWorkItem, TeamGithubScope
+    from app.services.work_item_states import DONE_STATUSES
+    unfinished = await db.scalar(select(GithubWorkItem.id).join(
+        TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id).where(
+        TeamGithubScope.preset_id == team.id, GithubWorkItem.dispatch_status.not_in(DONE_STATUSES)).limit(1))
+    return unfinished is None
 
 
 def _current_binding(team):
@@ -101,7 +117,8 @@ async def observe_supervisor(db, preset_id: int, *, now: datetime | None = None)
     if team is None:
         return None
     actor = await db.get(MailExternalActor, team.supervisor_actor_id) if team.supervisor_actor_id else None
-    observation = supervisor_observation(team, now=current, actor=actor)
+    observation = supervisor_observation(team, now=current, actor=actor,
+                                         quiet=await team_needs_no_supervision(db, team))
     old_status, new_status = team.supervisor_observed_status, observation["status"]
     if old_status == new_status or (old_status is None and new_status == "none"):
         return observation
@@ -177,7 +194,7 @@ async def supervisor_checkin(db, actor, preset_id: int, next_check_at: datetime,
     else:
         await db.commit()
     team = await _team(db, preset_id)
-    result = supervisor_observation(team, now=current, actor=actor)
+    result = supervisor_observation(team, now=current, actor=actor, quiet=await team_needs_no_supervision(db, team))
     from app.services.github_team_idle_service import github_team_idle_service
     from sqlalchemy.ext.asyncio import async_sessionmaker
     # The check-in is already committed. Isolate observation rollback/expiry from
