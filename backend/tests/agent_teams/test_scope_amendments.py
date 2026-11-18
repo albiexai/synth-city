@@ -1387,6 +1387,63 @@ async def test_escalated_review_recording_requires_current_submitted_authority(d
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["approval", "acknowledgement", "owner", "lease"])
+async def test_escalated_named_reviewer_binding_requires_submitted_authority(db, submitted_continuation, changed):
+    from fastapi import HTTPException
+    from app.api.v1.agent_teams import _named_reviewer_binding
+
+    a = submitted_continuation
+    await github_dispatch_service.escalate_without_notification(db, a.item, "plan_blocked")
+    if changed == "approval":
+        approval = await db.get(GithubApprovalRequest, a.revision.approval_request_id)
+        approval.status = "superseded"
+    elif changed == "acknowledgement":
+        a.revision.acknowledged_at = None
+    elif changed == "owner":
+        a.revision.owner_member_id = a.leader.id
+    else:
+        a.workspace.lease_token = "replacement-lease"
+    await db.commit()
+
+    with pytest.raises(HTTPException) as error:
+        await _named_reviewer_binding(db, a.item, a.scope, a.reviewer.id)
+    assert (error.value.status_code, error.value.detail) == (409, "review_binding_unavailable")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["attempt", "pause", "hold"])
+async def test_named_reviewer_binding_rechecks_attempt_and_stops_before_return(
+    db, submitted_continuation, monkeypatch, changed,
+):
+    from fastapi import HTTPException
+    from app.api.v1.agent_teams import _named_reviewer_binding
+    from app.models.database import GithubOwnerObservationPause
+    from app.services import github_coordination_service
+    from app.services.github_ci_watch_service import github_ci_watch_service
+
+    a = submitted_continuation
+    await github_dispatch_service.escalate_without_notification(db, a.item, "plan_blocked")
+    require_reviewer = github_ci_watch_service._reviewer
+
+    async def change_after_reviewer_check(*args):
+        result = await require_reviewer(*args)
+        if changed == "attempt":
+            a.item.dispatch_nonce = "replacement"
+        elif changed == "pause":
+            db.add(GithubOwnerObservationPause(work_item_id=a.item.id, wait_key="synthetic-wait",
+                authority_sha256="synthetic-authority", deadline=datetime.utcnow(), status="paused"))
+        else:
+            monkeypatch.setattr(github_coordination_service, "hold_code", lambda: "factory_hold")
+        await db.commit()
+        return result
+
+    monkeypatch.setattr(github_ci_watch_service, "_reviewer", change_after_reviewer_check)
+    with pytest.raises(HTTPException) as error:
+        await _named_reviewer_binding(db, a.item, a.scope, a.reviewer.id)
+    assert (error.value.status_code, error.value.detail) == (409, "review_binding_unavailable")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("invalid", ["owner", "leader", "leader_named", "old_head", "bad_verdict", "bad_evidence",
                                     "empty_summary"])
 async def test_an_accepted_fact_needs_the_same_binding_and_evidence_as_a_negative_one(db, submitted_attempt, invalid):

@@ -3923,6 +3923,7 @@ async def _named_reviewer_binding(db, item, scope, member_id):
     from app.services.github_approval_service import GithubApprovalError, github_approval_service
     from app.services.github_ci_watch_service import _digest, github_ci_watch_service as watches
     from app.services.github_head_acceptance_service import _fresh_item
+    from app.services.github_terminal_revision_service import read_current_named_review_attempt
     fresh = await _fresh_item(db, item.id)
     named = fresh is not None and await db.scalar(select(GithubRequiredCheckWatch.id).where(
         GithubRequiredCheckWatch.work_item_id == item.id,
@@ -3969,14 +3970,6 @@ async def _named_reviewer_binding(db, item, scope, member_id):
             != f"{context['scope']['repo_owner']}/{context['scope']['repo_name']}"
             or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha)):
         raise _binding_unavailable()
-    if context['dispatch_status'] == 'escalated' and not await db.scalar(select(GithubAttemptScopeRevision.id).where(
-            GithubAttemptScopeRevision.work_item_id == item.id,
-            GithubAttemptScopeRevision.dispatch_nonce == context['dispatch_nonce'],
-            GithubAttemptScopeRevision.revision == context['active_scope_revision'],
-            GithubAttemptScopeRevision.phase == 'implementation',
-            GithubAttemptScopeRevision.status == 'submitted',
-            GithubAttemptScopeRevision.submitted_head_sha == sha).limit(1)):
-        raise _binding_unavailable()
     watch = await db.scalar(select(GithubRequiredCheckWatch).where(
         GithubRequiredCheckWatch.work_item_id == item.id,
         GithubRequiredCheckWatch.dispatch_nonce == context['dispatch_nonce'],
@@ -3991,7 +3984,10 @@ async def _named_reviewer_binding(db, item, scope, member_id):
         await watches._reviewer(db, context, member_id)
     except ValueError:
         raise _not_reviewer() from None
-    return await _fresh_item(db, item.id)
+    try:
+        return await read_current_named_review_attempt(db, context, watch, member_slot)
+    except GithubApprovalError:
+        raise _binding_unavailable() from None
 
 
 @router.get('/github-work-items/{item_id}/review-binding', response_model=GithubReviewBindingResponse)
