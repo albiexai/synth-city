@@ -37,6 +37,12 @@ function normalizePath(path: string): string {
   return path.replace(/\/+$/, '') || '/';
 }
 
+// Comparison only: "." and empty segments are dropped. ".." is not resolved and nothing is read from disk.
+function pathKey(path: string): string {
+  const segments = path.split('/').filter((segment) => segment !== '' && segment !== '.');
+  return (path.startsWith('/') ? '/' : '') + segments.join('/');
+}
+
 interface TeamSlot {
   provider: string;
   path: string;
@@ -91,6 +97,12 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const [teamSlots, setTeamSlots] = useState<TeamSlot[] | null>(null);
   const [searchParams, setSearchParams] = useSearchParams();
   const { pathname } = useLocation();
+  const harness = pageHarness(pathname);
+  const [rosterHarness, setRosterHarness] = useState(harness);
+  if (rosterHarness !== harness) {
+    setRosterHarness(harness);
+    setTeamSlots(null);
+  }
 
   const fetchProjects = useCallback(async () => {
     setLoading(true);
@@ -190,27 +202,26 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   }, [fetchProjects]);
 
   const knownFolders = useMemo<KnownFolder[]>(() => {
-    const byPath = new Map<string, KnownFolder>();
-    for (const folder of teamFoldersOf(teamSlots ?? [])) byPath.set(folder.path, folder);
+    const byKey = new Map<string, KnownFolder>();
+    for (const folder of teamFoldersOf(teamSlots ?? [])) byKey.set(pathKey(folder.path), folder);
     for (const project of projects) {
-      const path = normalizePath(project.path);
-      if (!byPath.has(path)) byPath.set(path, { path, name: project.name, source: 'tracked' });
+      const key = pathKey(project.path);
+      if (!byKey.has(key)) byKey.set(key, { path: normalizePath(project.path), name: project.name, source: 'tracked' });
     }
-    return [...byPath.values()];
+    return [...byKey.values()];
   }, [teamSlots, projects]);
 
-  const harness = pageHarness(pathname);
   const pageFolders = useMemo<KnownFolder[]>(() => {
     if (harness === null) return knownFolders;
     if (teamSlots === null) return [];
-    const teamPaths = new Set(teamSlots.map((slot) => slot.path));
-    const byPath = new Map<string, KnownFolder>();
-    for (const folder of teamFoldersOf(teamSlots.filter((slot) => slot.provider === harness))) byPath.set(folder.path, folder);
+    const teamKeys = new Set(teamSlots.map((slot) => pathKey(slot.path)));
+    const byKey = new Map<string, KnownFolder>();
+    for (const folder of teamFoldersOf(teamSlots.filter((slot) => slot.provider === harness))) byKey.set(pathKey(folder.path), folder);
     for (const project of projects) {
-      const path = normalizePath(project.path);
-      if (!byPath.has(path) && !teamPaths.has(path)) byPath.set(path, { path, name: project.name, source: 'tracked' });
+      const key = pathKey(project.path);
+      if (!byKey.has(key) && !teamKeys.has(key)) byKey.set(key, { path: normalizePath(project.path), name: project.name, source: 'tracked' });
     }
-    return [...byPath.values()];
+    return [...byKey.values()];
   }, [harness, knownFolders, teamSlots, projects]);
 
   // The project comes from this page's URL. A missing or unknown value is no project, with no error.
@@ -218,9 +229,10 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const projectParam = scoped ? searchParams.get('project') : null;
   const activeProject = useMemo<ProjectResponse | null>(() => {
     if (!projectParam) return null;
-    const known = pageFolders.find((folder) => folder.path === normalizePath(projectParam));
+    const key = pathKey(projectParam);
+    const known = pageFolders.find((folder) => pathKey(folder.path) === key);
     if (!known) return null;
-    const tracked = projects.find((project) => normalizePath(project.path) === known.path);
+    const tracked = projects.find((project) => pathKey(project.path) === key);
     return {
       id: tracked?.id ?? -1,
       name: known.name,

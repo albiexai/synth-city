@@ -191,6 +191,46 @@ describe('harness pages offer their own members\' folders', () => {
     expect(screen.getByLabelText('active project')).toHaveTextContent('none')
   })
 
+  it('a tracked single-dot alias of a Claude Code member folder is hidden on Codex and listed once on Claude', async () => {
+    vi.mocked(apiClient).mockResolvedValue({ projects: [trackedAt('/work/release/./harness-live', 'harness-live')] })
+    const codex = renderAt(`/harnesses/codex-cli/mcp?project=${encodeURIComponent('/work/release/./harness-live')}`, <ProjectSelector />)
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'codex-live · C1 builder' })).toBeInTheDocument())
+    expect(screen.queryByRole('option', { name: /harness-live/ })).not.toBeInTheDocument()
+    expect(screen.getByLabelText('active project')).toHaveTextContent('none')
+    codex.unmount()
+
+    renderAt('/harnesses/claude-code/mcp', <ProjectSelector />)
+    await waitFor(() => expect(screen.getByRole('option', { name: 'harness-live · F3 implementer' })).toBeInTheDocument())
+    expect(screen.getAllByRole('option', { name: /harness-live/ })).toHaveLength(1)
+  })
+
+  it('a member folder moved since the last visit is not listed while the roster is read again', async () => {
+    const user = userEvent.setup()
+    let resolveRoster: (value: unknown) => void = () => undefined
+    render(
+      <MemoryRouter initialEntries={['/harnesses/claude-code/mcp']}>
+        <ProjectProvider>
+          <ProjectSelector />
+          <Link to="/harnesses/codex-cli/mcp">codex</Link>
+          <Link to="/harnesses/claude-code/mcp">claude</Link>
+        </ProjectProvider>
+      </MemoryRouter>,
+    )
+    await waitFor(() => expect(screen.getByRole('option', { name: 'harness-live · F3 implementer' })).toBeInTheDocument())
+
+    vi.mocked(fetchAgentTeamPresets).mockImplementation(() => new Promise((resolve) => { resolveRoster = resolve }) as never)
+    await user.click(screen.getByRole('link', { name: 'codex' }))
+    await user.click(screen.getByRole('link', { name: 'claude' }))
+
+    expect(screen.queryByRole('option', { name: /harness-live/ })).not.toBeInTheDocument()
+    await act(async () => {
+      resolveRoster({ presets: [{ id: 1, slots: [{ id: 2, display_name: 'F3 implementer', provider: 'claude-code', repo_path: MOVED_FOLDER }] }] })
+    })
+    await waitFor(() => expect(screen.getByRole('option', { name: 'harness-moved · F3 implementer' })).toBeInTheDocument())
+    expect(screen.queryByRole('option', { name: /harness-live/ })).not.toBeInTheDocument()
+  })
+
   it('a member folder moved since the last visit is listed after returning to the harness page in the app', async () => {
     const user = userEvent.setup()
     render(
