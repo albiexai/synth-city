@@ -1007,8 +1007,8 @@
         },
         "waiting": {
           "actor": "operator",
-          "reason_code": "unknown",
-          "summary": "State needs inspection."
+          "reason_code": "attempt_escalated",
+          "summary": "The attempt is stopped in factory tracking and needs attention."
         },
         "workspace": null
       }
