@@ -1,17 +1,19 @@
 """The Leader runs three standard recoveries with the operator guards, one audit fact and one Supervisor notice."""
 import asyncio
+import sqlite3
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 from fastapi import APIRouter, Depends
-from sqlalchemy import select
+from sqlalchemy import event, select, update
+from sqlalchemy.exc import OperationalError
 
 from app.api.v1.deps import require_operator
 from app.config import settings
 from app.models.database import (
-    FactoryAuditEvent, GithubMaintenanceEvent, MailAgentSession, MailExternalActor, MailMessage,
+    FactoryAuditEvent, GithubMaintenanceEvent, GithubWorkspace, MailAgentSession, MailExternalActor, MailMessage,
 )
 from app.services import github_leader_recovery_service as lr
 from tests.agent_teams.test_scope_amendments import db, healthy_attempt, submitted  # noqa: F401
@@ -171,6 +173,112 @@ async def test_concurrent_duplicate_cancel_requests_cancel_once_and_notify_once(
     for r in results:  # the loser is a replay or a clean refusal, never a second action or a second notice
         assert isinstance(r, (dict, lr.LeaderRecoveryError)), r
     assert len(await _notices(db)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("db", ["concurrent", "concurrent_wal"], indirect=True)
+async def test_cancel_completes_when_a_replay_writes_the_owner_notice_first(db, ready, monkeypatch):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.models.database import GithubWorkItem, MailTeamMember
+    from app.services.agent_mail_service import agent_mail_service
+
+    a = ready
+    first_has_read = asyncio.Event()
+    replay_has_written = asyncio.Event()
+    delivery_key = lr.github_approval_service.active_cancellation_delivery_key(a.revision)
+    create_message = agent_mail_service._create_message_row
+    locks = []
+
+    @event.listens_for(db.bind.sync_engine, "handle_error")
+    def record_notice_lock(context):
+        code = getattr(context.original_exception, "sqlite_errorcode", None)
+        if (code is not None and (code & 0xff) == sqlite3.SQLITE_BUSY
+                and (context.statement or "").startswith("INSERT INTO mail_messages")):
+            locks.append(code)
+
+    async with async_sessionmaker(db.bind, expire_on_commit=False)() as replay_db:
+        async def create_with_interleave(session, request, **kwargs):
+            owner_notice = kwargs.get("delivery_key") == delivery_key
+            if owner_notice and session is db and not first_has_read.is_set():
+                # The original caller already committed cancellation. Force the
+                # recipient read inside the Mail savepoint even if it is cached.
+                await session.get(MailTeamMember, request.recipient_member_id, populate_existing=True)
+                first_has_read.set()
+                await replay_has_written.wait()
+            result = await create_message(session, request, **kwargs)
+            if owner_notice and session is replay_db:
+                replay_has_written.set()
+            return result
+
+        monkeypatch.setattr(agent_mail_service, "_create_message_row", create_with_interleave)
+        item = await replay_db.get(GithubWorkItem, a.item.id)
+        session = await replay_db.get(MailAgentSession, a.leader_session.id)
+        nonce = a.nonce
+
+        async def replay():
+            await first_has_read.wait()
+            return await lr.cancel_revision(replay_db, item, session, revision_number=1,
+                                            dispatch_nonce=nonce, operation_id="op-1", reason=REASON)
+
+        async with asyncio.timeout(10):
+            results = await asyncio.gather(_cancel(db, a, a.leader_session), replay(), return_exceptions=True)
+
+    assert locks, "the original owner notice write must encounter a real SQLite lock"
+    assert [r.get("status") if isinstance(r, dict) else repr(r) for r in results] == [
+        "cancelled", "already_cancelled",
+    ]
+    assert sorted(r["notice"] for r in results) == ["already_sent", "sent"]
+    assert len(await _notices(db)) == 1
+    assert len((await db.scalars(select(MailMessage).where(MailMessage.delivery_key == delivery_key))).all()) == 1
+    assert len((await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == "recovery_cancellation",
+        FactoryAuditEvent.action_outcome == "applied"))).all()) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lease_changes", [False, True], ids=["busy_exhausted", "changed_lease"])
+async def test_cancel_notice_retry_preserves_the_committed_action(db, ready, monkeypatch, lease_changes):
+    a = ready
+    workspace_id = a.workspace.id
+    delivery_key = lr.github_approval_service.active_cancellation_delivery_key(a.revision)
+    send = lr.github_approval_service.ensure_active_cancellation_notice
+
+    async def busy_notice(session, _item, _revision):
+        if lease_changes:
+            # A new lease committed while cancellation's post-commit notice was pending.
+            await session.execute(update(GithubWorkspace).where(GithubWorkspace.id == workspace_id)
+                                  .values(lease_token="replacement-lease"))
+            await session.commit()
+        cause = sqlite3.OperationalError("database is locked")
+        cause.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        raise OperationalError(None, None, cause)
+
+    notice = AsyncMock(side_effect=busy_notice)
+    monkeypatch.setattr(lr.github_approval_service, "ensure_active_cancellation_notice", notice)
+    with pytest.raises(lr.LeaderRecoveryError) as error:
+        await _cancel(db, a, a.leader_session)
+
+    expected = ("active_continuation_cancel_conflict", 409, 1) if lease_changes else (
+        "database_busy_cancellation_saved", 503, 3,
+    )
+    assert (error.value.code, error.value.status_code, notice.await_count) == expected
+    await db.refresh(a.revision)
+    await db.refresh(a.item)
+    assert a.item.dispatch_status == "escalated" and a.revision.status == "superseded"
+    assert await db.scalar(select(MailMessage).where(MailMessage.delivery_key == delivery_key)) is None
+    assert len(await _notices(db)) == 1
+    assert len((await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == "recovery_cancellation",
+        FactoryAuditEvent.action_outcome == "applied"))).all()) == 1
+    notice_facts = (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == "recovery_cancellation_notification"))).all()
+    assert [fact.action_outcome for fact in notice_facts] == ["uncertain"]
+
+    if not lease_changes:
+        monkeypatch.setattr(lr.github_approval_service, "ensure_active_cancellation_notice", send)
+        result = await _cancel(db, a, a.leader_session)
+        assert result["status"] == "already_cancelled" and result["notice"] == "already_sent"
+        assert await db.scalar(select(MailMessage).where(MailMessage.delivery_key == delivery_key)) is not None
 
 
 # --- release a clean workspace -------------------------------------------------------------------------------

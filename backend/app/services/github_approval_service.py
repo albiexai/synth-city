@@ -42,6 +42,7 @@ from app.services.github_app_auth_service import (
 )
 from app.services.github_client import GithubClientResponseError, github_client
 from app.services.github_recovery_gate import configured_recovery_only_attempt
+from app.services.sqlite_busy_retry import SqliteBusyExhausted, retry_when_busy
 
 
 CONTINUABLE_ESCALATIONS = frozenset(
@@ -139,7 +140,7 @@ async def _record_decision_fact(
 
 
 class ActiveCancellationNoticeError(GithubApprovalError):
-    """The cancellation stands, but its owner notice was refused.
+    """The cancellation stands, but its owner notice did not settle.
 
     Callers must not record or report the committed cancellation as refused.
     """
@@ -3499,10 +3500,36 @@ class GithubApprovalService:
             "request_id": request_id,
             "correlation_id": notice,
         }
+        reason = revision.cancellation_reason
+        cancelled_at = revision.cancelled_at
+        dispatch_nonce = item.dispatch_nonce
+        retry_started = False
+
+        async def refresh_notice_context():
+            nonlocal retry_started
+            retry_started = True
+            await db.refresh(item)
+            await db.refresh(revision)
+            if (
+                item.dispatch_nonce != dispatch_nonce
+                or revision.cancelled_at != cancelled_at
+                or not await self._active_cancellation_resting_state_matches(db, item, revision, reason=reason)
+            ):
+                raise GithubApprovalError("active_continuation_cancel_conflict")
+
         try:
-            await self.ensure_active_cancellation_notice(db, item, revision)
+            # A competing replay can write the same keyed notice while this
+            # connection holds a read snapshot inside the Mail savepoint.
+            await retry_when_busy(
+                db,
+                lambda: self.ensure_active_cancellation_notice(db, item, revision),
+                route="active_cancellation_notice",
+                prepare=refresh_notice_context,
+            )
         except Exception as exc:
-            not_attempted = isinstance(exc, GithubApprovalError)
+            refused = isinstance(exc, GithubApprovalError)
+            # A lock can occur while reading the response after the send.
+            not_attempted = refused and not retry_started
             outcome = "rejected" if not_attempted else "uncertain"
             if actor is not None:
                 # One fact per notice outcome: an earlier uncertain result
@@ -3520,10 +3547,12 @@ class GithubApprovalService:
                     ),
                     **fields,
                 )
-            if not_attempted:
+            if refused:
                 raise ActiveCancellationNoticeError(
                     exc.detail, status_code=exc.status_code
                 ) from exc
+            if isinstance(exc, SqliteBusyExhausted):
+                raise ActiveCancellationNoticeError("database_busy_cancellation_saved", status_code=503) from exc
             raise
         if actor is None:
             return

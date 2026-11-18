@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select, update
+from sqlalchemy import event, select, update
 
 from app.api.v1 import agent_mail
 from app.config import settings
@@ -22,7 +22,7 @@ from app.services.github_client import GithubCommitSnapshot, github_client
 from app.services.github_verification_service import github_verification_service
 from app.services.github_dispatch_service import github_dispatch_service
 from app.utils import peer_process
-from app.database import Base
+from app.database import Base, configure_sqlite_connection
 from tests.agent_mail.test_api import _dispatch_approval_fixture
 from tests.agent_teams.test_github_verification_service import (
     _Client, _implementation_revision, _item, _owner, _scope,
@@ -32,9 +32,15 @@ from tests.agent_teams.test_github_verification_service import (
 @pytest_asyncio.fixture
 async def db(request, tmp_path):
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    mode = getattr(request, 'param', None)
     url = (f"sqlite+aiosqlite:///{tmp_path / 'authority.sqlite'}"
-        if getattr(request, 'param', None) == 'concurrent' else 'sqlite+aiosqlite:///:memory:')
+        if mode in {'concurrent', 'concurrent_wal'} else 'sqlite+aiosqlite:///:memory:')
     engine = create_async_engine(url)
+    if mode == 'concurrent_wal':
+        @event.listens_for(engine.sync_engine, "connect")
+        def configure(dbapi_conn, _):
+            configure_sqlite_connection(dbapi_conn)
+
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     async with async_sessionmaker(engine, expire_on_commit=False)() as session:
