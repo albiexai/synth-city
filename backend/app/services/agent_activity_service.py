@@ -39,7 +39,7 @@ from app.services.pi_activity_service import observe_pi
 from app.services.provider_refusal_notice_service import send_provider_refusal_notices
 from app.services.claude_activity_service import observe_claude
 from app.services.muse_activity_service import discover_muse_session, observe_muse
-from app.services.antigravity_activity_service import discover_antigravity_conversation, observe_antigravity
+from app.services.antigravity_activity_worker import discover_antigravity_conversation, observe_antigravity
 
 logger = logging.getLogger(__name__)
 
