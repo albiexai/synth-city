@@ -120,9 +120,11 @@ At the end of each tick, the supervisor promises its next check (`next_check_at`
 
 The grace period is the team's override when one is set. Otherwise it is the larger of 30 minutes and twice the interval between the last check-in and its promise.
 
-## Director's summary (not implemented)
+## Director's summary
 
-The Overview currently shows one status sentence: whether the factory is running, paused or idle, with the team count when known. The fuller summary described here would also answer three questions: Do I need to act? Is anyone watching? What work remains? It is not implemented, and its supervisor line and team total for remaining work are not built. See [#506](https://github.com/albiexai/synth-city/issues/506) and [#508](https://github.com/albiexai/synth-city/issues/508).
+The Overview shows one status line: whether the factory is running, paused or idle, with the team count when known. Each team's summary card on the Overview already shows its supervisor status, remaining work, attention items and the human actions it needs.
+
+A single top-of-page summary would also answer three questions: Do I need to act? Is anyone watching? What work remains? That top-of-page layout is not implemented. Its planned form is shown below. See [#506](https://github.com/albiexai/synth-city/issues/506) and [#508](https://github.com/albiexai/synth-city/issues/508).
 
 ```text
 Publish the next release                      Parent issue: #NNN
