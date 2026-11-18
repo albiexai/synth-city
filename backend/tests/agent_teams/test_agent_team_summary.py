@@ -182,6 +182,69 @@ async def test_fresh_guard_allows_one_prompt_label_write(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["hold", "work_item"])
+async def test_late_changes_invalidate_the_guard_before_publication(db, monkeypatch, change):
+    from app.services.agent_team_campaign_service import agent_team_campaign_service
+
+    team, _, items = await seed(db)
+    item_id = items[0].id
+    hold_code = None
+
+    class LateChange:
+        async def summary(self, db, preset_id, actions, **kwargs):
+            nonlocal hold_code
+            result = await agent_team_campaign_service.summary(db, preset_id, actions, **kwargs)
+            if change == "hold":
+                hold_code = "hold"
+            else:
+                item = await db.get(GithubWorkItem, item_id)
+                item.active_scope_revision += 1
+                await db.commit()
+            return result
+
+    summary, _ = service(monkeypatch, campaign=LateChange())
+    monkeypatch.setattr("app.services.agent_team_summary_service.hold_code", lambda: hold_code)
+    result = await summary.summary(db, team.id)
+
+    assert not result.coverage_complete and not result.next_actor_coverage_complete
+    assert {entry.code for entry in result.coverage_reason} == {"source_changed"}
+    assert result.hold_code == ("hold" if change == "hold" else None)
+    assert ("hold" in {entry.code for entry in result.attention}) is (change == "hold")
+    assert ("operator" in result.next_actors) is (change == "hold")
+    assert result.waiting_input is None
+    assert result.remaining_work.state == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_harness_filter_keeps_a_reason_without_exposing_the_other_slot(db, monkeypatch):
+    from types import SimpleNamespace
+    from app.services import agent_activity_service as activity
+
+    team, _, _ = await seed(db, ())
+    other = AgentTeamSlot(preset_id=team.id, display_name="Other", provider="claude-code",
+                          repo_path="/private/repo", repo_id="private", repo_name="repo")
+    db.add(other)
+    await db.commit()
+    other_id = other.id
+
+    async def native(db, preset_id, *, input_fence, **kwargs):
+        input_fence.update({entry[0]: entry for entry in await activity._team_inputs(db, preset_id, 256)})
+        slots = [SimpleNamespace(slot_id=slot_id, state="unknown" if slot_id == other_id else "idle",
+                                 reason="no_native_event", waiting_input=None) for slot_id in input_fence]
+        return SimpleNamespace(slots=slots, valid_until=datetime.now(timezone.utc) + timedelta(seconds=60))
+
+    monkeypatch.setattr(activity, "observe_team", native)
+    summary, _ = service(monkeypatch)
+    full = await summary.summary(db, team.id)
+    assert [entry.slot_id for entry in full.coverage_reason] == [other_id]
+
+    result = await summary.needs_you(db, team.id, provider="codex-cli")
+    assert not result.coverage_complete and not result.next_actor_coverage_complete
+    assert [(entry.code, entry.slot_id, entry.activity_reason) for entry in result.coverage_reason] == [
+        ("native_unknown", None, None)]
+
+
+@pytest.mark.asyncio
 async def test_supervisor_summary_is_additive_sanitized_and_clock_derived(db, monkeypatch):
     import hashlib
     import json

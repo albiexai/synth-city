@@ -213,9 +213,6 @@ class AgentTeamSummaryService:
         if len(approvals) > 64:
             coverage.append(TeamSummaryCoverageReason(code="approval_limit"))
         hold = hold_code()
-        if hold:
-            attention.append(TeamSummaryAttention(code=hold))
-            actors.add("operator")
 
         # Reserve five seconds of the eight-second overall deadline for native evidence and mail.
         # Recheck mail near publication. Charge the native and mail phases to their shared budget,
@@ -396,22 +393,13 @@ class AgentTeamSummaryService:
             if boundary > now:
                 expires.append(boundary)
         from app.services.github_team_idle_service import github_team_idle_service
+        idle = []
         try:
             idle = await bounded(lambda: github_team_idle_service.observe(db, preset_id, now=now,
                 coverage_complete=not coverage and min(expires) > now and waiting_input is not None and native_known,
                 # The summary lists a provider refusal, but it is not a wait on someone else (#1091).
                 external_wait=any(counts_as_external_wait(w.reason) for w in (waiting_input or []))
                 or any(a.state not in {"resolved", "historical"} for a in human_actions)))
-            if await self._snapshot(db, preset_id, scope_id, provider) != final or hold_code() != hold:
-                idle = []
-                if not changed:
-                    coverage.append(TeamSummaryCoverageReason(code="source_changed"))
-                    changed = True
-                    remaining = TeamRemainingWork(state="unknown", unfinished_items=final[3],
-                        reported_items=len(current), confidence="unknown", reason="context_changed")
-            for entry in idle:
-                attention.append(TeamSummaryAttention(code="team_idle", **entry))
-                actors.add("leader")
         except (TimeoutError, OSError, ValueError):
             if db.in_transaction():
                 await db.rollback()
@@ -427,13 +415,6 @@ class AgentTeamSummaryService:
                 db, preset_id, now=now, native_states=native_states, native_ok=stall_time_left is not None,
                 deadline=mail_deadline, native_fence=native_fence, native_baseline=native_baseline,
                 native_failure=native_failure)
-        for entry in stall.items:
-            attention.append(TeamSummaryAttention(code="unanswered_request", request_id=entry.request_id,
-                requester=entry.requester, recipient=entry.recipient, unanswered_seconds=entry.unanswered_seconds))
-        if not stall.complete:
-            attention.append(TeamSummaryAttention(code="unanswered_request_incomplete",
-                coverage_reason=stall.reason, omitted_count=stall.omitted_count or None))
-        supervisor["unanswered_requests"] = stall
         # The unfiltered call keeps its exact arguments; a filter is passed only when set (#1142).
         campaign_filter = {"scope_id": scope_id, "provider": provider} if matcher is not None else {}
         campaign = await self.campaign.summary(db, preset_id, human_actions if not changed else (), **campaign_filter)
@@ -445,13 +426,57 @@ class AgentTeamSummaryService:
                     work_item_id=item.id, scope_id=item.scope_id, issue_number=item.issue_number))
         reminders = await github_operator_attention_service.reminder_snapshot(
             db, [SimpleNamespace(**row._mapping) for row in final[1]], now=now)
+
+        # The guard describes the input state at publication. Earlier fences cannot certify the
+        # result after the Mail, campaign and reminder reads have yielded.
+        publication_error = None
+        try:
+            published = await bounded(lambda: self._snapshot(db, preset_id, scope_id, provider))
+        except (TimeoutError, OSError, ValueError, OperationalError) as error:
+            publication_error = error
+            published = final
+            if db.in_transaction():
+                await db.rollback()
+        if published is None:
+            return None
+        published_hold = hold_code()
+        late_change = published != final or published_hold != hold
+        if late_change and not changed:
+            coverage.append(TeamSummaryCoverageReason(code="source_changed"))
+        if publication_error is not None:
+            code = "observation_timeout" if isinstance(publication_error, TimeoutError) else "observation_failed"
+            if not any(reason.code == code for reason in coverage):
+                coverage.append(TeamSummaryCoverageReason(code=code))
+        if late_change or publication_error is not None:
+            changed = True
+            remaining = TeamRemainingWork(state="unknown", unfinished_items=published[3],
+                reported_items=len(current), confidence="unknown", reason="context_changed")
+            if late_change or stall.complete:
+                reason = "fence_changed" if late_change else mail_request_stall_service.failure_reason(publication_error)
+                stall = UnansweredRequestView(complete=False, reason=reason)
+        if published_hold:
+            attention.insert(0, TeamSummaryAttention(code=published_hold))
+            actors.add("operator")
+        if not changed:
+            for entry in idle:
+                attention.append(TeamSummaryAttention(code="team_idle", **entry))
+                actors.add("leader")
+        for entry in stall.items:
+            attention.append(TeamSummaryAttention(code="unanswered_request", request_id=entry.request_id,
+                requester=entry.requester, recipient=entry.recipient, unanswered_seconds=entry.unanswered_seconds))
+        if not stall.complete:
+            attention.append(TeamSummaryAttention(code="unanswered_request_incomplete",
+                coverage_reason=stall.reason, omitted_count=stall.omitted_count or None))
+        supervisor["unanswered_requests"] = stall
+
         valid_until = min(expires)
         if valid_until <= datetime.now(timezone.utc):
             coverage.append(TeamSummaryCoverageReason(code="window_expired"))
         complete = not coverage
         return AgentTeamSummaryResponse(preset_id=preset_id, description=final_team.description,
             parent_issue_url=final_team.parent_issue_url, checked_at=now, valid_until=valid_until,
-            coverage_complete=complete, coverage_reason=coverage, hold_code=hold, attention=attention, human_actions=human_actions,
+            coverage_complete=complete, coverage_reason=coverage, hold_code=published_hold, attention=attention,
+            human_actions=human_actions,
             required_ci_unreadable=unreadable, reminder_attention=reminders["rows"],
             reminder_attention_complete=reminders["complete"],
             supervisor_observation=supervisor, waiting_input=waiting_input if not changed else None,
@@ -465,11 +490,18 @@ class AgentTeamSummaryService:
         are narrowed where they are built. The lists that come from team-wide services (reminders, waiting
         members, the supervisor row, the stored attention rows) are trimmed here by the same rule.
         """
-        result = await self.summary(db, preset_id, scope_id=scope_id, provider=provider)
-        if result is None or (scope_id is None and provider is None):
-            return result
+        if scope_id is None and provider is None:
+            return await self.summary(db, preset_id)
         match = await self._matcher(db, preset_id, scope_id, provider)
+        result = await self.summary(db, preset_id, scope_id=scope_id, provider=provider)
+        if result is None:
+            return None
         visible = match.visible
+        # Work reasons already use the filtered snapshot. A hidden native slot can still affect
+        # team-wide completeness, so retain its fixed reason without any slot details.
+        coverage = [row for row in result.coverage_reason if row.slot_id is None or visible(None, slot_id=row.slot_id)]
+        if not coverage and result.coverage_reason:
+            coverage = [TeamSummaryCoverageReason(code=result.coverage_reason[0].code)]
         update = {
             "human_actions": [row for row in result.human_actions if visible(row.scope_id, row.work_item_id)],
             "attention": [row for row in result.attention if visible(row.scope_id, row.work_item_id)],
@@ -477,9 +509,7 @@ class AgentTeamSummaryService:
                                        if visible(row.scope_id, row.work_item_id)],
             "reminder_attention": [row for row in result.reminder_attention
                                    if visible(row.scope_id, row.work_item_id, row.owner_slot_id)],
-            # Work-specific reasons already come from the filtered snapshot. Native slots are team-wide.
-            "coverage_reason": [row for row in result.coverage_reason
-                                if row.slot_id is None or visible(None, slot_id=row.slot_id)],
+            "coverage_reason": coverage,
         }
         if result.waiting_input is not None:
             update["waiting_input"] = [row for row in result.waiting_input if visible(None, slot_id=row.slot_id)]
