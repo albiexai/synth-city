@@ -216,6 +216,49 @@ async def test_late_changes_invalidate_the_guard_before_publication(db, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_a_session_ending_during_campaign_read_invalidates_native_coverage(db, monkeypatch):
+    from sqlalchemy import select
+    from app.models.database import AgentPaneBinding, MailAgentSession, MailTeamMember
+    from app.models.schemas import AgentActivityObservation
+    from app.services import agent_activity_service as activity
+    from app.services.agent_team_campaign_service import agent_team_campaign_service
+
+    team, _, _ = await seed(db, ())
+    slot_id = await db.scalar(select(AgentTeamSlot.id).where(AgentTeamSlot.preset_id == team.id))
+    member = MailTeamMember(identity_key="late-session", repo_id="fixture", repo_path="/synthetic/project",
+        repo_name="fixture", display_name="Worker", team_preset_id=team.id, team_slot_id=slot_id)
+    db.add(member)
+    await db.flush()
+    binding = AgentPaneBinding(pane_pid=41001, pane_proc_start="28", slot_id=slot_id, preset_id=team.id, tmux_target="%9")
+    session = MailAgentSession(member_id=member.id, provider="codex-cli", source="mcp", session_key="late-session",
+        team_slot_id=slot_id, team_preset_id=team.id, bound_pane_pid=41001, bound_pane_proc_start="28",
+        cwd="/synthetic/project", capability_token_hash="test-hash", mailbox_status="connected")
+    db.add_all([binding, session])
+    await db.commit()
+    session_id, team_id = session.id, team.id
+
+    def observe(slot_id, provider, session_id, bindings, duplicate, now, *, provenance=None):
+        assert len(bindings) == 1
+        return AgentActivityObservation(slot_id=slot_id, state="idle", reason="turn_completed", observed_at=now)
+
+    class EndsSession:
+        async def summary(self, db, preset_id, actions, **kwargs):
+            result = await agent_team_campaign_service.summary(db, preset_id, actions, **kwargs)
+            session = await db.get(MailAgentSession, session_id)
+            session.closed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            await db.commit()
+            return result
+
+    monkeypatch.setattr(activity, "_observe", observe)
+    summary, _ = service(monkeypatch, campaign=EndsSession())
+    result = await summary.summary(db, team_id)
+    assert not result.coverage_complete and not result.next_actor_coverage_complete
+    assert [(entry.code, entry.source) for entry in result.coverage_reason] == [("fence_changed", "native")]
+    assert result.waiting_input is None
+    assert result.remaining_work.state == "known"
+
+
+@pytest.mark.asyncio
 async def test_harness_filter_keeps_a_reason_without_exposing_the_other_slot(db, monkeypatch):
     from types import SimpleNamespace
     from app.services import agent_activity_service as activity

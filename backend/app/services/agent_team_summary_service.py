@@ -429,12 +429,17 @@ class AgentTeamSummaryService:
 
         # The guard describes the input state at publication. Earlier fences cannot certify the
         # result after the Mail, campaign and reminder reads have yielded.
+        published = final
         publication_error = None
+        rechecking_native = native_changed = False
         try:
             published = await bounded(lambda: self._snapshot(db, preset_id, scope_id, provider))
+            if published is not None and stall_time_left is not None:
+                rechecking_native = True
+                published_native = {entry[0]: entry for entry in await bounded(lambda: _team_inputs(db, preset_id, 256))}
+                native_changed = published_native != native_fence
         except (TimeoutError, OSError, ValueError, OperationalError) as error:
             publication_error = error
-            published = final
             if db.in_transaction():
                 await db.rollback()
         if published is None:
@@ -443,21 +448,27 @@ class AgentTeamSummaryService:
         late_change = published != final or published_hold != hold
         if late_change and not changed:
             coverage.append(TeamSummaryCoverageReason(code="source_changed"))
+        if native_changed and not any(reason.code == "fence_changed" and reason.source == "native" for reason in coverage):
+            coverage.append(TeamSummaryCoverageReason(code="fence_changed", source="native"))
         if publication_error is not None:
             code = "observation_timeout" if isinstance(publication_error, TimeoutError) else "observation_failed"
             if not any(reason.code == code for reason in coverage):
-                coverage.append(TeamSummaryCoverageReason(code=code))
-        if late_change or publication_error is not None:
+                coverage.append(TeamSummaryCoverageReason(code=code, source="native" if rechecking_native else None))
+        native_unverified = native_changed or (publication_error is not None and rechecking_native)
+        if native_unverified:
+            waiting_input = None
+        if late_change or (publication_error is not None and not rechecking_native):
             changed = True
             remaining = TeamRemainingWork(state="unknown", unfinished_items=published[3],
                 reported_items=len(current), confidence="unknown", reason="context_changed")
-            if late_change or stall.complete:
-                reason = "fence_changed" if late_change else mail_request_stall_service.failure_reason(publication_error)
-                stall = UnansweredRequestView(complete=False, reason=reason)
+        if late_change or native_changed:
+            stall = UnansweredRequestView(complete=False, reason="fence_changed")
+        elif publication_error is not None and stall.complete:
+            stall = UnansweredRequestView(complete=False, reason=mail_request_stall_service.failure_reason(publication_error))
         if published_hold:
             attention.insert(0, TeamSummaryAttention(code=published_hold))
             actors.add("operator")
-        if not changed:
+        if not changed and not native_unverified:
             for entry in idle:
                 attention.append(TeamSummaryAttention(code="team_idle", **entry))
                 actors.add("leader")
