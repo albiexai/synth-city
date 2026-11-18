@@ -3923,6 +3923,7 @@ async def _named_reviewer_binding(db, item, scope, member_id):
     from app.services.github_approval_service import GithubApprovalError, github_approval_service
     from app.services.github_ci_watch_service import _digest, github_ci_watch_service as watches
     from app.services.github_head_acceptance_service import _fresh_item
+    from app.services.github_terminal_revision_service import read_current_named_review_attempt
     fresh = await _fresh_item(db, item.id)
     named = fresh is not None and await db.scalar(select(GithubRequiredCheckWatch.id).where(
         GithubRequiredCheckWatch.work_item_id == item.id,
@@ -3931,8 +3932,10 @@ async def _named_reviewer_binding(db, item, scope, member_id):
         GithubRequiredCheckWatch.reviewer_member_id == member_id).limit(1))
     if not named:
         raise _not_reviewer()  # not named for this attempt and revision: no remote read for a stranger
+    capture = (github_approval_service.revision_review_attempt_context if fresh.active_scope_revision
+               else github_approval_service.healthy_scope_context)
     try:
-        context, owner, _leader, _workspace = await github_approval_service.healthy_scope_context(db, item, scope)
+        context, owner, _leader, _workspace = await capture(db, item, scope)
         digest = _digest(effective_policy(item, scope))
     except GithubApprovalError:
         raise _binding_unavailable() from None
@@ -3948,11 +3951,11 @@ async def _named_reviewer_binding(db, item, scope, member_id):
         pull = await watches._read_pull(scope, context['pr_number'])
     except Exception:
         raise _binding_unavailable() from None
-    # After the remote await, the whole authority is read and fenced again (#1027 review): a healthy context,
+    # After the remote await, the whole authority is read and fenced again (#1027 review): a current context,
     # the same attempt, revision, PR, owner, team, Leader, branch and repository, and the same effective policy.
     # Only these post-read values are used below, starting with the observed pull request.
     try:
-        context, owner, _leader, _workspace = await github_approval_service.healthy_scope_context(db, item, scope)
+        context, owner, _leader, _workspace = await capture(db, item, scope)
         digest_after = _digest(effective_policy(item, scope))
     except GithubApprovalError:
         raise _binding_unavailable() from None
@@ -3981,7 +3984,10 @@ async def _named_reviewer_binding(db, item, scope, member_id):
         await watches._reviewer(db, context, member_id)
     except ValueError:
         raise _not_reviewer() from None
-    return await _fresh_item(db, item.id)
+    try:
+        return await read_current_named_review_attempt(db, context, watch, member_slot)
+    except GithubApprovalError:
+        raise _binding_unavailable() from None
 
 
 @router.get('/github-work-items/{item_id}/review-binding', response_model=GithubReviewBindingResponse)
