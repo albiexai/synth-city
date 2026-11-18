@@ -177,6 +177,35 @@ or consent setting was preset (Supervisor decision, 2026-11-16). No other screen
 
 Synth City's Antigravity readiness gates are unchanged by these runs.
 
+### Deciding run (#994)
+
+#994 asked for one deciding run: is `call_mcp_tool` declared to the model, and does one Mail call round-trip? The same
+pinned `agy` 1.5.9 (sha256 checked against the value used in #993) ran once in the #993 isolation: a loopback-only user,
+network and pid namespace with an allowlisted environment, a dummy key, the local stub model, and a scratch Synth City
+backend on loopback (never port 8011) with Synth City's own Antigravity install applied through it. The run used
+`--dangerously-skip-permissions` and a `trustedWorkspaces` entry, as in #993. The isolation checks passed before the turn
+(the only interface was `lo`, an external connect was refused, the key was the dummy, no token variable existed). The
+first-run onboarding colour-scheme screen was displayed from the first sample (3 s) to the last (45 s) and **was never
+interacted with**: no keys were sent and no onboarding or consent setting was preset. No other screen appeared.
+
+**Observed:**
+
+- The Mail server loaded under `synth-city-mail` and the install reported the MCP server and the hooks present. Synth
+  City recorded one connected `antigravity-cli` MCP session, and the `SessionStart` and `PreInvocation` hooks reached
+  the backend.
+- The model request offered the **14 built-in tools only**. **`call_mcp_tool`, `list_resources` and `read_resource` were
+  not declared.** The scripted `call_mcp_tool` call for `synth_city_whoami` was refused with
+  `unknown tool: "call_mcp_tool"`. No `tools/call` reached Synth City.
+
+**Established:** with the product's own install, the dummy key, `--dangerously-skip-permissions` and a `trustedWorkspaces`
+entry, `agy` 1.5.9 still does not declare `call_mcp_tool` to the model (the #993 result, now a third run). The Agent Mail
+round trip through `agy` is **not proven**, so #994 closes as **verified not ready**: the Mail readiness gate
+(`ANTIGRAVITY_UNPROVEN_GATES`) stays, and so does the onboarding gate.
+
+**Not established:** why `call_mcp_tool` is not declared, whether a real model, a signed-in user or a slot-bound team
+launch changes it, and whether a minimal stub MCP server (as in #736 P1, which declared it) differs from the product's
+server in a way that matters. Those were not tested: the decision rule allowed one run.
+
 ## Q2–Q7: what is documented and what was observed
 
 Each row states the source of every claim.
