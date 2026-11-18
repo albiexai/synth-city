@@ -1,10 +1,12 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ClipboardList, Search, Calendar, HardDrive, FileText } from 'lucide-react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { RefreshButton } from '@/components/shared/RefreshButton'
+import { ReadScopeNotice } from '@/components/shared/ReadScopeNotice'
+import { scopeReadDenial, scopeUnreadable, type HarnessReadScope } from '@/types/harnessScope'
 import { usePlansApi } from '@/hooks/usePlansApi'
 import { useProviderContext } from '@/contexts/ProviderContext'
 import { CLICKABLE_CARD } from '@/lib/constants'
@@ -61,27 +63,50 @@ export function PlansPage() {
   const [stats, setStats] = useState<PlanStatsResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [scope, setScope] = useState<HarnessReadScope | null>(null)
+  const [readDenial, setReadDenial] = useState<string | null>(null)
+  const requests = useRef({ latest: 0 })
+  const unreadable = readDenial !== null || scopeUnreadable(scope)
   const [searchQuery, setSearchQuery] = useState('')
 
   const fetchData = useCallback(async () => {
+    const request = ++requests.current.latest
     setLoading(true)
     setError(null)
     try {
-      const [plansData, statsData] = await Promise.all([
+      const [plansResult, statsResult] = await Promise.allSettled([
         listPlans(),
         getStats(),
       ])
-      setPlans(plansData.plans)
-      setStats(statsData)
+      if (request !== requests.current.latest) return
+      if (plansResult.status === 'rejected') throw plansResult.reason
+      const source = plansResult.value.scope ?? null
+      const blocked = scopeUnreadable(source)
+      setScope(source)
+      setReadDenial(null)
+      setPlans(blocked ? [] : plansResult.value.plans)
+      setStats(!blocked && statsResult.status === 'fulfilled' ? statsResult.value : null)
+      if (!blocked && statsResult.status === 'rejected') throw statsResult.reason
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load plans')
+      if (request === requests.current.latest) {
+        const denial = scopeReadDenial(err)
+        if (denial) {
+          setReadDenial(denial)
+          setPlans([])
+          setStats(null)
+        } else {
+          setError(err instanceof Error ? err.message : 'Failed to load plans')
+        }
+      }
     } finally {
-      setLoading(false)
+      if (request === requests.current.latest) setLoading(false)
     }
   }, [listPlans, getStats])
 
   useEffect(() => {
+    const pending = requests.current
     fetchData()
+    return () => { pending.latest++ }
   }, [fetchData])
 
   const providerPlans = useMemo(
@@ -105,7 +130,7 @@ export function PlansPage() {
   const isCodex = selectedProviderId === 'codex-cli'
   const sourceDescription = isCodex
     ? 'Browse Codex update_plan snapshots from local session history'
-    : 'Browse and search your Claude Code execution plans'
+    : 'Browse and search Claude Code execution plans'
   const planNoun = isCodex ? 'Plan Snapshots' : 'Total Plans'
   const sizeDescription = isCodex ? 'Source JSONL data' : 'Combined plan files'
   const emptyText = isCodex
@@ -114,21 +139,31 @@ export function PlansPage() {
   const searchPlaceholder = isCodex
     ? 'Search snapshots by step, repo, or session...'
     : 'Search plans by title, content, or slug...'
+  const fallbackFolder = isCodex ? 'Codex home' : scope?.data_dir === null ? 'configured plans folder' : 'plans folder'
+
+  const header = (
+    <div className="flex items-center justify-between">
+      <div>
+        <h1 className="text-3xl font-bold flex items-center gap-2">
+          <ClipboardList className="h-8 w-8" />
+          Plans
+        </h1>
+        <p className="text-muted-foreground">
+          {sourceDescription}
+        </p>
+      </div>
+      <RefreshButton onClick={fetchData} loading={loading} />
+    </div>
+  )
+  const sourceNotice = <ReadScopeNotice scope={scope} denial={readDenial} fallbackFolder={fallbackFolder} />
+  if (unreadable) {
+    return <div className="space-y-6">{header}{sourceNotice}</div>
+  }
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold flex items-center gap-2">
-            <ClipboardList className="h-8 w-8" />
-            Plans
-          </h1>
-          <p className="text-muted-foreground">
-            {sourceDescription}
-          </p>
-        </div>
-        <RefreshButton onClick={fetchData} loading={loading} />
-      </div>
+      {header}
+      {sourceNotice}
 
       {error && (
         <Card className="border-destructive">

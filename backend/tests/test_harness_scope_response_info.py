@@ -21,8 +21,15 @@ from tests.test_harness_scope_data_routes import API, data, write_plan  # noqa: 
 ROUTES = ["/sessions/projects", "/usage/summary", "/context/active", "/plans", "/plans?provider=codex-cli"]
 
 
-def expected_scope(user: str, home: Path, *, exists: bool = True, readable: bool = True) -> dict:
-    return {"user": user, "claude_dir": str(home / ".claude"), "exists": exists, "readable": readable}
+def expected_scope(user: str, home: Path, route: str | None, *, exists: bool = True, readable: bool = True) -> dict:
+    folders = {"/plans": home / ".claude" / "plans", "/plans?provider=codex-cli": home / ".codex"}
+    return {
+        "user": user,
+        "claude_dir": str(home / ".claude"),
+        "data_dir": str(folders.get(route, home / ".claude" / "projects")) if route is not None else None,
+        "exists": exists,
+        "readable": readable,
+    }
 
 
 async def read(client, route: str, user: str | None = None):
@@ -39,9 +46,9 @@ async def read(client, route: str, user: str | None = None):
 async def test_each_response_names_the_user_and_the_folder_it_read(data, client, route):
     controller = path_utils.controller_user_name()
 
-    assert (await read(client, route, AGENT))["scope"] == expected_scope(AGENT, data.agent)
-    assert (await read(client, route, controller))["scope"] == expected_scope(controller, data.controller)
-    assert (await read(client, route))["scope"] == expected_scope(AGENT, data.agent)     # the agent user is the default
+    assert (await read(client, route, AGENT))["scope"] == expected_scope(AGENT, data.agent, route)
+    assert (await read(client, route, controller))["scope"] == expected_scope(controller, data.controller, route)
+    assert (await read(client, route))["scope"] == expected_scope(AGENT, data.agent, route)
 
 
 @pytest.mark.asyncio
@@ -50,7 +57,7 @@ async def test_switching_users_leaks_nothing_between_requests(data, client):
     for user, home in ((AGENT, data.agent), (controller, data.controller), (AGENT, data.agent),
                        (controller, data.controller)):
         for route in ROUTES:
-            assert (await read(client, route, user))["scope"] == expected_scope(user, home), (route, user)
+            assert (await read(client, route, user))["scope"] == expected_scope(user, home, route), (route, user)
 
 
 @pytest.mark.asyncio
@@ -59,7 +66,7 @@ async def test_a_single_user_install_names_the_controller(data, client, monkeypa
     monkeypatch.setattr(settings, "harness_agent_user", None)
     controller = path_utils.controller_user_name()
 
-    assert (await read(client, route))["scope"] == expected_scope(controller, data.controller)
+    assert (await read(client, route))["scope"] == expected_scope(controller, data.controller, route)
 
 
 # ---- unreadable is not empty ---------------------------------------------------------------------------------------------
@@ -75,7 +82,7 @@ async def test_a_user_with_no_claude_folder_is_empty_not_unreadable(data, client
 
     body = await read(client, route, AGENT)
 
-    assert body["scope"] == expected_scope(AGENT, data.agent, exists=False, readable=True)
+    assert body["scope"] == expected_scope(AGENT, data.agent, route, exists=False, readable=True)
     assert body[key] in ([], {}) or (key == "summary" and body[key]["total_tokens"] == 0)
 
 
@@ -98,7 +105,7 @@ async def test_an_empty_plans_folder_says_readable_and_an_unreadable_one_does_no
     finally:
         plans.chmod(0o755)
     assert unreadable["plans"] == []                     # the same list as the empty one ...
-    assert unreadable["scope"] == expected_scope(controller, data.controller, readable=False)   # ... but not empty
+    assert unreadable["scope"] == expected_scope(controller, data.controller, "/plans", readable=False)
 
 
 @pytest.mark.asyncio
@@ -122,6 +129,7 @@ async def test_a_configured_plans_folder_is_not_judged_by_the_homes_own_folder(d
         plans.chmod(0o755)
 
     assert [p["slug"] for p in body["plans"]] == ["cfg-one"] and body["scope"]["readable"] is True
+    assert body["scope"]["data_dir"] is None
 
 
 @pytest.mark.asyncio
@@ -144,7 +152,7 @@ async def test_a_configured_plans_folder_that_cannot_be_listed_is_never_inspecte
         elsewhere.chmod(0o755)
 
     assert body["plans"] == []
-    assert body["scope"] == expected_scope(path_utils.controller_user_name(), data.controller)   # not judged: readable
+    assert body["scope"] == expected_scope(path_utils.controller_user_name(), data.controller, None)
 
 
 @pytest.mark.asyncio
@@ -163,7 +171,7 @@ async def test_codex_plans_are_judged_by_the_codex_folder_not_by_an_unrelated_cl
         claude.chmod(0o755)
 
     assert [p["title"] for p in body["plans"]] != []                       # the response carries real Codex plans
-    assert body["scope"] == expected_scope(user, home, exists=True, readable=True)   # so they are readable
+    assert body["scope"] == expected_scope(user, home, "/plans?provider=codex-cli", exists=True, readable=True)
 
 
 @pytest.mark.asyncio
@@ -216,7 +224,7 @@ async def test_a_search_only_claude_folder_with_readable_data_is_reported_readab
         claude.chmod(0o755)
 
     assert HAS_DATA[route](body), (route, body)                  # the response carries real data ...
-    assert body["scope"] == expected_scope(user, home)           # ... so the folder it came from is readable
+    assert body["scope"] == expected_scope(user, home, route)
 
 
 @pytest.mark.asyncio
@@ -235,7 +243,7 @@ async def test_a_missing_data_folder_under_a_search_only_claude_folder_is_empty_
         claude.chmod(0o755)
 
     assert not HAS_DATA[route](body)
-    assert body["scope"] == expected_scope(path_utils.controller_user_name(), data.controller)
+    assert body["scope"] == expected_scope(path_utils.controller_user_name(), data.controller, route)
 
 
 # ---- what existed before is unchanged ----------------------------------------------------------------------------------------

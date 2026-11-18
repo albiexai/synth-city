@@ -1177,6 +1177,8 @@ class ScopeInfo(BaseModel):
     claude_dir: str
     exists: bool
     readable: bool
+    # The server-derived folder this view reads. Configured Plans paths remain undisclosed.
+    data_dir: Optional[str] = None
 
 
 class SessionProjectListResponse(BaseModel):

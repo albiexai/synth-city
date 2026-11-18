@@ -2,6 +2,8 @@ import { useEffect, useState, useCallback, useRef } from 'react'
 import { Gauge, HelpCircle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { RefreshButton } from '@/components/shared/RefreshButton'
+import { ReadScopeNotice } from '@/components/shared/ReadScopeNotice'
+import { scopeReadDenial, scopeUnreadable, type HarnessReadScope } from '@/types/harnessScope'
 import { useContextApi } from '@/hooks/useContextApi'
 import { ActiveSessionsList } from './ActiveSessionsList'
 import { ContextGauge } from './ContextGauge'
@@ -21,28 +23,54 @@ export function ContextPage() {
   const [loading, setLoading] = useState(true)
   const [analysisLoading, setAnalysisLoading] = useState(false)
   const [showHelp, setShowHelp] = useState(false)
+  const [scope, setScope] = useState<HarnessReadScope | null>(null)
+  const [readDenial, setReadDenial] = useState<string | null>(null)
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const requests = useRef({ sessions: 0, analysis: 0 })
+  const unreadable = readDenial !== null || scopeUnreadable(scope)
+
+  const clearAnalysis = useCallback(() => {
+    requests.current.analysis++
+    setSelectedSession(null)
+    setAnalysis(null)
+    setAnalysisLoading(false)
+  }, [])
 
   const fetchSessions = useCallback(async () => {
+    const request = ++requests.current.sessions
     try {
       const data = await getActiveSessions()
-      setSessions(data.sessions)
-    } catch {
-      // Silently handle polling errors
+      if (request !== requests.current.sessions) return false
+      const source = data.scope ?? null
+      const blocked = scopeUnreadable(source)
+      setScope(source)
+      setReadDenial(null)
+      setSessions(blocked ? [] : data.sessions)
+      if (blocked) clearAnalysis()
+      return !blocked
+    } catch (err) {
+      const denial = scopeReadDenial(err)
+      if (request === requests.current.sessions && denial) {
+        setReadDenial(denial)
+        setSessions([])
+        clearAnalysis()
+      }
+      return false
     } finally {
-      setLoading(false)
+      if (request === requests.current.sessions) setLoading(false)
     }
-  }, [getActiveSessions])
+  }, [clearAnalysis, getActiveSessions])
 
   const fetchAnalysis = useCallback(async (session: ActiveSessionContext) => {
+    const request = ++requests.current.analysis
     setAnalysisLoading(true)
     try {
       const data = await getSessionContext(session.project_folder, session.session_id)
-      setAnalysis(data.analysis)
+      if (request === requests.current.analysis) setAnalysis(data.analysis)
     } catch {
-      setAnalysis(null)
+      if (request === requests.current.analysis) setAnalysis(null)
     } finally {
-      setAnalysisLoading(false)
+      if (request === requests.current.analysis) setAnalysisLoading(false)
     }
   }, [getSessionContext])
 
@@ -53,14 +81,15 @@ export function ContextPage() {
 
   const handleRefresh = useCallback(async () => {
     setLoading(true)
-    await fetchSessions()
-    if (selectedSession) {
+    const readable = await fetchSessions()
+    if (readable && selectedSession) {
       await fetchAnalysis(selectedSession)
     }
   }, [fetchSessions, fetchAnalysis, selectedSession])
 
   // Initial fetch + auto-poll
   useEffect(() => {
+    const pending = requests.current
     fetchSessions()
 
     const startPolling = () => {
@@ -82,6 +111,8 @@ export function ContextPage() {
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current)
       document.removeEventListener('visibilitychange', handleVisibility)
+      pending.sessions++
+      pending.analysis++
     }
   }, [fetchSessions])
 
@@ -111,21 +142,25 @@ export function ContextPage() {
         </div>
       </div>
 
+      <ReadScopeNotice scope={scope} denial={readDenial} fallbackFolder="projects folder" />
+
       {/* Active Sessions */}
-      <ActiveSessionsList
-        sessions={sessions}
-        selectedId={selectedSession?.session_id}
-        onSelect={handleSelect}
-      />
+      {!unreadable && !loading && (
+        <ActiveSessionsList
+          sessions={sessions}
+          selectedId={selectedSession?.session_id}
+          onSelect={handleSelect}
+        />
+      )}
 
       {/* Analysis */}
-      {analysisLoading && (
+      {!unreadable && analysisLoading && (
         <div className="py-8 text-center">
           <p className="text-muted-foreground">Analyzing session...</p>
         </div>
       )}
 
-      {analysis && !analysisLoading && (
+      {!unreadable && analysis && !analysisLoading && (
         <div className="space-y-4">
           {/* Top row: gauge + projections + cache */}
           <div className="grid gap-4 md:grid-cols-3">

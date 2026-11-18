@@ -4,6 +4,8 @@ import { MessageSquare } from 'lucide-react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { RefreshButton } from '@/components/shared/RefreshButton'
+import { ReadScopeNotice } from '@/components/shared/ReadScopeNotice'
+import { scopeReadDenial, scopeUnreadable, type HarnessReadScope } from '@/types/harnessScope'
 import { useSessionsApi } from '@/hooks/useSessionsApi'
 import { useProjectContext } from '@/contexts/ProjectContext'
 import { SessionList } from './SessionList'
@@ -19,14 +21,21 @@ export function SessionsPage() {
     activeProject?.path || searchParams.get('project') || null
   )
   const [loading, setLoading] = useState(true)
+  const [scope, setScope] = useState<HarnessReadScope | null>(null)
+  const [readDenial, setReadDenial] = useState<string | null>(null)
+  const unreadable = readDenial !== null || scopeUnreadable(scope)
 
   const loadProjects = useCallback(async () => {
     setLoading(true)
     try {
       const data = await listProjects()
+      setScope(data.scope ?? null)
+      setReadDenial(null)
       setProjects(data.projects)
     } catch (err) {
-      console.error('Failed to load projects:', err)
+      const denial = scopeReadDenial(err)
+      setReadDenial(denial)
+      if (!denial) console.error('Failed to load projects:', err)
     } finally {
       setLoading(false)
     }
@@ -39,7 +48,12 @@ export function SessionsPage() {
   const handleProjectChange = (value: string) => {
     const folder = value === 'all' ? null : value
     setSelectedProject(folder)
-    setSearchParams(folder ? { project: folder } : {})
+    setSearchParams(current => {
+      const next = new URLSearchParams(current)
+      if (folder) next.set('project', folder)
+      else next.delete('project')
+      return next
+    })
   }
 
   return (
@@ -51,14 +65,16 @@ export function SessionsPage() {
             Session Transcripts
           </h1>
           <p className="text-muted-foreground">
-            View your Claude Code conversation history
+            View Claude Code conversation history
           </p>
         </div>
         <RefreshButton onClick={loadProjects} loading={loading} />
       </div>
 
+      <ReadScopeNotice scope={scope} denial={readDenial} fallbackFolder="projects folder" />
+
       {/* Project Filter */}
-      <Card>
+      {!unreadable && <Card>
         <CardHeader>
           <CardTitle>Filter by Project</CardTitle>
           <CardDescription>
@@ -80,10 +96,10 @@ export function SessionsPage() {
             </SelectContent>
           </Select>
         </CardContent>
-      </Card>
+      </Card>}
 
       {/* Session List */}
-      <SessionList projectFolder={selectedProject} />
+      {!unreadable && !loading && <SessionList projectFolder={selectedProject} />}
     </div>
   )
 }

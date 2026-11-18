@@ -1,10 +1,12 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { BarChart3 } from 'lucide-react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { RefreshButton } from '@/components/shared/RefreshButton'
+import { ReadScopeNotice } from '@/components/shared/ReadScopeNotice'
+import { scopeReadDenial, scopeUnreadable, type HarnessReadScope } from '@/types/harnessScope'
 import { useUsageApi } from '@/hooks/useUsageApi'
 import { useProjectContext } from '@/contexts/ProjectContext'
 import { UsageSummaryCards } from './UsageSummaryCards'
@@ -15,6 +17,7 @@ import { BlocksView } from './BlocksView'
 import { MonthlyUsageChart } from './MonthlyUsageChart'
 import { ExportCard } from './ExportCard'
 import { getFromCache, saveToCache, isCacheStale, invalidateCache } from '@/lib/usageCache'
+import { scopeUserHeaders } from '@/lib/api'
 import type {
   UsageSummary,
   DailyUsage,
@@ -24,7 +27,6 @@ import type {
 } from '@/types/usage'
 
 interface UsageCacheData {
-  summary: UsageSummary | null
   daily: DailyUsage[]
   sessions: SessionUsage[]
   monthly: MonthlyUsage[]
@@ -32,6 +34,14 @@ interface UsageCacheData {
   activeBlock?: SessionBlock
   totalSessionCost: number
   totalBlockCost: number
+}
+
+const EMPTY_USAGE: UsageCacheData = {
+  daily: [], sessions: [], monthly: [], blocks: [], totalSessionCost: 0, totalBlockCost: 0,
+}
+
+function usageCacheKey(scope: HarnessReadScope | null, project: string | null): string | null {
+  return scope?.data_dir ? JSON.stringify([scope.user, scope.data_dir, project]) : null
 }
 
 export function UsagePage() {
@@ -44,70 +54,57 @@ export function UsagePage() {
   )
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [scope, setScope] = useState<HarnessReadScope | null>(null)
+  const [readDenial, setReadDenial] = useState<string | null>(null)
+  const requests = useRef({ latest: 0 })
+  const unreadable = readDenial !== null || scopeUnreadable(scope)
 
   // Data states
   const [summary, setSummary] = useState<UsageSummary | null>(null)
-  const [dailyData, setDailyData] = useState<DailyUsage[]>([])
-  const [sessionData, setSessionData] = useState<SessionUsage[]>([])
-  const [monthlyData, setMonthlyData] = useState<MonthlyUsage[]>([])
-  const [blocks, setBlocks] = useState<SessionBlock[]>([])
-  const [activeBlock, setActiveBlock] = useState<SessionBlock | undefined>()
-  const [totalSessionCost, setTotalSessionCost] = useState(0)
-  const [totalBlockCost, setTotalBlockCost] = useState(0)
+  const [usage, setUsage] = useState(EMPTY_USAGE)
+  const { daily: dailyData, sessions: sessionData, monthly: monthlyData, blocks, activeBlock, totalSessionCost, totalBlockCost } = usage
 
   const loadData = useCallback(async (forceRefresh = false) => {
+    const request = ++requests.current.latest
+    const requestedUser = scopeUserHeaders()['X-Harness-Scope-User']
+    const isCurrent = () => request === requests.current.latest
+      && requestedUser === scopeUserHeaders()['X-Harness-Scope-User']
     setError(null)
-
-    // Try to load from cache first (instant)
-    if (!forceRefresh) {
-      const cached = getFromCache<UsageCacheData>(selectedProject)
-      if (cached) {
-        // Apply cached data immediately (no loading spinner)
-        setSummary(cached.summary)
-        setDailyData(cached.daily)
-        setSessionData(cached.sessions)
-        setTotalSessionCost(cached.totalSessionCost)
-        setMonthlyData(cached.monthly)
-        setBlocks(cached.blocks)
-        setActiveBlock(cached.activeBlock)
-        setTotalBlockCost(cached.totalBlockCost)
-        setLoading(false)
-
-        // If cache is fresh, we're done
-        if (!isCacheStale(selectedProject)) return
-        // Otherwise, continue to background refresh (don't show loading)
-      }
-    }
-
-    // Show loading only if no cached data or force refresh
-    const hasCachedData = !forceRefresh && getFromCache<UsageCacheData>(selectedProject)
-    if (!hasCachedData) setLoading(true)
+    setLoading(true)
 
     try {
       const params = selectedProject ? { project_path: selectedProject } : undefined
+      const summaryRes = await getSummary(params)
+      if (!isCurrent()) return
+      const source = summaryRes.scope ?? null
+      setScope(source)
+      setReadDenial(null)
+      if (scopeUnreadable(source)) {
+        setSummary(null)
+        setUsage(EMPTY_USAGE)
+        return
+      }
+      setSummary(summaryRes.summary)
 
-      // Fetch all data in parallel
-      const [summaryRes, dailyRes, sessionRes, monthlyRes, blockRes] = await Promise.all([
-        getSummary(params),
+      // The default user can change between visits. Confirm the source before reading cached charts.
+      const cacheKey = usageCacheKey(source, selectedProject)
+      if (cacheKey && !forceRefresh) {
+        const cached = getFromCache<UsageCacheData>(cacheKey)
+        if (cached) {
+          setUsage(cached)
+          setLoading(false)
+          if (!isCacheStale(cacheKey)) return
+        }
+      }
+
+      const [dailyRes, sessionRes, monthlyRes, blockRes] = await Promise.all([
         getDaily(params),
         getSessions({ ...params, limit: 100 }),
         getMonthly(params),
         getBlocks({ ...params, recent: true }),
       ])
-
-      // Update state
-      setSummary(summaryRes.summary)
-      setDailyData(dailyRes.data)
-      setSessionData(sessionRes.data)
-      setTotalSessionCost(sessionRes.total_cost)
-      setMonthlyData(monthlyRes.data)
-      setBlocks(blockRes.data)
-      setActiveBlock(blockRes.active_block)
-      setTotalBlockCost(blockRes.total_cost)
-
-      // Save to cache
-      saveToCache<UsageCacheData>(selectedProject, {
-        summary: summaryRes.summary,
+      if (!isCurrent()) return
+      const updated = {
         daily: dailyRes.data,
         sessions: sessionRes.data,
         monthly: monthlyRes.data,
@@ -115,44 +112,71 @@ export function UsagePage() {
         activeBlock: blockRes.active_block,
         totalSessionCost: sessionRes.total_cost,
         totalBlockCost: blockRes.total_cost,
-      })
+      }
+      setUsage(updated)
+      if (cacheKey) saveToCache(cacheKey, updated)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load usage data')
+      if (isCurrent()) {
+        const denial = scopeReadDenial(err)
+        if (denial) {
+          setReadDenial(denial)
+          setSummary(null)
+          setUsage(EMPTY_USAGE)
+        } else {
+          setError(err instanceof Error ? err.message : 'Failed to load usage data')
+        }
+      }
     } finally {
-      setLoading(false)
+      if (isCurrent()) setLoading(false)
     }
   }, [selectedProject, getSummary, getDaily, getSessions, getMonthly, getBlocks])
 
   const handleRefresh = useCallback(() => {
-    invalidateCache(selectedProject)
+    const key = usageCacheKey(scope, selectedProject)
+    if (key) invalidateCache(key)
     loadData(true)
-  }, [loadData, selectedProject])
+  }, [loadData, scope, selectedProject])
 
   useEffect(() => {
+    const pending = requests.current
     loadData()
+    return () => { pending.latest++ }
   }, [loadData])
 
   const handleProjectChange = (value: string) => {
     const path = value === 'all' ? null : value
     setSelectedProject(path)
-    setSearchParams(path ? { project: path } : {})
+    setSearchParams(current => {
+      const next = new URLSearchParams(current)
+      if (path) next.set('project', path)
+      else next.delete('project')
+      return next
+    })
+  }
+
+  const header = (
+    <div className="flex items-center justify-between">
+      <div>
+        <h1 className="text-3xl font-bold flex items-center gap-2">
+          <BarChart3 className="h-8 w-8" />
+          Usage Tracking
+        </h1>
+        <p className="text-muted-foreground">
+          Monitor Claude Code token usage and costs
+        </p>
+      </div>
+      <RefreshButton onClick={handleRefresh} loading={loading} />
+    </div>
+  )
+  const sourceNotice = <ReadScopeNotice scope={scope} denial={readDenial} fallbackFolder="projects folder" />
+  if (unreadable) {
+    return <div className="space-y-6">{header}{sourceNotice}</div>
   }
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold flex items-center gap-2">
-            <BarChart3 className="h-8 w-8" />
-            Usage Tracking
-          </h1>
-          <p className="text-muted-foreground">
-            Monitor your Claude Code token usage and costs
-          </p>
-        </div>
-        <RefreshButton onClick={handleRefresh} loading={loading} />
-      </div>
+      {header}
+      {sourceNotice}
 
       {/* Error Display */}
       {error && (
