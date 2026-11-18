@@ -3931,8 +3931,10 @@ async def _named_reviewer_binding(db, item, scope, member_id):
         GithubRequiredCheckWatch.reviewer_member_id == member_id).limit(1))
     if not named:
         raise _not_reviewer()  # not named for this attempt and revision: no remote read for a stranger
+    capture = (github_approval_service.revision_review_attempt_context if fresh.active_scope_revision
+               else github_approval_service.healthy_scope_context)
     try:
-        context, owner, _leader, _workspace = await github_approval_service.healthy_scope_context(db, item, scope)
+        context, owner, _leader, _workspace = await capture(db, item, scope)
         digest = _digest(effective_policy(item, scope))
     except GithubApprovalError:
         raise _binding_unavailable() from None
@@ -3948,11 +3950,11 @@ async def _named_reviewer_binding(db, item, scope, member_id):
         pull = await watches._read_pull(scope, context['pr_number'])
     except Exception:
         raise _binding_unavailable() from None
-    # After the remote await, the whole authority is read and fenced again (#1027 review): a healthy context,
+    # After the remote await, the whole authority is read and fenced again (#1027 review): a current context,
     # the same attempt, revision, PR, owner, team, Leader, branch and repository, and the same effective policy.
     # Only these post-read values are used below, starting with the observed pull request.
     try:
-        context, owner, _leader, _workspace = await github_approval_service.healthy_scope_context(db, item, scope)
+        context, owner, _leader, _workspace = await capture(db, item, scope)
         digest_after = _digest(effective_policy(item, scope))
     except GithubApprovalError:
         raise _binding_unavailable() from None
@@ -3966,6 +3968,14 @@ async def _named_reviewer_binding(db, item, scope, member_id):
             or (head.get('repo') or {}).get('full_name')
             != f"{context['scope']['repo_owner']}/{context['scope']['repo_name']}"
             or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha)):
+        raise _binding_unavailable()
+    if context['dispatch_status'] == 'escalated' and not await db.scalar(select(GithubAttemptScopeRevision.id).where(
+            GithubAttemptScopeRevision.work_item_id == item.id,
+            GithubAttemptScopeRevision.dispatch_nonce == context['dispatch_nonce'],
+            GithubAttemptScopeRevision.revision == context['active_scope_revision'],
+            GithubAttemptScopeRevision.phase == 'implementation',
+            GithubAttemptScopeRevision.status == 'submitted',
+            GithubAttemptScopeRevision.submitted_head_sha == sha).limit(1)):
         raise _binding_unavailable()
     watch = await db.scalar(select(GithubRequiredCheckWatch).where(
         GithubRequiredCheckWatch.work_item_id == item.id,

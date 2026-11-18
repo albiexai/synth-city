@@ -73,6 +73,7 @@ IMPLEMENTATION_COMPLETION_ACTIONS = frozenset(
 )
 # A handoff the new owner has accepted leaves a settled owner binding. A pending or unknown one does not.
 _SETTLED_HANDOFF_STATES = (None, "accepted")
+_LIVE_ATTEMPT_STATUSES = frozenset({"dispatched", "verifying", "ready_for_review", "awaiting_human_review"})
 
 
 def _settled_handoff_condition():
@@ -468,18 +469,29 @@ class GithubApprovalService:
             raise GithubApprovalError("current_mail_session_required", status_code=403) from exc
 
     async def healthy_scope_context(self, db, item, scope, *, allow_recovery=False):
-        """Capture stopped/healthy authority; the returned private values are SQL fences."""
+        statuses = _LIVE_ATTEMPT_STATUSES | {"escalated"} if allow_recovery else _LIVE_ATTEMPT_STATUSES
+        return await self._fenced_attempt_context(db, item, scope, statuses=statuses,
+            unavailable_code="amendment_context_unavailable")
+
+    async def revision_review_attempt_context(self, db, item, scope):
+        """A submitted head can receive review evidence during a recoverable escalation."""
+        return await self._fenced_attempt_context(db, item, scope, statuses=_LIVE_ATTEMPT_STATUSES | {"escalated"},
+            unavailable_code="revision_review_context_unavailable", escalation_reasons=CONTINUABLE_ESCALATIONS)
+
+    async def _fenced_attempt_context(self, db, item, scope, *, statuses, unavailable_code, escalation_reasons=None):
+        """Capture current attempt identity and policy for the SQL write fences."""
         from app.services.github_coordination_service import hold_code
         from app.services.factory_delivery_policy import policy_context
         await db.refresh(item)
         await db.refresh(scope)
         team = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
+        escalated_review = escalation_reasons is not None and item.dispatch_status == "escalated"
         if (hold_code() or not scope.enabled or not team or not team.autonomy_enabled
                 or item.scope_id != scope.id or item.handoff_state not in _SETTLED_HANDOFF_STATES
-                or item.dispatch_status not in ({"dispatched", "verifying", "ready_for_review", "awaiting_human_review"}
-                    | ({"escalated"} if allow_recovery else set()))
+                or item.dispatch_status not in statuses
+                or (escalated_review and item.escalation_reason not in escalation_reasons)
                 or not item.dispatch_nonce or not item.dispatch_head_ref):
-            raise GithubApprovalError("amendment_context_unavailable")
+            raise GithubApprovalError(unavailable_code)
         owner, leader = await self._current_participants(db, item)
         workspace = await db.scalar(select(GithubWorkspace).where(
             GithubWorkspace.leased_item_id == item.id, GithubWorkspace.scope_id == scope.id))
@@ -499,9 +511,11 @@ class GithubApprovalService:
             "id", "preset_id", "repo_owner", "repo_name", "github_auth_mode", "continuation_enabled",
             "max_scope_paths", "max_scope_commands", "max_continuation_revisions",
             "max_continuation_failed_heads", "max_failed_heads_per_revision")}
+        if escalated_review:
+            context["escalation_reason"] = item.escalation_reason
         if not await db.scalar(select(exists(select(GithubWorkItem.id).where(
                 *self.healthy_scope_conditions(context))))):
-            raise GithubApprovalError("amendment_context_unavailable")
+            raise GithubApprovalError(unavailable_code)
         return context, owner, leader, workspace
 
     @staticmethod
