@@ -46,6 +46,7 @@ from app.models.database import (
 from app.services.github_leader_recovery_service import (
     CancelRevisionRequest, FinalizeMergedLeaderRequest, ReleaseWorkspaceRequest,
 )
+from app.services.github_end_stopped_item_service import EndStoppedItemRequest
 from app.models.schemas import (
     GithubScopeAmendmentCreate, GithubRevisionReviewCreate, GithubRevisionReviewWithdraw,
     GithubSubmittedRevisionEnd, GithubRevisionReviewResponse,
@@ -2466,9 +2467,17 @@ async def get_team_summary(
     response: Response,
     scope_id: int | None = Query(None, ge=1),
     provider: str | None = Query(None, min_length=1, max_length=64),
+    work_item_id: int | None = Query(None, ge=1),
     db: AsyncSession = Depends(get_db),
 ):
     response.headers["Cache-Control"] = "no-store"
+    if work_item_id is not None:
+        if scope_id is not None or provider is not None:
+            raise HTTPException(status_code=422, detail="invalid_filter")
+        result = await agent_team_summary_service.for_work_item(db, preset_id, work_item_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="resource_not_found")
+        return result
     # Optional Needs-you filters (#1141): the same checks as the factory filters. Without them the read is unchanged.
     if provider is not None and provider not in {p.id for p in get_providers()}:
         raise HTTPException(status_code=422, detail="invalid_filter")
@@ -4136,6 +4145,14 @@ async def leader_release_workspace(item_id: int, request: ReleaseWorkspaceReques
     return await _leader_recovery(item_id, session, db, 'agent_teams.leader_release_workspace',
         lambda item: recovery.release_workspace(db, item, session, workspace_id=request.workspace_id,
             expected_leased_at=request.leased_at(), operation_id=request.operation_id, reason=request.reason))
+
+
+@router.post('/github-work-items/{item_id}/leader-recovery/end-stopped')
+async def leader_end_stopped(item_id: int, request: EndStoppedItemRequest,
+    session: MailAgentSession | None = Depends(mail_session), db: AsyncSession = Depends(get_db)):
+    from app.services import github_leader_recovery_service as recovery
+    return await _leader_recovery(item_id, session, db, 'agent_teams.leader_end_stopped',
+        lambda item: recovery.end_stopped(db, item, session, request))
 
 
 async def _with_reader(db, item_id, call):

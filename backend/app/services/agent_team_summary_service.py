@@ -5,7 +5,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, tuple_
 from sqlalchemy.exc import OperationalError
 from mcp_shim.work_remaining_protocol import MAX_AGE
 
@@ -25,7 +25,7 @@ from app.services.github_work_progress_service import github_work_progress_servi
 from app.services.agent_team_campaign_service import agent_team_campaign_service
 from app.services import required_ci_attention
 from app.services.agent_team_supervisor_service import observe_supervisor, supervisor_observation, team_needs_no_supervision
-from app.services.work_item_states import ATTENTION_STATUSES, DONE_STATUSES
+from app.services.work_item_states import ATTENTION_STATUSES, FINISHED_STATUSES
 
 _ACTORS = ("owner", "leader", "operator", "controller", "reviewer")
 _KINDS = {"review_pr", "merge_pr", "inspect_attempt", "inspect_checkpoint", "milestone_acceptance",
@@ -110,7 +110,7 @@ class AgentTeamSummaryService:
             .order_by(TeamGithubScope.id).limit(33))).all())
         selected = (select(GithubWorkItem).join(TeamGithubScope,
             TeamGithubScope.id == GithubWorkItem.scope_id).where(TeamGithubScope.preset_id == preset_id,
-            GithubWorkItem.dispatch_status.not_in(DONE_STATUSES)))
+            GithubWorkItem.dispatch_status.not_in(FINISHED_STATUSES)))
         # #1142: a repository or harness filter narrows the unfinished items themselves, so remaining work, next
         # actors and coverage are computed over the same work. A harness keeps only owned work.
         if scope_id is not None:
@@ -407,6 +407,31 @@ class AgentTeamSummaryService:
             supervisor_observation=supervisor, waiting_input=waiting_input if not changed else None,
             remaining_work=remaining, next_actors=[actor for actor in _ACTORS if actor in actors],
             next_actor_coverage_complete=complete and len(observations) == total, campaign=campaign)
+
+    async def for_work_item(self, db, preset_id, work_item_id):
+        """Keep the item's and unbound blockers over the same team observation."""
+        tracked_items = select(GithubWorkItem.id, GithubWorkItem.scope_id, GithubWorkItem.issue_number).join(
+            TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id).where(
+                TeamGithubScope.preset_id == preset_id)
+        if (await db.execute(tracked_items.where(GithubWorkItem.id == work_item_id))).one_or_none() is None:
+            return None
+        result = await self.summary(db, preset_id)
+        if result is None:
+            return None
+        # A Leader-reported action can carry a tracked issue's identity before it carries the work item id.
+        unbound = {(row.scope_id, row.issue_number) for row in (*result.human_actions, *result.attention)
+                   if row.work_item_id is None and row.scope_id is not None and row.issue_number is not None}
+        bindings = {}
+        if unbound:
+            rows = await db.execute(tracked_items.where(tuple_(GithubWorkItem.scope_id, GithubWorkItem.issue_number)
+                                                       .in_(unbound)))
+            bindings = {(row.scope_id, row.issue_number): row.id for row in rows}
+
+        def relevant(row):
+            return (row.work_item_id or bindings.get((row.scope_id, row.issue_number))) in (None, work_item_id)
+
+        return result.model_copy(update={"attention": [row for row in result.attention if relevant(row)],
+                                         "human_actions": [row for row in result.human_actions if relevant(row)]})
 
     async def needs_you(self, db, preset_id, *, scope_id=None, provider=None):
         """The summary narrowed to a repository and an assigned harness (#1141, #1142).

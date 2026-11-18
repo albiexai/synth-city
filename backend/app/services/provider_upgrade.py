@@ -45,7 +45,7 @@ _SUFFIXES = {
     "end_submitted_revision", "settle_accepted_revision", "record_head_review", "preflight_request",
     "get_review_binding",
     "extend_effort_limit", "render_pull_summary", "publish_pull_summary",
-    "leader_cancel_revision", "leader_finalize_merged", "leader_release_workspace",
+    "leader_cancel_revision", "leader_end_stopped", "leader_finalize_merged", "leader_release_workspace",
 }
 
 

@@ -18,6 +18,8 @@ from app.services.github_terminal_revision_service import (
 from app.services.accepted_source_imports import SourceImportRequest, register_source_import
 from app.services.github_client import GithubClientResponseError
 from app.services.github_check_observation import GithubCheckObservationError
+from app.services.factory_audit_service import derive_actor
+from app.services.github_end_stopped_item_service import EndStoppedItemRequest, end_stopped_item
 from app.services.owner_observation_pause import resume_observation_pause
 from app.services.maintenance_operations import digest
 from typing import Literal
@@ -46,6 +48,21 @@ async def context(db, preset_id, item_id):
     if scope is None or scope.preset_id != preset_id:
         raise HTTPException(status_code=404, detail="Work item not found")
     return item, scope
+
+
+@router.post("/presets/{preset_id}/work-items/{item_id}/end-stopped")
+async def end_stopped_route(preset_id: int, item_id: int, request: EndStoppedItemRequest,
+                            response: Response, _operator=Depends(require_operator), db: AsyncSession = Depends(get_db)):
+    response.headers["Cache-Control"] = "no-store"
+    item, scope = await context(db, preset_id, item_id)
+    try:
+        return await end_stopped_item(db, item, scope, request, actor=derive_actor(actor_kind="operator"))
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except (IntegrityError, OperationalError):
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="end_stopped_item_context_changed") from None
 
 
 @router.get("/presets/{preset_id}/terminal-revisions")

@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from urllib.parse import quote
 
 import httpx
@@ -1174,12 +1174,15 @@ def synth_city_update_team_campaign(
 
 
 @mcp.tool()
-def synth_city_get_team_summary(preset_id: int) -> dict:
+def synth_city_get_team_summary(preset_id: int, work_item_id: int | None = None) -> dict:
     """Read a team's outcome, parent link, existing attention signals, effort total and next actors.
 
+    For a PR's final hold check, pass its tracked work_item_id. Attention and human actions then keep
+    only that item and unbound signals. Team coverage, HOLD, and native waiting signals still apply.
     Unknown or incomplete observations keep the total Unknown. This read grants no execution authority.
     """
-    result = _team_request("GET", f"/presets/{preset_id}/summary")
+    filters = {"params": {"work_item_id": work_item_id}} if work_item_id is not None else {}
+    result = _team_request("GET", f"/presets/{preset_id}/summary", **filters)
     if not result["ok"]:
         return result
     return {"ok": True, "summary": result["data"]}
@@ -1493,6 +1496,7 @@ def synth_city_list_work_items(status: str = "escalated", limit: int = 100) -> d
                 "work_item_id": item.get("id"),
                 "issue_number": item.get("issue_number"),
                 "dispatch_status": item.get("dispatch_status"),
+                "dispatch_generation": item.get("dispatch_generation"),
                 "escalation_reason": item.get("escalation_reason"),
                 "status_note": item.get("status_note"),
                 "ack_approval_round": item.get("ack_approval_round"),
@@ -1734,6 +1738,23 @@ def synth_city_leader_release_workspace(work_item_id: int, workspace_id: int, ex
     return _revision_review_request(f"/github-work-items/{work_item_id}/leader-recovery/release-workspace",
         {"workspace_id": workspace_id, "expected_leased_at": expected_leased_at,
          "operation_id": operation_id, "reason": reason})
+
+
+@mcp.tool()
+def synth_city_leader_end_stopped(work_item_id: int, expected_dispatch_generation: str | None,
+    expected_scope_revision: int, operation_id: str, outcome: Literal["deferred", "superseded"],
+    reason: str, target_milestone: str | None = None, superseding_pr_number: int | None = None) -> dict:
+    """Current Leader ends one stopped work item and safely releases any clean workspace.
+
+    Read dispatch_generation and active_scope_revision from list_work_items. Use null generation only if the
+    item has none. Supply a target milestone for deferred or the delivering PR number for superseded.
+    A matching operation_id replay is safe. HOLD, a changed attempt or an unsafe lease refuses the action.
+    """
+    return _revision_review_request(f"/github-work-items/{work_item_id}/leader-recovery/end-stopped", {
+        "expected_dispatch_generation": expected_dispatch_generation, "expected_scope_revision": expected_scope_revision,
+        "operation_id": operation_id, "outcome": outcome, "reason": reason,
+        "target_milestone": target_milestone, "superseding_pr_number": superseding_pr_number,
+    })
 
 
 @mcp.tool()

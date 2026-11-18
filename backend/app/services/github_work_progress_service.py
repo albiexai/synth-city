@@ -31,10 +31,10 @@ from app.services.github_work_item_projection import _load_work_item_authority
 from app.services.github_work_progress_observation import (
     ProgressObservationError, WorkspaceProgressContext, workspace_progress_observer,
 )
-from app.services.work_item_states import is_done, needs_attention
+from app.services.work_item_states import FINISHED_STATUSES, needs_attention
 
 _SHA = re.compile(r"[0-9a-f]{40}")
-_TERMINAL_REPORT_STATUSES = frozenset({"merged", "completed", "closed"})
+_TERMINAL_REPORT_STATUSES = frozenset((*FINISHED_STATUSES, "closed"))
 _REPO_PART = re.compile(r"[A-Za-z0-9_.-]{1,100}")
 _REF = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,250}")
 _CACHE_SECONDS = 15
@@ -105,7 +105,7 @@ _STOPPED_PROGRESS = {
 
 def _next_step(item, scope, preset, pending, hold: str | None, *,
                stopped_step: StoppedAttemptStep | None = None) -> tuple[str, str, str]:
-    if is_done(item.dispatch_status):
+    if item.dispatch_status in FINISHED_STATUSES:
         return "complete", "none", "This tracked item is complete."
     if stopped_step is not None:
         phase, action = _STOPPED_PROGRESS[stopped_step]

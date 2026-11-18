@@ -262,6 +262,54 @@ async def test_an_unknown_preset_stays_none(db, world, monkeypatch):
     assert await service.needs_you(db, 999999, scope_id=world.ids["a1"]) is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("own_attention", [False, True])
+async def test_pr_guard_ignores_other_items_and_keeps_team_coverage(db, world, client, monkeypatch, own_attention):
+    ids, items = world.ids, world.items
+    world.i1.pr_number = 101
+    world.i2.dispatch_status = "escalated"
+    await db.commit()
+    _, full = await _service(db, world, monkeypatch)
+    actions = [full.human_actions[1], full.human_actions[2].model_copy(update={"work_item_id": None})]
+    attention = [full.attention[1]]
+    if own_attention:
+        actions.append(full.human_actions[0])
+        attention.append(full.attention[0])
+    full = full.model_copy(update={"coverage_complete": True, "waiting_input": [], "hold_code": None,
+                                  "human_actions": actions, "attention": attention})
+
+    async def summary(db, preset_id, **filters):
+        return full
+
+    monkeypatch.setattr(agent_team_summary_service, "summary", summary)
+    url = f"/api/v1/agent-teams/presets/{ids['team']}/summary"
+    plain = (await client.get(url)).json()
+    scoped_response = await client.get(url, params={"work_item_id": items["i1"]})
+    assert scoped_response.status_code == 200
+    scoped = scoped_response.json()
+    assert scoped["attention"] == ([plain["attention"][-1]] if own_attention else [])
+    assert scoped["human_actions"] == ([plain["human_actions"][-1]] if own_attention else [])
+    for field in ("coverage_complete", "next_actor_coverage_complete", "valid_until", "hold_code", "waiting_input"):
+        assert scoped[field] == plain[field]
+    assert (await client.get(url, params={"work_item_id": items["ib"]})).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_pr_guard_preserves_global_hold_waits_and_unknown_coverage(db, world, monkeypatch):
+    service, full = await _service(db, world, monkeypatch)
+    full = full.model_copy(update={"coverage_complete": False, "hold_code": "hold"})
+
+    async def summary(db, preset_id):
+        return full
+
+    monkeypatch.setattr(service, "summary", summary)
+    scoped = await service.for_work_item(db, world.ids["team"], world.items["i1"])
+    assert scoped.coverage_complete is False and scoped.hold_code == "hold"
+    assert scoped.waiting_input == full.waiting_input
+    assert [row.code for row in scoped.attention] == ["attempt_stopped", "human_review", "hold"]
+    assert [row.kind for row in scoped.human_actions] == ["review_pr", "pilot_decision"]
+
+
 @pytest_asyncio.fixture
 async def client(db, monkeypatch):
     monkeypatch.setattr(settings, "operator_token", "needs-you-filter-test-token")
