@@ -23,7 +23,7 @@ function waitingText(work: WorkProjection) {
 
 export function WorkTable({ rows }: { rows: WorkProjection[] }) {
   return (
-    <div data-work-table className="overflow-x-auto rounded-lg border">
+    <div data-work-table className="relative overflow-x-auto rounded-lg border">
       <table className="w-full min-w-[720px] table-fixed text-left text-sm">
         <caption className="sr-only">
           Work of the selected teams and watched repositories
