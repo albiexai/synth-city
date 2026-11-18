@@ -3,6 +3,7 @@ import copy
 import atexit
 import os
 import tempfile
+from collections import OrderedDict
 from unittest.mock import patch
 
 import pytest
@@ -90,6 +91,13 @@ def isolated_settings(monkeypatch):
     defaults = Settings()
     for name in Settings.model_fields:
         monkeypatch.setattr(settings, name, copy.deepcopy(getattr(defaults, name)))
+
+
+@pytest.fixture(autouse=True)
+def isolated_github_rate_limit_state(monkeypatch):
+    # The rate-limit service is process-wide; a 403 recorded by one test must not pause /health in the next.
+    from app.services.github_rate_limit_service import github_rate_limit_service
+    monkeypatch.setattr(github_rate_limit_service, "_observations", OrderedDict())
 
 
 @pytest.fixture(autouse=True)
