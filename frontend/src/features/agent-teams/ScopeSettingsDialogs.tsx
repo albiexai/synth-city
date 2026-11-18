@@ -298,13 +298,13 @@ export function ScopeDialog({
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="human">Human reviews and merges</SelectItem>
-                <SelectItem value="auto">Auto-merge after checks pass</SelectItem>
+                <SelectItem value="auto">Automatic merge</SelectItem>
               </SelectContent>
             </Select>
             <p className="text-xs text-amber-700 dark:text-amber-400">
               Applies to the code pipeline only. Design-pipeline PRs always require a human review.
             </p>
-            <p className="text-xs text-muted-foreground">Human: Synth City marks the PR ready for review. Auto: merges after GitHub checks pass, within the rolling daily cap; otherwise it waits for a human.</p>
+            <p className="text-xs text-muted-foreground">Human merge marks the PR ready for review. Automatic merge requires an enabled verifier separate from the Leader and PR owner to accept the exact PR commit. It also requires passing GitHub checks and room under a positive daily cap.</p>
           </div>
           <div className="grid gap-2">
             <Label htmlFor="approval-rounds">Max approval rounds</Label>

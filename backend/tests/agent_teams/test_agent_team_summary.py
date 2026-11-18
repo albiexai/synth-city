@@ -109,7 +109,221 @@ async def test_empty_team_has_zero_effort_and_no_actor(db, monkeypatch):
     assert result.remaining_work.state == "known"
     assert result.remaining_work.effort_low_minutes == result.remaining_work.effort_high_minutes == 0
     assert result.next_actors == [] and result.next_actor_coverage_complete
+    assert result.coverage_complete and result.coverage_reason == []
     assert reads.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason,expected", [
+    ("restart_needed_for_observation", "restart_needed_for_observation"),
+    ("no_native_event", "no_native_event"),
+    ("completion_unconfirmed", "completion_unconfirmed"),
+    ("private-native-debug-value", None),
+])
+async def test_summary_reports_public_native_reason_without_private_identity(db, monkeypatch, reason, expected):
+    from types import SimpleNamespace
+
+    team, _, items = await seed(db)
+    slot_id = items[0].owner_slot_id
+
+    async def native(db, preset_id, **kwargs):
+        inputs = await activity._team_inputs(db, preset_id, 256)
+        kwargs["input_fence"].update({entry[0]: entry for entry in inputs})
+        return SimpleNamespace(slots=[SimpleNamespace(slot_id=slot_id, state="unknown", reason=reason,
+            waiting_input=None)], valid_until=datetime.now(timezone.utc) + timedelta(seconds=60))
+
+    from app.services import agent_activity_service as activity
+    monkeypatch.setattr(activity, "observe_team", native)
+    summary, _ = service(monkeypatch)
+    result = await summary.summary(db, team.id)
+    assert not result.coverage_complete
+    assert [(entry.code, entry.slot_id, entry.activity_reason) for entry in result.coverage_reason] == [
+        ("native_unknown", slot_id, expected)]
+    assert result.remaining_work.state == "known"
+    assert "private-launch-option" not in result.model_dump_json()
+    assert "private-native-debug-value" not in result.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_summary_reports_missing_progress_and_dispatch_coverage(db, monkeypatch):
+    class Incomplete(Attention):
+        async def dispatch_snapshot(self, db, scopes):
+            return {"complete": False, "actions": []}
+
+    team, _, items = await seed(db)
+    summary, _ = service(monkeypatch, {items[0].id: None}, attention=Incomplete())
+    result = await summary.summary(db, team.id)
+    assert not result.coverage_complete
+    assert ("dispatch_incomplete", None) in [(entry.code, entry.work_item_id) for entry in result.coverage_reason]
+    assert ("progress_missing", items[0].id) in [(entry.code, entry.work_item_id) for entry in result.coverage_reason]
+
+
+@pytest.mark.asyncio
+async def test_fresh_guard_allows_one_prompt_label_write(db, monkeypatch):
+    from types import SimpleNamespace
+
+    team, _, _ = await seed(db, ())
+    summary, _ = service(monkeypatch)
+
+    async def native(db, preset_id, *, input_fence, **kwargs):
+        from app.services.agent_activity_service import _team_inputs
+
+        input_fence.update({entry[0]: entry for entry in await _team_inputs(db, preset_id, 256)})
+        return SimpleNamespace(slots=[], valid_until=datetime.now(timezone.utc) + timedelta(seconds=60))
+
+    monkeypatch.setattr("app.services.agent_activity_service.observe_team", native)
+    guard = await summary.summary(db, team.id)
+    labels = {"synth-city-v43-review-hold"}
+    attempted_at = guard.checked_at + timedelta(seconds=16)
+    if guard.coverage_complete and attempted_at < guard.valid_until and guard.hold_code is None:
+        labels.remove("synth-city-v43-review-hold")
+    assert labels == set()
+    assert guard.coverage_reason == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["hold", "work_item"])
+async def test_late_changes_invalidate_the_guard_before_publication(db, monkeypatch, change):
+    from app.services.agent_team_campaign_service import agent_team_campaign_service
+
+    team, _, items = await seed(db)
+    item_id = items[0].id
+    hold_code = None
+
+    class LateChange:
+        async def summary(self, db, preset_id, actions, **kwargs):
+            nonlocal hold_code
+            result = await agent_team_campaign_service.summary(db, preset_id, actions, **kwargs)
+            if change == "hold":
+                hold_code = "hold"
+            else:
+                item = await db.get(GithubWorkItem, item_id)
+                item.active_scope_revision += 1
+                await db.commit()
+            return result
+
+    summary, _ = service(monkeypatch, campaign=LateChange())
+    monkeypatch.setattr("app.services.agent_team_summary_service.hold_code", lambda: hold_code)
+    result = await summary.summary(db, team.id)
+
+    assert not result.coverage_complete and not result.next_actor_coverage_complete
+    assert {entry.code for entry in result.coverage_reason} == {"source_changed"}
+    assert result.hold_code == ("hold" if change == "hold" else None)
+    assert ("hold" in {entry.code for entry in result.attention}) is (change == "hold")
+    assert ("operator" in result.next_actors) is (change == "hold")
+    assert result.waiting_input is None
+    assert result.remaining_work.state == "unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_mail_timeout", [False, True], ids=["binding_changed", "partial_mail_timeout"])
+async def test_a_session_ending_during_campaign_read_invalidates_native_coverage(db, monkeypatch, partial_mail_timeout):
+    from sqlalchemy import select
+    from app.config import settings
+    from app.models.database import AgentPaneBinding, MailAgentSession, MailMessage, MailTeamMember
+    from app.models.schemas import AgentActivityObservation
+    from app.services import agent_activity_service as activity
+    from app.services.agent_team_campaign_service import agent_team_campaign_service
+    from app.services.mail_request_stall_service import mail_request_stall_service
+
+    team, _, _ = await seed(db, ())
+    slot_id = await db.scalar(select(AgentTeamSlot.id).where(AgentTeamSlot.preset_id == team.id))
+    member = MailTeamMember(identity_key="late-session", repo_id="fixture", repo_path="/synthetic/project",
+        repo_name="fixture", display_name="Worker", team_preset_id=team.id, team_slot_id=slot_id)
+    db.add(member)
+    await db.flush()
+    binding = AgentPaneBinding(pane_pid=41001, pane_proc_start="28", slot_id=slot_id, preset_id=team.id, tmux_target="%9")
+    session = MailAgentSession(member_id=member.id, provider="codex-cli", source="mcp", session_key="late-session",
+        team_slot_id=slot_id, team_preset_id=team.id, bound_pane_pid=41001, bound_pane_proc_start="28",
+        cwd="/synthetic/project", capability_token_hash="test-hash", mailbox_status="connected")
+    db.add_all([binding, session])
+    if partial_mail_timeout:
+        requester = MailTeamMember(identity_key="late-session-requester", repo_id="fixture", repo_path="/synthetic/project",
+            repo_name="fixture", display_name="Requester", team_preset_id=team.id)
+        db.add(requester)
+        await db.flush()
+        created_at = datetime.utcnow() - timedelta(seconds=settings.mail_request_unanswered_seconds + 60)
+        db.add_all(MailMessage(kind="context_request", request_status="pending", sender_member_id=requester.id,
+            recipient_member_id=member.id, audience_type="member", audience_id=str(member.id),
+            body_markdown="Disposable request", created_at=created_at) for _ in range(17))
+    await db.commit()
+    session_id, team_id = session.id, team.id
+    session_ended = False
+    earlier_mail = []
+    read_native_inputs = activity._team_inputs
+    read_mail = mail_request_stall_service.observe
+
+    async def native_inputs(*args, **kwargs):
+        if partial_mail_timeout and session_ended:
+            raise TimeoutError
+        return await read_native_inputs(*args, **kwargs)
+
+    async def observe_mail(*args, **kwargs):
+        result = await read_mail(*args, **kwargs)
+        earlier_mail.append(result)
+        return result
+
+    def observe(slot_id, provider, session_id, bindings, duplicate, now, *, provenance=None):
+        assert len(bindings) == 1
+        return AgentActivityObservation(slot_id=slot_id, state="idle", reason="turn_completed", observed_at=now)
+
+    class EndsSession:
+        async def summary(self, db, preset_id, actions, **kwargs):
+            nonlocal session_ended
+            result = await agent_team_campaign_service.summary(db, preset_id, actions, **kwargs)
+            session = await db.get(MailAgentSession, session_id)
+            session.closed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            await db.commit()
+            session_ended = True
+            return result
+
+    monkeypatch.setattr(activity, "_observe", observe)
+    monkeypatch.setattr(activity, "_team_inputs", native_inputs)
+    monkeypatch.setattr(mail_request_stall_service, "observe", observe_mail)
+    summary, _ = service(monkeypatch, campaign=EndsSession())
+    result = await summary.summary(db, team_id)
+    assert not result.coverage_complete and not result.next_actor_coverage_complete
+    coverage_reason = "observation_timeout" if partial_mail_timeout else "fence_changed"
+    assert [(entry.code, entry.source) for entry in result.coverage_reason] == [(coverage_reason, "native")]
+    assert result.waiting_input is None
+    assert result.remaining_work.state == "known"
+    if partial_mail_timeout:
+        (partial,) = earlier_mail
+        assert not partial.complete and partial.reason == "entry_limit" and len(partial.items) == 16
+        published_mail = result.supervisor_observation.unanswered_requests
+        assert published_mail.items == [] and not published_mail.complete and published_mail.reason == "stall_timeout"
+        assert all(entry.code != "unanswered_request" for entry in result.attention)
+        (incomplete,) = [entry for entry in result.attention if entry.code == "unanswered_request_incomplete"]
+        assert incomplete.coverage_reason == "stall_timeout"
+
+
+@pytest.mark.asyncio
+async def test_harness_filter_keeps_a_reason_without_exposing_the_other_slot(db, monkeypatch):
+    from types import SimpleNamespace
+    from app.services import agent_activity_service as activity
+
+    team, _, _ = await seed(db, ())
+    other = AgentTeamSlot(preset_id=team.id, display_name="Other", provider="claude-code",
+                          repo_path="/private/repo", repo_id="private", repo_name="repo")
+    db.add(other)
+    await db.commit()
+    other_id = other.id
+
+    async def native(db, preset_id, *, input_fence, **kwargs):
+        input_fence.update({entry[0]: entry for entry in await activity._team_inputs(db, preset_id, 256)})
+        slots = [SimpleNamespace(slot_id=slot_id, state="unknown" if slot_id == other_id else "idle",
+                                 reason="no_native_event", waiting_input=None) for slot_id in input_fence]
+        return SimpleNamespace(slots=slots, valid_until=datetime.now(timezone.utc) + timedelta(seconds=60))
+
+    monkeypatch.setattr(activity, "observe_team", native)
+    summary, _ = service(monkeypatch)
+    full = await summary.summary(db, team.id)
+    assert [entry.slot_id for entry in full.coverage_reason] == [other_id]
+
+    result = await summary.needs_you(db, team.id, provider="codex-cli")
+    assert not result.coverage_complete and not result.next_actor_coverage_complete
+    assert [(entry.code, entry.slot_id, entry.activity_reason) for entry in result.coverage_reason] == [
+        ("native_unknown", None, None)]
 
 
 @pytest.mark.asyncio
@@ -284,11 +498,14 @@ async def test_shared_time_limit_and_item_limit_keep_unknown_coverage(db, monkey
     assert reads.calls == [item_id]
     assert started == [item_id]
     assert cancelled == [item_id]
+    assert [(entry.code, entry.source, entry.work_item_id) for entry in result.coverage_reason] == [
+        ("observation_timeout", "progress", item_id)]
     summary, reads = service(monkeypatch, item_limit=1)
     result = await summary.summary(db, team_id)
     assert result.remaining_work.unfinished_items == 2
     assert result.remaining_work.state == "unknown"
     assert not result.coverage_complete and len(reads.calls) <= 1
+    assert "work_item_limit" in {entry.code for entry in result.coverage_reason}
 
 
 @pytest.mark.asyncio
@@ -303,6 +520,7 @@ async def test_changed_context_invalidates_the_complete_total(db, monkeypatch):
     result = await summary.summary(db, team.id)
     assert result.remaining_work.state == "unknown"
     assert not result.next_actor_coverage_complete
+    assert "source_changed" in {entry.code for entry in result.coverage_reason}
 
 
 @pytest.mark.asyncio
@@ -321,6 +539,7 @@ async def test_human_actions_preserve_pending_details_and_drop_private_fields(db
     # #1107: incomplete human-action coverage is reported as coverage, not as unknown remaining work. This team has no
     # unfinished items, so its remaining work is known and zero.
     assert result.coverage_complete is False
+    assert "human_actions_incomplete" in {entry.code for entry in result.coverage_reason}
     assert (result.remaining_work.state, result.remaining_work.unfinished_items) == ("known", 0)
     assert result.next_actors == ["operator"]
     assert "private-" not in result.model_dump_json()
@@ -652,6 +871,7 @@ async def test_an_expired_item_report_still_makes_remaining_work_unknown(db, mon
     summary, _ = service(monkeypatch, {items[0].id: progress(items[0].id, expired=True)})
     result = await summary.summary(db, team.id)
     assert (result.remaining_work.state, result.remaining_work.reason) == ("unknown", "observation_incomplete")
+    assert "window_expired" in {entry.code for entry in result.coverage_reason}
 
 
 @pytest.mark.asyncio
