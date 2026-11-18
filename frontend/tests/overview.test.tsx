@@ -1,4 +1,4 @@
-import { cleanup, screen, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { OverviewPage } from '../src/features/factory/pages/OverviewPage'
 import { resetFactoryReads } from '../src/features/factory/reads'
@@ -464,6 +464,67 @@ describe('Needs you filters', () => {
     await open('/?scope_id=8')
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not read what needs you')
     expect(screen.queryByText('Nothing needs you right now.')).not.toBeInTheDocument()
+  })
+
+  // A failed refresh keeps the earlier data and sets the error (reads.ts), so these start from a loaded read.
+  async function refresh() {
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Refresh' })) })
+    await settle()
+    await settle()
+  }
+  const empty = () => screen.queryByText('Nothing needs you right now.')
+
+  it('shows the alert, not the empty state, when a refresh fails after an empty filtered read', async () => {
+    let broken = false
+    serveFilters((id) => (broken ? jsonResponse({ detail: 'broken' }, 500) : jsonResponse(summary({ preset_id: id }))))
+    await open('/?scope_id=8')
+    expect(empty()).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    broken = true
+    await refresh()
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not read what needs you')
+    expect(empty()).not.toBeInTheDocument()
+  })
+
+  it('keeps the loaded rows and shows the alert when a refresh fails after a non-empty read', async () => {
+    let broken = false
+    serveFilters((id) => (broken ? jsonResponse({ detail: 'broken' }, 500)
+      : jsonResponse(id === 1 ? summary({ human_actions: [action(8, 47, 9)] }) : summary({ preset_id: 2 }))))
+    await open('/?scope_id=8')
+    expect(within(needsYouList()).getByRole('link', { name: /Open #47/ })).toBeInTheDocument()
+    broken = true
+    await refresh()
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not read what needs you')
+    expect(within(needsYouList()).getByRole('link', { name: /Open #47/ })).toBeInTheDocument()
+  })
+
+  it('removes the alert and restores the plain state when a later refresh succeeds', async () => {
+    let broken = false
+    serveFilters((id) => (broken ? jsonResponse({ detail: 'broken' }, 500) : jsonResponse(summary({ preset_id: id }))))
+    await open('/?scope_id=8')
+    broken = true
+    await refresh()
+    expect(await screen.findByRole('alert')).toBeInTheDocument()
+    broken = false
+    await refresh()
+    await settle()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(empty()).toBeInTheDocument()
+  })
+
+  it('removes the alert after recovery and still shows the rows of a non-empty read', async () => {
+    let broken = false
+    serveFilters((id) => (broken ? jsonResponse({ detail: 'broken' }, 500)
+      : jsonResponse(id === 1 ? summary({ human_actions: [action(8, 47, 9)] }) : summary({ preset_id: 2 }))))
+    await open('/?scope_id=8')
+    broken = true
+    await refresh()
+    expect(await screen.findByRole('alert')).toBeInTheDocument()
+    broken = false
+    await refresh()
+    await settle()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(within(needsYouList()).getByRole('link', { name: /Open #47/ })).toBeInTheDocument()
   })
 
   it('says it is checking, not that nothing needs you, while the filtered read is pending', async () => {

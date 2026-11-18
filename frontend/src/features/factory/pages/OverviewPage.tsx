@@ -52,7 +52,8 @@ export function OverviewPage() {
   const summariesLoading =
     presetList.data === null || needsReads.some((item) => item.data === null && item.error === null);
   // A failed read is not an empty list: say so instead of "Nothing needs you right now."
-  const needsFailed = needsFilter !== "" && needsStates.some((item) => item.data === null && item.error !== null);
+  // A failed refresh keeps the earlier data and sets the error, so the error alone decides.
+  const needsFailed = needsFilter !== "" && needsStates.some((item) => item.error !== null);
   return (
     <section className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
