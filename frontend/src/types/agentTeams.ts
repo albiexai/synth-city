@@ -117,6 +117,7 @@ export interface TeamSummaryHumanAction {
   source: 'leader' | 'dispatch' | 'unknown'
   assessment_current: boolean
   pull_request_number?: number | null
+  escalation_reason?: string | null
 }
 
 export interface RequiredCIUnreadableSignal {

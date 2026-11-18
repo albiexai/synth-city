@@ -18,18 +18,21 @@ from app.models.factory_schemas import (
     TeamRequiredCIUnreadable, TeamWaitingInput,
 )
 from app.services.github_coordination_service import hold_code
+from app.services.github_dispatch_service import ESCALATION_REASONS
 from app.services.github_operator_attention_service import github_operator_attention_service
 from app.services.github_work_progress_service import github_work_progress_service
 from app.services.agent_team_campaign_service import agent_team_campaign_service
 from app.services import required_ci_attention
 from app.services.agent_team_supervisor_service import observe_supervisor, supervisor_observation, team_needs_no_supervision
-from app.services.work_item_states import DONE_STATUSES
+from app.services.work_item_states import ATTENTION_STATUSES, DONE_STATUSES
 
 _ACTORS = ("owner", "leader", "operator", "controller", "reviewer")
 _KINDS = {"review_pr", "merge_pr", "inspect_attempt", "inspect_checkpoint", "milestone_acceptance",
           "pilot_decision", "scope_clarification", "provide_evidence"}
 _STATES = {"requested", "context_pending", "waiting_for_prerequisites", "historical", "resolved",
            "head_changed", "pr_unavailable", "pr_identity_unavailable"}
+_LEGACY_OBSERVATION_PAUSE_REASON = "owner_observation_pause"
+_INSPECTION_REASONS = ESCALATION_REASONS | {_LEGACY_OBSERVATION_PAUSE_REASON}
 
 
 def _utc(value):
@@ -142,7 +145,7 @@ class AgentTeamSummaryService:
             .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
             .where(TeamGithubScope.preset_id == preset_id, GithubOwnerObservationPause.status == "paused",
                    GithubWorkItem.dispatch_status == "escalated",
-                   GithubWorkItem.escalation_reason == "owner_observation_pause")
+                   GithubWorkItem.escalation_reason == _LEGACY_OBSERVATION_PAUSE_REASON)
             .order_by(GithubOwnerObservationPause.id).limit(65))).all())
 
     async def summary(self, db, preset_id, scope_id=None, provider=None):
@@ -228,19 +231,25 @@ class AgentTeamSummaryService:
             human = await bounded(lambda: self.attention.summary(db, preset_id))
             complete = complete and human["coverage_complete"]
             expires.append(_utc(human["observation_expires_at"]))
+            attempt_reasons = {
+                (item.scope_id, item.issue_number, item.id): item.escalation_reason
+                for item in items[:self.item_limit]
+                if item.dispatch_status in ATTENTION_STATUSES and item.escalation_reason in _INSPECTION_REASONS
+            }
             for action in human["actions"][:64]:
                 # Existing action data also contains private context and prose. Use a narrow allowlist.
                 kind, state = action.get("kind"), action.get("state")
                 if kind not in _KINDS or state not in _STATES:
                     complete = False
                     continue
-                if matcher is not None and not matcher.visible(action["scope_id"], action.get("work_item_id")):
+                scope, issue, work_item = action["scope_id"], action["issue_number"], action.get("work_item_id")
+                if matcher is not None and not matcher.visible(scope, work_item):
                     continue
-                human_actions.append(TeamSummaryHumanAction(scope_id=action["scope_id"],
-                    issue_number=action["issue_number"], work_item_id=action.get("work_item_id"),
+                human_actions.append(TeamSummaryHumanAction(scope_id=scope, issue_number=issue, work_item_id=work_item,
                     kind=kind, state=state, source=action.get("source") if action.get("source") in {
                         "leader", "dispatch"} else "unknown", assessment_current=action.get("assessment_current") is True,
-                    pull_request_number=action.get("pull_request_number")))
+                    pull_request_number=action.get("pull_request_number"),
+                    escalation_reason=attempt_reasons.get((scope, issue, work_item)) if kind == "inspect_attempt" else None))
                 if state != "resolved":
                     actors.add("operator")
             complete = complete and len(human["actions"]) <= 64

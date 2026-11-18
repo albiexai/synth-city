@@ -313,6 +313,7 @@ class TeamSummaryHumanAction(FactoryModel):
     source: Literal["leader", "dispatch", "unknown"]
     assessment_current: bool
     pull_request_number: PositiveId | None = None
+    escalation_reason: str | None = None
 
 
 class TeamRemainingWork(FactoryModel):

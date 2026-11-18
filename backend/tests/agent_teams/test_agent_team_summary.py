@@ -319,6 +319,37 @@ async def test_human_actions_preserve_pending_details_and_drop_private_fields(db
     assert "private-" not in result.model_dump_json()
 
 
+@pytest.mark.parametrize("status,reason,kind,expected", [
+    ("escalated", "leader_ack_timeout", "inspect_attempt", "leader_ack_timeout"),
+    ("failed", "retry_count_exhausted", "inspect_attempt", "retry_count_exhausted"),
+    ("escalated", "owner_observation_pause", "inspect_attempt", "owner_observation_pause"),
+    ("escalated", "private-arbitrary-reason", "inspect_attempt", None),
+    ("escalated", "leader_ack_timeout", "inspect_checkpoint", None),
+    ("dispatched", "leader_ack_timeout", "inspect_attempt", None),
+])
+@pytest.mark.asyncio
+async def test_human_action_exposes_only_a_known_attempt_reason(db, monkeypatch, status, reason, kind, expected):
+    team, scope, (item,) = await seed(db, (status,))
+    item.escalation_reason = reason
+    await db.commit()
+    action = {"scope_id": scope.id, "issue_number": item.issue_number, "work_item_id": item.id,
+              "kind": kind, "state": "context_pending", "source": "dispatch", "assessment_current": True,
+              "gate_reason": "private-action-gate"}
+
+    class PendingAction(Attention):
+        async def summary(self, db, preset_id):
+            result = await super().summary(db, preset_id)
+            result["actions"] = [action, {**action, "issue_number": item.issue_number + 1}]
+            return result
+
+    summary, _ = service(monkeypatch, attention=PendingAction())
+    result = await summary.summary(db, team.id)
+    assert result.human_actions[0].model_dump()["escalation_reason"] == expected
+    assert result.human_actions[1].model_dump()["escalation_reason"] is None
+    assert all(entry.state == "context_pending" for entry in result.human_actions)
+    assert "private-" not in result.model_dump_json()
+
+
 @pytest.mark.asyncio
 async def test_unknown_team_returns_none(db, monkeypatch):
     summary, _ = service(monkeypatch)

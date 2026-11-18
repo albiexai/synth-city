@@ -49,3 +49,30 @@ export const ACTION_TEXT: Record<TeamSummaryHumanAction['kind'], string> = {
   scope_clarification: 'Clarify the scope',
   provide_evidence: 'Provide evidence',
 }
+
+const escalationReasonLabels: Record<string, string> = {
+  plan_blocked: 'Plan blocked',
+  launch_outcome_unknown: 'Session launch outcome unknown',
+  approval_rounds_exhausted: 'Approval rounds exhausted',
+  leader_offline: 'Leader offline',
+  owner_offline: 'Owner offline',
+  brief_unread: 'Owner has not read the brief',
+  leader_ack_timeout: 'Leader acknowledgement timed out',
+  owner_idle_timeout: 'Owner idle timeout',
+  owner_observation_unavailable: 'Owner observation unavailable',
+  integration_update_conflict: 'Integration update needs coordination',
+  retry_count_exhausted: 'Verification retries exhausted',
+  continuation_revision_exhausted: 'Continuation revision exhausted',
+  continuation_budget_exhausted: 'Continuation budget exhausted',
+  continuation_invalid_state: 'Continuation state invalid',
+  continuation_pr_identity_invalid: 'Continuation PR identity invalid',
+  dispatch_label_removed: 'Dispatch label removed',
+  abandoned_by_operator: 'Abandoned by the Director',
+  prepared_owner_unavailable: 'Prepared owner unavailable',
+  pr_closed_unmerged: 'PR closed without merge',
+}
+
+export function escalationReasonLabel(reason?: string | null) {
+  if (!reason) return 'Unknown reason'
+  return escalationReasonLabels[reason] ?? reason.replaceAll('_', ' ')
+}
