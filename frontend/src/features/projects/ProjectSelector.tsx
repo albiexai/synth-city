@@ -11,13 +11,13 @@ import { useProjectContext } from '@/contexts/ProjectContext';
 const ADD_FOLDER = '__add_folder__';
 
 export function ProjectSelector() {
-  const { activeProject, knownFolders, setProjectPath, addProject } = useProjectContext();
+  const { activeProject, pageFolders, setProjectPath, addProject } = useProjectContext();
   const [adding, setAdding] = useState(false);
   const [path, setPath] = useState('');
   const [error, setError] = useState<string | null>(null);
 
-  const team = knownFolders.filter((folder) => folder.source === 'team');
-  const tracked = knownFolders.filter((folder) => folder.source === 'tracked');
+  const team = pageFolders.filter((folder) => folder.source === 'team');
+  const tracked = pageFolders.filter((folder) => folder.source === 'tracked');
 
   const onChange = (value: string) => {
     if (value === ADD_FOLDER) {
