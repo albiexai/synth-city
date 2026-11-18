@@ -120,8 +120,10 @@ class FrontendFiles(StaticFiles):
 
 async def database_busy_exception_handler(request, exc):
     """#1149: a lock that outlasts the busy timeout is retryable, so answer 503 instead of 500."""
-    message = str(getattr(exc, "orig", exc)).lower()
-    if "database is locked" in message or "database is busy" in message:
+    from app.services.sqlite_busy_retry import is_sqlite_busy
+
+    # Every busy or locked code, extended ones included (262, a shared-cache table lock), not only the message text.
+    if is_sqlite_busy(exc):
         logger.warning("database_busy path=%s", request.url.path)
         return JSONResponse({"detail": "database_busy"}, status_code=503, headers={"Retry-After": "1"})
     logger.error("Unhandled database error on %s", request.url.path, exc_info=exc)

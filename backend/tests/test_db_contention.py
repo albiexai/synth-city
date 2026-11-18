@@ -120,6 +120,66 @@ async def test_a_write_that_outlasts_the_busy_timeout_answers_503(tmp_path):
     assert OperationalError in product_app.exception_handlers
 
 
+def _handler_app(engine):
+    from app.main import install_database_busy_handler
+
+    sessions = async_sessionmaker(engine)
+
+    async def get_db():
+        async with sessions() as db:
+            yield db
+
+    app = FastAPI()
+    install_database_busy_handler(app)
+
+    @app.get("/read")
+    async def read(db=Depends(get_db)):
+        await db.execute(text("SELECT * FROM t"))
+        return {"ok": True}
+
+    @app.get("/missing")
+    async def missing(db=Depends(get_db)):
+        await db.execute(text("SELECT * FROM no_such_table"))
+        return {"ok": True}
+
+    return app
+
+
+@pytest.mark.asyncio
+async def test_a_shared_cache_table_lock_answers_503_too():
+    # V1 on #1163: SQLITE_LOCKED_SHAREDCACHE (262, "database table is locked") is a lock as well.
+    uri = "file:contention1149?mode=memory&cache=shared"
+    holder = sqlite3.connect(uri, uri=True, isolation_level=None, check_same_thread=False)
+    holder.execute("CREATE TABLE t (x INTEGER)")
+    holder.execute("BEGIN")
+    holder.execute("INSERT INTO t VALUES (1)")  # holds the table's write lock in the shared cache
+    engine = create_async_engine(f"sqlite+aiosqlite:///{uri}&uri=true")
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_handler_app(engine)),
+                                     base_url="http://test") as client:
+            response = await client.get("/read")
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == "1"
+        assert response.json() == {"detail": "database_busy"}
+    finally:
+        holder.execute("ROLLBACK")
+        await engine.dispose()
+        holder.close()
+
+
+@pytest.mark.asyncio
+async def test_a_database_error_that_is_not_a_lock_still_answers_500(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'plain.db'}")
+    try:
+        transport = httpx.ASGITransport(app=_handler_app(engine), raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/missing")
+        assert response.status_code == 500
+        assert response.text == "Internal Server Error"  # no SQL or path leaks into the body
+    finally:
+        await engine.dispose()
+
+
 def _source(path, rows=600):
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA journal_mode=WAL")
