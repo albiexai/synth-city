@@ -83,6 +83,14 @@ def hold_code() -> str | None:
     try:
         if configured_recovery_only_attempt() is not None:
             return "recovery_only"
+    except (OSError, ValueError):
+        return "hold_unavailable"
+    return external_hold_code()
+
+
+def external_hold_code() -> str | None:
+    """Read the external safety markers independently of recovery-only selection."""
+    try:
         for configured in settings.github_coordination_hold_paths:
             path = Path(configured).expanduser()
             if not path.is_absolute():

@@ -17,6 +17,7 @@ import httpx
 from app.config import settings
 from app.services.github_check_observation import observe_checks
 from app.services.github_offline import github_http_client
+from app.services.github_rate_limit_service import github_rate_limit_service
 
 _GITHUB_API = "https://api.github.com"
 _GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -58,9 +59,12 @@ class GithubClient:
         self._token = token if token is not None else settings.github_token
 
     def _client(self) -> httpx.AsyncClient:
-        if self._http is not None:
-            return self._http
-        return github_http_client(_GITHUB_API, settings)
+        client = self._http if self._http is not None else github_http_client(_GITHUB_API, settings)
+        github_rate_limit_service.install(client)
+        return client
+
+    def require_poll_available(self) -> None:
+        github_rate_limit_service.require_available(self._headers().get("Authorization"))
 
     def _headers(self, token: str | None = None) -> dict[str, str]:
         headers = {"Accept": "application/vnd.github+json"}

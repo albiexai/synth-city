@@ -1,6 +1,7 @@
 /**
  * TypeScript types for context window analysis
  */
+import type { HarnessReadScope } from './harnessScope'
 
 export interface ContextSnapshot {
   turn_number: number
@@ -101,4 +102,5 @@ export interface ActiveSessionContext {
 
 export interface ActiveSessionsResponse {
   sessions: ActiveSessionContext[]
+  scope?: HarnessReadScope | null
 }

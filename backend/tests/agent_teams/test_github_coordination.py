@@ -17,7 +17,7 @@ from app.models.database import (
 )
 from app.services.agent_mail_service import agent_mail_service
 from app.services.github_coordination_service import (
-    CoordinationError, github_coordination_service as service, hold_code,
+    CoordinationError, external_hold_code, github_coordination_service as service, hold_code,
 )
 from app.services.github_dispatch_service import github_dispatch_service
 
@@ -291,6 +291,19 @@ def test_unreadable_or_invalid_hold_configuration_fails_closed(monkeypatch, tmp_
     marker = tmp_path / "HOLD"; marker.symlink_to(tmp_path / "missing")
     monkeypatch.setattr(settings, "github_coordination_hold_paths", [str(marker)])
     assert hold_code() == "hold"
+
+
+def test_external_hold_is_observable_during_recovery_only_mode(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "github_recovery_only_attempt", f"1:2:3:{'a' * 16}:task")
+    monkeypatch.setattr(settings, "github_coordination_hold_paths", [])
+    assert external_hold_code() is None
+    monkeypatch.setattr(settings, "github_coordination_hold_paths", ["relative-marker"])
+    assert external_hold_code() == "hold_unavailable"
+    marker = tmp_path / "HOLD"
+    marker.touch()
+    monkeypatch.setattr(settings, "github_coordination_hold_paths", [str(marker)])
+    assert external_hold_code() == "hold"
+    assert hold_code() == "recovery_only"
 
 
 @pytest.mark.asyncio

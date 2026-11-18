@@ -226,7 +226,7 @@
               "block_code": "not_escalated",
               "name": "retry",
               "reason": "Only escalated work can be retried.",
-              "required_actor": "leader",
+              "required_actor": "operator",
               "state": "blocked"
             },
             {

@@ -48,6 +48,7 @@ from app.services.github_terminal_revision_service import (
     TerminalRevisionContextChanged, complete_current_revision, lock_terminal_transition,
 )
 from app.services.github_dispatch_service import github_dispatch_service, restored_escalation_reason
+from app.services.github_rate_limit_service import GithubRateLimited
 from app.services.github_recovery_gate import (
     GithubRecoveryOnlyAttempt,
     configured_recovery_only_attempt,
@@ -1199,6 +1200,9 @@ class GithubVerificationService:
                 await db.rollback()
                 await db.refresh(scope)
                 logger.info("Terminal attempt changed; no merge transition recorded")
+            except GithubRateLimited:
+                await db.rollback()
+                raise
             except GithubCheckObservationError as exc:
                 # Missing or ambiguous CI evidence must not consume a retry or
                 # diagnostic budget. Continue polling the other work items.
@@ -1212,9 +1216,10 @@ class GithubVerificationService:
                 logger.exception(
                     "GitHub verification failed for work item %s", item.id
                 )
-                self._set_failure_note(
-                    item, f"GitHub verification failed; will retry: {exc}"
-                )
+                note = f"GitHub verification failed; will retry: {exc}"
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (401, 403):
+                    note = f"GitHub authentication or permissions failed (HTTP {exc.response.status_code})."
+                self._set_failure_note(item, note)
                 item.updated_at = datetime.utcnow()
                 await db.commit()
 
@@ -1277,6 +1282,8 @@ class GithubVerificationService:
                     db, scope, item, client,
                     notify=recovery_only_attempt is None,
                 )
+            except GithubRateLimited:
+                raise
             except (httpx.HTTPError, GithubClientResponseError, ValueError):
                 # Observation failure is not another implementation failure.
                 logger.warning(
@@ -1772,6 +1779,8 @@ class GithubVerificationService:
                 await self._promote_settled_revision(db, scope, item, client, revision, pull)
         except TerminalRevisionContextChanged:
             raise  # the caller rolls back and records that the attempt changed
+        except GithubRateLimited:
+            raise
         except (httpx.HTTPError, GithubClientResponseError):
             # An unreadable or uninterpretable GitHub response is a failed read: nothing changes, nothing is logged.
             await db.rollback()
@@ -1837,6 +1846,8 @@ class GithubVerificationService:
             await db.rollback()
             await db.refresh(scope)
             logger.info("Terminal attempt changed; no promotion recorded")
+        except GithubRateLimited:
+            raise
         except (httpx.HTTPError, GithubClientResponseError):
             await db.rollback()
             await db.refresh(scope)
@@ -3091,6 +3102,8 @@ class GithubVerificationService:
         # Owner readiness and labels can change while checks are read.
         try:
             fresh_pull = await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
+        except GithubRateLimited:
+            raise
         except (httpx.HTTPError, GithubClientResponseError):
             await self._record_readiness_hold(
                 db, item, "PR readiness could not be read; automatic merge is blocked.")
@@ -3148,6 +3161,8 @@ class GithubVerificationService:
                 int(item.pr_number),
                 expected_head_sha=current_head,
             )
+        except GithubRateLimited:
+            raise
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code
             if status_code in _MERGE_TRANSIENT_STATUS_CODES or status_code >= 500:
@@ -3349,6 +3364,8 @@ class GithubVerificationService:
             return "Review hold label is invalid; automatic merge is blocked."
         try:
             issue = await client.get_issue(scope.repo_owner, scope.repo_name, item.issue_number)
+        except GithubRateLimited:
+            raise
         except (httpx.HTTPError, GithubClientResponseError):
             return unknown
         if not isinstance(issue, dict) or type(issue.get("number")) is not int or issue["number"] != item.issue_number:
