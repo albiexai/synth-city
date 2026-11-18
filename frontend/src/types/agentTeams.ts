@@ -463,6 +463,8 @@ export interface GithubScopeRevision {
   allowed_actions: string[]
   allowed_commands: string[]
   prohibited_actions: string[]
+  /** #1185: true only while the revision is active or submitted. */
+  prohibitions_in_force?: boolean
   tool_fallbacks: Record<string, unknown>
   baseline_head_sha: string
   baseline_tree_sha: string
