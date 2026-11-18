@@ -773,6 +773,9 @@
                   "enum": [
                     "candidate_limit",
                     "native_unknown",
+                    "stall_timeout",
+                    "inputs_changing",
+                    "fence_changed",
                     "ambiguous_legacy_request",
                     "reply_scan_limit",
                     "entry_limit"
@@ -960,6 +963,110 @@
             "code"
           ],
           "title": "TeamSummaryAttention",
+          "type": "object"
+        },
+        "TeamSummaryCoverageReason": {
+          "additionalProperties": false,
+          "properties": {
+            "activity_reason": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "restart_needed_for_observation",
+                    "no_native_event",
+                    "completion_unconfirmed",
+                    "session_identity_unavailable",
+                    "native_identity_unavailable",
+                    "native_log_unavailable",
+                    "native_log_unreadable",
+                    "binding_changed",
+                    "session_mismatch",
+                    "observation_unavailable",
+                    "history_window_exceeded",
+                    "no_current_binding",
+                    "ambiguous_binding",
+                    "duplicate_native_identity"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Activity Reason"
+            },
+            "code": {
+              "enum": [
+                "work_item_limit",
+                "scope_limit",
+                "approval_limit",
+                "native_unknown",
+                "dispatch_incomplete",
+                "pause_limit",
+                "human_actions_incomplete",
+                "human_action_invalid",
+                "human_action_limit",
+                "progress_missing",
+                "observation_timeout",
+                "observation_failed",
+                "fence_changed",
+                "source_changed",
+                "window_expired"
+              ],
+              "title": "Code",
+              "type": "string"
+            },
+            "slot_id": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Slot Id"
+            },
+            "source": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "native",
+                    "dispatch",
+                    "pauses",
+                    "human_actions",
+                    "progress"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Source"
+            },
+            "work_item_id": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Work Item Id"
+            }
+          },
+          "required": [
+            "code"
+          ],
+          "title": "TeamSummaryCoverageReason",
           "type": "object"
         },
         "TeamSummaryHumanAction": {
@@ -1190,6 +1297,9 @@
                   "enum": [
                     "candidate_limit",
                     "native_unknown",
+                    "stall_timeout",
+                    "inputs_changing",
+                    "fence_changed",
                     "ambiguous_legacy_request",
                     "reply_scan_limit",
                     "entry_limit"
@@ -1228,6 +1338,13 @@
         "coverage_complete": {
           "title": "Coverage Complete",
           "type": "boolean"
+        },
+        "coverage_reason": {
+          "items": {
+            "$ref": "#/$defs/TeamSummaryCoverageReason"
+          },
+          "title": "Coverage Reason",
+          "type": "array"
         },
         "description": {
           "anyOf": [

@@ -199,7 +199,7 @@ async def test_a_binding_that_changes_during_the_reads_is_not_a_stable_observati
 
     service._signatures = drifting
     view = await observe(db, team, states(people), service=service)
-    assert view.items == [] and view.reason == "native_unknown" and not view.complete
+    assert view.items == [] and view.reason == "fence_changed" and not view.complete
 
 
 # --- who and what counts ----------------------------------------------------------------------
@@ -494,7 +494,7 @@ async def test_a_slow_observation_times_out_into_an_incomplete_view(db):
 
     service._candidates = hang
     view = await observe(db, team, states(people), service=service)
-    assert view.items == [] and view.reason == "native_unknown" and not view.complete
+    assert view.items == [] and view.reason == "stall_timeout" and not view.complete
 
 
 def slow_phases(service, states_by_slot, native=0.0, mail=0.0):
@@ -522,7 +522,38 @@ async def test_native_and_mail_phases_share_one_deadline(db):
     service.deadline_seconds = 0.2
     slow_phases(service, states(people), native=0.15, mail=0.15)
     view = await service.projection(db, team.id)
-    assert view.items == [] and view.reason == "native_unknown" and not view.complete
+    assert view.items == [] and view.reason == "stall_timeout" and not view.complete
+
+
+@pytest.mark.asyncio
+async def test_three_busy_unaddressed_members_do_not_break_a_recipient_fence(db, monkeypatch):
+    from app.services import agent_activity_service as activity
+
+    team, people = await make_team(db, members=4)
+    recipient = people[3]
+    request = await add_request(db, people[0], recipient, age=THRESHOLD + 60)
+    await db.commit()
+    request_id = request.id
+    calls = 0
+
+    async def changing_inputs(db, preset_id, max_rows=None, identity=None):
+        nonlocal calls
+        calls += 1
+        if identity is not None:
+            identity.update({person.slot.id: (person.id, ()) for person in people})
+        return [(person.slot.id, calls if person is not recipient else 0) for person in people]
+
+    async def native(db, preset_id, *, input_fence, **kwargs):
+        input_fence.update({entry[0]: entry for entry in await changing_inputs(db, preset_id)})
+        return SimpleNamespace(slots=[SimpleNamespace(slot_id=person.slot.id,
+            state="idle" if person is recipient else "working") for person in people])
+
+    monkeypatch.setattr(activity, "_team_inputs", changing_inputs)
+    monkeypatch.setattr(activity, "observe_team", native)
+    view = await MailRequestStallService().projection(db, team.id)
+    assert calls >= 3
+    assert view.complete and view.reason is None
+    assert ids(view) == [request_id]
 
 
 @pytest.mark.asyncio
@@ -550,7 +581,7 @@ async def test_an_exhausted_budget_before_the_mail_phase_is_incomplete_and_leave
     service.deadline_seconds = 0.05
     slow_phases(service, states(people), native=0.3, mail=0.0)
     view = await service.projection(db, team.id)
-    assert view.items == [] and view.reason == "native_unknown" and not view.complete
+    assert view.items == [] and view.reason == "stall_timeout" and not view.complete
     assert not db.in_transaction()
 
 
@@ -562,7 +593,7 @@ async def test_an_absolute_deadline_that_has_already_passed_is_the_incomplete_vi
     past = asyncio.get_running_loop().time() - 1
     view = await MailRequestStallService().observe(
         db, team.id, now=datetime.now(timezone.utc), native_states=states(people), native_ok=True, deadline=past)
-    assert view.items == [] and view.reason == "native_unknown" and not view.complete
+    assert view.items == [] and view.reason == "stall_timeout" and not view.complete
 
 
 # --- native provenance: the idle evidence belongs to the current addressee and is revalidated (F2) ----
@@ -636,7 +667,7 @@ async def test_native_inputs_that_change_during_the_mail_reads_are_not_idle_evid
     service = MailRequestStallService()
     after_legacy_scan(monkeypatch, service, lambda: change_slot_session(db, people[1]))
     view = await service.projection(db, team.id)
-    assert view.items == [] and view.complete is False and view.reason == "native_unknown"
+    assert view.items == [] and view.complete is False and view.reason == "fence_changed"
 
 
 @pytest.mark.asyncio
@@ -651,7 +682,7 @@ async def test_the_summary_also_revalidates_the_native_inputs_after_the_mail_rea
     after_legacy_scan(monkeypatch, mail_request_stall_service, lambda: change_slot_session(db, people[1]))
     summary, _elapsed = await summary_for(db, monkeypatch, people, team)
     view = summary.supervisor_observation.unanswered_requests
-    assert view.items == [] and view.complete is False and view.reason == "native_unknown"
+    assert view.items == [] and view.complete is False and view.reason == "fence_changed"
     assert not [item for item in summary.attention if item.code == "unanswered_request"]
 
 
@@ -713,7 +744,7 @@ async def test_a_replacement_that_appears_during_the_mail_reads_is_caught_by_the
     service = MailRequestStallService()
     after_legacy_scan(monkeypatch, service, lambda: replace_member(db, team, people[1]))
     view = await observe(db, team, states(people), service=service)
-    assert request.id not in ids(view) and view.complete is False and view.reason == "native_unknown"
+    assert request.id not in ids(view) and view.complete is False and view.reason == "fence_changed"
 
 
 # --- one coherent, fresh and identity-bound native observation (F2, revision C2a) --------------------
@@ -823,7 +854,7 @@ async def test_a_newer_member_with_a_new_matching_session_after_the_names_read_i
     act_before_first_input_read(monkeypatch, gate, act)
     view = await service.projection(db, team.id)
     assert gate.fired == 1
-    assert view.items == [] and view.complete is False and view.reason == "native_unknown"
+    assert view.items == [] and view.complete is False and view.reason == "fence_changed"
 
 
 @pytest.mark.asyncio
@@ -840,11 +871,11 @@ async def test_a_new_session_of_the_same_member_after_the_names_read_is_not_old_
     act_before_first_input_read(monkeypatch, gate, act)
     view = await service.projection(db, team.id)
     assert gate.fired == 1
-    assert view.items == [] and view.complete is False and view.reason == "native_unknown"
+    assert view.items == [] and view.complete is False and view.reason == "fence_changed"
 
 
 @pytest.mark.asyncio
-async def test_an_input_change_committed_by_another_connection_before_the_final_read_is_native_unknown(db, monkeypatch):
+async def test_an_input_change_before_the_final_read_changes_the_fence(db, monkeypatch):
     team, people = await bound_fixture(db, monkeypatch, pid=19503)
     service = MailRequestStallService()
     gate = Gate()
@@ -853,7 +884,7 @@ async def test_an_input_change_committed_by_another_connection_before_the_final_
                                 lambda: asyncio.sleep(0, raw_update_launch_options(db, people[1].slot.id, "changed-1")))
     view = await service.projection(db, team.id)
     assert gate.fired == 1
-    assert view.items == [] and view.complete is False and view.reason == "native_unknown"
+    assert view.items == [] and view.complete is False and view.reason == "fence_changed"
 
 
 @pytest.mark.asyncio
@@ -876,7 +907,7 @@ async def test_a_change_between_the_builders_component_reads_discards_the_attemp
     monkeypatch.setattr(activity, "_inputs_from_rows", mid_read)
     view = await service.projection(db, team.id)
     assert len(calls) >= 2                      # the first attempt was discarded and read again
-    assert view.items == [] and view.complete is False and view.reason == "native_unknown"
+    assert view.items == [] and view.complete is False and view.reason == "fence_changed"
 
 
 @pytest.mark.asyncio
@@ -898,7 +929,7 @@ async def test_three_incoherent_attempts_fail_closed(db, monkeypatch):
     monkeypatch.setattr(activity, "_inputs_from_rows", always_changing)
     view = await service.projection(db, team.id)
     assert len(calls) == 3
-    assert view.items == [] and view.complete is False and view.reason == "native_unknown"
+    assert view.items == [] and view.complete is False and view.reason == "inputs_changing"
 
 
 @pytest.mark.asyncio
@@ -920,7 +951,7 @@ async def test_a_failed_early_projection_capture_is_untrusted_and_never_replaced
     monkeypatch.setattr(service, "_coherent_snapshot", failing)
     view = await service.projection(db, team.id)
     assert len(calls) == 1                       # no replacement baseline was ever taken
-    assert view.items == [] and view.complete is False and view.reason == "native_unknown"
+    assert view.items == [] and view.complete is False and view.reason == ("stall_timeout" if failure == "timeout" else "native_unknown")
 
 
 @pytest.mark.asyncio
@@ -1021,7 +1052,7 @@ async def test_a_member_replaced_between_the_summarys_native_await_and_the_stall
 
     summary, _elapsed = await summary_for(db, monkeypatch, people, team, attention=_HookedAttention(replace))
     view = summary.supervisor_observation.unanswered_requests
-    assert view.items == [] and view.complete is False and view.reason == "native_unknown"
+    assert view.items == [] and view.complete is False and view.reason == "fence_changed"
     assert not [item for item in summary.attention if item.code == "unanswered_request"]
 
 
@@ -1036,7 +1067,7 @@ async def test_a_session_replaced_between_the_summarys_native_await_and_the_stal
 
     summary, _elapsed = await summary_for(db, monkeypatch, people, team, attention=_HookedAttention(replace))
     view = summary.supervisor_observation.unanswered_requests
-    assert view.items == [] and view.complete is False and view.reason == "native_unknown"
+    assert view.items == [] and view.complete is False and view.reason == "fence_changed"
 
 
 @pytest.mark.asyncio
@@ -1069,7 +1100,7 @@ async def test_a_failed_early_summary_capture_is_untrusted_and_never_replaced(db
     view = summary.supervisor_observation.unanswered_requests
     assert seen == [None]                          # a FAILED capture is passed as None, not as omitted
     assert len(calls) == 1                         # no replacement baseline was ever taken
-    assert view.items == [] and view.complete is False and view.reason == "native_unknown"
+    assert view.items == [] and view.complete is False and view.reason == ("stall_timeout" if failure == "timeout" else "native_unknown")
     assert not [item for item in summary.attention if item.code == "unanswered_request"]
 
 
@@ -1078,6 +1109,7 @@ async def test_the_summary_passes_the_baseline_it_captured_before_the_native_awa
     from app.services.mail_request_stall_service import _UNSET, mail_request_stall_service
 
     team, people = await bound_fixture(db, monkeypatch, pid=19604)
+    slot_id = people[1].slot.id
     seen = []
     original = mail_request_stall_service.observe
 
@@ -1089,7 +1121,7 @@ async def test_the_summary_passes_the_baseline_it_captured_before_the_native_awa
     summary, _elapsed = await summary_for(db, monkeypatch, people, team)
     assert len(seen) == 1 and seen[0] is not _UNSET and seen[0] is not None
     inputs, identity = seen[0]
-    assert people[1].slot.id in identity
+    assert slot_id in identity
 
 
 @pytest.mark.asyncio
@@ -1663,8 +1695,29 @@ async def test_the_summary_keeps_the_five_second_stall_budget_inside_its_eight_s
     # The summary's own window is not exceeded, so it completes; the stall view is bounded by its own budget.
     assert summary.coverage_complete is True
     view = summary.supervisor_observation.unanswered_requests
-    assert view.items == [] and view.reason == "native_unknown" and view.complete is False
+    assert view.items == [] and view.reason == "stall_timeout" and view.complete is False
     assert not [item for item in summary.attention if item.code == "unanswered_request"]
+
+
+@pytest.mark.asyncio
+async def test_unrelated_summary_reads_do_not_spend_the_stall_budget(db, monkeypatch):
+    from app.services.mail_request_stall_service import mail_request_stall_service
+
+    class SlowHumanActions(_Attention):
+        async def summary(self, db, preset_id):
+            await asyncio.sleep(0.35)
+            return await super().summary(db, preset_id)
+
+    team, people = await make_team(db)
+    request = await add_request(db, people[0], people[1], age=THRESHOLD + 60)
+    await db.commit()
+    request_id = request.id
+    fake_native(monkeypatch, people, delay=0.01)
+    monkeypatch.setattr(mail_request_stall_service, "deadline_seconds", 0.3)
+    summary, _ = await summary_for(db, monkeypatch, people, team, attention=SlowHumanActions())
+    assert summary.coverage_complete
+    view = summary.supervisor_observation.unanswered_requests
+    assert view.complete and ids(view) == [request_id]
 
 
 @pytest.mark.asyncio
@@ -1680,7 +1733,7 @@ async def test_the_summary_native_await_itself_stops_at_the_stall_budget(db, mon
     assert elapsed < 1.0
     assert summary.coverage_complete is False
     view = summary.supervisor_observation.unanswered_requests
-    assert view.items == [] and view.reason == "native_unknown" and view.complete is False
+    assert view.items == [] and view.reason == "stall_timeout" and view.complete is False
 
 
 @pytest.mark.asyncio
@@ -1694,7 +1747,7 @@ async def test_an_earlier_summary_deadline_caps_the_stall_observation(db, monkey
     summary, elapsed = await summary_for(db, monkeypatch, people, team, observation_seconds=0.5)
     assert elapsed < 1.5
     view = summary.supervisor_observation.unanswered_requests
-    assert view.items == [] and view.complete is False and view.reason == "native_unknown"
+    assert view.items == [] and view.complete is False and view.reason == "stall_timeout"
 
 
 @pytest_asyncio.fixture

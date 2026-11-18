@@ -1951,7 +1951,8 @@ class TeamIdleItem(BaseModel):
 
 
 UnansweredRequestReason = Literal[
-    "candidate_limit", "native_unknown", "ambiguous_legacy_request", "reply_scan_limit", "entry_limit"]
+    "candidate_limit", "native_unknown", "stall_timeout", "inputs_changing", "fence_changed",
+    "ambiguous_legacy_request", "reply_scan_limit", "entry_limit"]
 
 
 class UnansweredRequestItem(BaseModel):

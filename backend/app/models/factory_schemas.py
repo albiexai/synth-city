@@ -4,7 +4,9 @@ from typing import Annotated, Literal
 
 from pydantic import AfterValidator, ConfigDict, Field, model_validator
 from app.models.api_model import ApiModel as BaseModel
-from app.models.schemas import AgentStatus, RequiredCIUnreadableSignal, SupervisorObservation, wait_label_from_reason
+from app.models.schemas import (
+    AgentStatus, RequiredCIUnreadableSignal, SupervisorObservation, UnansweredRequestReason, wait_label_from_reason,
+)
 
 
 def _utc(value: datetime) -> datetime:
@@ -297,8 +299,7 @@ class TeamSummaryAttention(FactoryModel):
     requester: str | None = Field(default=None, max_length=80)
     recipient: str | None = Field(default=None, max_length=80)
     unanswered_seconds: int | None = Field(default=None, ge=0)
-    coverage_reason: Literal["candidate_limit", "native_unknown", "ambiguous_legacy_request",
-                             "reply_scan_limit", "entry_limit"] | None = None
+    coverage_reason: UnansweredRequestReason | None = None
     omitted_count: int | None = Field(default=None, ge=0)
 
 
@@ -391,6 +392,27 @@ class TeamWaitingInput(FactoryModel):
     _label_follows_reason = model_validator(mode="before")(classmethod(lambda cls, values: wait_label_from_reason(values)))
 
 
+TeamSummaryActivityReason = Literal[
+    "restart_needed_for_observation", "no_native_event", "completion_unconfirmed",
+    "session_identity_unavailable", "native_identity_unavailable", "native_log_unavailable", "native_log_unreadable",
+    "binding_changed", "session_mismatch", "observation_unavailable", "history_window_exceeded",
+    "no_current_binding", "ambiguous_binding", "duplicate_native_identity",
+]
+
+
+class TeamSummaryCoverageReason(FactoryModel):
+    code: Literal[
+        "work_item_limit", "scope_limit", "approval_limit", "native_unknown", "dispatch_incomplete",
+        "pause_limit", "human_actions_incomplete", "human_action_invalid", "human_action_limit",
+        "progress_missing", "observation_timeout", "observation_failed", "fence_changed",
+        "source_changed", "window_expired",
+    ]
+    source: Literal["native", "dispatch", "pauses", "human_actions", "progress"] | None = None
+    slot_id: PositiveId | None = None
+    work_item_id: PositiveId | None = None
+    activity_reason: TeamSummaryActivityReason | None = None
+
+
 class AgentTeamSummaryResponse(FactoryModel):
     preset_id: PositiveId
     description: str | None
@@ -401,6 +423,7 @@ class AgentTeamSummaryResponse(FactoryModel):
     checked_at: Timestamp
     valid_until: Timestamp
     coverage_complete: bool
+    coverage_reason: list[TeamSummaryCoverageReason] = Field(default_factory=list)
     hold_code: Literal["hold", "recovery_only", "hold_unavailable"] | None
     attention: list[TeamSummaryAttention]
     required_ci_unreadable: list[TeamRequiredCIUnreadable] = Field(default_factory=list)

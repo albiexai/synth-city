@@ -109,7 +109,76 @@ async def test_empty_team_has_zero_effort_and_no_actor(db, monkeypatch):
     assert result.remaining_work.state == "known"
     assert result.remaining_work.effort_low_minutes == result.remaining_work.effort_high_minutes == 0
     assert result.next_actors == [] and result.next_actor_coverage_complete
+    assert result.coverage_complete and result.coverage_reason == []
     assert reads.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason,expected", [
+    ("restart_needed_for_observation", "restart_needed_for_observation"),
+    ("no_native_event", "no_native_event"),
+    ("completion_unconfirmed", "completion_unconfirmed"),
+    ("private-native-debug-value", None),
+])
+async def test_summary_reports_public_native_reason_without_private_identity(db, monkeypatch, reason, expected):
+    from types import SimpleNamespace
+
+    team, _, items = await seed(db)
+    slot_id = items[0].owner_slot_id
+
+    async def native(db, preset_id, **kwargs):
+        inputs = await activity._team_inputs(db, preset_id, 256)
+        kwargs["input_fence"].update({entry[0]: entry for entry in inputs})
+        return SimpleNamespace(slots=[SimpleNamespace(slot_id=slot_id, state="unknown", reason=reason,
+            waiting_input=None)], valid_until=datetime.now(timezone.utc) + timedelta(seconds=60))
+
+    from app.services import agent_activity_service as activity
+    monkeypatch.setattr(activity, "observe_team", native)
+    summary, _ = service(monkeypatch)
+    result = await summary.summary(db, team.id)
+    assert not result.coverage_complete
+    assert [(entry.code, entry.slot_id, entry.activity_reason) for entry in result.coverage_reason] == [
+        ("native_unknown", slot_id, expected)]
+    assert result.remaining_work.state == "known"
+    assert "private-launch-option" not in result.model_dump_json()
+    assert "private-native-debug-value" not in result.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_summary_reports_missing_progress_and_dispatch_coverage(db, monkeypatch):
+    class Incomplete(Attention):
+        async def dispatch_snapshot(self, db, scopes):
+            return {"complete": False, "actions": []}
+
+    team, _, items = await seed(db)
+    summary, _ = service(monkeypatch, {items[0].id: None}, attention=Incomplete())
+    result = await summary.summary(db, team.id)
+    assert not result.coverage_complete
+    assert ("dispatch_incomplete", None) in [(entry.code, entry.work_item_id) for entry in result.coverage_reason]
+    assert ("progress_missing", items[0].id) in [(entry.code, entry.work_item_id) for entry in result.coverage_reason]
+
+
+@pytest.mark.asyncio
+async def test_fresh_guard_allows_one_prompt_label_write(db, monkeypatch):
+    from types import SimpleNamespace
+
+    team, _, _ = await seed(db, ())
+    summary, _ = service(monkeypatch)
+
+    async def native(db, preset_id, *, input_fence, **kwargs):
+        from app.services.agent_activity_service import _team_inputs
+
+        input_fence.update({entry[0]: entry for entry in await _team_inputs(db, preset_id, 256)})
+        return SimpleNamespace(slots=[], valid_until=datetime.now(timezone.utc) + timedelta(seconds=60))
+
+    monkeypatch.setattr("app.services.agent_activity_service.observe_team", native)
+    guard = await summary.summary(db, team.id)
+    labels = {"synth-city-v43-review-hold"}
+    attempted_at = guard.checked_at + timedelta(seconds=16)
+    if guard.coverage_complete and attempted_at < guard.valid_until and guard.hold_code is None:
+        labels.remove("synth-city-v43-review-hold")
+    assert labels == set()
+    assert guard.coverage_reason == []
 
 
 @pytest.mark.asyncio
@@ -284,11 +353,14 @@ async def test_shared_time_limit_and_item_limit_keep_unknown_coverage(db, monkey
     assert reads.calls == [item_id]
     assert started == [item_id]
     assert cancelled == [item_id]
+    assert [(entry.code, entry.source, entry.work_item_id) for entry in result.coverage_reason] == [
+        ("observation_timeout", "progress", item_id)]
     summary, reads = service(monkeypatch, item_limit=1)
     result = await summary.summary(db, team_id)
     assert result.remaining_work.unfinished_items == 2
     assert result.remaining_work.state == "unknown"
     assert not result.coverage_complete and len(reads.calls) <= 1
+    assert "work_item_limit" in {entry.code for entry in result.coverage_reason}
 
 
 @pytest.mark.asyncio
@@ -303,6 +375,7 @@ async def test_changed_context_invalidates_the_complete_total(db, monkeypatch):
     result = await summary.summary(db, team.id)
     assert result.remaining_work.state == "unknown"
     assert not result.next_actor_coverage_complete
+    assert "source_changed" in {entry.code for entry in result.coverage_reason}
 
 
 @pytest.mark.asyncio
@@ -321,6 +394,7 @@ async def test_human_actions_preserve_pending_details_and_drop_private_fields(db
     # #1107: incomplete human-action coverage is reported as coverage, not as unknown remaining work. This team has no
     # unfinished items, so its remaining work is known and zero.
     assert result.coverage_complete is False
+    assert "human_actions_incomplete" in {entry.code for entry in result.coverage_reason}
     assert (result.remaining_work.state, result.remaining_work.unfinished_items) == ("known", 0)
     assert result.next_actors == ["operator"]
     assert "private-" not in result.model_dump_json()
@@ -652,6 +726,7 @@ async def test_an_expired_item_report_still_makes_remaining_work_unknown(db, mon
     summary, _ = service(monkeypatch, {items[0].id: progress(items[0].id, expired=True)})
     result = await summary.summary(db, team.id)
     assert (result.remaining_work.state, result.remaining_work.reason) == ("unknown", "observation_incomplete")
+    assert "window_expired" in {entry.code for entry in result.coverage_reason}
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,7 @@ import { formatServerTime } from '@/lib/serverTime'
 import type {
   AgentTeamPresetListResponse, AgentTeamSummary, TeamRemainingWork,
 } from '@/types/agentTeams'
-import { ACTION_TEXT, ATTENTION_TEXT, incompleteRequestText, unansweredRequestText } from './summaryText'
+import { ACTION_TEXT, ATTENTION_TEXT, incompleteRequestText, teamCoverageReasonText, unansweredRequestText } from './summaryText'
 import { blockedText, waitingText } from './supervisorText'
 import { parseReminders, reminderAge } from './reminderText'
 import { SupervisorStatus } from './SupervisorStatus'
@@ -216,7 +216,18 @@ export function TeamSummaryCard({ presetId, name, running, showChecked = true, c
               </Row>
             )}
           </dl>
-          {(!summary.coverage_complete || !summary.next_actor_coverage_complete || summary.reminder_attention_complete === false) && (
+          {!!summary.coverage_reason?.length ? (
+            <div role="note" className="text-xs text-muted-foreground">
+              <p>Some team observations are incomplete.</p>
+              <ul className="list-disc pl-4">
+                {summary.coverage_reason.map((reason, index) => (
+                  <li key={`${reason.code}-${reason.slot_id ?? reason.work_item_id ?? index}`}>
+                    {teamCoverageReasonText(reason, slotNames)}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : (!summary.coverage_complete || !summary.next_actor_coverage_complete || summary.reminder_attention_complete === false) && (
             <p role="note" className="text-xs text-muted-foreground">
               This summary may be incomplete: Synth City did not read every item.
             </p>
