@@ -1496,7 +1496,8 @@ def synth_city_list_work_items(status: str = "escalated", limit: int = 100) -> d
                 "work_item_id": item.get("id"),
                 "issue_number": item.get("issue_number"),
                 "dispatch_status": item.get("dispatch_status"),
-                "dispatch_generation": item.get("dispatch_generation"),
+                **({"dispatch_generation": item["dispatch_generation"]}
+                   if item.get("dispatch_generation") is not None else {}),
                 "escalation_reason": item.get("escalation_reason"),
                 "status_note": item.get("status_note"),
                 "ack_approval_round": item.get("ack_approval_round"),

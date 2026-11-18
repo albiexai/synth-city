@@ -1,10 +1,11 @@
 """One actor across the progress, retry, and operator attention reads (#1131)."""
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from app.config import settings
 from app.models.database import GithubApprovalRequest, GithubAttemptScopeRevision
+from app.services.agent_team_summary_service import AgentTeamSummaryService
 from app.services.factory_projection_service import utc_now, work_projections
 from app.services.github_coordination_service import hold_code
 from app.services.github_operator_attention_service import GithubOperatorAttentionService
@@ -19,6 +20,46 @@ async def read_surfaces(db, item, scope, preset):
     attention = await GithubOperatorAttentionService().dispatch_snapshot(db, [scope])
     return (progress.phase, progress.next_actor, projection.waiting.actor, retry.required_actor,
             retry.state, [action["kind"] for action in attention["actions"]])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pr_number,retry_state", [(None, "eligible"), (42, "blocked")])
+async def test_ordinary_plan_blocked_items_show_the_leader_with_or_without_a_pr(db, pr_number, retry_state):
+    item, scope, preset, _ = await seed(db)
+    item.dispatch_status = "escalated"
+    item.escalation_reason = "plan_blocked"
+    item.pr_number = pr_number
+    await db.commit()
+    assert await read_surfaces(db, item, scope, preset) == (
+        "intervention", "leader", "leader", "leader", retry_state, [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["historical", "context_pending"])
+async def test_an_inspection_record_does_not_choose_the_stopped_actor(db, state):
+    item, scope, preset, _ = await seed(db)
+    item.dispatch_status = "escalated"
+    item.escalation_reason = "plan_blocked"
+    item.pr_number = None
+    await db.commit()
+    record = {"kind": "inspect_attempt", "state": state, "source": "leader",
+              "assessment_current": state != "historical", "work_item_id": item.id, "scope_id": scope.id,
+              "issue_number": item.issue_number}
+
+    class Attention(GithubOperatorAttentionService):
+        records = []
+
+        async def summary(self, db, preset_id):
+            return {"actions": self.records, "coverage_complete": True,
+                    "observation_expires_at": datetime.now(timezone.utc) + timedelta(minutes=1)}
+
+    attention = Attention()
+    service = AgentTeamSummaryService(progress=GithubWorkProgressService(Observer(), Client()), attention=attention)
+    without_record = await service.summary(db, preset.id)
+    attention.records = [record]
+    with_record = await service.summary(db, preset.id)
+    assert without_record.next_actors == with_record.next_actors == ["leader"]
+    assert [row.state for row in with_record.human_actions] == [state]
 
 
 @pytest.mark.asyncio

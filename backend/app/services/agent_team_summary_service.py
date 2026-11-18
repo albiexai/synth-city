@@ -249,6 +249,8 @@ class AgentTeamSummaryService:
                 if code and (matcher is None or matcher.visible(action["scope_id"], action.get("work_item_id"))):
                     attention.append(TeamSummaryAttention(code=code, work_item_id=action.get("work_item_id"),
                         scope_id=action["scope_id"], issue_number=action["issue_number"]))
+                    if kind in {"inspect_attempt", "inspect_checkpoint"}:
+                        actors.add("operator")
             pauses = await bounded(lambda: self._pauses(db, preset_id))
             complete = complete and len(pauses) <= 64
             for pause in pauses[:64]:
@@ -312,6 +314,8 @@ class AgentTeamSummaryService:
             if db.in_transaction():
                 await db.rollback()
         human_actions = []
+        stopped_items = {(item.scope_id, item.issue_number) for item in items[:self.item_limit]
+                         if item.dispatch_status in ATTENTION_STATUSES}
         for action in visible_actions:
             # Existing action data also contains private context and prose. Use a narrow allowlist.
             kind, state = action["kind"], action["state"]
@@ -326,7 +330,9 @@ class AgentTeamSummaryService:
                 kind=kind, state=state, source=action.get("source") if action.get("source") in {"leader", "dispatch"}
                 else "unknown", assessment_current=assessment_current,
                 pull_request_number=action.get("pull_request_number"), escalation_reason=reason))
-            if state != "resolved":
+            stopped_inspection = (kind in {"inspect_attempt", "inspect_checkpoint"}
+                                  and (action_scope_id, issue_number) in stopped_items)
+            if state not in {"resolved", "historical"} and not stopped_inspection:
                 actors.add("operator")
         changed = final != initial or hold_code() != hold
         now = datetime.now(timezone.utc)
@@ -430,8 +436,16 @@ class AgentTeamSummaryService:
         def relevant(row):
             return (row.work_item_id or bindings.get((row.scope_id, row.issue_number))) in (None, work_item_id)
 
-        return result.model_copy(update={"attention": [row for row in result.attention if relevant(row)],
-                                         "human_actions": [row for row in result.human_actions if relevant(row)]})
+        updates = {"attention": [row for row in result.attention if relevant(row)],
+                   "human_actions": [row for row in result.human_actions if relevant(row)]}
+        # Binding an issue to a work item may await after the team observation. Preserve its timestamp
+        # and fail closed if the coverage expired or the hold changed while the bindings were read.
+        current_hold = hold_code()
+        if current_hold != result.hold_code or _utc(result.valid_until) <= datetime.now(timezone.utc):
+            updates.update(coverage_complete=False, next_actor_coverage_complete=False, waiting_input=None)
+            if current_hold is not None:
+                updates["hold_code"] = current_hold
+        return result.model_copy(update=updates)
 
     async def needs_you(self, db, preset_id, *, scope_id=None, provider=None):
         """The summary narrowed to a repository and an assigned harness (#1141, #1142).

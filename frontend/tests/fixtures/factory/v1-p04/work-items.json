@@ -9,12 +9,12 @@
     },
     "response": {
       "counts": {
-        "active": 27,
+        "active": 24,
         "attention": 0,
         "finished": 0,
         "queued": 0,
         "review": 0,
-        "total": 27,
+        "total": 24,
         "unknown": 0
       },
       "filters": {
@@ -72,8 +72,8 @@
             }
           ],
           "approver": {
-            "member_id": 1,
-            "slot_id": 1,
+            "member_id": 3,
+            "slot_id": 3,
             "source": "explicit_assignment"
           },
           "approver_session": {
@@ -102,11 +102,11 @@
             "checks_unavailable_since": null,
             "created_at": "2026-09-30T12:00:00Z",
             "diagnostic_retry_count": 0,
-            "dispatch_status": "dispatched",
+            "dispatch_status": "verifying",
             "github_updated_at": "2026-09-30T12:00:00Z",
-            "id": 132,
-            "issue_number": 132,
-            "issue_title": "Fixture issue 132",
+            "id": 124,
+            "issue_number": 124,
+            "issue_title": "Fixture issue 124",
             "issue_type": "code",
             "last_verified_sha": null,
             "pending_approval_kind": null,
@@ -114,46 +114,46 @@
             "pr_number": null,
             "required_ci_unreadable": null,
             "retry_count": 0,
-            "scope_id": 3,
+            "scope_id": 2,
             "updated_at": "2026-09-30T12:00:00Z"
           },
           "links": {
             "bridge_target": {
-              "member_id": 2,
-              "session_id": 2,
-              "slot_id": 2,
-              "team_id": 1
+              "member_id": 4,
+              "session_id": 4,
+              "slot_id": 4,
+              "team_id": 2
             },
             "launch_plan": {
-              "slot_id": 1,
-              "team_id": 1
+              "slot_id": 3,
+              "team_id": 2
             },
             "mail": {
-              "member_id": 2,
-              "slot_id": 2,
-              "team_id": 1
+              "member_id": 4,
+              "slot_id": 4,
+              "team_id": 2
             }
           },
           "owner": {
             "configured_provider": "codex-cli",
-            "member_id": 2,
+            "member_id": 4,
             "name": "Owner",
             "provider_label": "Codex",
-            "slot_id": 2
+            "slot_id": 4
           },
           "policy": {
-            "continuation_enabled": false,
+            "continuation_enabled": true,
             "max_approval_rounds": 3,
             "max_verification_retries": 2,
             "merge_policy": "human"
           },
           "repository": {
-            "display_name": "fixture/paused",
+            "display_name": "fixture/shared",
             "github": {
-              "name": "paused",
+              "name": "shared",
               "owner": "fixture"
             },
-            "scope_id": 3
+            "scope_id": 2
           },
           "session": {
             "agent_status": {
@@ -168,29 +168,29 @@
               "wake_state": "cannot_wake"
             },
             "bridge_target": {
-              "member_id": 2,
-              "session_id": 2,
-              "slot_id": 2,
-              "team_id": 1
+              "member_id": 4,
+              "session_id": 4,
+              "slot_id": 4,
+              "team_id": 2
             },
             "observed_provider": "codex-cli",
             "state": "bound"
           },
           "team": {
-            "id": 1,
-            "name": "Fixture team 1"
+            "id": 2,
+            "name": "Fixture team 2"
           },
           "waiting": {
-            "actor": "owner",
-            "reason_code": "owner_ack_required",
-            "summary": "Waiting for the assigned owner to acknowledge the plan."
+            "actor": "unknown",
+            "reason_code": "checks_running",
+            "summary": "Checks are being verified."
           },
           "workspace": null
         }
       ],
-      "next_cursor": "eyJmaWx0ZXJzIjp7ImNhdGVnb3J5IjoiYWN0aXZlIiwicHJvdmlkZXIiOm51bGwsInNjb3BlX2lkIjpudWxsLCJ0ZWFtX2lkIjpudWxsfSwiaWQiOjEzMiwia2luZCI6IndvcmsiLCJ1cGRhdGVkX2F0IjoiMjAyNi0wOS0zMFQxMjowMDowMCswMDowMCIsInYiOjF9",
+      "next_cursor": "eyJmaWx0ZXJzIjp7ImNhdGVnb3J5IjoiYWN0aXZlIiwicHJvdmlkZXIiOm51bGwsInNjb3BlX2lkIjpudWxsLCJ0ZWFtX2lkIjpudWxsfSwiaWQiOjEyNCwia2luZCI6IndvcmsiLCJ1cGRhdGVkX2F0IjoiMjAyNi0wOS0zMFQxMjowMDowMCswMDowMCIsInYiOjF9",
       "schema_version": 1,
-      "total": 27
+      "total": 24
     }
   },
   "attention": {
@@ -204,11 +204,11 @@
     "response": {
       "counts": {
         "active": 0,
-        "attention": 26,
+        "attention": 24,
         "finished": 0,
         "queued": 0,
         "review": 0,
-        "total": 26,
+        "total": 24,
         "unknown": 0
       },
       "filters": {
@@ -266,8 +266,8 @@
             }
           ],
           "approver": {
-            "member_id": 1,
-            "slot_id": 1,
+            "member_id": 3,
+            "slot_id": 3,
             "source": "explicit_assignment"
           },
           "approver_session": {
@@ -298,9 +298,9 @@
             "diagnostic_retry_count": 0,
             "dispatch_status": "failed",
             "github_updated_at": "2026-09-30T12:00:00Z",
-            "id": 127,
-            "issue_number": 127,
-            "issue_title": "Fixture issue 127",
+            "id": 128,
+            "issue_number": 128,
+            "issue_title": "Fixture issue 128",
             "issue_type": "code",
             "last_verified_sha": null,
             "pending_approval_kind": null,
@@ -308,18 +308,33 @@
             "pr_number": null,
             "required_ci_unreadable": null,
             "retry_count": 0,
-            "scope_id": 1,
+            "scope_id": 2,
             "updated_at": "2026-09-30T12:00:00Z"
           },
           "links": {
-            "bridge_target": null,
-            "launch_plan": {
-              "slot_id": 1,
-              "team_id": 1
+            "bridge_target": {
+              "member_id": 4,
+              "session_id": 4,
+              "slot_id": 4,
+              "team_id": 2
             },
-            "mail": null
+            "launch_plan": {
+              "slot_id": 3,
+              "team_id": 2
+            },
+            "mail": {
+              "member_id": 4,
+              "slot_id": 4,
+              "team_id": 2
+            }
           },
-          "owner": null,
+          "owner": {
+            "configured_provider": "codex-cli",
+            "member_id": 4,
+            "name": "Owner",
+            "provider_label": "Codex",
+            "slot_id": 4
+          },
           "policy": {
             "continuation_enabled": true,
             "max_approval_rounds": 3,
@@ -332,17 +347,32 @@
               "name": "shared",
               "owner": "fixture"
             },
-            "scope_id": 1
+            "scope_id": 2
           },
           "session": {
-            "agent_status": null,
-            "bridge_target": null,
-            "observed_provider": null,
-            "state": "unknown"
+            "agent_status": {
+              "activity_reason": "no_current_binding",
+              "activity_state": "unknown",
+              "checked_at": "2026-09-30T12:00:00Z",
+              "idle_since": null,
+              "session_state": "online",
+              "valid_until": "2026-09-30T12:00:15Z",
+              "waiting_input": null,
+              "wake_reason": "wake_target_unbound",
+              "wake_state": "cannot_wake"
+            },
+            "bridge_target": {
+              "member_id": 4,
+              "session_id": 4,
+              "slot_id": 4,
+              "team_id": 2
+            },
+            "observed_provider": "codex-cli",
+            "state": "bound"
           },
           "team": {
-            "id": 1,
-            "name": "Fixture team 1"
+            "id": 2,
+            "name": "Fixture team 2"
           },
           "waiting": {
             "actor": "operator",
@@ -352,9 +382,9 @@
           "workspace": null
         }
       ],
-      "next_cursor": "eyJmaWx0ZXJzIjp7ImNhdGVnb3J5IjoiYXR0ZW50aW9uIiwicHJvdmlkZXIiOm51bGwsInNjb3BlX2lkIjpudWxsLCJ0ZWFtX2lkIjpudWxsfSwiaWQiOjEyNywia2luZCI6IndvcmsiLCJ1cGRhdGVkX2F0IjoiMjAyNi0wOS0zMFQxMjowMDowMCswMDowMCIsInYiOjF9",
+      "next_cursor": "eyJmaWx0ZXJzIjp7ImNhdGVnb3J5IjoiYXR0ZW50aW9uIiwicHJvdmlkZXIiOm51bGwsInNjb3BlX2lkIjpudWxsLCJ0ZWFtX2lkIjpudWxsfSwiaWQiOjEyOCwia2luZCI6IndvcmsiLCJ1cGRhdGVkX2F0IjoiMjAyNi0wOS0zMFQxMjowMDowMCswMDowMCIsInYiOjF9",
       "schema_version": 1,
-      "total": 26
+      "total": 24
     }
   },
   "empty": {
@@ -401,10 +431,10 @@
       "counts": {
         "active": 0,
         "attention": 0,
-        "finished": 26,
+        "finished": 36,
         "queued": 0,
         "review": 0,
-        "total": 26,
+        "total": 36,
         "unknown": 0
       },
       "filters": {
@@ -492,357 +522,7 @@
             "checks_unavailable_since": null,
             "created_at": "2026-09-30T12:00:00Z",
             "diagnostic_retry_count": 0,
-            "dispatch_status": "completed",
-            "github_updated_at": "2026-09-30T12:00:00Z",
-            "id": 129,
-            "issue_number": 129,
-            "issue_title": "Fixture issue 129",
-            "issue_type": "code",
-            "last_verified_sha": null,
-            "pending_approval_kind": null,
-            "pending_approval_status": null,
-            "pr_number": null,
-            "required_ci_unreadable": null,
-            "retry_count": 0,
-            "scope_id": 1,
-            "updated_at": "2026-09-30T12:00:00Z"
-          },
-          "links": {
-            "bridge_target": {
-              "member_id": 2,
-              "session_id": 2,
-              "slot_id": 2,
-              "team_id": 1
-            },
-            "launch_plan": {
-              "slot_id": 1,
-              "team_id": 1
-            },
-            "mail": {
-              "member_id": 2,
-              "slot_id": 2,
-              "team_id": 1
-            }
-          },
-          "owner": {
-            "configured_provider": "codex-cli",
-            "member_id": 2,
-            "name": "Owner",
-            "provider_label": "Codex",
-            "slot_id": 2
-          },
-          "policy": {
-            "continuation_enabled": true,
-            "max_approval_rounds": 3,
-            "max_verification_retries": 2,
-            "merge_policy": "human"
-          },
-          "repository": {
-            "display_name": "fixture/shared",
-            "github": {
-              "name": "shared",
-              "owner": "fixture"
-            },
-            "scope_id": 1
-          },
-          "session": {
-            "agent_status": {
-              "activity_reason": "no_current_binding",
-              "activity_state": "unknown",
-              "checked_at": "2026-09-30T12:00:00Z",
-              "idle_since": null,
-              "session_state": "online",
-              "valid_until": "2026-09-30T12:00:15Z",
-              "waiting_input": null,
-              "wake_reason": "wake_target_unbound",
-              "wake_state": "cannot_wake"
-            },
-            "bridge_target": {
-              "member_id": 2,
-              "session_id": 2,
-              "slot_id": 2,
-              "team_id": 1
-            },
-            "observed_provider": "codex-cli",
-            "state": "bound"
-          },
-          "team": {
-            "id": 1,
-            "name": "Fixture team 1"
-          },
-          "waiting": null,
-          "workspace": null
-        }
-      ],
-      "next_cursor": "eyJmaWx0ZXJzIjp7ImNhdGVnb3J5IjoiZmluaXNoZWQiLCJwcm92aWRlciI6bnVsbCwic2NvcGVfaWQiOm51bGwsInRlYW1faWQiOm51bGx9LCJpZCI6MTI5LCJraW5kIjoid29yayIsInVwZGF0ZWRfYXQiOiIyMDI2LTA5LTMwVDEyOjAwOjAwKzAwOjAwIiwidiI6MX0",
-      "schema_version": 1,
-      "total": 26
-    }
-  },
-  "first_page": {
-    "endpoint": "/api/v1/factory/work-items",
-    "http_status": 200,
-    "method": "GET",
-    "query": {
-      "limit": 2
-    },
-    "response": {
-      "counts": {
-        "active": 27,
-        "attention": 26,
-        "finished": 26,
-        "queued": 14,
-        "review": 26,
-        "total": 132,
-        "unknown": 13
-      },
-      "filters": {
-        "category": "all",
-        "provider": null,
-        "scope_id": null,
-        "team_id": null
-      },
-      "generated_at": "2026-09-30T12:00:00Z",
-      "has_more": true,
-      "items": [
-        {
-          "actions": [
-            {
-              "block_code": "not_escalated",
-              "name": "retry",
-              "reason": "Only escalated work can be retried.",
-              "required_actor": "leader",
-              "state": "blocked"
-            },
-            {
-              "block_code": "unknown",
-              "name": "resume_attempt",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "operator",
-              "state": "unknown"
-            },
-            {
-              "block_code": "unknown",
-              "name": "escalate_attempt",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "operator",
-              "state": "unknown"
-            },
-            {
-              "block_code": "unknown",
-              "name": "cancel_continuation_request",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "owner",
-              "state": "unknown"
-            },
-            {
-              "block_code": "unknown",
-              "name": "cancel_active_revision",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "operator",
-              "state": "unknown"
-            },
-            {
-              "block_code": "unknown",
-              "name": "release_recovery_checkpoint",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "operator",
-              "state": "unknown"
-            }
-          ],
-          "approver": {
-            "member_id": 1,
-            "slot_id": 1,
-            "source": "explicit_assignment"
-          },
-          "approver_session": {
-            "agent_status": {
-              "activity_reason": "no_current_binding",
-              "activity_state": "unknown",
-              "checked_at": "2026-09-30T12:00:00Z",
-              "idle_since": null,
-              "session_state": "offline",
-              "valid_until": "2026-09-30T12:00:15Z",
-              "waiting_input": null,
-              "wake_reason": "wake_target_unbound",
-              "wake_state": "cannot_wake"
-            },
-            "bridge_target": null,
-            "observed_provider": null,
-            "state": "offline"
-          },
-          "category": "active",
-          "item": {
-            "active_scope_revision": 0,
-            "active_scope_status": null,
-            "approval_round_count": 0,
-            "attempt_phase": "implementation",
-            "checks_unavailable_reason": null,
-            "checks_unavailable_since": null,
-            "created_at": "2026-09-30T12:00:00Z",
-            "diagnostic_retry_count": 0,
-            "dispatch_status": "dispatched",
-            "github_updated_at": "2026-09-30T12:00:00Z",
-            "id": 132,
-            "issue_number": 132,
-            "issue_title": "Fixture issue 132",
-            "issue_type": "code",
-            "last_verified_sha": null,
-            "pending_approval_kind": null,
-            "pending_approval_status": null,
-            "pr_number": null,
-            "required_ci_unreadable": null,
-            "retry_count": 0,
-            "scope_id": 3,
-            "updated_at": "2026-09-30T12:00:00Z"
-          },
-          "links": {
-            "bridge_target": {
-              "member_id": 2,
-              "session_id": 2,
-              "slot_id": 2,
-              "team_id": 1
-            },
-            "launch_plan": {
-              "slot_id": 1,
-              "team_id": 1
-            },
-            "mail": {
-              "member_id": 2,
-              "slot_id": 2,
-              "team_id": 1
-            }
-          },
-          "owner": {
-            "configured_provider": "codex-cli",
-            "member_id": 2,
-            "name": "Owner",
-            "provider_label": "Codex",
-            "slot_id": 2
-          },
-          "policy": {
-            "continuation_enabled": false,
-            "max_approval_rounds": 3,
-            "max_verification_retries": 2,
-            "merge_policy": "human"
-          },
-          "repository": {
-            "display_name": "fixture/paused",
-            "github": {
-              "name": "paused",
-              "owner": "fixture"
-            },
-            "scope_id": 3
-          },
-          "session": {
-            "agent_status": {
-              "activity_reason": "no_current_binding",
-              "activity_state": "unknown",
-              "checked_at": "2026-09-30T12:00:00Z",
-              "idle_since": null,
-              "session_state": "online",
-              "valid_until": "2026-09-30T12:00:15Z",
-              "waiting_input": null,
-              "wake_reason": "wake_target_unbound",
-              "wake_state": "cannot_wake"
-            },
-            "bridge_target": {
-              "member_id": 2,
-              "session_id": 2,
-              "slot_id": 2,
-              "team_id": 1
-            },
-            "observed_provider": "codex-cli",
-            "state": "bound"
-          },
-          "team": {
-            "id": 1,
-            "name": "Fixture team 1"
-          },
-          "waiting": {
-            "actor": "owner",
-            "reason_code": "owner_ack_required",
-            "summary": "Waiting for the assigned owner to acknowledge the plan."
-          },
-          "workspace": null
-        },
-        {
-          "actions": [
-            {
-              "block_code": "not_escalated",
-              "name": "retry",
-              "reason": "Only escalated work can be retried.",
-              "required_actor": "leader",
-              "state": "blocked"
-            },
-            {
-              "block_code": "unknown",
-              "name": "resume_attempt",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "operator",
-              "state": "unknown"
-            },
-            {
-              "block_code": "unknown",
-              "name": "escalate_attempt",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "operator",
-              "state": "unknown"
-            },
-            {
-              "block_code": "unknown",
-              "name": "cancel_continuation_request",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "owner",
-              "state": "unknown"
-            },
-            {
-              "block_code": "unknown",
-              "name": "cancel_active_revision",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "operator",
-              "state": "unknown"
-            },
-            {
-              "block_code": "unknown",
-              "name": "release_recovery_checkpoint",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "operator",
-              "state": "unknown"
-            }
-          ],
-          "approver": {
-            "member_id": 1,
-            "slot_id": 1,
-            "source": "explicit_assignment"
-          },
-          "approver_session": {
-            "agent_status": {
-              "activity_reason": "no_current_binding",
-              "activity_state": "unknown",
-              "checked_at": "2026-09-30T12:00:00Z",
-              "idle_since": null,
-              "session_state": "offline",
-              "valid_until": "2026-09-30T12:00:15Z",
-              "waiting_input": null,
-              "wake_reason": "wake_target_unbound",
-              "wake_state": "cannot_wake"
-            },
-            "bridge_target": null,
-            "observed_provider": null,
-            "state": "offline"
-          },
-          "category": "queued",
-          "item": {
-            "active_scope_revision": 0,
-            "active_scope_status": null,
-            "approval_round_count": 0,
-            "attempt_phase": "implementation",
-            "checks_unavailable_reason": null,
-            "checks_unavailable_since": null,
-            "created_at": "2026-09-30T12:00:00Z",
-            "diagnostic_retry_count": 0,
-            "dispatch_status": "pending",
+            "dispatch_status": "cancelled",
             "github_updated_at": "2026-09-30T12:00:00Z",
             "id": 131,
             "issue_number": 131,
@@ -920,36 +600,31 @@
             "id": 1,
             "name": "Fixture team 1"
           },
-          "waiting": {
-            "actor": "unknown",
-            "reason_code": "work_queued",
-            "summary": "Waiting for dispatch."
-          },
+          "waiting": null,
           "workspace": null
         }
       ],
-      "next_cursor": "eyJmaWx0ZXJzIjp7ImNhdGVnb3J5IjoiYWxsIiwicHJvdmlkZXIiOm51bGwsInNjb3BlX2lkIjpudWxsLCJ0ZWFtX2lkIjpudWxsfSwiaWQiOjEzMSwia2luZCI6IndvcmsiLCJ1cGRhdGVkX2F0IjoiMjAyNi0wOS0zMFQxMjowMDowMCswMDowMCIsInYiOjF9",
+      "next_cursor": "eyJmaWx0ZXJzIjp7ImNhdGVnb3J5IjoiZmluaXNoZWQiLCJwcm92aWRlciI6bnVsbCwic2NvcGVfaWQiOm51bGwsInRlYW1faWQiOm51bGx9LCJpZCI6MTMxLCJraW5kIjoid29yayIsInVwZGF0ZWRfYXQiOiIyMDI2LTA5LTMwVDEyOjAwOjAwKzAwOjAwIiwidiI6MX0",
       "schema_version": 1,
-      "total": 132
+      "total": 36
     }
   },
-  "next_page": {
+  "first_page": {
     "endpoint": "/api/v1/factory/work-items",
     "http_status": 200,
     "method": "GET",
     "query": {
-      "cursor": "eyJmaWx0ZXJzIjp7ImNhdGVnb3J5IjoiYWxsIiwicHJvdmlkZXIiOm51bGwsInNjb3BlX2lkIjpudWxsLCJ0ZWFtX2lkIjpudWxsfSwiaWQiOjEzMSwia2luZCI6IndvcmsiLCJ1cGRhdGVkX2F0IjoiMjAyNi0wOS0zMFQxMjowMDowMCswMDowMCIsInYiOjF9",
       "limit": 2
     },
     "response": {
       "counts": {
-        "active": 27,
-        "attention": 26,
-        "finished": 26,
-        "queued": 14,
-        "review": 26,
+        "active": 24,
+        "attention": 24,
+        "finished": 36,
+        "queued": 12,
+        "review": 24,
         "total": 132,
-        "unknown": 13
+        "unknown": 12
       },
       "filters": {
         "category": "all",
@@ -1006,8 +681,8 @@
             }
           ],
           "approver": {
-            "member_id": 3,
-            "slot_id": 3,
+            "member_id": 1,
+            "slot_id": 1,
             "source": "explicit_assignment"
           },
           "approver_session": {
@@ -1038,9 +713,9 @@
             "diagnostic_retry_count": 0,
             "dispatch_status": "future_status",
             "github_updated_at": "2026-09-30T12:00:00Z",
-            "id": 130,
-            "issue_number": 130,
-            "issue_title": "Fixture issue 130",
+            "id": 132,
+            "issue_number": 132,
+            "issue_title": "Fixture issue 132",
             "issue_type": "code",
             "last_verified_sha": null,
             "pending_approval_kind": null,
@@ -1048,46 +723,46 @@
             "pr_number": null,
             "required_ci_unreadable": null,
             "retry_count": 0,
-            "scope_id": 2,
+            "scope_id": 3,
             "updated_at": "2026-09-30T12:00:00Z"
           },
           "links": {
             "bridge_target": {
-              "member_id": 4,
-              "session_id": 4,
-              "slot_id": 4,
-              "team_id": 2
+              "member_id": 2,
+              "session_id": 2,
+              "slot_id": 2,
+              "team_id": 1
             },
             "launch_plan": {
-              "slot_id": 3,
-              "team_id": 2
+              "slot_id": 1,
+              "team_id": 1
             },
             "mail": {
-              "member_id": 4,
-              "slot_id": 4,
-              "team_id": 2
+              "member_id": 2,
+              "slot_id": 2,
+              "team_id": 1
             }
           },
           "owner": {
             "configured_provider": "codex-cli",
-            "member_id": 4,
+            "member_id": 2,
             "name": "Owner",
             "provider_label": "Codex",
-            "slot_id": 4
+            "slot_id": 2
           },
           "policy": {
-            "continuation_enabled": true,
+            "continuation_enabled": false,
             "max_approval_rounds": 3,
             "max_verification_retries": 2,
             "merge_policy": "human"
           },
           "repository": {
-            "display_name": "fixture/shared",
+            "display_name": "fixture/paused",
             "github": {
-              "name": "shared",
+              "name": "paused",
               "owner": "fixture"
             },
-            "scope_id": 2
+            "scope_id": 3
           },
           "session": {
             "agent_status": {
@@ -1102,17 +777,17 @@
               "wake_state": "cannot_wake"
             },
             "bridge_target": {
-              "member_id": 4,
-              "session_id": 4,
-              "slot_id": 4,
-              "team_id": 2
+              "member_id": 2,
+              "session_id": 2,
+              "slot_id": 2,
+              "team_id": 1
             },
             "observed_provider": "codex-cli",
             "state": "bound"
           },
           "team": {
-            "id": 2,
-            "name": "Fixture team 2"
+            "id": 1,
+            "name": "Fixture team 1"
           },
           "waiting": {
             "actor": "unknown",
@@ -1197,7 +872,354 @@
             "checks_unavailable_since": null,
             "created_at": "2026-09-30T12:00:00Z",
             "diagnostic_retry_count": 0,
+            "dispatch_status": "cancelled",
+            "github_updated_at": "2026-09-30T12:00:00Z",
+            "id": 131,
+            "issue_number": 131,
+            "issue_title": "Fixture issue 131",
+            "issue_type": "code",
+            "last_verified_sha": null,
+            "pending_approval_kind": null,
+            "pending_approval_status": null,
+            "pr_number": null,
+            "required_ci_unreadable": null,
+            "retry_count": 0,
+            "scope_id": 1,
+            "updated_at": "2026-09-30T12:00:00Z"
+          },
+          "links": {
+            "bridge_target": {
+              "member_id": 2,
+              "session_id": 2,
+              "slot_id": 2,
+              "team_id": 1
+            },
+            "launch_plan": {
+              "slot_id": 1,
+              "team_id": 1
+            },
+            "mail": {
+              "member_id": 2,
+              "slot_id": 2,
+              "team_id": 1
+            }
+          },
+          "owner": {
+            "configured_provider": "codex-cli",
+            "member_id": 2,
+            "name": "Owner",
+            "provider_label": "Codex",
+            "slot_id": 2
+          },
+          "policy": {
+            "continuation_enabled": true,
+            "max_approval_rounds": 3,
+            "max_verification_retries": 2,
+            "merge_policy": "human"
+          },
+          "repository": {
+            "display_name": "fixture/shared",
+            "github": {
+              "name": "shared",
+              "owner": "fixture"
+            },
+            "scope_id": 1
+          },
+          "session": {
+            "agent_status": {
+              "activity_reason": "no_current_binding",
+              "activity_state": "unknown",
+              "checked_at": "2026-09-30T12:00:00Z",
+              "idle_since": null,
+              "session_state": "online",
+              "valid_until": "2026-09-30T12:00:15Z",
+              "waiting_input": null,
+              "wake_reason": "wake_target_unbound",
+              "wake_state": "cannot_wake"
+            },
+            "bridge_target": {
+              "member_id": 2,
+              "session_id": 2,
+              "slot_id": 2,
+              "team_id": 1
+            },
+            "observed_provider": "codex-cli",
+            "state": "bound"
+          },
+          "team": {
+            "id": 1,
+            "name": "Fixture team 1"
+          },
+          "waiting": null,
+          "workspace": null
+        }
+      ],
+      "next_cursor": "eyJmaWx0ZXJzIjp7ImNhdGVnb3J5IjoiYWxsIiwicHJvdmlkZXIiOm51bGwsInNjb3BlX2lkIjpudWxsLCJ0ZWFtX2lkIjpudWxsfSwiaWQiOjEzMSwia2luZCI6IndvcmsiLCJ1cGRhdGVkX2F0IjoiMjAyNi0wOS0zMFQxMjowMDowMCswMDowMCIsInYiOjF9",
+      "schema_version": 1,
+      "total": 132
+    }
+  },
+  "next_page": {
+    "endpoint": "/api/v1/factory/work-items",
+    "http_status": 200,
+    "method": "GET",
+    "query": {
+      "cursor": "eyJmaWx0ZXJzIjp7ImNhdGVnb3J5IjoiYWxsIiwicHJvdmlkZXIiOm51bGwsInNjb3BlX2lkIjpudWxsLCJ0ZWFtX2lkIjpudWxsfSwiaWQiOjEzMSwia2luZCI6IndvcmsiLCJ1cGRhdGVkX2F0IjoiMjAyNi0wOS0zMFQxMjowMDowMCswMDowMCIsInYiOjF9",
+      "limit": 2
+    },
+    "response": {
+      "counts": {
+        "active": 24,
+        "attention": 24,
+        "finished": 36,
+        "queued": 12,
+        "review": 24,
+        "total": 132,
+        "unknown": 12
+      },
+      "filters": {
+        "category": "all",
+        "provider": null,
+        "scope_id": null,
+        "team_id": null
+      },
+      "generated_at": "2026-09-30T12:00:00Z",
+      "has_more": true,
+      "items": [
+        {
+          "actions": [
+            {
+              "block_code": "not_escalated",
+              "name": "retry",
+              "reason": "Only escalated work can be retried.",
+              "required_actor": "leader",
+              "state": "blocked"
+            },
+            {
+              "block_code": "unknown",
+              "name": "resume_attempt",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "operator",
+              "state": "unknown"
+            },
+            {
+              "block_code": "unknown",
+              "name": "escalate_attempt",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "operator",
+              "state": "unknown"
+            },
+            {
+              "block_code": "unknown",
+              "name": "cancel_continuation_request",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "owner",
+              "state": "unknown"
+            },
+            {
+              "block_code": "unknown",
+              "name": "cancel_active_revision",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "operator",
+              "state": "unknown"
+            },
+            {
+              "block_code": "unknown",
+              "name": "release_recovery_checkpoint",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "operator",
+              "state": "unknown"
+            }
+          ],
+          "approver": {
+            "member_id": 3,
+            "slot_id": 3,
+            "source": "explicit_assignment"
+          },
+          "approver_session": {
+            "agent_status": {
+              "activity_reason": "no_current_binding",
+              "activity_state": "unknown",
+              "checked_at": "2026-09-30T12:00:00Z",
+              "idle_since": null,
+              "session_state": "offline",
+              "valid_until": "2026-09-30T12:00:15Z",
+              "waiting_input": null,
+              "wake_reason": "wake_target_unbound",
+              "wake_state": "cannot_wake"
+            },
+            "bridge_target": null,
+            "observed_provider": null,
+            "state": "offline"
+          },
+          "category": "finished",
+          "item": {
+            "active_scope_revision": 0,
+            "active_scope_status": null,
+            "approval_round_count": 0,
+            "attempt_phase": "implementation",
+            "checks_unavailable_reason": null,
+            "checks_unavailable_since": null,
+            "created_at": "2026-09-30T12:00:00Z",
+            "diagnostic_retry_count": 0,
             "dispatch_status": "completed",
+            "github_updated_at": "2026-09-30T12:00:00Z",
+            "id": 130,
+            "issue_number": 130,
+            "issue_title": "Fixture issue 130",
+            "issue_type": "code",
+            "last_verified_sha": null,
+            "pending_approval_kind": null,
+            "pending_approval_status": null,
+            "pr_number": null,
+            "required_ci_unreadable": null,
+            "retry_count": 0,
+            "scope_id": 2,
+            "updated_at": "2026-09-30T12:00:00Z"
+          },
+          "links": {
+            "bridge_target": {
+              "member_id": 4,
+              "session_id": 4,
+              "slot_id": 4,
+              "team_id": 2
+            },
+            "launch_plan": {
+              "slot_id": 3,
+              "team_id": 2
+            },
+            "mail": {
+              "member_id": 4,
+              "slot_id": 4,
+              "team_id": 2
+            }
+          },
+          "owner": {
+            "configured_provider": "codex-cli",
+            "member_id": 4,
+            "name": "Owner",
+            "provider_label": "Codex",
+            "slot_id": 4
+          },
+          "policy": {
+            "continuation_enabled": true,
+            "max_approval_rounds": 3,
+            "max_verification_retries": 2,
+            "merge_policy": "human"
+          },
+          "repository": {
+            "display_name": "fixture/shared",
+            "github": {
+              "name": "shared",
+              "owner": "fixture"
+            },
+            "scope_id": 2
+          },
+          "session": {
+            "agent_status": {
+              "activity_reason": "no_current_binding",
+              "activity_state": "unknown",
+              "checked_at": "2026-09-30T12:00:00Z",
+              "idle_since": null,
+              "session_state": "online",
+              "valid_until": "2026-09-30T12:00:15Z",
+              "waiting_input": null,
+              "wake_reason": "wake_target_unbound",
+              "wake_state": "cannot_wake"
+            },
+            "bridge_target": {
+              "member_id": 4,
+              "session_id": 4,
+              "slot_id": 4,
+              "team_id": 2
+            },
+            "observed_provider": "codex-cli",
+            "state": "bound"
+          },
+          "team": {
+            "id": 2,
+            "name": "Fixture team 2"
+          },
+          "waiting": null,
+          "workspace": null
+        },
+        {
+          "actions": [
+            {
+              "block_code": "not_escalated",
+              "name": "retry",
+              "reason": "Only escalated work can be retried.",
+              "required_actor": "leader",
+              "state": "blocked"
+            },
+            {
+              "block_code": "unknown",
+              "name": "resume_attempt",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "operator",
+              "state": "unknown"
+            },
+            {
+              "block_code": "unknown",
+              "name": "escalate_attempt",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "operator",
+              "state": "unknown"
+            },
+            {
+              "block_code": "unknown",
+              "name": "cancel_continuation_request",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "owner",
+              "state": "unknown"
+            },
+            {
+              "block_code": "unknown",
+              "name": "cancel_active_revision",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "operator",
+              "state": "unknown"
+            },
+            {
+              "block_code": "unknown",
+              "name": "release_recovery_checkpoint",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "operator",
+              "state": "unknown"
+            }
+          ],
+          "approver": {
+            "member_id": 1,
+            "slot_id": 1,
+            "source": "explicit_assignment"
+          },
+          "approver_session": {
+            "agent_status": {
+              "activity_reason": "no_current_binding",
+              "activity_state": "unknown",
+              "checked_at": "2026-09-30T12:00:00Z",
+              "idle_since": null,
+              "session_state": "offline",
+              "valid_until": "2026-09-30T12:00:15Z",
+              "waiting_input": null,
+              "wake_reason": "wake_target_unbound",
+              "wake_state": "cannot_wake"
+            },
+            "bridge_target": null,
+            "observed_provider": null,
+            "state": "offline"
+          },
+          "category": "finished",
+          "item": {
+            "active_scope_revision": 0,
+            "active_scope_status": null,
+            "approval_round_count": 0,
+            "attempt_phase": "implementation",
+            "checks_unavailable_reason": null,
+            "checks_unavailable_since": null,
+            "created_at": "2026-09-30T12:00:00Z",
+            "diagnostic_retry_count": 0,
+            "dispatch_status": "merged",
             "github_updated_at": "2026-09-30T12:00:00Z",
             "id": 129,
             "issue_number": 129,
@@ -1294,13 +1316,13 @@
     },
     "response": {
       "counts": {
-        "active": 23,
-        "attention": 22,
-        "finished": 22,
-        "queued": 12,
-        "review": 23,
+        "active": 21,
+        "attention": 20,
+        "finished": 31,
+        "queued": 10,
+        "review": 21,
         "total": 113,
-        "unknown": 11
+        "unknown": 10
       },
       "filters": {
         "category": "all",
@@ -1377,7 +1399,7 @@
             "observed_provider": null,
             "state": "offline"
           },
-          "category": "active",
+          "category": "unknown",
           "item": {
             "active_scope_revision": 0,
             "active_scope_status": null,
@@ -1387,7 +1409,7 @@
             "checks_unavailable_since": null,
             "created_at": "2026-09-30T12:00:00Z",
             "diagnostic_retry_count": 0,
-            "dispatch_status": "dispatched",
+            "dispatch_status": "future_status",
             "github_updated_at": "2026-09-30T12:00:00Z",
             "id": 132,
             "issue_number": 132,
@@ -1466,9 +1488,9 @@
             "name": "Fixture team 1"
           },
           "waiting": {
-            "actor": "owner",
-            "reason_code": "owner_ack_required",
-            "summary": "Waiting for the assigned owner to acknowledge the plan."
+            "actor": "unknown",
+            "reason_code": "unknown",
+            "summary": "State needs inspection."
           },
           "workspace": null
         },
@@ -1538,7 +1560,7 @@
             "observed_provider": null,
             "state": "offline"
           },
-          "category": "queued",
+          "category": "finished",
           "item": {
             "active_scope_revision": 0,
             "active_scope_status": null,
@@ -1548,7 +1570,7 @@
             "checks_unavailable_since": null,
             "created_at": "2026-09-30T12:00:00Z",
             "diagnostic_retry_count": 0,
-            "dispatch_status": "pending",
+            "dispatch_status": "cancelled",
             "github_updated_at": "2026-09-30T12:00:00Z",
             "id": 131,
             "issue_number": 131,
@@ -1626,11 +1648,7 @@
             "id": 1,
             "name": "Fixture team 1"
           },
-          "waiting": {
-            "actor": "unknown",
-            "reason_code": "work_queued",
-            "summary": "Waiting for dispatch."
-          },
+          "waiting": null,
           "workspace": null
         }
       ],
@@ -1652,401 +1670,13 @@
         "active": 0,
         "attention": 0,
         "finished": 0,
-        "queued": 14,
+        "queued": 12,
         "review": 0,
-        "total": 14,
+        "total": 12,
         "unknown": 0
       },
       "filters": {
         "category": "queued",
-        "provider": null,
-        "scope_id": null,
-        "team_id": null
-      },
-      "generated_at": "2026-09-30T12:00:00Z",
-      "has_more": true,
-      "items": [
-        {
-          "actions": [
-            {
-              "block_code": "not_escalated",
-              "name": "retry",
-              "reason": "Only escalated work can be retried.",
-              "required_actor": "leader",
-              "state": "blocked"
-            },
-            {
-              "block_code": "unknown",
-              "name": "resume_attempt",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "operator",
-              "state": "unknown"
-            },
-            {
-              "block_code": "unknown",
-              "name": "escalate_attempt",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "operator",
-              "state": "unknown"
-            },
-            {
-              "block_code": "unknown",
-              "name": "cancel_continuation_request",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "owner",
-              "state": "unknown"
-            },
-            {
-              "block_code": "unknown",
-              "name": "cancel_active_revision",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "operator",
-              "state": "unknown"
-            },
-            {
-              "block_code": "unknown",
-              "name": "release_recovery_checkpoint",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "operator",
-              "state": "unknown"
-            }
-          ],
-          "approver": {
-            "member_id": 1,
-            "slot_id": 1,
-            "source": "explicit_assignment"
-          },
-          "approver_session": {
-            "agent_status": {
-              "activity_reason": "no_current_binding",
-              "activity_state": "unknown",
-              "checked_at": "2026-09-30T12:00:00Z",
-              "idle_since": null,
-              "session_state": "offline",
-              "valid_until": "2026-09-30T12:00:15Z",
-              "waiting_input": null,
-              "wake_reason": "wake_target_unbound",
-              "wake_state": "cannot_wake"
-            },
-            "bridge_target": null,
-            "observed_provider": null,
-            "state": "offline"
-          },
-          "category": "queued",
-          "item": {
-            "active_scope_revision": 0,
-            "active_scope_status": null,
-            "approval_round_count": 0,
-            "attempt_phase": "implementation",
-            "checks_unavailable_reason": null,
-            "checks_unavailable_since": null,
-            "created_at": "2026-09-30T12:00:00Z",
-            "diagnostic_retry_count": 0,
-            "dispatch_status": "pending",
-            "github_updated_at": "2026-09-30T12:00:00Z",
-            "id": 131,
-            "issue_number": 131,
-            "issue_title": "Fixture issue 131",
-            "issue_type": "code",
-            "last_verified_sha": null,
-            "pending_approval_kind": null,
-            "pending_approval_status": null,
-            "pr_number": null,
-            "required_ci_unreadable": null,
-            "retry_count": 0,
-            "scope_id": 1,
-            "updated_at": "2026-09-30T12:00:00Z"
-          },
-          "links": {
-            "bridge_target": {
-              "member_id": 2,
-              "session_id": 2,
-              "slot_id": 2,
-              "team_id": 1
-            },
-            "launch_plan": {
-              "slot_id": 1,
-              "team_id": 1
-            },
-            "mail": {
-              "member_id": 2,
-              "slot_id": 2,
-              "team_id": 1
-            }
-          },
-          "owner": {
-            "configured_provider": "codex-cli",
-            "member_id": 2,
-            "name": "Owner",
-            "provider_label": "Codex",
-            "slot_id": 2
-          },
-          "policy": {
-            "continuation_enabled": true,
-            "max_approval_rounds": 3,
-            "max_verification_retries": 2,
-            "merge_policy": "human"
-          },
-          "repository": {
-            "display_name": "fixture/shared",
-            "github": {
-              "name": "shared",
-              "owner": "fixture"
-            },
-            "scope_id": 1
-          },
-          "session": {
-            "agent_status": {
-              "activity_reason": "no_current_binding",
-              "activity_state": "unknown",
-              "checked_at": "2026-09-30T12:00:00Z",
-              "idle_since": null,
-              "session_state": "online",
-              "valid_until": "2026-09-30T12:00:15Z",
-              "waiting_input": null,
-              "wake_reason": "wake_target_unbound",
-              "wake_state": "cannot_wake"
-            },
-            "bridge_target": {
-              "member_id": 2,
-              "session_id": 2,
-              "slot_id": 2,
-              "team_id": 1
-            },
-            "observed_provider": "codex-cli",
-            "state": "bound"
-          },
-          "team": {
-            "id": 1,
-            "name": "Fixture team 1"
-          },
-          "waiting": {
-            "actor": "unknown",
-            "reason_code": "work_queued",
-            "summary": "Waiting for dispatch."
-          },
-          "workspace": null
-        }
-      ],
-      "next_cursor": "eyJmaWx0ZXJzIjp7ImNhdGVnb3J5IjoicXVldWVkIiwicHJvdmlkZXIiOm51bGwsInNjb3BlX2lkIjpudWxsLCJ0ZWFtX2lkIjpudWxsfSwiaWQiOjEzMSwia2luZCI6IndvcmsiLCJ1cGRhdGVkX2F0IjoiMjAyNi0wOS0zMFQxMjowMDowMCswMDowMCIsInYiOjF9",
-      "schema_version": 1,
-      "total": 14
-    }
-  },
-  "review": {
-    "endpoint": "/api/v1/factory/work-items",
-    "http_status": 200,
-    "method": "GET",
-    "query": {
-      "category": "review",
-      "limit": 1
-    },
-    "response": {
-      "counts": {
-        "active": 0,
-        "attention": 0,
-        "finished": 0,
-        "queued": 0,
-        "review": 26,
-        "total": 26,
-        "unknown": 0
-      },
-      "filters": {
-        "category": "review",
-        "provider": null,
-        "scope_id": null,
-        "team_id": null
-      },
-      "generated_at": "2026-09-30T12:00:00Z",
-      "has_more": true,
-      "items": [
-        {
-          "actions": [
-            {
-              "block_code": "not_escalated",
-              "name": "retry",
-              "reason": "Only escalated work can be retried.",
-              "required_actor": "leader",
-              "state": "blocked"
-            },
-            {
-              "block_code": "unknown",
-              "name": "resume_attempt",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "operator",
-              "state": "unknown"
-            },
-            {
-              "block_code": "unknown",
-              "name": "escalate_attempt",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "operator",
-              "state": "unknown"
-            },
-            {
-              "block_code": "unknown",
-              "name": "cancel_continuation_request",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "owner",
-              "state": "unknown"
-            },
-            {
-              "block_code": "unknown",
-              "name": "cancel_active_revision",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "operator",
-              "state": "unknown"
-            },
-            {
-              "block_code": "unknown",
-              "name": "release_recovery_checkpoint",
-              "reason": "Open attempt recovery to check available actions.",
-              "required_actor": "operator",
-              "state": "unknown"
-            }
-          ],
-          "approver": {
-            "member_id": 1,
-            "slot_id": 1,
-            "source": "explicit_assignment"
-          },
-          "approver_session": {
-            "agent_status": {
-              "activity_reason": "no_current_binding",
-              "activity_state": "unknown",
-              "checked_at": "2026-09-30T12:00:00Z",
-              "idle_since": null,
-              "session_state": "offline",
-              "valid_until": "2026-09-30T12:00:15Z",
-              "waiting_input": null,
-              "wake_reason": "wake_target_unbound",
-              "wake_state": "cannot_wake"
-            },
-            "bridge_target": null,
-            "observed_provider": null,
-            "state": "offline"
-          },
-          "category": "review",
-          "item": {
-            "active_scope_revision": 0,
-            "active_scope_status": null,
-            "approval_round_count": 0,
-            "attempt_phase": "implementation",
-            "checks_unavailable_reason": null,
-            "checks_unavailable_since": null,
-            "created_at": "2026-09-30T12:00:00Z",
-            "diagnostic_retry_count": 0,
-            "dispatch_status": "ready_for_review",
-            "github_updated_at": "2026-09-30T12:00:00Z",
-            "id": 125,
-            "issue_number": 125,
-            "issue_title": "Fixture issue 125",
-            "issue_type": "code",
-            "last_verified_sha": null,
-            "pending_approval_kind": null,
-            "pending_approval_status": null,
-            "pr_number": null,
-            "required_ci_unreadable": null,
-            "retry_count": 0,
-            "scope_id": 1,
-            "updated_at": "2026-09-30T12:00:00Z"
-          },
-          "links": {
-            "bridge_target": {
-              "member_id": 2,
-              "session_id": 2,
-              "slot_id": 2,
-              "team_id": 1
-            },
-            "launch_plan": {
-              "slot_id": 1,
-              "team_id": 1
-            },
-            "mail": {
-              "member_id": 2,
-              "slot_id": 2,
-              "team_id": 1
-            }
-          },
-          "owner": {
-            "configured_provider": "codex-cli",
-            "member_id": 2,
-            "name": "Owner",
-            "provider_label": "Codex",
-            "slot_id": 2
-          },
-          "policy": {
-            "continuation_enabled": true,
-            "max_approval_rounds": 3,
-            "max_verification_retries": 2,
-            "merge_policy": "human"
-          },
-          "repository": {
-            "display_name": "fixture/shared",
-            "github": {
-              "name": "shared",
-              "owner": "fixture"
-            },
-            "scope_id": 1
-          },
-          "session": {
-            "agent_status": {
-              "activity_reason": "no_current_binding",
-              "activity_state": "unknown",
-              "checked_at": "2026-09-30T12:00:00Z",
-              "idle_since": null,
-              "session_state": "online",
-              "valid_until": "2026-09-30T12:00:15Z",
-              "waiting_input": null,
-              "wake_reason": "wake_target_unbound",
-              "wake_state": "cannot_wake"
-            },
-            "bridge_target": {
-              "member_id": 2,
-              "session_id": 2,
-              "slot_id": 2,
-              "team_id": 1
-            },
-            "observed_provider": "codex-cli",
-            "state": "bound"
-          },
-          "team": {
-            "id": 1,
-            "name": "Fixture team 1"
-          },
-          "waiting": {
-            "actor": "human",
-            "reason_code": "human_review",
-            "summary": "Ready for human review."
-          },
-          "workspace": null
-        }
-      ],
-      "next_cursor": "eyJmaWx0ZXJzIjp7ImNhdGVnb3J5IjoicmV2aWV3IiwicHJvdmlkZXIiOm51bGwsInNjb3BlX2lkIjpudWxsLCJ0ZWFtX2lkIjpudWxsfSwiaWQiOjEyNSwia2luZCI6IndvcmsiLCJ1cGRhdGVkX2F0IjoiMjAyNi0wOS0zMFQxMjowMDowMCswMDowMCIsInYiOjF9",
-      "schema_version": 1,
-      "total": 26
-    }
-  },
-  "unknown": {
-    "endpoint": "/api/v1/factory/work-items",
-    "http_status": 200,
-    "method": "GET",
-    "query": {
-      "category": "unknown",
-      "limit": 1
-    },
-    "response": {
-      "counts": {
-        "active": 0,
-        "attention": 0,
-        "finished": 0,
-        "queued": 0,
-        "review": 0,
-        "total": 13,
-        "unknown": 13
-      },
-      "filters": {
-        "category": "unknown",
         "provider": null,
         "scope_id": null,
         "team_id": null
@@ -2120,7 +1750,7 @@
             "observed_provider": null,
             "state": "offline"
           },
-          "category": "unknown",
+          "category": "queued",
           "item": {
             "active_scope_revision": 0,
             "active_scope_status": null,
@@ -2130,11 +1760,11 @@
             "checks_unavailable_since": null,
             "created_at": "2026-09-30T12:00:00Z",
             "diagnostic_retry_count": 0,
-            "dispatch_status": "future_status",
+            "dispatch_status": "pending",
             "github_updated_at": "2026-09-30T12:00:00Z",
-            "id": 130,
-            "issue_number": 130,
-            "issue_title": "Fixture issue 130",
+            "id": 122,
+            "issue_number": 122,
+            "issue_title": "Fixture issue 122",
             "issue_type": "code",
             "last_verified_sha": null,
             "pending_approval_kind": null,
@@ -2210,15 +1840,403 @@
           },
           "waiting": {
             "actor": "unknown",
+            "reason_code": "work_queued",
+            "summary": "Waiting for dispatch."
+          },
+          "workspace": null
+        }
+      ],
+      "next_cursor": "eyJmaWx0ZXJzIjp7ImNhdGVnb3J5IjoicXVldWVkIiwicHJvdmlkZXIiOm51bGwsInNjb3BlX2lkIjpudWxsLCJ0ZWFtX2lkIjpudWxsfSwiaWQiOjEyMiwia2luZCI6IndvcmsiLCJ1cGRhdGVkX2F0IjoiMjAyNi0wOS0zMFQxMjowMDowMCswMDowMCIsInYiOjF9",
+      "schema_version": 1,
+      "total": 12
+    }
+  },
+  "review": {
+    "endpoint": "/api/v1/factory/work-items",
+    "http_status": 200,
+    "method": "GET",
+    "query": {
+      "category": "review",
+      "limit": 1
+    },
+    "response": {
+      "counts": {
+        "active": 0,
+        "attention": 0,
+        "finished": 0,
+        "queued": 0,
+        "review": 24,
+        "total": 24,
+        "unknown": 0
+      },
+      "filters": {
+        "category": "review",
+        "provider": null,
+        "scope_id": null,
+        "team_id": null
+      },
+      "generated_at": "2026-09-30T12:00:00Z",
+      "has_more": true,
+      "items": [
+        {
+          "actions": [
+            {
+              "block_code": "not_escalated",
+              "name": "retry",
+              "reason": "Only escalated work can be retried.",
+              "required_actor": "leader",
+              "state": "blocked"
+            },
+            {
+              "block_code": "unknown",
+              "name": "resume_attempt",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "operator",
+              "state": "unknown"
+            },
+            {
+              "block_code": "unknown",
+              "name": "escalate_attempt",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "operator",
+              "state": "unknown"
+            },
+            {
+              "block_code": "unknown",
+              "name": "cancel_continuation_request",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "owner",
+              "state": "unknown"
+            },
+            {
+              "block_code": "unknown",
+              "name": "cancel_active_revision",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "operator",
+              "state": "unknown"
+            },
+            {
+              "block_code": "unknown",
+              "name": "release_recovery_checkpoint",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "operator",
+              "state": "unknown"
+            }
+          ],
+          "approver": {
+            "member_id": 3,
+            "slot_id": 3,
+            "source": "explicit_assignment"
+          },
+          "approver_session": {
+            "agent_status": {
+              "activity_reason": "no_current_binding",
+              "activity_state": "unknown",
+              "checked_at": "2026-09-30T12:00:00Z",
+              "idle_since": null,
+              "session_state": "offline",
+              "valid_until": "2026-09-30T12:00:15Z",
+              "waiting_input": null,
+              "wake_reason": "wake_target_unbound",
+              "wake_state": "cannot_wake"
+            },
+            "bridge_target": null,
+            "observed_provider": null,
+            "state": "offline"
+          },
+          "category": "review",
+          "item": {
+            "active_scope_revision": 0,
+            "active_scope_status": null,
+            "approval_round_count": 0,
+            "attempt_phase": "implementation",
+            "checks_unavailable_reason": null,
+            "checks_unavailable_since": null,
+            "created_at": "2026-09-30T12:00:00Z",
+            "diagnostic_retry_count": 0,
+            "dispatch_status": "ready_for_review",
+            "github_updated_at": "2026-09-30T12:00:00Z",
+            "id": 126,
+            "issue_number": 126,
+            "issue_title": "Fixture issue 126",
+            "issue_type": "code",
+            "last_verified_sha": null,
+            "pending_approval_kind": null,
+            "pending_approval_status": null,
+            "pr_number": null,
+            "required_ci_unreadable": null,
+            "retry_count": 0,
+            "scope_id": 2,
+            "updated_at": "2026-09-30T12:00:00Z"
+          },
+          "links": {
+            "bridge_target": {
+              "member_id": 4,
+              "session_id": 4,
+              "slot_id": 4,
+              "team_id": 2
+            },
+            "launch_plan": {
+              "slot_id": 3,
+              "team_id": 2
+            },
+            "mail": {
+              "member_id": 4,
+              "slot_id": 4,
+              "team_id": 2
+            }
+          },
+          "owner": {
+            "configured_provider": "codex-cli",
+            "member_id": 4,
+            "name": "Owner",
+            "provider_label": "Codex",
+            "slot_id": 4
+          },
+          "policy": {
+            "continuation_enabled": true,
+            "max_approval_rounds": 3,
+            "max_verification_retries": 2,
+            "merge_policy": "human"
+          },
+          "repository": {
+            "display_name": "fixture/shared",
+            "github": {
+              "name": "shared",
+              "owner": "fixture"
+            },
+            "scope_id": 2
+          },
+          "session": {
+            "agent_status": {
+              "activity_reason": "no_current_binding",
+              "activity_state": "unknown",
+              "checked_at": "2026-09-30T12:00:00Z",
+              "idle_since": null,
+              "session_state": "online",
+              "valid_until": "2026-09-30T12:00:15Z",
+              "waiting_input": null,
+              "wake_reason": "wake_target_unbound",
+              "wake_state": "cannot_wake"
+            },
+            "bridge_target": {
+              "member_id": 4,
+              "session_id": 4,
+              "slot_id": 4,
+              "team_id": 2
+            },
+            "observed_provider": "codex-cli",
+            "state": "bound"
+          },
+          "team": {
+            "id": 2,
+            "name": "Fixture team 2"
+          },
+          "waiting": {
+            "actor": "human",
+            "reason_code": "human_review",
+            "summary": "Ready for human review."
+          },
+          "workspace": null
+        }
+      ],
+      "next_cursor": "eyJmaWx0ZXJzIjp7ImNhdGVnb3J5IjoicmV2aWV3IiwicHJvdmlkZXIiOm51bGwsInNjb3BlX2lkIjpudWxsLCJ0ZWFtX2lkIjpudWxsfSwiaWQiOjEyNiwia2luZCI6IndvcmsiLCJ1cGRhdGVkX2F0IjoiMjAyNi0wOS0zMFQxMjowMDowMCswMDowMCIsInYiOjF9",
+      "schema_version": 1,
+      "total": 24
+    }
+  },
+  "unknown": {
+    "endpoint": "/api/v1/factory/work-items",
+    "http_status": 200,
+    "method": "GET",
+    "query": {
+      "category": "unknown",
+      "limit": 1
+    },
+    "response": {
+      "counts": {
+        "active": 0,
+        "attention": 0,
+        "finished": 0,
+        "queued": 0,
+        "review": 0,
+        "total": 12,
+        "unknown": 12
+      },
+      "filters": {
+        "category": "unknown",
+        "provider": null,
+        "scope_id": null,
+        "team_id": null
+      },
+      "generated_at": "2026-09-30T12:00:00Z",
+      "has_more": true,
+      "items": [
+        {
+          "actions": [
+            {
+              "block_code": "not_escalated",
+              "name": "retry",
+              "reason": "Only escalated work can be retried.",
+              "required_actor": "leader",
+              "state": "blocked"
+            },
+            {
+              "block_code": "unknown",
+              "name": "resume_attempt",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "operator",
+              "state": "unknown"
+            },
+            {
+              "block_code": "unknown",
+              "name": "escalate_attempt",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "operator",
+              "state": "unknown"
+            },
+            {
+              "block_code": "unknown",
+              "name": "cancel_continuation_request",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "owner",
+              "state": "unknown"
+            },
+            {
+              "block_code": "unknown",
+              "name": "cancel_active_revision",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "operator",
+              "state": "unknown"
+            },
+            {
+              "block_code": "unknown",
+              "name": "release_recovery_checkpoint",
+              "reason": "Open attempt recovery to check available actions.",
+              "required_actor": "operator",
+              "state": "unknown"
+            }
+          ],
+          "approver": {
+            "member_id": 1,
+            "slot_id": 1,
+            "source": "explicit_assignment"
+          },
+          "approver_session": {
+            "agent_status": {
+              "activity_reason": "no_current_binding",
+              "activity_state": "unknown",
+              "checked_at": "2026-09-30T12:00:00Z",
+              "idle_since": null,
+              "session_state": "offline",
+              "valid_until": "2026-09-30T12:00:15Z",
+              "waiting_input": null,
+              "wake_reason": "wake_target_unbound",
+              "wake_state": "cannot_wake"
+            },
+            "bridge_target": null,
+            "observed_provider": null,
+            "state": "offline"
+          },
+          "category": "unknown",
+          "item": {
+            "active_scope_revision": 0,
+            "active_scope_status": null,
+            "approval_round_count": 0,
+            "attempt_phase": "implementation",
+            "checks_unavailable_reason": null,
+            "checks_unavailable_since": null,
+            "created_at": "2026-09-30T12:00:00Z",
+            "diagnostic_retry_count": 0,
+            "dispatch_status": "future_status",
+            "github_updated_at": "2026-09-30T12:00:00Z",
+            "id": 132,
+            "issue_number": 132,
+            "issue_title": "Fixture issue 132",
+            "issue_type": "code",
+            "last_verified_sha": null,
+            "pending_approval_kind": null,
+            "pending_approval_status": null,
+            "pr_number": null,
+            "required_ci_unreadable": null,
+            "retry_count": 0,
+            "scope_id": 3,
+            "updated_at": "2026-09-30T12:00:00Z"
+          },
+          "links": {
+            "bridge_target": {
+              "member_id": 2,
+              "session_id": 2,
+              "slot_id": 2,
+              "team_id": 1
+            },
+            "launch_plan": {
+              "slot_id": 1,
+              "team_id": 1
+            },
+            "mail": {
+              "member_id": 2,
+              "slot_id": 2,
+              "team_id": 1
+            }
+          },
+          "owner": {
+            "configured_provider": "codex-cli",
+            "member_id": 2,
+            "name": "Owner",
+            "provider_label": "Codex",
+            "slot_id": 2
+          },
+          "policy": {
+            "continuation_enabled": false,
+            "max_approval_rounds": 3,
+            "max_verification_retries": 2,
+            "merge_policy": "human"
+          },
+          "repository": {
+            "display_name": "fixture/paused",
+            "github": {
+              "name": "paused",
+              "owner": "fixture"
+            },
+            "scope_id": 3
+          },
+          "session": {
+            "agent_status": {
+              "activity_reason": "no_current_binding",
+              "activity_state": "unknown",
+              "checked_at": "2026-09-30T12:00:00Z",
+              "idle_since": null,
+              "session_state": "online",
+              "valid_until": "2026-09-30T12:00:15Z",
+              "waiting_input": null,
+              "wake_reason": "wake_target_unbound",
+              "wake_state": "cannot_wake"
+            },
+            "bridge_target": {
+              "member_id": 2,
+              "session_id": 2,
+              "slot_id": 2,
+              "team_id": 1
+            },
+            "observed_provider": "codex-cli",
+            "state": "bound"
+          },
+          "team": {
+            "id": 1,
+            "name": "Fixture team 1"
+          },
+          "waiting": {
+            "actor": "unknown",
             "reason_code": "unknown",
             "summary": "State needs inspection."
           },
           "workspace": null
         }
       ],
-      "next_cursor": "eyJmaWx0ZXJzIjp7ImNhdGVnb3J5IjoidW5rbm93biIsInByb3ZpZGVyIjpudWxsLCJzY29wZV9pZCI6bnVsbCwidGVhbV9pZCI6bnVsbH0sImlkIjoxMzAsImtpbmQiOiJ3b3JrIiwidXBkYXRlZF9hdCI6IjIwMjYtMDktMzBUMTI6MDA6MDArMDA6MDAiLCJ2IjoxfQ",
+      "next_cursor": "eyJmaWx0ZXJzIjp7ImNhdGVnb3J5IjoidW5rbm93biIsInByb3ZpZGVyIjpudWxsLCJzY29wZV9pZCI6bnVsbCwidGVhbV9pZCI6bnVsbH0sImlkIjoxMzIsImtpbmQiOiJ3b3JrIiwidXBkYXRlZF9hdCI6IjIwMjYtMDktMzBUMTI6MDA6MDArMDA6MDAiLCJ2IjoxfQ",
       "schema_version": 1,
-      "total": 13
+      "total": 12
     }
   }
 }

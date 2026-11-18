@@ -142,6 +142,10 @@ async def end_stopped_item(db, item, scope, request, *, actor, before_commit=Non
             .execution_options(synchronize_session="fetch"))
         if claim.rowcount != 1:
             raise ValueError("end_stopped_item_context_changed")
+        # The release calls this under the acquisition lock. A previous owner write may have
+        # finished while it was waiting, so confirm again before revoking access or editing config.
+        if workspace is not None and await github_workspace_service.delegated_release_blocker(scope, workspace, item):
+            raise ValueError("workspace_not_clean")
 
         await db.execute(update(GithubApprovalRequest).where(
             GithubApprovalRequest.work_item_id == item_id, GithubApprovalRequest.status == "pending")

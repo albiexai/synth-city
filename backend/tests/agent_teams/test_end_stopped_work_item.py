@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 import subprocess
 from types import SimpleNamespace
@@ -63,6 +64,17 @@ def _body(item_id, outcome):
 OPERATOR = {"X-Synth-City-Operator-Token": "test-director"}
 
 
+def _git(path, *args):
+    return subprocess.check_output(["git", "-C", str(path), "-c", "user.name=Test",
+                                    "-c", "user.email=test@example.invalid", *args], text=True).strip()
+
+
+def _git_base(path):
+    _git(path, "init", "-b", "release/test")
+    _git(path, "commit", "--allow-empty", "-m", "Tracked base")
+    _git(path, "update-ref", "refs/remotes/origin/release/test", "HEAD")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["deferred", "superseded"])
 async def test_ending_stopped_work_resolves_attention_and_releases_its_lease(
@@ -120,15 +132,9 @@ async def test_ending_refuses_unauthorized_stale_and_unpublished_work(db, tmp_pa
 
 @pytest.mark.asyncio
 async def test_ending_preserves_a_real_unpublished_commit(db, tmp_path, monkeypatch):
-    def git(*args):
-        return subprocess.check_output(["git", "-C", str(tmp_path), "-c", "user.name=Test",
-                                        "-c", "user.email=test@example.invalid", *args], text=True).strip()
-
-    git("init", "-b", "release/test")
-    git("commit", "--allow-empty", "-m", "Tracked base")
-    git("update-ref", "refs/remotes/origin/release/test", "HEAD")
-    git("commit", "--allow-empty", "-m", "Unpublished work")
-    unpublished = git("rev-parse", "HEAD")
+    _git_base(tmp_path)
+    _git(tmp_path, "commit", "--allow-empty", "-m", "Unpublished work")
+    unpublished = _git(tmp_path, "rev-parse", "HEAD")
     preset, _, item, workspace = await _stopped(db, tmp_path)
     url = f"/presets/{preset.id}/work-items/{item.id}/end-stopped"
     async with _api(db, monkeypatch) as client:
@@ -137,7 +143,33 @@ async def test_ending_preserves_a_real_unpublished_commit(db, tmp_path, monkeypa
     await db.refresh(workspace)
     await db.refresh(item)
     assert workspace.leased_item_id == item.id and item.dispatch_status == "escalated"
-    assert git("rev-parse", "HEAD") == unpublished
+    assert _git(tmp_path, "rev-parse", "HEAD") == unpublished
+
+
+@pytest.mark.asyncio
+async def test_release_rechecks_unpublished_work_under_the_release_lock(db, tmp_path, monkeypatch):
+    _git_base(tmp_path)
+    preset, _, item, workspace = await _stopped(db, tmp_path)
+    original_lock = github_workspace_service.config_lock
+    revoke = AsyncMock()
+    monkeypatch.setattr(github_workspace_service, "revoke_push_token", revoke)
+
+    @asynccontextmanager
+    async def lock(workspace_id):
+        async with original_lock(workspace_id):
+            _git(tmp_path, "commit", "--allow-empty", "-m", "Owner write finished before the lock")
+            yield
+
+    monkeypatch.setattr(github_workspace_service, "config_lock", lock)
+    url = f"/presets/{preset.id}/work-items/{item.id}/end-stopped"
+    async with _api(db, monkeypatch) as client:
+        response = await client.post(url, json=_body(item.id, "deferred"), headers=OPERATOR)
+    assert response.status_code == 409 and response.json()["detail"] == "workspace_not_clean"
+    assert _git(tmp_path, "rev-list", "--count", "origin/release/test..HEAD") == "1"
+    revoke.assert_not_awaited()
+    await db.refresh(item)
+    await db.refresh(workspace)
+    assert item.dispatch_status == "escalated" and workspace.leased_item_id == item.id
 
 
 @pytest.mark.asyncio

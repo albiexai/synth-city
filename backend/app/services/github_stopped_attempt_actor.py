@@ -19,6 +19,7 @@ class StoppedAttemptStep(Enum):
     DECIDE = ("leader", "decide")
     ACKNOWLEDGE = ("owner", "acknowledge")
     RETRY = ("leader", "retry")
+    RECONCILE_PLAN = ("leader", "reconcile_plan")
 
     @property
     def actor(self) -> str:
@@ -81,5 +82,10 @@ def stopped_attempt_step(
         return StoppedAttemptStep.PAUSED
     if continuation is not None:
         return continuation
+    if pending is not None and pending.dispatch_nonce != item.dispatch_nonce:
+        pending = None
+    if (item.escalation_reason == "plan_blocked" and pending is None and item.active_scope_revision == 0
+            and not _bound_revision(item, revision)):
+        return StoppedAttemptStep.RECONCILE_PLAN
     eligible = github_dispatch_service.retry_eligibility(item, pending_approval=pending is not None)
     return StoppedAttemptStep.RETRY if eligible.allowed else StoppedAttemptStep.INSPECT

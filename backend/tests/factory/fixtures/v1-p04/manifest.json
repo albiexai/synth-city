@@ -1,14 +1,14 @@
 {
   "artifact_sha256": {
     "errors.json": "e43899ff499409803e28ba4b005d408602aeb231a708d0b4d5f9dfbbb58c3a52",
-    "mapping.json": "b864f58be9d6dc3dee37d009ac52c9f2dbf8c752eb8e39665ca8245e5bdb1923",
-    "overview.json": "d6da0628ef53273fe1d072b39dbf882584685cdf2cc7941ac49071dd262f7680",
+    "mapping.json": "69cf09bc7a360b1af0494e1b0b4fdad4a8bc1891097ddd925b3bb03987fa1d70",
+    "overview.json": "34e66a5088c84a05387f24342613491a9d12daecfb052491e55117e9c32d8ce2",
     "protected-errors.json": "dd54587e32b53c33ddde27b43bcd8be413662cc2153bf4dfba5a9e93be518151",
     "repositories.json": "1749e1b194b71859891d28adf7d1c2e8683ef0c6ac0ab7000b27fce00e6d9559",
     "repository.json": "0bb10513a04713b1ffefb5897bd765c1b5bea8596e50f3f968913bf02cde61d1",
     "schema.json": "07f00e8356522bf03dbb85e046427a68af8ba7e46f4074225b743f949c21d8e1",
-    "work-item.json": "c6533ed8ddf63c3ecffe0ce03f7b49b041a180a8b1c8db476f19ba057b4a76be",
-    "work-items.json": "a5b1a85120bd44111ec4d27fe5229b319f88ff269869223ca11eb950e82738b7"
+    "work-item.json": "ba713420ead57087452516666cc22fc0c9ea295f91fb9e64153321bbe53d37cf",
+    "work-items.json": "08edf91dc5528abb85fc045b5d9e96e65732157d444b7f13d8a035cd005edf64"
   },
   "artifact_source": "current working tree; historical review fields do not approve regenerated artifacts",
   "based_on_p01_manifest_sha256": "b17dea10bb7c2f9ac2047c35f5921b9adb0dacc85b71fdc700849913471d9706",

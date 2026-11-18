@@ -228,6 +228,10 @@ only after the team's verifier slot has accepted its exact current head; the ite
 owner and the Leader cannot supply that acceptance. Passing checks do not prove independent
 review acceptance. Check the current PR head and review evidence before merging.
 
+When you move an issue to another milestone, end its work item as deferred and
+name the target milestone. The team learns about the move from this action until
+milestone routing is available. [#1223](https://github.com/albiexai/synth-city/issues/1223)
+
 ### Observation limits
 
 The initial adapter supports Codex CLI sessions with an explicit resume UUID and

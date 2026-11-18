@@ -100,6 +100,7 @@ _STOPPED_PROGRESS = {
     StoppedAttemptStep.DECIDE: ("plan_review", "Review the pending continuation through the supported approval process."),
     StoppedAttemptStep.ACKNOWLEDGE: ("intervention", "Acknowledge the delivered continuation through the supported process."),
     StoppedAttemptStep.RETRY: ("intervention", "Assess retry using the existing eligibility and recovery checks."),
+    StoppedAttemptStep.RECONCILE_PLAN: ("intervention", "Reconcile the blocked plan and check the permitted recovery actions."),
 }
 
 

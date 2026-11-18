@@ -297,7 +297,9 @@ async def test_pr_guard_ignores_other_items_and_keeps_team_coverage(db, world, c
 @pytest.mark.asyncio
 async def test_pr_guard_preserves_global_hold_waits_and_unknown_coverage(db, world, monkeypatch):
     service, full = await _service(db, world, monkeypatch)
-    full = full.model_copy(update={"coverage_complete": False, "hold_code": "hold"})
+    full = full.model_copy(update={"coverage_complete": False, "hold_code": "hold",
+                                  "valid_until": datetime.now(timezone.utc) + timedelta(seconds=30)})
+    monkeypatch.setattr("app.services.agent_team_summary_service.hold_code", lambda: "hold")
 
     async def summary(db, preset_id):
         return full
@@ -308,6 +310,38 @@ async def test_pr_guard_preserves_global_hold_waits_and_unknown_coverage(db, wor
     assert scoped.waiting_input == full.waiting_input
     assert [row.code for row in scoped.attention] == ["attempt_stopped", "human_review", "hold"]
     assert [row.kind for row in scoped.human_actions] == ["review_pr", "pilot_decision"]
+
+
+@pytest.mark.asyncio
+async def test_pr_guard_rechecks_hold_after_binding_an_unbound_action(db, world, monkeypatch):
+    service, full = await _service(db, world, monkeypatch)
+    unbound = full.human_actions[1].model_copy(update={"work_item_id": None})
+    full = full.model_copy(update={"coverage_complete": True, "waiting_input": [], "hold_code": None,
+                                  "valid_until": datetime.now(timezone.utc) + timedelta(seconds=30),
+                                  "human_actions": [unbound], "attention": []})
+    hold = None
+    original_execute = db.execute
+    summary_returned = False
+
+    async def summary(db, preset_id):
+        nonlocal summary_returned
+        summary_returned = True
+        return full
+
+    async def execute(statement, *args, **kwargs):
+        nonlocal hold
+        result = await original_execute(statement, *args, **kwargs)
+        if summary_returned:
+            hold = "hold"
+        return result
+
+    monkeypatch.setattr(service, "summary", summary)
+    monkeypatch.setattr(db, "execute", execute)
+    monkeypatch.setattr("app.services.agent_team_summary_service.hold_code", lambda: hold)
+    scoped = await service.for_work_item(db, world.ids["team"], world.items["i1"])
+    assert scoped.human_actions == []
+    assert scoped.hold_code == "hold" and not scoped.coverage_complete
+    assert scoped.waiting_input is None
 
 
 @pytest_asyncio.fixture
