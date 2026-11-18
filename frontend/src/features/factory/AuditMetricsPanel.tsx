@@ -689,8 +689,11 @@ export function AuditMetricsPage() {
                     <td className="p-2">{sample.excluded_count}</td>
                     <td className="p-2 wrap-break-word">{notes.coverage[sample.name]}</td>
                     <td className="p-2">
-                      {(notes.refs[sample.name] ?? []).map((ref) => (
-                        <a key={ref} href={`#metric-note-${ref}`} className="mr-1 text-primary underline">{ref}</a>
+                      {(notes.refs[sample.name] ?? []).map((ref, index) => (
+                        <span key={ref}>
+                          {index > 0 && ", "}
+                          <a href={`#metric-note-${ref}`} className="text-primary underline">{ref}</a>
+                        </span>
                       ))}
                     </td>
                   </tr>
