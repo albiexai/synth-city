@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import JSON, delete, exists, insert, literal, select, true, update
+from sqlalchemy import JSON, and_, delete, exists, insert, literal, select, true, update
 from sqlalchemy.orm import aliased
 from sqlalchemy.exc import IntegrityError
 
@@ -22,7 +22,7 @@ from app.models.database import (
     AgentTeamPreset, AgentTeamSlot, FactoryAuditEvent, GithubMaintenanceEvent, GithubAttemptScopeRevision, GithubOwnerObservationPause, GithubWorkItem,
     GithubWorkspace, MailAgentSession, MailExternalActor, MailMessage, MailReceipt, TeamGithubScope,
 )
-from app.models.api_model import naive_utc_confirmation
+from app.models.api_model import naive_utc_confirmation, utc_datetime
 from app.services import factory_audit_service as audit
 from app.services.agent_mail_service import agent_mail_service
 from app.services.github_approval_service import (
@@ -458,6 +458,36 @@ async def _settle_release_claim(db, ctx, operation_id, attempt, *, inherited, st
     await db.commit()
     if reverted.rowcount == 1:
         await _unclaim(db, "release", ctx, operation_id, workspace_id=workspace_id, leased_at=leased_at)
+
+
+class WorkspaceReleaseContext(BaseModel):
+    work_item_id: int
+    workspace_id: int
+    leased_at: datetime
+
+
+async def release_workspace_context(db, item, session) -> WorkspaceReleaseContext:
+    """Read the identity the Leader must confirm when releasing a terminal lease."""
+    scope, _, _, _ = await _authorize(db, item, session)
+    item_id = item.id
+    row = (await db.execute(
+        select(GithubWorkItem.dispatch_status, GithubWorkspace.id.label("workspace_id"), GithubWorkspace.leased_at)
+        .outerjoin(GithubWorkspace, and_(
+            GithubWorkspace.leased_item_id == GithubWorkItem.id,
+            GithubWorkspace.scope_id == GithubWorkItem.scope_id,
+            GithubWorkspace.lease_token.is_not(None),
+        ))
+        .where(GithubWorkItem.id == item_id, GithubWorkItem.scope_id == scope.id)
+    )).one_or_none()
+    if row is None:
+        raise LeaderRecoveryError("recovery_context_changed")
+    if row.dispatch_status not in TERMINAL_ITEMS:
+        raise LeaderRecoveryError("item_not_terminal")
+    if row.workspace_id is None or row.leased_at is None:
+        raise LeaderRecoveryError("workspace_lease_changed")
+    return WorkspaceReleaseContext(
+        work_item_id=item_id, workspace_id=row.workspace_id, leased_at=utc_datetime(row.leased_at),
+    )
 
 
 async def release_workspace(db, item, session, *, workspace_id, expected_leased_at, operation_id, reason):

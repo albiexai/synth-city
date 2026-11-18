@@ -14,6 +14,26 @@ def test_mcp_shim_imports_without_app_package_dependency():
     assert callable(shim.synth_city_whoami)
 
 
+def test_work_item_context_reads_the_leader_release_lease_on_request(monkeypatch):
+    import mcp_shim.agent_mail_server as shim
+
+    calls = []
+    context = {"work_item_id": 7, "workspace_id": 3, "leased_at": "2026-11-17T18:11:59.123456+00:00"}
+    monkeypatch.setattr(shim, "_ensure_registered", lambda: {"ok": True})
+
+    def request(method, path):
+        calls.append((method, path))
+        return {"ok": True, "data": context}
+
+    monkeypatch.setattr(shim, "_dispatch_request", request)
+    assert shim.synth_city_get_work_item_context(7, leader_release=True) == {"ok": True, "context": context}
+    assert shim.synth_city_get_work_item_context(7)["ok"]
+    assert calls == [
+        ("GET", "/github-work-items/7/leader-recovery/release-workspace/context"),
+        ("POST", "/github-work-items/7/claim-continuation"),
+    ]
+
+
 def test_remaining_summary_uses_authenticated_context_and_makes_no_writes(monkeypatch):
     import mcp_shim.agent_mail_server as shim
     from mcp_shim.work_remaining_protocol import parse_report

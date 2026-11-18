@@ -1007,7 +1007,7 @@ def _git(env, *args, cwd=None):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pull_state", ["merged", "open"])
+@pytest.mark.parametrize("pull_state", ["merged", "open", "closed_unmerged"])
 async def test_release_accepts_clean_pushed_pr_head_outside_stale_base(
     db, tmp_path, monkeypatch, pull_state
 ):
@@ -1045,6 +1045,8 @@ async def test_release_accepts_clean_pushed_pr_head_outside_stale_base(
     scope.github_auth_mode = "ambient"
     item.pr_number = 42
     item.dispatch_head_ref = "deck/test-attempt"
+    if pull_state == "closed_unmerged":
+        item.dispatch_status = "completed"
     workspace = GithubWorkspace(
         scope_id=scope.id, path=str(worktree), kind="worktree", leased_item_id=item.id
     )
@@ -1058,7 +1060,7 @@ async def test_release_accepts_clean_pushed_pr_head_outside_stale_base(
     async def get_pull(*_args, **_kwargs):
         return {
             "state": "open" if pull_state == "open" else "closed",
-            "merged_at": None if pull_state == "open" else "2026-09-29T08:46:06Z",
+            "merged_at": "2026-09-29T08:46:06Z" if pull_state == "merged" else None,
             "head": {
                 "sha": pushed_sha,
                 "ref": "deck/test-attempt",
@@ -1071,6 +1073,11 @@ async def test_release_accepts_clean_pushed_pr_head_outside_stale_base(
     )
     service = GithubWorkspaceService()
     assert await service.release_blocker(scope, workspace, item) is None
+
+    if pull_state == "closed_unmerged":
+        item.dispatch_status = "escalated"
+        assert "not the pushed head" in await service.release_blocker(scope, workspace, item)
+        item.dispatch_status = "completed"
 
     (worktree / "change.txt").write_text("not committed\n")
     assert "uncommitted" in await service.release_blocker(scope, workspace, item)
@@ -1117,6 +1124,39 @@ async def test_release_refuses_unverifiable_or_unrelated_pr_head(db, tmp_path, m
     monkeypatch.setattr(
         "app.services.github_workspace_service.github_client.get_pull", unrelated_pull
     )
+    assert "not the pushed head" in await service.release_blocker(scope, workspace, item)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_proof", ["head", "branch", "repository", "merge_state"])
+async def test_completed_release_requires_exact_closed_pr_proof(db, tmp_path, monkeypatch, bad_proof):
+    scope, _, item = await _context(db, tmp_path / "repo")
+    item.pr_number = 42
+    item.dispatch_head_ref = "deck/test-attempt"
+    item.dispatch_status = "completed"
+    workspace = GithubWorkspace(scope_id=scope.id, path=str(tmp_path / "worktree"), kind="worktree")
+    runner = FakeGitRunner()
+    runner.statuses[workspace.path] = ""
+    runner.rev_counts[workspace.path] = "2"
+    runner.identities[workspace.path] = ("a" * 40,)
+    pull = {
+        "state": "closed", "merged_at": None,
+        "head": {"sha": "a" * 40, "ref": item.dispatch_head_ref, "repo": {"full_name": "owner/repo"}},
+    }
+    if bad_proof == "head":
+        pull["head"]["sha"] = "b" * 40
+    elif bad_proof == "branch":
+        pull["head"]["ref"] = "deck/other-attempt"
+    elif bad_proof == "repository":
+        pull["head"]["repo"] = {"full_name": "fork/repo"}
+    else:
+        del pull["merged_at"]
+
+    async def get_pull(*_args, **_kwargs):
+        return pull
+
+    monkeypatch.setattr("app.services.github_workspace_service.github_client.get_pull", get_pull)
+    service = GithubWorkspaceService(runner=runner)
     assert "not the pushed head" in await service.release_blocker(scope, workspace, item)
 
 

@@ -432,12 +432,17 @@ export const manifest = [
   },
   {
     "name": "synth_city_get_work_item_context",
-    "description": "Claim the current owner's continuation context, including the persisted\n    branch, approval round, workspace, and lease capability after a handoff or\n    session restart.",
+    "description": "Claim the current owner's continuation context, including the persisted\n    branch, approval round, workspace, and lease capability after a handoff or\n    session restart.\n\n    Set leader_release=True for a read-only Leader context on a terminal item.\n    Use the returned workspace_id and leased_at as expected_leased_at for\n    synth_city_leader_release_workspace.\n    ",
     "inputSchema": {
       "properties": {
         "work_item_id": {
           "title": "Work Item Id",
           "type": "integer"
+        },
+        "leader_release": {
+          "default": false,
+          "title": "Leader Release",
+          "type": "boolean"
         }
       },
       "required": [
@@ -647,7 +652,7 @@ export const manifest = [
   },
   {
     "name": "synth_city_leader_release_workspace",
-    "description": "Current Leader releases a CLEAN workspace of a terminal item.\n\n    Refused when the tree is dirty, has unpushed commits or cannot be inspected, when the item is not\n    terminal, or when the lease changed. Dirty or unknown state is operator-only. One notice to the\n    bound Supervisor; replay-safe.\n    ",
+    "description": "Current Leader releases a CLEAN workspace of a terminal item.\n\n    Read workspace_id and leased_at with synth_city_get_work_item_context(leader_release=True).\n    Refused when the tree is dirty, has unpushed commits or cannot be inspected, when the item is not\n    terminal, or when the lease changed. Dirty or unknown state is operator-only. One notice to the\n    bound Supervisor; replay-safe.\n    ",
     "inputSchema": {
       "properties": {
         "work_item_id": {

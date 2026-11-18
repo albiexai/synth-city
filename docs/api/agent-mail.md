@@ -324,8 +324,13 @@ and differs from the owner, there is no pause or HOLD, and a Supervisor is bound
 - **Cancel** needs the revision number, nonce and a reason, and cancels one active or submitted revision.
 - **Finalize merged** first reads fresh merge evidence and a digest (`dry_run`, the default in the tool),
   then records the merge only if the digest still matches. It performs no merge and releases nothing.
-- **Release workspace** needs the inspected `leased_at`. The item must be terminal and the tree clean, with no
-  unpushed commits. A dirty, unpushed or unreadable tree is refused and stays an operator action.
+- **Release workspace** uses the `workspace_id` and exact `leased_at` from
+  `synth_city_get_work_item_context(work_item_id, leader_release=True)`
+  (`GET /github-work-items/{id}/leader-recovery/release-workspace/context`). The current Leader
+  passes those values as `workspace_id` and `expected_leased_at`. This read leaves the workspace
+  lease in place and returns only the work item ID, workspace ID, and UTC lease start.
+  Release requires a terminal item and a clean, readable tree. Commits outside the local base must
+  match the head, branch and source repository of the recorded PR, including a closed unmerged PR.
 - **End stopped work** uses the generation and scope revision from `synth_city_list_work_items`. It records
   `deferred` with a target milestone or `superseded` with the delivering merged PR. It releases a verified clean
   lease and clears the stopped item's current attention. See [Maintenance](agent-teams.md#maintenance).
