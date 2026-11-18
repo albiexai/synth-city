@@ -61,8 +61,9 @@ export function OverviewPage() {
   const { states, refresh: refreshSummaries } = useObservations<AgentTeamSummary>(
     needsFilter ? [] : presets.map((preset) => `agent-teams/presets/${preset.id}/summary`),
   );
+  // A scoped read waits for the names, so a scope value that no repository has is never sent.
   const { states: needsStates, refresh: refreshNeeds } = useObservations<AgentTeamSummary>(
-    needsFilter ? matching.map((preset) => `agent-teams/presets/${preset.id}/summary?${needsFilter}`) : [],
+    needsFilter && ready ? matching.map((preset) => `agent-teams/presets/${preset.id}/summary?${needsFilter}`) : [],
   );
   const needsReads = needsFilter ? needsStates : states;
   const summaries = needsReads.map((item) => item.data);
@@ -105,12 +106,14 @@ export function OverviewPage() {
           {!(needsFailed && rows.length === 0) && <NeedsYou rows={rows} loading={summariesLoading} />}
           <CampaignProgress presets={matching} summaries={summaries} />
           <StatusTiles counts={state.data.counts} params={params} />
-          <TeamSummaries
-            teamId={teamId}
-            onOverview
-            filterQuery={needsFilter}
-            onlyIds={needsFilter ? matching.map((preset) => preset.id) : null}
-          />
+          {(!needsFilter || ready) && (
+            <TeamSummaries
+              teamId={teamId}
+              onOverview
+              filterQuery={needsFilter}
+              onlyIds={needsFilter ? matching.map((preset) => preset.id) : null}
+            />
+          )}
           <ActiveWork query={query} viewAll={workLink(params, "open")} />
           <details className={`${panel} space-y-2 py-3`}>
             <summary className="cursor-pointer font-semibold">Automation details</summary>
