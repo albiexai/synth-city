@@ -131,6 +131,9 @@ def _state(path: Path, uid: int, session_id: str, cwd: str, now: datetime,
     # from observed_at, the activity time, which a kept event must not move.
     last_timestamp = None
     terminal = None
+    # Claude Code writes one row per content block of a message (#1205). terminal stays the first row of the
+    # final message (the settlement identity); terminal_last follows that message's later rows.
+    terminal_message = terminal_last = None
     cursor = None
     for line in lines:
         row = json.loads(line)
@@ -184,6 +187,13 @@ def _state(path: Path, uid: int, session_id: str, cwd: str, now: datetime,
         elif kind == "assistant":
             if not isinstance(message, dict) or message.get("role") != "assistant":
                 return "unknown", "observation_invalid", None
+            if (state == "idle" and terminal is not None and message.get("id") is not None
+                    and message.get("id") == terminal_message and row.get("parentUuid") == terminal_last):
+                # Another content block of the final message, not new activity: keep the completion.
+                if not isinstance(row.get("uuid"), str) or not row["uuid"]:
+                    return "unknown", "observation_invalid", None
+                terminal_last = row["uuid"]
+                continue
             if state != "working":
                 state, reason = "unknown", "native_progress_without_start"
                 terminal = None
@@ -191,7 +201,8 @@ def _state(path: Path, uid: int, session_id: str, cwd: str, now: datetime,
                 if not isinstance(row.get("uuid"), str) or not row["uuid"]:
                     return "unknown", "observation_invalid", None
                 state, reason = "idle", "native_turn_completed"
-                terminal = row["uuid"]
+                terminal = terminal_last = row["uuid"]
+                terminal_message = message.get("id")
             elif message.get("stop_reason") in {"max_tokens", "refusal"}:
                 state, reason = "idle", "native_turn_interrupted"
                 terminal = None
@@ -199,7 +210,7 @@ def _state(path: Path, uid: int, session_id: str, cwd: str, now: datetime,
                 reason = "native_progress"
         else:
             # Duration is a second record for the same end_turn, not a new settlement.
-            if state != "idle" or terminal is None or row.get("parentUuid") != terminal:
+            if state != "idle" or terminal is None or row.get("parentUuid") != terminal_last:
                 state, reason, terminal = "unknown", "completion_unconfirmed", None
                 observed_at = timestamp
             continue

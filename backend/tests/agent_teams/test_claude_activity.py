@@ -511,3 +511,39 @@ def test_claude_a_kept_event_with_the_same_time_as_the_last_real_event_is_in_ord
     result, _ = _observed(native, records[:4] + [same_time])
 
     assert _view(result) == _view(plain)
+
+
+def _split_final_message(native, *, second_message_id="msg-final"):
+    """The final message written as two rows, one per content block (#1205, Claude Code 2.1.292)."""
+    thinking = native["row"]("assistant", -1, message={
+        "id": "msg-final", "role": "assistant", "stop_reason": "end_turn", "content": [{"type": "thinking"}]})
+    text = native["row"]("assistant", -.8, parentUuid=thinking["uuid"], message={
+        "id": second_message_id, "role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text"}]})
+    duration = native["row"]("system", -.5, subtype="turn_duration", parentUuid=text["uuid"])
+    native["write"]([native["user"], native["tool"], native["result"], thinking, text, duration])
+
+
+def test_claude_final_message_split_into_rows_settles_idle(native):
+    _split_final_message(native)
+    metadata = {}
+    result = native["observe"](provenance=metadata)
+    assert (result.state, result.reason) == ("idle", "native_turn_completed")
+    assert metadata["event_source"] == "claude_end_turn"
+
+
+def test_claude_end_turn_from_another_message_cannot_continue_a_settled_turn(native):
+    _split_final_message(native, second_message_id="msg-other")
+    assert native["observe"]().state != "idle"
+
+
+def test_claude_split_final_message_keeps_one_settlement_identity(native):
+    # Reading between the two rows and after them must name the same completion (no double settlement).
+    thinking = native["row"]("assistant", -1, message={
+        "id": "msg-final", "role": "assistant", "stop_reason": "end_turn", "content": [{"type": "thinking"}]})
+    text = native["row"]("assistant", -.8, parentUuid=thinking["uuid"], message={
+        "id": "msg-final", "role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text"}]})
+    head = [native["user"], native["tool"], native["result"], thinking]
+    first, second = {}, {}
+    native["write"](head); native["observe"](provenance=first)
+    native["write"](head + [text]); native["observe"](provenance=second)
+    assert first["event_id"] == second["event_id"]
