@@ -30,7 +30,7 @@ export function RepositoryTable({ rows }: { rows: RepositoryProjection[] }) {
   const roster = useObservation<AgentTeamPresetListResponse>("agent-teams/presets");
   const teams = new Map(roster.error ? [] : roster.data?.presets.map((team) => [team.id, team]));
   return (
-    <div className="overflow-x-auto rounded-lg border">
+    <div className="relative overflow-x-auto rounded-lg border">
       <table className="w-full min-w-[720px] table-fixed text-left text-sm">
         <caption className="sr-only">Repositories that Synth City watches</caption>
         <thead className="bg-muted">
