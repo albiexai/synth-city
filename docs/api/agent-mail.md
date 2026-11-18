@@ -238,9 +238,16 @@ Rules, each with a code the server also uses:
 - **Limits:** paths, commands and failed heads per revision, from the scope (`continuation_path_limit_exceeded`, `continuation_command_limit_exceeded`, `continuation_failed_head_limit_exceeded`); an empty summary or the reserved companion trailer in a summary.
 - **Initial plan:** `plan_metadata.allowed_paths` must be a non-empty list of closed file paths (`plan_allowed_paths_missing`); later amendments read it. Reserved keys are refused.
 - **Stale authority:** unread stop, hold or decision Mail for the owner (`unread_authority_mail`, which names only the message id).
-- **Estimate:** an optional `estimate_active_minutes` (a number, or an object with `high` and optionally `low`) is compared with the current authority window. Today that window is the one fixed expiry every revision gets (`github_continuation_proposal_expiry_seconds`, 60 minutes). An upper bound above it is `estimate_exceeds_window`; within 10 minutes of it is a warning, `estimate_near_window`; an unusable value is `estimate_invalid`. The estimate is never stored. The item ceiling, a scope maximum window and an estimate-derived window are not part of this check yet (#938).
+- **Estimate:** an optional `estimate_active_minutes` (a number, or an object with `high` and optionally `low`) is compared with the scope's `max_item_effort_minutes` (default 120). An upper bound above it is `estimate_exceeds_window`; within 10 minutes of it is a warning, `estimate_near_window`; an unusable value is `estimate_invalid`. Preflight never stores the estimate; approval turns it into the item's effort limit (see [Effort limits and extensions](#effort-limits-and-extensions)). The one-hour proposal expiry (`github_continuation_proposal_expiry_seconds`) only bounds the path from proposal to activation and does not judge an estimate.
 
 The continuation and amendment submit routes run the same checks and refuse with the same first code and status as before, so a request that passes preflight is not refused for these rules. Rules that need stored state, such as budgets, a pending request or the repository head, are still checked only when you submit.
+
+## Effort limits and extensions
+
+- `POST /api/v1/agent-mail/effort-extensions` takes a Mail session of the item's current Leader. The body has `work_item_id`, `dispatch_nonce`, `minutes` (a whole number, at most the step cap), `expected_extension_minutes` (the extension total the Leader saw), `reason` and `evidence`. The MCP tool is `synth_city_extend_effort_limit`.
+- A refusal's `detail` is one code: `effort_extension_stale`, `not_item_leader`, `extension_reason_required`, `extension_evidence_required`, `expected_extension_minutes_required`, `effort_limit_not_set`, `extension_exceeds_cap`, `effort_extension_total_changed`, `extension_exceeds_ceiling`, `effort_extension_not_acknowledged`, `effort_extension_paused` or `effort_extension_no_recent_activity`.
+- At approval an estimate over the ceiling is refused with `effort_estimate_exceeds_ceiling`, and an unreadable estimate with `effort_estimate_invalid`.
+- The scope setting is `max_item_effort_minutes`, changed with `PATCH /api/v1/agent-teams/github-scopes/{scope_id}` (operator token). It accepts 15 to 1440 and defaults to 120.
 
 ## Healthy scope amendments and submitted review settlement
 
@@ -249,6 +256,8 @@ The owner requests `POST /github-work-items/{id}/scope-amendments` with the same
 proposal fields as a continuation, with `phase: implementation`. The server assigns immutable
 `origin_kind: scope_amendment`; ordinary continuations retain their escalation and PR requirements.
 The corresponding MCP tool is `synth_city_request_scope_amendment`.
+
+`allowed_paths` is the amendment's whole effective path set: name every approved path you keep as well as the new ones, because completion checks changed files against exactly this list. List each approved path you deliberately drop in the optional `withdrawn_paths`. If approved paths are missing and `withdrawn_paths` doesn't list exactly those, the request is refused before anything is stored: `409 amendment_base_paths_omitted` when nothing is withdrawn, `409 amendment_withdrawn_paths_invalid` otherwise. Companion paths count as named. Existing revisions keep the allowed paths they were approved with.
 
 A healthy amendment works before a PR exists. It reads the assigned branch's committed head
 and tree without discarding held edits. Its path baseline must come from structured approved

@@ -1,6 +1,7 @@
 /**
  * TypeScript types for session transcripts
  */
+import type { HarnessReadScope } from './harnessScope'
 
 export interface ContentBlock {
   type: string
@@ -67,6 +68,7 @@ export interface SessionListResponse {
 export interface SessionProjectListResponse {
   projects: SessionProject[]
   total_sessions: number
+  scope?: HarnessReadScope | null
 }
 
 export interface SessionDetailResponse {

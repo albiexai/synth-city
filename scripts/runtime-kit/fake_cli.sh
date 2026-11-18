@@ -71,6 +71,13 @@ if [[ "${RUNTIME_KIT_TEST_FAULT:-}" == cli_grandchild ]]; then
     _ "$state" </dev/null >/dev/null 2>&1 &
 fi
 
+if [[ "${RUNTIME_KIT_TEST_FAULT:-}" == cli_separate_session ]]; then
+  # Outlive the down deadline so natural exit cannot satisfy the teardown proof.
+  # shellcheck disable=SC2016 # expanded by the child shell
+  setsid bash -c 'printf "%s\n" "$$" >"$1/daemon-pid.tmp"; mv "$1/daemon-pid.tmp" "$1/daemon-pid"; exec -a "$1/setsid-daemon" sleep 45' \
+    _ "$state" </dev/null >/dev/null 2>&1 &
+fi
+
 export FAKE_CLI_NAME="$name"
 # shellcheck disable=SC2016 # expanded by the inner shell
 exec -a "$name" "$BASH" -c 'echo "$FAKE_CLI_NAME runtime-kit fake ready"; while IFS= read -r line; do printf "%s\n" "$line"; done'

@@ -77,7 +77,13 @@ def current_scope(data_dir: Path | None = None) -> ScopeInfo:
             readable = os.access(claude_dir if exists else home, os.R_OK | os.X_OK)
     except OSError:
         exists, readable = False, False
-    return ScopeInfo(user=user, claude_dir=str(claude_dir), exists=exists, readable=readable)
+    return ScopeInfo(
+        user=user,
+        claude_dir=str(claude_dir),
+        exists=exists,
+        readable=readable,
+        data_dir=str(data_dir) if data_dir is not None else None,
+    )
 
 
 @router.get("/harness-scope", response_model=HarnessScopeResponse)

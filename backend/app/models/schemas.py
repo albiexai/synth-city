@@ -1177,6 +1177,8 @@ class ScopeInfo(BaseModel):
     claude_dir: str
     exists: bool
     readable: bool
+    # The server-derived folder this view reads. Configured Plans paths remain undisclosed.
+    data_dir: Optional[str] = None
 
 
 class SessionProjectListResponse(BaseModel):
@@ -2115,6 +2117,8 @@ class GithubContinuationProposalCreate(BaseModel):
 
 class GithubScopeAmendmentCreate(GithubContinuationProposalCreate):
     phase: Literal["implementation"] = "implementation"
+    # #1154: approved base paths the amendment deliberately leaves out. Optional; must equal the omission exactly.
+    withdrawn_paths: List[str] = Field(default_factory=list, max_length=64)
 
 
 class GithubRevisionReviewCreate(BaseModel):
@@ -2214,6 +2218,8 @@ class GithubScopeRevisionResponse(BaseModel):
     allowed_actions: List[str]
     allowed_commands: List[str]
     prohibited_actions: List[str]
+    # #1185: prohibitions bind only while the revision is active or submitted.
+    prohibitions_in_force: bool = False
     tool_fallbacks: Dict[str, Any]
     baseline_head_sha: str
     baseline_tree_sha: str
@@ -2826,6 +2832,14 @@ class TeamGithubScopeUpdate(BaseModel):
     enabled: Optional[bool] = None
 
 
+class GithubRateLimitStatus(BaseModel):
+    reason: Literal["github_rate_limited"] | None
+    remaining: int | None
+    reset_at: datetime | None
+    retry_at: datetime | None
+    observed_at: datetime
+
+
 class TeamGithubScopeResponse(BaseModel):
     id: int
     preset_id: int
@@ -2841,6 +2855,7 @@ class TeamGithubScopeResponse(BaseModel):
     github_auth_mode: str
     github_auth_configured: bool
     github_poll_token_configured: bool
+    github_rate_limit: GithubRateLimitStatus | None = None
     max_approval_rounds: int
     max_concurrent_dispatched: int
     max_verification_retries: int

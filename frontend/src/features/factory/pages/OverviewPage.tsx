@@ -2,7 +2,7 @@ import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { TeamSummaries } from "@/features/agent-teams/TeamSummaryCard";
 import type { AgentTeamPresetListResponse, AgentTeamSummary } from "@/types/agentTeams";
-import type { OverviewResponse } from "@/types/factory";
+import type { OverviewResponse, RepositoryListResponse } from "@/types/factory";
 import { ActiveWork } from "../components/overview/ActiveWork";
 import { CampaignProgress } from "../components/overview/CampaignProgress";
 import { NeedsYou } from "../components/overview/NeedsYou";
@@ -32,13 +32,47 @@ export function OverviewPage() {
   const presets = (presetList.data?.presets ?? []).filter(
     (preset) => !teamId || String(preset.id) === teamId,
   );
+  // Repository and Assigned-harness filters (#1141, #1142). With either one set, Needs you, Progress and the team
+  // cards all read the same separately keyed, filtered summary of each matching team (one request for each team).
+  // Without them the page makes exactly the unfiltered reads it always made.
+  const needsQuery = new URLSearchParams();
+  for (const key of ["scope_id", "provider"]) {
+    const value = params.get(key);
+    if (value) needsQuery.set(key, value);
+  }
+  const needsFilter = needsQuery.toString();
+  // Which teams the filter keeps, without a new wire field: a harness filter needs a slot of that harness, a
+  // repository filter needs the team that owns it (the shared repository list). A list that cannot prove the
+  // owner (not loaded, or longer than one page) keeps every team rather than guess.
+  const repositories = useObservation<RepositoryListResponse>("factory/repositories?limit=100");
+  const scopeFilter = params.get("scope_id");
+  const providerFilter = params.get("provider");
+  const owningTeam =
+    scopeFilter && repositories.data && !repositories.data.has_more
+      ? repositories.data.repositories.find((row) => String(row.scope_id) === scopeFilter)?.team.id
+      : undefined;
+  const matching = needsFilter
+    ? presets.filter(
+        (preset) =>
+          (!providerFilter || preset.slots.some((slot) => slot.provider === providerFilter)) &&
+          (owningTeam === undefined || preset.id === owningTeam),
+      )
+    : presets;
   const { states, refresh: refreshSummaries } = useObservations<AgentTeamSummary>(
-    presets.map((preset) => `agent-teams/presets/${preset.id}/summary`),
+    needsFilter ? [] : presets.map((preset) => `agent-teams/presets/${preset.id}/summary`),
   );
-  const summaries = states.map((item) => item.data);
-  const rows = needsYouRows(presets, summaries);
+  // A scoped read waits for the names, so a scope value that no repository has is never sent.
+  const { states: needsStates, refresh: refreshNeeds } = useObservations<AgentTeamSummary>(
+    needsFilter && ready ? matching.map((preset) => `agent-teams/presets/${preset.id}/summary?${needsFilter}`) : [],
+  );
+  const needsReads = needsFilter ? needsStates : states;
+  const summaries = needsReads.map((item) => item.data);
+  const rows = needsYouRows(matching, summaries);
   const summariesLoading =
-    presetList.data === null || states.some((item) => item.data === null && item.error === null);
+    presetList.data === null || needsReads.some((item) => item.data === null && item.error === null);
+  // A failed read is not an empty list: say so instead of "Nothing needs you right now."
+  // A failed refresh keeps the earlier data and sets the error, so the error alone decides.
+  const needsFailed = needsFilter !== "" && needsStates.some((item) => item.error !== null);
   return (
     <section className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -52,7 +86,7 @@ export function OverviewPage() {
         </div>
         <Button
           variant="outline"
-          onClick={() => void Promise.all([state.refresh(), presetList.refresh(), refreshSummaries()])}
+          onClick={() => void Promise.all([state.refresh(), presetList.refresh(), refreshSummaries(), refreshNeeds()])}
         >
           Refresh
         </Button>
@@ -64,10 +98,22 @@ export function OverviewPage() {
       {state.data && (
         <>
           <StatusLine data={state.data} teams={presetList.data ? presets.length : null} />
-          <NeedsYou rows={rows} loading={summariesLoading} />
-          <CampaignProgress presets={presets} summaries={summaries} />
+          {needsFailed && (
+            <p role="alert" className="rounded-lg border border-destructive px-4 py-2.5 text-sm">
+              Could not read what needs you for these filters. Refresh to try again.
+            </p>
+          )}
+          {!(needsFailed && rows.length === 0) && <NeedsYou rows={rows} loading={summariesLoading} />}
+          <CampaignProgress presets={matching} summaries={summaries} />
           <StatusTiles counts={state.data.counts} params={params} />
-          <TeamSummaries teamId={teamId} onOverview />
+          {(!needsFilter || ready) && (
+            <TeamSummaries
+              teamId={teamId}
+              onOverview
+              filterQuery={needsFilter}
+              onlyIds={needsFilter ? matching.map((preset) => preset.id) : null}
+            />
+          )}
           <ActiveWork query={query} viewAll={workLink(params, "open")} />
           <details className={`${panel} space-y-2 py-3`}>
             <summary className="cursor-pointer font-semibold">Automation details</summary>

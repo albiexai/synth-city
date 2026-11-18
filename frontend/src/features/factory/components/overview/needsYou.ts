@@ -1,4 +1,4 @@
-import { ACTION_TEXT, ATTENTION_TEXT } from "@/features/agent-teams/summaryText";
+import { ACTION_TEXT, ATTENTION_TEXT, escalationReasonLabel } from "@/features/agent-teams/summaryText";
 import { parseReminders, reminderAge, reminderSentence } from "@/features/agent-teams/reminderText";
 import { waitingText } from "@/features/agent-teams/supervisorText";
 import type { AgentTeamPreset, AgentTeamSummary } from "@/types/agentTeams";
@@ -27,10 +27,14 @@ export function needsYouRows(
       (action) => action.state === "requested" || action.state === "context_pending",
     );
     for (const action of actions) {
+      const reason = action.kind === "inspect_attempt" && action.escalation_reason
+        ? escalationReasonLabel(action.escalation_reason)
+        : null;
+      const status = reason ?? (action.state === "context_pending" ? "details pending" : null);
       rows.push({
         key: `${preset.id}-action-${action.kind}-${action.scope_id}-${action.issue_number}`,
         title: `${ACTION_TEXT[action.kind]}${action.pull_request_number ? ` #${action.pull_request_number}` : ""}`,
-        detail: `on #${action.issue_number}${action.state === "context_pending" ? " · details pending" : ""}`,
+        detail: `on #${action.issue_number}${status ? ` · ${status}` : ""}`,
         team: preset.name,
         href: action.work_item_id ? `/work/${action.work_item_id}` : fallback,
         cta: `Open #${action.issue_number}`,

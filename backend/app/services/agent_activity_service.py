@@ -39,11 +39,14 @@ from app.services.pi_activity_service import observe_pi
 from app.services.provider_refusal_notice_service import send_provider_refusal_notices
 from app.services.claude_activity_service import observe_claude
 from app.services.muse_activity_service import discover_muse_session, observe_muse
-from app.services.antigravity_activity_service import discover_antigravity_conversation, observe_antigravity
+from app.services.antigravity_activity_worker import discover_antigravity_conversation, observe_antigravity
 
 logger = logging.getLogger(__name__)
 
 _TAIL_BYTES = 1_048_576
+# A long Codex turn can push its task_started out of the tail (#1201). Read earlier chunks up to this bound.
+_MAX_HISTORY_BYTES = 8 * _TAIL_BYTES
+_CODEX_TURN_BOUNDARIES = {"task_started", "task_complete", "turn_aborted", "error"}
 _MAX_PROCESS_DESCRIPTORS = 256
 _WORK_FRESHNESS_SECONDS = 180
 _STOPPED_STATES = {"T", "t", "Z", "X", "x"}
@@ -331,6 +334,21 @@ def _process_started_at(start: str) -> datetime:
         seconds=1 / ticks_per_second)
 
 
+def _codex_has_turn_boundary(data: bytes, offset: int) -> bool:
+    """Whether the read window holds a Codex turn boundary. The parser below still validates every event."""
+    lines = data.splitlines()
+    for line in lines[1:] if offset else lines:  # the first line can be a partial record
+        if b'"event_msg"' not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            return True  # stop widening; the parser reports the invalid record
+        if record.get("type") == "event_msg" and record.get("payload", {}).get("type") in _CODEX_TURN_BOUNDARIES:
+            return True
+    return False
+
+
 def _native_state(path: Path, session_id: str, cwd: str, now: datetime, started_at: datetime,
                   *, provenance: dict | None = None
                   ) -> tuple[str, str, datetime | None]:
@@ -345,6 +363,20 @@ def _native_state(path: Path, session_id: str, cwd: str, now: datetime, started_
         offset = max(0, size - _TAIL_BYTES)
         stream.seek(offset)
         tail = stream.read(_TAIL_BYTES)
+        # A long turn can push its task_started out of the tail (#1201). Read adjacent earlier
+        # chunks until a turn boundary is in view, within a fixed history bound. Progress alone
+        # still never starts a turn.
+        if tail.endswith(b"\n"):
+            while offset and not _codex_has_turn_boundary(tail, offset):
+                remaining = _MAX_HISTORY_BYTES - len(tail)
+                if remaining <= 0:
+                    break
+                previous = max(0, offset - min(_TAIL_BYTES, remaining))
+                stream.seek(previous)
+                prefix = stream.read(offset - previous)
+                if len(prefix) != offset - previous:
+                    return "unknown", "observation_incomplete", None
+                tail, offset = prefix + tail, previous
     if not tail.endswith(b"\n"):
         return "unknown", "observation_incomplete", None
     lines = tail.splitlines()

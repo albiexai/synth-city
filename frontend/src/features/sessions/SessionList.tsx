@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect } from 'react'
 import { useSessionsApi } from '@/hooks/useSessionsApi'
+import { scopeReadDenial } from '@/types/harnessScope'
 import { SessionCard } from './SessionCard'
 import type { SessionSummary } from '@/types/sessions'
 
@@ -11,30 +12,38 @@ export function SessionList({ projectFolder }: Props) {
   const { listSessions } = useSessionsApi()
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [loading, setLoading] = useState(true)
-
-  const loadSessions = useCallback(async () => {
-    setLoading(true)
-    try {
-      const data = await listSessions({
-        project_folder: projectFolder || undefined,
-        limit: 50,
-        sort_by: 'date',
-        sort_order: 'desc',
-      })
-      setSessions(data.sessions)
-    } catch (err) {
-      console.error('Failed to load sessions:', err)
-    } finally {
-      setLoading(false)
-    }
-  }, [listSessions, projectFolder])
+  const [readError, setReadError] = useState<string | null>(null)
 
   useEffect(() => {
-    loadSessions()
-  }, [loadSessions])
+    let current = true
+    async function loadSessions() {
+      setLoading(true)
+      try {
+        const data = await listSessions({
+          project_folder: projectFolder || undefined,
+          limit: 50,
+          sort_by: 'date',
+          sort_order: 'desc',
+        })
+        if (!current) return
+        setSessions(data.sessions)
+        setReadError(null)
+      } catch (err) {
+        if (current) setReadError(scopeReadDenial(err) ?? 'Could not read sessions.')
+      } finally {
+        if (current) setLoading(false)
+      }
+    }
+    void loadSessions()
+    return () => { current = false }
+  }, [listSessions, projectFolder])
 
   if (loading) {
     return <div className="text-center py-8">Loading sessions...</div>
+  }
+
+  if (readError) {
+    return <p className="py-8 text-center text-sm text-destructive" role="alert">{readError}</p>
   }
 
   if (sessions.length === 0) {

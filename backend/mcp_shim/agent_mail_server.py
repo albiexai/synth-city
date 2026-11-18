@@ -731,8 +731,14 @@ def synth_city_request_scope_amendment(
     max_failed_heads: int,
     tool_fallbacks: dict[str, Any],
     lease_token: str,
+    withdrawn_paths: Optional[list[str]] = None,
 ) -> dict:
-    """Request a bounded healthy scope amendment. Fresh Leader decision and owner activation are required."""
+    """Request a bounded healthy scope amendment. Fresh Leader decision and owner activation are required.
+
+    allowed_paths is the whole effective set: name every approved path you keep, not only the new ones. List each
+    approved path you deliberately drop in withdrawn_paths; otherwise the request is refused with
+    amendment_base_paths_omitted (a wrong withdrawal is amendment_withdrawn_paths_invalid).
+    """
     err = _guard()
     if err:
         return err
@@ -751,6 +757,7 @@ def synth_city_request_scope_amendment(
             "max_failed_heads": max_failed_heads,
             "tool_fallbacks": tool_fallbacks,
             "lease_token": lease_token,
+            "withdrawn_paths": withdrawn_paths or [],
         },
     )
     if not result["ok"]:

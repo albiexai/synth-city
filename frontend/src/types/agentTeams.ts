@@ -117,6 +117,7 @@ export interface TeamSummaryHumanAction {
   source: 'leader' | 'dispatch' | 'unknown'
   assessment_current: boolean
   pull_request_number?: number | null
+  escalation_reason?: string | null
 }
 
 export interface RequiredCIUnreadableSignal {
@@ -202,11 +203,11 @@ export interface UnansweredRequestView {
   omitted_count: number
 }
 
-// A member waits at an interactive screen. Only the fixed reason is on the wire.
+// A member waits at an interactive screen, or is blocked by a provider refusal. Only the fixed reason is on the wire.
 export interface TeamWaitingInput {
   slot_id: number
-  reason: 'question' | 'trust' | 'sign_in'
-  label: 'Waiting for input'
+  reason: 'question' | 'trust' | 'sign_in' | 'provider_refusal'
+  label: 'Waiting for input' | 'Blocked: provider refusal'
 }
 
 // One unanswered-reminder signal (#528). Read it through parseReminders: the wire is not trusted.
@@ -463,6 +464,8 @@ export interface GithubScopeRevision {
   allowed_actions: string[]
   allowed_commands: string[]
   prohibited_actions: string[]
+  /** #1185: true only while the revision is active or submitted. */
+  prohibitions_in_force?: boolean
   tool_fallbacks: Record<string, unknown>
   baseline_head_sha: string
   baseline_tree_sha: string

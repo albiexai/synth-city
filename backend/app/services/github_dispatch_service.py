@@ -154,6 +154,15 @@ ESCALATION_REASONS = frozenset(
     }
 )
 
+
+def restored_escalation_reason(revision) -> str:
+    """The reason an attempt returns to escalation with when its revision ends (#1139).
+
+    A scope amendment starts from a healthy attempt, so its originating reason is empty; the attempt then needs a
+    fresh bounded proposal, which is "plan_blocked", the Leader-cancel path's fallback too. Never empty.
+    """
+    return revision.originating_escalation_reason or "plan_blocked"
+
 PENDING_REASONS = frozenset(
     {
         "queued_repo_cap",
@@ -1913,9 +1922,10 @@ class GithubDispatchService:
                 "This attempt is stopped, terminal or in an unrecognized state. "
                 "Do not make ordinary review corrections under its old approval "
                 "or lease. Escalated attempts require supported recovery; terminal "
-                "attempts require a separately authorized new attempt. This guidance "
-                "does not grant approval, retry or release authority. Respect "
-                "operator pauses and safety holds."
+                "attempts require a separately authorized new attempt. An ended "
+                "revision's prohibited actions no longer apply. Releasing a merged "
+                "item's workspace is never prohibited. This guidance does not grant "
+                "approval or retry authority. Respect operator pauses and safety holds."
             )
         if item is not None and (
             item.active_scope_revision > 0 or item.attempt_phase != "implementation"
@@ -1924,8 +1934,9 @@ class GithubDispatchService:
                 "This attempt uses a scoped or diagnostic continuation. Follow its "
                 "current approved revision, paths, commands and finite budgets. A "
                 "completed revision does not authorize another head; use supported "
-                "continuation recovery if additional work is needed. This guidance "
-                "does not grant approval. Respect operator pauses and safety holds."
+                "continuation recovery if additional work is needed. A revision's "
+                "prohibited actions apply only while it is active or submitted. This "
+                "guidance does not grant approval. Respect operator pauses and safety holds."
             )
         return (
             "ORDINARY PR REVIEW CORRECTIONS: For an initial implementation attempt "
@@ -2577,7 +2588,7 @@ class GithubDispatchService:
             if active_revision is not None:
                 item_update = item_update.values(
                     dispatch_status="escalated",
-                    escalation_reason=active_revision.originating_escalation_reason,
+                    escalation_reason=restored_escalation_reason(active_revision),
                     pending_reason=None,
                     continuation_nudged_at=None,
                     status_note=(

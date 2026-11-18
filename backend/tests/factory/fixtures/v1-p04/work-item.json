@@ -683,7 +683,7 @@
             "block_code": "active_continuation",
             "name": "retry",
             "reason": "Resolve the active continuation before retrying.",
-            "required_actor": "leader",
+            "required_actor": "operator",
             "state": "blocked"
           },
           {
@@ -857,7 +857,7 @@
             "block_code": "not_escalated",
             "name": "retry",
             "reason": "Only escalated work can be retried.",
-            "required_actor": "leader",
+            "required_actor": "operator",
             "state": "blocked"
           },
           {
@@ -1007,8 +1007,8 @@
         },
         "waiting": {
           "actor": "operator",
-          "reason_code": "unknown",
-          "summary": "State needs inspection."
+          "reason_code": "attempt_escalated",
+          "summary": "The attempt is stopped in factory tracking and needs attention."
         },
         "workspace": null
       }
@@ -1336,7 +1336,7 @@
             "block_code": null,
             "name": "retry",
             "reason": "The existing retry state checks permit retry.",
-            "required_actor": "leader",
+            "required_actor": "operator",
             "state": "eligible"
           },
           {
@@ -1641,7 +1641,7 @@
             "block_code": "pr_preserved",
             "name": "retry",
             "reason": "Resolve the preserved PR before retrying.",
-            "required_actor": "leader",
+            "required_actor": "operator",
             "state": "blocked"
           },
           {

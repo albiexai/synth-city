@@ -47,7 +47,8 @@ from app.services.github_ci_watch_service import github_ci_watch_service
 from app.services.github_terminal_revision_service import (
     TerminalRevisionContextChanged, complete_current_revision, lock_terminal_transition,
 )
-from app.services.github_dispatch_service import github_dispatch_service
+from app.services.github_dispatch_service import github_dispatch_service, restored_escalation_reason
+from app.services.github_rate_limit_service import GithubRateLimited
 from app.services.github_recovery_gate import (
     GithubRecoveryOnlyAttempt,
     configured_recovery_only_attempt,
@@ -564,7 +565,7 @@ class GithubVerificationService:
             .where(*item_conditions)
             .values(
                 dispatch_status="escalated",
-                escalation_reason=revision.originating_escalation_reason,
+                escalation_reason=restored_escalation_reason(revision),
                 status_note=(
                     "Diagnostic restoration verified. Propose the smallest bounded "
                     "implementation continuation supported by the evidence."
@@ -1199,6 +1200,9 @@ class GithubVerificationService:
                 await db.rollback()
                 await db.refresh(scope)
                 logger.info("Terminal attempt changed; no merge transition recorded")
+            except GithubRateLimited:
+                await db.rollback()
+                raise
             except GithubCheckObservationError as exc:
                 # Missing or ambiguous CI evidence must not consume a retry or
                 # diagnostic budget. Continue polling the other work items.
@@ -1212,9 +1216,10 @@ class GithubVerificationService:
                 logger.exception(
                     "GitHub verification failed for work item %s", item.id
                 )
-                self._set_failure_note(
-                    item, f"GitHub verification failed; will retry: {exc}"
-                )
+                note = f"GitHub verification failed; will retry: {exc}"
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (401, 403):
+                    note = f"GitHub authentication or permissions failed (HTTP {exc.response.status_code})."
+                self._set_failure_note(item, note)
                 item.updated_at = datetime.utcnow()
                 await db.commit()
 
@@ -1277,6 +1282,8 @@ class GithubVerificationService:
                     db, scope, item, client,
                     notify=recovery_only_attempt is None,
                 )
+            except GithubRateLimited:
+                raise
             except (httpx.HTTPError, GithubClientResponseError, ValueError):
                 # Observation failure is not another implementation failure.
                 logger.warning(
@@ -1375,7 +1382,10 @@ class GithubVerificationService:
         head_sha = self._head_sha(pull)
         if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
             raise ValueError("merged PR head SHA is unavailable")
-        if revision is not None and head_sha != revision.submitted_head_sha and not (
+        # #1164: a superseded revision never settles by its own head; only an exact active acceptance does.
+        submitted_head = None if revision is not None and revision.status == "superseded" else (
+            revision.submitted_head_sha if revision is not None else None)
+        if revision is not None and head_sha != submitted_head and not (
                 verdict == "merged" and await db.scalar(select(exists().where(
                     GithubHeadReview.work_item_id == item.id,
                     GithubHeadReview.dispatch_nonce == expected["dispatch_nonce"],
@@ -1525,7 +1535,7 @@ class GithubVerificationService:
             return
         if await self._review_hold_note(scope, item, client, pull) is not None:
             return
-        reason = item.escalation_reason or "unknown"
+        reason = item.escalation_reason or "escalation_reason_missing"  # a legacy empty row (#1139)
         settled = await self._settled_diagnostic_revision(db, item)
         if settled is None:
             await self._record_escalated_not_fired(
@@ -1769,6 +1779,8 @@ class GithubVerificationService:
                 await self._promote_settled_revision(db, scope, item, client, revision, pull)
         except TerminalRevisionContextChanged:
             raise  # the caller rolls back and records that the attempt changed
+        except GithubRateLimited:
+            raise
         except (httpx.HTTPError, GithubClientResponseError):
             # An unreadable or uninterpretable GitHub response is a failed read: nothing changes, nothing is logged.
             await db.rollback()
@@ -1834,6 +1846,8 @@ class GithubVerificationService:
             await db.rollback()
             await db.refresh(scope)
             logger.info("Terminal attempt changed; no promotion recorded")
+        except GithubRateLimited:
+            raise
         except (httpx.HTTPError, GithubClientResponseError):
             await db.rollback()
             await db.refresh(scope)
@@ -2188,7 +2202,9 @@ class GithubVerificationService:
     ) -> GithubAttemptScopeRevision | None:
         """The escalated attempt's current implementation revision when a merge may settle it (#1079).
 
-        Unlike the active-revision lookup, an exhausted revision is returned too; any other status is not.
+        Unlike the active-revision lookup, an exhausted revision is returned too, and so is a superseded one (#1164:
+        cancelled through the Leader's tool while escalated). A superseded revision has no submitted head, so it
+        settles only by an active acceptance of the merged head. Any other status is not returned.
         """
         revision = await db.scalar(select(GithubAttemptScopeRevision).where(
             GithubAttemptScopeRevision.work_item_id == item.id,
@@ -2196,7 +2212,7 @@ class GithubVerificationService:
             GithubAttemptScopeRevision.revision == item.active_scope_revision,
         ).execution_options(populate_existing=True))
         if (revision is None or revision.phase != "implementation" or item.attempt_phase != revision.phase
-                or revision.status not in ("active", "submitted", "exhausted")):
+                or revision.status not in ("active", "submitted", "exhausted", "superseded")):
             return None
         return revision
 
@@ -3086,6 +3102,8 @@ class GithubVerificationService:
         # Owner readiness and labels can change while checks are read.
         try:
             fresh_pull = await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
+        except GithubRateLimited:
+            raise
         except (httpx.HTTPError, GithubClientResponseError):
             await self._record_readiness_hold(
                 db, item, "PR readiness could not be read; automatic merge is blocked.")
@@ -3143,6 +3161,8 @@ class GithubVerificationService:
                 int(item.pr_number),
                 expected_head_sha=current_head,
             )
+        except GithubRateLimited:
+            raise
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code
             if status_code in _MERGE_TRANSIENT_STATUS_CODES or status_code >= 500:
@@ -3344,6 +3364,8 @@ class GithubVerificationService:
             return "Review hold label is invalid; automatic merge is blocked."
         try:
             issue = await client.get_issue(scope.repo_owner, scope.repo_name, item.issue_number)
+        except GithubRateLimited:
+            raise
         except (httpx.HTTPError, GithubClientResponseError):
             return unknown
         if not isinstance(issue, dict) or type(issue.get("number")) is not int or issue["number"] != item.issue_number:

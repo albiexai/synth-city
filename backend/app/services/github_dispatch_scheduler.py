@@ -22,6 +22,7 @@ from app.services.github_approval_service import github_approval_service
 from app.services.github_client import GithubClient, github_client
 from app.services.github_coordination_service import github_coordination_service
 from app.services.github_dispatch_service import github_dispatch_service
+from app.services.github_rate_limit_service import GithubRateLimited
 from app.services.github_recovery_gate import (
     GithubRecoveryOnlyAttempt,
     configured_recovery_only_attempt,
@@ -118,6 +119,9 @@ class GithubDispatchScheduler:
                 await self.run_repo_once(db, owner, repo)
                 await self.sync_jobs(db)
             await operations_health_service.record_poll_success(owner, repo)
+        except GithubRateLimited:
+            # The shared window is already visible in health. This was not a completed or rolled-back poll.
+            return
         except Exception as error:
             logger.exception("Autonomous GitHub dispatch job failed for %s/%s", owner, repo)
             # #941: the session was discarded with everything it had not committed; say so once.
@@ -134,6 +138,8 @@ class GithubDispatchScheduler:
         classify=None,
     ) -> None:
         client = client or github_client
+        if isinstance(client, GithubClient):
+            client.require_poll_available()
         scopes = (
             await db.execute(
                 select(TeamGithubScope)
@@ -159,6 +165,8 @@ class GithubDispatchScheduler:
             _poll_stage.set("poll_scope")
             await self.watcher.poll_scope(db, scope, client)
             await db.commit()
+            if isinstance(client, GithubClient):
+                client.require_poll_available()
             if not await self._scope_remains_autonomous(db, scope_id):
                 continue
             scope, slots = await self._reload_scope_context(db, scope_id)

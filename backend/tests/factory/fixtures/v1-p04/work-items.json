@@ -226,7 +226,7 @@
               "block_code": "not_escalated",
               "name": "retry",
               "reason": "Only escalated work can be retried.",
-              "required_actor": "leader",
+              "required_actor": "operator",
               "state": "blocked"
             },
             {
@@ -346,8 +346,8 @@
           },
           "waiting": {
             "actor": "operator",
-            "reason_code": "unknown",
-            "summary": "State needs inspection."
+            "reason_code": "attempt_escalated",
+            "summary": "The attempt is stopped in factory tracking and needs attention."
           },
           "workspace": null
         }

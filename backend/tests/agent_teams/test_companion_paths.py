@@ -64,6 +64,7 @@ def test_the_tool_surface_brings_the_inventory_tests_and_the_doc_page():
     found = companion_paths.companions_for(["backend/mcp_shim/agent_mail_server.py"])
     assert {"backend/tests/agent_mail/test_mcp_shim.py", "backend/tests/agent_mail/test_pi_shim.py",
             "backend/tests/agent_mail/test_tool_rename.py", "backend/tests/upgrade/test_provider_upgrade_startup.py",
+            "backend/tests/upgrade/test_provider_upgrade_interruption.py",
             "integrations/pi-agent-mail/manifest.ts", "docs/api/agent-mail.md"} <= set(found)
 
 
@@ -381,8 +382,10 @@ async def as_legacy_amendment(db, a, state, companion_map):
     An old record predates the map, so it is created while the map is empty and carries no trailer.
     """
     saved, companion_map["map"] = companion_map["map"], {}
+    # With the map empty the base companion is not named, so (#1154) the record states that withdrawal.
     revision, request, _ = await github_approval_service.create_scope_amendment_request(
-        db, a.item, a.scope, **{**amendment(a), "summary": "Placeholder summary"})
+        db, a.item, a.scope, **{**amendment(a), "summary": "Placeholder summary"},
+        withdrawn_paths=["tests/test_base.py"])
     companion_map["map"] = saved
     revision.summary = LEGACY_NOTE
     payload = github_approval_service.canonical_continuation_payload(phase=revision.phase,
@@ -642,3 +645,16 @@ async def test_an_unverifiable_trailer_earns_no_companion_exemption_in_the_budge
     with pytest.raises(GithubApprovalError) as refused:
         await github_approval_service.validate_amendment_budget(db, a.item, a.scope, revision)
     assert refused.value.detail == "continuation_budget_exhausted"  # every path counts as named again
+
+
+@pytest.mark.asyncio
+async def test_a_partial_withdrawal_of_the_base_is_refused(db, companion_map, healthy_attempt):
+    # #1154: the base here is src/base.py with its approved companion. Withdrawing one of two omitted paths is wrong.
+    a = healthy_attempt
+    with pytest.raises(GithubApprovalError, match="amendment_withdrawn_paths_invalid"):
+        await github_approval_service.create_scope_amendment_request(
+            db, a.item, a.scope, **amendment(a, ["src/unrelated.py"]), withdrawn_paths=["src/base.py"])
+    revision, _, created = await github_approval_service.create_scope_amendment_request(
+        db, a.item, a.scope, **amendment(a, ["src/unrelated.py"]),
+        withdrawn_paths=["src/base.py", "tests/test_base.py"])
+    assert created and revision.allowed_paths == ["src/unrelated.py"]

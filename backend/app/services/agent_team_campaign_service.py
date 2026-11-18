@@ -138,8 +138,19 @@ class AgentTeamCampaignService:
             self._cache.pop(oldest)
         self._cache[key] = BacklogObservation(started + self.interval_seconds, issues)
 
-    async def summary(self, db, preset_id, human_actions=()):
+    async def summary(self, db, preset_id, human_actions=(), scope_id=None, provider=None):
+        """The campaign counts. scope_id narrows them to one repository and provider to the work that an owner of
+        that harness holds (#1142), as the Work page does; work without an owner has no harness and is not counted."""
         scopes = await self._scopes(db, preset_id=preset_id)
+        owned = {scope.id for scope in scopes}
+        roster = provider is None or await db.scalar(select(AgentTeamSlot.id).where(
+            AgentTeamSlot.preset_id == preset_id, AgentTeamSlot.provider == provider).limit(1)) is not None
+        if scope_id is not None:
+            scopes = [scope for scope in scopes if scope.id == scope_id]
+        # A team outside the filter has no campaign to show.
+        matches = roster and (scope_id is None or scope_id in owned)
+        if not matches:
+            scopes = []
         by_scope = {scope.id: scope for scope in scopes}
         now = self.clock()
         observations = {scope.id: self._cache.get(self._key(scope)) for scope in scopes}
@@ -157,7 +168,10 @@ class AgentTeamCampaignService:
             AgentTeamSlot.display_name).join(TeamGithubScope,
                 TeamGithubScope.id == GithubWorkItem.scope_id).outerjoin(AgentTeamSlot,
                 AgentTeamSlot.id == GithubWorkItem.owner_slot_id).where(
-                TeamGithubScope.preset_id == preset_id).order_by(GithubWorkItem.id))).all()
+                TeamGithubScope.preset_id == preset_id,
+                *([GithubWorkItem.scope_id.in_([scope.id for scope in scopes])] if scope_id is not None or not matches else []),
+                *([AgentTeamSlot.provider == provider] if provider is not None else [])
+            ).order_by(GithubWorkItem.id))).all()
         # Dispatch watches the scope, while campaign counts may watch only a
         # milestone. Keep the complete pending queue independent of those counts.
         positions, dispatch_order = Counter(), []
@@ -201,7 +215,7 @@ class AgentTeamCampaignService:
                 queued.append(CampaignQueuedItem(title=row.issue_title))
         done.sort(key=lambda row: (row.auto_merged_at or datetime.min, row.id), reverse=True)
         groups = Counter()
-        if available:
+        if available and provider is None:
             slot_labels = (await db.scalars(select(AgentTeamSlot.area_labels).where(
                 AgentTeamSlot.preset_id == preset_id).order_by(AgentTeamSlot.position, AgentTeamSlot.id))).all()
             areas = list(dict.fromkeys(label for labels in slot_labels for label in (labels or []) if isinstance(label, str)))
@@ -217,7 +231,7 @@ class AgentTeamCampaignService:
                 if decision not in decisions:
                     decisions.append(decision)
         planned = await db.scalar(select(AgentTeamPreset.planned_decisions).where(AgentTeamPreset.id == preset_id))
-        for value in planned or []:
+        for value in (planned or []) if matches else []:
             # Legacy or manually damaged data cannot insert raw objects into the response.
             try:
                 decision = PlannedCampaignDecision.model_validate(value)

@@ -90,12 +90,12 @@ jobs:
         if: always() && steps.changes.outputs.run_suites != 'false'
         uses: actions/upload-artifact@v7
         with:
-          name: backend-test-timings-${{ matrix.shard }}
+          name: backend-test-timings-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: |
             backend/backend-junit-${{ matrix.shard }}.xml
             backend/backend-shard-${{ matrix.shard }}-collected.txt
             backend/backend-shard-${{ matrix.shard }}-executed.jsonl
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
 
   # The required check keeps its name and meaning (#1013). It passes only when every shard succeeded and the
@@ -159,8 +159,10 @@ jobs:
       - uses: actions/download-artifact@v5
         if: steps.changes.outputs.run_suites != 'false'
         with:
-          pattern: backend-test-timings-*
+          # Untouched shards can come from earlier attempts of this same run.
+          pattern: backend-test-timings-*-attempt-*
           path: shard-artifacts
+          merge-multiple: false
       - name: Collect the full backend suite
         if: steps.changes.outputs.run_suites != 'false'
         working-directory: backend
