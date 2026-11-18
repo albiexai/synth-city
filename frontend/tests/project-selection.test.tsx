@@ -1,6 +1,6 @@
 import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MemoryRouter, useLocation } from 'react-router-dom'
+import { Link, MemoryRouter, useLocation } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ProjectProvider, useProjectContext } from '../src/contexts/ProjectContext'
 import { ProjectSelector } from '../src/features/projects/ProjectSelector'
@@ -122,6 +122,7 @@ describe('ProjectSelector', () => {
 const CODEX_FOLDER = '/work/release/codex-live'
 const SHARED_FOLDER = '/work/release/shared'
 const UNLABELED_FOLDER = '/work/release/unlabeled'
+const MOVED_FOLDER = '/work/release/harness-moved'
 
 function trackedAt(path: string, name: string) {
   return { id: 8, name, path, is_active: false, last_accessed: '', created_at: '' }
@@ -179,6 +180,38 @@ describe('harness pages offer their own members\' folders', () => {
     await waitFor(() => expect(screen.getByRole('option', { name: 'codex-live · C1 builder' })).toBeInTheDocument())
     expect(screen.queryByRole('option', { name: /harness-live/ })).not.toBeInTheDocument()
     expect(screen.getByLabelText('active project')).toHaveTextContent('none')
+  })
+
+  it('a tracked project at another harness\'s member folder is hidden when its path has a trailing slash', async () => {
+    vi.mocked(apiClient).mockResolvedValue({ projects: [trackedAt(`${TEAM_FOLDER}/`, 'harness-live')] })
+    renderAt(`/harnesses/codex-cli/mcp?project=${encodeURIComponent(`${TEAM_FOLDER}/`)}`, <ProjectSelector />)
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'codex-live · C1 builder' })).toBeInTheDocument())
+    expect(screen.queryByRole('option', { name: /harness-live/ })).not.toBeInTheDocument()
+    expect(screen.getByLabelText('active project')).toHaveTextContent('none')
+  })
+
+  it('a member folder moved since the last visit is listed after returning to the harness page in the app', async () => {
+    const user = userEvent.setup()
+    render(
+      <MemoryRouter initialEntries={['/harnesses/claude-code/mcp']}>
+        <ProjectProvider>
+          <ProjectSelector />
+          <Link to="/sessions">away</Link>
+          <Link to="/harnesses/claude-code/mcp">back</Link>
+        </ProjectProvider>
+      </MemoryRouter>,
+    )
+    await waitFor(() => expect(screen.getByRole('option', { name: 'harness-live · F3 implementer' })).toBeInTheDocument())
+
+    vi.mocked(fetchAgentTeamPresets).mockResolvedValue({
+      presets: [{ id: 1, slots: [{ id: 2, display_name: 'F3 implementer', provider: 'claude-code', repo_path: MOVED_FOLDER }] }],
+    } as never)
+    await user.click(screen.getByRole('link', { name: 'away' }))
+    await user.click(screen.getByRole('link', { name: 'back' }))
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'harness-moved · F3 implementer' })).toBeInTheDocument())
+    expect(screen.queryByRole('option', { name: /harness-live/ })).not.toBeInTheDocument()
   })
 
   it('a harness page offers nothing when team membership cannot be read', async () => {

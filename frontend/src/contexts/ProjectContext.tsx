@@ -33,6 +33,10 @@ function folderName(path: string): string {
   return path.split('/').filter(Boolean).pop() ?? path;
 }
 
+function normalizePath(path: string): string {
+  return path.replace(/\/+$/, '') || '/';
+}
+
 interface TeamSlot {
   provider: string;
   path: string;
@@ -189,7 +193,8 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     const byPath = new Map<string, KnownFolder>();
     for (const folder of teamFoldersOf(teamSlots ?? [])) byPath.set(folder.path, folder);
     for (const project of projects) {
-      if (!byPath.has(project.path)) byPath.set(project.path, { path: project.path, name: project.name, source: 'tracked' });
+      const path = normalizePath(project.path);
+      if (!byPath.has(path)) byPath.set(path, { path, name: project.name, source: 'tracked' });
     }
     return [...byPath.values()];
   }, [teamSlots, projects]);
@@ -202,7 +207,8 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     const byPath = new Map<string, KnownFolder>();
     for (const folder of teamFoldersOf(teamSlots.filter((slot) => slot.provider === harness))) byPath.set(folder.path, folder);
     for (const project of projects) {
-      if (!byPath.has(project.path) && !teamPaths.has(project.path)) byPath.set(project.path, { path: project.path, name: project.name, source: 'tracked' });
+      const path = normalizePath(project.path);
+      if (!byPath.has(path) && !teamPaths.has(path)) byPath.set(path, { path, name: project.name, source: 'tracked' });
     }
     return [...byPath.values()];
   }, [harness, knownFolders, teamSlots, projects]);
@@ -212,9 +218,9 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const projectParam = scoped ? searchParams.get('project') : null;
   const activeProject = useMemo<ProjectResponse | null>(() => {
     if (!projectParam) return null;
-    const known = pageFolders.find((folder) => folder.path === projectParam);
+    const known = pageFolders.find((folder) => folder.path === normalizePath(projectParam));
     if (!known) return null;
-    const tracked = projects.find((project) => project.path === known.path);
+    const tracked = projects.find((project) => normalizePath(project.path) === known.path);
     return {
       id: tracked?.id ?? -1,
       name: known.name,
@@ -244,6 +250,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     }, { replace: true });
   }, [setSearchParams]);
 
+  // Membership is read again on each harness page entry, so a member folder moved since the last visit is not stale.
   useEffect(() => {
     let cancelled = false;
     fetchAgentTeamPresets()
@@ -253,7 +260,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
         for (const preset of response.presets) {
           for (const slot of preset.slots) {
             if (!slot.repo_path) continue;
-            slots.push({ provider: slot.provider, path: slot.repo_path, name: slot.display_name });
+            slots.push({ provider: slot.provider, path: normalizePath(slot.repo_path), name: slot.display_name });
           }
         }
         setTeamSlots(slots);
@@ -264,7 +271,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [harness]);
 
   // Fetch projects on mount
   useEffect(() => {
