@@ -25,13 +25,13 @@ from app.services.github_dispatch_service import ESCALATION_REASONS
 from app.services.github_stopped_attempt_actor import StoppedAttemptStep, stopped_attempt_policy, stopped_attempt_step
 from app.services.github_work_item_projection import _load_work_item_authority, _work_item_response
 from app.services.providers import get_providers
-from app.services.work_item_states import ATTENTION_STATUSES, DONE_STATUSES
+from app.services.work_item_states import ATTENTION_STATUSES, FINISHED_STATUSES
 
 
 CATEGORY_STATUSES = {
     "queued": ("pending",), "active": ("dispatched", "verifying"),
     "review": ("awaiting_human_review", "ready_for_review"),
-    "attention": ATTENTION_STATUSES, "finished": DONE_STATUSES,
+    "attention": ATTENTION_STATUSES, "finished": FINISHED_STATUSES,
 }
 STATUS_CATEGORY = {status: category for category, statuses in CATEGORY_STATUSES.items() for status in statuses}
 
@@ -314,7 +314,7 @@ def association(slot, member, sessions, bindings, retired, now):
 
 def waiting(item, legacy, owner_session, *, stopped_step=None):
     status = item.dispatch_status
-    if status in ("merged", "completed"):
+    if status in FINISHED_STATUSES:
         return None
     if status in ATTENTION_STATUSES:
         actor = stopped_step.actor if stopped_step else "operator"

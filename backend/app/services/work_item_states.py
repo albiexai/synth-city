@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 DONE_STATUSES = ("merged", "completed")
+FINISHED_STATUSES = (*DONE_STATUSES, "cancelled")
 
 
 def is_done(status) -> bool:

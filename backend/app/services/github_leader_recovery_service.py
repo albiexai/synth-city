@@ -1,4 +1,4 @@
-"""The current Leader runs three standard recoveries that only the operator API offered before.
+"""The current Leader runs standard recoveries with the operator guards.
 
 Each one reuses the operator service and every guard it has, adds the Leader and bound-Supervisor checks, and
 sends one notice to the bound Supervisor. The action audit stays the existing one; nothing here adds a second
@@ -29,6 +29,7 @@ from app.services.github_approval_service import (
     ActiveCancellationNoticeError, GithubApprovalError, github_approval_service,
 )
 from app.services.github_coordination_service import hold_code
+from app.services.github_end_stopped_item_service import end_stopped_item
 from app.services.github_terminal_revision_service import (
     TERMINAL_ITEMS, finalize_merged_item, finalize_merged_preview,
 )
@@ -550,6 +551,21 @@ async def release_workspace(db, item, session, *, workspace_id, expected_leased_
     notice = await _notify(db, ctx, kind="release", operation_id=operation_id,
         digest=digest, summary=f"workspace {workspace_id} was released.", reason=reason)
     return {"status": "released", "workspace_id": workspace_id, "notice": notice}
+
+
+async def end_stopped(db, item, session, request):
+    ctx = _ctx(item, session)
+    scope, preset, _leader, supervisor = await _authorize(db, item, session)
+    ctx = replace(ctx, preset_id=preset.id, supervisor_id=supervisor.id)
+    try:
+        result = await end_stopped_item(db, item, scope, request, actor=_actor(ctx),
+                                        before_commit=lambda: _assert_authority(db, ctx))
+    except ValueError as exc:
+        raise LeaderRecoveryError(str(exc)) from None
+    notice = await _notify(db, ctx, kind="end_stopped", operation_id=request.operation_id,
+        digest=_digest(request.model_dump(mode="json")), summary=f"the stopped item was {request.outcome}.",
+        reason=request.reason)
+    return {**result, "notice": notice}
 
 
 _OPERATION = {"pattern": r"^[A-Za-z0-9_.-]{1,100}$"}

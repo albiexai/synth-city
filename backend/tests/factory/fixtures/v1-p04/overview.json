@@ -22,13 +22,13 @@
         "stale_scopes": 0
       },
       "counts": {
-        "active": 27,
-        "attention": 26,
-        "finished": 26,
-        "queued": 14,
-        "review": 26,
+        "active": 24,
+        "attention": 24,
+        "finished": 36,
+        "queued": 12,
+        "review": 24,
         "total": 132,
-        "unknown": 13
+        "unknown": 12
       },
       "filters": {
         "provider": null,
@@ -64,13 +64,13 @@
         "stale_scopes": 0
       },
       "counts": {
-        "active": 27,
-        "attention": 26,
-        "finished": 26,
-        "queued": 14,
-        "review": 26,
+        "active": 24,
+        "attention": 24,
+        "finished": 36,
+        "queued": 12,
+        "review": 24,
         "total": 132,
-        "unknown": 13
+        "unknown": 12
       },
       "filters": {
         "provider": null,
@@ -106,13 +106,13 @@
         "stale_scopes": 1
       },
       "counts": {
-        "active": 27,
-        "attention": 26,
-        "finished": 26,
-        "queued": 14,
-        "review": 26,
+        "active": 24,
+        "attention": 24,
+        "finished": 36,
+        "queued": 12,
+        "review": 24,
         "total": 132,
-        "unknown": 13
+        "unknown": 12
       },
       "filters": {
         "provider": null,
@@ -148,13 +148,13 @@
         "stale_scopes": 0
       },
       "counts": {
-        "active": 27,
-        "attention": 26,
-        "finished": 26,
-        "queued": 14,
-        "review": 26,
+        "active": 24,
+        "attention": 24,
+        "finished": 36,
+        "queued": 12,
+        "review": 24,
         "total": 132,
-        "unknown": 13
+        "unknown": 12
       },
       "filters": {
         "provider": null,
@@ -192,13 +192,13 @@
         "stale_scopes": 0
       },
       "counts": {
-        "active": 14,
-        "attention": 13,
-        "finished": 13,
-        "queued": 14,
-        "review": 13,
+        "active": 12,
+        "attention": 12,
+        "finished": 18,
+        "queued": 6,
+        "review": 12,
         "total": 67,
-        "unknown": 0
+        "unknown": 7
       },
       "filters": {
         "provider": null,
@@ -234,13 +234,13 @@
         "stale_scopes": 0
       },
       "counts": {
-        "active": 27,
-        "attention": 26,
-        "finished": 26,
-        "queued": 14,
-        "review": 26,
+        "active": 24,
+        "attention": 24,
+        "finished": 36,
+        "queued": 12,
+        "review": 24,
         "total": 132,
-        "unknown": 13
+        "unknown": 12
       },
       "filters": {
         "provider": null,

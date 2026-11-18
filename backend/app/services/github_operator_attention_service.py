@@ -4,7 +4,7 @@ import re
 import time
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, tuple_
 
 from app.models.coordination import CoordinationDisposition
 from app.models.database import AgentTeamPreset, AgentTeamSlot, GithubApprovalRequest, GithubAttemptScopeRevision, GithubBacklogCoordination, GithubWorkItem, GithubWorkspace, TeamGithubScope
@@ -267,6 +267,13 @@ class GithubOperatorAttentionService:
                         "source":"leader", "assessment_current":current, "assessment_status":summary["status"],
                         "last_assessed_at":summary["last_assessed_at"], "evidence_issue_numbers":entry.evidence_issue_numbers,
                         "state":action["readiness"] if current else "historical"})
+        # Ending a stopped item retires its requests even if an older Leader assessment still lists them.
+        reported_issues = {(action["scope_id"], action["issue_number"]) for action in actions}
+        if reported_issues:
+            keys = (GithubWorkItem.scope_id, GithubWorkItem.issue_number)
+            ended = set((await db.execute(select(*keys).where(GithubWorkItem.dispatch_status == "cancelled",
+                tuple_(*keys).in_(reported_issues)))).all())
+            actions = [action for action in actions if (action["scope_id"], action["issue_number"]) not in ended]
         snapshot = await self.dispatch_snapshot(db, scopes[:32])
         complete = complete and snapshot["complete"]
         if snapshot["continuation_deadline"] is not None:

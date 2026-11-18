@@ -806,6 +806,7 @@ def test_list_work_items_projects_safe_continuation_fields(monkeypatch):
                         "id": 19,
                         "issue_number": 867,
                         "dispatch_status": "dispatched",
+                        "dispatch_generation": "a" * 64,
                         "pr_number": 875,
                         "attempt_phase": "implementation",
                         "active_scope_revision": 2,
@@ -822,6 +823,7 @@ def test_list_work_items_projects_safe_continuation_fields(monkeypatch):
     result = shim.synth_city_list_work_items(status="")
 
     assert result["items"][0]["active_scope_revision"] == 2
+    assert result["items"][0]["dispatch_generation"] == "a" * 64
     assert result["items"][0]["pr_number"] == 875
     assert "lease_token" not in result["items"][0]
     assert "must-not-project" not in repr(result)
@@ -906,8 +908,10 @@ def test_team_summary_and_parent_link_tools_use_narrow_team_routes(monkeypatch):
         return {"ok": True, "data": {"preset_id": 12}}
     monkeypatch.setattr(shim, "_team_request", request)
     assert shim.synth_city_get_team_summary(12) == {"ok": True, "summary": {"preset_id": 12}}
+    assert shim.synth_city_get_team_summary(12, work_item_id=19)["ok"]
     assert shim.synth_city_update_team_parent_issue(12, None)["ok"]
     assert requests == [("GET", "/presets/12/summary", {}),
+                        ("GET", "/presets/12/summary", {"params": {"work_item_id": 19}}),
                         ("PATCH", "/presets/12", {"json": {"parent_issue_url": None}})]
     monkeypatch.setattr(shim, "_team_request", lambda *args, **kwargs: {"ok": False, "error": "blocked"})
     assert not shim.synth_city_get_team_summary(12)["ok"]
@@ -1222,7 +1226,7 @@ def test_upgrade_probe_refuses_actual_dispatch_including_direct_http_tools(monke
             types.CallToolRequest(method="tools/call", params=types.CallToolRequestParams(
                 name=name, arguments=arguments)))
         assert wire.root.structuredContent == denied
-        assert len(tools) == 51
+        assert len(tools) == 52
         # Every published tool is refused before validation or execution.
         for tool in tools:
             assert await shim.mcp.call_tool(tool.name, {}) == denied
@@ -1252,7 +1256,7 @@ def test_upgrade_probe_lists_tools_without_registration_and_cannot_call_member_t
     spec.loader.exec_module(shim)
     calls = []
     monkeypatch.setattr(shim, "_request", lambda *args, **kwargs: calls.append((args, kwargs)))
-    assert len(asyncio.run(shim.mcp.list_tools())) == 51
+    assert len(asyncio.run(shim.mcp.list_tools())) == 52
     assert shim._ensure_registered() == {"ok": False, "error": {"code": "upgrade_probe_read_only"}}
     assert shim._state["member_id"] is None and shim._state["capability_token"] is None
     assert calls == []

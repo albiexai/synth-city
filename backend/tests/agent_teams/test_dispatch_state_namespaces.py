@@ -34,6 +34,7 @@ EXPECTED_DISPATCH_STATUSES = frozenset(
         "awaiting_human_review",
         "merged",
         "completed",
+        "cancelled",
         "escalated",
         "failed",
     }

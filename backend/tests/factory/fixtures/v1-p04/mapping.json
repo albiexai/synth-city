@@ -78,7 +78,8 @@
     ],
     "finished": [
       "merged",
-      "completed"
+      "completed",
+      "cancelled"
     ],
     "queued": [
       "pending"

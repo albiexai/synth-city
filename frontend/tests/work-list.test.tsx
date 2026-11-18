@@ -4,6 +4,7 @@ import { WorkPage } from "../src/features/factory/pages/WorkPage";
 import { resetFactoryReads } from "../src/features/factory/reads";
 import { clearOperatorToken } from "../src/features/agent-teams/operatorAuth";
 import work from "./fixtures/factory/v1-p04/work-items.json";
+import workItem from "./fixtures/factory/v1-p04/work-item.json";
 import repositories from "./fixtures/factory/v1-p04/repositories.json";
 import { fixtureFetch, jsonResponse, renderRoute, settle, visibility } from "./helpers/factory";
 
@@ -32,7 +33,8 @@ function serve(page: unknown) {
 
 describe("compact Work list", () => {
   it("shows one compact row per item with issue, repository, team, state, owner, PR and age", async () => {
-    serve(first);
+    const item = workItem.dispatched.response.work_item;
+    serve({ ...first, items: [item, ...first.items.slice(1)] });
     renderRoute(<WorkPage />, "/work");
     await settle();
     const table = document.querySelector("[data-work-table]") as HTMLElement;
@@ -40,7 +42,6 @@ describe("compact Work list", () => {
     expect(headers).toEqual(["Issue", "Team", "State", "Owner", "PR", "Updated"]);
     expect(within(table).queryByText(/Record observation|Open details|Stage|Actions/)).not.toBeInTheDocument();
     const row = within(table).getAllByRole("row")[1];
-    const item = first.items[0];
     expect(within(row).getByRole("link", { name: new RegExp(`^#${item.item.issue_number} `) })).toHaveAttribute("href", `/work/${item.item.id}`);
     expect(within(row).getByText(item.repository.display_name)).toBeInTheDocument();
     expect(within(row).getByText(item.team.name)).toBeInTheDocument();
