@@ -20,7 +20,7 @@ vi.mock('../src/contexts/DashboardContext', () => ({
   DashboardProvider: ({ children }: { children: React.ReactNode }) => children,
   useDashboard: () => ({ stats: null, loading: false, error: null, lastFetched: null, refreshDashboard: () => undefined }),
 }))
-vi.mock('../src/contexts/ProjectContext', () => ({ useProjectContext: () => ({ projects: [], activeProject: null, knownFolders: [], setProjectPath: () => undefined, addProject: async () => undefined }) }))
+vi.mock('../src/contexts/ProjectContext', () => ({ useProjectContext: () => ({ projects: [], activeProject: null, knownFolders: [], pageFolders: [], setProjectPath: () => undefined, addProject: async () => undefined }) }))
 
 const UNKNOWN = "version unknown (cannot read the agent user's install)"
 const catalogs = fixture.providers as unknown as Record<AgentProviderId, ProviderOperations>
