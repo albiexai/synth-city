@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import asyncio
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import hashlib
 import json
 import os
@@ -21,6 +21,40 @@ import urllib.request
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from app.services.agent_mail_service import MCP_HEARTBEAT_TTL_SECONDS
+
+
+class BackupStalled(RuntimeError):
+    """The checkpoint copy kept restarting because other connections wrote during it."""
+
+
+def _stepwise_backup(source: Path, destination: Path, *, pages: int = 1024, max_stalled_steps: int = 20,
+                     sleep: float = 0.05, on_step=None) -> None:
+    """Copy ``source`` into ``destination`` a few pages at a time (#1149).
+
+    The read lock is released between steps, so writers are never held for the whole copy. A write from another
+    connection restarts the copy, which shows as a step whose remaining-page count does not fall (it stays or grows).
+    More than ``max_stalled_steps`` of those stop the copy with BackupStalled, and the partial copy is removed: an
+    incomplete backup is never left at ``destination``.
+    """
+    state = {"remaining": None, "stalled": 0}
+
+    def progress(status, remaining, total):
+        if state["remaining"] is not None and remaining >= state["remaining"]:
+            state["stalled"] += 1
+            if state["stalled"] > max_stalled_steps:
+                raise BackupStalled(f"backup made no progress in {state['stalled']} steps")
+        state["remaining"] = remaining
+        if on_step is not None:
+            on_step(remaining, total)
+
+    try:
+        with closing(sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)) as db, \
+                closing(sqlite3.connect(destination)) as copy:
+            db.backup(copy, pages=pages, progress=progress, sleep=sleep)
+    except BaseException:
+        for leftover in (destination, Path(f"{destination}-journal")):
+            leftover.unlink(missing_ok=True)
+        raise
 
 _SHA = r"^[0-9a-f]{40}$"
 _NAME = r"^[A-Za-z0-9_.-]{1,100}$"
@@ -827,8 +861,7 @@ class Maintenance:
                 if self.source(path,user=self.profile.workspace_user)!=source: raise ValueError('owner_source_changed')
             backup=Path(self.profile.state_dir)/'maintenance'/(request.operation_id+'.sqlite3')
             descriptor=os.open(backup,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600);os.close(descriptor)
-            with sqlite3.connect(Path(self.profile.database).resolve().as_uri()+'?mode=ro',uri=True) as db:
-                with sqlite3.connect(backup) as destination: db.backup(destination)
+            _stepwise_backup(Path(self.profile.database),backup)
             if [self.accepted(pull) for pull in request.accepted_pulls]!=accepted:
                 raise ValueError('accepted_tip_changed')
             with self.reservation():

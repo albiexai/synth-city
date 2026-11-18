@@ -42,7 +42,7 @@ engine = create_async_engine(
 # WAL permits readers and a writer to overlap. SQLite still has one writer;
 # stale read snapshots may need rollback before a write can succeed. A busy
 # timeout alone does not recover that condition. WAL persists in the DB header.
-SQLITE_BUSY_TIMEOUT_MS = 5000
+SQLITE_BUSY_TIMEOUT_MS = 15000  # #1149: writes take milliseconds; ride out a burst, then answer 503
 
 
 def configure_sqlite_connection(dbapi_conn, busy_timeout_ms: int = SQLITE_BUSY_TIMEOUT_MS) -> None:

@@ -189,8 +189,12 @@ async def test_a_lock_error_before_the_request_commits_is_not_swallowed(client, 
         raise _busy()
 
     monkeypatch.setattr(github_approval_service, "create_continuation_request", locked_before_the_commit)
-    with pytest.raises(OperationalError):
-        await _post(client, item, token)  # no 503: nothing was saved, so there is nothing to say was saved
+    response = await _post(client, item, token)
+    # #1149: a lock is retryable, so it answers 503 rather than 500. Nothing was saved, so the detail is the generic
+    # database_busy, never database_busy_request_saved (#922).
+    assert response.status_code == 503
+    assert response.json()["detail"] == "database_busy"
+    assert response.headers["Retry-After"] == "1"
     assert await _count(db, GithubApprovalRequest) == 0
 
 

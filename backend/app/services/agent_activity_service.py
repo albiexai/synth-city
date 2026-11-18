@@ -663,7 +663,7 @@ async def _bounded_native_read(read):
 
 async def observe_team(db: AsyncSession, preset_id: int, *, include_agent_status: bool = True,
                        persist_identities: bool = True, max_input_rows: int | None = None,
-                       input_fence: dict | None = None) -> AgentTeamActivityResponse:
+                       input_fence: dict | None = None, record_input_waits: bool = True) -> AgentTeamActivityResponse:
     inputs = await _team_inputs(db, preset_id) if max_input_rows is None else await _team_inputs(db, preset_id, max_input_rows)
     now = datetime.now(timezone.utc)
     metadata = [{} for _ in inputs]
@@ -680,7 +680,8 @@ async def observe_team(db: AsyncSession, preset_id: int, *, include_agent_status
             observation.reason = "binding_changed"
             observation.observed_at = None
             observation.waiting_input = None
-    notices_changed = await _record_input_waits(db, preset_id, inputs, metadata, current, now=now)
+    # #1149: status projections (GET /agent-bridge/sessions, Mail status reads) pass False, so a read never writes.
+    notices_changed = record_input_waits and await _record_input_waits(db, preset_id, inputs, metadata, current, now=now)
     if persist_identities and await _save_codex_identities(db, inputs, metadata, current):
         await db.commit()
     if notices_changed:
