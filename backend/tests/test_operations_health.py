@@ -7,17 +7,20 @@ Detection uses sessions of its own, against a file database here, so a second co
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import httpx
 import pytest
 import pytest_asyncio
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.models.database  # noqa: F401
+from app.api.v1.agent_teams import _scope_response
 from app.api.v1.operations import list_operations_findings
 from app.api.v1.router import health_check
+from app.config import settings
 from app.database import Base
 from app.main import health as root_health
 from app.models.database import (
@@ -27,6 +30,9 @@ from app.services import github_dispatch_scheduler as scheduler_module
 from app.services import operations_health_service as ops_module
 from app.services.agent_team_supervisor_service import is_supervisor_message, supervisor_inbox
 from app.services.github_dispatch_scheduler import GithubDispatchScheduler
+from app.services.github_client import GithubClient
+from app.services.github_rate_limit_service import github_rate_limit_service
+from app.services.github_work_item_projection import _work_item_response
 from app.services.github_verification_service import github_verification_service
 from app.services.github_watcher_service import GithubWatcherService
 from app.services.operations_health_service import (
@@ -403,6 +409,55 @@ async def test_the_scheduler_job_records_a_failed_run_and_a_later_good_run(ops, 
 
 
 # ---- /health, the findings API, the Supervisor inbox ----
+
+@pytest.mark.asyncio
+async def test_health_reports_remaining_github_quota_and_the_reset_on_exhaustion(ops, monkeypatch):
+    monkeypatch.setattr(settings, "github_token", "quota-test-health")
+    now = datetime(2026, 11, 18, tzinfo=timezone.utc)
+    monkeypatch.setattr(github_rate_limit_service, "_now", lambda: now)
+    reset = int((now + timedelta(minutes=5)).timestamp())
+    remaining = 7
+
+    def handler(request):
+        return httpx.Response(200 if remaining else 403, json=[], headers={
+            "x-ratelimit-remaining": str(remaining), "x-ratelimit-reset": str(reset),
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://api.github.com") as http:
+        client = GithubClient(http=http)
+        await client.list_issues_with_label("o", "r", "ready")
+        assert set(await root_health()) == {"name", "version", "status"}
+        healthy = await health_check()
+        assert healthy["github_rate_limit"]["remaining"] == 7
+        assert healthy["status"] == "ok"
+        remaining = 0
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.list_issues_with_label("o", "r", "ready")
+
+    for body in (await root_health(), await health_check()):
+        assert body["health"] == "degraded"
+        assert body["reasons"] == ["github_rate_limited"]
+        assert body["open_findings"] == 0
+        assert body["github_rate_limit"]["remaining"] == 0
+        assert datetime.fromisoformat(body["github_rate_limit"]["retry_at"]).timestamp() == reset
+        assert "quota-test-health" not in str(body)
+
+    seeded = await _seed(ops)
+    async with ops.maker() as db:
+        scope = await db.get(TeamGithubScope, seeded.scope_id)
+        item = await db.get(GithubWorkItem, seeded.item_id)
+        item.status_note = "Awaiting exact-head review."
+        assert _scope_response(scope).github_rate_limit.reason == "github_rate_limited"
+        projection = _work_item_response(item, scope)
+        assert projection.status_note.startswith("Awaiting exact-head review.")
+        assert "github_rate_limited" in projection.status_note
+        assert item.status_note == "Awaiting exact-head review."
+
+        now += timedelta(minutes=5)
+        assert (await health_check())["health"] == "ok"
+        assert _scope_response(scope).github_rate_limit is None
+        assert _work_item_response(item, scope).status_note == "Awaiting exact-head review."
+
 
 @pytest.mark.asyncio
 async def test_health_is_degraded_with_reason_codes_while_a_finding_is_open_and_keeps_its_status(ops):

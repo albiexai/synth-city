@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.models.schemas import GithubRateLimitStatus
 from app.services.operations_health_service import operations_health_service
 
 # Under /health on purpose: it is the detail behind the health fields, and the factory pages keep "operations" out
@@ -35,6 +36,7 @@ class OperationsFindingsResponse(BaseModel):
     health: str
     reasons: list[str]
     open_findings: Optional[int] = None
+    github_rate_limit: GithubRateLimitStatus | None = None
     findings: list[OperationsFindingResponse]
 
 

@@ -319,6 +319,7 @@ async def _observe_handoff_rejection(db, session, *, item_id: int, scope_id: int
         item_id=item_id,
     )
 from app.services.github_client import GithubClientResponseError, github_client
+from app.services.github_rate_limit_service import github_rate_limit_service
 from app.services.github_app_auth_service import (
     GithubAppAuthError,
     GithubAppMintRejected,
@@ -500,6 +501,7 @@ def _scope_response(
         github_auth_mode=scope.github_auth_mode,
         github_auth_configured=_scope_auth_configured(scope),
         github_poll_token_configured=bool(settings.github_token),
+        github_rate_limit=github_rate_limit_service.polling_status(),
         max_approval_rounds=scope.max_approval_rounds,
         max_concurrent_dispatched=scope.max_concurrent_dispatched,
         max_verification_retries=scope.max_verification_retries,
@@ -2281,7 +2283,7 @@ async def claim_github_work_item_continuation(
         workspace_path=workspace.path if workspace is not None else None,
         lease_token=workspace.lease_token if workspace is not None else None,
         leader_member_id=leader_member.id if leader_member is not None else None,
-        status_note=item.status_note,
+        status_note=github_rate_limit_service.work_item_note(item.dispatch_status, item.status_note),
         active_revision=(
             _scope_revision_response(active_revision, effort=effort_view, current_view=True)
             if active_revision is not None
