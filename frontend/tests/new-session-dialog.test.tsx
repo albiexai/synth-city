@@ -51,12 +51,12 @@ beforeEach(() => {
 afterEach(() => { cleanup(); clearOperatorToken() })
 
 describe('KillSessionDialog', () => {
-  it('names the full product name first when the operator token is rejected', async () => {
+  it('names the full product name first when the Director key is rejected', async () => {
     setOperatorToken('token-123')
     vi.mocked(killSession).mockRejectedValue(new ApiHttpError('unauthorized', 401))
     render(<MemoryRouter><KillSessionDialog open onOpenChange={() => {}} session={{ session_name: 'deck:1.0' } as never} onKilled={() => {}} /></MemoryRouter>)
     fireEvent.click(screen.getByRole('button', { name: 'Kill' }))
-    expect(await screen.findByText('The Albiex Synth City operator token was rejected. Enter a valid token and retry.')).toBeInTheDocument()
+    expect(await screen.findByText('The Albiex Synth City Director key was rejected. Enter a valid key and retry.')).toBeInTheDocument()
   })
 })
 

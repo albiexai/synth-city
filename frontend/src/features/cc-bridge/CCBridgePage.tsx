@@ -35,7 +35,7 @@ const PROVIDER_FILTERS: { value: ProviderFilter; label: string }[] = [
   { value: 'all', label: 'All agents' },
   { value: 'claude-code', label: 'Claude Code' },
   { value: 'codex-cli', label: 'Codex' },
-  { value: 'copilot-cli', label: 'Copilot' },
+  { value: 'copilot-cli', label: 'GitHub Copilot CLI' },
   { value: 'opencode-cli', label: 'OpenCode' },
   { value: 'pi-cli', label: 'Pi' },
   { value: 'muse-cli', label: 'Muse Code' },

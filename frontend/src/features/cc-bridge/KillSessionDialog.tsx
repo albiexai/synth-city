@@ -44,7 +44,7 @@ export function KillSessionDialog({
     if (!session) return
     const operatorToken = getOperatorToken() ?? operatorTokenInput.trim()
     if (!operatorToken) {
-      setError('Enter the Albiex Synth City operator token to terminate a session.')
+      setError('Enter the Albiex Synth City Director key to terminate a session.')
       return
     }
     setSubmitting(true)
@@ -62,7 +62,7 @@ export function KillSessionDialog({
       if (err instanceof ApiHttpError && err.status === 401) {
         clearOperatorToken()
         setOperatorTokenInput('')
-        setError('The Albiex Synth City operator token was rejected. Enter a valid token and retry.')
+        setError('The Albiex Synth City Director key was rejected. Enter a valid key and retry.')
       } else {
         setError(err instanceof Error ? err.message : 'Failed to kill session')
       }
@@ -112,7 +112,7 @@ export function KillSessionDialog({
 
         {!getOperatorToken() && (
           <div className="space-y-2">
-            <Label htmlFor="kill-session-operator-token">Operator token</Label>
+            <Label htmlFor="kill-session-operator-token">Director key</Label>
             <Input
               id="kill-session-operator-token"
               type="password"

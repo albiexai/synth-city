@@ -584,7 +584,7 @@ export function NewSessionDialog({ open, onOpenChange, onSpawned, initialProvide
                   onCheckedChange={(checked) => setUseLast(checked === true)}
                 />
                 <Label htmlFor="codex-use-last" className="cursor-pointer">
-                  Use last {isPi ? 'Pi' : isCopilot ? 'Copilot' : 'Codex'} session
+                  Use last {isPi ? 'Pi' : isCopilot ? 'GitHub Copilot CLI' : 'Codex'} session
                 </Label>
               </div>
               {!useLast && (

@@ -1241,7 +1241,7 @@ export function AgentTeamsPage() {
         leader_slot_id: slot.id,
         expected_leader_slot_id: selectedPreset.leader_slot_id ?? null,
         expected_updated_at: selectedPreset.updated_at,
-        reason: 'Operator selected the Leader in the team roster.',
+        reason: 'Director selected the Leader in the team roster.',
       }, token))
       replacePreset(updated)
       toast.success('Leader assignment saved')
