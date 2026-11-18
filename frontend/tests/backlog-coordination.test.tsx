@@ -74,6 +74,13 @@ describe('Leader backlog coordination', () => {
         : 'Automatic follow-up reached a notification limit.')).toBeTruthy()
     expect(screen.getByText(/Remaining: 15/)).toBeTruthy()
   })
+  it('says coordination is off instead of a notification counter when it is disabled', async () => {
+    vi.mocked(apiClient).mockResolvedValue({ ...summary, enabled: false })
+    render(<BacklogCoordination scopeId={1} withOperatorToken={withToken} />)
+    expect(await screen.findByText('Coordination is off. No notifications are sent.')).toBeTruthy()
+    expect(screen.queryByText(/Coordination notifications today/)).toBeNull()
+    expect(screen.queryByText(/Remaining:/)).toBeNull()
+  })
   it('does not turn uncertain delivery into a retry action', async () => {
     vi.mocked(apiClient).mockResolvedValue({ ...ownerSummary, owner_followups: [{ ...followup, state: 'delivery_unknown', notification_limit: null }] })
     render(<BacklogCoordination scopeId={1} withOperatorToken={withToken} />)

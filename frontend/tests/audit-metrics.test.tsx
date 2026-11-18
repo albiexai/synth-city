@@ -97,7 +97,7 @@ function windowBody(marker: string): MetricsWindow {
         name: "cost", counting_unit: "usage_attribution", value: null,
         sample_count: 0, unknown_count: 1, excluded_count: 0,
         unknown_reasons: ["no measured usage attribution"],
-        source: "factory_audit_events", coverage: "unknown",
+        source: "factory_audit_events", coverage: "unknown; cost has no usage source in this window",
       },
     ],
   };
@@ -171,7 +171,16 @@ describe("AuditMetricsPage at the HTTP boundary", () => {
 
     // #517: the plain summary comes first. The definitions sit behind the "?" buttons.
     const summary = screen.getByRole("region", { name: "Delivery in this window" });
-    expect(within(summary).getByText(/Recording started .*2026\. The whole window has data\./)).toBeInTheDocument();
+    expect(within(summary).getByText(/Recording started .*2026\. Some metrics do not have full coverage of this window\./)).toBeInTheDocument();
+    const noteCells = [...new Set(screen.getAllByRole("link")
+      .filter((link) => link.getAttribute("href")?.startsWith("#metric-note-"))
+      .map((link) => link.closest("td")))];
+    expect(noteCells.length).toBeGreaterThan(0);
+    for (const cell of noteCells) {
+      const refs = [...cell!.querySelectorAll("a")].map((link) => link.textContent);
+      expect(cell!.textContent).toBe(refs.join(", "));
+    }
+    expect(noteCells.some((cell) => cell!.querySelectorAll("a").length > 1)).toBe(true);
     expect(within(summary).getByText("3 code PRs merged, 4 design")).toBeInTheDocument();
     expect(within(summary).getByText("not measured")).toBeInTheDocument();
     expect(screen.queryByText(/Terminal tracking is not delivery/)).not.toBeInTheDocument();

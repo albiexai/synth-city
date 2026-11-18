@@ -58,9 +58,35 @@ describe("coverageSentence", () => {
     expect(coverageSentence(metricsWindow())).toMatch(/^Recording started .*2026\. The first 5 days of this window have no data\.$/);
   });
 
-  it("says the whole window has data when recording started before it", () => {
-    const early = metricsWindow({ available_interval_start: "2026-10-06T08:58:01.957644Z" });
-    expect(coverageSentence(early)).toMatch(/The whole window has data\.$/);
+  it("says the whole window has data only when every metric has full coverage", () => {
+    const early = { available_interval_start: "2026-10-06T08:58:01.957644Z" };
+    expect(coverageSentence(metricsWindow(early, [
+      sample("delivered_in_window", 2),
+      sample("merged_code_in_window", 2, { coverage: "full; sourced merged code pull requests" }),
+    ]))).toMatch(/The whole window has data\.$/);
+  });
+
+  it("does not claim whole-window data when any metric is partial, unknown or without coverage", () => {
+    const early = { available_interval_start: "2026-10-06T08:58:01.957644Z" };
+    expect(coverageSentence(metricsWindow(early, [
+      sample("delivered_in_window", 2, { coverage: "partial" }),
+      sample("merged_code_in_window", 2, { coverage: "partial; precedes instrumentation start" }),
+    ]))).toMatch(/Some metrics do not have full coverage of this window\.$/);
+    expect(coverageSentence(metricsWindow(early, [
+      sample("delivered_in_window", 2),
+      sample("cost", null, { coverage: "unknown" }),
+    ]))).toMatch(/Some metrics do not have full coverage of this window\.$/);
+    expect(coverageSentence(metricsWindow(early, [
+      sample("delivered_in_window", 2, { coverage: "" }),
+    ]))).toMatch(/Some metrics do not have full coverage of this window\.$/);
+    expect(coverageSentence(metricsWindow(early, [
+      sample("delivered_in_window", 2, { coverage: undefined as unknown as string }),
+    ]))).toMatch(/Some metrics do not have full coverage of this window\.$/);
+  });
+
+  it("states that coverage is not reported when a window has no metrics", () => {
+    const early = { available_interval_start: "2026-10-06T08:58:01.957644Z" };
+    expect(coverageSentence(metricsWindow(early, []))).toMatch(/Metric coverage is not reported for this window\.$/);
   });
 
   it("counts hours for a short gap, and handles no marker or no interval", () => {
