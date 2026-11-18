@@ -1565,6 +1565,8 @@ async def request_github_work_item_continuation(
                 },
                 lease_token=request.lease_token,
                 actor=request_actor,
+                **({"withdrawn_paths": request.withdrawn_paths}
+                   if isinstance(request, GithubScopeAmendmentCreate) else {}),
             )
         )
         committed_request = (approval.id, revision.id)

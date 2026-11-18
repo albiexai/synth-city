@@ -734,6 +734,8 @@ class GithubApprovalService:
             # #1039: the named paths keep the scope's limit (checked above); their companions have a bound of their own.
             if len(extras) > companion_paths.MAX_COMPANION_PATHS:
                 raise GithubApprovalError("continuation_path_limit_exceeded")
+        # #1154: against the named paths with their companions, the set this revision will allow.
+        self.check_withdrawals(base_paths, paths, proposal.get("withdrawn_paths") or [])
         stored_summary = companion_paths.summary_with_trailer(owner_summary, identity, named, extras)
         payload = self.canonical_continuation_payload(phase="implementation",
             execution_target=proposal["execution_target"], summary=stored_summary,
@@ -793,6 +795,21 @@ class GithubApprovalService:
         await self.claim_healthy_scope_context(db, final_context)
         await db.commit()
         return revision, request, True
+
+    def check_withdrawals(self, base_paths, named_paths, withdrawn_paths):
+        """#1154 (Supervisor option A): an amendment names its whole effective path set.
+
+        Completion compares changes with allowed_paths literally, so an approved base path the owner leaves out is
+        withdrawn. That must be said: ``withdrawn_paths`` is exactly the base entries the named paths do not cover,
+        or the request is refused before anything is stored. Existing rows are never reinterpreted.
+        """
+        omitted = sorted({path for path in base_paths if not self.path_is_allowed(path, named_paths)})
+        withdrawn = sorted({path.strip() for path in withdrawn_paths if isinstance(path, str)})
+        if withdrawn != omitted:
+            # A withdrawal that is not a base path, is still named, or adds to the omission is wrong as given;
+            # an omission with no withdrawal is the #1055 trap.
+            raise GithubApprovalError("amendment_withdrawn_paths_invalid" if withdrawn
+                                      else "amendment_base_paths_omitted")
 
     def verify_amendment_binding(self, request, revision):
         if (revision.origin_kind != "scope_amendment" or request.request_kind != "continuation"

@@ -1674,3 +1674,70 @@ async def test_a_rejected_history_does_not_block_the_decision_time_budget(db, he
     for number in range(2, 5):
         await prior_amendment(a, db, number, [])
     await github_approval_service.validate_amendment_budget(db, a.item, a.scope, revision)
+
+
+# --- #1154 (Supervisor option A): an amendment names its whole effective set; withdrawals are explicit ------------
+
+async def _amendment_rows(db, item_id):
+    from app.models.database import GithubAttemptScopeRevision
+    return (await db.scalars(select(GithubAttemptScopeRevision).where(
+        GithubAttemptScopeRevision.work_item_id == item_id))).all()
+
+
+@pytest.mark.asyncio
+async def test_an_amendment_that_omits_a_base_path_is_refused_before_anything_is_stored(db, healthy_attempt):
+    # #1055: the owner named only the added path, the approved base fell out of allowed_paths, and completion then
+    # refused the base-path changes. The omission is now refused when the amendment is proposed.
+    a = healthy_attempt
+    item_id, round_before = a.item.id, a.item.approval_round_count
+    with pytest.raises(GithubApprovalError) as refused:
+        await github_approval_service.create_scope_amendment_request(
+            db, a.item, a.scope, **amendment(a, ["src/added.py"]))
+    assert refused.value.detail == "amendment_base_paths_omitted"
+    await db.rollback()
+    assert await _amendment_rows(db, item_id) == []
+    await db.refresh(a.item)
+    assert a.item.approval_round_count == round_before
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_withdrawal_narrows_the_scope(db, healthy_attempt):
+    a = healthy_attempt
+    revision, approval, created = await github_approval_service.create_scope_amendment_request(
+        db, a.item, a.scope, **amendment(a, ["src/added.py"]), withdrawn_paths=["src/base.py"])
+    assert created and approval.status == "pending"
+    assert revision.allowed_paths == ["src/added.py"]  # literal: the withdrawn base path is not allowed
+    assert revision.amendment_base_paths == ["src/base.py"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("paths,withdrawn", [
+    (["src/added.py"], ["src/other.py"]),  # not a base path
+    (["src/base.py", "src/added.py"], ["src/base.py"]),  # still named
+    (["src/added.py"], ["src/base.py", "src/added.py"]),  # more than the omission
+])
+async def test_a_withdrawal_must_be_exactly_the_omitted_base_paths(db, healthy_attempt, paths, withdrawn):
+    a = healthy_attempt
+    item_id = a.item.id
+    with pytest.raises(GithubApprovalError) as refused:
+        await github_approval_service.create_scope_amendment_request(
+            db, a.item, a.scope, **amendment(a, paths), withdrawn_paths=withdrawn)
+    assert refused.value.detail == "amendment_withdrawn_paths_invalid"
+    await db.rollback()
+    assert await _amendment_rows(db, item_id) == []
+
+
+@pytest.mark.asyncio
+async def test_the_api_passes_withdrawn_paths_through(db, healthy_attempt):
+    from app.api.v1 import agent_teams
+    from app.models.schemas import GithubScopeAmendmentCreate
+
+    a = healthy_attempt
+    args = amendment(a, ["src/added.py"])
+    args.pop("authenticated_owner_member_id")
+    args.pop("authenticated_owner_slot_id")
+    session = await db.scalar(select(MailAgentSession).where(MailAgentSession.member_id == a.owner.id))
+    accepted = await agent_teams.request_github_scope_amendment(
+        a.item.id, GithubScopeAmendmentCreate(**args, withdrawn_paths=["src/base.py"]), session, db)
+    assert accepted.revision.allowed_paths == ["src/added.py"]
+    assert GithubScopeAmendmentCreate(**args).withdrawn_paths == []  # optional: old clients send nothing
