@@ -685,3 +685,15 @@ def test_codex_lookback_is_bounded(native, monkeypatch):
     result = activity._native_state(native["log"], session_id, str(native["cwd"]),
                                     native["now"], native["now"] - timedelta(seconds=120))
     assert result[0] == "unknown"
+
+
+def test_codex_long_turn_completion_beyond_the_tail_reads_idle(native, monkeypatch):
+    # #1201 review: the same long turn, then a task_complete, settles as idle.
+    monkeypatch.setattr(activity, "_TAIL_BYTES", 4096)
+    session_id = str(uuid4())
+    _codex_long_turn(native, session_id, start_age=60, filler_bytes=3 * 4096, completed=True)
+    metadata = {}
+    result = activity._native_state(native["log"], session_id, str(native["cwd"]),
+                                    native["now"], native["now"] - timedelta(seconds=120), provenance=metadata)
+    assert result[:2] == ("idle", "native_turn_completed")
+    assert metadata["event_source"] == "task_complete"
