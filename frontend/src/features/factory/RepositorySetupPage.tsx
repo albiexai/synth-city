@@ -18,7 +18,7 @@ import { clearOperatorToken, getOperatorToken, setOperatorToken } from "@/featur
 import { OperatorTokenDialog } from "@/features/agent-teams/AutonomyPanel";
 import { useOptionalProjectContext } from "@/contexts/ProjectContext";
 import type { AgentTeamPreset, AgentTeamPresetInput, AgentTeamLaunchPlan, AgentTeamSlotInput, TeamGithubMergePolicy, TeamGithubScope } from "@/types/agentTeams";
-import { AUTO_MERGE_VERIFIER_REQUIREMENT, hasIndependentVerifier, VERIFIER_ROLE } from "./autoMergeReadiness";
+import { AUTO_MERGE_OWNER_REQUIREMENT, AUTO_MERGE_VERIFIER_REQUIREMENT, autoMergeSetupBlocker, VERIFIER_ROLE } from "./autoMergeReadiness";
 
 type Check = { status: "ready" | "blocked" | "unknown"; code: string; remedy: string };
 type Preflight = { status: "ready" | "blocked" | "unknown"; observed_at: string; checked_at?: string; checks: Record<string, Check>; configuration_presence?: Record<string, boolean>; host_guidance?: string[] };
@@ -308,14 +308,14 @@ export function RepositorySetupPage() {
     setTokenError(null);
   }
 
-  async function withOperatorToken<Result>(action: (value: string) => Promise<Result>, reason?: string): Promise<Result> {
+  async function withOperatorToken<Result>(action: (value: string, attempt: number) => Promise<Result>, reason?: string): Promise<Result> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const value = await requestOperatorToken(attempt ? "The Director key was rejected. Enter a valid key to retry." : null, reason);
       // Typed pre-send credential cancellation: the prompt cancel sends
       // nothing. Recovery clears only when every attempted create was a
       // proven non-write; uncertain writes keep the latch.
       if (!value) throw new SaveIntentChangedError("The Director key is required for this action.");
-      try { return await action(value); }
+      try { return await action(value, attempt); }
       catch (cause) {
         if (!(cause instanceof ApiHttpError) || cause.status !== 401 || attempt > 0) throw cause;
         clearOperatorToken();
@@ -475,6 +475,9 @@ export function RepositorySetupPage() {
       let anyUncertainCreateAttempt = false;
       if (draft.teamMode === "new" && !selected) {
         const slots = draftTeamSlots(draft, slotRouting);
+        if (draft.mergePolicy === "auto" && !slots.some((slot) => slot.role === "Worker")) {
+          throw new Error(AUTO_MERGE_OWNER_REQUIREMENT);
+        }
         const allNames = slots.map((slot) => slot.display_name);
         if (allNames.some((name) => !name) || new Set(allNames).size !== allNames.length) {
           throw new Error("Enter unique, non-empty names for the Leader and each worker.");
@@ -544,7 +547,8 @@ export function RepositorySetupPage() {
         throw new Error("The existing team has no explicit Leader assignment. Keep its settings unchanged and resolve its authority separately.");
       }
       setTeam(selected);
-      const sameScope = fresh.scopes.find((item) => item.preset_id === selected!.id && item.repo_owner.toLowerCase() === draft.owner.trim().toLowerCase() &&
+      const selectedTeam = selected;
+      const sameScope = fresh.scopes.find((item) => item.preset_id === selectedTeam.id && item.repo_owner.toLowerCase() === draft.owner.trim().toLowerCase() &&
         item.repo_name.toLowerCase() === draft.repo.trim().toLowerCase());
       let savedScope = sameScope ?? null;
       if (savedScope && !scopeMatchesDraft(savedScope, draft)) {
@@ -553,8 +557,9 @@ export function RepositorySetupPage() {
         throw new Error("This team already has a scope for the repository with different saved settings. The existing scope remains unchanged. Review it in Teams before making a separate edit.");
       }
       if (!savedScope) {
-        if (draft.mergePolicy === "auto" && !hasIndependentVerifier(selected)) {
-          throw new Error(AUTO_MERGE_VERIFIER_REQUIREMENT);
+        if (draft.mergePolicy === "auto") {
+          const blocker = autoMergeSetupBlocker(selectedTeam);
+          if (blocker) throw new Error(blocker);
         }
         if (intentChanged()) {
           // A stale save must not issue a scope create for changed inputs.
@@ -562,26 +567,38 @@ export function RepositorySetupPage() {
         }
         setRecovery({ kind: "scope", candidates: [], requestedDraft: { ...draft }, requestedRouting: { ...slotRouting } });
         try {
-          savedScope = await withOperatorToken((operatorToken) => {
+          savedScope = await withOperatorToken(async (operatorToken, attempt) => {
+            if (draft.mergePolicy === "auto" && attempt > 0 && !intentChanged()) {
+              // The replacement credential may have waited while the roster changed.
+              const observation = await fetchConfigurationObservation(operatorToken).catch(() => {
+                throw new SaveIntentChangedError("Could not refresh the team before retrying the scope save. Review the team and save again.");
+              });
+              const retryTeam = observation.presets.find((item) => item.id === selectedTeam.id);
+              if (!retryTeam || retryTeam.leader_slot_id !== selectedTeam.leader_slot_id) {
+                throw new SaveIntentChangedError("The selected team or Leader changed before the retry. Review the team and save again.");
+              }
+              const blocker = autoMergeSetupBlocker(retryTeam);
+              if (blocker) throw new SaveIntentChangedError(blocker);
+            }
             if (intentChanged()) {
               // Checked immediately before the scope create callback, including
               // any credential-retry invocation of the same callback. This is a
               // pre-send cancellation, not an uncertain transport outcome.
               throw new SaveIntentChangedError("Inputs changed during the save. Review the saved records before continuing.");
             }
-            return Promise.resolve(createTeamGithubScope(selected.id, {
-            repo_owner: draft.owner.trim(), repo_name: draft.repo.trim(), repo_path: draft.path.trim(),
-            dispatch_label: draft.dispatch.trim(), design_label: draft.design.trim(), merge_policy: draft.mergePolicy,
-            max_approval_rounds: 3, max_concurrent_dispatched: 1, max_verification_retries: 1,
-            max_auto_merges_per_day: draft.mergePolicy === "auto" ? DEFAULT_AUTO_MERGE_CAP : 0,
-            base_ref: draft.baseRef.trim(), github_auth_mode: draft.authMode === "github_app" ? "app" : "ambient",
-            builds_out_of_tree: false, max_build_parallelism: 1, enabled: false,
-          }, operatorToken)).catch((cause: unknown) => {
-            if (!(cause instanceof SaveIntentChangedError) && !isDefiniteCreateNonWrite(cause)) {
-              anyUncertainCreateAttempt = true;
-            }
-            throw cause;
-          });
+            return Promise.resolve(createTeamGithubScope(selectedTeam.id, {
+              repo_owner: draft.owner.trim(), repo_name: draft.repo.trim(), repo_path: draft.path.trim(),
+              dispatch_label: draft.dispatch.trim(), design_label: draft.design.trim(), merge_policy: draft.mergePolicy,
+              max_approval_rounds: 3, max_concurrent_dispatched: 1, max_verification_retries: 1,
+              max_auto_merges_per_day: draft.mergePolicy === "auto" ? DEFAULT_AUTO_MERGE_CAP : 0,
+              base_ref: draft.baseRef.trim(), github_auth_mode: draft.authMode === "github_app" ? "app" : "ambient",
+              builds_out_of_tree: false, max_build_parallelism: 1, enabled: false,
+            }, operatorToken)).catch((cause: unknown) => {
+              if (!(cause instanceof SaveIntentChangedError) && !isDefiniteCreateNonWrite(cause)) {
+                anyUncertainCreateAttempt = true;
+              }
+              throw cause;
+            });
           });
           if (!anyUncertainCreateAttempt) {
             setRecovery(null);
@@ -942,6 +959,7 @@ export function RepositorySetupPage() {
         </select>
       </label>
       <p>{AUTO_MERGE_VERIFIER_REQUIREMENT} The verifier reviews the exact PR commit. Required checks must pass before merging.</p>
+      {draft.mergePolicy === "auto" && <p>{AUTO_MERGE_OWNER_REQUIREMENT}</p>}
       <p>New scopes allow one active work item and one verification retry. Setup saves the scope disabled.</p>
       <Button onClick={() => setStep(4)}>Review setup</Button>
     </div>}

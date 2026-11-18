@@ -375,7 +375,7 @@ describe("guided repository setup", () => {
     };
   }
 
-  async function reviewAutomaticSetup(teamId?: number) {
+  async function reviewAutomaticSetup(teamId?: number, workerNames = "Worker A") {
     fireEvent.change(screen.getByLabelText("Repository owner"), { target: { value: "example" } });
     fireEvent.change(screen.getByLabelText("Repository name"), { target: { value: "synthetic-product" } });
     fireEvent.change(screen.getByLabelText("Primary checkout path"), { target: { value: "/synthetic/checkout" } });
@@ -385,7 +385,7 @@ describe("guided repository setup", () => {
       fireEvent.change(screen.getByLabelText("Team"), { target: { value: String(teamId) } });
     } else {
       fireEvent.change(screen.getByLabelText("Team name"), { target: { value: "Synthetic team" } });
-      fireEvent.change(screen.getByLabelText("Worker slots, one name per line"), { target: { value: "Worker A" } });
+      fireEvent.change(screen.getByLabelText("Worker slots, one name per line"), { target: { value: workerNames } });
     }
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
@@ -442,6 +442,45 @@ describe("guided repository setup", () => {
     expect(mocks.createTeamGithubScope).not.toHaveBeenCalled();
     expect(mocks.createAgentTeamPreset).not.toHaveBeenCalled();
     expect(mocks.updateAgentTeamPreset).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 12])("requires a separate PR owner for automatic setup with team %s", async (teamId) => {
+    mockReadyPreflightAndRoster();
+    const team = teamFixture(false);
+    const twoSlots = { ...team, slots: [team.slots[0], { ...team.slots[1], role: "verifier", display_name: "Verifier" }] };
+    mocks.fetchAgentTeamPresets.mockResolvedValue({ presets: teamId ? [twoSlots] : [] });
+    mocks.createAgentTeamPreset.mockResolvedValue(twoSlots);
+    mocks.createTeamGithubScope.mockResolvedValue({ ...scopeFixture(55, 12, false, "synthetic-product", "albiex-synth-city-ready"), merge_policy: "auto", max_auto_merges_per_day: 5 });
+    render(<MemoryRouter><RepositorySetupPage /></MemoryRouter>);
+    await reviewAutomaticSetup(teamId, "");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/automatic merge needs.*PR owner/i);
+    expect(mocks.createAgentTeamPreset).not.toHaveBeenCalled();
+    expect(mocks.createTeamGithubScope).not.toHaveBeenCalled();
+  });
+
+  it("rechecks the verifier before retrying an automatic scope save with a new key", async () => {
+    mockReadyPreflightAndRoster();
+    let storedKey: string | null = "synthetic-operator";
+    mocks.getOperatorToken.mockImplementation(() => storedKey);
+    mocks.clearOperatorToken.mockImplementation(() => { storedKey = null; });
+    mocks.setOperatorToken.mockImplementation((key: string) => { storedKey = key; });
+    const team = teamFixture(true);
+    const verifier = { ...team.slots[1], id: 103, role: "verifier", display_name: "Verifier" };
+    mocks.fetchAgentTeamPresets.mockResolvedValue({ presets: [{ ...team, slots: [...team.slots, verifier] }] });
+    mocks.createTeamGithubScope.mockRejectedValueOnce(new mocks.ApiHttpError("The Director key was rejected.", 401));
+    render(<MemoryRouter><RepositorySetupPage /></MemoryRouter>);
+    await reviewAutomaticSetup(12);
+
+    const dialog = await screen.findByRole("dialog");
+    mocks.fetchAgentTeamPresets.mockResolvedValue({ presets: [team] });
+    fireEvent.change(within(dialog).getByPlaceholderText("Enter secret value"), { target: { value: "replacement-token" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Use key" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/automatic merge requires an enabled verifier/i);
+    expect(mocks.createTeamGithubScope).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/Reconcile uncertain create/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save configuration" })).toBeEnabled();
   });
 
   async function runDraftToSavedSetup() {
