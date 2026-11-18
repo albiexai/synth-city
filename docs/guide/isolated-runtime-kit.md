@@ -120,6 +120,33 @@ For `--provider opencode-cli`, `up` pins the member to the kit's stub model befo
 
 **Limits.** The fake CLI is not OpenCode, so the product's OpenCode 2 gate refuses its Agent Mail registration and `up` with the fake stops at registration. That the stub-only config holds for a real OpenCode member, and that no hosted fallback happens, is proved only by a run of the real OpenCode CLI inside the kit; that run is a separate, approved phase.
 
+### OpenCode 2.2.7 teardown in v4.3
+
+On 2026-11-18, one real OpenCode 2.2.7 member ran on `release/v4.3`
+at `7701cf88`. The official Linux x64 archive matched the release's
+`SHA256SUMS` and GitHub asset SHA-256
+`89a6cee227b54bc011179c528a5e63176032462b1a5e21723b616801cddc2ca7`.
+The kit used only the loopback stub and bound the connected MCP session
+to the launched slot and pane. [OpenCode v2.2.7](https://github.com/anomalyco/opencode/releases/tag/v2.2.7)
+
+- **Teardown passed.** Standard `up` and `status` succeeded. Before
+  `down`, the standalone CLI, private `serve --stdio` process and Mail
+  shim formed a live parent-child chain. The server and shim each led
+  their own session and process group. Standard `down` stopped and
+  removed the kit. An independent process check found zero processes
+  in its PID namespace and none of the six recorded processes. The
+  verified status manifest SHA-256 was
+  `5bf21c3569e7f02a967af4d09dd0100817007c8c604c305768397a33f78cdd9c`.
+- **Q4 remains incomplete.** The session store recorded a user message,
+  an assistant message and a successful idle record, in that sequence.
+  The tool execution and permission-event order still needs evidence.
+- **The Mail round trip remains incomplete.** The stub emitted the
+  scripted Mail tool call. The member's stored turn contained no matching
+  tool execution or authenticated response. Registration is the observed
+  Mail evidence from this run.
+- **Q6 remains pending.** The run stopped before the planned crash and
+  relaunch when the Mail evidence was inconclusive. [Issue #1195](https://github.com/albiexai/synth-city/issues/1195)
+
 ## Using it for a live check
 
 1. Write the check as commands run with `exec`, or let the CLI under test act from its pane.
@@ -132,7 +159,7 @@ The end-to-end test `backend/tests/test_isolated_runtime_kit.py` runs a fake pro
 
 - **Linux only.** The kit needs unprivileged user, network and PID namespaces with a private procfs, plus `tmux`, `unshare`, `nsenter`, `ip`, `timeout` and `setsid`. The model and refusal tests run without namespace privileges.
 - **Not on the hosted `ubuntu-latest` runner as configured.** The runner denies the namespace setup (`unshare: write failed /proc/self/uid_map: Operation not permitted`). The log shows the denial, not its cause. There, each namespace-dependent test skips with `capability unavailable: uid_map`, and the namespace path is proved by one local run in the owner's leased workspace, with evidence on the PR for review.
-- **OpenCode evidence.** In #963, OpenCode 2.2.7's `opencode serve` and Agent Mail shim each led their own session. The #1018 fake-provider regression covers that process shape. The real OpenCode teardown, crash and relaunch capture, and Agent Mail round trip are tracked in [#1195](https://github.com/albiexai/synth-city/issues/1195).
+- **OpenCode evidence.** The #1018 fake-provider regression and the real 2.2.7 teardown above cover the separate session leaders observed in #963. The complete Q4 event order, Q6 crash and relaunch capture, and Mail round trip remain in [#1195](https://github.com/albiexai/synth-city/issues/1195).
 - **One OS user.** Factory members share one OS user, so ownership is proved by the instance id and namespace, never by the user id alone.
 - **Local checks only.** The stub model doesn't model a real provider; a real-provider check is a separate decision with its own approval.
 - **One kit per root.** The ports (18780 for the backend, 18781 for the stub) belong to the kit's own network namespace, so separate kits don't collide.
