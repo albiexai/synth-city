@@ -5,13 +5,21 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from fastapi import APIRouter, Depends
 from sqlalchemy import select
 
+from app.api.v1.deps import require_operator
+from app.config import settings
 from app.models.database import (
     FactoryAuditEvent, GithubMaintenanceEvent, MailAgentSession, MailExternalActor, MailMessage,
 )
 from app.services import github_leader_recovery_service as lr
 from tests.agent_teams.test_scope_amendments import db, healthy_attempt, submitted  # noqa: F401
+
+try:
+    from fastapi.routing import iter_route_contexts
+except ImportError:  # FastAPI before the effective route contexts: included routes are already flat in `routes`
+    iter_route_contexts = None
 
 REASON = "Standard recovery run by the Leader."
 
@@ -303,9 +311,45 @@ async def test_finalize_refuses_each_guard_without_a_notice(db, ready, refusal):
 
 # --- exposure --------------------------------------------------------------------------------------------------
 
+RECOVERY = "leader-recovery"
+RECOVERY_ROUTES = [
+    (f"{settings.api_v1_prefix}/agent-teams/github-work-items/{{item_id}}/leader-recovery/{tail}", ("POST",))
+    for tail in ("cancel-revision", "finalize-merged/preview", "finalize-merged", "release-workspace")
+]
+
+
+def _effective_routes(routes):
+    """(full path, methods, effective dependant) of every real route reachable from `routes`.
+
+    FastAPI 0.143 and later keep an included router as an `_IncludedRouter` node, so `router.routes` is no longer flat.
+    `iter_route_contexts` is FastAPI's own flattening: it yields each real route with the path that includes every
+    include prefix and the dependant that merges include-level and route-level dependencies. Before it existed the
+    routes were already flat and effective. Mounts and WebSocket routes carry no methods and are skipped."""
+    found = []
+    for route in (routes if iter_route_contexts is None else iter_route_contexts(routes)):
+        path, methods, dependant = (getattr(route, name, None) for name in ("path", "methods", "dependant"))
+        if path is not None and methods is not None and dependant is not None:
+            found.append((path, frozenset(methods), dependant))
+    return found
+
+
+def _depends_on(dependant, name):
+    """True when the dependant, or any dependency under it at any depth, is a call whose name contains `name`."""
+    return any(name in getattr(sub.call, "__name__", "") or _depends_on(sub, name) for sub in dependant.dependencies)
+
+
+def _assert_recovery_exposure(routes, expected):
+    effective = _effective_routes(routes)
+    recovery = [(path, methods, dependant) for path, methods, dependant in effective if RECOVERY in path]
+    assert sorted((path, tuple(sorted(methods))) for path, methods, _ in recovery) == sorted(expected)
+    for path, _, dependant in recovery:
+        assert not _depends_on(dependant, "require_operator"), f"{path} depends on require_operator"
+
+
 def test_operator_only_actions_are_not_exposed_to_the_leader():
     import inspect
-    from app.api.v1 import agent_teams
+    from app.api.v1 import factory_delivery
+    from app.main import app
     from mcp_shim import agent_mail_server as shim
     names = {n for n in dir(shim) if n.startswith("synth_city_leader_")}
     assert names == {"synth_city_leader_cancel_revision", "synth_city_leader_finalize_merged",
@@ -313,12 +357,81 @@ def test_operator_only_actions_are_not_exposed_to_the_leader():
     source = inspect.getsource(lr)
     for forbidden in ("max_continuation", "continuation_enabled", "github_publish", "settings.", "approve("):
         assert forbidden not in source  # no policy, limit or approval setter is reachable from the Leader service
-    routes = {(r.path, tuple(sorted(r.methods))) for r in agent_teams.router.routes
-              if "leader-recovery" in r.path}
-    assert len(routes) == 4
-    for route in agent_teams.router.routes:
-        if "leader-recovery" in route.path:
-            assert "require_operator" not in str(route.dependant.dependencies)
+    # The routes as the app really exposes them: exactly these four, none behind the operator guard.
+    _assert_recovery_exposure(app.routes, RECOVERY_ROUTES)
+    # The test must have looked at the operator-protected group: every delivery route is among the effective routes,
+    # under the agent-teams prefix, and depends on require_operator.
+    effective = _effective_routes(app.routes)
+    delivery = [route for route in factory_delivery.router.routes if getattr(route, "methods", None)]
+    assert delivery
+    for route in delivery:
+        full = f"{settings.api_v1_prefix}/agent-teams{route.path}"
+        matches = [dependant for path, methods, dependant in effective if path == full and methods == frozenset(route.methods)]
+        assert matches, full
+        assert all(_depends_on(dependant, "require_operator") for dependant in matches), full
+
+
+# --- nested routes: the same assertion, run on small trees built with the real include_router --------------------
+
+RECOVERY_PATH = "/github-work-items/{item_id}/leader-recovery/nested"
+
+
+def _transitive_guard(operator=Depends(require_operator)):  # reaches require_operator only through this dependency
+    return operator
+
+
+def _nested_tree(*, child_dependencies=(), include_dependencies=(), route_dependencies=(), path=RECOVERY_PATH, levels=1):
+    child = APIRouter(dependencies=list(child_dependencies))
+
+    @child.post(path, dependencies=list(route_dependencies))
+    def nested_endpoint():
+        return {}
+
+    tree = child
+    for index in range(levels):
+        outer = APIRouter()
+        outer.include_router(tree, dependencies=list(include_dependencies) if index == 0 else [])
+        tree = outer
+    return tree.routes
+
+
+NESTED = [(RECOVERY_PATH, ("POST",))]
+
+
+def test_nested_routes_guarded_by_the_child_router_are_found_and_fail_the_exposure_check():
+    routes = _nested_tree(child_dependencies=[Depends(require_operator)])
+    assert [path for path, _, _ in _effective_routes(routes)] == [RECOVERY_PATH]
+    with pytest.raises(AssertionError, match="depends on require_operator"):
+        _assert_recovery_exposure(routes, NESTED)
+
+
+def test_nested_routes_guarded_by_the_include_are_found_and_fail_the_exposure_check():
+    routes = _nested_tree(include_dependencies=[Depends(require_operator)])
+    with pytest.raises(AssertionError, match="depends on require_operator"):
+        _assert_recovery_exposure(routes, NESTED)
+
+
+def test_nested_routes_two_levels_deep_are_found_and_fail_the_exposure_check():
+    routes = _nested_tree(include_dependencies=[Depends(require_operator)], levels=2)
+    with pytest.raises(AssertionError, match="depends on require_operator"):
+        _assert_recovery_exposure(routes, NESTED)
+
+
+def test_nested_routes_that_reach_the_guard_only_through_another_dependency_fail_the_exposure_check():
+    routes = _nested_tree(route_dependencies=[Depends(_transitive_guard)])
+    with pytest.raises(AssertionError, match="depends on require_operator"):
+        _assert_recovery_exposure(routes, NESTED)
+
+
+def test_nested_routes_with_an_extra_unguarded_recovery_route_fail_the_inventory():
+    routes = _nested_tree()
+    with pytest.raises(AssertionError):
+        _assert_recovery_exposure(routes, [])           # one recovery route that the inventory does not expect
+
+
+def test_nested_routes_without_the_guard_and_with_the_expected_inventory_pass():
+    _assert_recovery_exposure(_nested_tree(), NESTED)                                    # not over-strict
+    _assert_recovery_exposure(_nested_tree(path="/github-work-items/{item_id}/other"), [])   # no recovery route at all
 
 
 # --- review 5919432941: one complete correction batch ------------------------------------------------------
