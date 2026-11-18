@@ -695,7 +695,8 @@ async def _bounded_native_read(read):
 
 async def observe_team(db: AsyncSession, preset_id: int, *, include_agent_status: bool = True,
                        persist_identities: bool = True, max_input_rows: int | None = None,
-                       input_fence: dict | None = None, record_input_waits: bool = True) -> AgentTeamActivityResponse:
+                       input_fence: dict | None = None, record_input_waits: bool = True,
+                       validity_seconds: int = 15) -> AgentTeamActivityResponse:
     inputs = await _team_inputs(db, preset_id) if max_input_rows is None else await _team_inputs(db, preset_id, max_input_rows)
     now = datetime.now(timezone.utc)
     metadata = [{} for _ in inputs]
@@ -728,7 +729,7 @@ async def observe_team(db: AsyncSession, preset_id: int, *, include_agent_status
     else:
         observations = [AgentActivityDisplayObservation(**entry.model_dump()) for entry in observations]
     return AgentTeamActivityResponse(preset_id=preset_id, checked_at=now,
-                                    valid_until=now + timedelta(seconds=15), slots=observations)
+                                    valid_until=now + timedelta(seconds=validity_seconds), slots=observations)
 
 
 async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) -> bool:

@@ -275,7 +275,8 @@ class GithubWorkProgressService:
             raise ProgressObservationError("changed_during_read")
         return result
 
-    async def summary(self, db: AsyncSession, item_id: int) -> GithubWorkProgressResponse | None:
+    async def summary(self, db: AsyncSession, item_id: int, *,
+                      validity_seconds: int = _CACHE_SECONDS) -> GithubWorkProgressResponse | None:
         rows = await self._rows(db, item_id)
         if rows is None:
             return None
@@ -459,9 +460,9 @@ class GithubWorkProgressService:
                             for part in (scope.repo_owner, scope.repo_name)) else None)
         remaining = self._remaining_view(remaining_packet, context, datetime.now(timezone.utc),
                                          issue_url, private_values)
-        valid_until = now + timedelta(seconds=_CACHE_SECONDS)
+        valid_until = now + timedelta(seconds=validity_seconds)
         if publication.state == "current" and publication.observed_at:
-            valid_until = min(valid_until, _utc(publication.observed_at) + timedelta(seconds=_CACHE_SECONDS))
+            valid_until = min(valid_until, _utc(publication.observed_at) + timedelta(seconds=validity_seconds))
         if continuation_deadline is not None:
             valid_until = min(valid_until, _utc(continuation_deadline))
         return GithubWorkProgressResponse(
