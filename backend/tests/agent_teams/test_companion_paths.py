@@ -64,6 +64,7 @@ def test_the_tool_surface_brings_the_inventory_tests_and_the_doc_page():
     found = companion_paths.companions_for(["backend/mcp_shim/agent_mail_server.py"])
     assert {"backend/tests/agent_mail/test_mcp_shim.py", "backend/tests/agent_mail/test_pi_shim.py",
             "backend/tests/agent_mail/test_tool_rename.py", "backend/tests/upgrade/test_provider_upgrade_startup.py",
+            "backend/tests/upgrade/test_provider_upgrade_interruption.py",
             "integrations/pi-agent-mail/manifest.ts", "docs/api/agent-mail.md"} <= set(found)
 
 
