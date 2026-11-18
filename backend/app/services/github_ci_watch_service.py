@@ -6,7 +6,7 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import exists, select, update
+from sqlalchemy import exists, inspect, select, update
 from sqlalchemy.exc import OperationalError
 
 from app.models.database import (AgentTeamPreset, AgentTeamSlot, GithubOwnerObservationPause,
@@ -50,8 +50,26 @@ def check_matrix(policy, checks, head):
 
 
 class GithubCIWatchService:
+    @staticmethod
+    async def _loaded(db, instance):
+        """Load what a rollback expired, in the async context; False for an expired object this session cannot load.
+
+        #1150: an earlier rollback in the poll expires the caller's scope and item, and a plain attribute read then
+        lazy-loads synchronously (MissingGreenlet). Only expired attributes are reloaded, so pending changes stay.
+        """
+        state = inspect(instance)
+        expired = list(state.expired_attributes)
+        if not expired:
+            return True
+        if state.session is not db.sync_session:
+            return False  # detached: never lazily loaded; the caller gets no watch
+        await db.refresh(instance, attribute_names=expired)
+        return True
+
     async def capture(self, db, scope, item):
         """Capture before GitHub awaits. Private lease values stay inside the SQL fence."""
+        if not await self._loaded(db, item) or not await self._loaded(db, scope):
+            return None
         expected = {k: getattr(item, k) for k in ('id', 'scope_id', 'dispatch_nonce', 'owner_slot_id',
             'active_scope_revision', 'attempt_phase', 'dispatch_status', 'pr_number',
             'verification_head_sha', 'ack_received_at', 'dispatch_head_ref', 'dispatch_base_ref')}
@@ -59,8 +77,8 @@ class GithubCIWatchService:
         if (hold_code() or expected['dispatch_status'] not in _ACTIVE or not expected['dispatch_nonce']
                 or not expected['owner_slot_id'] or not expected['pr_number']):
             return None
-        team = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
         fresh_scope = await db.get(TeamGithubScope, expected['scope_id'], populate_existing=True)
+        team = await db.get(AgentTeamPreset, fresh_scope.preset_id, populate_existing=True) if fresh_scope else None
         if not team or not fresh_scope or not team.autonomy_enabled or not fresh_scope.enabled:
             return None
         workspace = (await db.execute(select(GithubWorkspace).where(
