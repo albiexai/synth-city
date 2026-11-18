@@ -44,6 +44,8 @@ Each team has slots. A slot stores:
 - repository path
 - display name
 - role and charter
+- area labels, the GitHub label names that route an issue to this slot (exact, case-sensitive match)
+- expertise, a note that is stored but does not route work yet
 - optional UI color for Agent Bridge cards and terminals
 - optional bootstrap prompt
 - controlled language, enabled by default for each member
@@ -221,8 +223,14 @@ your action and can filter them. Leader approvals are labeled separately. For
 operator recovery checkpoints or stranded initial approvals, the action remains
 visible for the operator instead of being labeled as a Leader decision. Under
 automatic merge policy, a review-ready item needs your action only when Synth City has
-explicitly fallen back to human merge. Passing checks do not prove independent
+explicitly fallen back to human merge. A code PR under automatic merge policy merges
+only after the team's verifier slot has accepted its exact current head; the item's
+owner and the Leader cannot supply that acceptance. Passing checks do not prove independent
 review acceptance. Check the current PR head and review evidence before merging.
+
+When you move an issue to another milestone, end its work item as deferred and
+name the target milestone. The team learns about the move from this action until
+milestone routing is available. [#1223](https://github.com/albiexai/synth-city/issues/1223)
 
 ### Observation limits
 
@@ -372,15 +380,18 @@ world-writable.
 - **Directories.** Every directory below the home is opened without following symlinks
   and held open while its files are read; a symlinked, foreign-owned or world-writable
   directory, or one replaced during the read, gives `unknown`.
-- **Snapshots.** The two SQLite databases and their WAL files are read as bytes only,
-  copied twice and compared (once retried), then queried on a private copy with fixed,
-  limited queries and a step budget. Files over 16 MiB, damaged copies and a file
-  changing between rounds give `unknown`. The live files are never opened by SQLite or
-  changed. That the copied files form one consistent state across both databases is not
-  proven yet (continuation of #737); the checks above only refuse change they detect.
-- **Deadline.** One deadline starts when an observation or discovery starts; a result or
-  conversation id produced after it is refused. The work itself is bounded by the size
-  caps, not interrupted at the deadline.
+- **Snapshots.** Two matching copy rounds of both SQLite databases and WAL files
+  bracket a transcript sample. The named transcript and its open file descriptor must
+  keep the same identity and metadata throughout the sample. A database change gets
+  one retry; persistent changes, damaged copies and database files over 16 MiB give
+  `unknown`. SQLite reads private copies with fixed queries and an instruction budget
+  checked every 100 virtual-machine instructions. The live files are read as bytes.
+  The matching reads establish an overlap for the sampled files. The databases can
+  still contain different logical states while the harness commits them separately.
+- **Deadline.** Discovery and observation each have a one-second deadline. The activity
+  service runs the read in a child with the controller's permissions and kills a timed-out
+  child. The parent owns and cleans up the copy directory. An overdue result gives
+  `unknown` and an overdue discovery provides no conversation ID.
 - **Transcript.** From `brain/<id>/.system_generated/logs/transcript.jsonl`, only the
   step index, type, source, time and tool names are read; message text is ignored.
 - **States**, from the shapes observed on `agy` 1.5.9 (the turn is the latest user input,
@@ -398,12 +409,16 @@ world-writable.
   flag. Other tools, other modes and permission reviews were not observed and stay
   unknown. Every record of the current turn must be well formed and dated between the
   input and now.
-- **Not yet available.** The team guard does not yet handle `agy` members, and there is
-  no screen fallback. Both are tracked in a continuation of #737. Readiness stays blocked
-  as described above.
+- **Screen evidence.** One passive `agy` 1.5.9 launch with the isolated #993/#994
+  runner reached the first-run colour-scheme screen. The scratch backend applied
+  Agent Mail configuration. The run stopped at onboarding with no input. It produced
+  no transcript or requests to the local model stub, and the trial processes exited.
+  Agent Mail delivery through `agy` and the screens needed for working, waiting and
+  idle recognition remain unverified. The classifier keeps unproven activity `unknown`.
+  See [#1215](https://github.com/albiexai/synth-city/issues/1215).
 - **Separate controller and agent users.** The controller must be able to read the
   agent user's `antigravity-cli` files. Otherwise the status is `native_log_unreadable`.
-  Group access for this setup has not been tested yet.
+  The passive launch used one host user. Access across two users remains unverified.
 
 ## External Local Agents
 

@@ -47,7 +47,20 @@ for (const { name, route } of PAGES) {
       // a repeat of that request.
       guard.expectStatus('GET', /\/api\/v1\/factory\//, 404)
       guard.expectStatus('GET', /\/api\/v1\/factory\//, 422)
+      // The names are released only after the presets have answered, so the team reads
+      // always race the scope check ahead of the names (#1207).
+      let releaseNames: () => void = () => {}
+      const namesHeld = new Promise<void>((resolve) => {
+        releaseNames = resolve
+      })
+      await page.route(/\/api\/v1\/factory\/repositories\?/, async (route) => {
+        await namesHeld
+        await route.fallback()
+      })
+      const presetsAnswered = page.waitForResponse(/\/api\/v1\/agent-teams\/presets$/)
       await open(page, `${route}?${param}`, name)
+      await presetsAnswered
+      releaseNames()
       const reset = page.getByRole('link', { name: /reset/i })
       await expect(reset).toHaveCount(1)
       await expect(page.getByRole('combobox', { name: /^Team$/ })).toBeVisible()

@@ -38,6 +38,8 @@ from .harness_scope import router as harness_scope_router
 SETTINGS_WRITES = [Depends(require_operator_for_writes)]
 # The same, and the request reads the global scope of the user that the X-Harness-Scope-User header names.
 SCOPED_SETTINGS = [Depends(require_operator_for_writes), Depends(apply_harness_scope)]
+# The scope alone, for routers whose authorization stays as it is (#1065).
+SCOPED = [Depends(apply_harness_scope)]
 
 router = APIRouter()
 
@@ -70,11 +72,11 @@ router.include_router(agents_router, tags=["Agents"], dependencies=SCOPED_SETTIN
 router.include_router(backup_router, tags=["Backup"], dependencies=SETTINGS_WRITES)
 router.include_router(output_styles_router, tags=["Output Styles"], dependencies=SCOPED_SETTINGS)
 router.include_router(statusline_router, tags=["Status Line"], dependencies=SETTINGS_WRITES)
-router.include_router(sessions_router, tags=["Sessions"])
-router.include_router(usage_router, tags=["Usage"], dependencies=SETTINGS_WRITES)
+router.include_router(sessions_router, tags=["Sessions"], dependencies=SCOPED)
+router.include_router(usage_router, tags=["Usage"], dependencies=SCOPED_SETTINGS)
 router.include_router(memory_router, tags=["Memory"], dependencies=SCOPED_SETTINGS)
-router.include_router(context_router, tags=["Context"])
-router.include_router(plans_router, tags=["Plans"])
+router.include_router(context_router, tags=["Context"], dependencies=SCOPED)
+router.include_router(plans_router, tags=["Plans"], dependencies=SCOPED)
 router.include_router(agent_mail_router, prefix="/agent-mail", tags=["Agent Mail"])
 router.include_router(agent_teams_router, prefix="/agent-teams", tags=["Agent Teams"])
 router.include_router(operations_router)

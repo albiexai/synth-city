@@ -2,10 +2,10 @@ name: E2E
 
 on:
   pull_request:
-    branches: [master, release/v3.1, release/v4.0, release/v4.1, release/v4.2]
+    branches: [master, release/v3.1, release/v4.0, release/v4.1, release/v4.2, release/v4.3]
     types: [opened, synchronize, reopened]
   push:
-    branches: [master, release/v3.1, release/v4.0, release/v4.1, release/v4.2]
+    branches: [master, release/v3.1, release/v4.0, release/v4.1, release/v4.2, release/v4.3]
 
 permissions:
   contents: read
@@ -32,7 +32,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/ci/docs_only.py
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: steps.changes.outputs.run_suites != 'false'
         with:
           python-version: '3.12'
@@ -70,7 +70,7 @@ jobs:
         run: npm run e2e
       - name: Upload traces, screenshots and the backend log
         if: steps.changes.outputs.run_suites != 'false' && (failure())
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-results
           path: |
@@ -96,7 +96,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/ci/docs_only.py
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: steps.changes.outputs.run_suites != 'false'
         with:
           python-version: '3.12'
@@ -136,7 +136,7 @@ jobs:
         run: node e2e/support/report-progress.mjs test-results/results.json >> "$GITHUB_STEP_SUMMARY"
       - name: Upload traces and screenshots
         if: steps.changes.outputs.run_suites != 'false' && (steps.pending.outcome == 'failure')
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-pending-results
           path: |
@@ -180,7 +180,7 @@ jobs:
             echo "No guarded file changed; the loop is not needed."
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: steps.loop.outputs.run == 'true'
         with:
           python-version: '3.12'
@@ -223,7 +223,7 @@ jobs:
           '
       - name: Upload the loop result and the backend log
         if: steps.loop.outputs.run == 'true' && (success())
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-flicker-loop-result
           path: |
@@ -232,7 +232,7 @@ jobs:
           retention-days: 7
       - name: Upload traces, screenshots and the backend log
         if: steps.loop.outputs.run == 'true' && (failure())
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-flicker-loop-failure
           path: |

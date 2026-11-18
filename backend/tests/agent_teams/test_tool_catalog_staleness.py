@@ -17,30 +17,55 @@ from app.models.database import MailAgentSession
 from app.models.schemas import MailAgentRegisterRequest
 from app.services.agent_mail_service import agent_mail_service
 from app.services.agent_status_service import agent_status_service
-from app.services.tool_catalog import STALE_REASON, catalog_fingerprint, current_catalog_fingerprint
+from app.services.tool_catalog import STALE_REASON, catalog_fingerprint, current_catalog_fingerprint, deployed_schemas
 from tests.agent_teams.test_agent_status import seed_agent
 
 CURRENT = current_catalog_fingerprint()
-OLD = catalog_fingerprint(["synth_city_check_inbox", "synth_city_whoami"])
+# #1146: a session started before #1100, same tool names, but the extension tool without its two new parameters.
+def _before_1100() -> dict:
+    schemas = {name: dict(schema) for name, schema in deployed_schemas().items()}
+    extend = schemas["synth_city_extend_effort_limit"]
+    extend["properties"] = {key: value for key, value in extend["properties"].items()
+                            if key not in {"expected_extension_minutes", "evidence"}}
+    extend["required"] = [key for key in extend.get("required", []) if key not in {"expected_extension_minutes", "evidence"}]
+    return schemas
+
+
+OLD = catalog_fingerprint(_before_1100())
 
 
 # --- the fingerprint and its drift guard -------------------------------------------------------------------------------
 
 
 def test_the_fingerprint_is_stable_order_independent_and_sensitive_to_the_list():
-    assert catalog_fingerprint(["b", "a"]) == catalog_fingerprint(["a", "b"]) == catalog_fingerprint(("a", "b", "a"))
-    assert catalog_fingerprint(["a", "b"]) != catalog_fingerprint(["a", "b", "c"])
-    assert catalog_fingerprint(["a"]) != catalog_fingerprint(["b"])
-    assert len(catalog_fingerprint(["a"])) == 32 and int(catalog_fingerprint(["a"]), 16) >= 0
+    a, b = {"type": "object", "properties": {"x": {"type": "integer"}}}, {"type": "object", "properties": {}}
+    assert catalog_fingerprint({"b": b, "a": a}) == catalog_fingerprint({"a": a, "b": b})
+    assert catalog_fingerprint({"a": a, "b": b}) != catalog_fingerprint({"a": a, "b": b, "c": b})
+    assert catalog_fingerprint({"a": a}) != catalog_fingerprint({"b": a})
+    assert len(catalog_fingerprint({"a": a})) == 32 and int(catalog_fingerprint({"a": a}), 16) >= 0
+
+
+def test_a_changed_parameter_under_the_same_name_changes_the_fingerprint():
+    # #1146: #1100 added required parameters to synth_city_extend_effort_limit under the same name.
+    assert set(_before_1100()) == set(deployed_schemas())
+    assert OLD != CURRENT
+    schema = {"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]}
+    retyped = {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]}
+    assert catalog_fingerprint({"t": schema}) != catalog_fingerprint({"t": retyped})
+    # Key order inside a schema does not matter.
+    assert catalog_fingerprint({"t": {"required": ["x"], "properties": {"x": {"type": "integer"}}, "type": "object"}}) == \
+        catalog_fingerprint({"t": schema})
 
 
 @pytest.mark.asyncio
 async def test_the_backends_expected_tool_list_is_the_one_the_shim_registers():
     """The drift guard: a tool added to one side only changes one fingerprint and fails here."""
     import mcp_shim.agent_mail_server as shim
-    registered = sorted(tool.name for tool in await shim.mcp.list_tools())
+    registered = {tool.name: tool.inputSchema for tool in await shim.mcp.list_tools() if tool.name.startswith("synth_city_")}
     from app.services.provider_upgrade import _SUFFIXES
-    assert registered == sorted("synth_city_" + suffix for suffix in _SUFFIXES)
+    assert sorted(registered) == sorted("synth_city_" + suffix for suffix in _SUFFIXES)
+    # #1146: the committed snapshot carries every tool's input schema; regenerate it with scripts/tool-catalog-schemas.py.
+    assert registered == deployed_schemas()
     assert shim.tool_catalog_fingerprint() == CURRENT == catalog_fingerprint(registered)
 
 

@@ -17,6 +17,7 @@ import httpx
 from app.config import settings
 from app.services.github_check_observation import observe_checks
 from app.services.github_offline import github_http_client
+from app.services.github_rate_limit_service import github_rate_limit_service
 
 _GITHUB_API = "https://api.github.com"
 _GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -58,9 +59,12 @@ class GithubClient:
         self._token = token if token is not None else settings.github_token
 
     def _client(self) -> httpx.AsyncClient:
-        if self._http is not None:
-            return self._http
-        return github_http_client(_GITHUB_API, settings)
+        client = self._http if self._http is not None else github_http_client(_GITHUB_API, settings)
+        github_rate_limit_service.install(client)
+        return client
+
+    def require_poll_available(self) -> None:
+        github_rate_limit_service.require_available(self._headers().get("Authorization"))
 
     def _headers(self, token: str | None = None) -> dict[str, str]:
         headers = {"Accept": "application/vnd.github+json"}
@@ -438,6 +442,41 @@ class GithubClient:
                 raise GithubClientResponseError("GitHub comparison status was unknown")
             common_sha = self._git_sha(common.get("sha"), "comparison merge base")
             return status in {"ahead", "identical"} and common_sha == ancestor
+        finally:
+            if self._http is None:
+                await client.aclose()
+
+    async def get_merge_base(
+        self, owner: str, repo: str, base: str, head: str, *, token: str,
+    ) -> str:
+        """The merge base of two commits, from an exact, bounded comparison response (#1030)."""
+        base = self._git_sha(base, "merge base request")
+        head = self._git_sha(head, "merge head request")
+        endpoint = f"/repos/{owner}/{repo}/compare/{base}...{head}"
+        client = self._client()
+        try:
+            response = await client.get(endpoint, headers=self._headers(token))
+            response.raise_for_status()
+            self._require_expected_response(response, endpoint=endpoint, label="comparison")
+            body = self._json_object(response, "comparison")
+            base_commit, common = (body.get(name) for name in ("base_commit", "merge_base_commit"))
+            if not all(isinstance(value, dict) for value in (base_commit, common)):
+                raise GithubClientResponseError("GitHub comparison identities were missing")
+            binding_url = body.get("url")
+            if not isinstance(binding_url, str):
+                raise GithubClientResponseError("GitHub comparison binding was missing")
+            try:
+                binding = urlsplit(binding_url)
+            except ValueError:
+                raise GithubClientResponseError("GitHub comparison binding was malformed") from None
+            if (binding.scheme != "https" or binding.netloc != "api.github.com"
+                    or binding.path != endpoint or binding.query or binding.fragment
+                    or base_commit.get("sha") != base):
+                raise GithubClientResponseError("GitHub comparison identities changed")
+            status = body.get("status")
+            if not isinstance(status, str) or status not in {"ahead", "behind", "diverged", "identical"}:
+                raise GithubClientResponseError("GitHub comparison status was unknown")
+            return self._git_sha(common.get("sha"), "comparison merge base")
         finally:
             if self._http is None:
                 await client.aclose()

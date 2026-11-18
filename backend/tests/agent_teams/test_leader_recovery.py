@@ -1,17 +1,29 @@
-"""The Leader runs three standard recoveries with the operator guards, one audit fact and one Supervisor notice."""
+"""Leader recoveries keep the operator guards, audit facts and Supervisor notices."""
 import asyncio
-from datetime import datetime, timedelta
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from fastapi import APIRouter, Depends
+from sqlalchemy import event, select, update
+from sqlalchemy.exc import OperationalError
 
+from app.api.v1.deps import require_operator
+from app.config import settings
 from app.models.database import (
-    FactoryAuditEvent, GithubMaintenanceEvent, MailAgentSession, MailExternalActor, MailMessage,
+    FactoryAuditEvent, GithubMaintenanceEvent, GithubWorkspace, MailAgentSession, MailExternalActor, MailMessage,
 )
 from app.services import github_leader_recovery_service as lr
+from app.services.github_end_stopped_item_service import EndStoppedItemRequest
+from mcp_shim.work_remaining_protocol import public_generation
 from tests.agent_teams.test_scope_amendments import db, healthy_attempt, submitted  # noqa: F401
+
+try:
+    from fastapi.routing import iter_route_contexts
+except ImportError:  # FastAPI before the effective route contexts: included routes are already flat in `routes`
+    iter_route_contexts = None
 
 REASON = "Standard recovery run by the Leader."
 
@@ -51,6 +63,26 @@ async def ready(db, healthy_attempt):
     a.leader_session = await _session(db, a.leader)
     a.owner_session = await _session(db, a.owner)
     return a
+
+
+@pytest.mark.asyncio
+async def test_only_current_leader_ends_stopped_work_and_sends_one_notice(db, ready, monkeypatch):
+    attempt = ready
+    attempt.item.dispatch_status = "escalated"
+    await db.commit()
+    monkeypatch.setattr(lr.github_workspace_service, "delegated_release_blocker", AsyncMock(return_value=None))
+    request = EndStoppedItemRequest(operation_id="end-stopped", expected_scope_revision=attempt.item.active_scope_revision,
+        expected_dispatch_generation=public_generation(attempt.item.id, attempt.nonce), outcome="deferred",
+        target_milestone="vNext", reason="Work moved to the next milestone.")
+    with pytest.raises(lr.LeaderRecoveryError, match="leader_only"):
+        await lr.end_stopped(db, attempt.item, attempt.owner_session, request)
+    first = await lr.end_stopped(db, attempt.item, attempt.leader_session, request)
+    assert first["status"] == "ended" and first["notice"] == "sent"
+    await db.refresh(attempt.revision)
+    assert attempt.revision.status == "cancelled"
+    again = await lr.end_stopped(db, attempt.item, attempt.leader_session, request)
+    assert again["status"] == "already_ended" and again["notice"] == "already_sent"
+    assert len(await _notices(db)) == 1
 
 
 # --- cancel ---------------------------------------------------------------------------------------------------
@@ -165,6 +197,112 @@ async def test_concurrent_duplicate_cancel_requests_cancel_once_and_notify_once(
     assert len(await _notices(db)) == 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("db", ["concurrent", "concurrent_wal"], indirect=True)
+async def test_cancel_completes_when_a_replay_writes_the_owner_notice_first(db, ready, monkeypatch):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.models.database import GithubWorkItem, MailTeamMember
+    from app.services.agent_mail_service import agent_mail_service
+
+    a = ready
+    first_has_read = asyncio.Event()
+    replay_has_written = asyncio.Event()
+    delivery_key = lr.github_approval_service.active_cancellation_delivery_key(a.revision)
+    create_message = agent_mail_service._create_message_row
+    locks = []
+
+    @event.listens_for(db.bind.sync_engine, "handle_error")
+    def record_notice_lock(context):
+        code = getattr(context.original_exception, "sqlite_errorcode", None)
+        if (code is not None and (code & 0xff) == sqlite3.SQLITE_BUSY
+                and (context.statement or "").startswith("INSERT INTO mail_messages")):
+            locks.append(code)
+
+    async with async_sessionmaker(db.bind, expire_on_commit=False)() as replay_db:
+        async def create_with_interleave(session, request, **kwargs):
+            owner_notice = kwargs.get("delivery_key") == delivery_key
+            if owner_notice and session is db and not first_has_read.is_set():
+                # The original caller already committed cancellation. Force the
+                # recipient read inside the Mail savepoint even if it is cached.
+                await session.get(MailTeamMember, request.recipient_member_id, populate_existing=True)
+                first_has_read.set()
+                await replay_has_written.wait()
+            result = await create_message(session, request, **kwargs)
+            if owner_notice and session is replay_db:
+                replay_has_written.set()
+            return result
+
+        monkeypatch.setattr(agent_mail_service, "_create_message_row", create_with_interleave)
+        item = await replay_db.get(GithubWorkItem, a.item.id)
+        session = await replay_db.get(MailAgentSession, a.leader_session.id)
+        nonce = a.nonce
+
+        async def replay():
+            await first_has_read.wait()
+            return await lr.cancel_revision(replay_db, item, session, revision_number=1,
+                                            dispatch_nonce=nonce, operation_id="op-1", reason=REASON)
+
+        async with asyncio.timeout(10):
+            results = await asyncio.gather(_cancel(db, a, a.leader_session), replay(), return_exceptions=True)
+
+    assert locks, "the original owner notice write must encounter a real SQLite lock"
+    assert [r.get("status") if isinstance(r, dict) else repr(r) for r in results] == [
+        "cancelled", "already_cancelled",
+    ]
+    assert sorted(r["notice"] for r in results) == ["already_sent", "sent"]
+    assert len(await _notices(db)) == 1
+    assert len((await db.scalars(select(MailMessage).where(MailMessage.delivery_key == delivery_key))).all()) == 1
+    assert len((await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == "recovery_cancellation",
+        FactoryAuditEvent.action_outcome == "applied"))).all()) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lease_changes", [False, True], ids=["busy_exhausted", "changed_lease"])
+async def test_cancel_notice_retry_preserves_the_committed_action(db, ready, monkeypatch, lease_changes):
+    a = ready
+    workspace_id = a.workspace.id
+    delivery_key = lr.github_approval_service.active_cancellation_delivery_key(a.revision)
+    send = lr.github_approval_service.ensure_active_cancellation_notice
+
+    async def busy_notice(session, _item, _revision):
+        if lease_changes:
+            # A new lease committed while cancellation's post-commit notice was pending.
+            await session.execute(update(GithubWorkspace).where(GithubWorkspace.id == workspace_id)
+                                  .values(lease_token="replacement-lease"))
+            await session.commit()
+        cause = sqlite3.OperationalError("database is locked")
+        cause.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        raise OperationalError(None, None, cause)
+
+    notice = AsyncMock(side_effect=busy_notice)
+    monkeypatch.setattr(lr.github_approval_service, "ensure_active_cancellation_notice", notice)
+    with pytest.raises(lr.LeaderRecoveryError) as error:
+        await _cancel(db, a, a.leader_session)
+
+    expected = ("active_continuation_cancel_conflict", 409, 1) if lease_changes else (
+        "database_busy_cancellation_saved", 503, 3,
+    )
+    assert (error.value.code, error.value.status_code, notice.await_count) == expected
+    await db.refresh(a.revision)
+    await db.refresh(a.item)
+    assert a.item.dispatch_status == "escalated" and a.revision.status == "superseded"
+    assert await db.scalar(select(MailMessage).where(MailMessage.delivery_key == delivery_key)) is None
+    assert len(await _notices(db)) == 1
+    assert len((await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == "recovery_cancellation",
+        FactoryAuditEvent.action_outcome == "applied"))).all()) == 1
+    notice_facts = (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == "recovery_cancellation_notification"))).all()
+    assert [fact.action_outcome for fact in notice_facts] == ["uncertain"]
+
+    if not lease_changes:
+        monkeypatch.setattr(lr.github_approval_service, "ensure_active_cancellation_notice", send)
+        result = await _cancel(db, a, a.leader_session)
+        assert result["status"] == "already_cancelled" and result["notice"] == "already_sent"
+        assert await db.scalar(select(MailMessage).where(MailMessage.delivery_key == delivery_key)) is not None
+
+
 # --- release a clean workspace -------------------------------------------------------------------------------
 
 async def _release(db, a, session, **over):
@@ -195,6 +333,84 @@ async def test_release_clears_exactly_the_inspected_lease_and_notifies_once(db, 
     assert a.workspace.leased_item_id is None and len(await _notices(db)) == 1
     again = await _release(db, a, a.leader_session)
     assert again["status"] == "already_released" and again["notice"] == "already_sent"
+    assert len(await _notices(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_leader_reads_and_releases_the_lease_of_a_completed_closed_pr(db, ready):
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+    from app.api.v1 import agent_teams
+    from app.database import get_db
+    from app.services.agent_mail_service import agent_mail_service
+
+    a = ready
+    item_id, workspace_id = a.item.id, a.workspace.id
+    lease_start = datetime(2026, 11, 17, 18, 11, 59, 123456)
+    contact = lease_start + timedelta(seconds=10)
+    a.workspace.leased_at = lease_start
+    a.workspace.lease_last_owner_contact_at = contact
+    a.item.dispatch_status = "completed"
+    branches = _git(a.repo, "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines()
+    a.scope.base_ref = next(branch for branch in branches if branch != a.item.dispatch_head_ref)
+    (a.repo / "change.txt").write_text("ahead of the base\n")
+    _git(a.repo, "add", "change.txt")
+    _git(a.repo, "commit", "-qm", "closed PR commit")
+    a.pull.update(state="closed", merged_at=None)
+    a.pull["head"]["sha"] = _git(a.repo, "rev-parse", "HEAD")
+    assert _git(a.repo, "rev-list", "--count", f"{a.scope.base_ref}..HEAD") == "1"
+    a.leader_session.capability_token_hash = agent_mail_service.hash_capability_token("fixture-leader-token")
+    a.owner_session.capability_token_hash = agent_mail_service.hash_capability_token("fixture-owner-token")
+    await db.commit()
+
+    api = FastAPI()
+    api.include_router(agent_teams.router)
+
+    async def test_db():
+        yield db
+
+    api.dependency_overrides[get_db] = test_db
+    route = f"/github-work-items/{item_id}/leader-recovery/release-workspace"
+    leader = {"X-Synth-City-Session-Token": "fixture-leader-token"}
+    owner = {"X-Synth-City-Session-Token": "fixture-owner-token"}
+    async with AsyncClient(transport=ASGITransport(app=api), base_url="http://fixture") as client:
+        assert (await client.get(f"{route}/context")).status_code == 401
+        assert (await client.get(f"{route}/context", headers=owner)).status_code == 403
+        read = await client.get(f"{route}/context", headers=leader)
+        assert read.status_code == 200, read.text
+        assert read.headers.get("cache-control") == "no-store"
+        context = read.json()
+        assert set(context) == {"work_item_id", "workspace_id", "leased_at"}
+        assert context["work_item_id"] == item_id and context["workspace_id"] == workspace_id
+        assert datetime.fromisoformat(context["leased_at"]) == lease_start.replace(tzinfo=timezone.utc)
+        await db.refresh(a.workspace)
+        assert a.workspace.leased_item_id == item_id
+        assert a.workspace.lease_last_owner_contact_at == contact
+        assert await _notices(db) == []
+
+        await db.refresh(a.item)
+        a.item.dispatch_status = "verifying"
+        await db.commit()
+        active = await client.get(f"{route}/context", headers=leader)
+        assert active.status_code == 409 and active.json()["detail"] == "item_not_terminal"
+        await db.refresh(a.item)
+        a.item.dispatch_status = "completed"
+        await db.commit()
+
+        payload = {"workspace_id": context["workspace_id"], "expected_leased_at": context["leased_at"],
+                   "operation_id": "closed-pr-release", "reason": REASON}
+        stale = await client.post(route, headers=leader,
+                                  json=payload | {"expected_leased_at": (lease_start - timedelta(microseconds=1)).isoformat()})
+        assert stale.status_code == 409 and stale.json()["detail"] == "workspace_lease_changed"
+        released = await client.post(route, headers=leader, json=payload)
+        assert released.status_code == 200, released.text
+        assert released.json() == {"status": "released", "workspace_id": workspace_id, "notice": "sent"}
+        replayed = await client.post(route, headers=leader, json=payload)
+        assert replayed.json() == {"status": "already_released", "workspace_id": workspace_id, "notice": "already_sent"}
+        assert (await client.get(f"{route}/context", headers=leader)).status_code == 409
+
+    await db.refresh(a.workspace)
+    assert a.workspace.leased_item_id is None and a.workspace.lease_token is None
     assert len(await _notices(db)) == 1
 
 
@@ -303,22 +519,135 @@ async def test_finalize_refuses_each_guard_without_a_notice(db, ready, refusal):
 
 # --- exposure --------------------------------------------------------------------------------------------------
 
+RECOVERY = "leader-recovery"
+RECOVERY_ROUTES = [
+    (f"{settings.api_v1_prefix}/agent-teams/github-work-items/{{item_id}}/leader-recovery/{tail}", (method,))
+    for method, tail in (
+        ("POST", "cancel-revision"),
+        ("POST", "finalize-merged/preview"),
+        ("POST", "finalize-merged"),
+        ("POST", "release-workspace"),
+        ("GET", "release-workspace/context"),
+        ("POST", "end-stopped"),
+    )
+]
+
+
+def _effective_routes(routes):
+    """(full path, methods, effective dependant) of every real route reachable from `routes`.
+
+    FastAPI 0.143 and later keep an included router as an `_IncludedRouter` node, so `router.routes` is no longer flat.
+    `iter_route_contexts` is FastAPI's own flattening: it yields each real route with the path that includes every
+    include prefix and the dependant that merges include-level and route-level dependencies. Before it existed the
+    routes were already flat and effective. Mounts and WebSocket routes carry no methods and are skipped."""
+    found = []
+    for route in (routes if iter_route_contexts is None else iter_route_contexts(routes)):
+        path, methods, dependant = (getattr(route, name, None) for name in ("path", "methods", "dependant"))
+        if path is not None and methods is not None and dependant is not None:
+            found.append((path, frozenset(methods), dependant))
+    return found
+
+
+def _depends_on(dependant, name):
+    """True when the dependant, or any dependency under it at any depth, is a call whose name contains `name`."""
+    return any(name in getattr(sub.call, "__name__", "") or _depends_on(sub, name) for sub in dependant.dependencies)
+
+
+def _assert_recovery_exposure(routes, expected):
+    effective = _effective_routes(routes)
+    recovery = [(path, methods, dependant) for path, methods, dependant in effective if RECOVERY in path]
+    assert sorted((path, tuple(sorted(methods))) for path, methods, _ in recovery) == sorted(expected)
+    for path, _, dependant in recovery:
+        assert not _depends_on(dependant, "require_operator"), f"{path} depends on require_operator"
+
+
 def test_operator_only_actions_are_not_exposed_to_the_leader():
     import inspect
-    from app.api.v1 import agent_teams
+    from app.api.v1 import factory_delivery
+    from app.main import app
     from mcp_shim import agent_mail_server as shim
     names = {n for n in dir(shim) if n.startswith("synth_city_leader_")}
-    assert names == {"synth_city_leader_cancel_revision", "synth_city_leader_finalize_merged",
+    assert names == {"synth_city_leader_cancel_revision", "synth_city_leader_end_stopped", "synth_city_leader_finalize_merged",
                      "synth_city_leader_release_workspace"}
     source = inspect.getsource(lr)
     for forbidden in ("max_continuation", "continuation_enabled", "github_publish", "settings.", "approve("):
         assert forbidden not in source  # no policy, limit or approval setter is reachable from the Leader service
-    routes = {(r.path, tuple(sorted(r.methods))) for r in agent_teams.router.routes
-              if "leader-recovery" in r.path}
-    assert len(routes) == 4
-    for route in agent_teams.router.routes:
-        if "leader-recovery" in route.path:
-            assert "require_operator" not in str(route.dependant.dependencies)
+    # The exact recovery routes and lease context read the app exposes, all behind the Leader session guard.
+    _assert_recovery_exposure(app.routes, RECOVERY_ROUTES)
+    # The test must have looked at the operator-protected group: every delivery route is among the effective routes,
+    # under the agent-teams prefix, and depends on require_operator.
+    effective = _effective_routes(app.routes)
+    assert all(_depends_on(dependant, "mail_session") for path, _, dependant in effective if RECOVERY in path)
+    delivery = [route for route in factory_delivery.router.routes if getattr(route, "methods", None)]
+    assert delivery
+    for route in delivery:
+        full = f"{settings.api_v1_prefix}/agent-teams{route.path}"
+        matches = [dependant for path, methods, dependant in effective if path == full and methods == frozenset(route.methods)]
+        assert matches, full
+        assert all(_depends_on(dependant, "require_operator") for dependant in matches), full
+
+
+# --- nested routes: the same assertion, run on small trees built with the real include_router --------------------
+
+RECOVERY_PATH = "/github-work-items/{item_id}/leader-recovery/nested"
+
+
+def _transitive_guard(operator=Depends(require_operator)):  # reaches require_operator only through this dependency
+    return operator
+
+
+def _nested_tree(*, child_dependencies=(), include_dependencies=(), route_dependencies=(), path=RECOVERY_PATH, levels=1):
+    child = APIRouter(dependencies=list(child_dependencies))
+
+    @child.post(path, dependencies=list(route_dependencies))
+    def nested_endpoint():
+        return {}
+
+    tree = child
+    for index in range(levels):
+        outer = APIRouter()
+        outer.include_router(tree, dependencies=list(include_dependencies) if index == 0 else [])
+        tree = outer
+    return tree.routes
+
+
+NESTED = [(RECOVERY_PATH, ("POST",))]
+
+
+def test_nested_routes_guarded_by_the_child_router_are_found_and_fail_the_exposure_check():
+    routes = _nested_tree(child_dependencies=[Depends(require_operator)])
+    assert [path for path, _, _ in _effective_routes(routes)] == [RECOVERY_PATH]
+    with pytest.raises(AssertionError, match="depends on require_operator"):
+        _assert_recovery_exposure(routes, NESTED)
+
+
+def test_nested_routes_guarded_by_the_include_are_found_and_fail_the_exposure_check():
+    routes = _nested_tree(include_dependencies=[Depends(require_operator)])
+    with pytest.raises(AssertionError, match="depends on require_operator"):
+        _assert_recovery_exposure(routes, NESTED)
+
+
+def test_nested_routes_two_levels_deep_are_found_and_fail_the_exposure_check():
+    routes = _nested_tree(include_dependencies=[Depends(require_operator)], levels=2)
+    with pytest.raises(AssertionError, match="depends on require_operator"):
+        _assert_recovery_exposure(routes, NESTED)
+
+
+def test_nested_routes_that_reach_the_guard_only_through_another_dependency_fail_the_exposure_check():
+    routes = _nested_tree(route_dependencies=[Depends(_transitive_guard)])
+    with pytest.raises(AssertionError, match="depends on require_operator"):
+        _assert_recovery_exposure(routes, NESTED)
+
+
+def test_nested_routes_with_an_extra_unguarded_recovery_route_fail_the_inventory():
+    routes = _nested_tree()
+    with pytest.raises(AssertionError):
+        _assert_recovery_exposure(routes, [])           # one recovery route that the inventory does not expect
+
+
+def test_nested_routes_without_the_guard_and_with_the_expected_inventory_pass():
+    _assert_recovery_exposure(_nested_tree(), NESTED)                                    # not over-strict
+    _assert_recovery_exposure(_nested_tree(path="/github-work-items/{item_id}/other"), [])   # no recovery route at all
 
 
 # --- review 5919432941: one complete correction batch ------------------------------------------------------

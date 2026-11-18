@@ -1,12 +1,13 @@
 """Albiex Synth City Agent Mail MCP server over stdio."""
 import asyncio
 import hashlib
+import json
 import os
 import sys
 import threading
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from urllib.parse import quote
 
 import httpx
@@ -248,9 +249,14 @@ def _bridge_session_path(target: str) -> str:
 
 
 def tool_catalog_fingerprint() -> str:
-    """A short digest of the tool names this shim registered (the backend computes the same digest of its list)."""
-    names = sorted({tool.name for tool in mcp._tool_manager.list_tools()})
-    return hashlib.sha256("\n".join(names).encode()).hexdigest()[:32]
+    """A short digest of the public tools this shim registered and their input schemas (#1146).
+
+    The same digest as the backend's tool_catalog.catalog_fingerprint: one sorted "name<TAB>canonical schema JSON" line
+    per tool, so a parameter changed under an unchanged name makes a session that loaded the older schema stale.
+    """
+    lines = sorted(f"{tool.name}\t{json.dumps(tool.parameters, sort_keys=True, separators=(',', ':'))}"
+                   for tool in mcp._tool_manager.list_tools() if tool.name.startswith("synth_city_"))
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()[:32]
 
 
 def _ensure_registered() -> dict:
@@ -725,8 +731,14 @@ def synth_city_request_scope_amendment(
     max_failed_heads: int,
     tool_fallbacks: dict[str, Any],
     lease_token: str,
+    withdrawn_paths: Optional[list[str]] = None,
 ) -> dict:
-    """Request a bounded healthy scope amendment. Fresh Leader decision and owner activation are required."""
+    """Request a bounded healthy scope amendment. Fresh Leader decision and owner activation are required.
+
+    allowed_paths is the whole effective set: name every approved path you keep, not only the new ones. List each
+    approved path you deliberately drop in withdrawn_paths; otherwise the request is refused with
+    amendment_base_paths_omitted (a wrong withdrawal is amendment_withdrawn_paths_invalid).
+    """
     err = _guard()
     if err:
         return err
@@ -745,6 +757,7 @@ def synth_city_request_scope_amendment(
             "max_failed_heads": max_failed_heads,
             "tool_fallbacks": tool_fallbacks,
             "lease_token": lease_token,
+            "withdrawn_paths": withdrawn_paths or [],
         },
     )
     if not result["ok"]:
@@ -758,11 +771,23 @@ def synth_city_extend_effort_limit(
     dispatch_nonce: str,
     minutes: int,
     reason: str,
+    expected_extension_minutes: int,
+    evidence: str,
 ) -> dict:
-    """Leader only: extend a work item's effort limit once, by at most 30 minutes or 25 percent of the limit.
+    """Leader only: extend a work item's effort limit, and extend again up to the scope ceiling.
+
+    Each step adds at most 30 minutes or 25 percent of the original limit, whichever is smaller. The limit plus all
+    extensions may not pass the scope ceiling (max_item_effort_minutes); a step beyond it is refused with
+    extension_exceeds_ceiling and notifies the Supervisor once per attempt, because beyond the ceiling the Supervisor
+    decides. The item's effort shows the room left as extension_cap_minutes.
 
     The limit and its ledger are advisory elapsed working time from the system, not the owner's reported active
     effort. The extension changes no expiry, nonce, lease or status. The owner asks for it by Mail.
+
+    expected_extension_minutes is the extension total you saw in the item's effort (0 before any extension). A call
+    whose total is no longer the recorded one is refused with effort_extension_total_changed and grants nothing, so a
+    repeated call never extends twice. evidence is the work so far that supports the extension; it is recorded with
+    the reason.
     """
     err = _guard()
     if err:
@@ -775,6 +800,8 @@ def synth_city_extend_effort_limit(
             "dispatch_nonce": dispatch_nonce,
             "minutes": minutes,
             "reason": reason,
+            "expected_extension_minutes": expected_extension_minutes,
+            "evidence": evidence,
         },
     )
     if not result["ok"]:
@@ -1147,12 +1174,15 @@ def synth_city_update_team_campaign(
 
 
 @mcp.tool()
-def synth_city_get_team_summary(preset_id: int) -> dict:
+def synth_city_get_team_summary(preset_id: int, work_item_id: int | None = None) -> dict:
     """Read a team's outcome, parent link, existing attention signals, effort total and next actors.
 
+    For a PR's final hold check, pass its tracked work_item_id. Attention and human actions then keep
+    only that item and unbound signals. Team coverage, HOLD, and native waiting signals still apply.
     Unknown or incomplete observations keep the total Unknown. This read grants no execution authority.
     """
-    result = _team_request("GET", f"/presets/{preset_id}/summary")
+    filters = {"params": {"work_item_id": work_item_id}} if work_item_id is not None else {}
+    result = _team_request("GET", f"/presets/{preset_id}/summary", **filters)
     if not result["ok"]:
         return result
     return {"ok": True, "summary": result["data"]}
@@ -1411,17 +1441,23 @@ def synth_city_report_dispatch_status(
 
 
 @mcp.tool()
-def synth_city_get_work_item_context(work_item_id: int) -> dict:
+def synth_city_get_work_item_context(work_item_id: int, leader_release: bool = False) -> dict:
     """Claim the current owner's continuation context, including the persisted
     branch, approval round, workspace, and lease capability after a handoff or
-    session restart."""
+    session restart.
+
+    Set leader_release=True for a read-only Leader context on a terminal item.
+    Use the returned workspace_id and leased_at as expected_leased_at for
+    synth_city_leader_release_workspace.
+    """
     registered = _ensure_registered()
     if not registered["ok"]:
         return registered
-    result = _dispatch_request(
-        "POST",
-        f"/github-work-items/{work_item_id}/claim-continuation",
-    )
+    prefix = f"/github-work-items/{work_item_id}"
+    if leader_release:
+        result = _dispatch_request("GET", f"{prefix}/leader-recovery/release-workspace/context")
+    else:
+        result = _dispatch_request("POST", f"{prefix}/claim-continuation")
     if not result["ok"]:
         return result
     return {"ok": True, "context": result["data"]}
@@ -1466,6 +1502,8 @@ def synth_city_list_work_items(status: str = "escalated", limit: int = 100) -> d
                 "work_item_id": item.get("id"),
                 "issue_number": item.get("issue_number"),
                 "dispatch_status": item.get("dispatch_status"),
+                **({"dispatch_generation": item["dispatch_generation"]}
+                   if item.get("dispatch_generation") is not None else {}),
                 "escalation_reason": item.get("escalation_reason"),
                 "status_note": item.get("status_note"),
                 "ack_approval_round": item.get("ack_approval_round"),
@@ -1700,6 +1738,7 @@ def synth_city_leader_release_workspace(work_item_id: int, workspace_id: int, ex
     operation_id: str, reason: str) -> dict:
     """Current Leader releases a CLEAN workspace of a terminal item.
 
+    Read workspace_id and leased_at with synth_city_get_work_item_context(leader_release=True).
     Refused when the tree is dirty, has unpushed commits or cannot be inspected, when the item is not
     terminal, or when the lease changed. Dirty or unknown state is operator-only. One notice to the
     bound Supervisor; replay-safe.
@@ -1707,6 +1746,23 @@ def synth_city_leader_release_workspace(work_item_id: int, workspace_id: int, ex
     return _revision_review_request(f"/github-work-items/{work_item_id}/leader-recovery/release-workspace",
         {"workspace_id": workspace_id, "expected_leased_at": expected_leased_at,
          "operation_id": operation_id, "reason": reason})
+
+
+@mcp.tool()
+def synth_city_leader_end_stopped(work_item_id: int, expected_dispatch_generation: str | None,
+    expected_scope_revision: int, operation_id: str, outcome: Literal["deferred", "superseded"],
+    reason: str, target_milestone: str | None = None, superseding_pr_number: int | None = None) -> dict:
+    """Current Leader ends one stopped work item and safely releases any clean workspace.
+
+    Read dispatch_generation and active_scope_revision from list_work_items. Use null generation only if the
+    item has none. Supply a target milestone for deferred or the delivering PR number for superseded.
+    A matching operation_id replay is safe. HOLD, a changed attempt or an unsafe lease refuses the action.
+    """
+    return _revision_review_request(f"/github-work-items/{work_item_id}/leader-recovery/end-stopped", {
+        "expected_dispatch_generation": expected_dispatch_generation, "expected_scope_revision": expected_scope_revision,
+        "operation_id": operation_id, "outcome": outcome, "reason": reason,
+        "target_milestone": target_milestone, "superseding_pr_number": superseding_pr_number,
+    })
 
 
 @mcp.tool()

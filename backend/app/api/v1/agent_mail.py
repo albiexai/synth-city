@@ -623,6 +623,7 @@ async def decide_work_item(
     decision_item_id = item.id
     decision_scope_id = item.scope_id
     decided = False
+    escalated_rejection = item.dispatch_status == "escalated" and request.decision == "rejected"
     try:
         approval, _decided = await github_approval_service.decide(
             db,
@@ -635,6 +636,8 @@ async def decide_work_item(
         )
         decided = True
         decision_delivery_key = f"github-approval:{approval.id}:decision"
+        decision_message = github_approval_service.initial_decision_message(approval)
+        linked_message = None
         if approval.decision_message_id is not None:
             linked_message = await db.get(MailMessage, approval.decision_message_id)
             if (
@@ -642,45 +645,40 @@ async def decide_work_item(
                 or linked_message.delivery_key != decision_delivery_key
             ):
                 raise GithubApprovalError("approval_decision_link_mismatch")
-        message = await agent_mail_service.send_authoritative_decision(
-            db,
-            MailMessageCreate(
-                kind="answer",
-                sender_member_id=session.member_id,
-                thread_root_id=approval.request_message_id,
-                body_markdown=request.reason,
-                payload={
-                    "approval_request_id": approval.id,
-                    "request_kind": approval.request_kind,
-                    "work_item_id": approval.work_item_id,
-                },
-                decision=request.decision,
-            ),
-            authenticated_sender_member_id=session.member_id,
-            approval_round=approval.approval_round,
-            delivery_key=decision_delivery_key,
-        )
-        if approval.decision_message_id is None:
-            approval.decision_message_id = message.id
-            await db.commit()
-            await db.refresh(approval)
-        elif approval.decision_message_id != message.id:
-            raise GithubApprovalError("approval_decision_link_mismatch")
+        if escalated_rejection and linked_message is not None:
+            if not await agent_mail_service._same_delivery(
+                db, linked_message, decision_message, sender_actor_id=None, sender_type="member",
+                operator_authorized=False,
+            ):
+                raise GithubApprovalError("approval_decision_link_mismatch")
+            message = linked_message
+        else:
+            message = await agent_mail_service.send_authoritative_decision(
+                db, decision_message, authenticated_sender_member_id=session.member_id,
+                approval_round=approval.approval_round, delivery_key=decision_delivery_key,
+            )
+            if approval.decision_message_id is None:
+                approval.decision_message_id = message.id
+                await db.commit()
+                await db.refresh(approval)
+            elif approval.decision_message_id != message.id:
+                raise GithubApprovalError("approval_decision_link_mismatch")
         # C09: the decision notice is settled; its fact is separate from the
         # decision fact and keyed by the stable decision delivery key.
         await _record_decision_notice(
             db, actor=actor, scope_id=decision_scope_id, item_id=decision_item_id,
             request_id=request.approval_request_id, outcome="applied",
             reason="decision notice delivered")
-        await github_dispatch_service.apply_approval_decision(
-            db,
-            item,
-            scope,
-            decision=request.decision,
-            approval_round=approval.approval_round,
-            dispatch_nonce=approval.dispatch_nonce,
-            owner_member_id=approval.owner_member_id,
-        )
+        if not escalated_rejection:
+            await github_dispatch_service.apply_approval_decision(
+                db,
+                item,
+                scope,
+                decision=request.decision,
+                approval_round=approval.approval_round,
+                dispatch_nonce=approval.dispatch_nonce,
+                owner_member_id=approval.owner_member_id,
+            )
         await agent_mail_service.auto_nudge_members(
             db,
             {approval.owner_member_id},
@@ -765,6 +763,8 @@ class MailEffortExtensionRequest(BaseModel):
     dispatch_nonce: str
     minutes: Any = None
     reason: Any = None
+    expected_extension_minutes: Any = None
+    evidence: Any = None
 
 
 @router.post("/effort-extensions")
@@ -773,13 +773,14 @@ async def extend_effort_limit(
     session: MailAgentSession = Depends(require_mail_session),
     db: AsyncSession = Depends(get_db),
 ):
-    """The Leader's one extension of an item's effort limit (#938). It never changes an expiry."""
+    """One Leader extension step of an item's effort limit (#938, #1101), guarded by the expected total (#1100)."""
     from app.services.github_effort_limit_service import EffortLimitError, effort_limit_service
 
     try:
         result = await effort_limit_service.extend(
             db, work_item_id=request.work_item_id, dispatch_nonce=request.dispatch_nonce,
-            leader_member_id=session.member_id, minutes=request.minutes, reason=request.reason)
+            leader_member_id=session.member_id, minutes=request.minutes, reason=request.reason,
+            expected_extension_minutes=request.expected_extension_minutes, evidence=request.evidence)
     except EffortLimitError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
     return result

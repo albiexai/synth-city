@@ -246,7 +246,9 @@ export function BacklogCoordination({ scopeId, withOperatorToken }: {
       <p className="mt-1 text-muted-foreground">
         Running when last checked: {data.active_implementations ?? 'unknown'}/{data.execution_limit} · Available workspaces: {data.available_workspaces ?? 'unknown'} · Leased: {data.leased_workspaces ?? 'unknown'}
       </p>
-      <p className="mt-1 text-muted-foreground">Coordination notifications today: {data.requests_today}/{data.max_daily_requests} · Remaining: {data.notifications_remaining ?? Math.max(0, data.max_daily_requests - data.requests_today)}. Limits do not change implementation or retry budgets.</p>
+      {data.enabled
+        ? <p className="mt-1 text-muted-foreground">Coordination notifications today: {data.requests_today}/{data.max_daily_requests} · Remaining: {data.notifications_remaining ?? Math.max(0, data.max_daily_requests - data.requests_today)}. Limits do not change implementation or retry budgets.</p>
+        : <p className="mt-1 text-muted-foreground">Coordination is off. No notifications are sent.</p>}
       {data.notification_cap_reason && <div role="status" className="mt-2 rounded border p-2">
         <p>{data.notification_cap_reason === 'daily'
           ? `Daily notification limit reached. Budget resets: ${date(data.notification_budget_resets_at ?? null)}.`

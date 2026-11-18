@@ -35,7 +35,7 @@ class AgentStatusService:
             for team_id in sorted({m.team_preset_id for m in members if m.team_preset_id}):
                 try:
                     observed = await observe_team(db, team_id, include_agent_status=False,
-                                                  persist_identities=False)
+                                                  persist_identities=False, record_input_waits=False)
                 except (OSError, ValueError):
                     continue
                 native.update({entry.slot_id: entry for entry in observed.slots})

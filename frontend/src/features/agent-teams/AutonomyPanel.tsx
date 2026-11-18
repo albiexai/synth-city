@@ -34,10 +34,16 @@ import { fetchGithubRecoveryGate, fetchGithubRecoveryGateActive } from './api'
 
 export { OperatorTokenDialog } from './OperatorTokenDialog'
 
+function itemCountSummary(loaded: number, total: number | null) {
+  if (total != null && total > loaded) return `${loaded} of ${total} items`
+  return `${loaded} ${loaded === 1 ? 'item' : 'items'}`
+}
+
 export function AutonomyPanel({
   preset,
   scopes,
   workItems,
+  workItemTotal = null,
   loading,
   refreshing,
   lastRefreshedAt,
@@ -48,6 +54,7 @@ export function AutonomyPanel({
   preset: AgentTeamPreset
   scopes: TeamGithubScope[]
   workItems: GithubWorkItem[]
+  workItemTotal?: number | null
   loading: boolean
   refreshing: boolean
   lastRefreshedAt: Date | null
@@ -93,6 +100,7 @@ export function AutonomyPanel({
     () => workItems.filter((item) => ['pending', 'dispatched', 'verifying'].includes(item.dispatch_status)).length,
     [workItems]
   )
+  const countsLimited = workItemTotal != null && workItemTotal > workItems.length
   const inspectGate = async () => {
     setGateOpen(false)
     setGateLoading(true)
@@ -232,7 +240,7 @@ export function AutonomyPanel({
           <div className="rounded-lg border p-5 text-sm text-muted-foreground">
             <h3 className="font-semibold text-foreground">Before you enable autonomy</h3>
             <ol className="mt-2 list-decimal space-y-1 pl-5">
-              <li>Add <code>github_token</code> to <code>backend/.env</code> for GitHub polling, then restart Synth City. For App-backed dispatch, also configure the GitHub App settings. Synth City selects the dispatch mode when work becomes eligible.</li>
+              <li>Add <code>github_token</code> to the <a className="underline" href="https://github.com/albiexai/synth-city/blob/master/docs/guide/installation.md#configuration" target="_blank" rel="noreferrer">backend environment file</a> for GitHub polling, then restart Synth City. For App-backed dispatch, also configure the GitHub App settings. Synth City selects the dispatch mode when work becomes eligible.</li>
               <li>Add a repository with an existing primary checkout under your home directory and labels to watch. Use Add a repository above.</li>
               <li>In Roster, assign and launch the Leader slot. It approves plans.</li>
               <li>On GitHub, label an issue for dispatch; add an area label to route it to a particular owner.</li>
@@ -264,7 +272,7 @@ export function AutonomyPanel({
           <p>
             {loading ? 'Loading work items…'
               : loadError && workItems.length === 0 ? 'Work items are unavailable. Use Refresh to try again.'
-              : `${workItems.length} ${workItems.length === 1 ? 'item' : 'items'} · ${activeCount} active${actionCount > 0 ? ` · ${actionCount} ${actionCount === 1 ? 'needs' : 'need'} your action` : ''}`}
+              : `${itemCountSummary(workItems.length, workItemTotal)} · ${activeCount} active${actionCount > 0 ? ` · ${actionCount} ${actionCount === 1 ? 'needs' : 'need'} your action` : ''}${countsLimited ? ' (counts are for loaded items only)' : ''}`}
           </p>
           <span className="text-xs text-muted-foreground">
             {lastRefreshedAt ? `Summary updated ${lastRefreshedAt.toLocaleTimeString()}` : 'Summary not refreshed yet'}

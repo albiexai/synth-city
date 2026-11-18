@@ -9,13 +9,11 @@
 #   isolated-runtime-kit.sh crash  --root DIR --role cli
 #   isolated-runtime-kit.sh relaunch --root DIR
 #
-# Everything runs inside the kit's own user and network namespaces:
-#   - an outer anchor (`unshare --user --map-root-user --net`) brings up `lo`,
-#     which must be the only link;
+# Everything runs inside the kit's own user, network, PID and mount namespaces:
+#   - the outer anchor is PID 1 on private procfs and brings up lo, the only link;
 #   - an inner anchor (`unshare --user --map-user/--map-group`) maps back to the
 #     caller's uid and gid;
-#   - entry is two-step, through the outer anchor (it owns the network namespace)
-#     and then the inner one: `nsenter -U -n -t OUTER`, then `nsenter -U -t INNER`.
+#   - entry is two-step, into the outer namespaces and then the inner user namespace.
 # Inside run an isolated Synth City backend (own root, HOME, SQLite, private tmux
 # socket, synthetic operator token, allowlisted environment), a stub model
 # provider, and the CLI under test, launched through Synth City's normal team
@@ -29,10 +27,10 @@
 # target must be one of this instance's live processes:
 #   - the launcher and the outer anchor carry the instance id in their argv;
 #   - the inner anchor carries it in its argv and owns the recorded user namespace;
-#   - every other process is inside the recorded network namespace.
+#   - every other recorded role is inside the recorded kit namespaces.
 # Every recorded pid is stored with its start time (/proc/<pid>/stat field 22),
-# re-checked before use. `down` stops every process inside the kit's network
-# namespace and removes the root only after it proves that none remains.
+# re-checked before use. down signals only the proved PID namespace init.
+# The kernel stops its descendants, then down verifies cleanup before removal.
 #
 # A root left by `down --keep` or a failed `up` is never reused: `up` refuses
 # it, and `down` removes it.
@@ -127,7 +125,14 @@ def own_pids():
                 pass
     return found
 
-HOST = {kind: link("self", kind) for kind in ("net", "user")}
+HOST = {kind: link("self", kind) for kind in ("net", "user", "pid", "mnt")}
+
+def namespace_pid(pid):
+    with open(f"/proc/{pid}/status") as status:
+        for line in status:
+            if line.startswith("NSpid:"):
+                return int(line.split()[-1])
+    raise ValueError(f"missing namespace PID for {pid}")
 
 def instance(root):
     """The validated instance record, or a refusal (exit 2) before anything destructive."""
@@ -144,10 +149,12 @@ def instance(root):
         die(2, "the instance record is malformed")
     if (data.get("root_dev"), data.get("root_ino"), data.get("uid")) != (here.st_dev, here.st_ino, os.getuid()):
         die(2, "the instance record belongs to another root or user (copied or forged state)")
-    for kind in ("net", "user"):
+    for kind in HOST:
         value = data.get(kind)
         if value is not None and (not re.fullmatch(kind + r":\[[0-9]+\]", str(value)) or value == HOST[kind]):
             die(2, f"the instance names an invalid or host {kind} namespace")
+    if bool(data.get("pid")) != bool(data.get("mnt")) or (data.get("pid") and not (data.get("net") and data.get("user"))):
+        die(2, "the instance has incomplete PID or mount namespace identity")
     return data
 
 def processes(root):
@@ -180,6 +187,36 @@ def anchor_argv_ok(inst, root, name, pid):
         expected = ["_inner", root, inst["id"]]
     return tail[-len(expected):] == expected and tail[-len(expected) - 1].endswith("/isolated-runtime-kit.sh")
 
+def resolve_pid(root, name, local_pid):
+    """Resolve a kit-local PID only through the live recorded parent of that role."""
+    inst, procs = instance(root), processes(root)
+    parent = entry_of(procs, PARENT[name])
+    if parent is None or proc_stat(parent["pid"]) != (parent["start"], parent["ppid"]) \
+            or argv_hash(parent["pid"]) != parent["argv"]:
+        die(2, f"cannot prove the parent of {name}")
+    candidates = []
+    for pid in own_pids():
+        current = proc_stat(pid)
+        if current is None or current[1] != parent["pid"]:
+            continue
+        try:
+            pid_ns, mnt_ns = link(pid, "pid"), link(pid, "mnt")
+            if pid_ns == HOST["pid"] or mnt_ns == HOST["mnt"] or namespace_pid(pid) != local_pid:
+                continue
+            if name == "outer":
+                if local_pid != 1 or not anchor_argv_ok(inst, root, name, pid):
+                    continue
+            elif pid_ns != link(parent["pid"], "pid") or mnt_ns != link(parent["pid"], "mnt"):
+                continue
+            if name == "inner" and not anchor_argv_ok(inst, root, name, pid):
+                continue
+        except (OSError, ValueError):
+            continue
+        candidates.append(pid)
+    if len(candidates) != 1 or proc_stat(parent["pid"]) != (parent["start"], parent["ppid"]):
+        die(2, f"cannot resolve exactly one namespace process for {name}")
+    print(candidates[0])
+
 def namespaces_ok(inst, procs, name, pid):
     """Role-specific namespace proof; a host-namespace anchor never qualifies."""
     try:
@@ -188,6 +225,20 @@ def namespaces_ok(inst, procs, name, pid):
         return f"{name} pid {pid} cannot be inspected"
     if net == HOST["net"] or user == HOST["user"]:
         return f"{name} pid {pid} runs in a host namespace"
+    if inst.get("pid"):
+        try:
+            pid_ns, mnt_ns = link(pid, "pid"), link(pid, "mnt")
+            local_pid = namespace_pid(pid)
+        except (OSError, ValueError):
+            return f"{name} pid {pid} PID namespace cannot be inspected"
+        if pid_ns != inst["pid"] or mnt_ns != inst["mnt"] or not owned(pid):
+            return f"{name} pid {pid} is outside the proved PID or mount namespace"
+        if local_pid != procs[name].get("local_pid") or (name == "outer" and local_pid != 1):
+            return f"{name} pid {pid} has the wrong namespace PID"
+        if name == "outer" and user == inst["user"]:
+            return f"{name} pid {pid} shares the inner user namespace"
+        if name != "outer" and user != inst["user"]:
+            return f"{name} pid {pid} is outside the kit user namespace"
     if inst["net"] is not None:
         if net != inst["net"]:
             return f"{name} pid {pid} is outside the kit network namespace"
@@ -235,7 +286,7 @@ def check(inst, procs, name, entry, root=None, argv=True):
         return f"{name} pid {pid} is not this instance anchor"
     return namespaces_ok(inst, procs, name, pid)
 
-def verify(root, name):
+def verify(root, name, local=False):
     inst, procs = instance(root), processes(root)
     entry = entry_of(procs, name)
     if entry is None:
@@ -245,7 +296,7 @@ def verify(root, name):
         die(3, f"{name} (pid {entry.get(chr(112) + chr(105) + chr(100))}) is not running")
     if result != "ok":
         die(2, result)
-    print(entry["pid"])
+    print(entry["local_pid"] if local and inst.get("pid") else entry["pid"])
 
 def unrecorded(inst, procs, root):
     """Own processes inside the kit network namespace that are not currently proved roles."""
@@ -271,13 +322,32 @@ def unrecorded(inst, procs, root):
         if pid in proved or pid in (os.getpid(), os.getppid()):
             continue
         try:
-            if link(pid, "net") == inst["net"]:
+            if link(pid, "net") == inst["net"] or (inst.get("pid") and link(pid, "pid") == inst["pid"]):
                 found.append(pid)
         except FileNotFoundError:
             continue
         except OSError:
             unreadable.append(pid)
     return found, unreadable
+
+def namespace_plan(inst, targets, problems, found, unreadable):
+    """Only the proved init is a target; the kernel handles its descendants."""
+    contained = []
+    for pid in found:
+        try:
+            if link(pid, "pid") == inst["pid"]:
+                contained.append(pid)
+            else:
+                problems.append(f"unrecorded process {pid} outside the kit PID namespace")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            unreadable.append(pid)
+    if unreadable:
+        problems.append("processes that cannot be inspected: " + " ".join(map(str, unreadable)))
+    if (targets or contained) and "outer" not in targets:
+        problems.append("the kit PID namespace is occupied without a proved init")
+    return {"targets": ["outer"] if "outer" in targets else [], "members": [], "problems": problems}
 
 def group_leaders(inst, procs, root):
     """#1010: proved service roles that lead their own process group (tmux starts each pane with setsid).
@@ -341,6 +411,8 @@ def plan(root):
         elif result != "gone":
             problems.append(result)
     found, unreadable = unrecorded(inst, procs, root)
+    if inst.get("pid"):
+        return namespace_plan(inst, targets, problems, found, unreadable)
     # #1010: an unrecorded process in the group of a proved service leader is a member, stopped
     # before the roles; any other unrecorded process still refuses the whole teardown.
     leaders = group_leaders(inst, procs, root) if found else {}
@@ -515,7 +587,7 @@ def registration_proof(root):
         with open(os.path.join(real, "state", "launch.json")) as handle:
             slot = int(json.load(handle)["slot_id"])
         cli = processes(root)["cli"]
-        pid, start = int(cli["pid"]), str(cli["start"])
+        pid, start = int(cli.get("local_pid", cli["pid"])), str(cli["start"])
     except (OSError, ValueError, KeyError, TypeError):
         die(2, "the kit state needed for the registration proof cannot be read")
     if not provider:
@@ -552,7 +624,7 @@ def crash_clear(root):
         die(2, "the crash marker is not a regular file; it was kept")
     os.unlink(marker)
 
-def record(root, name, pid):
+def record(root, name, pid, local_pid=None):
     pid = int(pid)
     now = proc_stat(pid)
     if now is None:
@@ -563,7 +635,17 @@ def record(root, name, pid):
         die(2, f"{name} (pid {pid}) cannot be recorded")
     path = os.path.join(root, "state", "processes.json")
     data = processes(root)
-    data[name] = {"pid": pid, "start": now[0], "argv": digest, "ppid": now[1], "pstart": parent[0]}
+    entry = {"pid": pid, "start": now[0], "argv": digest, "ppid": now[1], "pstart": parent[0]}
+    if local_pid is not None:
+        expected_parent = entry_of(data, PARENT[name])
+        try:
+            matches = namespace_pid(pid) == int(local_pid)
+        except (OSError, ValueError):
+            matches = False
+        if not matches or expected_parent is None or (now[1], parent[0]) != (expected_parent["pid"], expected_parent["start"]):
+            die(2, f"{name} changed while its namespace identity was being recorded")
+        entry["local_pid"] = int(local_pid)
+    data[name] = entry
     tmp = path + ".tmp"
     with open(tmp, "w") as out:
         json.dump(data, out)
@@ -642,11 +724,11 @@ def publish(root, attempt):
     except OSError:
         die(1, f"published, but the summary could not be printed; evidence at {os.path.join(base, "evidence")}")
 
-def set_instance(root, ident, net, user):
+def set_instance(root, ident, net, user, pid="", mnt=""):
     path = os.path.join(root, "state", "instance.json")
     here = os.stat(root)
     data = {"id": ident, "root_dev": here.st_dev, "root_ino": here.st_ino, "uid": os.getuid(),
-            "net": net or None, "user": user or None}
+            "net": net or None, "user": user or None, "pid": pid or None, "mnt": mnt or None}
     fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as out:
         json.dump(data, out)
@@ -1078,8 +1160,12 @@ def main():
     if command == "instance":
         data = instance(root)
         print(data["id"], data["net"] or "-", data["user"] or "-")
+    elif command == "pid-namespace":
+        print(instance(root).get("pid") or "-")
     elif command == "verify":
         verify(root, rest[0])
+    elif command == "verify-local":
+        verify(root, rest[0], local=True)
     elif command == "plan-teardown":
         result = plan(root)
         print(json.dumps(result))
@@ -1105,7 +1191,9 @@ def main():
     elif command == "refresh":
         refresh(root, rest[0])
     elif command == "record":
-        record(root, rest[0], rest[1])
+        record(root, *rest)
+    elif command == "resolve-pid":
+        resolve_pid(root, rest[0], int(rest[1]))
     elif command == "set-instance":
         set_instance(root, *rest)
     elif command == "opencode-config":
@@ -1140,28 +1228,41 @@ kitpy() { RUNTIME_KIT_REPO_ROOT="$REPO_ROOT" RUNTIME_KIT_PYTHON="${KIT_PYTHON:-}
 
 verify() { # name -> pid of this instance's live process for that role; refuses otherwise
   local out code=0
-  out="$(kitpy verify "$ROOT" "$1" 2>&1)" || code=$?
+  out="$(kitpy "${2:-verify}" "$ROOT" "$1" 2>&1)" || code=$?
   if ((code)); then
     ((code == 3)) && incomplete "$out"
     refuse "$out"
   fi
   echo "$out"
 }
-record() { kitpy record "$ROOT" "$1" "$2" >/dev/null || refuse "could not record $1"; }
+record() { kitpy record "$ROOT" "$@" >/dev/null || refuse "could not record $1"; }
 
 # --- Namespace entry -----------------------------------------------------------------
 
+namespace_entry() { # fill the caller's namespace_entry_args with proved namespace targets
+  local outer inner pid
+  pid="$(kitpy pid-namespace "$ROOT")" || return
+  outer="$(verify outer)" || return
+  if [[ "$pid" == "-" ]]; then
+    inner="$(verify inner)" || return
+    namespace_entry_args=(nsenter --preserve-credentials -U -n -t "$outer")
+  else
+    inner="$(verify inner verify-local)" || return
+    # The first nsenter forks into the PID namespace and sees its private procfs.
+    # The second target is then the inner anchor's namespace-local PID.
+    namespace_entry_args=(nsenter --preserve-credentials -U -n -m -p -t "$outer")
+  fi
+  namespace_entry_args+=(nsenter --preserve-credentials -U -t "$inner")
+}
+
 in_ns() { # run a command inside the kit namespaces, with the allowlisted environment
-  local outer inner
-  outer="$(verify outer)"
-  inner="$(verify inner)"
-  nsenter --preserve-credentials -U -n -t "$outer" \
-    nsenter --preserve-credentials -U -t "$inner" \
-    env -i "${CLEAN_ENV[@]}" "$@"
+  local -a namespace_entry_args
+  namespace_entry || return
+  "${namespace_entry_args[@]}" env -i "${CLEAN_ENV[@]}" "$@"
 }
 
 spawn() { # name log argv... : the inner anchor starts it as its own child; it is recorded with that parent.
-  local name="$1" log="$2" ready="$ROOT/state/run-$INSTANCE_ID" req pid inner i
+  local name="$1" log="$2" ready="$ROOT/state/run-$INSTANCE_ID" req pid local_pid inner i
   shift 2
   inner="$(verify inner)"
   req="$(mktemp -d "$ready/req-XXXXXX")"
@@ -1170,13 +1271,14 @@ spawn() { # name log argv... : the inner anchor starts it as its own child; it i
   printf '%s\n' "$req" >"$ready/spawn.fifo"
   for i in $(seq 1 50); do [[ -s "$req/pid" ]] && break; sleep 0.1; done
   [[ -s "$req/pid" ]] || fail "the inner anchor did not start $name"
-  pid="$(cat "$req/pid")"
+  local_pid="$(cat "$req/pid")"
+  pid="$(kitpy resolve-pid "$ROOT" "$name" "$local_pid")" || refuse "could not resolve $name in the kit PID namespace"
   # Record only after exec: until then the child still shows the anchor's command line.
   for i in $(seq 1 50); do
     cmp -s "/proc/$pid/cmdline" "/proc/$inner/cmdline" || break
     sleep 0.05
   done
-  record "$name" "$pid"
+  record "$name" "$pid" "$local_pid"
   [[ "$(kitpy verify "$ROOT" "$name" 2>/dev/null)" == "$pid" ]] || refuse "$name was not started by the recorded inner anchor"
 }
 
@@ -1196,6 +1298,8 @@ if [[ "$COMMAND" == _outer ]]; then
   # Root of the outer user namespace: own the network namespace, bring up lo only.
   ROOT="$1" CALLER_UID="$2" CALLER_GID="$3" INSTANCE="$4"
   ready="$ROOT/state/run-$INSTANCE"
+  [[ "$$" == 1 && "$(readlink /proc/1/ns/pid)" == "$(readlink /proc/self/ns/pid)" ]] \
+    || refuse "the outer anchor is not PID 1 on its private procfs"
   ip link set lo up
   links="$(ip -o link | awk -F': ' '{print $2}' | tr '\n' ' ')"
   [[ "$links" == "lo " ]] || { echo "links: $links" >"$ready/outer.refused"; exit 2; }
@@ -1214,7 +1318,8 @@ if [[ "$COMMAND" == _inner ]]; then
   mkfifo -m 600 "$ready/spawn.fifo"
   trap 'exit 0' TERM INT
   exec 3<>"$ready/spawn.fifo"
-  echo "$$ $(id -u) $(id -g) $(readlink /proc/self/ns/net) $(readlink /proc/self/ns/user)" >"$ready/inner.id"
+  echo "$$ $(id -u) $(id -g) $(readlink /proc/self/ns/net) $(readlink /proc/self/ns/user) $(readlink /proc/self/ns/pid) $(readlink /proc/self/ns/mnt)" >"$ready/inner.tmp"
+  mv "$ready/inner.tmp" "$ready/inner.id"
   while read -r req <&3; do
     [[ "$req" == "$ready"/req-* && -f "$req/argv" && -f "$ROOT/state/env" ]] || continue
     mapfile -d '' -t argv <"$req/argv"
@@ -1368,7 +1473,7 @@ up() {
   # (tokens, sockets, identities) may live inside the namespaces. The launcher is
   # recorded at once, so a failure at any later point can still stop it.
   setsid env -i "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" "HOME=$ROOT/home" "LANG=C.UTF-8" \
-    unshare --user --map-root-user --net --kill-child "$SELF" _outer "$ROOT" "$(id -u)" "$(id -g)" "$instance" \
+    unshare --user --map-root-user --net --pid --fork --mount-proc --kill-child "$SELF" _outer "$ROOT" "$(id -u)" "$(id -g)" "$instance" \
     </dev/null >"$ROOT/logs/anchor.log" 2>&1 &
   record launcher "$!"
   until [[ -s "$ready/inner.id" || -f "$ready/outer.refused" ]]; do
@@ -1376,10 +1481,15 @@ up() {
     sleep 0.1
   done
   [[ ! -f "$ready/outer.refused" ]] || refuse "the network namespace is not loopback-only ($(cat "$ready/outer.refused"))"
-  record outer "$(cat "$ready/outer.pid")"
-  local inner_pid inner_uid inner_gid inner_net inner_user
-  read -r inner_pid inner_uid inner_gid inner_net inner_user <"$ready/inner.id"
-  record inner "$inner_pid"
+  local outer_pid inner_pid inner_local inner_uid inner_gid inner_net inner_user inner_pid_ns inner_mount
+  [[ "$(cat "$ready/outer.pid")" == 1 ]] || refuse "the outer anchor did not report PID 1"
+  outer_pid="$(kitpy resolve-pid "$ROOT" outer 1)" || refuse "could not resolve the kit PID namespace init"
+  record outer "$outer_pid" 1
+  read -r inner_local inner_uid inner_gid inner_net inner_user inner_pid_ns inner_mount <"$ready/inner.id"
+  inner_pid="$(kitpy resolve-pid "$ROOT" inner "$inner_local")" || refuse "could not resolve the inner anchor"
+  record inner "$inner_pid" "$inner_local"
+  kitpy set-instance "$ROOT" "$instance" "$inner_net" "$inner_user" "$inner_pid_ns" "$inner_mount"
+  kitpy instance "$ROOT" >/dev/null || refuse "the instance record did not validate"
   [[ "${RUNTIME_KIT_TEST_FAULT:-}" != after_anchor_spawn ]] || fail "injected fault after the anchor spawn"
   if [[ "${RUNTIME_KIT_TEST_FAULT:-}" == uid_mismatch ]]; then inner_uid=$((inner_uid + 1)); fi
   [[ "$inner_uid" == "$(id -u)" && "$inner_gid" == "$(id -g)" ]] \
@@ -1387,13 +1497,16 @@ up() {
   [[ "$inner_net" != "$(readlink /proc/self/ns/net)" && "$inner_user" != "$(readlink /proc/self/ns/user)" ]] \
     || refuse "the kit shares a host namespace"
   local joined
-  joined="$(in_ns sh -c 'echo "$(id -u) $(id -g) $(readlink /proc/self/ns/net) $(readlink /proc/self/ns/user) $(ip -o link | wc -l)"')" \
+  # shellcheck disable=SC2016 # expand the process fields inside the isolated shell
+  joined="$(in_ns sh -c '
+    read -r proc_pid rest </proc/self/stat
+    [ "$proc_pid" = "$$" ] || exit 1
+    echo "$(id -u) $(id -g) $(readlink /proc/self/ns/net) $(readlink /proc/self/ns/user) $(readlink /proc/self/ns/pid) $(readlink /proc/self/ns/mnt) $(ip -o link | wc -l)"
+  ')" \
     || refuse "entering the kit namespaces failed"
   if [[ "${RUNTIME_KIT_TEST_FAULT:-}" == join_mismatch ]]; then joined="$joined mismatch"; fi
-  [[ "$joined" == "$(id -u) $(id -g) $inner_net $inner_user 1" ]] \
+  [[ "$joined" == "$(id -u) $(id -g) $inner_net $inner_user $inner_pid_ns $inner_mount 1" ]] \
     || refuse "the namespace join check failed (got: $joined)"
-  kitpy set-instance "$ROOT" "$instance" "$inner_net" "$inner_user"
-  kitpy instance "$ROOT" >/dev/null || refuse "the instance record did not validate"
   printf '%s\n' "${CLEAN_ENV[@]}" >"$ROOT/state/env"
 
   # --- Private tmux server: a foreground child of the inner anchor, on the kit's socket --
@@ -1404,7 +1517,7 @@ up() {
   [[ "$(in_ns "$ROOT/bin/tmux" display-message -p -t '=kit-probe' '#{socket_path}')" == "$ROOT/t/s" ]] \
     || refuse "tmux used a socket outside the kit root"
   [[ "$(in_ns "$ROOT/bin/tmux" list-sessions -F '#{session_name}')" == kit-probe ]] || refuse "the tmux server is not private"
-  [[ "$(in_ns "$ROOT/bin/tmux" display-message -p '#{pid}')" == "$(verify tmux)" ]] \
+  [[ "$(in_ns "$ROOT/bin/tmux" display-message -p '#{pid}')" == "$(verify tmux verify-local)" ]] \
     || refuse "the tmux server is not the recorded one"
   # #947: the recorded server outlives its sessions, so a crashed CLI pane cannot stop it.
   in_ns "$ROOT/bin/tmux" set-option -s exit-empty off
@@ -1525,7 +1638,7 @@ PY
 # The launched pane is the CLI: record it at once (parent = the recorded tmux server),
 # so any later failure can still stop it with a proved identity. Used by up and relaunch.
 record_cli_pane() {
-  local i
+  local i local_pid="" pid_ns
   CLI_PANE_PID=""
   for i in $(seq 1 50); do
     CLI_PANE_PID="$(in_ns "$ROOT/bin/tmux" list-panes -a -F '#{pane_pid}' 2>/dev/null | head -1)"
@@ -1533,6 +1646,11 @@ record_cli_pane() {
     sleep 0.1
   done
   [[ "$CLI_PANE_PID" =~ ^[0-9]+$ ]] || fail "the launch started no pane"
+  pid_ns="$(kitpy pid-namespace "$ROOT")" || return
+  if [[ "$pid_ns" != "-" ]]; then
+    local_pid="$CLI_PANE_PID"
+    CLI_PANE_PID="$(kitpy resolve-pid "$ROOT" cli "$local_pid")" || refuse "could not resolve the CLI pane in the kit PID namespace"
+  fi
   # Wait until the pane's command line is stable (a CLI may exec once at start).
   local last="" now stable=0
   for i in $(seq 1 50); do
@@ -1542,7 +1660,11 @@ record_cli_pane() {
     ((stable >= 5)) && break
     sleep 0.1
   done
-  record cli "$CLI_PANE_PID"
+  if [[ -n "$local_pid" ]]; then
+    record cli "$CLI_PANE_PID" "$local_pid"
+  else
+    record cli "$CLI_PANE_PID"
+  fi
   verify cli >/dev/null
   python3 -I - "$ROOT/state/processes.json" <<'PY' || refuse "the CLI pane is not a child of the recorded tmux server"
 import json, sys
@@ -1596,11 +1718,13 @@ root, pane, reg = sys.argv[1:4]
 lines = open(os.path.join(root, "run/ns.txt")).read().split()
 launch = json.load(open(os.path.join(root, "state/launch.json")))
 procs = json.load(open(os.path.join(root, "state/processes.json")))
+instance = json.load(open(os.path.join(root, "state/instance.json")))
 log = os.path.join(root, "run/stub-requests.jsonl")
 digest = os.path.join(root, "state/stub-script.sha256")
 pane_pid, _, pane_command = pane.partition(" ")
 print(json.dumps({
     "root": root, "net_namespace": lines[0], "links": lines[1:], "uid": os.getuid(), "gid": os.getgid(),
+    "pid_namespace": instance.get("pid"), "mount_namespace": instance.get("mnt"),
     "preset_id": launch["preset_id"], "slot_id": launch["slot_id"],
     "pane_pid": int(pane_pid) if pane_pid else None, "pane_command": pane_command,
     "registration": json.loads(reg), "stub_requests": sum(1 for _ in open(log)) if os.path.exists(log) else 0,
@@ -1653,8 +1777,8 @@ status() {
 
 capture_evidence() { # dir: every evidence file and the summary; fails without publishing anything
   local ev="$1" name
-  in_ns sh -c 'printf "{\"net\": \"%s\", \"user\": \"%s\"}\n" "$(readlink /proc/self/ns/net)" "$(readlink /proc/self/ns/user)"' \
-    | python3 -I -c 'import json,sys,os; d=json.load(sys.stdin); d["host_net"]=os.readlink("/proc/self/ns/net"); d["host_user"]=os.readlink("/proc/self/ns/user"); print(json.dumps(d))' >"$ev/namespaces.json" || return 1
+  in_ns python3 -I -c 'import json, os; print(json.dumps({k: os.readlink(f"/proc/self/ns/{k}") for k in ("net", "user", "pid", "mnt")}))' \
+    | python3 -I -c 'import json, os, sys; d=json.load(sys.stdin); d.update({f"host_{k}": os.readlink(f"/proc/self/ns/{k}") for k in d}); print(json.dumps(d))' >"$ev/namespaces.json" || return 1
   in_ns ip -o link | awk -F': ' '{print $2}' >"$ev/links.txt" || return 1
   local opencode=() provider stub_files=() stub_sha
   provider="$(kitpy kit-provider "$ROOT")" || return 1
@@ -1719,10 +1843,9 @@ run_exec() {
   [[ "$EXEC_TIMEOUT" =~ ^[0-9]+$ && "$EXEC_TIMEOUT" -ge 1 && "$EXEC_TIMEOUT" -le "$EXEC_CAP" ]] \
     || refuse "--timeout must be 1..$EXEC_CAP seconds"
   [[ $# -gt 0 ]] || refuse "exec needs a command after --"
-  local outer inner
-  outer="$(verify outer)"; inner="$(verify inner)"
-  timeout -k 5 "$EXEC_TIMEOUT" nsenter --preserve-credentials -U -n -t "$outer" \
-    nsenter --preserve-credentials -U -t "$inner" env -i "${CLEAN_ENV[@]}" "$@"
+  local -a namespace_entry_args
+  namespace_entry || return
+  timeout -k 5 "$EXEC_TIMEOUT" "${namespace_entry_args[@]}" env -i "${CLEAN_ENV[@]}" "$@"
 }
 
 # --- down ------------------------------------------------------------------------------
@@ -1733,21 +1856,21 @@ down() {
   # instance of the caller's own (not copied, not forged, no host namespace).
   kitpy instance "$ROOT" >/dev/null || refuse "this root has no valid kit instance; nothing was signalled or removed"
   # Every proof before any signal: recorded identities with their parents, and no
-  # unrecorded or unreadable process in the kit namespace.
+  # process whose containment cannot be proved.
   local plan code=0 name
   plan="$(kitpy plan-teardown "$ROOT")" || code=$?
   ((code == 0 || code == 5)) || refuse "the teardown plan could not be computed; nothing was signalled"
   if ((code == 5)); then
     incomplete "teardown refused before any signal: $(python3 -I -c 'import json,sys; print("; ".join(json.loads(sys.argv[1])["problems"]))' "$plan"); the root and anchors are kept"
   fi
-  # #1010: unrecorded members of a proved service's process group first, each proved again by pidfd.
+  # Legacy roots: stop members of proved service groups individually.
   local spec
   local -a members
   mapfile -t members < <(python3 -I -c 'import json,sys; [print(json.dumps(m)) for m in json.loads(sys.argv[1])["members"]]' "$plan")
   for spec in "${members[@]}"; do
     stop_member "$spec" || incomplete "an unrecorded member of a kit process group could not be stopped with a proved identity; teardown stopped and the root is kept"
   done
-  # Children before parents: cli, stub, backend, tmux, then inner and outer last.
+  # Current roots target only namespace PID 1. Legacy roots stop children before parents.
   for name in $(python3 -I -c 'import json,sys; print(" ".join(json.loads(sys.argv[1])["targets"]))' "$plan"); do
     stop_role "$name" || incomplete "$name could not be stopped with a proved identity; teardown stopped and the root is kept"
   done

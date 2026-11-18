@@ -250,6 +250,10 @@ describe("guided repository setup", () => {
     expect(slots[0]).toMatchObject({ role: "Leader", area_labels: [], expertise: null });
     expect(slots[1]).toMatchObject({ role: "Worker", area_labels: ["backend"], expertise: "API" });
     expect(slots[2]).toMatchObject({ role: "Worker", area_labels: ["frontend"], expertise: "UI" });
+    expect(slots).toHaveLength(3);
+    expect(mocks.createTeamGithubScope).toHaveBeenCalledWith(12, expect.objectContaining({
+      merge_policy: "human", max_auto_merges_per_day: 0,
+    }), expect.any(String));
   });
 
   it("allows safe correction after a definite rejected create without latching", async () => {
@@ -370,6 +374,114 @@ describe("guided repository setup", () => {
       github_auth_mode: "ambient", github_auth_configured: true, github_poll_token_configured: true, enabled,
     };
   }
+
+  async function reviewAutomaticSetup(teamId?: number, workerNames = "Worker A") {
+    fireEvent.change(screen.getByLabelText("Repository owner"), { target: { value: "example" } });
+    fireEvent.change(screen.getByLabelText("Repository name"), { target: { value: "synthetic-product" } });
+    fireEvent.change(screen.getByLabelText("Primary checkout path"), { target: { value: "/synthetic/checkout" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Continue to configuration" }));
+    if (teamId) {
+      fireEvent.change(screen.getByLabelText("Team setup"), { target: { value: "existing" } });
+      fireEvent.change(screen.getByLabelText("Team"), { target: { value: String(teamId) } });
+    } else {
+      fireEvent.change(screen.getByLabelText("Team name"), { target: { value: "Synthetic team" } });
+      fireEvent.change(screen.getByLabelText("Worker slots, one name per line"), { target: { value: workerNames } });
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(screen.getByText(/automatic merge requires an enabled verifier/i)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Merge policy"), { target: { value: "auto" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+    expect(screen.getByText(/automatic merge.*5 per day/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText(/Save configuration only/));
+    fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+  }
+
+  it("saves a separate verifier and a positive cap for a new automatic scope", async () => {
+    mockReadyPreflightAndRoster();
+    const team = teamFixture(false);
+    const createTeam = (input: { slots: typeof team.slots }) => ({
+      ...team, leader_slot_id: null,
+      slots: input.slots.map((slot, index) => ({ ...slot, id: 101 + index })),
+    });
+    mocks.createAgentTeamPreset.mockImplementation(async (input) => createTeam(input));
+    mocks.updateAgentTeamLeader.mockImplementation(async () => ({
+      ...createTeam(mocks.createAgentTeamPreset.mock.calls[0][0]), leader_slot_id: 101,
+    }));
+    mocks.createTeamGithubScope.mockImplementation(async (presetId, input) => ({ ...input, id: 55, preset_id: presetId }));
+    render(<MemoryRouter><RepositorySetupPage /></MemoryRouter>);
+    await reviewAutomaticSetup();
+
+    await screen.findByRole("heading", { name: "Saved configuration" });
+    const [input] = mocks.createAgentTeamPreset.mock.calls[0];
+    expect(input.autonomy_enabled).toBe(false);
+    expect(input.slots).toHaveLength(3);
+    expect(input.slots[2]).toMatchObject({ display_name: "Verifier", role: "verifier", enabled: true, area_labels: [], expertise: null });
+    expect(mocks.updateAgentTeamLeader).toHaveBeenCalledWith(12, expect.objectContaining({
+      leader_slot_id: 101, expected_leader_slot_id: null,
+    }), expect.any(String));
+    expect(mocks.createTeamGithubScope).toHaveBeenCalledWith(12, expect.objectContaining({
+      merge_policy: "auto", max_auto_merges_per_day: 5, enabled: false,
+    }), expect.any(String));
+    expect(mocks.launchAgentTeam).not.toHaveBeenCalled();
+    expect(mocks.updateTeamGithubScope).not.toHaveBeenCalled();
+  });
+
+  it("rechecks the existing team's verifier before saving an automatic scope", async () => {
+    mockReadyPreflightAndRoster();
+    const team = teamFixture(true);
+    const verifier = { ...team.slots[1], id: 103, role: "verifier", display_name: "Verifier" };
+    mocks.fetchAgentTeamPresets.mockResolvedValue({ presets: [{ ...team, slots: [...team.slots, verifier] }] });
+    mocks.fetchConfigurationObservation.mockResolvedValue({
+      complete: true, presets: [{ ...team, slots: [...team.slots, { ...verifier, enabled: false }] }], scopes: [],
+    });
+    render(<MemoryRouter><RepositorySetupPage /></MemoryRouter>);
+    await reviewAutomaticSetup(12);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/automatic merge requires an enabled verifier/i);
+    expect(mocks.createTeamGithubScope).not.toHaveBeenCalled();
+    expect(mocks.createAgentTeamPreset).not.toHaveBeenCalled();
+    expect(mocks.updateAgentTeamPreset).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 12])("requires a separate PR owner for automatic setup with team %s", async (teamId) => {
+    mockReadyPreflightAndRoster();
+    const team = teamFixture(false);
+    const twoSlots = { ...team, slots: [team.slots[0], { ...team.slots[1], role: "verifier", display_name: "Verifier" }] };
+    mocks.fetchAgentTeamPresets.mockResolvedValue({ presets: teamId ? [twoSlots] : [] });
+    mocks.createAgentTeamPreset.mockResolvedValue(twoSlots);
+    mocks.createTeamGithubScope.mockResolvedValue({ ...scopeFixture(55, 12, false, "synthetic-product", "albiex-synth-city-ready"), merge_policy: "auto", max_auto_merges_per_day: 5 });
+    render(<MemoryRouter><RepositorySetupPage /></MemoryRouter>);
+    await reviewAutomaticSetup(teamId, "");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/automatic merge needs.*PR owner/i);
+    expect(mocks.createAgentTeamPreset).not.toHaveBeenCalled();
+    expect(mocks.createTeamGithubScope).not.toHaveBeenCalled();
+  });
+
+  it("rechecks the verifier before retrying an automatic scope save with a new key", async () => {
+    mockReadyPreflightAndRoster();
+    let storedKey: string | null = "synthetic-operator";
+    mocks.getOperatorToken.mockImplementation(() => storedKey);
+    mocks.clearOperatorToken.mockImplementation(() => { storedKey = null; });
+    mocks.setOperatorToken.mockImplementation((key: string) => { storedKey = key; });
+    const team = teamFixture(true);
+    const verifier = { ...team.slots[1], id: 103, role: "verifier", display_name: "Verifier" };
+    mocks.fetchAgentTeamPresets.mockResolvedValue({ presets: [{ ...team, slots: [...team.slots, verifier] }] });
+    mocks.createTeamGithubScope.mockRejectedValueOnce(new mocks.ApiHttpError("The Director key was rejected.", 401));
+    render(<MemoryRouter><RepositorySetupPage /></MemoryRouter>);
+    await reviewAutomaticSetup(12);
+
+    const dialog = await screen.findByRole("dialog");
+    mocks.fetchAgentTeamPresets.mockResolvedValue({ presets: [team] });
+    fireEvent.change(within(dialog).getByPlaceholderText("Enter secret value"), { target: { value: "replacement-token" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Use key" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/automatic merge requires an enabled verifier/i);
+    expect(mocks.createTeamGithubScope).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/Reconcile uncertain create/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save configuration" })).toBeEnabled();
+  });
 
   async function runDraftToSavedSetup() {
     fireEvent.change(screen.getByLabelText("Repository owner"), { target: { value: "example" } });

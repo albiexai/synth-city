@@ -3,12 +3,12 @@ import type { TeamGithubScope } from '@/types/agentTeams'
 export function authStatus(scope: TeamGithubScope) {
   if (!scope.github_poll_token_configured) return {
     label: 'Polling token not set',
-    help: 'Set github_token in backend/.env and restart Synth City. The watcher uses this host token to poll GitHub; private repos cannot be polled through App settings alone.',
+    help: 'Set github_token in the backend environment file and restart Synth City. The watcher uses this host token to poll GitHub; private repos cannot be polled through App settings alone.',
     warning: true,
   }
   if (!scope.github_auth_configured) return {
     label: 'GitHub App setup incomplete',
-    help: 'Complete the GitHub App settings in backend/.env or remove partial App settings, then restart Synth City. Synth City selects a dispatch auth mode when eligible work is dispatched.',
+    help: 'Complete the GitHub App settings in the backend environment file or remove partial App settings, then restart Synth City. Synth City selects a dispatch auth mode when eligible work is dispatched.',
     warning: true,
   }
   if (scope.github_auth_mode === 'unknown') return {

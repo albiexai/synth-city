@@ -16,6 +16,7 @@ import { SURFACE_GROUPS } from "@/features/harnesses/surfaceCatalog";
 import { HarnessBreadcrumb } from "@/features/harnesses/HarnessNav";
 import { ScopeSelector } from "@/features/projects/ScopeSelector";
 import { availablePages, focusRing, useDocumentTitle } from "@/features/harnesses/harnessPages";
+import { scopedVersionBadge, scopedVersionLine } from "@/features/harnesses/versionLine";
 import { providerOperationKeys, type AgentProviderId, type AgentProviderStatus, type ProviderOperations } from "@/types/providers";
 
 
@@ -45,6 +46,16 @@ function harnessStatus(metadata: AgentProviderStatus | undefined, catalog: Provi
   return catalog ? { kind: "unchecked", label: "Not checked yet" } : null;
 }
 
+// A pending observation is re-read soon, so the list and the page converge without waiting for the cache window.
+const PENDING_OBSERVATION_RETRY_MS = 5_000
+function usePendingObservationRetry(catalog: ProviderOperations | null, refresh: () => Promise<void>) {
+  useEffect(() => {
+    if (catalog?.readiness.probe_state !== "pending") return;
+    const timer = setTimeout(() => { void refresh() }, PENDING_OBSERVATION_RETRY_MS);
+    return () => clearTimeout(timer);
+  }, [catalog, refresh]);
+}
+
 // Green for ready, amber only for needs setup, neutral grey for not installed. Each colour has a light and a dark value.
 const statusClass: Record<HarnessStatus["kind"], string> = {
   ready: "border-emerald-600/40 text-emerald-700 dark:text-emerald-400",
@@ -70,6 +81,7 @@ function TechnicalDetails({ id, metadata, mail }: { id: AgentProviderId; metadat
       <summary className="cursor-pointer font-medium">Technical details</summary>
       <div className="space-y-3 pt-3">
         <p>Binary: {metadata ? metadata.installed ? `installed ${metadata.version ?? ""}${metadata.binary_path ? ` · ${metadata.binary_path}` : ""}` : "missing" : "not reported"}</p>
+        {scopedVersionLine(metadata) && <p>Selected user's Claude Code: {scopedVersionLine(metadata)}</p>}
         <dl className="space-y-2 text-sm" aria-label={`${harnesses[id]} readiness`}>
           <div>
             <dt className="font-medium">Configuration</dt>
@@ -150,9 +162,10 @@ function Tiles({ id, metadata, catalog, withCounts }: { id: AgentProviderId; met
 }
 
 function HarnessPage({ id, metadata, registryLoading }: { id: AgentProviderId; metadata?: AgentProviderStatus; registryLoading: boolean }) {
-  const { state, catalog } = useProviderOperations(id);
+  const { state, catalog, refresh } = useProviderOperations(id);
   const mail = useAgentMailSetup();
   useDocumentTitle(`${harnesses[id]} · Albiex Synth City`);
+  usePendingObservationRetry(catalog, refresh);
   const summaryAccess = catalog ? nativeAccess(id, "summary", metadata, catalog) : null;
   if (registryLoading || state === "idle" || state === "loading") return <HarnessCardSkeleton id={id} />;
   const status = harnessStatus(metadata, catalog);
@@ -165,7 +178,9 @@ function HarnessPage({ id, metadata, registryLoading }: { id: AgentProviderId; m
             <h2 className="text-2xl font-semibold">{harnesses[id]}</h2>
             {status && <StatusBadge status={status} />}
           </div>
-          {metadata?.installed && metadata.version && <p className="text-sm text-muted-foreground">Version {metadata.version}</p>}
+          {scopedVersionLine(metadata)
+            ? <p className="text-sm text-muted-foreground">{scopedVersionLine(metadata)}</p>
+            : metadata?.installed && metadata.version && <p className="text-sm text-muted-foreground">Version {metadata.version}</p>}
           {metadata && !metadata.installed && <p className="text-sm text-muted-foreground">Install it on this machine to use it in a team.</p>}
         </header>
         {state === "error" && <p role="alert">Operating catalog unavailable. Readiness is unknown and native pages are unavailable.</p>}
@@ -183,11 +198,14 @@ function HarnessPage({ id, metadata, registryLoading }: { id: AgentProviderId; m
 }
 
 function HarnessCard({ id, metadata, registryLoading, teamCount }: { id: AgentProviderId; metadata?: AgentProviderStatus; registryLoading: boolean; teamCount: number | null }) {
-  const { state, catalog } = useProviderOperations(id);
+  const { state, catalog, refresh } = useProviderOperations(id);
+  usePendingObservationRetry(catalog, refresh);
   const navigate = useNavigate();
   if (registryLoading || state === "idle" || state === "loading") return <HarnessCardSkeleton id={id} />;
   const status = harnessStatus(metadata, catalog);
   const missing = status?.kind === "missing";
+  // A chosen user's version (or its unknown message) shows whether or not the controller has a claude of its own.
+  const versionBadge = scopedVersionBadge(metadata) ?? (!missing && metadata?.version ? `v${metadata.version}` : null);
   const pageCount = catalog ? availablePages(id, metadata, catalog).length : 0;
   const pages = pageCount > 0 ? `${pageCount} settings ${pageCount === 1 ? "page" : "pages"}` : "No settings pages in Synth City";
   const usedBy = teamCount ? ` · used by ${teamCount} ${teamCount === 1 ? "team" : "teams"}` : "";
@@ -214,7 +232,7 @@ function HarnessCard({ id, metadata, registryLoading, teamCount }: { id: AgentPr
             {harnesses[id]}
             {status && <StatusBadge status={status} />}
           </h3>
-          {!missing && metadata?.version && <span className="font-mono text-xs text-muted-foreground">v{metadata.version}</span>}
+          {versionBadge && <span className="font-mono text-xs text-muted-foreground">{versionBadge}</span>}
         </div>
         <p className="text-sm text-muted-foreground">{missing ? "Install it to use it in a team." : `${pages}${usedBy}`}</p>
         {status?.kind === "setup" && status.reason && <p className="line-clamp-2 text-sm text-amber-700 dark:text-amber-400">{status.reason}</p>}

@@ -154,18 +154,19 @@ def test_the_reserved_companion_trailer_in_a_summary_is_refused():
         assert "continuation_summary_reserved" in codes(request_preflight.preflight(kind, **values))
 
 
-def test_companions_the_server_adds_are_warned_and_counted_toward_the_limit(monkeypatch):
+def test_companions_the_server_adds_are_warned_and_counted_on_their_own_bound(monkeypatch):
     monkeypatch.setattr(request_preflight.companion_paths, "companions_for",
                         lambda paths, mapping=None: ["docs/guide.md", "tests/test_a.py"])
     result = request_preflight.preflight("continuation", **continuation())
     assert result.ok
     assert [w.code for w in result.warnings] == ["companion_paths_added"]
     assert "docs/guide.md" in result.warnings[0].message
-    tight = SimpleNamespace(max_scope_paths=2, max_scope_commands=16, max_failed_heads_per_revision=2)
+    # #1039: companions do not use up the scope's path limit; room for the one named path is enough.
+    tight = SimpleNamespace(max_scope_paths=1, max_scope_commands=16, max_failed_heads_per_revision=2)
+    assert request_preflight.preflight("continuation", **continuation(scope=tight)).ok
+    monkeypatch.setattr(request_preflight.companion_paths, "MAX_COMPANION_PATHS", 1)  # their own bound still holds
     over = request_preflight.preflight("continuation", **continuation(scope=tight))
     assert "continuation_path_limit_exceeded" in codes(over)
-    assert request_preflight.preflight("continuation", **continuation(
-        scope=SimpleNamespace(max_scope_paths=3, max_scope_commands=16, max_failed_heads_per_revision=2))).ok
 
 
 @pytest.mark.parametrize("metadata,code", [
@@ -614,6 +615,7 @@ COMPANION = lambda paths, mapping=None: ["docs/guide.md"]  # noqa: E731
 
 def test_a_bad_action_list_does_not_hide_the_companion_path_limit(monkeypatch):
     monkeypatch.setattr(request_preflight.companion_paths, "companions_for", COMPANION)
+    monkeypatch.setattr(request_preflight.companion_paths, "MAX_COMPANION_PATHS", 0)  # #1039: the companion bound
     tight = SimpleNamespace(max_scope_paths=1, max_scope_commands=16, max_failed_heads_per_revision=2)
     for kind, values in (("continuation", continuation(allowed_actions=["edit_production"], scope=tight)),
                          ("scope_amendment", amendment_values(allowed_actions=["edit_tests"], scope=tight))):

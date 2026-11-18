@@ -14,6 +14,26 @@ def test_mcp_shim_imports_without_app_package_dependency():
     assert callable(shim.synth_city_whoami)
 
 
+def test_work_item_context_reads_the_leader_release_lease_on_request(monkeypatch):
+    import mcp_shim.agent_mail_server as shim
+
+    calls = []
+    context = {"work_item_id": 7, "workspace_id": 3, "leased_at": "2026-11-17T18:11:59.123456+00:00"}
+    monkeypatch.setattr(shim, "_ensure_registered", lambda: {"ok": True})
+
+    def request(method, path):
+        calls.append((method, path))
+        return {"ok": True, "data": context}
+
+    monkeypatch.setattr(shim, "_dispatch_request", request)
+    assert shim.synth_city_get_work_item_context(7, leader_release=True) == {"ok": True, "context": context}
+    assert shim.synth_city_get_work_item_context(7)["ok"]
+    assert calls == [
+        ("GET", "/github-work-items/7/leader-recovery/release-workspace/context"),
+        ("POST", "/github-work-items/7/claim-continuation"),
+    ]
+
+
 def test_remaining_summary_uses_authenticated_context_and_makes_no_writes(monkeypatch):
     import mcp_shim.agent_mail_server as shim
     from mcp_shim.work_remaining_protocol import parse_report
@@ -806,6 +826,7 @@ def test_list_work_items_projects_safe_continuation_fields(monkeypatch):
                         "id": 19,
                         "issue_number": 867,
                         "dispatch_status": "dispatched",
+                        "dispatch_generation": "a" * 64,
                         "pr_number": 875,
                         "attempt_phase": "implementation",
                         "active_scope_revision": 2,
@@ -822,6 +843,7 @@ def test_list_work_items_projects_safe_continuation_fields(monkeypatch):
     result = shim.synth_city_list_work_items(status="")
 
     assert result["items"][0]["active_scope_revision"] == 2
+    assert result["items"][0]["dispatch_generation"] == "a" * 64
     assert result["items"][0]["pr_number"] == 875
     assert "lease_token" not in result["items"][0]
     assert "must-not-project" not in repr(result)
@@ -906,8 +928,10 @@ def test_team_summary_and_parent_link_tools_use_narrow_team_routes(monkeypatch):
         return {"ok": True, "data": {"preset_id": 12}}
     monkeypatch.setattr(shim, "_team_request", request)
     assert shim.synth_city_get_team_summary(12) == {"ok": True, "summary": {"preset_id": 12}}
+    assert shim.synth_city_get_team_summary(12, work_item_id=19)["ok"]
     assert shim.synth_city_update_team_parent_issue(12, None)["ok"]
     assert requests == [("GET", "/presets/12/summary", {}),
+                        ("GET", "/presets/12/summary", {"params": {"work_item_id": 19}}),
                         ("PATCH", "/presets/12", {"json": {"parent_issue_url": None}})]
     monkeypatch.setattr(shim, "_team_request", lambda *args, **kwargs: {"ok": False, "error": "blocked"})
     assert not shim.synth_city_get_team_summary(12)["ok"]
@@ -1222,7 +1246,7 @@ def test_upgrade_probe_refuses_actual_dispatch_including_direct_http_tools(monke
             types.CallToolRequest(method="tools/call", params=types.CallToolRequestParams(
                 name=name, arguments=arguments)))
         assert wire.root.structuredContent == denied
-        assert len(tools) == 51
+        assert len(tools) == 52
         # Every published tool is refused before validation or execution.
         for tool in tools:
             assert await shim.mcp.call_tool(tool.name, {}) == denied
@@ -1252,7 +1276,7 @@ def test_upgrade_probe_lists_tools_without_registration_and_cannot_call_member_t
     spec.loader.exec_module(shim)
     calls = []
     monkeypatch.setattr(shim, "_request", lambda *args, **kwargs: calls.append((args, kwargs)))
-    assert len(asyncio.run(shim.mcp.list_tools())) == 51
+    assert len(asyncio.run(shim.mcp.list_tools())) == 52
     assert shim._ensure_registered() == {"ok": False, "error": {"code": "upgrade_probe_read_only"}}
     assert shim._state["member_id"] is None and shim._state["capability_token"] is None
     assert calls == []
@@ -1521,8 +1545,14 @@ def test_the_leader_extension_tool_posts_one_request_and_changes_nothing_else(mo
         return {"ok": True, "data": {"extension_minutes": 15, "effective_limit_minutes": 75, "repeated": False}}
 
     monkeypatch.setattr(shim, "_request", fake_request)
-    answer = shim.synth_city_extend_effort_limit(19, "nonce-19", 15, "healthy and close to done")
+    answer = shim.synth_city_extend_effort_limit(19, "nonce-19", 15, "healthy and close to done", 0,
+                                                 "4 of 5 tests green")
     assert answer == {"ok": True, "extension_minutes": 15, "effective_limit_minutes": 75, "repeated": False}
     assert calls == [("POST", "/effort-extensions", {"json": {
-        "work_item_id": 19, "dispatch_nonce": "nonce-19", "minutes": 15, "reason": "healthy and close to done"}})]
+        "work_item_id": 19, "dispatch_nonce": "nonce-19", "minutes": 15, "reason": "healthy and close to done",
+        "expected_extension_minutes": 0, "evidence": "4 of 5 tests green"}})]
+    doc = " ".join(shim.synth_city_extend_effort_limit.__doc__.split())
+    assert "expected_extension_minutes" in doc and "evidence" in doc
+    assert "effort limit once" not in doc and "up to the scope ceiling" in doc  # #1101
+    assert "notifies the Supervisor once per attempt" in doc  # #1102
     assert "not the owner's reported active effort" in " ".join(shim.synth_city_extend_effort_limit.__doc__.split())

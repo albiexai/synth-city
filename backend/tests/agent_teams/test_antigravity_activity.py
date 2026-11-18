@@ -16,7 +16,9 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import sys
 import threading
+import time
 
 import pytest
 
@@ -464,6 +466,95 @@ def test_deadline_and_query_budget_are_enforced(home, monkeypatch):
     assert observe(home) == ("unknown", "observation_incomplete")
 
 
+def test_sqlite_vm_budget_interrupts_a_query_before_its_deadline(tmp_path, monkeypatch):
+    path = tmp_path / "query.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("create table fixture (value integer)")
+    data = path.read_bytes()
+    deadline = time.monotonic() + 5.0
+    monkeypatch.setattr(ag, "_VM_STEPS", 100)
+    assert ag._query(data, None, deadline, [("select 1", ())]) == [[(1,)]]
+
+    with pytest.raises(ag._Unknown, match="observation_incomplete"):
+        ag._query(data, None, deadline, [(
+            "with recursive counter(n) as (select 1 union all select n+1 from counter where n<200) "
+            "select sum(n) from counter", (),
+        )])
+    assert time.monotonic() < deadline
+
+
+@pytest.mark.parametrize(("database", "write"), [
+    ("summaries", "update conversation_summaries set step_count = step_count + 1"),
+    ("conversation", "update steps set status = status + 1 where idx = 2"),
+])
+def test_transcript_sample_is_bracketed_by_both_database_reads(home, monkeypatch, database, write):
+    read = ag.read_transcript_records
+    writes = 0
+
+    def read_and_change(*args, **kwargs):
+        nonlocal writes
+        sample = read(*args, **kwargs)
+        home[database].execute(write)
+        home[database].commit()
+        writes += 1
+        return sample
+
+    monkeypatch.setattr(ag, "read_transcript_records", read_and_change)
+    assert observe(home) == ("unknown", "binding_changed")
+    assert writes == 2
+
+
+def test_transcript_append_during_the_sample_is_unknown(home, monkeypatch):
+    pread = os.pread
+
+    def append_after_read(fd, size, offset):
+        data = pread(fd, size, offset)
+        with home["transcript"].open("ab") as stream:
+            stream.write((json.dumps(user(3, 2)) + "\n").encode())
+        return data
+
+    monkeypatch.setattr(os, "pread", append_after_read)
+    assert observe(home) == ("unknown", "binding_changed")
+
+
+@pytest.mark.parametrize("operation", ["observation", "discovery"])
+def test_worker_timeout_discards_output_reaps_process_and_cleans_copies(operation, tmp_path, monkeypatch):
+    from app.services import antigravity_activity_worker as worker
+
+    marker = tmp_path / "worker-started"
+    program = (
+        "import json, os, pathlib, sys, time\n"
+        "root = pathlib.Path(os.environ['TMPDIR'])\n"
+        "(root / 'private-copy').write_text('temporary fixture')\n"
+        "pathlib.Path(sys.argv[1]).write_text(json.dumps([os.getpid(), str(root)]))\n"
+        "print(sys.argv[2], flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    early_output = json.dumps(["idle", "native_idle", NOW.isoformat()] if operation == "observation" else CID)
+    monkeypatch.setattr(worker, "_WORKER_COMMAND", [sys.executable, "-I", "-c", program, str(marker), early_output])
+    monkeypatch.setattr(worker, "_DEADLINE_SECONDS", 0.6)
+
+    started = time.monotonic()
+    if operation == "observation":
+        assert worker.observe_antigravity(4242, CID, str(tmp_path), NOW, START) == (
+            "unknown", "observation_incomplete", None,
+        )
+    else:
+        assert worker.discover_antigravity_conversation(4242, str(tmp_path)) is None
+    assert time.monotonic() - started < 3.0
+    pid, root = json.loads(marker.read_text())
+    assert not Path("/proc", str(pid)).exists()
+    assert not Path(root).exists()
+
+
+def test_worker_entry_point_runs_the_observer_for_an_invalid_session(tmp_path):
+    from app.services import antigravity_activity_worker as worker
+
+    assert worker.observe_antigravity(4242, "invalid-id", str(tmp_path), NOW, START) == (
+        "unknown", "session_mismatch", None,
+    )
+
+
 def test_damaged_database_copy_is_unknown(home):
     path = home["root"] / "conversations" / f"{CID}.db"
     home["conversation"].execute("pragma wal_checkpoint(truncate)")
@@ -529,6 +620,36 @@ def test_unknown_never_reports_a_wait_or_a_new_identity(monkeypatch):
     result, metadata = _dispatch(monkeypatch, CID, observed=("unknown", "native_wait_unconfirmed", None))
     assert result.waiting_input is None and (result.state, result.reason) == ("unknown", "native_wait_unconfirmed")
     assert "discovered_session_id" not in metadata and "input_wait_known" not in metadata
+
+
+@pytest.mark.parametrize(("source_provider", "screen_file", "source_reason"), [
+    ("claude-code", "claude-question-form.ansi", "question"),
+    ("codex-cli", "codex-sign-in.txt", "sign_in"),
+    ("codex-cli", "codex-idle-prompt.txt", "clear"),
+])
+def test_antigravity_unknown_does_not_borrow_another_harness_screen(
+    monkeypatch, source_provider, screen_file, source_reason,
+):
+    from types import SimpleNamespace
+
+    from app.services import agent_activity_service as activity
+
+    screen = (FIXTURES.parent / "native_screens" / screen_file).read_text(encoding="utf-8")
+    assert activity.recognize_native_input_wait(source_provider, screen) == source_reason
+    assert activity.recognize_native_input_wait("antigravity-cli", screen) is None
+
+    def tmux(command, **_options):
+        if command[:2] == ["tmux", "display-message"]:
+            return SimpleNamespace(returncode=0, stdout="41000:%8\n")
+        assert command[:2] == ["tmux", "capture-pane"]
+        return SimpleNamespace(returncode=0, stdout=screen)
+
+    monkeypatch.setattr(activity.subprocess, "run", tmux)
+    result, metadata = _dispatch(monkeypatch, CID, observed=("unknown", "native_wait_unconfirmed", None))
+
+    assert (result.state, result.reason) == ("unknown", "native_wait_unconfirmed")
+    assert result.waiting_input is None
+    assert "input_wait_known" not in metadata
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal, Base
 from app.models.database import AgentTeamPreset, GithubWorkItem, MailMessage, OperationsFinding, TeamGithubScope
+from app.services.github_rate_limit_service import github_rate_limit_service
 
 logger = logging.getLogger(__name__)
 
@@ -246,13 +247,14 @@ class OperationsHealthService:
 
     # ---- detector 4: a poll whose writes were rolled back -----------------------------------------------
 
-    async def record_poll_failure(self, owner: str, repo: str, error: BaseException) -> None:
+    async def record_poll_failure(self, owner: str, repo: str, error: BaseException, stage: str | None = None) -> None:
         """A repo run raised, so its session was discarded with everything it had not committed."""
+        where = f" in {stage}" if stage else ""
         try:
             async with self._session() as db:
                 await self._open(
                     db, kind=POLL_ROLLED_BACK, subject=f"repo:{owner}/{repo}",
-                    detail=(f"A poll of {owner}/{repo} failed ({type(error).__name__}) and its uncommitted "
+                    detail=(f"A poll of {owner}/{repo} failed{where} ({type(error).__name__}) and its uncommitted "
                             "writes were discarded."))
         except Exception:
             self._failed(f"poll failure record for {owner}/{repo}")
@@ -269,6 +271,16 @@ class OperationsHealthService:
 
     async def health(self) -> dict:
         """health, reasons and open_findings for /health. Unreadable findings are themselves degraded."""
+        result = await self._findings_health()
+        quota = github_rate_limit_service.polling_status()
+        if quota is not None:
+            result["github_rate_limit"] = quota
+            if quota["reason"]:
+                result["health"] = "degraded"
+                result["reasons"] = sorted({*result["reasons"], quota["reason"]})
+        return result
+
+    async def _findings_health(self) -> dict:
         try:
             async with self._session() as db:
                 rows = (await db.execute(

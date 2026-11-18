@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from contextvars import ContextVar
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,6 +22,7 @@ from app.services.github_approval_service import github_approval_service
 from app.services.github_client import GithubClient, github_client
 from app.services.github_coordination_service import github_coordination_service
 from app.services.github_dispatch_service import github_dispatch_service
+from app.services.github_rate_limit_service import GithubRateLimited
 from app.services.github_recovery_gate import (
     GithubRecoveryOnlyAttempt,
     configured_recovery_only_attempt,
@@ -28,10 +30,15 @@ from app.services.github_recovery_gate import (
 from app.services.github_verification_service import github_verification_service
 from app.services.github_watcher_service import github_watcher_service
 from app.services.operations_health_service import operations_health_service
+from app.services.wake_followup_service import wake_followup_service
 
 logger = logging.getLogger(__name__)
 
 _JOB_PREFIX = "github-dispatch:"
+
+
+# #1148: the stage a repo run is in, per task, so a poll failure finding says where it failed.
+_poll_stage: ContextVar[str | None] = ContextVar("poll_stage", default=None)
 
 
 class GithubDispatchScheduler:
@@ -106,15 +113,19 @@ class GithubDispatchScheduler:
             )
 
     async def run_repo_job(self, owner: str, repo: str) -> None:
+        _poll_stage.set("start")
         try:
             async with AsyncSessionLocal() as db:
                 await self.run_repo_once(db, owner, repo)
                 await self.sync_jobs(db)
             await operations_health_service.record_poll_success(owner, repo)
+        except GithubRateLimited:
+            # The shared window is already visible in health. This was not a completed or rolled-back poll.
+            return
         except Exception as error:
             logger.exception("Autonomous GitHub dispatch job failed for %s/%s", owner, repo)
             # #941: the session was discarded with everything it had not committed; say so once.
-            await operations_health_service.record_poll_failure(owner, repo, error)
+            await operations_health_service.record_poll_failure(owner, repo, error, _poll_stage.get())
 
     async def run_repo_once(
         self,
@@ -127,6 +138,8 @@ class GithubDispatchScheduler:
         classify=None,
     ) -> None:
         client = client or github_client
+        if isinstance(client, GithubClient):
+            client.require_poll_available()
         scopes = (
             await db.execute(
                 select(TeamGithubScope)
@@ -149,16 +162,20 @@ class GithubDispatchScheduler:
             if not await self._scope_remains_autonomous(db, scope_id):
                 continue
             scope, _slots = await self._reload_scope_context(db, scope_id)
+            _poll_stage.set("poll_scope")
             await self.watcher.poll_scope(db, scope, client)
             await db.commit()
-            if not await self._scope_remains_autonomous(db, scope.id):
+            if isinstance(client, GithubClient):
+                client.require_poll_available()
+            if not await self._scope_remains_autonomous(db, scope_id):
                 continue
-            scope, slots = await self._reload_scope_context(db, scope.id)
+            scope, slots = await self._reload_scope_context(db, scope_id)
             issues_by_number = await self._pending_issues_by_number(db, scope, client)
             issue_labels_by_number = {
                 number: [label["name"] for label in issue.get("labels", []) if "name" in label]
                 for number, issue in issues_by_number.items()
             }
+            _poll_stage.set("dispatch_pending")
             await self.dispatch.dispatch_pending(
                 db,
                 scope,
@@ -171,19 +188,22 @@ class GithubDispatchScheduler:
                 require_autonomy=True,
             )
             await db.commit()
-            if not await self._scope_remains_autonomous(db, scope.id):
+            if not await self._scope_remains_autonomous(db, scope_id):
                 continue
-            scope, slots = await self._reload_scope_context(db, scope.id)
+            scope, slots = await self._reload_scope_context(db, scope_id)
+            _poll_stage.set("monitor_dispatched")
             await self.dispatch.monitor_dispatched(db, scope, slots)
             await db.commit()
-            if not await self._scope_remains_autonomous(db, scope.id):
+            if not await self._scope_remains_autonomous(db, scope_id):
                 continue
-            scope, slots = await self._reload_scope_context(db, scope.id)
+            scope, slots = await self._reload_scope_context(db, scope_id)
+            _poll_stage.set("monitor_continuation")
             await self.dispatch.monitor_continuation(db, scope, slots)
             await db.commit()
-            if not await self._scope_remains_autonomous(db, scope.id):
+            if not await self._scope_remains_autonomous(db, scope_id):
                 continue
-            scope, _slots = await self._reload_scope_context(db, scope.id)
+            scope, _slots = await self._reload_scope_context(db, scope_id)
+            _poll_stage.set("verification")
             await self.verification.process_scope(db, scope, client=client)
             await db.commit()
             # #941: detection runs after the commit, in sessions of its own, and never raises.
@@ -191,19 +211,21 @@ class GithubDispatchScheduler:
                 scope_id, set(getattr(self.verification, "skipped_item_ids", ())))
             await operations_health_service.sweep_verifying_after_merge(
                 scope_id, owner, repo, client)
-            if not await self._scope_remains_autonomous(db, scope.id):
+            if not await self._scope_remains_autonomous(db, scope_id):
                 continue
-            scope, slots = await self._reload_scope_context(db, scope.id)
+            scope, slots = await self._reload_scope_context(db, scope_id)
+            _poll_stage.set("monitor_recovery")
             await self.dispatch.monitor_recovery(db, scope, slots)
             await db.commit()
-            if not await self._scope_remains_autonomous(db, scope.id):
+            if not await self._scope_remains_autonomous(db, scope_id):
                 continue
-            scope, _slots = await self._reload_scope_context(db, scope.id)
+            scope, _slots = await self._reload_scope_context(db, scope_id)
+            _poll_stage.set("remind_held_leases")
             await self.dispatch.remind_held_leases(db, scope)
             await db.commit()
             # Backlog assessment is advisory and cannot wedge verification/recovery.
-            if await self._scope_remains_autonomous(db, scope.id):
-                coordination_scope_id = scope.id
+            if await self._scope_remains_autonomous(db, scope_id):
+                coordination_scope_id = scope_id
                 try:
                     await github_coordination_service.reconcile(db, coordination_scope_id, client)
                 except Exception as error:
@@ -217,6 +239,9 @@ class GithubDispatchScheduler:
                     await db.rollback()
                     logger.warning("owner_followup_failed scope=%s error_type=%s",
                                    coordination_scope_id, type(error).__name__)
+        # #1059: a delivered wake with no activity is repeated once. It never fails the poll.
+        _poll_stage.set("wake_followup")
+        await wake_followup_service.tick(db)
 
     async def _run_recovery_only(
         self,
@@ -234,6 +259,7 @@ class GithubDispatchScheduler:
         await agent_mail_service.sync_observed_sessions(db, strict=True)
         await db.commit()
         for stage in ("continuation", "verification", "recovery"):
+            _poll_stage.set(f"recovery_only_{stage}")  # #1148: a recovery-only failure names its stage too
             if not await self._recovery_only_target_current(db, attempt):
                 return
             scope, slots = await self._reload_scope_context(db, attempt.scope_id)

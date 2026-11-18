@@ -114,6 +114,31 @@ describe('waiting for input', () => {
     expect(row).toHaveTextContent('A member is waiting at a trust prompt')
   })
 
+  it('shows a provider refusal under Blocked, never under Waiting for input', async () => {
+    const region = await card(
+      summary({ waiting_input: [
+        { slot_id: 5, reason: 'question', label: 'Waiting for input' },
+        { slot_id: 7, reason: 'provider_refusal', label: 'Blocked: provider refusal' },
+      ] }),
+      { 5: 'R2 release implementer', 7: 'R4 docs implementer' },
+    )
+    const waitingRow = within(region).getByText('Waiting for input').parentElement!
+    expect(waitingRow).toHaveTextContent('R2 release implementer is waiting at a question')
+    expect(waitingRow).not.toHaveTextContent('R4 docs implementer')
+    const blockedRow = within(region).getByText('Blocked: provider refusal').parentElement!
+    expect(blockedRow).toHaveTextContent('R4 docs implementer is blocked by a provider refusal')
+    expect(blockedRow).not.toHaveTextContent('waiting')
+  })
+
+  it('shows no Waiting row when the only entry is a provider refusal', async () => {
+    const region = await card(
+      summary({ waiting_input: [{ slot_id: 7, reason: 'provider_refusal', label: 'Blocked: provider refusal' }] }),
+      { 7: 'R4 docs implementer' },
+    )
+    expect(within(region).queryByText('Waiting for input')).not.toBeInTheDocument()
+    expect(within(region).getByText('R4 docs implementer is blocked by a provider refusal')).toBeInTheDocument()
+  })
+
   it.each([null, undefined, []])('shows nothing when the field is %j', async (value) => {
     const region = await card(summary({ waiting_input: value }))
     expect(within(region).queryByText('Waiting for input')).not.toBeInTheDocument()

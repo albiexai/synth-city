@@ -310,7 +310,7 @@ export const manifest = [
   },
   {
     "name": "synth_city_extend_effort_limit",
-    "description": "Leader only: extend a work item's effort limit once, by at most 30 minutes or 25 percent of the limit.\n\n    The limit and its ledger are advisory elapsed working time from the system, not the owner's reported active\n    effort. The extension changes no expiry, nonce, lease or status. The owner asks for it by Mail.\n    ",
+    "description": "Leader only: extend a work item's effort limit, and extend again up to the scope ceiling.\n\n    Each step adds at most 30 minutes or 25 percent of the original limit, whichever is smaller. The limit plus all\n    extensions may not pass the scope ceiling (max_item_effort_minutes); a step beyond it is refused with\n    extension_exceeds_ceiling and notifies the Supervisor once per attempt, because beyond the ceiling the Supervisor\n    decides. The item's effort shows the room left as extension_cap_minutes.\n\n    The limit and its ledger are advisory elapsed working time from the system, not the owner's reported active\n    effort. The extension changes no expiry, nonce, lease or status. The owner asks for it by Mail.\n\n    expected_extension_minutes is the extension total you saw in the item's effort (0 before any extension). A call\n    whose total is no longer the recorded one is refused with effort_extension_total_changed and grants nothing, so a\n    repeated call never extends twice. evidence is the work so far that supports the extension; it is recorded with\n    the reason.\n    ",
     "inputSchema": {
       "properties": {
         "work_item_id": {
@@ -328,13 +328,23 @@ export const manifest = [
         "reason": {
           "title": "Reason",
           "type": "string"
+        },
+        "expected_extension_minutes": {
+          "title": "Expected Extension Minutes",
+          "type": "integer"
+        },
+        "evidence": {
+          "title": "Evidence",
+          "type": "string"
         }
       },
       "required": [
         "work_item_id",
         "dispatch_nonce",
         "minutes",
-        "reason"
+        "reason",
+        "expected_extension_minutes",
+        "evidence"
       ],
       "title": "synth_city_extend_effort_limitArguments",
       "type": "object"
@@ -393,12 +403,24 @@ export const manifest = [
   },
   {
     "name": "synth_city_get_team_summary",
-    "description": "Read a team's outcome, parent link, existing attention signals, effort total and next actors.\n\n    Unknown or incomplete observations keep the total Unknown. This read grants no execution authority.\n    ",
+    "description": "Read a team's outcome, parent link, existing attention signals, effort total and next actors.\n\n    For a PR's final hold check, pass its tracked work_item_id. Attention and human actions then keep\n    only that item and unbound signals. Team coverage, HOLD, and native waiting signals still apply.\n    Unknown or incomplete observations keep the total Unknown. This read grants no execution authority.\n    ",
     "inputSchema": {
       "properties": {
         "preset_id": {
           "title": "Preset Id",
           "type": "integer"
+        },
+        "work_item_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Work Item Id"
         }
       },
       "required": [
@@ -410,12 +432,17 @@ export const manifest = [
   },
   {
     "name": "synth_city_get_work_item_context",
-    "description": "Claim the current owner's continuation context, including the persisted\n    branch, approval round, workspace, and lease capability after a handoff or\n    session restart.",
+    "description": "Claim the current owner's continuation context, including the persisted\n    branch, approval round, workspace, and lease capability after a handoff or\n    session restart.\n\n    Set leader_release=True for a read-only Leader context on a terminal item.\n    Use the returned workspace_id and leased_at as expected_leased_at for\n    synth_city_leader_release_workspace.\n    ",
     "inputSchema": {
       "properties": {
         "work_item_id": {
           "title": "Work Item Id",
           "type": "integer"
+        },
+        "leader_release": {
+          "default": false,
+          "title": "Leader Release",
+          "type": "boolean"
         }
       },
       "required": [
@@ -510,6 +537,83 @@ export const manifest = [
     }
   },
   {
+    "name": "synth_city_leader_end_stopped",
+    "description": "Current Leader ends one stopped work item and safely releases any clean workspace.\n\n    Read dispatch_generation and active_scope_revision from list_work_items. Use null generation only if the\n    item has none. Supply a target milestone for deferred or the delivering PR number for superseded.\n    A matching operation_id replay is safe. HOLD, a changed attempt or an unsafe lease refuses the action.\n    ",
+    "inputSchema": {
+      "properties": {
+        "work_item_id": {
+          "title": "Work Item Id",
+          "type": "integer"
+        },
+        "expected_dispatch_generation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expected Dispatch Generation"
+        },
+        "expected_scope_revision": {
+          "title": "Expected Scope Revision",
+          "type": "integer"
+        },
+        "operation_id": {
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "outcome": {
+          "enum": [
+            "deferred",
+            "superseded"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        },
+        "target_milestone": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Milestone"
+        },
+        "superseding_pr_number": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Superseding Pr Number"
+        }
+      },
+      "required": [
+        "work_item_id",
+        "expected_dispatch_generation",
+        "expected_scope_revision",
+        "operation_id",
+        "outcome",
+        "reason"
+      ],
+      "title": "synth_city_leader_end_stoppedArguments",
+      "type": "object"
+    }
+  },
+  {
     "name": "synth_city_leader_finalize_merged",
     "description": "Current Leader records a merged PR the poll could not settle, from fresh evidence.\n\n    Call with dry_run true (the default) for the evidence and its digest. Then call with dry_run false,\n    the digest, an operation_id and a reason. It performs no merge and releases nothing. Replay-safe;\n    one notice to the bound Supervisor.\n    ",
     "inputSchema": {
@@ -548,7 +652,7 @@ export const manifest = [
   },
   {
     "name": "synth_city_leader_release_workspace",
-    "description": "Current Leader releases a CLEAN workspace of a terminal item.\n\n    Refused when the tree is dirty, has unpushed commits or cannot be inspected, when the item is not\n    terminal, or when the lease changed. Dirty or unknown state is operator-only. One notice to the\n    bound Supervisor; replay-safe.\n    ",
+    "description": "Current Leader releases a CLEAN workspace of a terminal item.\n\n    Read workspace_id and leased_at with synth_city_get_work_item_context(leader_release=True).\n    Refused when the tree is dirty, has unpushed commits or cannot be inspected, when the item is not\n    terminal, or when the lease changed. Dirty or unknown state is operator-only. One notice to the\n    bound Supervisor; replay-safe.\n    ",
     "inputSchema": {
       "properties": {
         "work_item_id": {
@@ -1573,7 +1677,7 @@ export const manifest = [
   },
   {
     "name": "synth_city_request_scope_amendment",
-    "description": "Request a bounded healthy scope amendment. Fresh Leader decision and owner activation are required.",
+    "description": "Request a bounded healthy scope amendment. Fresh Leader decision and owner activation are required.\n\n    allowed_paths is the whole effective set: name every approved path you keep, not only the new ones. List each\n    approved path you deliberately drop in withdrawn_paths; otherwise the request is refused with\n    amendment_base_paths_omitted (a wrong withdrawal is amendment_withdrawn_paths_invalid).\n    ",
     "inputSchema": {
       "properties": {
         "work_item_id": {
@@ -1632,6 +1736,21 @@ export const manifest = [
         "lease_token": {
           "title": "Lease Token",
           "type": "string"
+        },
+        "withdrawn_paths": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Withdrawn Paths"
         }
       },
       "required": [

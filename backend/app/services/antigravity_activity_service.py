@@ -37,7 +37,8 @@ _SCAN_STEP = 1_048_576
 _SCAN_BYTES = 8 * 1_048_576
 _FILE_CAP = 16 * 1_048_576
 _DEADLINE_SECONDS = 1.0
-_VM_STEPS = 200_000
+_VM_BATCH = 100
+_VM_STEPS = 20_000_000
 _STEP_ROWS = 64
 _FRESH_SECONDS = 180
 
@@ -246,6 +247,11 @@ def _bound_root(pid: int) -> tuple[int, "_Tree", tuple]:
 
 # --- Bounded snapshots of live SQLite files --------------------------------------------------
 
+def _file_version(info: os.stat_result) -> tuple:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+            info.st_uid, info.st_mode)
+
+
 def _read_file(source: tuple[int, str], uid: int, deadline: float) -> tuple[bytes, tuple] | None:
     """The bytes of one regular file owned by ``uid`` in a held directory; None when it does not exist."""
     dir_fd, path = source
@@ -274,14 +280,14 @@ def _read_file(source: tuple[int, str], uid: int, deadline: float) -> tuple[byte
         after = os.fstat(fd)
     finally:
         os.close(fd)
-    key = (after.st_ino, after.st_size, after.st_mtime_ns)
-    if (before.st_ino, before.st_size, before.st_mtime_ns) != key or len(data) != after.st_size:
+    key = _file_version(after)
+    if _file_version(before) != key or len(data) != after.st_size:
         raise _Unknown("binding_changed")
     try:
         current = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
     except FileNotFoundError:
         raise _Unknown("binding_changed") from None
-    if (current.st_ino, current.st_size, current.st_mtime_ns) != key:
+    if _file_version(current) != key:
         raise _Unknown("binding_changed")
     return data, key
 
@@ -294,15 +300,24 @@ def _round(paths: dict[str, tuple[int, str]], uid: int, deadline: float) -> dict
     return files
 
 
-def _snapshot(paths: dict[str, tuple[int, str]], uid: int, deadline: float) -> dict[str, bytes | None]:
-    """Two identical copy rounds of every file, once retried; otherwise ``binding_changed``."""
+def _snapshot(
+    paths: dict[str, tuple[int, str]], uid: int, deadline: float, *,
+    transcript: tuple[_Tree, str] | None = None,
+) -> tuple[dict[str, bytes | None], list[dict] | None]:
+    """Bracket the transcript sample with two matching database and WAL copy rounds."""
     for attempt in range(2):
         first = _round(paths, uid, deadline)
         _between_rounds(attempt)
+        records = None
+        if transcript is not None:
+            tree, logs = transcript
+            records, failure = read_transcript_records("transcript.jsonl", uid, dir_fd=tree.data(logs))
+            if failure:
+                raise _Unknown(failure)
         second = _round(paths, uid, deadline)
         if all((first[n] is None) == (second[n] is None) and (first[n] is None or first[n][:2] == second[n][:2])
                for n in paths):
-            return {name: (None if value is None else value[2]) for name, value in second.items()}
+            return {name: (None if value is None else value[2]) for name, value in second.items()}, records
     raise _Unknown("binding_changed")
 
 
@@ -319,16 +334,16 @@ def _query(database: bytes, wal: bytes | None, deadline: float, statements: list
         steps = {"n": 0}
 
         def budget():
-            steps["n"] += 1
-            return 1 if steps["n"] > _VM_STEPS or time.monotonic() > deadline else 0
-        connection.set_progress_handler(budget, 100)
+            steps["n"] += _VM_BATCH
+            return 1 if steps["n"] >= _VM_STEPS or time.monotonic() > deadline else 0
+        connection.set_progress_handler(budget, _VM_BATCH)
         try:
             connection.execute("pragma query_only=on")
             if connection.execute("pragma quick_check").fetchone() != ("ok",):
                 raise _Unknown("observation_invalid")
             return [connection.execute(sql, args).fetchall() for sql, args in statements]
         except sqlite3.DatabaseError:
-            if time.monotonic() > deadline or steps["n"] > _VM_STEPS:
+            if time.monotonic() > deadline or steps["n"] >= _VM_STEPS:
                 raise _Unknown("observation_incomplete") from None
             raise _Unknown("observation_invalid") from None
         finally:
@@ -391,17 +406,27 @@ def read_transcript_records(path: Path | str, uid: int, *, dir_fd: int | None = 
         size = info.st_size
         offset = max(0, size - _TAIL_BYTES)
         data = os.pread(fd, size - offset, offset)
-        if data and not data.endswith(b"\n"):
+        if len(data) != size - offset or (data and not data.endswith(b"\n")):
             return None, "observation_incomplete"
         while True:
             lines = data.split(b"\n")
             complete = lines[1:] if offset > 0 else lines
             records = [_record(line) for line in complete if line.strip()]
             if offset == 0 or any(r["type"] == "USER_INPUT" for r in records) or size - offset >= _SCAN_BYTES:
+                try:
+                    named = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return None, "binding_changed"
+                version = _file_version(info)
+                if _file_version(os.fstat(fd)) != version or _file_version(named) != version:
+                    return None, "binding_changed"
                 return records, None
             step = min(_SCAN_STEP, offset)
             offset -= step
-            data = os.pread(fd, step, offset) + data
+            prefix = os.pread(fd, step, offset)
+            if len(prefix) != step:
+                return None, "observation_incomplete"
+            data = prefix + data
     except _Unknown as failure:
         return None, failure.reason
     finally:
@@ -548,9 +573,10 @@ def _final(pid: int, tree: _Tree, identity: tuple, ids: list[str], deadline: flo
     return time.monotonic() <= deadline
 
 
-def discover_antigravity_conversation(pid: int, cwd: str) -> str | None:
+def discover_antigravity_conversation(pid: int, cwd: str, *, deadline: float | None = None) -> str | None:
     """The conversation id of the one presence lock this process holds, bound to ``cwd``."""
-    deadline = time.monotonic() + _DEADLINE_SECONDS
+    if deadline is None:
+        deadline = time.monotonic() + _DEADLINE_SECONDS
     tree = None
     try:
         uid, tree, identity = _bound_root(pid)
@@ -558,8 +584,8 @@ def discover_antigravity_conversation(pid: int, cwd: str) -> str | None:
         if len(ids) != 1:
             return None
         root = tree.data()
-        files = _snapshot({"summaries": (root, "conversation_summaries.db"),
-                           "summaries_wal": (root, "conversation_summaries.db-wal")}, uid, deadline)
+        files, _ = _snapshot({"summaries": (root, "conversation_summaries.db"),
+                              "summaries_wal": (root, "conversation_summaries.db-wal")}, uid, deadline)
         if files["summaries"] is None:
             return None
         rows = _query(files["summaries"], files["summaries_wal"], deadline, [(_SUMMARY_QUERY, (ids[0],))])[0]
@@ -573,8 +599,12 @@ def discover_antigravity_conversation(pid: int, cwd: str) -> str | None:
             tree.close()
 
 
-def observe_antigravity(pid: int, conversation_id: str, cwd: str, now: datetime, started_at: datetime):
-    deadline = time.monotonic() + _DEADLINE_SECONDS
+def observe_antigravity(
+    pid: int, conversation_id: str, cwd: str, now: datetime, started_at: datetime, *,
+    deadline: float | None = None,
+):
+    if deadline is None:
+        deadline = time.monotonic() + _DEADLINE_SECONDS
     tree = None
     try:
         if not _UUID.fullmatch(conversation_id):
@@ -582,7 +612,9 @@ def observe_antigravity(pid: int, conversation_id: str, cwd: str, now: datetime,
         uid, tree, identity = _bound_root(pid)
         if _presence_ids(pid, tree) != [conversation_id]:
             return "unknown", "session_mismatch", None
-        files = _snapshot(_databases(tree, conversation_id), uid, deadline)
+        logs = f"brain/{conversation_id}/.system_generated/logs"
+        files, records = _snapshot(_databases(tree, conversation_id), uid, deadline,
+                                   transcript=(tree, logs))
         if files["summaries"] is None or files["conversation"] is None:
             return "unknown", "native_log_unavailable", None
         summary_rows = _query(files["summaries"], files["summaries_wal"], deadline,
@@ -591,11 +623,7 @@ def observe_antigravity(pid: int, conversation_id: str, cwd: str, now: datetime,
             ("select count(*) from steps", ()),
             ("select idx, step_type, status from steps order by idx desc limit ?", (_STEP_ROWS,))])
         summary = _summary(summary_rows, cwd)
-        logs = tree.data(f"brain/{conversation_id}/.system_generated/logs")
-        records, failure = read_transcript_records("transcript.jsonl", uid, dir_fd=logs)
-        if failure:
-            return "unknown", failure, None
-        state = antigravity_state(summary, count_rows[0][0], step_rows, records, started_at, now,
+        state = antigravity_state(summary, count_rows[0][0], step_rows, records or [], started_at, now,
                                   skip_permissions=identity[2] is True)
         # Refuse any result that arrives after the one deadline, after every final check.
         if not _final(pid, tree, identity, [conversation_id], deadline):

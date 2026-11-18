@@ -65,6 +65,17 @@ function localDate(iso: string): string {
   return parseServerTime(iso).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 }
 
+function fullCoverage(sample: MetricSample): boolean {
+  return /^\s*full\b/i.test(sample.coverage ?? "");
+}
+
+// Claims full data only when every metric reports full coverage.
+function wholeWindowClaim(window: MetricsWindow): string {
+  if (!window.metrics.length) return "Metric coverage is not reported for this window.";
+  if (window.metrics.every(fullCoverage)) return "The whole window has data.";
+  return "Some metrics do not have full coverage of this window.";
+}
+
 /** One sentence: when recording started and how much of the window has no data. */
 export function coverageSentence(window: MetricsWindow | null): string {
   if (!window) return "Coverage is not loaded yet.";
@@ -72,7 +83,7 @@ export function coverageSentence(window: MetricsWindow | null): string {
   const started = `Recording started ${localDate(window.instrumentation_start)}.`;
   if (!window.available_interval_start) return `${started} This window has no data.`;
   const gap = Date.parse(window.available_interval_start) - Date.parse(window.window_start);
-  if (!Number.isFinite(gap) || gap < 3600 * 1000) return `${started} The whole window has data.`;
+  if (!Number.isFinite(gap) || gap < 3600 * 1000) return `${started} ${wholeWindowClaim(window)}`;
   const days = Math.round(gap / DAY_MS);
   if (days >= 1) return `${started} The first ${days} ${days === 1 ? "day" : "days"} of this window have no data.`;
   const hours = Math.max(1, Math.round(gap / 3600_000));

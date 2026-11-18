@@ -13,6 +13,7 @@ from app.services.providers.capabilities import capability_flags, normalize_capa
 
 
 _MAX_TREE_DEPTH = 4
+_CLI_NOT_FOUND = re.compile(r"\b(?:CLI|command|executable) (?:was )?not found\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -160,7 +161,10 @@ class AgentProvider(ABC):
         binary_path = shutil.which(self.binary_name)
         if not binary_path:
             return None
+        return self._probe_version(binary_path)[1]
 
+    def _probe_version(self, binary_path: str) -> tuple[bool, str | None]:
+        """Return (installed, version). Only an explicit not-found message proves absence."""
         try:
             result = subprocess.run(
                 [binary_path, *self.version_args],
@@ -169,22 +173,24 @@ class AgentProvider(ABC):
                 timeout=5,
             )
         except (OSError, subprocess.SubprocessError):
-            return None
+            return True, None
 
         output = f"{result.stdout}\n{result.stderr}"
+        if _CLI_NOT_FOUND.search(output):
+            return False, None
         match = re.search(r"(\d+\.\d+\.\d+(?:[-+][\w.]+)?)", output)
-        return match.group(1) if match else output.strip().splitlines()[0] if output.strip() else None
+        return True, match.group(1) if match else output.strip().splitlines()[0] if output.strip() else None
 
     def get_status(self) -> dict[str, Any]:
         """Return install/version status suitable for the API."""
         binary_path = shutil.which(self.binary_name)
-        version = self.get_version() if binary_path else None
+        installed, version = self._probe_version(binary_path) if binary_path else (False, None)
         return {
             "id": self.id,
             "display_name": self.display_name,
             "binary_name": self.binary_name,
-            "installed": binary_path is not None,
-            "binary_path": binary_path,
+            "installed": installed,
+            "binary_path": binary_path if installed else None,
             "version": version,
             "capabilities": self.get_capabilities(),
             "capability_matrix": self.get_capability_matrix(),

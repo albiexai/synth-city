@@ -26,6 +26,7 @@ from app.services.github_app_auth_service import (
     github_app_auth_service,
 )
 from app.services.github_client import GithubClientResponseError, github_client
+from app.services.github_terminal_revision_service import TERMINAL_ITEMS
 
 GIT_TIMEOUT_SECONDS = 300
 
@@ -1125,6 +1126,12 @@ class GithubWorkspaceService:
                     return "pushed PR head could not be verified on GitHub"
                 head = pull.get("head")
                 head_repo = head.get("repo") if isinstance(head, dict) else None
+                closed_unmerged = (
+                    pull.get("state") == "closed"
+                    and "merged_at" in pull
+                    and pull["merged_at"] is None
+                    and item.dispatch_status in TERMINAL_ITEMS
+                )
                 if (
                     isinstance(head, dict)
                     and isinstance(head_repo, dict)
@@ -1132,7 +1139,7 @@ class GithubWorkspaceService:
                     and head.get("ref") == item.dispatch_head_ref
                     and str(head_repo.get("full_name", "")).casefold()
                     == f"{scope.repo_owner}/{scope.repo_name}".casefold()
-                    and (pull.get("state") == "open" or pull.get("merged_at") is not None)
+                    and (pull.get("state") == "open" or pull.get("merged_at") is not None or closed_unmerged)
                 ):
                     return None
                 return "workspace HEAD is not the pushed head of its recorded PR"

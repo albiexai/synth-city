@@ -45,7 +45,7 @@ _SUFFIXES = {
     "end_submitted_revision", "settle_accepted_revision", "record_head_review", "preflight_request",
     "get_review_binding",
     "extend_effort_limit", "render_pull_summary", "publish_pull_summary",
-    "leader_cancel_revision", "leader_finalize_merged", "leader_release_workspace",
+    "leader_cancel_revision", "leader_end_stopped", "leader_finalize_merged", "leader_release_workspace",
 }
 
 
@@ -364,6 +364,11 @@ async def _protocol(entry, provider):
                     tools = await session.list_tools()
                     if initialized.serverInfo.name != a.NEW or {tool.name for tool in tools.tools} != {
                             "synth_city_" + suffix for suffix in _SUFFIXES} or len(tools.tools) != len(_SUFFIXES):
+                        raise a.Incomplete("protocol_unverified")
+                    # #1146: the parameters too must be the deployed ones, not only the names.
+                    from app.services.tool_catalog import catalog_fingerprint, current_catalog_fingerprint
+                    if catalog_fingerprint({tool.name: tool.inputSchema for tool in tools.tools}) != \
+                            current_catalog_fingerprint():
                         raise a.Incomplete("protocol_unverified")
 
 

@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.schemas import ActiveSessionsResponse, ContextAnalysisResponse
 from app.services.context_service import ContextService
+from app.api.v1.harness_scope import current_scope
 
 router = APIRouter(prefix="/context", tags=["Context"])
 
@@ -13,7 +14,9 @@ router = APIRouter(prefix="/context", tags=["Context"])
 async def get_active_sessions():
     """Get context info for all recently active sessions."""
     service = ContextService()
-    return await service.get_active_sessions()
+    response = await service.get_active_sessions()
+    response.scope = current_scope(service.projects_dir)
+    return response
 
 
 @router.get("/{project_folder}/{session_id}", response_model=ContextAnalysisResponse)

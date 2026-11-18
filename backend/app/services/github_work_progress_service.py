@@ -26,12 +26,15 @@ from app.models.github_work_progress_schemas import (
 from mcp_shim.work_remaining_protocol import RemainingReport, ReportContext, parse_report, public_generation, report_reason
 from app.services.github_client import GithubClientResponseError, github_client
 from app.services.github_coordination_service import hold_code
+from app.services.github_stopped_attempt_actor import StoppedAttemptStep, stopped_attempt_policy, stopped_attempt_step
+from app.services.github_work_item_projection import _load_work_item_authority
 from app.services.github_work_progress_observation import (
     ProgressObservationError, WorkspaceProgressContext, workspace_progress_observer,
 )
+from app.services.work_item_states import FINISHED_STATUSES, needs_attention
 
 _SHA = re.compile(r"[0-9a-f]{40}")
-_TERMINAL_REPORT_STATUSES = frozenset({"merged", "completed", "closed"})
+_TERMINAL_REPORT_STATUSES = frozenset((*FINISHED_STATUSES, "closed"))
 _REPO_PART = re.compile(r"[A-Za-z0-9_.-]{1,100}")
 _REF = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,250}")
 _CACHE_SECONDS = 15
@@ -91,15 +94,29 @@ def _historical(snapshot, reason: str) -> GithubPublicationObservation:
     return GithubPublicationObservation(state="unavailable", reason=reason)
 
 
-def _next_step(item, scope, preset, pending, hold: str | None) -> tuple[str, str, str]:
-    if item.dispatch_status in {"merged", "completed"}:
+_STOPPED_PROGRESS = {
+    StoppedAttemptStep.PAUSED: ("paused", "Read the safety hold and its current issue instructions."),
+    StoppedAttemptStep.INSPECT: ("intervention", "Read the issue and guarded recovery details."),
+    StoppedAttemptStep.DECIDE: ("plan_review", "Review the pending continuation through the supported approval process."),
+    StoppedAttemptStep.ACKNOWLEDGE: ("intervention", "Acknowledge the delivered continuation through the supported process."),
+    StoppedAttemptStep.RETRY: ("intervention", "Assess retry using the existing eligibility and recovery checks."),
+    StoppedAttemptStep.RECONCILE_PLAN: ("intervention", "Reconcile the blocked plan and check the permitted recovery actions."),
+}
+
+
+def _next_step(item, scope, preset, pending, hold: str | None, *,
+               stopped_step: StoppedAttemptStep | None = None) -> tuple[str, str, str]:
+    if item.dispatch_status in FINISHED_STATUSES:
         return "complete", "none", "This tracked item is complete."
+    if stopped_step is not None:
+        phase, action = _STOPPED_PROGRESS[stopped_step]
+        return phase, stopped_step.actor, action
     if hold:
         return "paused", "operator", "Read the safety hold and its current issue instructions."
+    if needs_attention(item.dispatch_status):
+        return "intervention", "operator", "Read the issue and guarded recovery details."
     if not scope.enabled or not preset.autonomy_enabled:
         return "paused", "operator", "Review the paused automation and its current issue instructions."
-    if item.dispatch_status in {"escalated", "failed"}:
-        return "intervention", "operator", "Read the issue and guarded recovery details."
     if pending:
         return "plan_review", "leader", "Review the pending plan through the supported approval process."
     if item.dispatch_status == "awaiting_human_review":
@@ -259,7 +276,8 @@ class GithubWorkProgressService:
             raise ProgressObservationError("changed_during_read")
         return result
 
-    async def summary(self, db: AsyncSession, item_id: int) -> GithubWorkProgressResponse | None:
+    async def summary(self, db: AsyncSession, item_id: int, *,
+                      validity_seconds: int = _CACHE_SECONDS) -> GithubWorkProgressResponse | None:
         rows = await self._rows(db, item_id)
         if rows is None:
             return None
@@ -376,26 +394,10 @@ class GithubWorkProgressService:
                 "reason": "workspace_not_leased" if final_workspace is None or not final_workspace.lease_token
                 else "changed_during_read",
             })
-        phase, actor, action = _next_step(item, scope, preset, pending, hold_code())
-        if phase in {"implementation", "planning"} and (
-            final_workspace is None or not final_workspace.lease_token
-        ):
-            phase, actor, action = ("workspace_wait", "leader",
-                "Reconcile the missing workspace lease before work continues.")
         from app.services.github_ci_watch_service import github_ci_watch_service
         status_before, head_before = item.dispatch_status, item.last_verified_sha
         leased_before = final_workspace is not None and bool(final_workspace.lease_token)
         required_checks = await github_ci_watch_service.view(db, item)
-        if required_checks and phase in {"ci", "review"} and actor != "operator":
-            if required_checks["state"] == "waiting":
-                phase, actor, action = ("ci_wait", "controller",
-                    f"Waiting for required checks ({required_checks['completed']} of {required_checks['total']} done).")
-            elif required_checks["state"] == "no_next_actor":
-                phase, actor, action = ("ci_no_next_actor", "leader",
-                    "Checks finished, no next actor has a confirmed wake. Reconcile current review or correction ownership.")
-            else:
-                phase, actor, action = ("ci_finished", "leader",
-                    "Required checks finished. Complete the current-head review or correction handoff; merge gates remain.")
         # The check view above awaited. Take one fresh, coherent item/scope/workspace projection AFTER it, so a
         # terminal context is never built from facts that changed during that await.
         if db.in_transaction():
@@ -406,6 +408,33 @@ class GithubWorkProgressService:
         item, scope, preset, final_workspace, pending, polled_at = fresh
         facts_stable = (item.dispatch_status == status_before and item.last_verified_sha == head_before
                         and (final_workspace is not None and bool(final_workspace.lease_token)) == leased_before)
+        hold, recovery_attempt = stopped_attempt_policy(hold_code())
+        stopped_step = None
+        continuation_deadline = None
+        if needs_attention(item.dispatch_status):
+            authority = (await _load_work_item_authority(db, [item]))[item.id]
+            pending = authority.pending_approval
+            revision = authority.pending_revision or authority.active_revision
+            stopped_step = stopped_attempt_step(
+                item, pending, revision, hold, recovery_attempt, now=datetime.utcnow())
+            if stopped_step in {StoppedAttemptStep.DECIDE, StoppedAttemptStep.ACKNOWLEDGE}:
+                continuation_deadline = revision.expires_at
+        phase, actor, action = _next_step(item, scope, preset, pending, hold, stopped_step=stopped_step)
+        if phase in {"implementation", "planning"} and (
+            final_workspace is None or not final_workspace.lease_token
+        ):
+            phase, actor, action = ("workspace_wait", "leader",
+                "Reconcile the missing workspace lease before work continues.")
+        if facts_stable and required_checks and phase in {"ci", "review"} and actor != "operator":
+            if required_checks["state"] == "waiting":
+                phase, actor, action = ("ci_wait", "controller",
+                    f"Waiting for required checks ({required_checks['completed']} of {required_checks['total']} done).")
+            elif required_checks["state"] == "no_next_actor":
+                phase, actor, action = ("ci_no_next_actor", "leader",
+                    "Checks finished, no next actor has a confirmed wake. Reconcile current review or correction ownership.")
+            else:
+                phase, actor, action = ("ci_finished", "leader",
+                    "Required checks finished. Complete the current-head review or correction handoff; merge gates remain.")
         check_head = item.last_verified_sha
         if not isinstance(check_head, str) or not _SHA.fullmatch(check_head):
             check_head = None
@@ -432,13 +461,15 @@ class GithubWorkProgressService:
                             for part in (scope.repo_owner, scope.repo_name)) else None)
         remaining = self._remaining_view(remaining_packet, context, datetime.now(timezone.utc),
                                          issue_url, private_values)
+        valid_until = now + timedelta(seconds=validity_seconds)
+        if publication.state == "current" and publication.observed_at:
+            valid_until = min(valid_until, _utc(publication.observed_at) + timedelta(seconds=validity_seconds))
+        if continuation_deadline is not None:
+            valid_until = min(valid_until, _utc(continuation_deadline))
         return GithubWorkProgressResponse(
             work_item_id=item_id, dispatch_nonce=item.dispatch_nonce,
             owner_slot_id=item.owner_slot_id, checked_at=datetime.now(timezone.utc),
-            valid_until=min(now + timedelta(seconds=_CACHE_SECONDS),
-                _utc(publication.observed_at) + timedelta(seconds=_CACHE_SECONDS))
-                if publication.state == "current" and publication.observed_at
-                else now + timedelta(seconds=_CACHE_SECONDS),
+            valid_until=valid_until,
             phase=phase, next_actor=actor, next_action=action,
             next_poll_expected_at=(_utc(polled_at) + timedelta(
                 seconds=settings.github_dispatch_interval_seconds)) if polled_at else None,

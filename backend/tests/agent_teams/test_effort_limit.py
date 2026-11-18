@@ -17,8 +17,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.config import settings
 from app.database import Base
 from app.models.database import (
-    GithubApprovalRequest, GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace, MailMessage,
-    TeamGithubScope,
+    AgentTeamPreset, FactoryAuditEvent, GithubApprovalRequest, GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace,
+    MailMessage, TeamGithubScope,
 )
 from app.services.agent_mail_service import agent_mail_service
 from app.services.github_approval_service import GithubApprovalError, github_approval_service
@@ -66,6 +66,13 @@ async def _item(fx, db):
 async def _set(fx, **values):
     async with fx.maker() as db:
         await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == fx.item_id).values(**values))
+        await db.commit()
+
+
+async def _scope_ceiling(fx, minutes):
+    async with fx.maker() as db:
+        await db.execute(update(TeamGithubScope).where(TeamGithubScope.id == fx.scope_id)
+                         .values(max_item_effort_minutes=minutes))
         await db.commit()
 
 
@@ -287,6 +294,7 @@ async def test_the_notice_goes_to_the_leader_and_the_owner_once_at_the_limit(fx)
     body = notices[0].body_markdown
     assert "advisory elapsed working time" in body and "not the owner's reported active effort" in body
     assert "approximation" in body and "300 seconds" in body
+    assert "extend again up to the scope ceiling" in body and "limit once" not in body  # #1101
     await _tick(fx, T0 + timedelta(seconds=62))
     assert len(await _notices(fx)) == 2
 
@@ -341,11 +349,12 @@ def test_the_extension_cap_is_the_smaller_of_30_minutes_and_25_percent(limit, ca
     assert service.extension_cap(limit) == cap
 
 
-async def _extend(fx, minutes=15, *, leader=None, nonce=None, reason="healthy"):
+async def _extend(fx, minutes=15, *, leader=None, nonce=None, reason="healthy", expected=0,
+                  evidence="tests pass; two files left"):
     async with fx.maker() as db:
         return await service.extend(db, work_item_id=fx.item_id, dispatch_nonce=nonce or fx.nonce,
                                     leader_member_id=leader or fx.leader, minutes=minutes, reason=reason,
-                                    now=T0)
+                                    expected_extension_minutes=expected, evidence=evidence, now=T0)
 
 
 async def _code(coro):
@@ -386,7 +395,7 @@ async def test_a_stale_nonce_is_refused(fx):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["verifying", "escalated", "merged", "released", "blocked"])
+@pytest.mark.parametrize("status", ["escalated", "merged", "released", "blocked"])
 async def test_an_item_that_is_not_working_is_refused(fx, status):
     await _limited(fx, dispatch_status=status)
     assert await _code(_extend(fx, 10)) == "effort_extension_stale"
@@ -398,12 +407,111 @@ async def test_an_item_without_a_limit_is_refused(fx):
 
 
 @pytest.mark.asyncio
-async def test_a_second_extension_is_refused_and_the_same_call_repeats_its_result(fx):
+async def test_a_replayed_extension_is_refused_by_the_expected_total_and_grants_nothing(fx):
     await _limited(fx)
     first = await _extend(fx, 10)
-    again = await _extend(fx, 10)
-    assert again["extension_minutes"] == 10 and again["repeated"] is True and first["repeated"] is False
-    assert await _code(_extend(fx, 5)) == "effort_extension_already_used"
+    assert first["extension_minutes"] == 10 and first["repeated"] is False
+    # The replay still says it saw a total of 0; the recorded total is now 10 (#1100).
+    assert await _code(_extend(fx, 10)) == "effort_extension_total_changed"
+    # A caller that saw the new total extends again (#1101).
+    assert (await _extend(fx, 5, expected=10))["extension_minutes"] == 15
+    async with fx.maker() as db:
+        assert (await _item(fx, db)).effort_extension_minutes == 15
+
+
+@pytest.mark.asyncio
+async def test_an_item_under_review_may_be_extended(fx):
+    # #1059: review corrections run while the item is verifying; the extension was refused as stale.
+    await _limited(fx, dispatch_status="verifying")
+    result = await _extend(fx, 10)
+    assert result["extension_minutes"] == 10 and result["effective_limit_minutes"] == 70
+
+
+@pytest.mark.asyncio
+async def test_the_leader_extends_repeatedly_up_to_the_scope_ceiling(fx):
+    await _limited(fx, limit=60)
+    await _scope_ceiling(fx, 90)
+    assert (await _extend(fx, 15, reason="first", evidence="review finding 1"))["effective_limit_minutes"] == 75
+    assert (await _extend(fx, 15, expected=15, reason="second", evidence="review finding 2"))[
+        "effective_limit_minutes"] == 90
+    assert await _code(_extend(fx, 1, expected=30)) == "extension_exceeds_ceiling"
+    async with fx.maker() as db:
+        item = await _item(fx, db)
+        assert (item.effort_limit_minutes, item.effort_extension_minutes, item.effort_extension_reason) == (
+            60, 30, "second")
+        events = (await db.scalars(select(FactoryAuditEvent).where(
+            FactoryAuditEvent.event_kind == "effort_extension").order_by(FactoryAuditEvent.id))).all()
+    assert [("review finding 1" in e.sanitized_reason, "review finding 2" in e.sanitized_reason)
+            for e in events] == [(True, False), (False, True)]
+
+
+@pytest.mark.asyncio
+async def test_a_step_beyond_the_scope_ceiling_is_refused_with_its_own_code_and_grants_nothing(fx):
+    await _limited(fx, limit=60)
+    await _scope_ceiling(fx, 70)
+    with pytest.raises(EffortLimitError) as caught:
+        await _extend(fx, 15)  # within the per-step cap of 15, but 10 minutes of room are left
+    assert (caught.value.code, caught.value.status_code) == ("extension_exceeds_ceiling", 400)
+    assert "10 minutes" in str(caught.value) and "70" in str(caught.value)
+    assert await _code(_extend(fx, 16)) == "extension_exceeds_cap"  # the per-step cap still applies first
+    async with fx.maker() as db:
+        assert (await _item(fx, db)).effort_extension_minutes == 0
+    assert (await _extend(fx, 10))["effective_limit_minutes"] == 70
+
+
+@pytest.mark.asyncio
+async def test_every_step_keeps_the_per_step_cap_of_the_original_limit(fx):
+    await _limited(fx, limit=60)
+    await _extend(fx, 15)
+    # The cap is 25 percent of the original 60 minutes, not of the 75-minute effective limit.
+    assert await _code(_extend(fx, 16, expected=15)) == "extension_exceeds_cap"
+
+
+@pytest.mark.asyncio
+async def test_an_expected_total_that_differs_from_the_recorded_one_is_refused(fx):
+    await _limited(fx)
+    with pytest.raises(EffortLimitError) as caught:
+        await _extend(fx, 10, expected=5)
+    assert caught.value.code == "effort_extension_total_changed" and caught.value.status_code == 409
+    assert "0 minutes" in str(caught.value)  # names the recorded total the caller should have seen
+    async with fx.maker() as db:
+        item = await _item(fx, db)
+        assert item.effort_extension_minutes == 0 and item.effort_extension_decided_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected", [None, -1, True, "0", 1.0])
+async def test_the_expected_total_is_required(fx, expected):
+    await _limited(fx)
+    with pytest.raises(EffortLimitError) as caught:
+        await _extend(fx, 10, expected=expected)
+    assert (caught.value.code, caught.value.status_code) == ("expected_extension_minutes_required", 400)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence", [None, "", "   ", 7])
+async def test_evidence_is_required(fx, evidence):
+    await _limited(fx)
+    with pytest.raises(EffortLimitError) as caught:
+        await _extend(fx, 10, evidence=evidence)
+    assert (caught.value.code, caught.value.status_code) == ("extension_evidence_required", 400)
+    async with fx.maker() as db:
+        assert (await _item(fx, db)).effort_extension_minutes == 0
+
+
+@pytest.mark.asyncio
+async def test_a_granted_extension_records_one_audit_event_with_its_reason_and_evidence(fx):
+    await _limited(fx)
+    assert await _code(_extend(fx, 10, expected=3)) == "effort_extension_total_changed"
+    await _extend(fx, 10, reason="close to done", evidence="4 of 5 tests green")
+    async with fx.maker() as db:
+        events = (await db.scalars(select(FactoryAuditEvent).where(
+            FactoryAuditEvent.event_kind == "effort_extension"))).all()
+    assert len(events) == 1  # the refusal recorded nothing
+    event = events[0]
+    assert (event.item_id, event.actor_kind, event.actor_member_id, event.action_outcome) == (
+        fx.item_id, "member", fx.leader, "granted")
+    assert "close to done" in event.sanitized_reason and "4 of 5 tests green" in event.sanitized_reason
 
 
 @pytest.mark.asyncio
@@ -412,7 +520,7 @@ async def test_two_concurrent_extensions_one_wins(fx):
     outcomes = await asyncio.gather(_extend(fx, 10, reason="a"), _extend(fx, 12, reason="b"), return_exceptions=True)
     wins = [outcome for outcome in outcomes if isinstance(outcome, dict)]
     losses = [outcome for outcome in outcomes if isinstance(outcome, EffortLimitError)]
-    assert len(wins) == 1 and len(losses) == 1 and losses[0].code == "effort_extension_already_used"
+    assert len(wins) == 1 and len(losses) == 1 and losses[0].code == "effort_extension_total_changed"
     async with fx.maker() as db:
         assert (await _item(fx, db)).effort_extension_minutes == wins[0]["extension_minutes"]
 
@@ -504,7 +612,8 @@ async def test_the_route_grants_the_leaders_extension_and_maps_refusals(fx):
     await _limited(fx, limit=60)
     await _workspace_set(fx, lease_last_owner_contact_at=datetime.utcnow())  # the route reads the real clock
     leader, owner = SimpleNamespace(member_id=fx.leader), SimpleNamespace(member_id=fx.owner)
-    request = MailEffortExtensionRequest(work_item_id=fx.item_id, dispatch_nonce=fx.nonce, minutes=15, reason="ok")
+    request = MailEffortExtensionRequest(work_item_id=fx.item_id, dispatch_nonce=fx.nonce, minutes=15, reason="ok",
+                                         expected_extension_minutes=0, evidence="three tests left")
     async with fx.maker() as db:
         with pytest.raises(HTTPException) as caught:
             await agent_mail.extend_effort_limit(request, session=owner, db=db)
@@ -514,8 +623,23 @@ async def test_the_route_grants_the_leaders_extension_and_maps_refusals(fx):
         assert granted["effective_limit_minutes"] == 75 and granted["repeated"] is False
     async with fx.maker() as db:
         with pytest.raises(HTTPException) as caught:
-            await agent_mail.extend_effort_limit(request.model_copy(update={"minutes": 14}), session=leader, db=db)
-        assert (caught.value.status_code, caught.value.detail) == (409, "effort_extension_already_used")
+            await agent_mail.extend_effort_limit(request, session=leader, db=db)
+        assert (caught.value.status_code, caught.value.detail) == (409, "effort_extension_total_changed")
+    async with fx.maker() as db:
+        with pytest.raises(HTTPException) as caught:
+            await agent_mail.extend_effort_limit(
+                request.model_copy(update={"minutes": 46, "expected_extension_minutes": 15}), session=leader, db=db)
+        assert (caught.value.status_code, caught.value.detail) == (400, "extension_exceeds_cap")
+    async with fx.maker() as db:
+        again = await agent_mail.extend_effort_limit(
+            request.model_copy(update={"minutes": 14, "expected_extension_minutes": 15}), session=leader, db=db)
+        assert again["effective_limit_minutes"] == 89
+    async with fx.maker() as db:
+        with pytest.raises(HTTPException) as caught:
+            await agent_mail.extend_effort_limit(MailEffortExtensionRequest(
+                work_item_id=fx.item_id, dispatch_nonce=fx.nonce, minutes=5, reason="ok", evidence="x"),
+                session=leader, db=db)
+        assert (caught.value.status_code, caught.value.detail) == (400, "expected_extension_minutes_required")
 
 
 @pytest.mark.asyncio
@@ -662,11 +786,11 @@ async def test_a_resolved_observation_pause_does_not_refuse(fx):
 
 
 @pytest.mark.asyncio
-async def test_a_repeat_of_a_granted_extension_still_returns_its_record_without_fresh_contact(fx):
+async def test_a_repeat_of_a_granted_extension_is_refused_by_the_expected_total_without_fresh_contact(fx):
     await _limited(fx)
     await _extend(fx, 10)
     await _workspace_set(fx, lease_last_owner_contact_at=T0 - timedelta(days=2))
-    assert (await _extend(fx, 10))["repeated"] is True
+    assert await _code(_extend(fx, 10)) == "effort_extension_total_changed"
 
 
 # The writer is held from the first statement, so another connection cannot change contact or a pause between the
@@ -686,7 +810,7 @@ def _after_activity_read(monkeypatch, change):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["contact", "pause", "ack"])
+@pytest.mark.parametrize("change", ["contact", "pause", "ack", "total"])
 async def test_the_guarded_update_refuses_a_change_made_after_the_activity_read(fx, monkeypatch, change):
     await _limited(fx)
 
@@ -698,6 +822,9 @@ async def test_the_guarded_update_refuses_a_change_made_after_the_activity_read(
             db.add(GithubOwnerObservationPause(work_item_id=fx.item_id, wait_key="w", authority_sha256="x",
                                                status="paused", deadline=T0 + timedelta(hours=1)))
             await db.flush()
+        elif change == "total":  # the guarded update keys on the expected total (#1100)
+            await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == fx.item_id)
+                             .values(effort_extension_minutes=7))
         else:
             await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == fx.item_id).values(ack_received_at=None))
 
@@ -730,3 +857,125 @@ async def test_another_connection_cannot_write_between_the_read_and_the_update(f
     _after_activity_read(monkeypatch, second_connection_writes)
     assert (await _extend(fx, 10))["extension_minutes"] == 10
     assert outcome["blocked"] is True
+
+
+# --- the Supervisor notice beyond the ceiling (#1102) ---------------------------------------------------------------
+
+
+async def _bind_supervisor(fx, actor_id=6):
+    async with fx.maker() as db:
+        preset_id = (await db.get(TeamGithubScope, fx.scope_id)).preset_id
+        await db.execute(update(AgentTeamPreset).where(AgentTeamPreset.id == preset_id)
+                         .values(supervisor_actor_id=actor_id))
+        await db.commit()
+
+
+async def _ceiling_notices(fx):
+    async with fx.maker() as db:
+        return (await db.scalars(select(MailMessage).where(MailMessage.subject == "Effort ceiling reached"))).all()
+
+
+@pytest.mark.asyncio
+async def test_a_request_beyond_the_ceiling_notifies_the_bound_supervisor_once_per_attempt(fx, caplog):
+    from app.services.agent_team_supervisor_service import supervisor_inbox
+
+    await _limited(fx, limit=60)
+    await _scope_ceiling(fx, 70)
+    await _bind_supervisor(fx)
+    assert await _code(_extend(fx, 15)) == "extension_exceeds_ceiling"  # the refusal itself is unchanged
+    caplog.clear()
+    assert await _code(_extend(fx, 12)) == "extension_exceeds_ceiling"  # the same attempt: no second notice
+    assert not [r for r in caplog.records if "effort ceiling notice" in r.getMessage()]  # found, not refused
+    notices = await _ceiling_notices(fx)
+    assert len(notices) == 1
+    notice = notices[0]
+    assert notice.payload == {
+        "notice": "effort_ceiling_reached", "work_item_id": fx.item_id, "issue_number": notice.payload["issue_number"],
+        "limit_minutes": 60, "extension_minutes": 0, "ceiling_minutes": 70, "requested_minutes": 15,
+        "supervisor_actor_id": 6}
+    assert fx.nonce not in str(notice.payload) and fx.nonce not in notice.body_markdown
+    assert "beyond it, the Supervisor decides" in notice.body_markdown and "10 minutes" in notice.body_markdown
+    async with fx.maker() as db:
+        seen = await supervisor_inbox(db, SimpleNamespace(id=6))
+        assert [row.id for row in seen] == [notice.id]
+        db.add(AgentTeamPreset(name="Other", description="", created_by="t", supervisor_actor_id=7))
+        await db.commit()
+        assert await supervisor_inbox(db, SimpleNamespace(id=7)) == []  # another team's Supervisor sees nothing
+    # A new attempt is a new decision for the Supervisor.
+    await _set(fx, dispatch_nonce="the-next-attempt")
+    assert await _code(_extend(fx, 15, nonce="the-next-attempt")) == "extension_exceeds_ceiling"
+    assert len(await _ceiling_notices(fx)) == 2
+
+
+@pytest.mark.asyncio
+async def test_no_ceiling_notice_without_a_bound_supervisor(fx):
+    await _limited(fx, limit=60)
+    await _scope_ceiling(fx, 70)
+    assert await _code(_extend(fx, 15)) == "extension_exceeds_ceiling"
+    assert await _ceiling_notices(fx) == []
+
+
+@pytest.mark.asyncio
+async def test_other_refusals_send_no_ceiling_notice(fx):
+    await _limited(fx, limit=60)
+    await _scope_ceiling(fx, 70)
+    await _bind_supervisor(fx)
+    assert await _code(_extend(fx, 16)) == "extension_exceeds_cap"  # the per-step cap is the Leader's own bound
+    assert await _code(_extend(fx, 10, expected=5)) == "effort_extension_total_changed"
+    await _set(fx, dispatch_status="escalated")  # an attempt that is not live
+    assert await _code(_extend(fx, 15)) == "extension_exceeds_ceiling"
+    assert await _ceiling_notices(fx) == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_notice_write_still_refuses_and_records_nothing(fx, monkeypatch):
+    await _limited(fx, limit=60)
+    await _scope_ceiling(fx, 70)
+    await _bind_supervisor(fx)
+
+    async def broken(*_args, **_kwargs):
+        raise RuntimeError("mail store down")
+
+    monkeypatch.setattr(service, "_add_ceiling_notice", broken)
+    assert await _code(_extend(fx, 15)) == "extension_exceeds_ceiling"
+    assert await _ceiling_notices(fx) == []
+
+
+def _ceiling_root(**changes):
+    payload = {"notice": "effort_ceiling_reached", "work_item_id": 3, "issue_number": 1102, "limit_minutes": 60,
+               "extension_minutes": 0, "ceiling_minutes": 70, "requested_minutes": 15, "supervisor_actor_id": 6}
+    payload.update(changes.pop("payload", {}))
+    for key in changes.pop("drop", ()):
+        payload.pop(key)
+    root = dict(kind="message", audience_type="team_preset", thread_root_id=None, sender_type="system",
+                sender_member_id=None, sender_actor_id=None, recipient_member_id=None,
+                subject="Effort ceiling reached", payload=payload)
+    root.update(changes)
+    return SimpleNamespace(**root)
+
+
+@pytest.mark.parametrize("changes,recognised", [
+    ({}, True),
+    ({"payload": {"extension_minutes": 15}}, True),
+    ({"payload": {"extra": 1}}, False),
+    ({"drop": ("requested_minutes",)}, False),
+    ({"payload": {"work_item_id": "3"}}, False),
+    ({"payload": {"extension_minutes": -1}}, False),
+    ({"payload": {"ceiling_minutes": True}}, False),
+    ({"payload": {"notice": "something_else"}}, False),
+    ({"subject": "Effort limit reached"}, False),
+    ({"sender_type": "member"}, False),
+    ({"recipient_member_id": 4}, False),
+])
+def test_the_supervisor_recognises_exactly_the_ceiling_notice(changes, recognised):
+    from app.services.agent_team_supervisor_service import _is_effort_ceiling_notice
+
+    assert _is_effort_ceiling_notice(_ceiling_root(**changes)) is recognised
+
+
+def test_the_charter_line_says_the_leader_extends_within_the_ceiling():
+    from app.services.factory_delivery_policy import policy_guidance, scope_policy
+
+    text = policy_guidance(scope_policy(SimpleNamespace(delivery_policy=None)), None)
+    assert "the Leader extends within the scope ceiling; beyond it, the Supervisor decides" in text
+    assert "Ask the operator at the limit" not in text

@@ -1,4 +1,4 @@
-"""The current Leader runs three standard recoveries that only the operator API offered before.
+"""The current Leader runs standard recoveries with the operator guards.
 
 Each one reuses the operator service and every guard it has, adds the Leader and bound-Supervisor checks, and
 sends one notice to the bound Supervisor. The action audit stays the existing one; nothing here adds a second
@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import JSON, delete, exists, insert, literal, select, true, update
+from sqlalchemy import JSON, and_, delete, exists, insert, literal, select, true, update
 from sqlalchemy.orm import aliased
 from sqlalchemy.exc import IntegrityError
 
@@ -22,13 +22,14 @@ from app.models.database import (
     AgentTeamPreset, AgentTeamSlot, FactoryAuditEvent, GithubMaintenanceEvent, GithubAttemptScopeRevision, GithubOwnerObservationPause, GithubWorkItem,
     GithubWorkspace, MailAgentSession, MailExternalActor, MailMessage, MailReceipt, TeamGithubScope,
 )
-from app.models.api_model import naive_utc_confirmation
+from app.models.api_model import naive_utc_confirmation, utc_datetime
 from app.services import factory_audit_service as audit
 from app.services.agent_mail_service import agent_mail_service
 from app.services.github_approval_service import (
     ActiveCancellationNoticeError, GithubApprovalError, github_approval_service,
 )
 from app.services.github_coordination_service import hold_code
+from app.services.github_end_stopped_item_service import end_stopped_item
 from app.services.github_terminal_revision_service import (
     TERMINAL_ITEMS, finalize_merged_item, finalize_merged_preview,
 )
@@ -459,6 +460,36 @@ async def _settle_release_claim(db, ctx, operation_id, attempt, *, inherited, st
         await _unclaim(db, "release", ctx, operation_id, workspace_id=workspace_id, leased_at=leased_at)
 
 
+class WorkspaceReleaseContext(BaseModel):
+    work_item_id: int
+    workspace_id: int
+    leased_at: datetime
+
+
+async def release_workspace_context(db, item, session) -> WorkspaceReleaseContext:
+    """Read the identity the Leader must confirm when releasing a terminal lease."""
+    scope, _, _, _ = await _authorize(db, item, session)
+    item_id = item.id
+    row = (await db.execute(
+        select(GithubWorkItem.dispatch_status, GithubWorkspace.id.label("workspace_id"), GithubWorkspace.leased_at)
+        .outerjoin(GithubWorkspace, and_(
+            GithubWorkspace.leased_item_id == GithubWorkItem.id,
+            GithubWorkspace.scope_id == GithubWorkItem.scope_id,
+            GithubWorkspace.lease_token.is_not(None),
+        ))
+        .where(GithubWorkItem.id == item_id, GithubWorkItem.scope_id == scope.id)
+    )).one_or_none()
+    if row is None:
+        raise LeaderRecoveryError("recovery_context_changed")
+    if row.dispatch_status not in TERMINAL_ITEMS:
+        raise LeaderRecoveryError("item_not_terminal")
+    if row.workspace_id is None or row.leased_at is None:
+        raise LeaderRecoveryError("workspace_lease_changed")
+    return WorkspaceReleaseContext(
+        work_item_id=item_id, workspace_id=row.workspace_id, leased_at=utc_datetime(row.leased_at),
+    )
+
+
 async def release_workspace(db, item, session, *, workspace_id, expected_leased_at, operation_id, reason):
     reason = _need_reason(reason)
     ctx = _ctx(item, session)
@@ -550,6 +581,21 @@ async def release_workspace(db, item, session, *, workspace_id, expected_leased_
     notice = await _notify(db, ctx, kind="release", operation_id=operation_id,
         digest=digest, summary=f"workspace {workspace_id} was released.", reason=reason)
     return {"status": "released", "workspace_id": workspace_id, "notice": notice}
+
+
+async def end_stopped(db, item, session, request):
+    ctx = _ctx(item, session)
+    scope, preset, _leader, supervisor = await _authorize(db, item, session)
+    ctx = replace(ctx, preset_id=preset.id, supervisor_id=supervisor.id)
+    try:
+        result = await end_stopped_item(db, item, scope, request, actor=_actor(ctx),
+                                        before_commit=lambda: _assert_authority(db, ctx))
+    except ValueError as exc:
+        raise LeaderRecoveryError(str(exc)) from None
+    notice = await _notify(db, ctx, kind="end_stopped", operation_id=request.operation_id,
+        digest=_digest(request.model_dump(mode="json")), summary=f"the stopped item was {request.outcome}.",
+        reason=request.reason)
+    return {**result, "notice": notice}
 
 
 _OPERATION = {"pattern": r"^[A-Za-z0-9_.-]{1,100}$"}

@@ -1166,11 +1166,27 @@ class SessionListResponse(BaseModel):
     total: int
 
 
+class ScopeInfo(BaseModel):
+    """Whose home a Harnesses view read, and whether what it read could be listed (#1066).
+
+    `readable` is about the folder the view reads (the projects folder, the plans folder, the Codex home), not only
+    `.claude`, so an empty answer that came from a folder that cannot be listed is told apart from a truly empty one.
+    """
+
+    user: str
+    claude_dir: str
+    exists: bool
+    readable: bool
+    # The server-derived folder this view reads. Configured Plans paths remain undisclosed.
+    data_dir: Optional[str] = None
+
+
 class SessionProjectListResponse(BaseModel):
     """List of projects with session counts."""
 
     projects: List[SessionProject]
     total_sessions: int
+    scope: Optional[ScopeInfo] = None
 
 
 class SessionDetailResponse(BaseModel):
@@ -1336,6 +1352,7 @@ class UsageSummaryResponse(BaseModel):
     """Usage summary response."""
 
     summary: UsageSummary
+    scope: Optional[ScopeInfo] = None
 
 
 # Settings Update Schemas
@@ -1673,6 +1690,7 @@ class ActiveSessionsResponse(BaseModel):
     """List of active sessions with context info."""
 
     sessions: List[ActiveSessionContext]
+    scope: Optional[ScopeInfo] = None
 
 
 # Plan History Browser Schemas
@@ -1753,6 +1771,7 @@ class PlanListResponse(BaseModel):
 
     plans: List[PlanSummary]
     total: int
+    scope: Optional[ScopeInfo] = None
 
 
 class PlanDetailResponse(BaseModel):
@@ -1842,11 +1861,35 @@ MAIL_MESSAGE_KINDS = ["message", "broadcast", "context_request", "handoff", "ans
 MAIL_REQUEST_KINDS = ["context_request", "handoff"]
 
 
+# The label a wait carries is fixed by its reason. A provider refusal is a block, not a wait for input (#1091).
+WAIT_LABELS = {
+    "question": "Waiting for input", "trust": "Waiting for input", "sign_in": "Waiting for input",
+    "provider_refusal": "Blocked: provider refusal",
+}
+
+
+def wait_label_from_reason(values):
+    """Fill a missing label from the reason and refuse a label that does not match it."""
+    if not isinstance(values, dict):
+        return values
+    expected = WAIT_LABELS.get(values.get("reason"))
+    if expected is None:
+        return values  # an unknown reason is refused by the Literal
+    label = values.get("label")
+    if label is None:
+        return {**values, "label": expected}
+    if label != expected:
+        raise ValueError("The label does not match the reason")
+    return values
+
+
 class NativeInputWait(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    reason: Literal["question", "trust", "sign_in"]
-    label: Literal["Waiting for input"] = "Waiting for input"
+    reason: Literal["question", "trust", "sign_in", "provider_refusal"]
+    label: Literal["Waiting for input", "Blocked: provider refusal"] = "Waiting for input"
     observed_at: datetime
+
+    _label_follows_reason = model_validator(mode="before")(classmethod(lambda cls, values: wait_label_from_reason(values)))
 
 
 class AgentStatus(BaseModel):
@@ -1910,7 +1953,8 @@ class TeamIdleItem(BaseModel):
 
 
 UnansweredRequestReason = Literal[
-    "candidate_limit", "native_unknown", "ambiguous_legacy_request", "reply_scan_limit", "entry_limit"]
+    "candidate_limit", "native_unknown", "stall_timeout", "inputs_changing", "fence_changed",
+    "ambiguous_legacy_request", "reply_scan_limit", "entry_limit"]
 
 
 class UnansweredRequestItem(BaseModel):
@@ -2074,6 +2118,8 @@ class GithubContinuationProposalCreate(BaseModel):
 
 class GithubScopeAmendmentCreate(GithubContinuationProposalCreate):
     phase: Literal["implementation"] = "implementation"
+    # #1154: approved base paths the amendment deliberately leaves out. Optional; must equal the omission exactly.
+    withdrawn_paths: List[str] = Field(default_factory=list, max_length=64)
 
 
 class GithubRevisionReviewCreate(BaseModel):
@@ -2173,6 +2219,8 @@ class GithubScopeRevisionResponse(BaseModel):
     allowed_actions: List[str]
     allowed_commands: List[str]
     prohibited_actions: List[str]
+    # #1185: prohibitions bind only while the revision is active or submitted.
+    prohibitions_in_force: bool = False
     tool_fallbacks: Dict[str, Any]
     baseline_head_sha: str
     baseline_tree_sha: str
@@ -2785,6 +2833,14 @@ class TeamGithubScopeUpdate(BaseModel):
     enabled: Optional[bool] = None
 
 
+class GithubRateLimitStatus(BaseModel):
+    reason: Literal["github_rate_limited"] | None
+    remaining: int | None
+    reset_at: datetime | None
+    retry_at: datetime | None
+    observed_at: datetime
+
+
 class TeamGithubScopeResponse(BaseModel):
     id: int
     preset_id: int
@@ -2800,6 +2856,7 @@ class TeamGithubScopeResponse(BaseModel):
     github_auth_mode: str
     github_auth_configured: bool
     github_poll_token_configured: bool
+    github_rate_limit: GithubRateLimitStatus | None = None
     max_approval_rounds: int
     max_concurrent_dispatched: int
     max_verification_retries: int
@@ -3019,6 +3076,7 @@ class GithubWorkItemResponse(BaseModel):
 
 class GithubWorkItemListResponse(BaseModel):
     items: List[GithubWorkItemResponse] = Field(default_factory=list)
+    total: int | None = None
 
 
 class GithubWorkItemContinuationResponse(BaseModel):

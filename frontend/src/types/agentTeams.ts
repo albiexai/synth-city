@@ -87,6 +87,7 @@ export type TeamSummaryAttentionCode =
 // Why the unanswered-request view is not complete (#752). A fixed word, never free text.
 export type UnansweredRequestReason =
   | 'candidate_limit' | 'native_unknown' | 'ambiguous_legacy_request' | 'reply_scan_limit' | 'entry_limit'
+  | 'stall_timeout' | 'inputs_changing' | 'fence_changed'
 
 export interface TeamSummaryAttention {
   code: TeamSummaryAttentionCode
@@ -117,6 +118,7 @@ export interface TeamSummaryHumanAction {
   source: 'leader' | 'dispatch' | 'unknown'
   assessment_current: boolean
   pull_request_number?: number | null
+  escalation_reason?: string | null
 }
 
 export interface RequiredCIUnreadableSignal {
@@ -155,8 +157,12 @@ export interface CampaignDecision { text: string; state: 'later' | 'now' | 'done
 export interface TeamCampaignSummary {
   backlog_state: 'available' | 'backlog unavailable'
   done_count: number
+  /** The part of done_count merged into a branch other than the scope's base (#1106). */
+  done_on_other_branch_count?: number
   latest_done: CampaignDoneItem[]
   under_way_count: number
+  /** Escalated or failed items; older responses omit it (#1129). */
+  attention_count?: number
   under_way: CampaignUnderWayItem[]
   queued_count: number
   queued: { title: string }[]
@@ -198,11 +204,11 @@ export interface UnansweredRequestView {
   omitted_count: number
 }
 
-// A member waits at an interactive screen. Only the fixed reason is on the wire.
+// A member waits at an interactive screen, or is blocked by a provider refusal. Only the fixed reason is on the wire.
 export interface TeamWaitingInput {
   slot_id: number
-  reason: 'question' | 'trust' | 'sign_in'
-  label: 'Waiting for input'
+  reason: 'question' | 'trust' | 'sign_in' | 'provider_refusal'
+  label: 'Waiting for input' | 'Blocked: provider refusal'
 }
 
 // One unanswered-reminder signal (#528). Read it through parseReminders: the wire is not trusted.
@@ -221,6 +227,22 @@ export interface ReminderAttention {
   notification_budget_resets_at?: string | null
 }
 
+export interface TeamSummaryCoverageReason {
+  code:
+    | 'work_item_limit' | 'scope_limit' | 'approval_limit' | 'native_unknown' | 'dispatch_incomplete'
+    | 'pause_limit' | 'human_actions_incomplete' | 'human_action_invalid' | 'human_action_limit'
+    | 'progress_missing' | 'observation_timeout' | 'observation_failed' | 'fence_changed'
+    | 'source_changed' | 'window_expired'
+  source?: 'native' | 'dispatch' | 'pauses' | 'human_actions' | 'progress' | null
+  slot_id?: number | null
+  work_item_id?: number | null
+  activity_reason?:
+    | 'restart_needed_for_observation' | 'no_native_event' | 'completion_unconfirmed'
+    | 'session_identity_unavailable' | 'native_identity_unavailable' | 'native_log_unavailable'
+    | 'native_log_unreadable' | 'binding_changed' | 'session_mismatch' | 'observation_unavailable'
+    | 'history_window_exceeded' | 'no_current_binding' | 'ambiguous_binding' | 'duplicate_native_identity' | null
+}
+
 // GET agent-teams/presets/{id}/summary. A display-only read: it grants no action.
 export interface AgentTeamSummary {
   preset_id: number
@@ -236,6 +258,7 @@ export interface AgentTeamSummary {
   checked_at: string
   valid_until: string
   coverage_complete: boolean
+  coverage_reason?: TeamSummaryCoverageReason[]
   hold_code: 'hold' | 'recovery_only' | 'hold_unavailable' | null
   attention: TeamSummaryAttention[]
   required_ci_unreadable?: TeamRequiredCIUnreadable[]
@@ -459,6 +482,8 @@ export interface GithubScopeRevision {
   allowed_actions: string[]
   allowed_commands: string[]
   prohibited_actions: string[]
+  /** #1185: true only while the revision is active or submitted. */
+  prohibitions_in_force?: boolean
   tool_fallbacks: Record<string, unknown>
   baseline_head_sha: string
   baseline_tree_sha: string
@@ -563,6 +588,7 @@ export interface GithubWorkItem {
 
 export interface GithubWorkItemListResponse {
   items: GithubWorkItem[]
+  total?: number | null
 }
 
 export interface GithubWorkspace {

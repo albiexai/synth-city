@@ -42,6 +42,7 @@ from app.services.github_app_auth_service import (
 )
 from app.services.github_client import GithubClientResponseError, github_client
 from app.services.github_recovery_gate import configured_recovery_only_attempt
+from app.services.sqlite_busy_retry import SqliteBusyExhausted, retry_when_busy
 
 
 CONTINUABLE_ESCALATIONS = frozenset(
@@ -72,6 +73,7 @@ IMPLEMENTATION_COMPLETION_ACTIONS = frozenset(
 )
 # A handoff the new owner has accepted leaves a settled owner binding. A pending or unknown one does not.
 _SETTLED_HANDOFF_STATES = (None, "accepted")
+_LIVE_ATTEMPT_STATUSES = frozenset({"dispatched", "verifying", "ready_for_review", "awaiting_human_review"})
 
 
 def _settled_handoff_condition():
@@ -139,7 +141,7 @@ async def _record_decision_fact(
 
 
 class ActiveCancellationNoticeError(GithubApprovalError):
-    """The cancellation stands, but its owner notice was refused.
+    """The cancellation stands, but its owner notice did not settle.
 
     Callers must not record or report the committed cancellation as refused.
     """
@@ -467,18 +469,29 @@ class GithubApprovalService:
             raise GithubApprovalError("current_mail_session_required", status_code=403) from exc
 
     async def healthy_scope_context(self, db, item, scope, *, allow_recovery=False):
-        """Capture stopped/healthy authority; the returned private values are SQL fences."""
+        statuses = _LIVE_ATTEMPT_STATUSES | {"escalated"} if allow_recovery else _LIVE_ATTEMPT_STATUSES
+        return await self._fenced_attempt_context(db, item, scope, statuses=statuses,
+            unavailable_code="amendment_context_unavailable")
+
+    async def revision_review_attempt_context(self, db, item, scope):
+        """A submitted head can receive review evidence during a recoverable escalation."""
+        return await self._fenced_attempt_context(db, item, scope, statuses=_LIVE_ATTEMPT_STATUSES | {"escalated"},
+            unavailable_code="revision_review_context_unavailable", escalation_reasons=CONTINUABLE_ESCALATIONS)
+
+    async def _fenced_attempt_context(self, db, item, scope, *, statuses, unavailable_code, escalation_reasons=None):
+        """Capture current attempt identity and policy for the SQL write fences."""
         from app.services.github_coordination_service import hold_code
         from app.services.factory_delivery_policy import policy_context
         await db.refresh(item)
         await db.refresh(scope)
         team = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
+        escalated_review = escalation_reasons is not None and item.dispatch_status == "escalated"
         if (hold_code() or not scope.enabled or not team or not team.autonomy_enabled
                 or item.scope_id != scope.id or item.handoff_state not in _SETTLED_HANDOFF_STATES
-                or item.dispatch_status not in ({"dispatched", "verifying", "ready_for_review", "awaiting_human_review"}
-                    | ({"escalated"} if allow_recovery else set()))
+                or item.dispatch_status not in statuses
+                or (escalated_review and item.escalation_reason not in escalation_reasons)
                 or not item.dispatch_nonce or not item.dispatch_head_ref):
-            raise GithubApprovalError("amendment_context_unavailable")
+            raise GithubApprovalError(unavailable_code)
         owner, leader = await self._current_participants(db, item)
         workspace = await db.scalar(select(GithubWorkspace).where(
             GithubWorkspace.leased_item_id == item.id, GithubWorkspace.scope_id == scope.id))
@@ -498,9 +511,11 @@ class GithubApprovalService:
             "id", "preset_id", "repo_owner", "repo_name", "github_auth_mode", "continuation_enabled",
             "max_scope_paths", "max_scope_commands", "max_continuation_revisions",
             "max_continuation_failed_heads", "max_failed_heads_per_revision")}
+        if escalated_review:
+            context["escalation_reason"] = item.escalation_reason
         if not await db.scalar(select(exists(select(GithubWorkItem.id).where(
                 *self.healthy_scope_conditions(context))))):
-            raise GithubApprovalError("amendment_context_unavailable")
+            raise GithubApprovalError(unavailable_code)
         return context, owner, leader, workspace
 
     @staticmethod
@@ -529,6 +544,11 @@ class GithubApprovalService:
         if "escalation_reason" in c:
             # Only a caller that admitted a state through the reason fences it; None compares as IS NULL.
             clauses.append(GithubWorkItem.escalation_reason == c["escalation_reason"])
+        return [*clauses, *GithubApprovalService._attempt_actor_conditions(c)]
+
+    @staticmethod
+    def _attempt_actor_conditions(c):
+        clauses = []
         for member_id, slot_id in ((c["owner_member_id"], c["owner_slot_id"]),
                                    (c["leader_member_id"], c["leader_slot_id"])):
             member, newer = aliased(MailTeamMember), aliased(MailTeamMember)
@@ -731,8 +751,11 @@ class GithubApprovalService:
         extras = [path for path in companion_paths.companions_for(named) if path not in named]
         if extras:
             paths = self._canonical_paths([*named, *extras])
-            if len(paths) > scope.max_scope_paths:
+            # #1039: the named paths keep the scope's limit (checked above); their companions have a bound of their own.
+            if len(extras) > companion_paths.MAX_COMPANION_PATHS:
                 raise GithubApprovalError("continuation_path_limit_exceeded")
+        # #1154: against the named paths with their companions, the set this revision will allow.
+        self.check_withdrawals(base_paths, paths, proposal.get("withdrawn_paths") or [])
         stored_summary = companion_paths.summary_with_trailer(owner_summary, identity, named, extras)
         payload = self.canonical_continuation_payload(phase="implementation",
             execution_target=proposal["execution_target"], summary=stored_summary,
@@ -749,12 +772,12 @@ class GithubApprovalService:
             GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce,
         ))).all())
         amendments = [row for row in prior if row.origin_kind == "scope_amendment"]
-        previous_added = {path for row in amendments for path in row.amendment_added_paths}
+        previous_added = {path for row in amendments for path in self._named_added(item, row)}
         if sum(1 for row in amendments if row.approved_at is not None) >= MAX_SCOPE_AMENDMENTS:
             raise GithubApprovalError("amendment_count_limit")
         if len(amendments) >= MAX_SCOPE_AMENDMENT_REQUESTS:
             raise GithubApprovalError("amendment_request_limit")
-        if len(previous_added | set(added)) > MAX_AMENDMENT_ADDED_PATHS:
+        if len(previous_added | (set(added) - set(extras))) > MAX_AMENDMENT_ADDED_PATHS:
             raise GithubApprovalError("amendment_added_path_limit")
         if len(prior) >= scope.max_continuation_revisions or (
                 sum(row.failed_head_count for row in prior) + max_failures > scope.max_continuation_failed_heads):
@@ -793,6 +816,23 @@ class GithubApprovalService:
         await db.commit()
         return revision, request, True
 
+    def check_withdrawals(self, base_paths, named_paths, withdrawn_paths):
+        """#1154 (Supervisor option A): an amendment names its whole effective path set.
+
+        Completion compares changes with allowed_paths literally, so an approved base path the owner leaves out is
+        withdrawn. That must be said: ``withdrawn_paths`` is exactly the base entries the named paths do not cover,
+        or the request is refused before anything is stored. Existing rows are never reinterpreted.
+        """
+        omitted = sorted({path for path in base_paths if not self.path_is_allowed(path, named_paths)})
+        withdrawn = sorted({path.strip() for path in withdrawn_paths if isinstance(path, str)})
+        if withdrawn != omitted:
+            # A withdrawal that is not a base path, is still named, or adds to the omission is wrong as given;
+            # an omission with no withdrawal is the #1055 trap. Literal raises keep both codes visible to the
+            # plain-language refusal catalogue's scan (frontend/tests/audit-refusals.test.ts).
+            if withdrawn:
+                raise GithubApprovalError("amendment_withdrawn_paths_invalid")
+            raise GithubApprovalError("amendment_base_paths_omitted")
+
     def verify_amendment_binding(self, request, revision):
         if (revision.origin_kind != "scope_amendment" or request.request_kind != "continuation"
                 or request.scope_revision_id != revision.id or revision.approval_request_id != request.id
@@ -823,14 +863,35 @@ class GithubApprovalService:
             raise GithubApprovalError("amendment_count_limit")
         if len(amendments) > MAX_SCOPE_AMENDMENT_REQUESTS:
             raise GithubApprovalError("amendment_request_limit")
-        if len({path for row in amendments for path in row.amendment_added_paths}) > MAX_AMENDMENT_ADDED_PATHS:
+        if len({path for row in amendments for path in self._named_added(item, row)}) > MAX_AMENDMENT_ADDED_PATHS:
             raise GithubApprovalError("amendment_added_path_limit")
+        named, companions = self._counted_paths(item, revision)
         if (len(rows) > scope.max_continuation_revisions
                 or sum(row.failed_head_count for row in rows) + revision.max_failed_heads > scope.max_continuation_failed_heads
                 or revision.max_failed_heads > scope.max_failed_heads_per_revision
-                or len(revision.allowed_paths) > scope.max_scope_paths
+                or len(named) > scope.max_scope_paths
+                or len(companions) > companion_paths.MAX_COMPANION_PATHS
                 or len(revision.allowed_commands) > scope.max_scope_commands):
             raise GithubApprovalError("continuation_budget_exhausted")
+
+    @staticmethod
+    def _counted_paths(item, revision) -> tuple[list[str], list[str]]:
+        """``(named, companions)`` of a revision for its path limits (#1039).
+
+        Only an amendment's digest-verified companion trailer earns the separate companion count; anything else
+        counts every allowed path as named.
+        """
+        if revision.origin_kind != "scope_amendment":
+            return list(revision.allowed_paths), []
+        _summary, named, companions = companion_paths.split_summary(
+            revision.summary, (item.id, revision.dispatch_nonce, revision.previous_scope_revision),
+            revision.allowed_paths)
+        return named, companions
+
+    def _named_added(self, item, revision) -> set[str]:
+        """The paths an amendment added for new scope: its added paths without its verified companions (#1039)."""
+        _named, companions = self._counted_paths(item, revision)
+        return set(revision.amendment_added_paths) - set(companions)
 
     @staticmethod
     def amendment_revision_conditions(revision):
@@ -2345,6 +2406,49 @@ class GithubApprovalService:
             raise GithubApprovalError("approval_request_not_found", status_code=404)
         return request
 
+    @staticmethod
+    def initial_decision_message(request):
+        return MailMessageCreate(kind="answer", sender_member_id=request.leader_member_id,
+            thread_root_id=request.request_message_id, body_markdown=request.reason, decision=request.status,
+            payload={"approval_request_id": request.id, "request_kind": request.request_kind,
+                "work_item_id": request.work_item_id})
+
+    async def _escalated_initial_rejection_conditions(self, db, item, request, owner, leader, actor):
+        scope = await db.get(TeamGithubScope, item.scope_id, populate_existing=True)
+        if scope is None:
+            raise GithubApprovalError("scope_not_found", status_code=404)
+        context = dict(team_id=scope.preset_id, owner_member_id=owner.id, owner_slot_id=owner.team_slot_id,
+            leader_member_id=leader.id, leader_slot_id=leader.team_slot_id)
+        await self.bind_actor_session(db, context, actor)
+        if context.get("actor_session") and context["actor_session"]["team_slot_id"] != leader.team_slot_id:
+            raise GithubApprovalError("current_mail_session_required", status_code=403)
+        root = await db.get(MailMessage, request.request_message_id, populate_existing=True)
+        if root is None or not self.matches_linked_request_message(
+                request, root, delivery_key=f"github-approval:{request.id}:request"):
+            raise GithubApprovalError("approval_request_link_mismatch")
+        return (
+            GithubWorkItem.dispatch_status == "escalated",
+            GithubWorkItem.scope_id == scope.id,
+            GithubWorkItem.escalation_reason == item.escalation_reason,
+            GithubWorkItem.launch_id == item.launch_id,
+            GithubWorkItem.active_scope_revision == item.active_scope_revision,
+            GithubWorkItem.pr_number == item.pr_number,
+            GithubWorkItem.handoff_state == item.handoff_state,
+            _settled_handoff_condition(),
+            exists(select(TeamGithubScope.id).where(
+                TeamGithubScope.id == scope.id, TeamGithubScope.preset_id == context["team_id"])),
+            exists(select(AgentTeamPreset.id).where(
+                AgentTeamPreset.id == context["team_id"], AgentTeamPreset.leader_slot_id == leader.team_slot_id)),
+            ~exists(select(GithubOwnerObservationPause.id).where(
+                GithubOwnerObservationPause.work_item_id == item.id,
+                GithubOwnerObservationPause.status.in_(("waiting", "paused")))),
+            exists(select(MailMessage.id).where(
+                MailMessage.id == root.id, MailMessage.kind == "context_request", MailMessage.thread_root_id.is_(None),
+                MailMessage.request_status == "pending", MailMessage.sender_member_id == owner.id,
+                MailMessage.recipient_member_id == leader.id, MailMessage.delivery_key == root.delivery_key)),
+            *self._attempt_actor_conditions(context),
+        )
+
     async def decide(
         self,
         db: AsyncSession,
@@ -2361,6 +2465,8 @@ class GithubApprovalService:
         A caller that supplies its trusted ``actor`` gets one applied decision
         fact in the decision commit. An exact replay records nothing.
         """
+        from app.services.github_coordination_service import hold_code
+
         decision_item_id = item.id
         decision_scope_id = item.scope_id
         request = await self.resolve_for_decision(
@@ -2380,6 +2486,9 @@ class GithubApprovalService:
             raise GithubApprovalError("stale_nonce")
         if request.request_message_id is None:
             raise GithubApprovalError("approval_request_delivery_pending")
+        escalated_rejection = item.dispatch_status == "escalated" and decision == "rejected"
+        if escalated_rejection and (stop := hold_code()):
+            raise GithubApprovalError(stop)
         if request.status != "pending":
             if request.status not in {"approved", "rejected"}:
                 raise GithubApprovalError("request_not_pending")
@@ -2391,26 +2500,50 @@ class GithubApprovalService:
                     raise GithubApprovalError("approval_round_mismatch")
                 return request, False
             raise GithubApprovalError("approval_request_already_decided")
-        if item.dispatch_status == "escalated":
+        if item.dispatch_status == "escalated" and not escalated_rejection:
             raise GithubApprovalError("item_escalated")
         if request.approval_round != item.approval_round_count:
             raise GithubApprovalError("approval_round_mismatch")
         if owner.team_slot_id is None:
             raise GithubApprovalError("stale_approval_owner")
+        item_conditions = (
+            GithubWorkItem.id == item.id,
+            GithubWorkItem.dispatch_nonce == request.dispatch_nonce,
+            GithubWorkItem.approval_round_count == request.approval_round,
+            GithubWorkItem.owner_slot_id == owner.team_slot_id,
+        )
+        request_conditions = (
+            GithubApprovalRequest.id == request.id,
+            GithubApprovalRequest.work_item_id == item.id,
+            GithubApprovalRequest.status == "pending",
+            GithubApprovalRequest.request_kind == "initial_plan",
+            GithubApprovalRequest.dispatch_nonce == item.dispatch_nonce,
+            GithubApprovalRequest.approval_round == item.approval_round_count,
+            GithubApprovalRequest.owner_member_id == owner.id,
+            GithubApprovalRequest.leader_member_id == leader.id,
+        )
+        if escalated_rejection:
+            item_conditions += await self._escalated_initial_rejection_conditions(
+                db, item, request, owner, leader, actor)
+            request_conditions += (
+                GithubApprovalRequest.scope_revision_id.is_(None),
+                GithubApprovalRequest.request_message_id == request.request_message_id,
+                GithubApprovalRequest.request_fingerprint == request.request_fingerprint,
+                GithubApprovalRequest.decided_at.is_(None),
+                GithubApprovalRequest.decision_message_id.is_(None),
+            )
+        else:
+            item_conditions += (GithubWorkItem.dispatch_status != "escalated",)
         item_guard = await db.execute(
             update(GithubWorkItem)
-            .where(
-                GithubWorkItem.id == item.id,
-                GithubWorkItem.dispatch_status != "escalated",
-                GithubWorkItem.dispatch_nonce == request.dispatch_nonce,
-                GithubWorkItem.approval_round_count == request.approval_round,
-                GithubWorkItem.owner_slot_id == owner.team_slot_id,
-            )
+            .where(*item_conditions)
             .values(updated_at=GithubWorkItem.updated_at)
             .execution_options(synchronize_session=False)
         )
         if item_guard.rowcount != 1:
             await db.rollback()
+            if escalated_rejection:
+                raise GithubApprovalError("stale_approval_context")
             await db.refresh(item)
             if item.dispatch_status == "escalated":
                 raise GithubApprovalError("item_escalated")
@@ -2422,23 +2555,8 @@ class GithubApprovalService:
         result = await db.execute(
             update(GithubApprovalRequest)
             .where(
-                GithubApprovalRequest.id == request.id,
-                GithubApprovalRequest.status == "pending",
-                GithubApprovalRequest.request_kind == "initial_plan",
-                GithubApprovalRequest.dispatch_nonce == item.dispatch_nonce,
-                GithubApprovalRequest.approval_round == item.approval_round_count,
-                GithubApprovalRequest.owner_member_id == owner.id,
-                GithubApprovalRequest.leader_member_id == leader.id,
-                exists(
-                    select(GithubWorkItem.id).where(
-                        GithubWorkItem.id == request.work_item_id,
-                        GithubWorkItem.dispatch_status != "escalated",
-                        GithubWorkItem.dispatch_nonce == request.dispatch_nonce,
-                        GithubWorkItem.approval_round_count
-                        == request.approval_round,
-                        GithubWorkItem.owner_slot_id == owner.team_slot_id,
-                    )
-                ),
+                *request_conditions,
+                exists(select(GithubWorkItem.id).where(*item_conditions)),
             )
             .values(
                 status=decision,
@@ -2447,25 +2565,42 @@ class GithubApprovalService:
             )
             .execution_options(synchronize_session=False)
         )
-        if result.rowcount == 1 and actor is not None:
-            await _record_decision_fact(
-                db,
-                event_kind="approval_decision",
-                source="github_approval_service.decide",
-                actor=actor,
-                scope_id=decision_scope_id,
-                item_id=decision_item_id,
-                request_id=request_id,
-                revision_id=None,
-                request_kind="initial_plan",
-                decision=decision,
-            )
-        await db.commit()
+        try:
+            if result.rowcount == 1 and actor is not None:
+                await _record_decision_fact(
+                    db,
+                    event_kind="approval_decision",
+                    source="github_approval_service.decide",
+                    actor=actor,
+                    scope_id=decision_scope_id,
+                    item_id=decision_item_id,
+                    request_id=request_id,
+                    revision_id=None,
+                    request_kind="initial_plan",
+                    decision=decision,
+                )
+            if escalated_rejection and result.rowcount == 1:
+                # Keep retry blocked until the decision and its linked Mail answer are both durable.
+                await db.refresh(request)
+                message = await agent_mail_service._send_message(db, self.initial_decision_message(request),
+                    auto_nudge=False, authenticated_sender_member_id=leader.id,
+                    authoritative_approval_round=request.approval_round,
+                    delivery_key=f"github-approval:{request.id}:decision", commit=False)
+                request.decision_message_id = message.id
+            if escalated_rejection and (stop := hold_code()):
+                raise GithubApprovalError(stop)
+            await db.commit()
+        except Exception:
+            if escalated_rejection:
+                await db.rollback()
+            raise
         await db.refresh(request)
         if result.rowcount == 1:
             return request, True
         if request.status == decision and request.reason == reason:
             return request, False
+        if escalated_rejection:
+            raise GithubApprovalError("stale_approval_context")
         await db.refresh(item)
         if item.dispatch_status == "escalated":
             raise GithubApprovalError("item_escalated")
@@ -3458,10 +3593,36 @@ class GithubApprovalService:
             "request_id": request_id,
             "correlation_id": notice,
         }
+        reason = revision.cancellation_reason
+        cancelled_at = revision.cancelled_at
+        dispatch_nonce = item.dispatch_nonce
+        retry_started = False
+
+        async def refresh_notice_context():
+            nonlocal retry_started
+            retry_started = True
+            await db.refresh(item)
+            await db.refresh(revision)
+            if (
+                item.dispatch_nonce != dispatch_nonce
+                or revision.cancelled_at != cancelled_at
+                or not await self._active_cancellation_resting_state_matches(db, item, revision, reason=reason)
+            ):
+                raise GithubApprovalError("active_continuation_cancel_conflict")
+
         try:
-            await self.ensure_active_cancellation_notice(db, item, revision)
+            # A competing replay can write the same keyed notice while this
+            # connection holds a read snapshot inside the Mail savepoint.
+            await retry_when_busy(
+                db,
+                lambda: self.ensure_active_cancellation_notice(db, item, revision),
+                route="active_cancellation_notice",
+                prepare=refresh_notice_context,
+            )
         except Exception as exc:
-            not_attempted = isinstance(exc, GithubApprovalError)
+            refused = isinstance(exc, GithubApprovalError)
+            # A lock can occur while reading the response after the send.
+            not_attempted = refused and not retry_started
             outcome = "rejected" if not_attempted else "uncertain"
             if actor is not None:
                 # One fact per notice outcome: an earlier uncertain result
@@ -3479,10 +3640,12 @@ class GithubApprovalService:
                     ),
                     **fields,
                 )
-            if not_attempted:
+            if refused:
                 raise ActiveCancellationNoticeError(
                     exc.detail, status_code=exc.status_code
                 ) from exc
+            if isinstance(exc, SqliteBusyExhausted):
+                raise ActiveCancellationNoticeError("database_busy_cancellation_saved", status_code=503) from exc
             raise
         if actor is None:
             return

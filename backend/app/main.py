@@ -6,7 +6,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from sqlalchemy.exc import OperationalError
 from mcp_shim.environment_warning import warn_legacy_environment
 
 from app.api.v1.router import router as api_v1_router
@@ -103,19 +104,56 @@ async def health():
 frontend_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "frontend", "dist")
 
 
+HASHED_ASSET_CACHE = "public, max-age=31536000, immutable"
+REVALIDATE = "no-cache"
+
+
+class FrontendFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if path.lstrip("/").startswith("assets/"):
+            response.headers["Cache-Control"] = HASHED_ASSET_CACHE
+        else:
+            response.headers["Cache-Control"] = REVALIDATE
+        return response
+
+
+async def database_busy_exception_handler(request, exc):
+    """#1149: a lock that outlasts the busy timeout is retryable, so answer 503 instead of 500."""
+    from app.services.sqlite_busy_retry import is_sqlite_busy
+
+    # Every busy or locked code, extended ones included (262, a shared-cache table lock), not only the message text.
+    if is_sqlite_busy(exc):
+        logger.warning("database_busy path=%s", request.url.path)
+        return JSONResponse({"detail": "database_busy"}, status_code=503, headers={"Retry-After": "1"})
+    logger.error("Unhandled database error on %s", request.url.path, exc_info=exc)
+    return PlainTextResponse("Internal Server Error", status_code=500)
+
+
+def install_database_busy_handler(target: FastAPI) -> None:
+    target.add_exception_handler(OperationalError, database_busy_exception_handler)
+
+
+install_database_busy_handler(app)
+
+
 async def spa_not_found_exception_handler(request, exc):
-    """Serve the SPA for UI routes without erasing API error details."""
-    if not request.url.path.startswith(settings.api_v1_prefix):
-        return FileResponse(os.path.join(frontend_path, "index.html"), status_code=200)
-    return JSONResponse(
-        {"detail": exc.detail},
-        status_code=exc.status_code,
-        headers=exc.headers,
+    """Serve the SPA for UI routes without erasing API error details or masking missing assets."""
+    if request.url.path.startswith((settings.api_v1_prefix, "/assets/")):
+        return JSONResponse(
+            {"detail": exc.detail},
+            status_code=exc.status_code,
+            headers=exc.headers,
+        )
+    return FileResponse(
+        os.path.join(frontend_path, "index.html"),
+        status_code=200,
+        headers={"Cache-Control": REVALIDATE},
     )
 
 
 if os.path.exists(frontend_path):
-    app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")
+    app.mount("/", FrontendFiles(directory=frontend_path, html=True), name="frontend")
     app.add_exception_handler(404, spa_not_found_exception_handler)
 else:
     @app.get("/")

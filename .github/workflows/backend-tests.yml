@@ -2,10 +2,10 @@ name: Backend regression tests
 
 on:
   pull_request:
-    branches: [master, feature/software-delivery-product-reposition, release/v3.1, release/v4.0, release/v4.1, release/v4.2]
+    branches: [master, feature/software-delivery-product-reposition, release/v3.1, release/v4.0, release/v4.1, release/v4.2, release/v4.3]
     types: [opened, synchronize, reopened]
   push:
-    branches: [master, feature/software-delivery-product-reposition, release/v3.1, release/v4.0, release/v4.1, release/v4.2]
+    branches: [master, feature/software-delivery-product-reposition, release/v3.1, release/v4.0, release/v4.1, release/v4.2, release/v4.3]
 
 permissions:
   contents: read
@@ -44,7 +44,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/ci/docs_only.py
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: steps.changes.outputs.run_suites != 'false'
         with:
           python-version: '3.12'
@@ -88,14 +88,14 @@ jobs:
       - name: Keep the backend test timings and identities
         # Runs after a failed suite too, so a failing run still keeps what pytest wrote.
         if: always() && steps.changes.outputs.run_suites != 'false'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
-          name: backend-test-timings-${{ matrix.shard }}
+          name: backend-test-timings-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: |
             backend/backend-junit-${{ matrix.shard }}.xml
             backend/backend-shard-${{ matrix.shard }}-collected.txt
             backend/backend-shard-${{ matrix.shard }}-executed.jsonl
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
 
   # The required check keeps its name and meaning (#1013). It passes only when every shard succeeded and the
@@ -129,7 +129,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/ci/docs_only.py
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: steps.changes.outputs.run_suites != 'false'
         with:
           python-version: '3.12'
@@ -159,8 +159,10 @@ jobs:
       - uses: actions/download-artifact@v5
         if: steps.changes.outputs.run_suites != 'false'
         with:
-          pattern: backend-test-timings-*
+          # Untouched shards can come from earlier attempts of this same run.
+          pattern: backend-test-timings-*-attempt-*
           path: shard-artifacts
+          merge-multiple: false
       - name: Collect the full backend suite
         if: steps.changes.outputs.run_suites != 'false'
         working-directory: backend
@@ -197,7 +199,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/ci/docs_only.py
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: steps.changes.outputs.run_suites != 'false'
         with:
           python-version: '3.12'

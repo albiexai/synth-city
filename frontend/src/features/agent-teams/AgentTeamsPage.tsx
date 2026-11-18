@@ -827,6 +827,7 @@ export function AgentTeamsPage() {
   const [launchOptionsByProvider, setLaunchOptionsByProvider] = useState<LaunchOptionsByProvider>({})
   const [githubScopes, setGithubScopes] = useState<TeamGithubScope[]>([])
   const [githubWorkItems, setGithubWorkItems] = useState<GithubWorkItem[]>([])
+  const [githubWorkItemTotal, setGithubWorkItemTotal] = useState<number | null>(null)
   const [autonomyLoading, setAutonomyLoading] = useState(false)
   const [autonomyRefreshing, setAutonomyRefreshing] = useState(false)
   const [autonomyTab, setAutonomyTab] = useState<'roster' | 'autonomy'>(requestedTab === 'autonomy' ? 'autonomy' : 'roster')
@@ -986,6 +987,7 @@ export function AgentTeamsPage() {
       if (autonomyRequestIdRef.current === requestId) {
         setGithubScopes(scopeResponse.scopes)
         setGithubWorkItems(workItemResponse.items)
+        setGithubWorkItemTotal(workItemResponse.total ?? null)
         autonomyDataPresetIdRef.current = presetId
         setAutonomyDataPresetId(presetId)
         setAutonomyLastRefreshedAt(new Date())
@@ -997,6 +999,7 @@ export function AgentTeamsPage() {
         if (autonomyDataPresetIdRef.current !== presetId) {
           setGithubScopes([])
           setGithubWorkItems([])
+          setGithubWorkItemTotal(null)
           setAutonomyLastRefreshedAt(null)
           autonomyDataPresetIdRef.current = presetId
           setAutonomyDataPresetId(presetId)
@@ -1044,6 +1047,7 @@ export function AgentTeamsPage() {
       queueMicrotask(() => {
         setGithubScopes([])
         setGithubWorkItems([])
+        setGithubWorkItemTotal(null)
         setAutonomyLoading(false)
         setAutonomyRefreshing(false)
         setAutonomyLastRefreshedAt(null)
@@ -1237,7 +1241,7 @@ export function AgentTeamsPage() {
         leader_slot_id: slot.id,
         expected_leader_slot_id: selectedPreset.leader_slot_id ?? null,
         expected_updated_at: selectedPreset.updated_at,
-        reason: 'Operator selected the Leader in the team roster.',
+        reason: 'Director selected the Leader in the team roster.',
       }, token))
       replacePreset(updated)
       toast.success('Leader assignment saved')
@@ -1471,6 +1475,7 @@ export function AgentTeamsPage() {
                     preset={selectedPreset}
                     scopes={autonomyDataPresetId === selectedPreset.id ? githubScopes : []}
                     workItems={autonomyDataPresetId === selectedPreset.id ? githubWorkItems : []}
+                    workItemTotal={autonomyDataPresetId === selectedPreset.id ? githubWorkItemTotal : null}
                     loading={autonomyLoading || autonomyDataPresetId !== selectedPreset.id}
                     refreshing={autonomyDataPresetId === selectedPreset.id && autonomyRefreshing}
                     lastRefreshedAt={autonomyDataPresetId === selectedPreset.id ? autonomyLastRefreshedAt : null}

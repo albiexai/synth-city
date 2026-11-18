@@ -64,6 +64,7 @@ def test_the_tool_surface_brings_the_inventory_tests_and_the_doc_page():
     found = companion_paths.companions_for(["backend/mcp_shim/agent_mail_server.py"])
     assert {"backend/tests/agent_mail/test_mcp_shim.py", "backend/tests/agent_mail/test_pi_shim.py",
             "backend/tests/agent_mail/test_tool_rename.py", "backend/tests/upgrade/test_provider_upgrade_startup.py",
+            "backend/tests/upgrade/test_provider_upgrade_interruption.py",
             "integrations/pi-agent-mail/manifest.ts", "docs/api/agent-mail.md"} <= set(found)
 
 
@@ -381,8 +382,10 @@ async def as_legacy_amendment(db, a, state, companion_map):
     An old record predates the map, so it is created while the map is empty and carries no trailer.
     """
     saved, companion_map["map"] = companion_map["map"], {}
+    # With the map empty the base companion is not named, so (#1154) the record states that withdrawal.
     revision, request, _ = await github_approval_service.create_scope_amendment_request(
-        db, a.item, a.scope, **{**amendment(a), "summary": "Placeholder summary"})
+        db, a.item, a.scope, **{**amendment(a), "summary": "Placeholder summary"},
+        withdrawn_paths=["tests/test_base.py"])
     companion_map["map"] = saved
     revision.summary = LEGACY_NOTE
     payload = github_approval_service.canonical_continuation_payload(phase=revision.phase,
@@ -559,3 +562,99 @@ async def test_a_new_plan_filed_with_paths_is_shown_its_companions(db, companion
 ])
 def test_the_plan_path_helper_returns_one_unambiguous_list_or_nothing(stored, expected):
     assert github_approval_service.initial_plan_paths(stored) == expected
+
+
+# --- #1039: companions are counted on their own bound, not against the scope's path limit -------------------
+
+from app.services import github_approval_service as approval_module  # noqa: E402
+from app.services.github_dispatch_service import github_dispatch_service  # noqa: E402
+
+NEW = {**MAPPED, "src/new.py": [{"path": "tests/test_new.py", "kind": "test"}, {"path": "docs/new.md", "kind": "doc"}]}
+NAMED = ["src/base.py", "src/new.py"]
+
+
+async def _activate(db, a, revision, approval):
+    await github_approval_service.ensure_continuation_request_message(db, a.item, approval, revision)
+    await github_approval_service.decide_continuation(db, a.item, authenticated_leader_member_id=a.leader.id,
+        decision="approved", reason="Reviewed amendment", request_id=approval.id)
+    await github_approval_service.ensure_continuation_decision_message(db, a.item, approval, revision)
+    await github_approval_service.deliver_approved_continuation(db, a.item, approval, revision)
+    return await github_dispatch_service.activate_continuation_revision(db, a.item, a.scope, revision,
+        authenticated_owner_member_id=a.owner.id, authenticated_owner_slot_id=a.owner.team_slot_id,
+        dispatch_nonce=a.item.dispatch_nonce, lease_token=a.workspace.lease_token)
+
+
+@pytest.mark.asyncio
+async def test_named_paths_within_the_limit_are_not_refused_for_their_companions(db, companion_map, healthy_attempt):
+    a = healthy_attempt
+    companion_map["map"] = dict(NEW)
+    a.scope.max_scope_paths = 2  # exactly the named paths; their three companions come on top
+    await db.commit()
+    revision, approval, _ = await github_approval_service.create_scope_amendment_request(
+        db, a.item, a.scope, **amendment(a, NAMED))
+    assert revision.allowed_paths == ["docs/new.md", "src/base.py", "src/new.py", "tests/test_base.py",
+                                      "tests/test_new.py"]
+    assert await _activate(db, a, revision, approval)
+    await db.refresh(revision)
+    assert revision.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_companions_of_a_new_source_do_not_use_up_the_added_path_cap(db, companion_map, healthy_attempt,
+                                                                           monkeypatch):
+    a = healthy_attempt
+    companion_map["map"] = dict(NEW)
+    monkeypatch.setattr(approval_module, "MAX_AMENDMENT_ADDED_PATHS", 1)  # room for the one named new source
+    revision, approval, _ = await github_approval_service.create_scope_amendment_request(
+        db, a.item, a.scope, **amendment(a, NAMED))
+    assert revision.amendment_added_paths == ["docs/new.md", "src/new.py", "tests/test_new.py"]
+    assert await _activate(db, a, revision, approval)
+
+
+@pytest.mark.asyncio
+async def test_companions_over_their_own_bound_are_still_refused(db, companion_map, healthy_attempt, monkeypatch):
+    a = healthy_attempt
+    companion_map["map"] = dict(NEW)
+    monkeypatch.setattr(companion_paths, "MAX_COMPANION_PATHS", 2)  # three companions: one too many
+    with pytest.raises(GithubApprovalError) as refused:
+        await github_approval_service.create_scope_amendment_request(db, a.item, a.scope, **amendment(a, NAMED))
+    assert refused.value.detail == "continuation_path_limit_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_named_paths_over_the_limit_are_still_refused(db, companion_map, healthy_attempt):
+    a = healthy_attempt
+    companion_map["map"] = dict(NEW)
+    a.scope.max_scope_paths = 1
+    await db.commit()
+    with pytest.raises(GithubApprovalError) as refused:
+        await github_approval_service.create_scope_amendment_request(db, a.item, a.scope, **amendment(a, NAMED))
+    assert refused.value.detail == "continuation_path_limit_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_an_unverifiable_trailer_earns_no_companion_exemption_in_the_budget(db, companion_map, healthy_attempt):
+    a = healthy_attempt
+    companion_map["map"] = dict(NEW)
+    a.scope.max_scope_paths = 2
+    await db.commit()
+    revision, _, _ = await github_approval_service.create_scope_amendment_request(
+        db, a.item, a.scope, **amendment(a, NAMED))
+    await github_approval_service.validate_amendment_budget(db, a.item, a.scope, revision)  # verified: fits
+    revision.summary = revision.summary.replace("Companion digest: ", "Companion digest: 0")  # breaks the digest
+    with pytest.raises(GithubApprovalError) as refused:
+        await github_approval_service.validate_amendment_budget(db, a.item, a.scope, revision)
+    assert refused.value.detail == "continuation_budget_exhausted"  # every path counts as named again
+
+
+@pytest.mark.asyncio
+async def test_a_partial_withdrawal_of_the_base_is_refused(db, companion_map, healthy_attempt):
+    # #1154: the base here is src/base.py with its approved companion. Withdrawing one of two omitted paths is wrong.
+    a = healthy_attempt
+    with pytest.raises(GithubApprovalError, match="amendment_withdrawn_paths_invalid"):
+        await github_approval_service.create_scope_amendment_request(
+            db, a.item, a.scope, **amendment(a, ["src/unrelated.py"]), withdrawn_paths=["src/base.py"])
+    revision, _, created = await github_approval_service.create_scope_amendment_request(
+        db, a.item, a.scope, **amendment(a, ["src/unrelated.py"]),
+        withdrawn_paths=["src/base.py", "tests/test_base.py"])
+    assert created and revision.allowed_paths == ["src/unrelated.py"]

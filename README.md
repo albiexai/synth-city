@@ -52,6 +52,8 @@ Read more in the [Factory operating model](docs/guide/operating-model.md), [Auto
 
 **Prerequisites:** Python 3.11+, Node.js 22.12+, tmux, and at least one supported agent CLI on the same host.
 
+Running the frontend tests needs a newer Node.js than the installer checks for: 22.22.2 or later in the 22 line, 24.15 or later in the 24 line, or 26 and later (jsdom 31). Node.js 23 and 25 are not supported for the tests.
+
 ```bash
 git clone https://github.com/albiexai/synth-city.git
 cd synth-city

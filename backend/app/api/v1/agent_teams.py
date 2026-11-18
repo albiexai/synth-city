@@ -44,8 +44,9 @@ from app.models.database import (
     TeamGithubScope,
 )
 from app.services.github_leader_recovery_service import (
-    CancelRevisionRequest, FinalizeMergedLeaderRequest, ReleaseWorkspaceRequest,
+    CancelRevisionRequest, FinalizeMergedLeaderRequest, ReleaseWorkspaceRequest, WorkspaceReleaseContext,
 )
+from app.services.github_end_stopped_item_service import EndStoppedItemRequest
 from app.models.schemas import (
     GithubScopeAmendmentCreate, GithubRevisionReviewCreate, GithubRevisionReviewWithdraw,
     GithubSubmittedRevisionEnd, GithubRevisionReviewResponse,
@@ -319,6 +320,7 @@ async def _observe_handoff_rejection(db, session, *, item_id: int, scope_id: int
         item_id=item_id,
     )
 from app.services.github_client import GithubClientResponseError, github_client
+from app.services.github_rate_limit_service import github_rate_limit_service
 from app.services.github_app_auth_service import (
     GithubAppAuthError,
     GithubAppMintRejected,
@@ -339,6 +341,7 @@ from app.services.github_verification_service import (
     github_verification_service,
 )
 from app.services.agent_team_service import PlanConflictError, TeamDeletionConflictError, agent_team_service
+from app.services.providers import get_providers
 from app.services.providers.base import ProviderLaunchError
 
 from app.services.github_work_item_projection import (
@@ -499,6 +502,7 @@ def _scope_response(
         github_auth_mode=scope.github_auth_mode,
         github_auth_configured=_scope_auth_configured(scope),
         github_poll_token_configured=bool(settings.github_token),
+        github_rate_limit=github_rate_limit_service.polling_status(),
         max_approval_rounds=scope.max_approval_rounds,
         max_concurrent_dispatched=scope.max_concurrent_dispatched,
         max_verification_retries=scope.max_verification_retries,
@@ -587,7 +591,10 @@ def _scope_revision_response(
     include_commands: bool = True,
     approval: GithubApprovalRequest | None = None,
     effort: dict | None = None,
+    current_view: bool = False,
 ) -> GithubScopeRevisionResponse:
+    """``current_view``: the owner's current context, where an ended revision's prohibitions are not shown (#1185)."""
+    in_force = revision.status in ("active", "submitted")
     return GithubScopeRevisionResponse(
         id=revision.id,
         work_item_id=revision.work_item_id,
@@ -605,7 +612,8 @@ def _scope_revision_response(
         allowed_paths=revision.allowed_paths,
         allowed_actions=revision.allowed_actions,
         allowed_commands=revision.allowed_commands if include_commands else [],
-        prohibited_actions=revision.prohibited_actions,
+        prohibited_actions=revision.prohibited_actions if in_force or not current_view else [],
+        prohibitions_in_force=in_force,
         tool_fallbacks=revision.tool_fallbacks,
         baseline_head_sha=revision.baseline_head_sha,
         baseline_tree_sha=revision.baseline_tree_sha,
@@ -1541,10 +1549,33 @@ async def request_github_work_item_continuation(
     # R07: once the request commits, a later failure concerns only its notice.
     committed_request: tuple[int, int] | None = None
     try:
-        revision, approval, _created = (
-            await (github_approval_service.create_scope_amendment_request
-                   if isinstance(request, GithubScopeAmendmentCreate)
-                   else github_approval_service.create_continuation_request)(
+        # Two explicit calls (no ** splat), so the state-namespace guard can see every field written (#1154).
+        if isinstance(request, GithubScopeAmendmentCreate):
+            revision, approval, _created = await github_approval_service.create_scope_amendment_request(
+                db,
+                item,
+                scope,
+                authenticated_owner_member_id=session.member_id,
+                authenticated_owner_slot_id=slot_id,
+                dispatch_nonce=request.dispatch_nonce,
+                phase=request.phase,
+                execution_target=request.execution_target,
+                summary=request.summary,
+                allowed_paths=request.allowed_paths,
+                allowed_actions=request.allowed_actions,
+                allowed_commands=request.allowed_commands,
+                prohibited_actions=request.prohibited_actions,
+                max_failed_heads=request.max_failed_heads,
+                tool_fallbacks={
+                    name: fallback.model_dump()
+                    for name, fallback in request.tool_fallbacks.items()
+                },
+                lease_token=request.lease_token,
+                actor=request_actor,
+                withdrawn_paths=request.withdrawn_paths,
+            )
+        else:
+            revision, approval, _created = await github_approval_service.create_continuation_request(
                 db,
                 item,
                 scope,
@@ -1566,7 +1597,6 @@ async def request_github_work_item_continuation(
                 lease_token=request.lease_token,
                 actor=request_actor,
             )
-        )
         committed_request = (approval.id, revision.id)
         if isinstance(request, GithubScopeAmendmentCreate) and not _created and approval.status != "pending":
             return GithubContinuationRequestResponse(
@@ -2254,9 +2284,9 @@ async def claim_github_work_item_continuation(
         workspace_path=workspace.path if workspace is not None else None,
         lease_token=workspace.lease_token if workspace is not None else None,
         leader_member_id=leader_member.id if leader_member is not None else None,
-        status_note=item.status_note,
+        status_note=github_rate_limit_service.work_item_note(item.dispatch_status, item.status_note),
         active_revision=(
-            _scope_revision_response(active_revision, effort=effort_view)
+            _scope_revision_response(active_revision, effort=effort_view, current_view=True)
             if active_revision is not None
             else None
         ),
@@ -2432,9 +2462,28 @@ async def get_preset(preset_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/presets/{preset_id}/summary", response_model=AgentTeamSummaryResponse)
-async def get_team_summary(preset_id: int, response: Response, db: AsyncSession = Depends(get_db)):
+async def get_team_summary(
+    preset_id: int,
+    response: Response,
+    scope_id: int | None = Query(None, ge=1),
+    provider: str | None = Query(None, min_length=1, max_length=64),
+    work_item_id: int | None = Query(None, ge=1),
+    db: AsyncSession = Depends(get_db),
+):
     response.headers["Cache-Control"] = "no-store"
-    result = await agent_team_summary_service.summary(db, preset_id)
+    if work_item_id is not None:
+        if scope_id is not None or provider is not None:
+            raise HTTPException(status_code=422, detail="invalid_filter")
+        result = await agent_team_summary_service.for_work_item(db, preset_id, work_item_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="resource_not_found")
+        return result
+    # Optional Needs-you filters (#1141): the same checks as the factory filters. Without them the read is unchanged.
+    if provider is not None and provider not in {p.id for p in get_providers()}:
+        raise HTTPException(status_code=422, detail="invalid_filter")
+    if scope_id is not None and await db.get(TeamGithubScope, scope_id) is None:
+        raise HTTPException(status_code=404, detail="resource_not_found")
+    result = await agent_team_summary_service.needs_you(db, preset_id, scope_id=scope_id, provider=provider)
     if result is None:
         raise HTTPException(status_code=404, detail="preset_not_found")
     return result
@@ -3055,7 +3104,12 @@ async def list_github_work_items(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     rows = (
         await db.execute(
-            select(GithubWorkItem, TeamGithubScope, GithubWorkspace.path)
+            select(
+                GithubWorkItem,
+                TeamGithubScope,
+                GithubWorkspace.path,
+                func.count().over().label("total"),
+            )
             .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
             .outerjoin(GithubWorkspace, GithubWorkspace.leased_item_id == GithubWorkItem.id)
             .where(TeamGithubScope.preset_id == preset_id)
@@ -3065,7 +3119,7 @@ async def list_github_work_items(
     ).all()
     authority_by_item = await _load_work_item_authority(
         db,
-        [item for item, _scope, _workspace_path in rows],
+        [item for item, _scope, _workspace_path, _total in rows],
     )
     return GithubWorkItemListResponse(
         items=[
@@ -3079,8 +3133,9 @@ async def list_github_work_items(
                 continuation_revision_count=authority_by_item[item.id].revision_count,
                 continuation_failed_head_count=authority_by_item[item.id].failed_head_count,
             ).model_copy(update={"dispatch_nonce": None})  # unauthenticated read: the public generation names the dispatch
-            for item, scope, workspace_path in rows
-        ]
+            for item, scope, workspace_path, _total in rows
+        ],
+        total=rows[0].total if rows else 0,
     )
 
 
@@ -3868,6 +3923,7 @@ async def _named_reviewer_binding(db, item, scope, member_id):
     from app.services.github_approval_service import GithubApprovalError, github_approval_service
     from app.services.github_ci_watch_service import _digest, github_ci_watch_service as watches
     from app.services.github_head_acceptance_service import _fresh_item
+    from app.services.github_terminal_revision_service import read_current_named_review_attempt
     fresh = await _fresh_item(db, item.id)
     named = fresh is not None and await db.scalar(select(GithubRequiredCheckWatch.id).where(
         GithubRequiredCheckWatch.work_item_id == item.id,
@@ -3876,8 +3932,10 @@ async def _named_reviewer_binding(db, item, scope, member_id):
         GithubRequiredCheckWatch.reviewer_member_id == member_id).limit(1))
     if not named:
         raise _not_reviewer()  # not named for this attempt and revision: no remote read for a stranger
+    capture = (github_approval_service.revision_review_attempt_context if fresh.active_scope_revision
+               else github_approval_service.healthy_scope_context)
     try:
-        context, owner, _leader, _workspace = await github_approval_service.healthy_scope_context(db, item, scope)
+        context, owner, _leader, _workspace = await capture(db, item, scope)
         digest = _digest(effective_policy(item, scope))
     except GithubApprovalError:
         raise _binding_unavailable() from None
@@ -3893,11 +3951,11 @@ async def _named_reviewer_binding(db, item, scope, member_id):
         pull = await watches._read_pull(scope, context['pr_number'])
     except Exception:
         raise _binding_unavailable() from None
-    # After the remote await, the whole authority is read and fenced again (#1027 review): a healthy context,
+    # After the remote await, the whole authority is read and fenced again (#1027 review): a current context,
     # the same attempt, revision, PR, owner, team, Leader, branch and repository, and the same effective policy.
     # Only these post-read values are used below, starting with the observed pull request.
     try:
-        context, owner, _leader, _workspace = await github_approval_service.healthy_scope_context(db, item, scope)
+        context, owner, _leader, _workspace = await capture(db, item, scope)
         digest_after = _digest(effective_policy(item, scope))
     except GithubApprovalError:
         raise _binding_unavailable() from None
@@ -3926,7 +3984,10 @@ async def _named_reviewer_binding(db, item, scope, member_id):
         await watches._reviewer(db, context, member_id)
     except ValueError:
         raise _not_reviewer() from None
-    return await _fresh_item(db, item.id)
+    try:
+        return await read_current_named_review_attempt(db, context, watch, member_slot)
+    except GithubApprovalError:
+        raise _binding_unavailable() from None
 
 
 @router.get('/github-work-items/{item_id}/review-binding', response_model=GithubReviewBindingResponse)
@@ -4083,6 +4144,20 @@ async def leader_finalize_merged(item_id: int, request: FinalizeMergedLeaderRequ
             expected_context_sha256=request.expected_context_sha256, reason=request.reason)))
 
 
+@router.get('/github-work-items/{item_id}/leader-recovery/release-workspace/context',
+            response_model=WorkspaceReleaseContext)
+async def leader_workspace_release_context(
+    item_id: int,
+    response: Response,
+    session: MailAgentSession | None = Depends(mail_session),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services import github_leader_recovery_service as recovery
+    response.headers["Cache-Control"] = "no-store"
+    return await _leader_recovery(item_id, session, db, 'agent_teams.leader_workspace_release_context',
+        lambda item: recovery.release_workspace_context(db, item, session))
+
+
 @router.post('/github-work-items/{item_id}/leader-recovery/release-workspace')
 async def leader_release_workspace(item_id: int, request: ReleaseWorkspaceRequest,
     session: MailAgentSession | None = Depends(mail_session), db: AsyncSession = Depends(get_db)):
@@ -4090,6 +4165,14 @@ async def leader_release_workspace(item_id: int, request: ReleaseWorkspaceReques
     return await _leader_recovery(item_id, session, db, 'agent_teams.leader_release_workspace',
         lambda item: recovery.release_workspace(db, item, session, workspace_id=request.workspace_id,
             expected_leased_at=request.leased_at(), operation_id=request.operation_id, reason=request.reason))
+
+
+@router.post('/github-work-items/{item_id}/leader-recovery/end-stopped')
+async def leader_end_stopped(item_id: int, request: EndStoppedItemRequest,
+    session: MailAgentSession | None = Depends(mail_session), db: AsyncSession = Depends(get_db)):
+    from app.services import github_leader_recovery_service as recovery
+    return await _leader_recovery(item_id, session, db, 'agent_teams.leader_end_stopped',
+        lambda item: recovery.end_stopped(db, item, session, request))
 
 
 async def _with_reader(db, item_id, call):

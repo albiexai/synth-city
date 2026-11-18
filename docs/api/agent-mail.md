@@ -230,17 +230,24 @@ Receipt recipients are snapshotted when the message is stored. A keyed replay us
 Rules, each with a code the server also uses:
 
 - **Phase and actions:** `continuation_phase_invalid`; an amendment must be implementation (`amendment_diagnostic_restoration_required`); `execution_target_invalid`; unknown actions (`allowed_actions_invalid`); an implementation needs `push_pr_head` and `request_verification` (`implementation_completion_actions_required`); a diagnostic needs `revert_diagnostic_changes` (`diagnostic_revert_required`) and, when hosted-only, no local build command; `install_hosted_ci_tool` and `tool_fallbacks` go together (`hosted_tool_fallback_required`, `tool_fallbacks_invalid`, `hosted_tool_target_required`).
-- **Paths:** repo-relative, no `..`, no absolute or backslash form, no glob characters (`allowed_paths_invalid`, `allowed_paths_required`); an amendment names closed files (`amendment_closed_file_paths_required`). Companion paths from the checked-in map that the request omits are listed as a warning (`companion_paths_added`), and the path limit is checked with them counted.
+- **Paths:** repo-relative, no `..`, no absolute or backslash form, no glob characters (`allowed_paths_invalid`, `allowed_paths_required`); an amendment names closed files (`amendment_closed_file_paths_required`). Companion paths from the checked-in map that the request omits are listed as a warning (`companion_paths_added`). They are counted on their own bound of 32 per request (`continuation_path_limit_exceeded` when over it), not against the scope's path limit, which counts only the named paths, and they never count toward an amendment's added-path cap. Only companions recorded in the amendment's digest-verified trailer are counted this way; any other path counts as named.
 - **Submit schema:** the limits the real submit routes enforce with a 422 are reported as problems too (`request_schema_invalid`, with the field and the constraint, never the value you sent): `max_failed_heads` of at least 1, a summary of at most 12000 characters, a tool-fallback package of at most 200 characters, and the field types. The submit responses are unchanged.
 - **Field types:** a value of the wrong type for any field, such as a list or object given as `phase`, `execution_target` or `summary`, is a problem on that field (never a server error), and the other fields are still checked.
-- **Independent fields:** each field is judged on its own, so one bad field does not hide another field's problem, including the path and command limits and the companion-inclusive path limit.
+- **Independent fields:** each field is judged on its own, so one bad field does not hide another field's problem, including the path and command limits and the companion bound.
 - **Action rule:** an implementation needs `push_pr_head` and `request_verification`, as the submit routes have always required; `edit_production` is not required, so a tests-only implementation stays a tests-only grant.
 - **Limits:** paths, commands and failed heads per revision, from the scope (`continuation_path_limit_exceeded`, `continuation_command_limit_exceeded`, `continuation_failed_head_limit_exceeded`); an empty summary or the reserved companion trailer in a summary.
 - **Initial plan:** `plan_metadata.allowed_paths` must be a non-empty list of closed file paths (`plan_allowed_paths_missing`); later amendments read it. Reserved keys are refused.
 - **Stale authority:** unread stop, hold or decision Mail for the owner (`unread_authority_mail`, which names only the message id).
-- **Estimate:** an optional `estimate_active_minutes` (a number, or an object with `high` and optionally `low`) is compared with the current authority window. Today that window is the one fixed expiry every revision gets (`github_continuation_proposal_expiry_seconds`, 60 minutes). An upper bound above it is `estimate_exceeds_window`; within 10 minutes of it is a warning, `estimate_near_window`; an unusable value is `estimate_invalid`. The estimate is never stored. The item ceiling, a scope maximum window and an estimate-derived window are not part of this check yet (#938).
+- **Estimate:** an optional `estimate_active_minutes` (a number, or an object with `high` and optionally `low`) is compared with the scope's `max_item_effort_minutes` (default 120). An upper bound above it is `estimate_exceeds_window`; within 10 minutes of it is a warning, `estimate_near_window`; an unusable value is `estimate_invalid`. Preflight never stores the estimate; approval turns it into the item's effort limit (see [Effort limits and extensions](#effort-limits-and-extensions)). The one-hour proposal expiry (`github_continuation_proposal_expiry_seconds`) only bounds the path from proposal to activation and does not judge an estimate.
 
 The continuation and amendment submit routes run the same checks and refuse with the same first code and status as before, so a request that passes preflight is not refused for these rules. Rules that need stored state, such as budgets, a pending request or the repository head, are still checked only when you submit.
+
+## Effort limits and extensions
+
+- `POST /api/v1/agent-mail/effort-extensions` takes a Mail session of the item's current Leader. The body has `work_item_id`, `dispatch_nonce`, `minutes` (a whole number, at most the step cap), `expected_extension_minutes` (the extension total the Leader saw), `reason` and `evidence`. The MCP tool is `synth_city_extend_effort_limit`.
+- A refusal's `detail` is one code: `effort_extension_stale`, `not_item_leader`, `extension_reason_required`, `extension_evidence_required`, `expected_extension_minutes_required`, `effort_limit_not_set`, `extension_exceeds_cap`, `effort_extension_total_changed`, `extension_exceeds_ceiling`, `effort_extension_not_acknowledged`, `effort_extension_paused` or `effort_extension_no_recent_activity`.
+- At approval an estimate over the ceiling is refused with `effort_estimate_exceeds_ceiling`, and an unreadable estimate with `effort_estimate_invalid`.
+- The scope setting is `max_item_effort_minutes`, changed with `PATCH /api/v1/agent-teams/github-scopes/{scope_id}` (operator token). It accepts 15 to 1440 and defaults to 120.
 
 ## Healthy scope amendments and submitted review settlement
 
@@ -249,6 +256,8 @@ The owner requests `POST /github-work-items/{id}/scope-amendments` with the same
 proposal fields as a continuation, with `phase: implementation`. The server assigns immutable
 `origin_kind: scope_amendment`; ordinary continuations retain their escalation and PR requirements.
 The corresponding MCP tool is `synth_city_request_scope_amendment`.
+
+`allowed_paths` is the amendment's whole effective path set: name every approved path you keep as well as the new ones, because completion checks changed files against exactly this list. List each approved path you deliberately drop in the optional `withdrawn_paths`. If approved paths are missing and `withdrawn_paths` doesn't list exactly those, the request is refused before anything is stored: `409 amendment_base_paths_omitted` when nothing is withdrawn, `409 amendment_withdrawn_paths_invalid` otherwise. Companion paths count as named. Existing revisions keep the allowed paths they were approved with.
 
 A healthy amendment works before a PR exists. It reads the assigned branch's committed head
 and tree without discarding held edits. Its path baseline must come from structured approved
@@ -306,18 +315,25 @@ A real failed check in the same observation still charges the head once.
 
 ### Leader-run standard recoveries
 
-Three recoveries that only the operator API offered are also available to the current Leader, through
-`synth_city_leader_cancel_revision`, `synth_city_leader_finalize_merged` and
-`synth_city_leader_release_workspace` (routes under `POST /github-work-items/{id}/leader-recovery/`:
-`cancel-revision`, `finalize-merged/preview`, `finalize-merged` and `release-workspace`). Each one calls the
+The current Leader can use `synth_city_leader_cancel_revision`, `synth_city_leader_finalize_merged`,
+`synth_city_leader_release_workspace` and `synth_city_leader_end_stopped`. Their routes are under
+`POST /github-work-items/{id}/leader-recovery/`. Each one calls the
 operator service, so it keeps every operator guard, and adds these checks: the caller is the current Leader
 and differs from the owner, there is no pause or HOLD, and a Supervisor is bound.
 
 - **Cancel** needs the revision number, nonce and a reason, and cancels one active or submitted revision.
 - **Finalize merged** first reads fresh merge evidence and a digest (`dry_run`, the default in the tool),
   then records the merge only if the digest still matches. It performs no merge and releases nothing.
-- **Release workspace** needs the inspected `leased_at`. The item must be terminal and the tree clean, with no
-  unpushed commits. A dirty, unpushed or unreadable tree is refused and stays an operator action.
+- **Release workspace** uses the `workspace_id` and exact `leased_at` from
+  `synth_city_get_work_item_context(work_item_id, leader_release=True)`
+  (`GET /github-work-items/{id}/leader-recovery/release-workspace/context`). The current Leader
+  passes those values as `workspace_id` and `expected_leased_at`. This read leaves the workspace
+  lease in place and returns only the work item ID, workspace ID, and UTC lease start.
+  Release requires a terminal item and a clean, readable tree. Commits outside the local base must
+  match the head, branch and source repository of the recorded PR, including a closed unmerged PR.
+- **End stopped work** uses the generation and scope revision from `synth_city_list_work_items`. It records
+  `deferred` with a target milestone or `superseded` with the delivering merged PR. It releases a verified clean
+  lease and clears the stopped item's current attention. See [Maintenance](agent-teams.md#maintenance).
 
 Every request carries an `operation_id`. The same request again is a replay and never repeats the action; a
 different request under the same id is refused as `operation_conflict`. The action keeps its existing audit

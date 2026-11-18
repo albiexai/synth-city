@@ -47,13 +47,15 @@ from app.services.github_ci_watch_service import github_ci_watch_service
 from app.services.github_terminal_revision_service import (
     TerminalRevisionContextChanged, complete_current_revision, lock_terminal_transition,
 )
-from app.services.github_dispatch_service import github_dispatch_service
+from app.services.github_dispatch_service import github_dispatch_service, restored_escalation_reason
+from app.services.github_rate_limit_service import GithubRateLimited
 from app.services.github_recovery_gate import (
     GithubRecoveryOnlyAttempt,
     configured_recovery_only_attempt,
 )
 from app.services.github_workspace_service import github_workspace_service
 from app.services.team_communication_policy import HUMAN_REVIEW_SUMMARY_GUIDANCE
+from app.services.session_recovery import recover_session
 
 from app.services.factory_delivery_policy import (
     claim_policy_context, effective_policy, policy_context, policy_context_conditions,
@@ -72,6 +74,9 @@ _HUMAN_MERGE_NOTE_PREFIXES = (
     "Auto-merge failed",
     "Auto-merge retry budget exhausted",
 )
+# The two human-merge fallbacks whose cause can clear without a person (#1037).
+_CAP_FALLBACK_PREFIX = "Auto-merge budget exhausted"
+_STALL_FALLBACK_PREFIX = "Auto-merge blocked: GitHub checks stalled"
 _MERGE_TRANSIENT_STATUS_CODES = {405, 409, 422}
 # Escalations a late PR legitimately resolves: the agent said it was stuck, or Albiex Synth City
 # inferred it from a timer. Anything not listed stays rejected by default.
@@ -136,6 +141,58 @@ class GithubVerificationService:
         self._logged_inconsistent: set[tuple] = set()
         # The items verification skipped in the current poll: read by the scheduler for #941's skipped-item detector.
         self.skipped_item_ids: set[int] = set()
+
+    @staticmethod
+    def _same_tree_entry(
+        left: Mapping[str, GithubTreeEntry], right: Mapping[str, GithubTreeEntry], path: str,
+    ) -> bool:
+        a, b = left.get(path), right.get(path)
+        if a is None or b is None:
+            return a is None and b is None
+        return (a.mode, a.object_type, a.sha) == (b.mode, b.object_type, b.sha)
+
+    async def _base_side_paths(
+        self,
+        scope: TeamGithubScope,
+        item: GithubWorkItem,
+        revision: GithubAttemptScopeRevision,
+        client: GithubClient,
+        token: str,
+        pull: dict,
+        head_sha: str,
+        baseline_tree: Mapping[str, GithubTreeEntry],
+        current_tree: Mapping[str, GithubTreeEntry],
+        paths: set[str],
+    ) -> set[str]:
+        """The given paths that only a base update changed, so they are not scope growth (#1030).
+
+        A path is base-side when the PR's own diff leaves it untouched both at the revision's baseline and at the
+        head: each matches its merge base with the PR's current base tip. An edit of that path in the PR, before or
+        after the baseline, is still the PR's own change. Any missing, foreign or unreadable evidence is inconclusive.
+        """
+        base = pull.get("base")
+        base_ref = base.get("ref") if isinstance(base, dict) else None
+        base_sha = base.get("sha") if isinstance(base, dict) else None
+        try:
+            expected_ref = await self.normalize_base_ref(scope, client, token=token, base_ref=item.dispatch_base_ref)
+            if base_ref != expected_ref:
+                raise ValueError("the PR base is not the item's dispatch base")
+            merge_trees = []
+            for commit_sha in (revision.baseline_head_sha, head_sha):
+                merge_base = await client.get_merge_base(
+                    scope.repo_owner, scope.repo_name, base_sha, commit_sha, token=token)
+                snapshot = await client.get_commit_snapshot(
+                    scope.repo_owner, scope.repo_name, merge_base, token=token)
+                merge_trees.append(await client.get_recursive_tree(
+                    scope.repo_owner, scope.repo_name, snapshot.tree_sha, token=token))
+        except (ValueError, GithubClientResponseError, httpx.HTTPError) as exc:
+            raise ContinuationCompletionError("continuation_diff_inconclusive") from exc
+        at_baseline, at_head = merge_trees
+        return {
+            path for path in paths
+            if self._same_tree_entry(baseline_tree, at_baseline, path)
+            and self._same_tree_entry(current_tree, at_head, path)
+        }
 
     @staticmethod
     def _changed_tree_paths(
@@ -268,6 +325,11 @@ class GithubVerificationService:
             path for path in changed_paths
             if not github_approval_service.path_is_allowed(path, revision.allowed_paths)
         }
+        if outside_paths:
+            outside_paths -= await self._base_side_paths(
+                scope, item, revision, client, token, pull, current_head_sha,
+                baseline_tree, current_tree, outside_paths,
+            )
         import_conditions = []
         if outside_paths:
             import_conditions = source_import_claim_conditions(item, revision, workspace, scope)
@@ -503,7 +565,7 @@ class GithubVerificationService:
             .where(*item_conditions)
             .values(
                 dispatch_status="escalated",
-                escalation_reason=revision.originating_escalation_reason,
+                escalation_reason=restored_escalation_reason(revision),
                 status_note=(
                     "Diagnostic restoration verified. Propose the smallest bounded "
                     "implementation continuation supported by the evidence."
@@ -1068,7 +1130,9 @@ class GithubVerificationService:
                 # A proposed, rejected or approved-but-unacknowledged amendment
                 # stops the whole round. It cannot advance old source through CI,
                 # but a merged PR is an external fact that the stopped round must not hide.
-                await self._settle_merged_while_round_stopped(db, scope, item, client)
+                await self._settle_merged_revision(
+                    db, scope, item, client, statuses=("submitted",),
+                    source="github_verification_service._settle_merged_while_round_stopped")
                 if inspect(item).unloaded:  # the merge check rolled back and expired the item
                     await db.refresh(item)
                 await self._observe_superseded_revision(db, scope, item, client)
@@ -1084,7 +1148,13 @@ class GithubVerificationService:
                             elif await self._superseded_revision(db, item) is not None:
                                 await self._observe_superseded_revision(db, scope, item, client)
                             else:
-                                self._log_inconsistent_once(item)
+                                # #1080: a completed revision that is not a positive settlement still settles a merged
+                                # PR; the item counts as skipped only while it stays verifying.
+                                snapshot = self._state_snapshot(item)
+                                await self._settle_merged_revision(db, scope, item, client, statuses=("completed",))
+                                if await db.scalar(select(GithubWorkItem.dispatch_status).where(
+                                        GithubWorkItem.id == snapshot[0])) == "verifying":
+                                    self._log_inconsistent_once(None, snapshot=snapshot)
                             continue
                         if revision.phase == "diagnostic":
                             if item.dispatch_status != "dispatched":
@@ -1106,6 +1176,8 @@ class GithubVerificationService:
                             )
                             continue
                         if item.dispatch_status == "dispatched":
+                            # The revision's work is not submitted, but a merged PR is an external fact (#1078).
+                            await self._settle_merged_revision(db, scope, item, client, statuses=("active",))
                             continue
                     await self._verify_item(
                         db,
@@ -1128,6 +1200,9 @@ class GithubVerificationService:
                 await db.rollback()
                 await db.refresh(scope)
                 logger.info("Terminal attempt changed; no merge transition recorded")
+            except GithubRateLimited:
+                await db.rollback()
+                raise
             except GithubCheckObservationError as exc:
                 # Missing or ambiguous CI evidence must not consume a retry or
                 # diagnostic budget. Continue polling the other work items.
@@ -1141,9 +1216,10 @@ class GithubVerificationService:
                 logger.exception(
                     "GitHub verification failed for work item %s", item.id
                 )
-                self._set_failure_note(
-                    item, f"GitHub verification failed; will retry: {exc}"
-                )
+                note = f"GitHub verification failed; will retry: {exc}"
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (401, 403):
+                    note = f"GitHub authentication or permissions failed (HTTP {exc.response.status_code})."
+                self._set_failure_note(item, note)
                 item.updated_at = datetime.utcnow()
                 await db.commit()
 
@@ -1157,7 +1233,7 @@ class GithubVerificationService:
 
             await github_summary_publication_service.publish_scope(db, scope, client)
         except Exception as exc:
-            await db.rollback()
+            await recover_session(db, exc, discard=True)
             logger.warning("summary_publication_failed error_type=%s", type(exc).__name__)
 
     async def _reconcile_escalated_merges(
@@ -1206,6 +1282,8 @@ class GithubVerificationService:
                     db, scope, item, client,
                     notify=recovery_only_attempt is None,
                 )
+            except GithubRateLimited:
+                raise
             except (httpx.HTTPError, GithubClientResponseError, ValueError):
                 # Observation failure is not another implementation failure.
                 logger.warning(
@@ -1260,28 +1338,21 @@ class GithubVerificationService:
         ))
         if await db.scalar(select(pending_approval)):
             return
-        revision = await self._active_scope_revision(db, item)
-        if item.active_scope_revision and (
-            revision is None or revision.phase != "implementation"
-            or revision.status != "submitted"
-        ):
+        # #1079: an escalated attempt's revision may be active, submitted or exhausted when its PR merges.
+        revision = await self._escalated_merge_revision(db, item) if item.active_scope_revision else None
+        if item.active_scope_revision and revision is None:
             return
-        revision_guard = ()
-        if revision is not None:
-            revision_guard = (exists(select(GithubAttemptScopeRevision.id).where(
-                GithubAttemptScopeRevision.id == revision.id,
-                GithubAttemptScopeRevision.work_item_id == item.id,
-                GithubAttemptScopeRevision.dispatch_nonce == expected["dispatch_nonce"],
-                GithubAttemptScopeRevision.owner_slot_id == expected["owner_slot_id"],
-                GithubAttemptScopeRevision.revision == expected["active_scope_revision"],
-                GithubAttemptScopeRevision.phase == "implementation",
-                GithubAttemptScopeRevision.status == "submitted",
-                GithubAttemptScopeRevision.submitted_head_sha == revision.submitted_head_sha,
-            )),)
         workspace = None
         lease_snapshot = None
         revision_snapshot = ({column.name: getattr(revision, column.name)
             for column in revision.__table__.columns} if revision is not None else {})
+        revision_guard = ()
+        if revision is not None:  # the exact revision the decision is made on, whatever its status
+            revision_guard = (exists(select(GithubAttemptScopeRevision.id).where(
+                GithubAttemptScopeRevision.owner_slot_id == expected["owner_slot_id"],
+                *(_same_value(getattr(GithubAttemptScopeRevision, key), value)
+                  for key, value in revision_snapshot.items()),
+            )),)
         closed_policy_guard = policy_context(item)
         if revision is not None:
             workspace = await db.scalar(select(GithubWorkspace).where(
@@ -1302,7 +1373,8 @@ class GithubVerificationService:
                     guards=(enabled_scope, ~pending_approval),
                 )
             return
-        closed_submitted = verdict == "closed_unmerged" and revision is not None
+        # Only a submitted revision is superseded by a closed PR; an active or exhausted one is left as it is.
+        closed_submitted = verdict == "closed_unmerged" and revision is not None and revision.status == "submitted"
         if not closed_submitted and (verdict != "merged" or pull.get("merged") is not True):
             return
         if self._pull_number(pull) != expected["pr_number"]:
@@ -1310,8 +1382,16 @@ class GithubVerificationService:
         head_sha = self._head_sha(pull)
         if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
             raise ValueError("merged PR head SHA is unavailable")
-        if revision is not None and head_sha != revision.submitted_head_sha:
-            return
+        # #1164: a superseded revision never settles by its own head; only an exact active acceptance does.
+        submitted_head = None if revision is not None and revision.status == "superseded" else (
+            revision.submitted_head_sha if revision is not None else None)
+        if revision is not None and head_sha != submitted_head and not (
+                verdict == "merged" and await db.scalar(select(exists().where(
+                    GithubHeadReview.work_item_id == item.id,
+                    GithubHeadReview.dispatch_nonce == expected["dispatch_nonce"],
+                    GithubHeadReview.pr_number == expected["pr_number"], GithubHeadReview.head_sha == head_sha,
+                    GithubHeadReview.verdict == "accepted", GithubHeadReview.status == "active")))):
+            return  # nobody submitted or accepted this head: it stays escalated for the operator (#1038 Q1)
         expected_base = await self.normalize_base_ref(
             scope, client, token=None, base_ref=expected["dispatch_base_ref"]
         )
@@ -1381,12 +1461,18 @@ class GithubVerificationService:
             return
         await self._mark_merged_with_fact(
             db, item, pull, source="github_verification_service._reconcile_escalated_merge")
-        if revision is not None:
-            revision.status = "completed"
+        if revision is not None and revision_snapshot["status"] in ("active", "submitted"):
+            revision.status = "completed"  # an exhausted revision stays exhausted (#1038 Q2)
             revision.completed_at = datetime.utcnow()
             await self._record_revision_outcome(
                 db, item, revision, "completed",
                 source="github_verification_service._reconcile_escalated_merge")
+        from app.services import factory_audit_service as _audit
+        await _audit.record_merged_settlement(
+            db, item_id=item.id, revision_id=revision.id if revision is not None else None,
+            reason=("pr_merged_while_escalated" if revision is None
+                    else f"pr_merged_while_escalated_with_{revision_snapshot['status']}_revision"),
+            source="github_verification_service._reconcile_escalated_merge")
         await db.commit()
         if notify:
             await self._notify_blocker_merged(db, scope, item)
@@ -1449,7 +1535,7 @@ class GithubVerificationService:
             return
         if await self._review_hold_note(scope, item, client, pull) is not None:
             return
-        reason = item.escalation_reason or "unknown"
+        reason = item.escalation_reason or "escalation_reason_missing"  # a legacy empty row (#1139)
         settled = await self._settled_diagnostic_revision(db, item)
         if settled is None:
             await self._record_escalated_not_fired(
@@ -1569,20 +1655,30 @@ class GithubVerificationService:
             raise
         await db.refresh(item)
 
-    async def _settle_merged_while_round_stopped(
-        self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, client: GithubClient
+    async def _settle_merged_revision(
+        self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, client: GithubClient, *,
+        statuses: tuple[str, ...],
+        source: str = "github_verification_service._settle_merged_revision",
     ) -> None:
-        """Record a merge that happened while an unacknowledged amendment stopped the round.
+        """Record a merge on an item whose round does not otherwise read its PR: an unacknowledged amendment stopped
+        it, or its active revision is not submitted yet (#1078).
 
-        Only a merged PR changes anything here; an open or closed pull leaves the stopped round as it is.
-        A failure for this item is logged and isolated, and never stops the other items.
+        Only a merged PR changes anything here; an open or closed pull leaves the item as it is. ``statuses`` are the
+        revision states this caller may settle. A failure for this item is logged and isolated, and never stops the
+        other items.
         """
         item_id = item.id
         try:
             if item.dispatch_status not in ("dispatched", "verifying") or item.active_scope_revision <= 0:
                 return
-            revision = await self._active_scope_revision(db, item)
-            if revision is None or revision.status != "submitted" or revision.phase != "implementation":
+            # The current revision by number, in one of the caller's states (#1080: a completed one too).
+            revision = await db.scalar(select(GithubAttemptScopeRevision).where(
+                GithubAttemptScopeRevision.work_item_id == item.id,
+                GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce,
+                GithubAttemptScopeRevision.revision == item.active_scope_revision,
+            ).execution_options(populate_existing=True))
+            if (revision is None or revision.status not in statuses or revision.phase != "implementation"
+                    or item.attempt_phase != revision.phase):
                 return
             pull = await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
             if self._classify_pull(pull) != "merged" or pull.get("merged") is not True:
@@ -1590,17 +1686,15 @@ class GithubVerificationService:
             expected_base = await self.normalize_base_ref(
                 scope, client, token=None, base_ref=item.dispatch_base_ref)
             self._verify_pull_identity(pull, scope, item, expected_base=expected_base)
-            await self._settle_merged_submitted(
-                db, scope, item, client, revision, pull,
-                source="github_verification_service._settle_merged_while_round_stopped")
+            await self._settle_merged_submitted(db, scope, item, client, revision, pull, source=source)
         except TerminalRevisionContextChanged:
             await db.rollback()
             await db.refresh(scope)
             logger.info("Terminal attempt changed; no merge transition recorded")
-        except Exception:
+        except Exception as caught_error:
+            await recover_session(db, caught_error, discard=True)
             logger.warning("Merged-PR check failed for work item %s; the item stays as it is", item_id,
                            exc_info=True)
-            await db.rollback()
             await db.refresh(scope)
 
     async def _settled_revision(
@@ -1685,6 +1779,8 @@ class GithubVerificationService:
                 await self._promote_settled_revision(db, scope, item, client, revision, pull)
         except TerminalRevisionContextChanged:
             raise  # the caller rolls back and records that the attempt changed
+        except GithubRateLimited:
+            raise
         except (httpx.HTTPError, GithubClientResponseError):
             # An unreadable or uninterpretable GitHub response is a failed read: nothing changes, nothing is logged.
             await db.rollback()
@@ -1750,6 +1846,8 @@ class GithubVerificationService:
             await db.rollback()
             await db.refresh(scope)
             logger.info("Terminal attempt changed; no promotion recorded")
+        except GithubRateLimited:
+            raise
         except (httpx.HTTPError, GithubClientResponseError):
             await db.rollback()
             await db.refresh(scope)
@@ -1757,10 +1855,10 @@ class GithubVerificationService:
             await db.rollback()
             await db.refresh(scope)
             self._log_inconsistent_once(None, f"a PR response failed the identity check ({exc})", snapshot=snapshot)
-        except Exception:
+        except Exception as caught_error:
+            await recover_session(db, caught_error, discard=True)
             logger.warning("Superseded-revision check failed for work item %s; the item stays as it is",
                            snapshot[0], exc_info=True)
-            await db.rollback()
             await db.refresh(scope)
 
     async def _promote_settled_revision(
@@ -1807,7 +1905,11 @@ class GithubVerificationService:
             if acceptance_note is not None:
                 reason = f"{label} revision not promoted: {acceptance_note}"
             elif not await self._head_is_green(scope, client, head, item=item):
-                reason = f"{label} revision not promoted: the required checks are not all green at {head[:7]}."
+                failed_statuses = await self._failed_commit_statuses(scope, client, head)
+                reason = (
+                    f"{label} revision not promoted: commit status failed at {head[:7]}: "
+                    f"{', '.join(failed_statuses)}." if failed_statuses else
+                    f"{label} revision not promoted: the required checks are not all green at {head[:7]}.")
             elif superseded:
                 refusal = await self._capture_superseded_fence(db, scope, item, head)
                 if isinstance(refusal, str):
@@ -2011,11 +2113,13 @@ class GithubVerificationService:
         *,
         source: str,
     ) -> None:
-        """A PR merged while a revision is submitted or positively settled: settle only at a head someone submitted or accepted.
+        """A PR merged while a revision is active, submitted or positively settled: settle only at a head someone
+        submitted or accepted.
 
-        The merged head must equal the revision's submitted head or the head of an active accepted review.
-        Then a submitted revision completes (a settled one already is, and keeps its status, its time and its
-        one outcome record) and the item is merged. Any other merged head escalates with a note naming
+        The merged head must equal the revision's submitted head or the head of an active accepted review; an active
+        revision has no submitted head, so only an accepted review authorizes it (#1078). Then an active or submitted
+        revision completes (a settled one already is, and keeps its status, its time and its one outcome record), the
+        item is merged and one merged_settlement audit event names the state it settled from. Any other merged head escalates with a note naming
         both heads and records no merge; a settled revision stays as it was. Everything the decision rests on is captured before the awaited reads.
         The PR is read again and must pass the full identity check; then the terminal writer is taken and the
         captured item, scope and exact revision must still be what they were, so BOTH outcomes are fenced and a
@@ -2052,7 +2156,7 @@ class GithubVerificationService:
         if ({name: getattr(item, name) for name in _SETTLEMENT_ITEM_IDENTITY} != item_before
                 or {name: getattr(scope, name) for name in _SETTLEMENT_SCOPE_IDENTITY} != scope_before
                 or {column.name: getattr(revision, column.name) for column in revision.__table__.columns} != revision_before
-                or revision.status not in ("submitted", "completed")):
+                or revision.status not in ("active", "submitted", "completed")):
             raise TerminalRevisionContextChanged("terminal_revision_context_changed")
         settled = revision.status == "completed"
         authorized = head == revision.submitted_head_sha or bool(await db.scalar(select(exists().where(
@@ -2070,7 +2174,7 @@ class GithubVerificationService:
             GithubAttemptScopeRevision.work_item_id == item_id,
             GithubAttemptScopeRevision.dispatch_nonce == nonce,
             GithubAttemptScopeRevision.revision == item.active_scope_revision,
-            GithubAttemptScopeRevision.status == ("completed" if settled else "submitted"),
+            GithubAttemptScopeRevision.status == revision_before["status"],
         ).values(**values).execution_options(synchronize_session=False))
         if claim.rowcount != 1:
             raise TerminalRevisionContextChanged("terminal_revision_context_changed")
@@ -2080,13 +2184,37 @@ class GithubVerificationService:
         if not authorized:
             await github_dispatch_service.escalate_without_notification(
                 db, item, "continuation_invalid_state",
-                f"PR #{pr_number} merged at head {head}, which is not the submitted revision head "
-                f"{revision_before['submitted_head_sha']} or an accepted head; no merge was recorded. An operator "
-                "must review and finalize this item.")
+                f"PR #{pr_number} merged at head {head}, which is not "
+                + (f"the submitted revision head {revision_before['submitted_head_sha']}"
+                   if revision_before["submitted_head_sha"] else "a submitted head (the revision was still active)")
+                + " or an accepted head; no merge was recorded. An operator must review and finalize this item.")
             return
         await self._mark_merged_with_fact(db, item, current, source=source)
+        from app.services import factory_audit_service as _audit
+        await _audit.record_merged_settlement(
+            db, item_id=item_id, revision_id=revision.id,
+            reason=f"pr_merged_with_{revision_before['status']}_revision", source=source)
         await db.commit()
         await self._notify_blocker_merged(db, scope, item)
+
+    async def _escalated_merge_revision(
+        self, db: AsyncSession, item: GithubWorkItem,
+    ) -> GithubAttemptScopeRevision | None:
+        """The escalated attempt's current implementation revision when a merge may settle it (#1079).
+
+        Unlike the active-revision lookup, an exhausted revision is returned too, and so is a superseded one (#1164:
+        cancelled through the Leader's tool while escalated). A superseded revision has no submitted head, so it
+        settles only by an active acceptance of the merged head. Any other status is not returned.
+        """
+        revision = await db.scalar(select(GithubAttemptScopeRevision).where(
+            GithubAttemptScopeRevision.work_item_id == item.id,
+            GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce,
+            GithubAttemptScopeRevision.revision == item.active_scope_revision,
+        ).execution_options(populate_existing=True))
+        if (revision is None or revision.phase != "implementation" or item.attempt_phase != revision.phase
+                or revision.status not in ("active", "submitted", "exhausted", "superseded")):
+            return None
+        return revision
 
     async def _active_scope_revision(
         self,
@@ -2535,12 +2663,12 @@ class GithubVerificationService:
                 db, scope, item, slots
             )
             await db.commit()
-        except Exception:
+        except Exception as caught_error:
+            await recover_session(db, caught_error, discard=True)
             logger.exception(
                 "Failed to send blocker-merged notification for work item %s",
                 item.id,
             )
-            await db.rollback()
 
     async def _completion_head_is_current(self, db, scope, item, client, head_sha, *, revision=None):
         """Check remote identity again after fetching checks, before publishing a handoff."""
@@ -2894,7 +3022,14 @@ class GithubVerificationService:
         if item.issue_type == "design" or scope.merge_policy != "auto":
             return
         if item.status_note and item.status_note.startswith(_HUMAN_MERGE_NOTE_PREFIXES):
-            return
+            cleared_note = await self._cleared_fallback_note(db, scope, item, client, pull)
+            if cleared_note is None:
+                return
+            item.status_note = cleared_note
+            item.merge_wait_head_sha = None
+            item.merge_wait_started_at = None
+            item.updated_at = datetime.utcnow()
+            await db.commit()
         readiness_note = self._draft_readiness_note(item, pull)
         if readiness_note is not None:
             await self._record_readiness_hold(db, item, readiness_note)
@@ -2952,8 +3087,12 @@ class GithubVerificationService:
             # Preserve the wait bound if another check started during this read.
             if await self._wait_for_merge_checks(db, scope, item, client, current_head):
                 return
+            failed_statuses = await self._failed_commit_statuses(scope, client, current_head)
             item.dispatch_status = "verifying"
             item.status_note = (
+                f"Auto-merge did not fire: commit status failed on head {current_head}: "
+                f"{', '.join(failed_statuses)}. Re-verifying before auto-merge."
+                if failed_statuses else
                 "Head changed or is no longer green since promotion; re-verifying "
                 "before auto-merge."
             )
@@ -2963,6 +3102,8 @@ class GithubVerificationService:
         # Owner readiness and labels can change while checks are read.
         try:
             fresh_pull = await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
+        except GithubRateLimited:
+            raise
         except (httpx.HTTPError, GithubClientResponseError):
             await self._record_readiness_hold(
                 db, item, "PR readiness could not be read; automatic merge is blocked.")
@@ -3020,6 +3161,8 @@ class GithubVerificationService:
                 int(item.pr_number),
                 expected_head_sha=current_head,
             )
+        except GithubRateLimited:
+            raise
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code
             if status_code in _MERGE_TRANSIENT_STATUS_CODES or status_code >= 500:
@@ -3221,6 +3364,8 @@ class GithubVerificationService:
             return "Review hold label is invalid; automatic merge is blocked."
         try:
             issue = await client.get_issue(scope.repo_owner, scope.repo_name, item.issue_number)
+        except GithubRateLimited:
+            raise
         except (httpx.HTTPError, GithubClientResponseError):
             return unknown
         if not isinstance(issue, dict) or type(issue.get("number")) is not int or issue["number"] != item.issue_number:
@@ -3362,6 +3507,33 @@ class GithubVerificationService:
             scope.repo_owner, scope.repo_name, head_sha,
         )
         required_ci_attention.note_readable(item)
+        pending = self._pending_merge_checks(checks, status, head_sha)
+        if not pending:
+            # A later pending period on this head starts its own wait (#1037).
+            item.merge_wait_head_sha = None
+            item.merge_wait_started_at = None
+            return False
+        now = datetime.utcnow()
+        if item.merge_wait_head_sha != head_sha or item.merge_wait_started_at is None:
+            item.merge_wait_head_sha = head_sha
+            item.merge_wait_started_at = now
+        names = ", ".join(pending)
+        if now - item.merge_wait_started_at >= _MERGE_CHECK_WAIT_LIMIT:
+            await self._fallback_to_human_merge(
+                db,
+                item,
+                f"Auto-merge blocked: GitHub checks stalled for 60 minutes on head {head_sha}. "
+                f"Pending checks: {names}.",
+            )
+        else:
+            item.status_note = f"Auto-merge waiting for checks on head {head_sha}: {names}."
+            item.updated_at = now
+        await db.commit()
+        return True
+
+    @staticmethod
+    def _pending_merge_checks(checks: list[dict], status: dict, head_sha: str) -> list[str]:
+        """The names of the head's check runs and commit statuses that have not finished."""
         pending = [
             str(check.get("name") or check.get("id") or "unnamed check")
             for check in checks
@@ -3383,25 +3555,38 @@ class GithubVerificationService:
             pending.append("pending commit status contexts")
         elif total_contexts > len(contexts) and status.get("state") != "success":
             pending.append("unobserved commit status contexts")
-        if not pending:
-            return False
-        now = datetime.utcnow()
-        if item.merge_wait_head_sha != head_sha or item.merge_wait_started_at is None:
-            item.merge_wait_head_sha = head_sha
-            item.merge_wait_started_at = now
-        names = ", ".join(pending)
-        if now - item.merge_wait_started_at >= _MERGE_CHECK_WAIT_LIMIT:
-            await self._fallback_to_human_merge(
-                db,
-                item,
-                f"Auto-merge blocked: GitHub checks stalled for 60 minutes on head {head_sha}. "
-                f"Pending checks: {names}.",
-            )
-        else:
-            item.status_note = f"Auto-merge waiting for checks on head {head_sha}: {names}."
-            item.updated_at = now
-        await db.commit()
-        return True
+        return pending
+
+    async def _cleared_fallback_note(
+        self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, client: GithubClient, pull: dict,
+    ) -> str | None:
+        """The note for a human-merge fallback whose cause has cleared, or ``None`` while it stays with a human (#1037).
+
+        Only two causes clear by themselves: the daily cap, once usage is below it, and a check stall, once every check
+        and status on the same verified head has finished green. Every other fallback needs a person. A cleared item
+        goes back through every gate of the automatic merge path.
+        """
+        note = item.status_note or ""
+        if note.startswith(_CAP_FALLBACK_PREFIX):
+            used, cap = await self._auto_merge_usage(db, scope)
+            if used < cap:
+                return f"Auto-merge offered again: {used} of {cap} automatic merges in the last 24 hours."
+            return None
+        if note.startswith(_STALL_FALLBACK_PREFIX):
+            head = self._head_sha(pull)
+            if not head or head != item.merge_wait_head_sha:
+                return None
+            checks = await client.list_check_runs_for_ref(scope.repo_owner, scope.repo_name, head)
+            status = await client.get_combined_status_for_ref(scope.repo_owner, scope.repo_name, head)
+            if self._pending_merge_checks(checks, status, head):
+                return None
+            # A finished red status is neither pending nor a check run; any status present must have succeeded.
+            if (status.get("total_count") or status.get("statuses")) and status.get("state") != "success":
+                return None
+            if not await self._head_is_green(scope, client, head, item=item):
+                return None
+            return f"Auto-merge offered again: the checks on head {head} finished."
+        return None
 
     async def _record_transient_merge_failure(
         self,
@@ -4088,7 +4273,30 @@ class GithubVerificationService:
             for check in checks
         ):
             return False
-        return all(check.get("conclusion") in _SUCCESS_CONCLUSIONS for check in checks)
+        if not all(check.get("conclusion") in _SUCCESS_CONCLUSIONS for check in checks):
+            return False
+        # #1076: this one status read decides. A failed, errored, pending or unobserved commit status is not green,
+        # even when an earlier read saw success; an empty aggregate (no statuses at all) is.
+        status = await client.get_combined_status_for_ref(scope.repo_owner, scope.repo_name, head_sha)
+        return not (self._failed_status_contexts(status) or self._pending_merge_checks([], status, head_sha))
+
+    async def _failed_commit_statuses(self, scope: TeamGithubScope, client: GithubClient, head_sha: str) -> list[str]:
+        """Read the head's commit statuses and name the contexts that ended in failure or error, for a note (#1076)."""
+        return self._failed_status_contexts(
+            await client.get_combined_status_for_ref(scope.repo_owner, scope.repo_name, head_sha))
+
+    @staticmethod
+    def _failed_status_contexts(status: dict) -> list[str]:
+        """The contexts in failure or error (#1076); a failed aggregate with no listed context fails closed."""
+        contexts = status.get("statuses") or []
+        failed = [
+            str(context.get("context") or "unnamed commit status")
+            for context in contexts
+            if isinstance(context, dict) and context.get("state") in _STATUS_FAILURE_STATES
+        ]
+        if not failed and status.get("state") in _STATUS_FAILURE_STATES:
+            failed.append("failed commit status contexts")  # the aggregate failed, but its contexts were not listed
+        return failed
 
 
 github_verification_service = GithubVerificationService()

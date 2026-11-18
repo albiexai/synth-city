@@ -465,7 +465,7 @@ async def test_escalated_merge_preserves_continuation_completion_guards(db, stat
     await db.refresh(item)
     await db.refresh(revision)
     await db.refresh(revision_workspace)
-    if state == "submitted":
+    if state in {"submitted", "active"}:  # #1079: an active revision's merged head settles too
         assert item.dispatch_status == "merged"
         assert revision.status == "completed"
         assert revision.completed_at is not None
@@ -1966,7 +1966,7 @@ async def test_dispatched_implementation_continuation_waits_for_completion_repor
 
     await db.refresh(item)
     await db.refresh(revision)
-    assert client.pull_calls == 0
+    assert client.pull_calls == 1  # #1078: one read, only to see whether the PR merged
     assert item.dispatch_status == "dispatched"
     assert revision.status == "active"
 

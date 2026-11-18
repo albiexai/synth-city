@@ -8,7 +8,7 @@
       "automation": {
         "configured_scopes": 3,
         "enabled_scopes": 2,
-        "intake_blocked_scopes": 0,
+        "intake_blocked_scopes": 1,
         "intake_eligible_scopes": 2,
         "intake_unknown_scopes": 0,
         "never_polled_scopes": 1,
@@ -22,13 +22,13 @@
         "stale_scopes": 0
       },
       "counts": {
-        "active": 27,
-        "attention": 26,
-        "finished": 26,
-        "queued": 14,
-        "review": 26,
+        "active": 24,
+        "attention": 24,
+        "finished": 36,
+        "queued": 12,
+        "review": 24,
         "total": 132,
-        "unknown": 13
+        "unknown": 12
       },
       "filters": {
         "provider": null,
@@ -50,7 +50,7 @@
       "automation": {
         "configured_scopes": 3,
         "enabled_scopes": 2,
-        "intake_blocked_scopes": 2,
+        "intake_blocked_scopes": 3,
         "intake_eligible_scopes": 0,
         "intake_unknown_scopes": 0,
         "never_polled_scopes": 0,
@@ -64,13 +64,13 @@
         "stale_scopes": 0
       },
       "counts": {
-        "active": 27,
-        "attention": 26,
-        "finished": 26,
-        "queued": 14,
-        "review": 26,
+        "active": 24,
+        "attention": 24,
+        "finished": 36,
+        "queued": 12,
+        "review": 24,
         "total": 132,
-        "unknown": 13
+        "unknown": 12
       },
       "filters": {
         "provider": null,
@@ -92,7 +92,7 @@
       "automation": {
         "configured_scopes": 3,
         "enabled_scopes": 2,
-        "intake_blocked_scopes": 0,
+        "intake_blocked_scopes": 1,
         "intake_eligible_scopes": 2,
         "intake_unknown_scopes": 0,
         "never_polled_scopes": 1,
@@ -106,13 +106,13 @@
         "stale_scopes": 1
       },
       "counts": {
-        "active": 27,
-        "attention": 26,
-        "finished": 26,
-        "queued": 14,
-        "review": 26,
+        "active": 24,
+        "attention": 24,
+        "finished": 36,
+        "queued": 12,
+        "review": 24,
         "total": 132,
-        "unknown": 13
+        "unknown": 12
       },
       "filters": {
         "provider": null,
@@ -134,7 +134,7 @@
       "automation": {
         "configured_scopes": 3,
         "enabled_scopes": 2,
-        "intake_blocked_scopes": 2,
+        "intake_blocked_scopes": 3,
         "intake_eligible_scopes": 0,
         "intake_unknown_scopes": 0,
         "never_polled_scopes": 0,
@@ -148,13 +148,13 @@
         "stale_scopes": 0
       },
       "counts": {
-        "active": 27,
-        "attention": 26,
-        "finished": 26,
-        "queued": 14,
-        "review": 26,
+        "active": 24,
+        "attention": 24,
+        "finished": 36,
+        "queued": 12,
+        "review": 24,
         "total": 132,
-        "unknown": 13
+        "unknown": 12
       },
       "filters": {
         "provider": null,
@@ -178,7 +178,7 @@
       "automation": {
         "configured_scopes": 2,
         "enabled_scopes": 1,
-        "intake_blocked_scopes": 0,
+        "intake_blocked_scopes": 1,
         "intake_eligible_scopes": 1,
         "intake_unknown_scopes": 0,
         "never_polled_scopes": 0,
@@ -192,13 +192,13 @@
         "stale_scopes": 0
       },
       "counts": {
-        "active": 14,
-        "attention": 13,
-        "finished": 13,
-        "queued": 14,
-        "review": 13,
+        "active": 12,
+        "attention": 12,
+        "finished": 18,
+        "queued": 6,
+        "review": 12,
         "total": 67,
-        "unknown": 0
+        "unknown": 7
       },
       "filters": {
         "provider": null,
@@ -220,7 +220,7 @@
       "automation": {
         "configured_scopes": 3,
         "enabled_scopes": 2,
-        "intake_blocked_scopes": 0,
+        "intake_blocked_scopes": 1,
         "intake_eligible_scopes": 0,
         "intake_unknown_scopes": 2,
         "never_polled_scopes": 0,
@@ -234,13 +234,13 @@
         "stale_scopes": 0
       },
       "counts": {
-        "active": 27,
-        "attention": 26,
-        "finished": 26,
-        "queued": 14,
-        "review": 26,
+        "active": 24,
+        "attention": 24,
+        "finished": 36,
+        "queued": 12,
+        "review": 24,
         "total": 132,
-        "unknown": 13
+        "unknown": 12
       },
       "filters": {
         "provider": null,
