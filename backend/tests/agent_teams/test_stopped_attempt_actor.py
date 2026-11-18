@@ -91,3 +91,66 @@ async def test_escalated_approval_and_checkpoint_actor(db, request_kind, stage, 
     expected_phase = "plan_review" if actor == "leader" else "intervention"
     assert await read_surfaces(db, item, scope, preset) == (
         expected_phase, actor, actor, actor, "blocked", operator_rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["ordinary", "selected", "different_attempt", "hold"])
+async def test_continuation_transitions_across_surfaces(db, monkeypatch, tmp_path, mode):
+    item, scope, preset, workspace = await seed(db)
+    item.dispatch_status = "escalated"
+    item.escalation_reason = "plan_blocked"
+    item.pr_number = 42
+    item.dispatch_nonce = "a" * 16
+    item.approval_round_count = 1
+    recovery = mode in {"selected", "different_attempt"}
+    monkeypatch.setattr("app.services.github_work_progress_service.hold_code", hold_code)
+    monkeypatch.setattr(settings, "github_recovery_only_attempt", "")
+    monkeypatch.setattr(settings, "github_coordination_hold_paths", [])
+    if recovery:
+        pr_number = item.pr_number if mode == "selected" else item.pr_number + 1
+        selector = f"{scope.id}:{item.id}:{pr_number}:{item.dispatch_nonce}:{item.dispatch_head_ref}"
+        monkeypatch.setattr(settings, "github_recovery_only_attempt", selector)
+    if mode == "hold":
+        marker = tmp_path / "hold"
+        marker.touch()
+        monkeypatch.setattr(settings, "github_coordination_hold_paths", [str(marker)])
+    revision = GithubAttemptScopeRevision(work_item_id=item.id, dispatch_nonce=item.dispatch_nonce, revision=1,
+        owner_slot_id=item.owner_slot_id, owner_member_id=1, phase="diagnostic", execution_target="workspace",
+        summary="fixture", allowed_paths=[], allowed_actions=[], allowed_commands=[], prohibited_actions=[],
+        tool_fallbacks={}, baseline_head_sha="a" * 40, baseline_tree_sha="b" * 40,
+        originating_escalation_reason="plan_blocked", expected_workspace_id=workspace.id,
+        expected_lease_token_hash="fixture", max_failed_heads=1, status="proposed",
+        recovery_checkpoint_stage="decision_hold" if recovery else None)
+    db.add(revision)
+    await db.flush()
+    request = GithubApprovalRequest(work_item_id=item.id, request_kind="continuation",
+        dispatch_nonce=item.dispatch_nonce, approval_round=1, owner_member_id=1, leader_member_id=2,
+        scope_revision_id=revision.id, request_fingerprint="fixture", request_message_id=1)
+    db.add(request)
+    await db.flush()
+    revision.approval_request_id = request.id
+    await db.commit()
+
+    checkpoint = ("paused", "operator", "operator", "operator", "blocked", ["inspect_checkpoint"])
+    paused = ("paused", "operator", "operator", "operator", "blocked", ["inspect_attempt"])
+    if recovery:
+        assert await read_surfaces(db, item, scope, preset) == checkpoint
+        revision.recovery_checkpoint_stage = "decision_open"
+        await db.commit()
+    can_continue = mode in {"ordinary", "selected"}
+    assert await read_surfaces(db, item, scope, preset) == (
+        ("plan_review", "leader", "leader", "leader", "blocked", []) if can_continue else paused)
+
+    request.status = "approved"
+    revision.status = "approved"
+    revision.recovery_checkpoint_stage = "ack_hold" if recovery else None
+    await db.commit()
+    assert await read_surfaces(db, item, scope, preset) == (checkpoint if recovery else paused if mode == "hold" else
+        ("intervention", "operator", "operator", "operator", "blocked", ["inspect_attempt"]))
+
+    revision.recovery_checkpoint_stage = "ack_open" if recovery else None
+    revision.delivery_message_id = 2
+    revision.delivered_at = utc_now().replace(tzinfo=None)
+    await db.commit()
+    assert await read_surfaces(db, item, scope, preset) == (
+        ("intervention", "owner", "owner", "owner", "blocked", []) if can_continue else paused)

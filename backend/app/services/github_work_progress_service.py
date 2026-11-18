@@ -26,7 +26,8 @@ from app.models.github_work_progress_schemas import (
 from mcp_shim.work_remaining_protocol import RemainingReport, ReportContext, parse_report, public_generation, report_reason
 from app.services.github_client import GithubClientResponseError, github_client
 from app.services.github_coordination_service import hold_code
-from app.services.github_stopped_attempt_actor import stopped_attempt_actor
+from app.services.github_recovery_gate import configured_recovery_only_attempt
+from app.services.github_stopped_attempt_actor import StoppedAttemptStep, stopped_attempt_step
 from app.services.github_work_item_projection import _load_work_item_authority
 from app.services.github_work_progress_observation import (
     ProgressObservationError, WorkspaceProgressContext, workspace_progress_observer,
@@ -94,16 +95,25 @@ def _historical(snapshot, reason: str) -> GithubPublicationObservation:
     return GithubPublicationObservation(state="unavailable", reason=reason)
 
 
-def _next_step(item, scope, preset, pending, hold: str | None, *, stopped_actor: str | None = None) -> tuple[str, str, str]:
+_STOPPED_PROGRESS = {
+    StoppedAttemptStep.PAUSED: ("paused", "Read the safety hold and its current issue instructions."),
+    StoppedAttemptStep.INSPECT: ("intervention", "Read the issue and guarded recovery details."),
+    StoppedAttemptStep.DECIDE: ("plan_review", "Review the pending continuation through the supported approval process."),
+    StoppedAttemptStep.ACKNOWLEDGE: ("intervention", "Acknowledge the delivered continuation through the supported process."),
+    StoppedAttemptStep.RETRY: ("intervention", "Assess retry using the existing eligibility and recovery checks."),
+}
+
+
+def _next_step(item, scope, preset, pending, hold: str | None, *,
+               stopped_step: StoppedAttemptStep | None = None) -> tuple[str, str, str]:
     if is_done(item.dispatch_status):
         return "complete", "none", "This tracked item is complete."
+    if stopped_step is not None:
+        phase, action = _STOPPED_PROGRESS[stopped_step]
+        return phase, stopped_step.actor, action
     if hold:
         return "paused", "operator", "Read the safety hold and its current issue instructions."
     if needs_attention(item.dispatch_status):
-        if stopped_actor == "leader" and pending:
-            return "plan_review", "leader", "Review the pending continuation through the supported approval process."
-        if stopped_actor == "leader":
-            return "intervention", "leader", "Assess retry using the existing eligibility and recovery checks."
         return "intervention", "operator", "Read the issue and guarded recovery details."
     if not scope.enabled or not preset.autonomy_enabled:
         return "paused", "operator", "Review the paused automation and its current issue instructions."
@@ -398,12 +408,14 @@ class GithubWorkProgressService:
         facts_stable = (item.dispatch_status == status_before and item.last_verified_sha == head_before
                         and (final_workspace is not None and bool(final_workspace.lease_token)) == leased_before)
         hold = hold_code()
-        stopped_actor = None
+        stopped_step = None
         if needs_attention(item.dispatch_status):
             authority = (await _load_work_item_authority(db, [item]))[item.id]
             pending = authority.pending_approval
-            stopped_actor = stopped_attempt_actor(item, pending, authority.pending_revision or authority.active_revision, hold)
-        phase, actor, action = _next_step(item, scope, preset, pending, hold, stopped_actor=stopped_actor)
+            recovery_attempt = configured_recovery_only_attempt() if hold == "recovery_only" else None
+            stopped_step = stopped_attempt_step(
+                item, pending, authority.pending_revision or authority.active_revision, hold, recovery_attempt)
+        phase, actor, action = _next_step(item, scope, preset, pending, hold, stopped_step=stopped_step)
         if phase in {"implementation", "planning"} and (
             final_workspace is None or not final_workspace.lease_token
         ):

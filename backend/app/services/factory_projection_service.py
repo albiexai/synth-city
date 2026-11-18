@@ -22,7 +22,8 @@ from app.services.agent_mail_service import MCP_HEARTBEAT_TTL_SECONDS
 from app.services.github_coordination_service import hold_code
 from app.services.github_dispatch_scheduler import github_dispatch_scheduler
 from app.services.github_dispatch_service import ESCALATION_REASONS
-from app.services.github_stopped_attempt_actor import stopped_attempt_actor
+from app.services.github_recovery_gate import configured_recovery_only_attempt
+from app.services.github_stopped_attempt_actor import StoppedAttemptStep, stopped_attempt_step
 from app.services.github_work_item_projection import _load_work_item_authority, _work_item_response
 from app.services.providers import get_providers
 from app.services.work_item_states import ATTENTION_STATUSES, DONE_STATUSES
@@ -312,14 +313,16 @@ def association(slot, member, sessions, bindings, retired, now):
                                        member_id=member.id, session_id=current.id))
 
 
-def waiting(item, legacy, owner_session, *, stopped_actor=None):
+def waiting(item, legacy, owner_session, *, stopped_step=None):
     status = item.dispatch_status
     if status in ("merged", "completed"):
         return None
     if status in ATTENTION_STATUSES:
-        actor = stopped_actor or "operator"
-        if actor == "leader" and legacy.pending_approval_status == "pending":
+        actor = stopped_step.actor if stopped_step else "operator"
+        if stopped_step is StoppedAttemptStep.DECIDE:
             code = "approval_pending"
+        elif stopped_step is StoppedAttemptStep.ACKNOWLEDGE:
+            code = "continuation_ack_required"
         elif item.escalation_reason == "abandoned_by_operator":
             code = "abandoned_by_operator"
         else:
@@ -387,6 +390,7 @@ async def work_projections(db, rows, now):
     providers = {p.id: p.display_name for p in get_providers()}
     result = []
     hold = hold_code()
+    recovery_attempt = configured_recovery_only_attempt() if hold == "recovery_only" else None
     for item, scope, team in rows:
         auth = authority[item.id]
         workspace = by_item.get(item.id)
@@ -394,7 +398,8 @@ async def work_projections(db, rows, now):
             active_revision=auth.active_revision, pending_approval=auth.pending_approval,
             pending_revision=auth.pending_revision, continuation_revision_count=auth.revision_count,
             continuation_failed_head_count=auth.failed_head_count)
-        stopped_actor = stopped_attempt_actor(item, auth.pending_approval, auth.pending_revision or auth.active_revision, hold)
+        stopped_step = stopped_attempt_step(
+            item, auth.pending_approval, auth.pending_revision or auth.active_revision, hold, recovery_attempt)
         slot = slots_by_id.get(item.owner_slot_id)
         if slot is not None and slot.preset_id != team.id:
             slot = None
@@ -435,12 +440,12 @@ async def work_projections(db, rows, now):
                 name=slot.display_name, configured_provider=slot.provider, provider_label=providers.get(slot.provider)) if slot else None,
             approver=wire.ApproverReference(slot_id=leader_slot.id, member_id=leader_member.id if leader_member else None,
                 source="explicit_assignment" if team.leader_slot_id == leader_slot.id else "unknown") if leader_slot else None,
-            waiting=waiting(item, legacy, owner_session, stopped_actor=stopped_actor),
+            waiting=waiting(item, legacy, owner_session, stopped_step=stopped_step),
             session=owner_session, approver_session=leader_session,
             policy=wire.WorkPolicy(merge_policy=scope.merge_policy, max_verification_retries=scope.max_verification_retries,
                                   max_approval_rounds=scope.max_approval_rounds, continuation_enabled=scope.continuation_enabled),
             workspace=wire.WorkspaceAssociation(id=workspace.id, state="leased") if workspace else None,
-            actions=actions(legacy, stopped_actor=stopped_actor), links=wire.LinkHints(
+            actions=actions(legacy, stopped_actor=stopped_step.actor if stopped_step else None), links=wire.LinkHints(
                 mail=wire.MailHint(team_id=team.id, slot_id=slot.id, member_id=member.id) if slot and member else None,
                 launch_plan=wire.LaunchPlanHint(team_id=team.id, slot_id=offline_slot.id) if offline_slot else None,
                 bridge_target=owner_session.bridge_target),

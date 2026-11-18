@@ -14,7 +14,8 @@ from app.services.github_operator_context_service import (
     SECTION_START, SECTION_END, bind_attempt, check as check_context, covered_by_leader,
     describe, github_operator_context_service, instruction_template,
 )
-from app.services.github_stopped_attempt_actor import operator_checkpoint_required, stopped_attempt_actor
+from app.services.github_recovery_gate import configured_recovery_only_attempt
+from app.services.github_stopped_attempt_actor import operator_checkpoint_required, stopped_attempt_step
 
 
 class GithubOperatorAttentionService:
@@ -164,7 +165,9 @@ class GithubOperatorAttentionService:
         async def checkpoint_revisions():
             return list((await db.execute(select(GithubAttemptScopeRevision.id,GithubAttemptScopeRevision.work_item_id,
                 GithubAttemptScopeRevision.revision,GithubAttemptScopeRevision.status,GithubAttemptScopeRevision.recovery_checkpoint_stage,
-                GithubAttemptScopeRevision.dispatch_nonce,GithubAttemptScopeRevision.origin_kind)
+                GithubAttemptScopeRevision.dispatch_nonce,GithubAttemptScopeRevision.origin_kind,
+                GithubAttemptScopeRevision.originating_escalation_reason,GithubAttemptScopeRevision.owner_slot_id,
+                GithubAttemptScopeRevision.delivery_message_id,GithubAttemptScopeRevision.delivered_at)
                 .join(GithubWorkItem,GithubWorkItem.id==GithubAttemptScopeRevision.work_item_id).where(
                 GithubWorkItem.id.in_(current_nonces),GithubAttemptScopeRevision.dispatch_nonce==GithubWorkItem.dispatch_nonce,
                 GithubAttemptScopeRevision.status.in_(["proposed","approved"])).order_by(GithubAttemptScopeRevision.id).limit(65))).all())
@@ -181,13 +184,15 @@ class GithubOperatorAttentionService:
         if len(approvals)>64 or len(revisions)>64:
             complete = False
         hold = hold_code()
+        recovery_attempt = configured_recovery_only_attempt() if hold == "recovery_only" else None
         for item in items[:64]:
             scope = scope_by_id[item.scope_id]
             checkpoint = checkpoint_by_item.get(item.id)
             approval = pending.get(item.id)
-            stopped_actor = stopped_attempt_actor(item, approval, checkpoint, hold)
-            if stopped_actor == "leader" or (stopped_actor is None and approval is not None
-                                             and approval.dispatch_nonce == item.dispatch_nonce):
+            stopped_step = stopped_attempt_step(item, approval, checkpoint, hold, recovery_attempt)
+            if stopped_step is not None and stopped_step.actor != "operator":
+                continue
+            if stopped_step is None and approval is not None and approval.dispatch_nonce == item.dispatch_nonce:
                 continue  # Pending Leader decisions do not become operator requests.
             operator_checkpoint = operator_checkpoint_required(item, checkpoint)
             fallback = any((item.status_note or "").startswith(prefix) for prefix in (
@@ -209,7 +214,8 @@ class GithubOperatorAttentionService:
                 "last_assessed_at":None, "evidence_issue_numbers":[item.issue_number], "prerequisite_issue_numbers":[], "state":"requested"})
             if kind=="review_pr" and item.pr_number is None:
                 actions[-1]["state"]="pr_identity_unavailable";complete=False
-        return {"actions":actions, "items":items, "approvals":approvals, "revisions":revisions, "hold":hold, "complete":complete}
+        return {"actions":actions, "items":items, "approvals":approvals, "revisions":revisions,
+                "recovery_policy":(hold, recovery_attempt), "complete":complete}
 
     async def summary(self, db, preset_id, client=None, *, include_templates=False):
         from app.services.github_coordination_service import CoordinationError, github_coordination_service as coordination
@@ -277,7 +283,7 @@ class GithubOperatorAttentionService:
         def item_identity(item):
             return (item.id,item.scope_id,item.issue_number,item.issue_type,item.dispatch_status,item.pr_number,item.last_verified_sha,
                     item.attempt_phase,item.status_note,item.dispatch_nonce,item.active_scope_revision,
-                    item.dispatched_at,item.approval_round_count,item.escalation_reason)
+                    item.dispatched_at,item.approval_round_count,item.escalation_reason,item.dispatch_head_ref,item.owner_slot_id)
         item_snapshot = [item_identity(i) for i in items]
         # End the DB transaction before bounded GitHub reads; presentation writes no rows.
         await db.commit()
@@ -347,7 +353,8 @@ class GithubOperatorAttentionService:
             .order_by(TeamGithubScope.id).limit(33).execution_options(populate_existing=True))).all())
         scope_changed = scope_snapshot != [(s.id,s.repo_owner,s.repo_name,s.merge_policy,s.enabled,s.updated_at) for s in latest_scopes]
         if (item_snapshot != [item_identity(i) for i in latest_items] or approvals != latest_dispatch["approvals"]
-            or revisions != latest_dispatch["revisions"] or snapshot["hold"] != latest_dispatch["hold"] or scope_changed):
+            or revisions != latest_dispatch["revisions"] or snapshot["recovery_policy"] != latest_dispatch["recovery_policy"]
+            or scope_changed):
             complete = False
             for action in actions:
                 if (action["source"]=="dispatch" or scope_changed
