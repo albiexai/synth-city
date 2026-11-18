@@ -77,7 +77,6 @@ function CategoryChips({
 
 export function FactoryFilters({
   work = false,
-  repository = false,
 }: {
   work?: boolean;
   repository?: boolean;
@@ -122,7 +121,7 @@ export function FactoryFilters({
         />
       )}
       <label className="grid gap-1 text-sm">
-        {repository ? "Team roster harness" : "Assigned harness"}
+        Assigned harness
         <select
           className={select}
           value={params.get("provider") ?? ""}
