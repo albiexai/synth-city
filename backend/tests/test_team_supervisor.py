@@ -946,6 +946,37 @@ def _armed(tmp_path, monkeypatch, records):
     return sup, transcript
 
 
+@pytest.mark.parametrize("unseen", [
+    _agy("ERROR", "SYSTEM", content="unproven error"),
+    _agy("FUTURE_TOOL_RECORD", "MODEL", content="unseen tool"),
+    _agy("PLANNER_RESPONSE", "USER_EXPLICIT", content="unproven source"),
+], ids=["error", "unknown_type", "unproven_source"])
+def test_unseen_antigravity_record_stops_armed_supervisor_at_saved_cursor(tmp_path, monkeypatch, unseen):
+    start = _agy("PLANNER_RESPONSE", "MODEL", content="observed reply")
+    sup, transcript = _armed(tmp_path, monkeypatch, [start])
+    ts.run(sup)
+    key = str(transcript)
+    cursor = transcript.stat().st_size
+    identity = sup.state["native_identities"][key]
+    assert sup.state["mode"] == "SUPERVISING"
+    assert sup.state["offsets"][key] == cursor
+
+    # On its own, the later model reply would cause a security-notice stop.
+    later = _agy("PLANNER_RESPONSE", "MODEL", content=NOTICE)
+    with transcript.open("a", encoding="utf-8") as stream:
+        for record in (unseen, later):
+            stream.write(json.dumps(record) + "\n")
+
+    ts.run(sup)
+
+    state = json.loads(Path(sup.state_path).read_text())
+    assert state["mode"] == "RECOVERY_REQUIRED"
+    assert state["autonomy_enabled"] is False
+    assert state["incident"]["reason"] == "supervision_ValueError"
+    assert state["offsets"][key] == cursor
+    assert state["native_identities"][key] == identity
+
+
 def _swap_before_open(monkeypatch, name, swap):
     """Run swap() once, just before the guard opens `name`, by name or by its last component."""
     import os

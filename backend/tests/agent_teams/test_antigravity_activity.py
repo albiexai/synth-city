@@ -622,6 +622,36 @@ def test_unknown_never_reports_a_wait_or_a_new_identity(monkeypatch):
     assert "discovered_session_id" not in metadata and "input_wait_known" not in metadata
 
 
+@pytest.mark.parametrize(("source_provider", "screen_file", "source_reason"), [
+    ("claude-code", "claude-question-form.ansi", "question"),
+    ("codex-cli", "codex-sign-in.txt", "sign_in"),
+    ("codex-cli", "codex-idle-prompt.txt", "clear"),
+])
+def test_antigravity_unknown_does_not_borrow_another_harness_screen(
+    monkeypatch, source_provider, screen_file, source_reason,
+):
+    from types import SimpleNamespace
+
+    from app.services import agent_activity_service as activity
+
+    screen = (FIXTURES.parent / "native_screens" / screen_file).read_text(encoding="utf-8")
+    assert activity.recognize_native_input_wait(source_provider, screen) == source_reason
+    assert activity.recognize_native_input_wait("antigravity-cli", screen) is None
+
+    def tmux(command, **_options):
+        if command[:2] == ["tmux", "display-message"]:
+            return SimpleNamespace(returncode=0, stdout="41000:%8\n")
+        assert command[:2] == ["tmux", "capture-pane"]
+        return SimpleNamespace(returncode=0, stdout=screen)
+
+    monkeypatch.setattr(activity.subprocess, "run", tmux)
+    result, metadata = _dispatch(monkeypatch, CID, observed=("unknown", "native_wait_unconfirmed", None))
+
+    assert (result.state, result.reason) == ("unknown", "native_wait_unconfirmed")
+    assert result.waiting_input is None
+    assert "input_wait_known" not in metadata
+
+
 @pytest.mark.asyncio
 async def test_discovered_identity_switches_the_slot_to_resume(db):
     from app.models.database import AgentTeamPreset, AgentTeamSlot
