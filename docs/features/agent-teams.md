@@ -405,12 +405,16 @@ world-writable.
   flag. Other tools, other modes and permission reviews were not observed and stay
   unknown. Every record of the current turn must be well formed and dated between the
   input and now.
-- **Remaining runtime proofs.** The team guard uses the observed reply-only record shapes.
-  Screen fallback, broader activity shapes and the cross-user proof remain in #1021.
-  Team readiness stays blocked as described above.
+- **Screen evidence.** One passive `agy` 1.5.9 launch with the isolated #993/#994
+  runner reached the first-run colour-scheme screen. The scratch backend applied
+  Agent Mail configuration. The run stopped at onboarding with no input. It produced
+  no transcript or requests to the local model stub, and the trial processes exited.
+  Agent Mail delivery through `agy` and the screens needed for working, waiting and
+  idle recognition remain unverified. The classifier keeps unproven activity `unknown`.
+  See [#1215](https://github.com/albiexai/synth-city/issues/1215).
 - **Separate controller and agent users.** The controller must be able to read the
   agent user's `antigravity-cli` files. Otherwise the status is `native_log_unreadable`.
-  Group access for this setup has not been tested yet.
+  The passive launch used one host user. Access across two users remains unverified.
 
 ## External Local Agents
 
