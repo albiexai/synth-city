@@ -3,7 +3,7 @@ from datetime import datetime
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from sqlalchemy import inspect as sqlalchemy_inspect, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.database import Base
@@ -538,3 +538,67 @@ async def test_actual_transport_rechecks_authority_before_text_and_enter(db,monk
     assert changed==([] if change=='none' else [change])
     states=(await db.execute(select(GithubRequiredCheckRecipient.member_id,GithubRequiredCheckRecipient.wake_state))).all()
     assert dict(states)=={leader_id:'confirmed',reviewer_id:'confirmed' if change=='none' else 'unknown'}
+
+
+# --- #1150: a rollback earlier in the poll expires the caller's scope and item ------------------------------------
+
+async def roll_back(db):
+    """A caught failure's rollback. With no open transaction a rollback expires nothing, so open one first."""
+    await db.execute(select(GithubWorkItem.id))
+    await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_capture_after_a_rollback_reads_no_expired_attribute_lazily(db, monkeypatch):
+    # Live: capture read scope.preset_id after a rollback had expired the poll's scope, a synchronous lazy load in
+    # async code (MissingGreenlet). The callers also read scope.repo_owner right after capture.
+    _, scope, item, members, policy = await seed(db)
+    svc = service(monkeypatch, [])
+    fresh = await svc.capture(db, scope, item)
+    await roll_back(db)  # what a caught failure earlier in the poll does: every loaded object expires
+    assert await svc.capture(db, scope, item) == fresh
+    assert (scope.repo_owner, item.pr_number) == ('example', 874)  # loaded again, so plain reads work
+
+
+@pytest.mark.asyncio
+async def test_capture_reloads_only_expired_attributes_and_keeps_pending_changes(db, monkeypatch):
+    _, scope, item, members, policy = await seed(db)
+    svc = service(monkeypatch, [])
+    db.expire(item, ['pr_number', 'verification_head_sha'])
+    db.expire(scope)
+    item.status_note = 'unflushed note'  # a caller's pending change must survive the capture
+    context = await svc.capture(db, scope, item)
+    assert context['pr_number'] == 874 and context['verification_head_sha'] == HEAD
+    assert item.status_note == 'unflushed note'
+
+
+@pytest.mark.asyncio
+async def test_capture_refuses_a_detached_expired_object_instead_of_loading_it(db, monkeypatch):
+    _, scope, item, members, policy = await seed(db)
+    svc = service(monkeypatch, [])
+    await roll_back(db)
+    assert sqlalchemy_inspect(scope).expired_attributes
+    db.expunge(scope)
+    assert await svc.capture(db, scope, item) is None  # no watch: the existing safe refusal
+
+
+@pytest.mark.asyncio
+async def test_verify_item_after_a_rollback_gets_past_the_capture(db, monkeypatch):
+    # The real caller: _verify_item captures first and then reads scope.repo_owner for the pull request.
+    from app.services.github_verification_service import github_verification_service
+
+    _, scope, item, members, policy = await seed(db)
+    service(monkeypatch, [])
+
+    class Reached(Exception):
+        pass
+
+    class Client:
+        async def get_pull(self, owner, repo, number):
+            raise Reached((owner, repo, number))
+
+    await roll_back(db)
+    assert sqlalchemy_inspect(scope).expired_attributes
+    with pytest.raises(Reached) as reached:
+        await github_verification_service._verify_item(db, scope, item, Client())
+    assert reached.value.args[0] == ('example', 'repo', 874)
