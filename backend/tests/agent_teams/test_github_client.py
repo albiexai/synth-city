@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 import httpx
 import pytest
 
@@ -6,11 +8,85 @@ from app.services.github_client import (
     GithubClientResponseError,
     GithubTreeEntry,
 )
+from app.services.github_rate_limit_service import GithubRateLimited, github_rate_limit_service
 
 
 COMMIT_SHA = "a" * 40
 TREE_SHA = "b" * 40
 BLOB_SHA = "c" * 40
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_stops_other_repositories_and_check_reads():
+    reset = int((datetime.now(timezone.utc) + timedelta(minutes=5)).timestamp())
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        if len(seen) == 1:
+            return httpx.Response(403, headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(reset)})
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://api.github.com") as http:
+        client = GithubClient(http=http, token="quota-test-shared")
+        second = GithubClient(http=http, token="quota-test-shared")
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.list_issues_with_label("o", "one", "ready")
+        with pytest.raises(httpx.HTTPStatusError, match="github_rate_limited"):
+            await second.get_pull("o", "two", 1)
+        with pytest.raises(httpx.HTTPStatusError, match="github_rate_limited"):
+            await second.list_check_runs_for_ref("o", "two", COMMIT_SHA)
+        assert seen == ["/repos/o/one/issues"]
+        assert await GithubClient(http=http, token="quota-test-other").get_pull("o", "two", 1) == {}
+
+
+@pytest.mark.asyncio
+async def test_permission_403_does_not_pause_the_client():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        if len(seen) == 1:
+            return httpx.Response(403, headers={"x-ratelimit-remaining": "120"}, json={"message": "Forbidden"})
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://api.github.com") as http:
+        client = GithubClient(http=http, token="quota-test-permission")
+        with pytest.raises(httpx.HTTPStatusError, match="403 Forbidden"):
+            await client.get_pull("o", "one", 1)
+        assert await client.get_pull("o", "one", 2) == {}
+    assert seen == ["/repos/o/one/pulls/1", "/repos/o/one/pulls/2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [403, 429])
+async def test_rate_limit_resumes_at_the_later_deadline(monkeypatch, status):
+    now = datetime(2026, 11, 18, tzinfo=timezone.utc)
+    start = now
+    monkeypatch.setattr(github_rate_limit_service, "_now", lambda: now)
+    reset = int((now + timedelta(seconds=30)).timestamp())
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        if len(seen) == 1:
+            return httpx.Response(status, headers={
+                "x-ratelimit-remaining": "0", "x-ratelimit-reset": str(reset), "retry-after": "90",
+            })
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://api.github.com") as http:
+        client = GithubClient(http=http, token=f"quota-test-deadline-{status}")
+        with pytest.raises(GithubRateLimited) as first:
+            await client.get_pull("o", "r", 1)
+        assert first.value.retry_at == start + timedelta(seconds=90)
+        now = start + timedelta(seconds=89)
+        with pytest.raises(GithubRateLimited):
+            await client.get_pull("o", "r", 2)
+        assert len(seen) == 1
+        now += timedelta(seconds=1)
+        assert await client.get_pull("o", "r", 3) == {}
+        assert seen == ["/repos/o/r/pulls/1", "/repos/o/r/pulls/3"]
 
 
 @pytest.mark.asyncio

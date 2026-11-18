@@ -2830,6 +2830,14 @@ class TeamGithubScopeUpdate(BaseModel):
     enabled: Optional[bool] = None
 
 
+class GithubRateLimitStatus(BaseModel):
+    reason: Literal["github_rate_limited"] | None
+    remaining: int | None
+    reset_at: datetime | None
+    retry_at: datetime | None
+    observed_at: datetime
+
+
 class TeamGithubScopeResponse(BaseModel):
     id: int
     preset_id: int
@@ -2845,6 +2853,7 @@ class TeamGithubScopeResponse(BaseModel):
     github_auth_mode: str
     github_auth_configured: bool
     github_poll_token_configured: bool
+    github_rate_limit: GithubRateLimitStatus | None = None
     max_approval_rounds: int
     max_concurrent_dispatched: int
     max_verification_retries: int

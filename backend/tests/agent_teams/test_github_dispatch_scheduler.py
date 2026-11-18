@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import httpx
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
@@ -19,6 +20,7 @@ from app.models.database import (
 )
 from app.services.github_dispatch_service import github_dispatch_service
 from app.services.github_dispatch_scheduler import GithubDispatchScheduler
+from app.services.github_client import GithubClient
 from app.services.github_watcher_service import github_watcher_service
 from app.services.github_workspace_service import github_workspace_service
 
@@ -71,6 +73,33 @@ class _FakeWatcher:
 
     async def poll_scope(self, db, scope, client):
         self.calls.append(scope.id)
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_scheduler_skips_remaining_poll_stages(db):
+    scope = await _scope(db)
+    await db.commit()
+    requests = []
+
+    class Watcher(_FakeWatcher):
+        async def poll_scope(self, db, scope, client):
+            await super().poll_scope(db, scope, client)
+            await client.list_issues_with_label(scope.repo_owner, scope.repo_name, scope.dispatch_label)
+
+    def handler(request):
+        requests.append(request.url.path)
+        return httpx.Response(429, headers={"retry-after": "300"})
+
+    watcher = Watcher()
+    scheduler = GithubDispatchScheduler(watcher=watcher)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://api.github.com") as http:
+        client = GithubClient(http=http, token="quota-test-scheduler")
+        for _ in range(2):
+            with pytest.raises(httpx.HTTPStatusError):
+                await scheduler.run_repo_once(db, "o", "r", client=client)
+    assert watcher.calls == [scope.id]
+    assert requests == ["/repos/o/r/issues"]
+    assert scope.last_polled_at is None
 
 
 class _FakeDispatch:

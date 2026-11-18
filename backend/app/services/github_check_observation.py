@@ -14,6 +14,8 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
+from app.services.github_rate_limit_service import GithubRateLimited
+
 _ACTIONS_APP_ID = 15368
 _PENDING = {"queued", "requested", "waiting", "pending", "in_progress"}
 _CONCLUSIONS = {
@@ -296,5 +298,7 @@ async def observe_checks(http: httpx.AsyncClient, headers: dict, owner: str, rep
     try:
         async with asyncio.timeout(_DEADLINE_SECONDS):
             return await _Reader(http, headers, owner, repo, sha).observe()
+    except GithubRateLimited:
+        raise
     except (httpx.HTTPError, TimeoutError) as exc:
         raise GithubCheckObservationError("github_checks_unavailable") from exc
