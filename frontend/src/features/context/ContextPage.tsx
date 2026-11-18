@@ -24,10 +24,11 @@ export function ContextPage() {
   const [analysisLoading, setAnalysisLoading] = useState(false)
   const [showHelp, setShowHelp] = useState(false)
   const [scope, setScope] = useState<HarnessReadScope | null>(null)
-  const [readDenial, setReadDenial] = useState<string | null>(null)
+  const [readError, setReadError] = useState<string | null>(null)
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const requests = useRef({ sessions: 0, analysis: 0 })
-  const unreadable = readDenial !== null || scopeUnreadable(scope)
+  const lastSource = useRef<HarnessReadScope | null>(null)
+  const unreadable = readError !== null || scopeUnreadable(scope)
 
   const clearAnalysis = useCallback(() => {
     requests.current.analysis++
@@ -42,16 +43,21 @@ export function ContextPage() {
       const data = await getActiveSessions()
       if (request !== requests.current.sessions) return false
       const source = data.scope ?? null
+      const previous = lastSource.current
+      const sourceChanged = source?.user !== previous?.user
+        || (source?.data_dir ?? source?.claude_dir) !== (previous?.data_dir ?? previous?.claude_dir)
       const blocked = scopeUnreadable(source)
+      lastSource.current = source
       setScope(source)
-      setReadDenial(null)
+      setReadError(null)
       setSessions(blocked ? [] : data.sessions)
-      if (blocked) clearAnalysis()
-      return !blocked
+      if (blocked || sourceChanged) clearAnalysis()
+      return !blocked && !sourceChanged
     } catch (err) {
-      const denial = scopeReadDenial(err)
-      if (request === requests.current.sessions && denial) {
-        setReadDenial(denial)
+      if (request === requests.current.sessions) {
+        lastSource.current = null
+        setScope(null)
+        setReadError(scopeReadDenial(err) ?? 'Could not read active sessions.')
         setSessions([])
         clearAnalysis()
       }
@@ -81,8 +87,8 @@ export function ContextPage() {
 
   const handleRefresh = useCallback(async () => {
     setLoading(true)
-    const readable = await fetchSessions()
-    if (readable && selectedSession) {
+    const sameReadableSource = await fetchSessions()
+    if (sameReadableSource && selectedSession) {
       await fetchAnalysis(selectedSession)
     }
   }, [fetchSessions, fetchAnalysis, selectedSession])
@@ -142,7 +148,7 @@ export function ContextPage() {
         </div>
       </div>
 
-      <ReadScopeNotice scope={scope} denial={readDenial} fallbackFolder="projects folder" />
+      <ReadScopeNotice scope={scope} denial={readError} fallbackFolder="projects folder" />
 
       {/* Active Sessions */}
       {!unreadable && !loading && (

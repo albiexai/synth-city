@@ -70,7 +70,10 @@ export function UsagePage() {
     const isCurrent = () => request === requests.current.latest
       && requestedUser === scopeUserHeaders()['X-Harness-Scope-User']
     setError(null)
+    setScope(null)
     setLoading(true)
+    setSummary(null)
+    setUsage(EMPTY_USAGE)
 
     try {
       const params = selectedProject ? { project_path: selectedProject } : undefined
@@ -117,11 +120,11 @@ export function UsagePage() {
       if (cacheKey) saveToCache(cacheKey, updated)
     } catch (err) {
       if (isCurrent()) {
+        setUsage(EMPTY_USAGE)
         const denial = scopeReadDenial(err)
         if (denial) {
           setReadDenial(denial)
           setSummary(null)
-          setUsage(EMPTY_USAGE)
         } else {
           setError(err instanceof Error ? err.message : 'Failed to load usage data')
         }
@@ -145,6 +148,11 @@ export function UsagePage() {
 
   const handleProjectChange = (value: string) => {
     const path = value === 'all' ? null : value
+    if (path !== selectedProject) {
+      setLoading(true)
+      setSummary(null)
+      setUsage(EMPTY_USAGE)
+    }
     setSelectedProject(path)
     setSearchParams(current => {
       const next = new URLSearchParams(current)
@@ -220,59 +228,61 @@ export function UsagePage() {
       <UsageSummaryCards summary={summary} loading={loading} />
 
       {/* Tabbed Views */}
-      <Tabs defaultValue="overview" className="space-y-4">
-        <TabsList>
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="daily">Daily</TabsTrigger>
-          <TabsTrigger value="sessions">Sessions</TabsTrigger>
-          <TabsTrigger value="monthly">Monthly</TabsTrigger>
-          <TabsTrigger value="blocks">
-            Blocks
-            {activeBlock && (
-              <span className="ml-1 w-2 h-2 bg-success rounded-full animate-pulse" />
-            )}
-          </TabsTrigger>
-        </TabsList>
+      {!error && (
+        <Tabs defaultValue="overview" className="space-y-4">
+          <TabsList>
+            <TabsTrigger value="overview">Overview</TabsTrigger>
+            <TabsTrigger value="daily">Daily</TabsTrigger>
+            <TabsTrigger value="sessions">Sessions</TabsTrigger>
+            <TabsTrigger value="monthly">Monthly</TabsTrigger>
+            <TabsTrigger value="blocks">
+              Blocks
+              {activeBlock && (
+                <span className="ml-1 w-2 h-2 bg-success rounded-full animate-pulse" />
+              )}
+            </TabsTrigger>
+          </TabsList>
 
-        {/* Overview Tab */}
-        <TabsContent value="overview" className="space-y-4">
-          <div className="grid gap-4 lg:grid-cols-2">
+          {/* Overview Tab */}
+          <TabsContent value="overview" className="space-y-4">
+            <div className="grid gap-4 lg:grid-cols-2">
+              <CostChart data={dailyData} loading={loading} />
+              <MonthlyUsageChart data={monthlyData} loading={loading} />
+            </div>
+            <DailyUsageChart data={dailyData.slice(0, 14)} loading={loading} />
+          </TabsContent>
+
+          {/* Daily Tab */}
+          <TabsContent value="daily" className="space-y-4">
+            <DailyUsageChart data={dailyData} loading={loading} />
             <CostChart data={dailyData} loading={loading} />
+          </TabsContent>
+
+          {/* Sessions Tab */}
+          <TabsContent value="sessions">
+            <SessionUsageTable
+              data={sessionData}
+              loading={loading}
+              totalCost={totalSessionCost}
+            />
+          </TabsContent>
+
+          {/* Monthly Tab */}
+          <TabsContent value="monthly">
             <MonthlyUsageChart data={monthlyData} loading={loading} />
-          </div>
-          <DailyUsageChart data={dailyData.slice(0, 14)} loading={loading} />
-        </TabsContent>
+          </TabsContent>
 
-        {/* Daily Tab */}
-        <TabsContent value="daily" className="space-y-4">
-          <DailyUsageChart data={dailyData} loading={loading} />
-          <CostChart data={dailyData} loading={loading} />
-        </TabsContent>
-
-        {/* Sessions Tab */}
-        <TabsContent value="sessions">
-          <SessionUsageTable
-            data={sessionData}
-            loading={loading}
-            totalCost={totalSessionCost}
-          />
-        </TabsContent>
-
-        {/* Monthly Tab */}
-        <TabsContent value="monthly">
-          <MonthlyUsageChart data={monthlyData} loading={loading} />
-        </TabsContent>
-
-        {/* Blocks Tab */}
-        <TabsContent value="blocks">
-          <BlocksView
-            blocks={blocks}
-            activeBlock={activeBlock}
-            loading={loading}
-            totalCost={totalBlockCost}
-          />
-        </TabsContent>
-      </Tabs>
+          {/* Blocks Tab */}
+          <TabsContent value="blocks">
+            <BlocksView
+              blocks={blocks}
+              activeBlock={activeBlock}
+              loading={loading}
+              totalCost={totalBlockCost}
+            />
+          </TabsContent>
+        </Tabs>
+      )}
     </div>
   )
 }

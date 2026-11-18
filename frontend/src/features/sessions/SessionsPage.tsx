@@ -22,20 +22,20 @@ export function SessionsPage() {
   )
   const [loading, setLoading] = useState(true)
   const [scope, setScope] = useState<HarnessReadScope | null>(null)
-  const [readDenial, setReadDenial] = useState<string | null>(null)
-  const unreadable = readDenial !== null || scopeUnreadable(scope)
+  const [readError, setReadError] = useState<string | null>(null)
+  const unreadable = readError !== null || scopeUnreadable(scope)
 
   const loadProjects = useCallback(async () => {
     setLoading(true)
     try {
       const data = await listProjects()
       setScope(data.scope ?? null)
-      setReadDenial(null)
+      setReadError(null)
       setProjects(data.projects)
     } catch (err) {
-      const denial = scopeReadDenial(err)
-      setReadDenial(denial)
-      if (!denial) console.error('Failed to load projects:', err)
+      setScope(null)
+      setReadError(scopeReadDenial(err) ?? 'Could not read session projects.')
+      setProjects([])
     } finally {
       setLoading(false)
     }
@@ -71,7 +71,7 @@ export function SessionsPage() {
         <RefreshButton onClick={loadProjects} loading={loading} />
       </div>
 
-      <ReadScopeNotice scope={scope} denial={readDenial} fallbackFolder="projects folder" />
+      <ReadScopeNotice scope={scope} denial={readError} fallbackFolder="projects folder" />
 
       {/* Project Filter */}
       {!unreadable && <Card>
@@ -99,7 +99,7 @@ export function SessionsPage() {
       </Card>}
 
       {/* Session List */}
-      {!unreadable && !loading && <SessionList projectFolder={selectedProject} />}
+      {!unreadable && !loading && <SessionList key={selectedProject ?? ''} projectFolder={selectedProject} />}
     </div>
   )
 }

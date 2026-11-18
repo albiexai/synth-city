@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { BrowserRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SessionsPage } from '@/features/sessions/SessionsPage'
@@ -6,6 +6,7 @@ import { UsagePage } from '@/features/usage/UsagePage'
 import { ContextPage } from '@/features/context/ContextPage'
 import { PlansPage } from '@/features/plans/PlansPage'
 import { clearNativeCatalogs, updateNativeCatalog, updateNativeMetadata } from '@/features/native-settings/surfaceRegistry'
+import type { ActiveSessionContext, ContextAnalysis } from '@/types/context'
 import type { AgentProviderStatus, ProviderOperations } from '@/types/providers'
 import catalogs from './fixtures/provider-operations/v1/catalog.json'
 
@@ -39,7 +40,11 @@ function scopeFor(page: Page, user = 'worker', readable = true) {
 
 type TestScope = Omit<ReturnType<typeof scopeFor>, 'data_dir'> & { data_dir?: string | null }
 
-function mockReads(page: Page, source: () => TestScope | undefined, options: { denied?: string; cost?: () => number } = {}) {
+function mockReads(page: Page, source: () => TestScope | undefined, options: {
+  denied?: string
+  cost?: () => number
+  reply?: (endpoint: string) => Response | Promise<Response> | undefined
+} = {}) {
   const fetcher = vi.fn(async (request: string, init?: RequestInit) => {
     const url = new URL(request, window.location.origin)
     const endpoint = url.pathname.replace(/^\/api\/v1\//, '')
@@ -50,6 +55,8 @@ function mockReads(page: Page, source: () => TestScope | undefined, options: { d
     if (endpoint === page.endpoint && url.searchParams.has('scope_user')) {
       throw new Error('scope_user belongs in the scope header')
     }
+    const reply = options.reply?.(endpoint)
+    if (reply) return reply
     if (endpoint === 'sessions/projects') {
       return Response.json({ projects: [{ folder: 'fixture-project', name: project.name, session_count: 0 }], total_sessions: 0, scope })
     }
@@ -169,6 +176,124 @@ it('verifies the current Usage source before applying a cache for the same proje
   expect(await screen.findByText("Reading controller's", { exact: false })).toHaveTextContent(scope.data_dir)
   expect(await screen.findByText('$0.9000')).toBeInTheDocument()
   await waitFor(() => expect(fetcher.mock.calls.some(([url]) => url.includes('/usage/daily'))).toBe(true))
+})
+
+it('drops the old Usage breakdown while another source loads and when its read fails', async () => {
+  const page = pages[1]
+  let scope = scopeFor(page)
+  let finishBreakdown!: (response: Response) => void
+  const pendingBreakdown = new Promise<Response>(resolve => { finishBreakdown = resolve })
+  mockReads(page, () => scope, { reply: endpoint => {
+    if (endpoint !== 'usage/sessions') return
+    if (scope.user === 'other-worker') return pendingBreakdown
+    return Response.json({ total_cost: 1, data: [{
+      session_id: 'original-session',
+      project_path: '/fixture/old-project',
+      input_tokens: 1,
+      output_tokens: 1,
+      total_cost: 1,
+      last_activity: '2026-11-18',
+      models_used: [],
+    }] })
+  } })
+  renderPage(page)
+  fireEvent.keyDown(await screen.findByRole('tab', { name: 'Sessions' }), { key: 'Enter' })
+  expect(await screen.findByText('old-project')).toBeInTheDocument()
+
+  scope = scopeFor(page, 'other-worker')
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+  expect(await screen.findByText("Reading other-worker's", { exact: false })).toBeInTheDocument()
+  expect(screen.queryByText('old-project')).not.toBeInTheDocument()
+
+  finishBreakdown(Response.json({ detail: 'Breakdown failed' }, { status: 500 }))
+  expect(await screen.findByText('Breakdown failed')).toBeInTheDocument()
+  expect(screen.queryByText('old-project')).not.toBeInTheDocument()
+  expect(screen.queryByText('No session data available')).not.toBeInTheDocument()
+})
+
+const activeSession: ActiveSessionContext = {
+  session_id: 'original-session',
+  project_folder: 'old-project',
+  project_name: 'Old Context project',
+  model: 'claude-sonnet',
+  current_context_tokens: 100,
+  max_context_tokens: 1000,
+  context_percentage: 10,
+  is_active: true,
+  last_activity: '2026-11-18',
+}
+
+const contextAnalysis: ContextAnalysis = {
+  ...activeSession,
+  snapshots: [],
+  content_categories: [],
+  file_consumptions: [],
+  tool_consumptions: [],
+  cache_efficiency: { total_cache_read: 0, total_cache_creation: 0, total_uncached: 100, hit_ratio: 0 },
+  avg_tokens_per_turn: 100,
+  estimated_turns_remaining: 9,
+  context_zone: 'green',
+  total_turns: 1,
+}
+
+it.each(['displayed', 'pending'] as const)('clears %s Context analysis when the source changes', async state => {
+  const page = pages[2]
+  let scope = scopeFor(page)
+  let finishAnalysis!: (response: Response) => void
+  const pendingAnalysis = new Promise<Response>(resolve => { finishAnalysis = resolve })
+  const fetcher = mockReads(page, () => scope, { reply: endpoint => {
+    if (endpoint === 'context/active') {
+      return Response.json({ sessions: scope.user === 'worker' ? [activeSession] : [], scope })
+    }
+    if (endpoint === 'context/old-project/original-session') {
+      return state === 'pending' ? pendingAnalysis : Response.json({ analysis: contextAnalysis })
+    }
+  } })
+  renderPage(page)
+  fireEvent.click(await screen.findByRole('button', { name: /Old Context project/ }))
+  if (state === 'displayed') expect(await screen.findByText('Cache Efficiency')).toBeInTheDocument()
+  else expect(await screen.findByText('Analyzing session...')).toBeInTheDocument()
+
+  scope = scopeFor(page, 'other-worker')
+  if (state === 'displayed') {
+    const hidden = vi.spyOn(document, 'hidden', 'get')
+    try {
+      hidden.mockReturnValue(true)
+      fireEvent(document, new Event('visibilitychange'))
+      hidden.mockReturnValue(false)
+      fireEvent(document, new Event('visibilitychange'))
+    } finally {
+      hidden.mockRestore()
+    }
+  } else {
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+  }
+  expect(await screen.findByText("Reading other-worker's", { exact: false })).toBeInTheDocument()
+  expect(screen.getByText(page.empty)).toBeInTheDocument()
+  expect(screen.queryByText('Old Context project')).not.toBeInTheDocument()
+  expect(screen.queryByText('Cache Efficiency')).not.toBeInTheDocument()
+  expect(screen.queryByText('Analyzing session...')).not.toBeInTheDocument()
+
+  await act(async () => { finishAnalysis(Response.json({ analysis: contextAnalysis })) })
+  expect(screen.queryByText('Cache Efficiency')).not.toBeInTheDocument()
+  expect(fetcher.mock.calls.filter(([url]) => url.includes('/context/old-project/original-session'))).toHaveLength(1)
+})
+
+it.each([
+  { page: pages[0], endpoint: 'sessions/projects', status: 500, expected: 'Could not read session projects.' },
+  { page: pages[0], endpoint: 'sessions', status: 500, expected: 'Could not read sessions.' },
+  { page: pages[0], endpoint: 'sessions', status: 403, expected: 'The controller cannot read this data folder.' },
+  { page: pages[2], endpoint: 'context/active', status: 500, expected: 'Could not read active sessions.' },
+])('shows a read failure for $endpoint with status $status', async ({ page, endpoint, status, expected }) => {
+  const detail = 'The controller cannot read /fixture/private/.claude.'
+  mockReads(page, () => scopeFor(page), { reply: path => (
+    path === endpoint ? Response.json({ detail }, { status }) : undefined
+  ) })
+  renderPage(page)
+
+  expect(await screen.findByRole('alert')).toHaveTextContent(expected)
+  expect(screen.queryByText(detail)).not.toBeInTheDocument()
+  expect(screen.queryByText(page.empty)).not.toBeInTheDocument()
 })
 
 it.each([pages[0], pages[1]])('preserves the scoped user when filtering $name by project', async (page) => {
