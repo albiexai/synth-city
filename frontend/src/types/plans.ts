@@ -1,4 +1,5 @@
 // Plan History Browser types matching backend schemas
+import type { HarnessReadScope } from './harnessScope'
 
 export interface PlanSummary {
   filename: string
@@ -65,6 +66,7 @@ export interface PlanSearchResult {
 export interface PlanListResponse {
   plans: PlanSummary[]
   total: number
+  scope?: HarnessReadScope | null
 }
 
 export interface PlanDetailResponse {
