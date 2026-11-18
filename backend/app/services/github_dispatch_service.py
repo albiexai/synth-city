@@ -154,6 +154,15 @@ ESCALATION_REASONS = frozenset(
     }
 )
 
+
+def restored_escalation_reason(revision) -> str:
+    """The reason an attempt returns to escalation with when its revision ends (#1139).
+
+    A scope amendment starts from a healthy attempt, so its originating reason is empty; the attempt then needs a
+    fresh bounded proposal, which is "plan_blocked", the Leader-cancel path's fallback too. Never empty.
+    """
+    return revision.originating_escalation_reason or "plan_blocked"
+
 PENDING_REASONS = frozenset(
     {
         "queued_repo_cap",
@@ -2577,7 +2586,7 @@ class GithubDispatchService:
             if active_revision is not None:
                 item_update = item_update.values(
                     dispatch_status="escalated",
-                    escalation_reason=active_revision.originating_escalation_reason,
+                    escalation_reason=restored_escalation_reason(active_revision),
                     pending_reason=None,
                     continuation_nudged_at=None,
                     status_note=(

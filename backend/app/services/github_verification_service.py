@@ -47,7 +47,7 @@ from app.services.github_ci_watch_service import github_ci_watch_service
 from app.services.github_terminal_revision_service import (
     TerminalRevisionContextChanged, complete_current_revision, lock_terminal_transition,
 )
-from app.services.github_dispatch_service import github_dispatch_service
+from app.services.github_dispatch_service import github_dispatch_service, restored_escalation_reason
 from app.services.github_recovery_gate import (
     GithubRecoveryOnlyAttempt,
     configured_recovery_only_attempt,
@@ -564,7 +564,7 @@ class GithubVerificationService:
             .where(*item_conditions)
             .values(
                 dispatch_status="escalated",
-                escalation_reason=revision.originating_escalation_reason,
+                escalation_reason=restored_escalation_reason(revision),
                 status_note=(
                     "Diagnostic restoration verified. Propose the smallest bounded "
                     "implementation continuation supported by the evidence."
@@ -1528,7 +1528,7 @@ class GithubVerificationService:
             return
         if await self._review_hold_note(scope, item, client, pull) is not None:
             return
-        reason = item.escalation_reason or "unknown"
+        reason = item.escalation_reason or "escalation_reason_missing"  # a legacy empty row (#1139)
         settled = await self._settled_diagnostic_revision(db, item)
         if settled is None:
             await self._record_escalated_not_fired(
