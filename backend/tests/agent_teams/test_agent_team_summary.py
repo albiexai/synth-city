@@ -362,6 +362,7 @@ async def test_human_action_exposes_only_a_known_attempt_reason(db, monkeypatch,
 async def test_inspection_reason_is_omitted_if_the_attempt_is_replaced(db, monkeypatch):
     team, scope, (item,) = await seed(db, ("escalated",))
     item.escalation_reason = "owner_offline"
+    item.pr_number = 42
     await db.commit()
     item_id = item.id
 
@@ -389,6 +390,7 @@ async def test_inspection_reason_survives_the_unfinished_item_limit(db, monkeypa
     team, scope, items = await seed(db, ("pending",) * 64 + ("escalated",))
     item = items[-1]
     item.escalation_reason = "leader_ack_timeout"
+    item.pr_number = 42
     await db.commit()
 
     class CurrentInspection(InspectionAttention):
@@ -413,6 +415,7 @@ async def test_inspection_scope_does_not_narrow_a_provider_only_campaign(db, mon
     await db.flush()
     active.scope_id = other_scope.id
     stopped.escalation_reason = "leader_ack_timeout"
+    stopped.pr_number = 42
     await db.commit()
 
     class CurrentInspection(InspectionAttention):
