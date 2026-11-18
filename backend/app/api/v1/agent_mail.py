@@ -636,6 +636,8 @@ async def decide_work_item(
         )
         decided = True
         decision_delivery_key = f"github-approval:{approval.id}:decision"
+        decision_message = github_approval_service.initial_decision_message(approval)
+        linked_message = None
         if approval.decision_message_id is not None:
             linked_message = await db.get(MailMessage, approval.decision_message_id)
             if (
@@ -643,30 +645,24 @@ async def decide_work_item(
                 or linked_message.delivery_key != decision_delivery_key
             ):
                 raise GithubApprovalError("approval_decision_link_mismatch")
-        message = await agent_mail_service.send_authoritative_decision(
-            db,
-            MailMessageCreate(
-                kind="answer",
-                sender_member_id=session.member_id,
-                thread_root_id=approval.request_message_id,
-                body_markdown=request.reason,
-                payload={
-                    "approval_request_id": approval.id,
-                    "request_kind": approval.request_kind,
-                    "work_item_id": approval.work_item_id,
-                },
-                decision=request.decision,
-            ),
-            authenticated_sender_member_id=session.member_id,
-            approval_round=approval.approval_round,
-            delivery_key=decision_delivery_key,
-        )
-        if approval.decision_message_id is None:
-            approval.decision_message_id = message.id
-            await db.commit()
-            await db.refresh(approval)
-        elif approval.decision_message_id != message.id:
-            raise GithubApprovalError("approval_decision_link_mismatch")
+        if escalated_rejection and linked_message is not None:
+            if not await agent_mail_service._same_delivery(
+                db, linked_message, decision_message, sender_actor_id=None, sender_type="member",
+                operator_authorized=False,
+            ):
+                raise GithubApprovalError("approval_decision_link_mismatch")
+            message = linked_message
+        else:
+            message = await agent_mail_service.send_authoritative_decision(
+                db, decision_message, authenticated_sender_member_id=session.member_id,
+                approval_round=approval.approval_round, delivery_key=decision_delivery_key,
+            )
+            if approval.decision_message_id is None:
+                approval.decision_message_id = message.id
+                await db.commit()
+                await db.refresh(approval)
+            elif approval.decision_message_id != message.id:
+                raise GithubApprovalError("approval_decision_link_mismatch")
         # C09: the decision notice is settled; its fact is separate from the
         # decision fact and keyed by the stable decision delivery key.
         await _record_decision_notice(

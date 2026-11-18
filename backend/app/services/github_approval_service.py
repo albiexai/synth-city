@@ -2406,6 +2406,13 @@ class GithubApprovalService:
             raise GithubApprovalError("approval_request_not_found", status_code=404)
         return request
 
+    @staticmethod
+    def initial_decision_message(request):
+        return MailMessageCreate(kind="answer", sender_member_id=request.leader_member_id,
+            thread_root_id=request.request_message_id, body_markdown=request.reason, decision=request.status,
+            payload={"approval_request_id": request.id, "request_kind": request.request_kind,
+                "work_item_id": request.work_item_id})
+
     async def _escalated_initial_rejection_conditions(self, db, item, request, owner, leader, actor):
         scope = await db.get(TeamGithubScope, item.scope_id, populate_existing=True)
         if scope is None:
@@ -2558,23 +2565,35 @@ class GithubApprovalService:
             )
             .execution_options(synchronize_session=False)
         )
-        if result.rowcount == 1 and actor is not None:
-            await _record_decision_fact(
-                db,
-                event_kind="approval_decision",
-                source="github_approval_service.decide",
-                actor=actor,
-                scope_id=decision_scope_id,
-                item_id=decision_item_id,
-                request_id=request_id,
-                revision_id=None,
-                request_kind="initial_plan",
-                decision=decision,
-            )
-        if escalated_rejection and (stop := hold_code()):
-            await db.rollback()
-            raise GithubApprovalError(stop)
-        await db.commit()
+        try:
+            if result.rowcount == 1 and actor is not None:
+                await _record_decision_fact(
+                    db,
+                    event_kind="approval_decision",
+                    source="github_approval_service.decide",
+                    actor=actor,
+                    scope_id=decision_scope_id,
+                    item_id=decision_item_id,
+                    request_id=request_id,
+                    revision_id=None,
+                    request_kind="initial_plan",
+                    decision=decision,
+                )
+            if escalated_rejection and result.rowcount == 1:
+                # Keep retry blocked until the decision and its linked Mail answer are both durable.
+                await db.refresh(request)
+                message = await agent_mail_service._send_message(db, self.initial_decision_message(request),
+                    auto_nudge=False, authenticated_sender_member_id=leader.id,
+                    authoritative_approval_round=request.approval_round,
+                    delivery_key=f"github-approval:{request.id}:decision", commit=False)
+                request.decision_message_id = message.id
+            if escalated_rejection and (stop := hold_code()):
+                raise GithubApprovalError(stop)
+            await db.commit()
+        except Exception:
+            if escalated_rejection:
+                await db.rollback()
+            raise
         await db.refresh(request)
         if result.rowcount == 1:
             return request, True

@@ -2318,6 +2318,41 @@ async def test_leader_rejects_pending_initial_approval_on_escalation_before_retr
 
 
 @pytest.mark.asyncio
+async def test_escalated_initial_rejection_blocks_retry_until_decision_mail_is_durable(client, db, monkeypatch):
+    item, (headers, _), decision = await _escalated_initial_approval(client, db, monkeypatch)
+    approval_id = decision["approval_request_id"]
+    retry_path = f"/api/v1/agent-teams/github-work-items/{item.id}/retry"
+    create_message = agent_mail_service._create_message_row
+
+    async def interrupt_after_writing_answer(session, request, **kwargs):
+        message = await create_message(session, request, **kwargs)
+        if request.decision == "rejected":
+            raise MailDeliveryIntegrityError("fixture interrupted decision delivery")
+        return message
+
+    with monkeypatch.context() as patch:
+        patch.setattr(agent_mail_service, "_create_message_row", interrupt_after_writing_answer)
+        interrupted = await client.post("/api/v1/agent-mail/decisions", headers=headers, json=decision)
+        assert (interrupted.status_code, interrupted.json()["detail"]) == (409, "delivery_key_conflict")
+    attempt = await client.post(retry_path, headers=headers)
+    assert attempt.status_code == 409, "Retry must remain blocked until the rejection and Mail answer are durable"
+    assert attempt.json()["detail"]["block_code"] == "approval_pending"
+    pending = await db.get(GithubApprovalRequest, approval_id, populate_existing=True)
+    root = await db.get(MailMessage, pending.request_message_id, populate_existing=True)
+    assert pending.status == "pending" and pending.decision_message_id is None
+    assert root.request_status == "pending"
+
+    replay = await client.post("/api/v1/agent-mail/decisions", headers=headers, json=decision)
+    assert replay.status_code == 200, replay.text
+    await db.refresh(pending)
+    await db.refresh(root)
+    assert pending.status == "rejected" and pending.decision_message_id == replay.json()["id"]
+    assert root.request_status == "answered"
+    retry = await client.post(retry_path, headers=headers)
+    assert retry.status_code == 200 and retry.json()["dispatch_status"] == "pending"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("change", "detail"), [
     ("hold", "hold"),
     ("paused", "stale_approval_context"),
