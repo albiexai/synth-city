@@ -216,12 +216,15 @@ async def test_late_changes_invalidate_the_guard_before_publication(db, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_a_session_ending_during_campaign_read_invalidates_native_coverage(db, monkeypatch):
+@pytest.mark.parametrize("partial_mail_timeout", [False, True], ids=["binding_changed", "partial_mail_timeout"])
+async def test_a_session_ending_during_campaign_read_invalidates_native_coverage(db, monkeypatch, partial_mail_timeout):
     from sqlalchemy import select
-    from app.models.database import AgentPaneBinding, MailAgentSession, MailTeamMember
+    from app.config import settings
+    from app.models.database import AgentPaneBinding, MailAgentSession, MailMessage, MailTeamMember
     from app.models.schemas import AgentActivityObservation
     from app.services import agent_activity_service as activity
     from app.services.agent_team_campaign_service import agent_team_campaign_service
+    from app.services.mail_request_stall_service import mail_request_stall_service
 
     team, _, _ = await seed(db, ())
     slot_id = await db.scalar(select(AgentTeamSlot.id).where(AgentTeamSlot.preset_id == team.id))
@@ -234,8 +237,31 @@ async def test_a_session_ending_during_campaign_read_invalidates_native_coverage
         team_slot_id=slot_id, team_preset_id=team.id, bound_pane_pid=41001, bound_pane_proc_start="28",
         cwd="/synthetic/project", capability_token_hash="test-hash", mailbox_status="connected")
     db.add_all([binding, session])
+    if partial_mail_timeout:
+        requester = MailTeamMember(identity_key="late-session-requester", repo_id="fixture", repo_path="/synthetic/project",
+            repo_name="fixture", display_name="Requester", team_preset_id=team.id)
+        db.add(requester)
+        await db.flush()
+        created_at = datetime.utcnow() - timedelta(seconds=settings.mail_request_unanswered_seconds + 60)
+        db.add_all(MailMessage(kind="context_request", request_status="pending", sender_member_id=requester.id,
+            recipient_member_id=member.id, audience_type="member", audience_id=str(member.id),
+            body_markdown="Disposable request", created_at=created_at) for _ in range(17))
     await db.commit()
     session_id, team_id = session.id, team.id
+    session_ended = False
+    earlier_mail = []
+    read_native_inputs = activity._team_inputs
+    read_mail = mail_request_stall_service.observe
+
+    async def native_inputs(*args, **kwargs):
+        if partial_mail_timeout and session_ended:
+            raise TimeoutError
+        return await read_native_inputs(*args, **kwargs)
+
+    async def observe_mail(*args, **kwargs):
+        result = await read_mail(*args, **kwargs)
+        earlier_mail.append(result)
+        return result
 
     def observe(slot_id, provider, session_id, bindings, duplicate, now, *, provenance=None):
         assert len(bindings) == 1
@@ -243,19 +269,32 @@ async def test_a_session_ending_during_campaign_read_invalidates_native_coverage
 
     class EndsSession:
         async def summary(self, db, preset_id, actions, **kwargs):
+            nonlocal session_ended
             result = await agent_team_campaign_service.summary(db, preset_id, actions, **kwargs)
             session = await db.get(MailAgentSession, session_id)
             session.closed_at = datetime.now(timezone.utc).replace(tzinfo=None)
             await db.commit()
+            session_ended = True
             return result
 
     monkeypatch.setattr(activity, "_observe", observe)
+    monkeypatch.setattr(activity, "_team_inputs", native_inputs)
+    monkeypatch.setattr(mail_request_stall_service, "observe", observe_mail)
     summary, _ = service(monkeypatch, campaign=EndsSession())
     result = await summary.summary(db, team_id)
     assert not result.coverage_complete and not result.next_actor_coverage_complete
-    assert [(entry.code, entry.source) for entry in result.coverage_reason] == [("fence_changed", "native")]
+    coverage_reason = "observation_timeout" if partial_mail_timeout else "fence_changed"
+    assert [(entry.code, entry.source) for entry in result.coverage_reason] == [(coverage_reason, "native")]
     assert result.waiting_input is None
     assert result.remaining_work.state == "known"
+    if partial_mail_timeout:
+        (partial,) = earlier_mail
+        assert not partial.complete and partial.reason == "entry_limit" and len(partial.items) == 16
+        published_mail = result.supervisor_observation.unanswered_requests
+        assert published_mail.items == [] and not published_mail.complete and published_mail.reason == "stall_timeout"
+        assert all(entry.code != "unanswered_request" for entry in result.attention)
+        (incomplete,) = [entry for entry in result.attention if entry.code == "unanswered_request_incomplete"]
+        assert incomplete.coverage_reason == "stall_timeout"
 
 
 @pytest.mark.asyncio

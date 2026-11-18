@@ -463,7 +463,8 @@ class AgentTeamSummaryService:
                 reported_items=len(current), confidence="unknown", reason="context_changed")
         if late_change or native_changed:
             stall = UnansweredRequestView(complete=False, reason="fence_changed")
-        elif publication_error is not None and stall.complete:
+        elif publication_error is not None and (rechecking_native or stall.complete):
+            # A partial result can still carry rows that depend on the native check.
             stall = UnansweredRequestView(complete=False, reason=mail_request_stall_service.failure_reason(publication_error))
         if published_hold:
             attention.insert(0, TeamSummaryAttention(code=published_hold))
