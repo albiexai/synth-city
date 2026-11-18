@@ -122,11 +122,11 @@ export function UsagePage() {
       if (isCurrent()) {
         setUsage(EMPTY_USAGE)
         const denial = scopeReadDenial(err)
+        setReadDenial(denial)
         if (denial) {
-          setReadDenial(denial)
           setSummary(null)
         } else {
-          setError(err instanceof Error ? err.message : 'Failed to load usage data')
+          setError('Could not read usage data.')
         }
       }
     } finally {
@@ -188,7 +188,7 @@ export function UsagePage() {
 
       {/* Error Display */}
       {error && (
-        <Card className="border-destructive">
+        <Card className="border-destructive" role="alert">
           <CardHeader>
             <CardTitle className="text-destructive">Error</CardTitle>
           </CardHeader>

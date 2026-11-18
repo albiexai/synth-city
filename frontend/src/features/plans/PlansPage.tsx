@@ -59,7 +59,7 @@ export function PlansPage() {
   const navigate = useNavigate()
   const { listPlans, getStats } = usePlansApi()
   const { selectedProviderId } = useProviderContext()
-  const [plans, setPlans] = useState<PlanSummary[]>([])
+  const [plans, setPlans] = useState<PlanSummary[] | null>(null)
   const [stats, setStats] = useState<PlanStatsResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -79,24 +79,25 @@ export function PlansPage() {
         getStats(),
       ])
       if (request !== requests.current.latest) return
-      if (plansResult.status === 'rejected') throw plansResult.reason
+
+      if (plansResult.status === 'rejected') {
+        const denial = scopeReadDenial(plansResult.reason)
+        setScope(null)
+        setReadDenial(denial)
+        setError(denial ? null : 'Could not read plans.')
+        setPlans(null)
+        setStats(null)
+        return
+      }
+
       const source = plansResult.value.scope ?? null
       const blocked = scopeUnreadable(source)
       setScope(source)
       setReadDenial(null)
       setPlans(blocked ? [] : plansResult.value.plans)
       setStats(!blocked && statsResult.status === 'fulfilled' ? statsResult.value : null)
-      if (!blocked && statsResult.status === 'rejected') throw statsResult.reason
-    } catch (err) {
-      if (request === requests.current.latest) {
-        const denial = scopeReadDenial(err)
-        if (denial) {
-          setReadDenial(denial)
-          setPlans([])
-          setStats(null)
-        } else {
-          setError(err instanceof Error ? err.message : 'Failed to load plans')
-        }
+      if (!blocked && statsResult.status === 'rejected') {
+        setError(scopeReadDenial(statsResult.reason) ?? 'Could not read plan statistics.')
       }
     } finally {
       if (request === requests.current.latest) setLoading(false)
@@ -110,7 +111,7 @@ export function PlansPage() {
   }, [fetchData])
 
   const providerPlans = useMemo(
-    () => plans.filter((plan) => (plan.source ?? 'claude-code') === selectedProviderId),
+    () => (plans ?? []).filter((plan) => (plan.source ?? 'claude-code') === selectedProviderId),
     [plans, selectedProviderId],
   )
   const providerStats = stats?.source === selectedProviderId ? stats : null
@@ -156,8 +157,16 @@ export function PlansPage() {
     </div>
   )
   const sourceNotice = <ReadScopeNotice scope={scope} denial={readDenial} fallbackFolder={fallbackFolder} />
-  if (unreadable) {
-    return <div className="space-y-6">{header}{sourceNotice}</div>
+  const errorNotice = error && (
+    <Card className="border-destructive" role="alert">
+      <CardHeader>
+        <CardTitle className="text-destructive">Error</CardTitle>
+        <CardDescription>{error}</CardDescription>
+      </CardHeader>
+    </Card>
+  )
+  if (unreadable || (error && plans === null)) {
+    return <div className="space-y-6">{header}{sourceNotice}{errorNotice}</div>
   }
 
   return (
@@ -165,14 +174,7 @@ export function PlansPage() {
       {header}
       {sourceNotice}
 
-      {error && (
-        <Card className="border-destructive">
-          <CardHeader>
-            <CardTitle className="text-destructive">Error</CardTitle>
-            <CardDescription>{error}</CardDescription>
-          </CardHeader>
-        </Card>
-      )}
+      {errorNotice}
 
       {/* Stats Row */}
       {providerStats && (

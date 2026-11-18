@@ -158,6 +158,51 @@ it('names the actual Codex home and keeps a configured Claude Plans path undiscl
   expect(screen.queryByText(scope.claude_dir, { exact: false })).not.toBeInTheDocument()
 })
 
+it.each([
+  { page: pages[1], message: 'Could not read usage data.' },
+  { page: pages[3], message: 'Could not read plans.' },
+])('replaces a denial with the latest $page.name read result', async ({ page, message }) => {
+  let status: number | null = 403
+  const denial = 'The controller cannot read this data folder.'
+  const serverDetail = 'Unexpected read failure at /fixture/private'
+  mockReads(page, () => scopeFor(page), { reply: endpoint => {
+    if (endpoint !== page.endpoint || status === null) return
+    const detail = status === 403 ? 'The controller cannot read /fixture/private.' : serverDetail
+    return Response.json({ detail }, { status })
+  } })
+  renderPage(page)
+  expect(await screen.findByRole('alert')).toHaveTextContent(denial)
+
+  status = 500
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+  expect(await screen.findByText(message)).toBeInTheDocument()
+  expect(screen.getByRole('alert')).toHaveTextContent(message)
+  expect(screen.queryByText(denial)).not.toBeInTheDocument()
+  expect(screen.queryByText(serverDetail)).not.toBeInTheDocument()
+  expect(screen.queryByText(page.empty)).not.toBeInTheDocument()
+
+  status = null
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+  expect(await screen.findByText(page.empty)).toBeInTheDocument()
+  expect(screen.getByText("Reading worker's", { exact: false })).toHaveTextContent(scopeFor(page).data_dir)
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+})
+
+it('keeps the confirmed Plans source and list when statistics fail', async () => {
+  const page = pages[3]
+  mockReads(page, () => scopeFor(page), { reply: endpoint => {
+    if (endpoint === 'plans/stats') {
+      return Response.json({ detail: 'Statistics failed at /fixture/private' }, { status: 500 })
+    }
+  } })
+  renderPage(page)
+
+  expect(await screen.findByText('Could not read plan statistics.')).toBeInTheDocument()
+  expect(screen.getByRole('alert')).toHaveTextContent('Could not read plan statistics.')
+  expect(screen.getByText("Reading worker's", { exact: false })).toHaveTextContent(scopeFor(page).data_dir)
+  expect(screen.getByText(page.empty)).toBeInTheDocument()
+})
+
 it('verifies the current Usage source before applying a cache for the same project', async () => {
   const page = pages[1]
   let scope = scopeFor(page)
@@ -206,7 +251,8 @@ it('drops the old Usage breakdown while another source loads and when its read f
   expect(screen.queryByText('old-project')).not.toBeInTheDocument()
 
   finishBreakdown(Response.json({ detail: 'Breakdown failed' }, { status: 500 }))
-  expect(await screen.findByText('Breakdown failed')).toBeInTheDocument()
+  expect(await screen.findByRole('alert')).toHaveTextContent('Could not read usage data.')
+  expect(screen.queryByText('Breakdown failed')).not.toBeInTheDocument()
   expect(screen.queryByText('old-project')).not.toBeInTheDocument()
   expect(screen.queryByText('No session data available')).not.toBeInTheDocument()
 })
