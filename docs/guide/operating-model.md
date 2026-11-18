@@ -2,10 +2,10 @@
 
 This page shows who does what when a Albiex Synth City team works on a GitHub backlog. Use it with the [Supervised factory playbook](./supervised-factory-playbook.md): this page explains the model, and the playbook gives the procedures.
 
-Select a figure to open it at full size. Parts marked **Planned (v3.1)** come from proposal [#506](https://github.com/albiexai/synth-city/issues/506). They are not in Deck 3.0.0. In the figures, green boxes are planned.
+Select a figure to open it at full size. Parts marked **Not implemented** describe planned behavior from proposal [#506](https://github.com/albiexai/synth-city/issues/506).
 
 ::: info Naming
-This page calls the human role the **Director**. Agent Mail already uses that name. The Deck 3.0.0 UI and API still say *operator* for the same role, for example the operator token and the operator API. In code, `operator` remains the name of the Director's authority interface. A supervisor uses it only under delegation. A later release will call the token the **Director key** in the UI ([#518](https://github.com/albiexai/synth-city/issues/518)).
+This page calls the human role the **Director**. Agent Mail already uses that name. The UI calls the Director's token the **Director key**. The API and code still say *operator* for the same role: the operator token, and `require_operator` on the factory routes. A supervisor uses it only under delegation.
 :::
 
 ## Kinds of actor
@@ -97,30 +97,34 @@ The supervisor works on the factory from outside it, and it does not run inside 
 | **Director** (human) | Write and order issues; apply the dispatch label | Write the outcome and delegation; authorize the start | Groom at any time; read the summary | Approve or decide on GitHub | Only for a security HOLD | Approve publication |
 | **Supervisor** (AI agent, optional) | Draft issues for the Director | Run startup checks | Fix routine blockers within delegation | Prepare the exact request and evidence | Fix, hand off, run the reviewed upgrade | Reconcile records; disable dispatch |
 | **Synth City controller** (non-agent) | Poll labelled issues | Store scopes, leases and Mail identity | Dispatch; bound attempts; show signals | List the human action | Record the operation; preserve authority and leases | Show the result |
-| **Leader and team** (AI agents) | Optional readiness assessment | Mail canary | Assess, plan, implement, verify | Independent work continues | Owner checkpoint, then hold | Close issues |
+| **Leader and team** (AI agents) | Optional readiness assessment | Mail canary | Assess, plan, implement, verify | Independent work continues | Owner checkpoint, then hold | Report results |
 | **GitHub** (non-agent) | The Director's backlog | Parent issue and backlog | PRs and required CI | Exact instructions in the issue | Only live status surface | Final record |
 
-## Supervisor heartbeat — Planned (v3.1)
+## Supervisor heartbeat
 
 <p>
   <a href="/docs/images/operating-model/supervisor-tick.svg"><img src="/images/operating-model/supervisor-tick.svg" alt="Supervisor tick: read, act if delegated, publish if changed, check in" width="48%"></a>
   <a href="/docs/images/operating-model/heartbeat-status.svg"><img src="/images/operating-model/heartbeat-status.svg" alt="The controller derives Healthy, Late or Absent from the last check-in and the clock" width="48%"></a>
 </p>
 
-The supervisor keeps no state between ticks. It reads Synth City and GitHub again on each tick, so a harness exit or reboot loses nothing. Replay safety comes from the controller's existing `replay_key` and `operation_id` records.
+The supervisor keeps no state between ticks. It reads Synth City and GitHub again on each tick, so a harness exit or reboot loses nothing.
 
-At the end of each tick, the supervisor promises its next check (`next_check_at`). The controller compares that promise with the clock. The supervisor never reports its own health.
+At the end of each tick, the supervisor promises its next check (`next_check_at`). The promise must be later than the check-in and at most 24 hours ahead. The controller compares that promise with the clock. The supervisor never reports its own health.
 
 | Status | Meaning |
 |---|---|
 | None | No supervisor is registered. This is not an error. |
 | Healthy | The promised check has not passed. |
-| Late | The check is overdue. Work can still run. |
-| Absent | No check-in, or the check is overdue past the threshold. |
+| Late | The promised check is overdue, but within the grace period. Work can still run. |
+| Absent | No check-in yet, or the grace period has passed. |
 
-## Director's summary — Planned (v3.1)
+The grace period is the team's override when one is set. Otherwise it is the larger of 30 minutes and twice the interval between the last check-in and its promise.
 
-One summary at the top of the Overview answers three questions: Do I need to act? Is anyone watching? What work remains? Most lines collect data that Deck 3.0.0 already has. The supervisor line and the team total for remaining work are new. See [#506](https://github.com/albiexai/synth-city/issues/506) and [#508](https://github.com/albiexai/synth-city/issues/508).
+## Director's summary
+
+The Overview shows one status line: whether the factory is running, paused or idle, with the team count when known. Each team's summary card on the Overview already shows its supervisor status, remaining work, attention items and the human actions it needs.
+
+A single top-of-page summary would also answer three questions: Do I need to act? Is anyone watching? What work remains? That top-of-page layout is not implemented. Its planned form is shown below. See [#506](https://github.com/albiexai/synth-city/issues/506) and [#508](https://github.com/albiexai/synth-city/issues/508).
 
 ```text
 Publish the next release                      Parent issue: #NNN

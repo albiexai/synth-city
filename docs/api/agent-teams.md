@@ -401,6 +401,34 @@ These routes need the operator token. They are generic references; IDs in paths 
 | PATCH `/api/v1/agent-teams/github-work-items/{item_id}/delivery-policy` | Applies the current scope policy to one existing attempt. The body has `expected_dispatch_nonce`, `expected_scope_revision`, `expected_policy_revision`, `target_policy_revision` and `reason`. A changed context returns 409 `attempt_delivery_policy_context_changed`. |
 | GET `/api/v1/agent-teams/github-scopes/{scope_id}/delivery-policy/history` | Lists the latest 100 policy change events for the scope. The history is append-only. |
 
+### Delivery policy fields and attempt snapshots
+
+`policy` takes the fields below. Unknown fields are rejected, and every field has a default. The policy is data: it grants no approval, merge, scope or execution authority.
+
+| Field | Values (default) | Effect |
+| --- | --- | --- |
+| `required_checks` | Up to 32 `{name, app_slug}` entries; `app_slug` defaults to `github-actions` (`[]`) | Names the hosted checks a candidate commit must pass. Each identity must be unique. |
+| `owner_contact` | `reports` or `native` (`reports`) | `native` lets fresh, bound native work renew owner contact. |
+| `owner_idle_seconds` | 60 to 86400, or unset | Owner idle timeout. Unset uses the server setting. |
+| `owner_nudge_grace_seconds` | 30 to 3600, or unset | Nudge grace period. Unset uses the server setting. |
+| `owner_observation_wait_seconds` | 30 to 1800, or unset; requires `native` | Bounded wait for unknown native evidence, after the usual nudge. |
+| `owner_observation_resume_seconds` | 60 to 3600 (`900`) | Resume deadline for a recorded observation pause. Only the operator can resume it. |
+| `accepted_base_update` | `disabled`, `fast_forward` or `merge` (`disabled`) | Allows an accepted-base integration update in that mode. `disabled` refuses it. The accepted pull must also carry every required check, from the named app. |
+| `broad_checks` | `local` or `hosted` (`local`); `hosted` requires `required_checks` | `hosted` makes the required hosted broad checks the final evidence. |
+| `checkpoint_delay_report_seconds` | 60 to 86400, or unset (`1800`) | Owner instruction to report a checkpoint publication delay after this many seconds. |
+| `caller_inventory_required` | boolean (`false`) | Owner instruction to record and review the caller inventory before shared-consumer edits. |
+| `regression_proof_required` | boolean (`false`) | Owner instruction to show each regression fail on its defective source and pass on the candidate. |
+
+The API rejects duplicate check identities, hosted broad checks without `required_checks`, and an observation wait unless `owner_contact` is `native`.
+
+Attempt snapshots follow these rules:
+
+- A new dispatch copies the scope's current policy and revision into the attempt. Later scope changes do not alter that attempt.
+- An attempt created before the upgrade has no stored policy. It keeps the legacy rules until it is adopted.
+- The scope PATCH applies only when `expected_revision` is current. A success records a history event and increments the revision.
+- The attempt PATCH copies the scope's current policy into the attempt. It runs only while the attempt is `pending`, `dispatched` or `escalated`, its nonce, scope revision and policy revision match the request, and the scope is still at `target_policy_revision`. Any other state returns 409 `attempt_delivery_policy_context_changed`.
+- History returns up to 100 events for the scope, newest first. Attempt adoptions appear with `work_item_id` set.
+
 ### Maintenance
 
 | Route | Behavior |
