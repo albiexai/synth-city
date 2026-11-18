@@ -92,7 +92,7 @@ export function AgentTeamsHelpDialog({ open, onOpenChange }: AgentTeamsHelpDialo
               <li>Put <code>github_token</code> in <code>backend/.env</code> for polling private repos and restart Albiex Synth City. App-backed dispatch also needs GitHub App settings; App settings alone do not authenticate the watcher.</li>
               <li>Add a watched repo with an existing primary checkout under your home directory.</li>
               <li>Assign and launch the Leader slot before enabling autonomy. Reordering and Role text do not change the assignment.</li>
-              <li>Add the dispatch label to a GitHub issue, then enable autonomy. Area labels route to a matching owner; otherwise Synth City uses expertise, then the Leader.</li>
+              <li>Add the dispatch label to a GitHub issue, then enable autonomy. An area label routes the issue to the first enabled slot, in roster order, whose area labels include it. With no match, the issue waits as pending and is not given to the Leader.</li>
               <li>Watch Activity. The Director key protects roster and watched-repo settings, team launch, autonomy, recovery policy, and Director remedies. It is separate from the GitHub polling token and stays in this browser tab.</li>
             </ol>
             <p>Design-labeled issues follow the human-review design pipeline. Code auto-merge depends on each repo&apos;s merge policy.</p>

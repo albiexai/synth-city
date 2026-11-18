@@ -44,6 +44,8 @@ Each team has slots. A slot stores:
 - repository path
 - display name
 - role and charter
+- area labels, the GitHub label names that route an issue to this slot (exact, case-sensitive match)
+- expertise, a note that is stored but does not route work yet
 - optional UI color for Agent Bridge cards and terminals
 - optional bootstrap prompt
 - controlled language, enabled by default for each member
@@ -221,7 +223,9 @@ your action and can filter them. Leader approvals are labeled separately. For
 operator recovery checkpoints or stranded initial approvals, the action remains
 visible for the operator instead of being labeled as a Leader decision. Under
 automatic merge policy, a review-ready item needs your action only when Synth City has
-explicitly fallen back to human merge. Passing checks do not prove independent
+explicitly fallen back to human merge. A code PR under automatic merge policy merges
+only after the team's verifier slot has accepted its exact current head; the item's
+owner and the Leader cannot supply that acceptance. Passing checks do not prove independent
 review acceptance. Check the current PR head and review evidence before merging.
 
 ### Observation limits

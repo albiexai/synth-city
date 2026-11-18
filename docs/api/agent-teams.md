@@ -149,7 +149,7 @@ DELETE /api/v1/agent-teams/slots/{slot_id}
 POST /api/v1/agent-teams/presets/{preset_id}/slots/reorder
 ```
 
-Slots store provider, repository path, display name, role, charter, UI color, bootstrap prompt, launch mode, provider options, and enabled state.
+Slots store provider, repository path, display name, role, charter, UI color, bootstrap prompt, launch mode, provider options, enabled state, `area_labels` and `expertise`. `area_labels` is a list of GitHub label names that route an issue to the slot; the match is exact and case-sensitive. `expertise` is stored but does not route work yet.
 
 Slots also store `controlled_language_enabled`. The default is `true` for new and existing slots.
 Send `false` on creation or slot update to disable ASD-STE100 guidance for that member. Omit the field on update to keep its value.
