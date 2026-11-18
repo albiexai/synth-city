@@ -528,8 +528,17 @@ class AgentTeamSummaryService:
         # Binding an issue to a work item may await after the team observation. Preserve its timestamp
         # and fail closed if the coverage expired or the hold changed while the bindings were read.
         current_hold = hold_code()
-        if current_hold != result.hold_code or _utc(result.valid_until) <= datetime.now(timezone.utc):
-            updates.update(coverage_complete=False, next_actor_coverage_complete=False, waiting_input=None)
+        hold_changed = current_hold != result.hold_code
+        window_expired = _utc(result.valid_until) <= datetime.now(timezone.utc)
+        if hold_changed or window_expired:
+            coverage = list(result.coverage_reason)
+            existing_codes = {reason.code for reason in coverage}
+            if hold_changed and "source_changed" not in existing_codes:
+                coverage.append(TeamSummaryCoverageReason(code="source_changed"))
+            if window_expired and "window_expired" not in existing_codes:
+                coverage.append(TeamSummaryCoverageReason(code="window_expired"))
+            updates.update(coverage_complete=False, coverage_reason=coverage,
+                           next_actor_coverage_complete=False, waiting_input=None)
             if current_hold is not None:
                 updates["hold_code"] = current_hold
         return result.model_copy(update=updates)
