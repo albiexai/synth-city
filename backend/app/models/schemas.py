@@ -2216,6 +2216,8 @@ class GithubScopeRevisionResponse(BaseModel):
     allowed_actions: List[str]
     allowed_commands: List[str]
     prohibited_actions: List[str]
+    # #1185: prohibitions bind only while the revision is active or submitted.
+    prohibitions_in_force: bool = False
     tool_fallbacks: Dict[str, Any]
     baseline_head_sha: str
     baseline_tree_sha: str

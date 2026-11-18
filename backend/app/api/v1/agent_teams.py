@@ -588,7 +588,10 @@ def _scope_revision_response(
     include_commands: bool = True,
     approval: GithubApprovalRequest | None = None,
     effort: dict | None = None,
+    current_view: bool = False,
 ) -> GithubScopeRevisionResponse:
+    """``current_view``: the owner's current context, where an ended revision's prohibitions are not shown (#1185)."""
+    in_force = revision.status in ("active", "submitted")
     return GithubScopeRevisionResponse(
         id=revision.id,
         work_item_id=revision.work_item_id,
@@ -606,7 +609,8 @@ def _scope_revision_response(
         allowed_paths=revision.allowed_paths,
         allowed_actions=revision.allowed_actions,
         allowed_commands=revision.allowed_commands if include_commands else [],
-        prohibited_actions=revision.prohibited_actions,
+        prohibited_actions=revision.prohibited_actions if in_force or not current_view else [],
+        prohibitions_in_force=in_force,
         tool_fallbacks=revision.tool_fallbacks,
         baseline_head_sha=revision.baseline_head_sha,
         baseline_tree_sha=revision.baseline_tree_sha,
@@ -2279,7 +2283,7 @@ async def claim_github_work_item_continuation(
         leader_member_id=leader_member.id if leader_member is not None else None,
         status_note=item.status_note,
         active_revision=(
-            _scope_revision_response(active_revision, effort=effort_view)
+            _scope_revision_response(active_revision, effort=effort_view, current_view=True)
             if active_revision is not None
             else None
         ),
