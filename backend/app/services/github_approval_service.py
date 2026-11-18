@@ -807,9 +807,11 @@ class GithubApprovalService:
         withdrawn = sorted({path.strip() for path in withdrawn_paths if isinstance(path, str)})
         if withdrawn != omitted:
             # A withdrawal that is not a base path, is still named, or adds to the omission is wrong as given;
-            # an omission with no withdrawal is the #1055 trap.
-            raise GithubApprovalError("amendment_withdrawn_paths_invalid" if withdrawn
-                                      else "amendment_base_paths_omitted")
+            # an omission with no withdrawal is the #1055 trap. Literal raises keep both codes visible to the
+            # plain-language refusal catalogue's scan (frontend/tests/audit-refusals.test.ts).
+            if withdrawn:
+                raise GithubApprovalError("amendment_withdrawn_paths_invalid")
+            raise GithubApprovalError("amendment_base_paths_omitted")
 
     def verify_amendment_binding(self, request, revision):
         if (revision.origin_kind != "scope_amendment" or request.request_kind != "continuation"
