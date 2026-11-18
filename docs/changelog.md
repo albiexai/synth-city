@@ -18,7 +18,6 @@ Albiex Synth City 4.3.0 is a correctness release: it makes existing features wor
 ### Added
 
 - **A member that doesn't react to a wake is woken once more, and the Leader and the Supervisor are told if it still doesn't.** A delivered wake with no observed activity gets one re-wake, never a second. If the re-wake also gets no activity, the Leader and the Supervisor each receive one notice naming the member and its work item (#1059, #1060).
-- **A wake prompt left unsent in a pane's input box is submitted.** Synth City recognises the unsent text and presses Enter only; it never types other text (#1061).
 - **Provider refusals are recognised and shown.** A Codex pane showing a provider refusal or content-filter notice is recorded as a blocked state on the member. The Leader and the Supervisor are notified once, and Teams shows "Blocked: provider refusal" on the member card (#1062, #1091, #1092, #1064).
 - **A stopped work item can be ended as deferred or superseded.** The operator route and the Leader tool `end-stopped` end an item with outcome `deferred` (naming the target milestone) or `superseded` (naming the delivering PR). It releases a verified clean workspace and clears the item's attention. A PR's final hold guard now ignores attention that belongs to other work items (#1219).
 

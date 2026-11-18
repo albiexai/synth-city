@@ -89,5 +89,6 @@ def test_the_installer_keeps_its_node_floor_and_does_not_take_the_test_run_floor
 
 def test_the_release_note_names_the_test_run_requirement():
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
-    assert re.search(r"frontend tests[^\n]*22\.22\.2", unreleased), "Unreleased has no note on the frontend-test Node requirement"
+    # The note shipped in 4.3.0 (#1158); it must stay in that release's section.
+    release = changelog.split("## [4.3.0]", 1)[1].split("\n## [", 1)[0]
+    assert re.search(r"frontend tests[^\n]*22\.22\.2", release), "4.3.0 has no note on the frontend-test Node requirement"
