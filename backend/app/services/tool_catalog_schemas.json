@@ -364,6 +364,11 @@
   },
   "synth_city_get_work_item_context": {
     "properties": {
+      "leader_release": {
+        "default": false,
+        "title": "Leader Release",
+        "type": "boolean"
+      },
       "work_item_id": {
         "title": "Work Item Id",
         "type": "integer"

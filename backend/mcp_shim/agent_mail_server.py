@@ -1438,17 +1438,23 @@ def synth_city_report_dispatch_status(
 
 
 @mcp.tool()
-def synth_city_get_work_item_context(work_item_id: int) -> dict:
+def synth_city_get_work_item_context(work_item_id: int, leader_release: bool = False) -> dict:
     """Claim the current owner's continuation context, including the persisted
     branch, approval round, workspace, and lease capability after a handoff or
-    session restart."""
+    session restart.
+
+    Set leader_release=True for a read-only Leader context on a terminal item.
+    Use the returned workspace_id and leased_at as expected_leased_at for
+    synth_city_leader_release_workspace.
+    """
     registered = _ensure_registered()
     if not registered["ok"]:
         return registered
-    result = _dispatch_request(
-        "POST",
-        f"/github-work-items/{work_item_id}/claim-continuation",
-    )
+    prefix = f"/github-work-items/{work_item_id}"
+    if leader_release:
+        result = _dispatch_request("GET", f"{prefix}/leader-recovery/release-workspace/context")
+    else:
+        result = _dispatch_request("POST", f"{prefix}/claim-continuation")
     if not result["ok"]:
         return result
     return {"ok": True, "context": result["data"]}
@@ -1727,6 +1733,7 @@ def synth_city_leader_release_workspace(work_item_id: int, workspace_id: int, ex
     operation_id: str, reason: str) -> dict:
     """Current Leader releases a CLEAN workspace of a terminal item.
 
+    Read workspace_id and leased_at with synth_city_get_work_item_context(leader_release=True).
     Refused when the tree is dirty, has unpushed commits or cannot be inspected, when the item is not
     terminal, or when the lease changed. Dirty or unknown state is operator-only. One notice to the
     bound Supervisor; replay-safe.

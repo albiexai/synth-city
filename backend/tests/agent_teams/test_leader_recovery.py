@@ -1,7 +1,7 @@
 """The Leader runs three standard recoveries with the operator guards, one audit fact and one Supervisor notice."""
 import asyncio
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -315,6 +315,84 @@ async def test_release_clears_exactly_the_inspected_lease_and_notifies_once(db, 
 
 
 @pytest.mark.asyncio
+async def test_leader_reads_and_releases_the_lease_of_a_completed_closed_pr(db, ready):
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+    from app.api.v1 import agent_teams
+    from app.database import get_db
+    from app.services.agent_mail_service import agent_mail_service
+
+    a = ready
+    item_id, workspace_id = a.item.id, a.workspace.id
+    lease_start = datetime(2026, 11, 17, 18, 11, 59, 123456)
+    contact = lease_start + timedelta(seconds=10)
+    a.workspace.leased_at = lease_start
+    a.workspace.lease_last_owner_contact_at = contact
+    a.item.dispatch_status = "completed"
+    branches = _git(a.repo, "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines()
+    a.scope.base_ref = next(branch for branch in branches if branch != a.item.dispatch_head_ref)
+    (a.repo / "change.txt").write_text("ahead of the base\n")
+    _git(a.repo, "add", "change.txt")
+    _git(a.repo, "commit", "-qm", "closed PR commit")
+    a.pull.update(state="closed", merged_at=None)
+    a.pull["head"]["sha"] = _git(a.repo, "rev-parse", "HEAD")
+    assert _git(a.repo, "rev-list", "--count", f"{a.scope.base_ref}..HEAD") == "1"
+    a.leader_session.capability_token_hash = agent_mail_service.hash_capability_token("fixture-leader-token")
+    a.owner_session.capability_token_hash = agent_mail_service.hash_capability_token("fixture-owner-token")
+    await db.commit()
+
+    api = FastAPI()
+    api.include_router(agent_teams.router)
+
+    async def test_db():
+        yield db
+
+    api.dependency_overrides[get_db] = test_db
+    route = f"/github-work-items/{item_id}/leader-recovery/release-workspace"
+    leader = {"X-Synth-City-Session-Token": "fixture-leader-token"}
+    owner = {"X-Synth-City-Session-Token": "fixture-owner-token"}
+    async with AsyncClient(transport=ASGITransport(app=api), base_url="http://fixture") as client:
+        assert (await client.get(f"{route}/context")).status_code == 401
+        assert (await client.get(f"{route}/context", headers=owner)).status_code == 403
+        read = await client.get(f"{route}/context", headers=leader)
+        assert read.status_code == 200, read.text
+        assert read.headers.get("cache-control") == "no-store"
+        context = read.json()
+        assert set(context) == {"work_item_id", "workspace_id", "leased_at"}
+        assert context["work_item_id"] == item_id and context["workspace_id"] == workspace_id
+        assert datetime.fromisoformat(context["leased_at"]) == lease_start.replace(tzinfo=timezone.utc)
+        await db.refresh(a.workspace)
+        assert a.workspace.leased_item_id == item_id
+        assert a.workspace.lease_last_owner_contact_at == contact
+        assert await _notices(db) == []
+
+        await db.refresh(a.item)
+        a.item.dispatch_status = "verifying"
+        await db.commit()
+        active = await client.get(f"{route}/context", headers=leader)
+        assert active.status_code == 409 and active.json()["detail"] == "item_not_terminal"
+        await db.refresh(a.item)
+        a.item.dispatch_status = "completed"
+        await db.commit()
+
+        payload = {"workspace_id": context["workspace_id"], "expected_leased_at": context["leased_at"],
+                   "operation_id": "closed-pr-release", "reason": REASON}
+        stale = await client.post(route, headers=leader,
+                                  json=payload | {"expected_leased_at": (lease_start - timedelta(microseconds=1)).isoformat()})
+        assert stale.status_code == 409 and stale.json()["detail"] == "workspace_lease_changed"
+        released = await client.post(route, headers=leader, json=payload)
+        assert released.status_code == 200, released.text
+        assert released.json() == {"status": "released", "workspace_id": workspace_id, "notice": "sent"}
+        replayed = await client.post(route, headers=leader, json=payload)
+        assert replayed.json() == {"status": "already_released", "workspace_id": workspace_id, "notice": "already_sent"}
+        assert (await client.get(f"{route}/context", headers=leader)).status_code == 409
+
+    await db.refresh(a.workspace)
+    assert a.workspace.leased_item_id is None and a.workspace.lease_token is None
+    assert len(await _notices(db)) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("refusal", ["owner", "dirty", "not_terminal", "lease_changed", "other_item",
                                      "no_supervisor", "reason"])
 async def test_release_refuses_each_guard_and_keeps_the_lease(db, releasable, monkeypatch, refusal):
@@ -421,8 +499,14 @@ async def test_finalize_refuses_each_guard_without_a_notice(db, ready, refusal):
 
 RECOVERY = "leader-recovery"
 RECOVERY_ROUTES = [
-    (f"{settings.api_v1_prefix}/agent-teams/github-work-items/{{item_id}}/leader-recovery/{tail}", ("POST",))
-    for tail in ("cancel-revision", "finalize-merged/preview", "finalize-merged", "release-workspace")
+    (f"{settings.api_v1_prefix}/agent-teams/github-work-items/{{item_id}}/leader-recovery/{tail}", (method,))
+    for method, tail in (
+        ("POST", "cancel-revision"),
+        ("POST", "finalize-merged/preview"),
+        ("POST", "finalize-merged"),
+        ("POST", "release-workspace"),
+        ("GET", "release-workspace/context"),
+    )
 ]
 
 
@@ -465,11 +549,12 @@ def test_operator_only_actions_are_not_exposed_to_the_leader():
     source = inspect.getsource(lr)
     for forbidden in ("max_continuation", "continuation_enabled", "github_publish", "settings.", "approve("):
         assert forbidden not in source  # no policy, limit or approval setter is reachable from the Leader service
-    # The routes as the app really exposes them: exactly these four, none behind the operator guard.
+    # The app exposes exactly the approved recovery actions and lease context read.
     _assert_recovery_exposure(app.routes, RECOVERY_ROUTES)
     # The test must have looked at the operator-protected group: every delivery route is among the effective routes,
     # under the agent-teams prefix, and depends on require_operator.
     effective = _effective_routes(app.routes)
+    assert all(_depends_on(dependant, "mail_session") for path, _, dependant in effective if RECOVERY in path)
     delivery = [route for route in factory_delivery.router.routes if getattr(route, "methods", None)]
     assert delivery
     for route in delivery:

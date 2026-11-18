@@ -44,7 +44,7 @@ from app.models.database import (
     TeamGithubScope,
 )
 from app.services.github_leader_recovery_service import (
-    CancelRevisionRequest, FinalizeMergedLeaderRequest, ReleaseWorkspaceRequest,
+    CancelRevisionRequest, FinalizeMergedLeaderRequest, ReleaseWorkspaceRequest, WorkspaceReleaseContext,
 )
 from app.models.schemas import (
     GithubScopeAmendmentCreate, GithubRevisionReviewCreate, GithubRevisionReviewWithdraw,
@@ -4127,6 +4127,20 @@ async def leader_finalize_merged(item_id: int, request: FinalizeMergedLeaderRequ
         lambda item: _with_reader(db, item_id, lambda read: recovery.finalize_merged(db, item, session,
             read_pull=read, operation_id=request.operation_id,
             expected_context_sha256=request.expected_context_sha256, reason=request.reason)))
+
+
+@router.get('/github-work-items/{item_id}/leader-recovery/release-workspace/context',
+            response_model=WorkspaceReleaseContext)
+async def leader_workspace_release_context(
+    item_id: int,
+    response: Response,
+    session: MailAgentSession | None = Depends(mail_session),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services import github_leader_recovery_service as recovery
+    response.headers["Cache-Control"] = "no-store"
+    return await _leader_recovery(item_id, session, db, 'agent_teams.leader_workspace_release_context',
+        lambda item: recovery.release_workspace_context(db, item, session))
 
 
 @router.post('/github-work-items/{item_id}/leader-recovery/release-workspace')
