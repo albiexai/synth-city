@@ -11,7 +11,7 @@ scripts/isolated-runtime-kit.sh down   --root /tmp/kit [--keep]
 
 ## What `up` starts
 
-- **Two namespace anchors.** The outer anchor runs `unshare --user --map-root-user --net`. It brings up `lo`, which must be the only network link, so nothing inside the kit can reach another host or another Synth City. The inner anchor maps back to the caller's uid and gid. Both start from an empty environment, so no token, socket or identity of the caller's session reaches the namespaces.
+- **Two namespace anchors.** The outer anchor is PID 1 in the kit's PID namespace, created with `--pid --fork --mount-proc` and its own user and network namespaces. It brings up `lo` as the only link. The inner anchor maps back to the caller's uid and gid. Both start from an empty environment.
 - **An isolated Synth City backend.** It has its own root, HOME, SQLite database and private tmux socket, a synthetic operator token, and an allowlisted environment. It doesn't build or serve the UI.
 - **A stub model provider** (`scripts/runtime-kit/stub_provider.py`) on `127.0.0.1`. It answers the OpenAI-compatible chat API with a fixed reply, and its log keeps a hash of each request, never prompt text.
 - **The CLI under test.** It's installed under its provider's binary name, for example `claude` for `claude-code`. Every other harness name resolves to a fake, so no host CLI can start, and `gh` is disabled. The kit then installs Agent Mail for the provider, creates a team preset with one slot and launches it through the normal launch API. That writes the real pane binding; the CLI then registers from its pane through the normal Agent Mail endpoint.
@@ -24,7 +24,7 @@ scripts/isolated-runtime-kit.sh down   --root /tmp/kit [--keep]
 - **Proved by `status`.** Before it writes anything, `status` refuses (exit 2) unless both files are absent, or both are regular files whose digest matches. A run with a script adds `stub-script.sha256` to the evidence and its manifest, and `summary.json` gains `stub_script_sha256` (null without a script). The digest is checked again after capture; a change publishes nothing.
 - `down` removes the copy with the root.
 
-`up` prints one JSON line: the namespace, the links, the uid, the pane, the registration and binding read from the kit's database, the stub request count, and the kit's process ids. It never prints a token.
+`up` prints one JSON line with the namespaces, links, uid, pane, registration and binding, stub request count and recorded host PIDs. Pane and registration PIDs are local to the kit.
 
 ## Commands
 
@@ -52,13 +52,13 @@ Each `up` creates one instance with a random id. `state/instance.json` (a privat
 - the inner anchor is the parent of the tmux server, the stub and the backend (it starts them itself);
 - the tmux server is the parent of the CLI pane.
 
-A process counts as the kit's only when every recorded field matches and its parent is the recorded process of its expected parent role. It must also be in the kit's recorded namespaces. Before those are recorded, only the anchors may exist, and only in their own non-host namespaces. A process in a host namespace never counts. When a process re-executes, only its recorded command line may change.
+A process counts as the kit's only when every recorded field matches and its parent is the recorded process of its expected parent role. It must also be in the kit's recorded namespaces. Before those are recorded, only the anchors may exist, and only in their own non-host namespaces. The kit resolves a namespace-local PID against the recorded parent and verifies that it still refers to the same process. When a process re-executes, only its recorded command line may change.
 
 **Signals.** Every signal opens a pidfd first, proves the full recorded identity, and then signals through that pidfd. Without pidfd support, or on any mismatch, nothing is signalled. The launcher is never signalled; it exits with the outer anchor.
 
-**`down`** first computes a read-only plan. It refuses before any signal, keeping the root and the anchors, if any recorded process fails its proof, or if any unreadable process or any unrecorded process other than a group member (below) is in the kit's network namespace. Otherwise it stops the group members, then the CLI, the stub, the backend, the tmux server, the inner anchor and the outer anchor, in that order.
+**`down`** first computes a read-only plan. It refuses before any signal if a recorded role fails its proof or the kit network contains a process whose PID namespace membership cannot be proved. For a current root its only signal target is the verified PID 1. The kernel stops the descendants of that init, including daemons in separate sessions. The kit proves cleanup before removing the root.
 
-**Group members (#1010).** A real CLI can start processes of its own. tmux starts each pane as a session and process-group leader, and a child stays in that group unless it calls `setsid` or `setpgid`. `down` stops an unrecorded process only when all of these hold:
+**Older roots.** Instances recorded before the PID namespace change use the group-based teardown from #1010. For those roots, `down` stops an unrecorded process only when all of these hold:
 - its process group id is the pid of a proved service role (the CLI, the stub, the backend or the tmux server) that leads its own group;
 - it is one of the caller's processes;
 - it is in the kit's network namespace.
@@ -70,7 +70,7 @@ A process can join a group only inside its own session, and a live leader keeps 
 ## Evidence
 
 `status` publishes these files in `ROOT/evidence/` (a link to the latest complete attempt in `ROOT/evidence.d/`), with `MANIFEST.sha256`:
-- `namespaces.json`
+- `namespaces.json`, with the host and kit user, network, PID and mount namespace identities
 - `links.txt`
 - `processes.txt`
 - `pane.json`
@@ -96,10 +96,10 @@ The kit refuses, with exit 2, when:
 - no real tmux executable is found (a launcher script is not accepted);
 - the network namespace has any link other than `lo`;
 - the inner namespace doesn't map to the caller's uid and gid;
-- the two-step namespace entry doesn't land in the anchors' namespaces;
+- the two-step entry lands in the wrong namespace or procfs shows a different PID from the process itself;
 - a recorded process id now has another start time, so it may belong to another process.
 
-**Namespace entry is two-step.** The kit enters through the outer anchor, which owns the network namespace, and then the inner one. A single `nsenter` into the inner anchor is refused by the kernel. Before it enters a namespace, the kit proves both anchors as described in [Ownership and cleanup](#ownership-and-cleanup).
+**Namespace entry is two-step.** The kit proves both anchors, then enters the outer user, network, mount and PID namespaces. There it uses the inner anchor's PID from private procfs to enter the inner user namespace.
 
 ## OpenCode members
 
@@ -130,10 +130,9 @@ The end-to-end test `backend/tests/test_isolated_runtime_kit.py` runs a fake pro
 
 ## Limits
 
-- **Linux only.** The kit needs unprivileged user and network namespaces, plus `tmux`, `unshare`, `nsenter`, `ip`, `timeout` and `setsid`. The kit's own checks without namespaces (the model, refusal, fake-CLI and stub tests) run on every host.
+- **Linux only.** The kit needs unprivileged user, network and PID namespaces with a private procfs, plus `tmux`, `unshare`, `nsenter`, `ip`, `timeout` and `setsid`. The model and refusal tests run without namespace privileges.
 - **Not on the hosted `ubuntu-latest` runner as configured.** The runner denies the namespace setup (`unshare: write failed /proc/self/uid_map: Operation not permitted`). The log shows the denial, not its cause. There, each namespace-dependent test skips with `capability unavailable: uid_map`, and the namespace path is proved by one local run in the owner's leased workspace, with evidence on the PR for review.
-- **Group members only.** A process that leaves its leader's group (with `setsid` or `setpgid`), or that outlives its leader, is still an unrecorded process, so `down` refuses (or, after it has stopped the roles, fails as incomplete) and keeps the root. The kit has no PID namespace, so it can't end every descendant at once.
-- **OpenCode is not covered.** OpenCode 2.2.7's `opencode serve` and its Agent Mail shim each lead their own session and group (observed in #963), so with a real OpenCode member `down` refuses before any signal and keeps the root. In #963, `crash --role cli` stopped the recorded CLI, both exited within 2 seconds, and `down` then succeeded. That is an observation of two runs, not a guarantee. A teardown that covers such children needs a PID namespace or a cgroup.
+- **OpenCode evidence.** In #963, OpenCode 2.2.7's `opencode serve` and Agent Mail shim each led their own session. The #1018 fake-provider regression covers that process shape. The real OpenCode teardown, crash and relaunch capture, and Agent Mail round trip are tracked in [#1195](https://github.com/albiexai/synth-city/issues/1195).
 - **One OS user.** Factory members share one OS user, so ownership is proved by the instance id and namespace, never by the user id alone.
 - **Local checks only.** The stub model doesn't model a real provider; a real-provider check is a separate decision with its own approval.
 - **One kit per root.** The ports (18780 for the backend, 18781 for the stub) belong to the kit's own network namespace, so separate kits don't collide.
