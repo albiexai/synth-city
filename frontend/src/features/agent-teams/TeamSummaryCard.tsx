@@ -9,7 +9,7 @@ import type {
   AgentTeamPresetListResponse, AgentTeamSummary, TeamRemainingWork,
 } from '@/types/agentTeams'
 import { ACTION_TEXT, ATTENTION_TEXT, incompleteRequestText, unansweredRequestText } from './summaryText'
-import { waitingText } from './supervisorText'
+import { blockedText, waitingText } from './supervisorText'
 import { parseReminders, reminderAge } from './reminderText'
 import { SupervisorStatus } from './SupervisorStatus'
 
@@ -78,7 +78,8 @@ export function TeamSummaryCard({ presetId, name, running, showChecked = true, c
   const state = useObservation<AgentTeamSummary>(`agent-teams/presets/${presetId}/summary${query ? `?${query}` : ''}`)
   const summary = state.data
   const unreadable = summary?.required_ci_unreadable ?? []
-  const waiting = summary?.waiting_input ?? []
+  const waiting = (summary?.waiting_input ?? []).filter((entry) => entry.label === 'Waiting for input')
+  const blocked = (summary?.waiting_input ?? []).filter((entry) => entry.label === 'Blocked: provider refusal')
   const overdue = summary?.supervisor_observation?.attention ?? null
   const reminders = parseReminders(summary?.reminder_attention)
   const actions = summary?.human_actions.filter(
@@ -182,6 +183,15 @@ export function TeamSummaryCard({ presetId, name, running, showChecked = true, c
                 <ul className="space-y-1">
                   {waiting.map((entry) => (
                     <li key={entry.slot_id}>{waitingText(entry, slotNames)}</li>
+                  ))}
+                </ul>
+              </Row>
+            )}
+            {blocked.length > 0 && (
+              <Row label="Blocked: provider refusal">
+                <ul className="space-y-1">
+                  {blocked.map((entry) => (
+                    <li key={entry.slot_id}>{blockedText(entry, slotNames)}</li>
                   ))}
                 </ul>
               </Row>
