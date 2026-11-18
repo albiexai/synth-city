@@ -26,8 +26,7 @@ from app.models.github_work_progress_schemas import (
 from mcp_shim.work_remaining_protocol import RemainingReport, ReportContext, parse_report, public_generation, report_reason
 from app.services.github_client import GithubClientResponseError, github_client
 from app.services.github_coordination_service import hold_code
-from app.services.github_recovery_gate import configured_recovery_only_attempt
-from app.services.github_stopped_attempt_actor import StoppedAttemptStep, stopped_attempt_step
+from app.services.github_stopped_attempt_actor import StoppedAttemptStep, stopped_attempt_policy, stopped_attempt_step
 from app.services.github_work_item_projection import _load_work_item_authority
 from app.services.github_work_progress_observation import (
     ProgressObservationError, WorkspaceProgressContext, workspace_progress_observer,
@@ -407,14 +406,17 @@ class GithubWorkProgressService:
         item, scope, preset, final_workspace, pending, polled_at = fresh
         facts_stable = (item.dispatch_status == status_before and item.last_verified_sha == head_before
                         and (final_workspace is not None and bool(final_workspace.lease_token)) == leased_before)
-        hold = hold_code()
+        hold, recovery_attempt = stopped_attempt_policy(hold_code())
         stopped_step = None
+        continuation_deadline = None
         if needs_attention(item.dispatch_status):
             authority = (await _load_work_item_authority(db, [item]))[item.id]
             pending = authority.pending_approval
-            recovery_attempt = configured_recovery_only_attempt() if hold == "recovery_only" else None
+            revision = authority.pending_revision or authority.active_revision
             stopped_step = stopped_attempt_step(
-                item, pending, authority.pending_revision or authority.active_revision, hold, recovery_attempt)
+                item, pending, revision, hold, recovery_attempt, now=datetime.utcnow())
+            if stopped_step in {StoppedAttemptStep.DECIDE, StoppedAttemptStep.ACKNOWLEDGE}:
+                continuation_deadline = revision.expires_at
         phase, actor, action = _next_step(item, scope, preset, pending, hold, stopped_step=stopped_step)
         if phase in {"implementation", "planning"} and (
             final_workspace is None or not final_workspace.lease_token
@@ -457,13 +459,15 @@ class GithubWorkProgressService:
                             for part in (scope.repo_owner, scope.repo_name)) else None)
         remaining = self._remaining_view(remaining_packet, context, datetime.now(timezone.utc),
                                          issue_url, private_values)
+        valid_until = now + timedelta(seconds=_CACHE_SECONDS)
+        if publication.state == "current" and publication.observed_at:
+            valid_until = min(valid_until, _utc(publication.observed_at) + timedelta(seconds=_CACHE_SECONDS))
+        if continuation_deadline is not None:
+            valid_until = min(valid_until, _utc(continuation_deadline))
         return GithubWorkProgressResponse(
             work_item_id=item_id, dispatch_nonce=item.dispatch_nonce,
             owner_slot_id=item.owner_slot_id, checked_at=datetime.now(timezone.utc),
-            valid_until=min(now + timedelta(seconds=_CACHE_SECONDS),
-                _utc(publication.observed_at) + timedelta(seconds=_CACHE_SECONDS))
-                if publication.state == "current" and publication.observed_at
-                else now + timedelta(seconds=_CACHE_SECONDS),
+            valid_until=valid_until,
             phase=phase, next_actor=actor, next_action=action,
             next_poll_expected_at=(_utc(polled_at) + timedelta(
                 seconds=settings.github_dispatch_interval_seconds)) if polled_at else None,

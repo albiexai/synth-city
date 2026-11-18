@@ -14,8 +14,9 @@ from app.services.github_operator_context_service import (
     SECTION_START, SECTION_END, bind_attempt, check as check_context, covered_by_leader,
     describe, github_operator_context_service, instruction_template,
 )
-from app.services.github_recovery_gate import configured_recovery_only_attempt
-from app.services.github_stopped_attempt_actor import operator_checkpoint_required, stopped_attempt_step
+from app.services.github_stopped_attempt_actor import (
+    StoppedAttemptStep, operator_checkpoint_required, stopped_attempt_policy, stopped_attempt_step,
+)
 
 
 class GithubOperatorAttentionService:
@@ -167,7 +168,8 @@ class GithubOperatorAttentionService:
                 GithubAttemptScopeRevision.revision,GithubAttemptScopeRevision.status,GithubAttemptScopeRevision.recovery_checkpoint_stage,
                 GithubAttemptScopeRevision.dispatch_nonce,GithubAttemptScopeRevision.origin_kind,
                 GithubAttemptScopeRevision.originating_escalation_reason,GithubAttemptScopeRevision.owner_slot_id,
-                GithubAttemptScopeRevision.delivery_message_id,GithubAttemptScopeRevision.delivered_at)
+                GithubAttemptScopeRevision.delivery_message_id,GithubAttemptScopeRevision.delivered_at,
+                GithubAttemptScopeRevision.expires_at)
                 .join(GithubWorkItem,GithubWorkItem.id==GithubAttemptScopeRevision.work_item_id).where(
                 GithubWorkItem.id.in_(current_nonces),GithubAttemptScopeRevision.dispatch_nonce==GithubWorkItem.dispatch_nonce,
                 GithubAttemptScopeRevision.status.in_(["proposed","approved"])).order_by(GithubAttemptScopeRevision.id).limit(65))).all())
@@ -183,13 +185,16 @@ class GithubOperatorAttentionService:
                     checkpoint_by_item[revision.work_item_id]=revision
         if len(approvals)>64 or len(revisions)>64:
             complete = False
-        hold = hold_code()
-        recovery_attempt = configured_recovery_only_attempt() if hold == "recovery_only" else None
+        hold, recovery_attempt = stopped_attempt_policy(hold_code())
+        now = datetime.utcnow()
+        deadlines = []
         for item in items[:64]:
             scope = scope_by_id[item.scope_id]
             checkpoint = checkpoint_by_item.get(item.id)
             approval = pending.get(item.id)
-            stopped_step = stopped_attempt_step(item, approval, checkpoint, hold, recovery_attempt)
+            stopped_step = stopped_attempt_step(item, approval, checkpoint, hold, recovery_attempt, now=now)
+            if stopped_step in {StoppedAttemptStep.DECIDE, StoppedAttemptStep.ACKNOWLEDGE} and checkpoint.expires_at is not None:
+                deadlines.append(checkpoint.expires_at)
             if stopped_step is not None and stopped_step.actor != "operator":
                 continue
             if stopped_step is None and approval is not None and approval.dispatch_nonce == item.dispatch_nonce:
@@ -215,7 +220,8 @@ class GithubOperatorAttentionService:
             if kind=="review_pr" and item.pr_number is None:
                 actions[-1]["state"]="pr_identity_unavailable";complete=False
         return {"actions":actions, "items":items, "approvals":approvals, "revisions":revisions,
-                "recovery_policy":(hold, recovery_attempt), "complete":complete}
+                "recovery_policy":(hold, recovery_attempt), "continuation_deadline":min(deadlines, default=None),
+                "complete":complete}
 
     async def summary(self, db, preset_id, client=None, *, include_templates=False):
         from app.services.github_coordination_service import CoordinationError, github_coordination_service as coordination
@@ -263,6 +269,8 @@ class GithubOperatorAttentionService:
                         "state":action["readiness"] if current else "historical"})
         snapshot = await self.dispatch_snapshot(db, scopes[:32])
         complete = complete and snapshot["complete"]
+        if snapshot["continuation_deadline"] is not None:
+            expires.append(snapshot["continuation_deadline"])
         for action in actions:
             if action["source"]=="leader" and action["kind"] in {"inspect_attempt", "inspect_checkpoint"}:
                 item = next((i for i in snapshot["items"] if i.scope_id==action["scope_id"] and i.issue_number==action["issue_number"]), None)
@@ -354,6 +362,7 @@ class GithubOperatorAttentionService:
         scope_changed = scope_snapshot != [(s.id,s.repo_owner,s.repo_name,s.merge_policy,s.enabled,s.updated_at) for s in latest_scopes]
         if (item_snapshot != [item_identity(i) for i in latest_items] or approvals != latest_dispatch["approvals"]
             or revisions != latest_dispatch["revisions"] or snapshot["recovery_policy"] != latest_dispatch["recovery_policy"]
+            or snapshot["continuation_deadline"] != latest_dispatch["continuation_deadline"]
             or scope_changed):
             complete = False
             for action in actions:

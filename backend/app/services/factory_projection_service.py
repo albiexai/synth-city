@@ -22,8 +22,7 @@ from app.services.agent_mail_service import MCP_HEARTBEAT_TTL_SECONDS
 from app.services.github_coordination_service import hold_code
 from app.services.github_dispatch_scheduler import github_dispatch_scheduler
 from app.services.github_dispatch_service import ESCALATION_REASONS
-from app.services.github_recovery_gate import configured_recovery_only_attempt
-from app.services.github_stopped_attempt_actor import StoppedAttemptStep, stopped_attempt_step
+from app.services.github_stopped_attempt_actor import StoppedAttemptStep, stopped_attempt_policy, stopped_attempt_step
 from app.services.github_work_item_projection import _load_work_item_authority, _work_item_response
 from app.services.providers import get_providers
 from app.services.work_item_states import ATTENTION_STATUSES, DONE_STATUSES
@@ -389,8 +388,8 @@ async def work_projections(db, rows, now):
     by_item = {w.leased_item_id: w for w in workspaces}
     providers = {p.id: p.display_name for p in get_providers()}
     result = []
-    hold = hold_code()
-    recovery_attempt = configured_recovery_only_attempt() if hold == "recovery_only" else None
+    hold, recovery_attempt = stopped_attempt_policy(hold_code())
+    routing_time = naive_utc(utc_now())
     for item, scope, team in rows:
         auth = authority[item.id]
         workspace = by_item.get(item.id)
@@ -399,7 +398,8 @@ async def work_projections(db, rows, now):
             pending_revision=auth.pending_revision, continuation_revision_count=auth.revision_count,
             continuation_failed_head_count=auth.failed_head_count)
         stopped_step = stopped_attempt_step(
-            item, auth.pending_approval, auth.pending_revision or auth.active_revision, hold, recovery_attempt)
+            item, auth.pending_approval, auth.pending_revision or auth.active_revision, hold, recovery_attempt,
+            now=routing_time)
         slot = slots_by_id.get(item.owner_slot_id)
         if slot is not None and slot.preset_id != team.id:
             slot = None
