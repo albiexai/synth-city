@@ -57,7 +57,7 @@ export function unansweredWords(view: UnansweredRequestView | null | undefined):
   return view.complete ? head : `${head} · view incomplete: ${reason}`
 }
 
-const WAIT_SCREEN: Record<TeamWaitingInput['reason'], string> = {
+const WAIT_SCREEN: Record<Exclude<TeamWaitingInput['reason'], 'provider_refusal'>, string> = {
   question: 'a question',
   trust: 'a trust prompt',
   sign_in: 'a sign-in screen',
@@ -65,9 +65,13 @@ const WAIT_SCREEN: Record<TeamWaitingInput['reason'], string> = {
 
 // Any other value shows a fixed fallback, never text from the screen.
 export function waitingScreen(reason: string) {
-  return WAIT_SCREEN[reason as TeamWaitingInput['reason']] ?? 'an input screen'
+  return WAIT_SCREEN[reason as keyof typeof WAIT_SCREEN] ?? 'an input screen'
 }
 
 export function waitingText(entry: TeamWaitingInput, names: Record<number, string> | undefined) {
   return `${names?.[entry.slot_id] ?? 'A member'} is waiting at ${waitingScreen(entry.reason)}`
+}
+
+export function blockedText(entry: TeamWaitingInput, names: Record<number, string> | undefined) {
+  return `${names?.[entry.slot_id] ?? 'A member'} is blocked by a provider refusal`
 }

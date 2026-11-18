@@ -202,11 +202,11 @@ export interface UnansweredRequestView {
   omitted_count: number
 }
 
-// A member waits at an interactive screen. Only the fixed reason is on the wire.
+// A member waits at an interactive screen, or is blocked by a provider refusal. Only the fixed reason is on the wire.
 export interface TeamWaitingInput {
   slot_id: number
-  reason: 'question' | 'trust' | 'sign_in'
-  label: 'Waiting for input'
+  reason: 'question' | 'trust' | 'sign_in' | 'provider_refusal'
+  label: 'Waiting for input' | 'Blocked: provider refusal'
 }
 
 // One unanswered-reminder signal (#528). Read it through parseReminders: the wire is not trusted.
