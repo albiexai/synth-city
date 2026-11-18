@@ -73,7 +73,12 @@ def test_the_gate_proves_the_partition_and_keeps_the_fixtures_check():
     text = _steps_text(_gate())
     assert "scripts/ci/backend_shard_identities.py" in text
     assert "--collect-only" in text and "--ignore=tests/test_cc_bridge_real_sudo.py" in text
-    assert "backend-test-timings-*" in text
+    downloads = [step for step in _gate()["steps"] if step.get("uses", "").startswith("actions/download-artifact@")]
+    assert len(downloads) == 1 and downloads[0]["with"] == {
+        "pattern": "backend-test-timings-*-attempt-*",
+        "path": "shard-artifacts",
+        "merge-multiple": False,
+    }
     assert "scripts/factory-fixtures.py --check" in text
     names = [step.get("name", "") for step in _gate()["steps"]]
     assert names.index("Prove that the shards ran every test exactly once") < names.index("Check the active factory fixtures")
@@ -84,7 +89,9 @@ def test_each_shard_collects_then_runs_with_the_identity_plugin_and_keeps_its_ar
     assert text.index("--collect-only") < text.index("-p tests.ci_shard_identity")
     assert "--identity-out=backend-shard-${{ matrix.shard }}-executed.jsonl" in text
     uploads = [step for step in _jobs()["backend"]["steps"] if str(step.get("uses", "")).startswith("actions/upload-artifact@")]
-    assert len(uploads) == 1 and uploads[0]["with"]["name"] == "backend-test-timings-${{ matrix.shard }}"
+    assert len(uploads) == 1
+    assert uploads[0]["with"]["name"] == "backend-test-timings-${{ matrix.shard }}-attempt-${{ github.run_attempt }}"
+    assert uploads[0]["with"]["if-no-files-found"] == "error"
     for kind in ("collected.txt", "executed.jsonl"):
         assert f"backend-shard-${{{{ matrix.shard }}}}-{kind}" in uploads[0]["with"]["path"]
     assert (ROOT / "backend" / "tests" / "ci_shard_identity.py").is_file()

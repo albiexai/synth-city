@@ -20,6 +20,7 @@ from collections import Counter
 from pathlib import Path
 
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+ARTIFACT_NAME = re.compile(r"backend-test-timings-([1-9][0-9]*)(?:-attempt-([1-9][0-9]*))?")
 FAILING = ("failed", "error")
 ALLOWED = ("passed", "skipped", "xfailed", "xpassed")   # every other outcome, known or not, is a problem
 SHOWN = 20
@@ -117,17 +118,35 @@ def _junit_tests(path: Path) -> int | None:
     return sum(int(suite.get("tests", 0)) for suite in suites) if suites else None
 
 
+def _latest_artifacts(artifacts: Path, count: int) -> tuple[dict[int, Path], list[str]]:
+    latest: dict[int, tuple[int, Path]] = {}
+    problems = []
+    layouts = set()
+    folders = sorted(path for path in artifacts.iterdir() if path.is_dir()) if artifacts.is_dir() else []
+    for folder in folders:
+        match = ARTIFACT_NAME.fullmatch(folder.name)
+        if match is None or int(match[1]) > count:
+            problems.append(f"unexpected artifact {folder.name}")
+            continue
+        index = int(match[1])
+        attempt = int(match[2] or 0)
+        layouts.add(attempt > 0)
+        if index not in latest or attempt > latest[index][0]:
+            latest[index] = (attempt, folder)
+    if len(layouts) > 1:
+        problems.append("cannot mix legacy and attempt-named artifacts")
+    return {index: folder for index, (_, folder) in latest.items()}, problems
+
+
 def load_shards(artifacts: Path, count: int) -> tuple[dict[str, dict], list[str]]:
-    """Read ``backend-test-timings-K/`` for K from 1 to ``count``; any other directory or missing file is a problem."""
-    problems, shards = [], {}
-    expected = {f"backend-test-timings-{index}" for index in range(1, count + 1)}
-    present = {path.name for path in artifacts.iterdir() if path.is_dir()} if artifacts.is_dir() else set()
-    for name in sorted(expected - present):
-        problems.append(f"missing artifact {name}")
-    for name in sorted(present - expected):
-        problems.append(f"unexpected artifact {name}")
+    """Read the newest artifact per shard, or a complete legacy set from one attempt."""
+    selected, problems = _latest_artifacts(artifacts, count)
+    shards = {}
     for index in range(1, count + 1):
-        folder = artifacts / f"backend-test-timings-{index}"
+        folder = selected.get(index)
+        if folder is None:
+            problems.append(f"missing artifact for shard {index}")
+            continue
         files = {"collected": folder / f"backend-shard-{index}-collected.txt",
                  "executed": folder / f"backend-shard-{index}-executed.jsonl",
                  "junit": folder / f"backend-junit-{index}.xml"}
@@ -139,18 +158,24 @@ def load_shards(artifacts: Path, count: int) -> tuple[dict[str, dict], list[str]
                 text[kind] = path.read_text(encoding="utf-8")
         executed, bad_rows = parse_executed(text.get("executed", ""))
         problems += [f"shard {index}: {message}" for message in bad_rows]
-        shards[f"shard {index}"] = {"collected": parse_collected(text.get("collected", "")), "executed": executed,
-                                    "junit_tests": _junit_tests(files["junit"]) if files["junit"].is_file() else None}
+        shards[f"shard {index}"] = {
+            "artifact": folder.name,
+            "collected": parse_collected(text.get("collected", "")),
+            "executed": executed,
+            "junit_tests": _junit_tests(files["junit"]) if files["junit"].is_file() else None,
+        }
     return shards, problems
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--full", type=Path, required=True, help="node ids of the full collection, one per line")
-    parser.add_argument("--artifacts", type=Path, required=True, help="directory holding backend-test-timings-K folders")
+    parser.add_argument("--artifacts", type=Path, required=True, help="directory holding one folder per shard artifact")
     parser.add_argument("--shards", type=int, required=True)
     args = parser.parse_args(argv)
     shards, problems = load_shards(args.artifacts, args.shards)
+    for name, shard in shards.items():
+        print(f"{name}: {shard['artifact']}")
     full = parse_collected(args.full.read_text(encoding="utf-8")) if args.full.is_file() else []
     more, summary = check(full, shards)
     problems += more
