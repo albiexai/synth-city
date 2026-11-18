@@ -426,9 +426,10 @@ async def test_health_reports_remaining_github_quota_and_the_reset_on_exhaustion
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://api.github.com") as http:
         client = GithubClient(http=http)
         await client.list_issues_with_label("o", "r", "ready")
-        healthy = await root_health()
+        assert set(await root_health()) == {"name", "version", "status"}
+        healthy = await health_check()
         assert healthy["github_rate_limit"]["remaining"] == 7
-        assert healthy["status"] == "running"
+        assert healthy["status"] == "ok"
         remaining = 0
         with pytest.raises(httpx.HTTPStatusError):
             await client.list_issues_with_label("o", "r", "ready")

@@ -92,8 +92,6 @@ async def health():
     findings = await operations_health_service.health()
     if findings["reasons"]:
         body.update(findings)
-    elif "github_rate_limit" in findings:
-        body["github_rate_limit"] = findings["github_rate_limit"]
     if settings.test_instance:
         # The E2E harness checks that this server is its own run's instance.
         body["test_instance"] = {

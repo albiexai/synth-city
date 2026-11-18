@@ -108,23 +108,35 @@ class GithubRateLimitService:
         retry_at = None
         if exhausted or rate_error:
             deadlines = (reset_at if exhausted else None, retry_after if rate_error else None)
-            retry_at = max((when for when in deadlines if when and when > now), default=now + _FALLBACK)
+            deadline = max((when for when in deadlines if when is not None), default=now + _FALLBACK)
+            if deadline > now:
+                retry_at = deadline
 
         key = self._key(request.headers.get("authorization"))
         previous = self._observations.get(key)
+        observed_at = now
         if previous and previous.retry_at and previous.retry_at > now:
             # A response from a request already in flight cannot shorten an observed pause.
             retry_at = max(previous.retry_at, retry_at) if retry_at else previous.retry_at
-            if previous.remaining == 0:
-                remaining, reset_at = 0, previous.reset_at
-        if remaining is None and previous and (previous.reset_at is None or previous.reset_at > now):
-            remaining, reset_at = previous.remaining, previous.reset_at
-        self._observations[key] = _Observation(remaining, reset_at, retry_at, now)
+        if previous and previous.reset_at is not None:
+            if reset_at is not None and reset_at < previous.reset_at:
+                # Quota headers can arrive out of order across requests and reset windows.
+                remaining, reset_at, observed_at = previous.remaining, previous.reset_at, previous.observed_at
+            elif reset_at == previous.reset_at or (reset_at is None and previous.reset_at > now):
+                reset_at = previous.reset_at
+                if remaining is None or (previous.remaining is not None and previous.remaining <= remaining):
+                    remaining, observed_at = previous.remaining, previous.observed_at
+        self._observations[key] = _Observation(remaining, reset_at, retry_at, observed_at)
         self._observations.move_to_end(key)
-        if len(self._observations) > _MAX_CREDENTIALS:
-            self._observations.popitem(last=False)
+        overflow = len(self._observations) - _MAX_CREDENTIALS
+        if overflow > 0:
+            # Only evict quota observations without a live pause. All live pauses survive until their deadline.
+            evictable = [candidate for candidate, value in self._observations.items()
+                         if value.retry_at is None or value.retry_at <= now]
+            for candidate in evictable[:overflow]:
+                del self._observations[candidate]
         if rate_error:
-            raise GithubRateLimited(retry_at, request, response)
+            raise GithubRateLimited(retry_at or now, request, response)
 
     def polling_status(self) -> dict | None:
         token = settings.github_token

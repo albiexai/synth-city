@@ -3,12 +3,13 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
+from app.config import settings
 from app.services.github_client import (
     GithubClient,
     GithubClientResponseError,
     GithubTreeEntry,
 )
-from app.services.github_rate_limit_service import GithubRateLimited, github_rate_limit_service
+from app.services.github_rate_limit_service import GithubRateLimited, GithubRateLimitService, github_rate_limit_service
 
 
 COMMIT_SHA = "a" * 40
@@ -87,6 +88,68 @@ async def test_rate_limit_resumes_at_the_later_deadline(monkeypatch, status):
         now += timedelta(seconds=1)
         assert await client.get_pull("o", "r", 3) == {}
         assert seen == ["/repos/o/r/pulls/1", "/repos/o/r/pulls/3"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("other_limited", [False, True])
+async def test_active_cooldown_survives_quota_cache_pressure(monkeypatch, other_limited):
+    now = datetime(2026, 11, 18, tzinfo=timezone.utc)
+    reset = now + timedelta(minutes=10)
+    store = GithubRateLimitService(now=lambda: now)
+    monkeypatch.setattr("app.services.github_client.github_rate_limit_service", store)
+    monkeypatch.setattr(settings, "github_token", "quota-test-capacity")
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        limited = len(seen) == 1 or other_limited
+        return httpx.Response(403 if limited else 200, json={}, headers={
+            "x-ratelimit-remaining": "0" if limited else "12", "x-ratelimit-reset": str(int(reset.timestamp())),
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://api.github.com") as http:
+        polling = GithubClient(http=http)
+        with pytest.raises(GithubRateLimited):
+            await polling.get_pull("o", "r", 1)
+        for number in range(128):
+            client = GithubClient(http=http, token=f"quota-test-capacity-other-{number}")
+            if other_limited:
+                with pytest.raises(GithubRateLimited):
+                    await client.get_pull("o", "r", 2)
+            else:
+                await client.get_pull("o", "r", 2)
+
+        quota = store.polling_status()
+        assert quota is not None and quota["reason"] == "github_rate_limited"
+        assert quota["remaining"] == 0 and quota["retry_at"] == reset.isoformat()
+        with pytest.raises(GithubRateLimited):
+            await polling.get_pull("o", "r", 3)
+        assert len(seen) == 129
+
+
+@pytest.mark.asyncio
+async def test_reordered_responses_preserve_the_current_window_and_lowest_count(monkeypatch):
+    now = datetime(2026, 11, 18, tzinfo=timezone.utc)
+    new = int((now + timedelta(minutes=5)).timestamp())
+    old = int((now - timedelta(seconds=1)).timestamp())
+    store = GithubRateLimitService(now=lambda: now)
+    monkeypatch.setattr("app.services.github_client.github_rate_limit_service", store)
+    monkeypatch.setattr(settings, "github_token", "quota-test-reordered")
+    observations = iter([(new, 4999), (old, 1), (old, 0), (new, 8), (new, 12), (new + 3600, 4998)])
+
+    def handler(request):
+        reset, remaining = next(observations)
+        return httpx.Response(200, json={}, headers={
+            "x-ratelimit-remaining": str(remaining), "x-ratelimit-reset": str(reset),
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://api.github.com") as http:
+        client = GithubClient(http=http)
+        for expected in (4999, 4999, 4999, 8, 8, 4998):
+            await client.get_pull("o", "r", 1)
+            quota = store.polling_status()
+            assert quota is not None and quota["remaining"] == expected
+            assert quota["reason"] is None
 
 
 @pytest.mark.asyncio
