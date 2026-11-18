@@ -36,9 +36,24 @@ export function OverviewPage() {
     presets.map((preset) => `agent-teams/presets/${preset.id}/summary`),
   );
   const summaries = states.map((item) => item.data);
-  const rows = needsYouRows(presets, summaries);
+  // Needs you honours the Repository and Assigned-harness filters (#1141). With either one set it reads its own,
+  // separately keyed summaries; the team cards and Progress keep the unfiltered reads above.
+  const needsQuery = new URLSearchParams();
+  for (const key of ["scope_id", "provider"]) {
+    const value = params.get(key);
+    if (value) needsQuery.set(key, value);
+  }
+  const needsFilter = needsQuery.toString();
+  const { states: needsStates, refresh: refreshNeeds } = useObservations<AgentTeamSummary>(
+    needsFilter ? presets.map((preset) => `agent-teams/presets/${preset.id}/summary?${needsFilter}`) : [],
+  );
+  const needsReads = needsFilter ? needsStates : states;
+  const rows = needsYouRows(presets, needsReads.map((item) => item.data));
   const summariesLoading =
-    presetList.data === null || states.some((item) => item.data === null && item.error === null);
+    presetList.data === null || needsReads.some((item) => item.data === null && item.error === null);
+  // A failed read is not an empty list: say so instead of "Nothing needs you right now."
+  // A failed refresh keeps the earlier data and sets the error, so the error alone decides.
+  const needsFailed = needsFilter !== "" && needsStates.some((item) => item.error !== null);
   return (
     <section className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -52,7 +67,7 @@ export function OverviewPage() {
         </div>
         <Button
           variant="outline"
-          onClick={() => void Promise.all([state.refresh(), presetList.refresh(), refreshSummaries()])}
+          onClick={() => void Promise.all([state.refresh(), presetList.refresh(), refreshSummaries(), refreshNeeds()])}
         >
           Refresh
         </Button>
@@ -64,7 +79,12 @@ export function OverviewPage() {
       {state.data && (
         <>
           <StatusLine data={state.data} teams={presetList.data ? presets.length : null} />
-          <NeedsYou rows={rows} loading={summariesLoading} />
+          {needsFailed && (
+            <p role="alert" className="rounded-lg border border-destructive px-4 py-2.5 text-sm">
+              Could not read what needs you for these filters. Refresh to try again.
+            </p>
+          )}
+          {!(needsFailed && rows.length === 0) && <NeedsYou rows={rows} loading={summariesLoading} />}
           <CampaignProgress presets={presets} summaries={summaries} />
           <StatusTiles counts={state.data.counts} params={params} />
           <TeamSummaries teamId={teamId} onOverview />

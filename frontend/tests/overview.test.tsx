@@ -1,4 +1,4 @@
-import { cleanup, screen, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { OverviewPage } from '../src/features/factory/pages/OverviewPage'
 import { resetFactoryReads } from '../src/features/factory/reads'
@@ -349,5 +349,188 @@ describe('Progress', () => {
     serve({ presets: [preset(1, 'A', true)], summaries: { 1: summary() }, overview: overviewWith({}) })
     await open()
     expect(screen.queryByRole('heading', { name: /^Progress/ })).not.toBeInTheDocument()
+  })
+})
+
+// #1141: Needs you honours the Repository (scope_id) and Assigned-harness (provider) filters. Only Needs you reads the
+// filtered summaries; the team cards and Progress keep the unfiltered reads.
+describe('Needs you filters', () => {
+  const action = (scope: number, issue: number, work: number) => ({
+    scope_id: scope, issue_number: issue, work_item_id: work, kind: 'review_pr' as const, state: 'requested' as const,
+    source: 'leader' as const, assessment_current: true,
+  })
+  const repository = (scope: number, team: number, name: string) => ({
+    scope_id: scope, team: { id: team, name: `Team ${team}` }, github: { owner: 'o', name },
+  })
+  const everything = summary({ human_actions: [action(8, 47, 9), action(9, 937, 11)] })
+
+  function serveFilters(filtered: (preset: number, query: URLSearchParams) => Response | Promise<Response>) {
+    return fixtureFetch((path, query) => {
+      if (path === 'factory/overview') return jsonResponse(overviewWith({}, counts({ review: 2 })))
+      if (path === 'factory/repositories') {
+        return jsonResponse({
+          repositories: [repository(8, 1, 'one'), repository(9, 1, 'two'), repository(10, 2, 'three')],
+          has_more: false, total: 3, generated_at: stamp,
+        })
+      }
+      if (path === 'agent-teams/presets') {
+        return jsonResponse({ presets: [preset(1, 'Release crew', true), preset(2, 'Second crew', true)] })
+      }
+      const match = /^agent-teams\/presets\/(\d+)\/summary$/.exec(path)
+      if (match) {
+        const id = Number(match[1])
+        if (query.has('scope_id') || query.has('provider')) return filtered(id, query)
+        return jsonResponse(id === 1 ? everything : summary({ preset_id: 2 }))
+      }
+      return jsonResponse({ rows: [], items: [], repositories: [], total: 0, has_more: false, generated_at: stamp })
+    })
+  }
+  const summaryReads = (requests: { path: string; query: URLSearchParams }[]) =>
+    requests.filter((request) => /^agent-teams\/presets\/\d+\/summary$/.test(request.path))
+  const needsYouList = () => screen.getByRole('heading', { name: /Needs you/ }).closest('section')!
+
+  it('makes the same reads as before when no repository or harness filter is set', async () => {
+    const { requests } = serveFilters(() => jsonResponse(summary()))
+    await open()
+    const reads = summaryReads(requests)
+    expect(reads.length).toBeGreaterThan(0)
+    expect(reads.every((request) => request.query.toString() === '')).toBe(true)
+    expect(within(needsYouList()).getAllByRole('listitem')).toHaveLength(2)
+  })
+
+  it('a Repository filter drops the other repository from Needs you, and only there', async () => {
+    const { requests } = serveFilters((id, query) => {
+      expect(query.get('scope_id')).toBe('8')
+      return jsonResponse(id === 1 ? summary({ human_actions: [action(8, 47, 9)] }) : summary({ preset_id: 2 }))
+    })
+    await open('/?scope_id=8')
+    const list = within(needsYouList())
+    expect(list.getAllByRole('listitem')).toHaveLength(1)
+    expect(list.getByRole('link', { name: /Open #47/ })).toHaveAttribute('href', '/work/9')
+    expect(list.queryByRole('link', { name: /Open #937/ })).not.toBeInTheDocument()
+    const reads = summaryReads(requests)
+    // The filtered read is for Needs you; the unfiltered reads for the cards and Progress are still made.
+    const filtered = reads.filter((request) => request.query.has('scope_id'))
+    expect(filtered.map((request) => request.path).sort()).toEqual([
+      'agent-teams/presets/1/summary', 'agent-teams/presets/2/summary'])
+    expect(filtered.every((request) => request.query.toString() === 'scope_id=8')).toBe(true)
+    const plain = reads.filter((request) => request.query.toString() === '').map((request) => request.path)
+    expect(plain).toContain('agent-teams/presets/1/summary')
+    expect(plain).toContain('agent-teams/presets/2/summary')
+  })
+
+  it('an Assigned-harness filter sends the provider and shows only what that read returns', async () => {
+    const { requests } = serveFilters((id, query) => {
+      expect(query.get('provider')).toBe('codex-cli')
+      return jsonResponse(id === 1 ? summary({ human_actions: [action(9, 937, 11)] }) : summary({ preset_id: 2 }))
+    })
+    await open('/?provider=codex-cli')
+    const list = within(needsYouList())
+    expect(list.getAllByRole('listitem')).toHaveLength(1)
+    expect(list.getByRole('link', { name: /Open #937/ })).toBeInTheDocument()
+    expect(list.queryByRole('link', { name: /Open #47/ })).not.toBeInTheDocument()
+    const filtered = summaryReads(requests).filter((request) => request.query.has('provider'))
+    expect(filtered.every((request) => request.query.toString() === 'provider=codex-cli')).toBe(true)
+    expect(filtered).toHaveLength(2)
+  })
+
+  it('sends both filters together and not the team filter', async () => {
+    const { requests } = serveFilters((id) => jsonResponse(summary({ preset_id: id })))
+    await open('/?scope_id=8&provider=claude-code')
+    expect(screen.getByText('Nothing needs you right now.')).toBeInTheDocument()
+    const filtered = summaryReads(requests).filter((request) => request.query.has('scope_id'))
+    expect(filtered.length).toBeGreaterThan(0)
+    expect(filtered.every((request) => request.query.toString() === 'scope_id=8&provider=claude-code')).toBe(true)
+  })
+
+  it('keeps the team filter out of the filtered read', async () => {
+    const { requests } = serveFilters(() => jsonResponse(summary({ human_actions: [action(8, 47, 9)] })))
+    await open('/?team_id=1&scope_id=8')
+    const filtered = summaryReads(requests).filter((request) => request.query.has('scope_id'))
+    expect(filtered.map((request) => request.path)).toEqual(['agent-teams/presets/1/summary'])
+    expect(filtered.every((request) => request.query.toString() === 'scope_id=8')).toBe(true)
+  })
+
+  it('shows the rows that loaded and says that another read failed', async () => {
+    serveFilters((id) => (id === 2 ? jsonResponse({ detail: 'broken' }, 500)
+      : jsonResponse(summary({ human_actions: [action(8, 47, 9)] }))))
+    await open('/?scope_id=8')
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not read what needs you')
+    expect(within(needsYouList()).getByRole('link', { name: /Open #47/ })).toBeInTheDocument()
+  })
+
+  it('does not call a failed filtered read an empty list', async () => {
+    serveFilters(() => jsonResponse({ detail: 'broken' }, 500))
+    await open('/?scope_id=8')
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not read what needs you')
+    expect(screen.queryByText('Nothing needs you right now.')).not.toBeInTheDocument()
+  })
+
+  // A failed refresh keeps the earlier data and sets the error (reads.ts), so these start from a loaded read.
+  async function refresh() {
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Refresh' })) })
+    await settle()
+    await settle()
+  }
+  const empty = () => screen.queryByText('Nothing needs you right now.')
+
+  it('shows the alert, not the empty state, when a refresh fails after an empty filtered read', async () => {
+    let broken = false
+    serveFilters((id) => (broken ? jsonResponse({ detail: 'broken' }, 500) : jsonResponse(summary({ preset_id: id }))))
+    await open('/?scope_id=8')
+    expect(empty()).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    broken = true
+    await refresh()
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not read what needs you')
+    expect(empty()).not.toBeInTheDocument()
+  })
+
+  it('keeps the loaded rows and shows the alert when a refresh fails after a non-empty read', async () => {
+    let broken = false
+    serveFilters((id) => (broken ? jsonResponse({ detail: 'broken' }, 500)
+      : jsonResponse(id === 1 ? summary({ human_actions: [action(8, 47, 9)] }) : summary({ preset_id: 2 }))))
+    await open('/?scope_id=8')
+    expect(within(needsYouList()).getByRole('link', { name: /Open #47/ })).toBeInTheDocument()
+    broken = true
+    await refresh()
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not read what needs you')
+    expect(within(needsYouList()).getByRole('link', { name: /Open #47/ })).toBeInTheDocument()
+  })
+
+  it('removes the alert and restores the plain state when a later refresh succeeds', async () => {
+    let broken = false
+    serveFilters((id) => (broken ? jsonResponse({ detail: 'broken' }, 500) : jsonResponse(summary({ preset_id: id }))))
+    await open('/?scope_id=8')
+    broken = true
+    await refresh()
+    expect(await screen.findByRole('alert')).toBeInTheDocument()
+    broken = false
+    await refresh()
+    await settle()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(empty()).toBeInTheDocument()
+  })
+
+  it('removes the alert after recovery and still shows the rows of a non-empty read', async () => {
+    let broken = false
+    serveFilters((id) => (broken ? jsonResponse({ detail: 'broken' }, 500)
+      : jsonResponse(id === 1 ? summary({ human_actions: [action(8, 47, 9)] }) : summary({ preset_id: 2 }))))
+    await open('/?scope_id=8')
+    broken = true
+    await refresh()
+    expect(await screen.findByRole('alert')).toBeInTheDocument()
+    broken = false
+    await refresh()
+    await settle()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(within(needsYouList()).getByRole('link', { name: /Open #47/ })).toBeInTheDocument()
+  })
+
+  it('says it is checking, not that nothing needs you, while the filtered read is pending', async () => {
+    serveFilters(() => new Promise<Response>(() => undefined))
+    await open('/?scope_id=8')
+    expect(screen.getByText('Checking what needs you…')).toBeInTheDocument()
+    expect(screen.queryByText('Nothing needs you right now.')).not.toBeInTheDocument()
   })
 })

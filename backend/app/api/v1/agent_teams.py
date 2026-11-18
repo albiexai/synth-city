@@ -339,6 +339,7 @@ from app.services.github_verification_service import (
     github_verification_service,
 )
 from app.services.agent_team_service import PlanConflictError, TeamDeletionConflictError, agent_team_service
+from app.services.providers import get_providers
 from app.services.providers.base import ProviderLaunchError
 
 from app.services.github_work_item_projection import (
@@ -2454,9 +2455,20 @@ async def get_preset(preset_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/presets/{preset_id}/summary", response_model=AgentTeamSummaryResponse)
-async def get_team_summary(preset_id: int, response: Response, db: AsyncSession = Depends(get_db)):
+async def get_team_summary(
+    preset_id: int,
+    response: Response,
+    scope_id: int | None = Query(None, ge=1),
+    provider: str | None = Query(None, min_length=1, max_length=64),
+    db: AsyncSession = Depends(get_db),
+):
     response.headers["Cache-Control"] = "no-store"
-    result = await agent_team_summary_service.summary(db, preset_id)
+    # Optional Needs-you filters (#1141): the same checks as the factory filters. Without them the read is unchanged.
+    if provider is not None and provider not in {p.id for p in get_providers()}:
+        raise HTTPException(status_code=422, detail="invalid_filter")
+    if scope_id is not None and await db.get(TeamGithubScope, scope_id) is None:
+        raise HTTPException(status_code=404, detail="resource_not_found")
+    result = await agent_team_summary_service.needs_you(db, preset_id, scope_id=scope_id, provider=provider)
     if result is None:
         raise HTTPException(status_code=404, detail="preset_not_found")
     return result

@@ -10,7 +10,7 @@ from sqlalchemy.exc import OperationalError
 from mcp_shim.work_remaining_protocol import MAX_AGE
 
 from app.models.database import (
-    AgentTeamPreset, GithubApprovalRequest, GithubOwnerObservationPause,
+    AgentTeamPreset, AgentTeamSlot, GithubApprovalRequest, GithubOwnerObservationPause,
     GithubWorkItem, GithubWorkspace, MailExternalActor, TeamGithubScope,
 )
 from app.models.factory_schemas import (
@@ -293,6 +293,55 @@ class AgentTeamSummaryService:
             supervisor_observation=supervisor, waiting_input=waiting_input if not changed else None,
             remaining_work=remaining, next_actors=[actor for actor in _ACTORS if actor in actors],
             next_actor_coverage_complete=complete and len(observations) == total, campaign=campaign)
+
+    async def needs_you(self, db, preset_id, *, scope_id=None, provider=None):
+        """The summary with only its Needs-you inputs narrowed to a repository and an assigned harness (#1141).
+
+        No filter is the plain summary. Counts, the campaign, remaining work and the coverage flags are never
+        changed: only the lists that the Overview reads as 'Needs you' are trimmed.
+        """
+        result = await self.summary(db, preset_id)
+        if result is None or (scope_id is None and provider is None):
+            return result
+        team_scopes = set((await db.execute(
+            select(TeamGithubScope.id).where(TeamGithubScope.preset_id == preset_id))).scalars())
+        slots = {row.id: row.provider for row in (await db.execute(
+            select(AgentTeamSlot.id, AgentTeamSlot.provider).where(AgentTeamSlot.preset_id == preset_id))).all()}
+        work_ids = {row.work_item_id for rows in (result.human_actions, result.attention, result.required_ci_unreadable,
+                                                  result.reminder_attention) for row in rows if row.work_item_id}
+        owners = {}
+        if work_ids:
+            owners = {row.id: row.owner_slot_id for row in (await db.execute(
+                select(GithubWorkItem.id, GithubWorkItem.owner_slot_id).where(
+                    GithubWorkItem.id.in_(work_ids), GithubWorkItem.scope_id.in_(team_scopes)))).all()}
+
+        def visible(scope, work_item_id=None, slot_id=None):
+            if scope_id is not None:
+                # A row without a scope belongs to the team: it shows only when the team owns the repository.
+                if scope is None and scope_id not in team_scopes or scope is not None and scope != scope_id:
+                    return False
+            if provider is None:
+                return True
+            owner = slot_id if slot_id is not None else owners.get(work_item_id)
+            if owner is not None:
+                return slots.get(owner) == provider
+            # Team-level rows follow the configured roster; a repository row without an owner has no harness.
+            return scope is None and work_item_id is None and provider in slots.values()
+
+        update = {
+            "human_actions": [row for row in result.human_actions if visible(row.scope_id, row.work_item_id)],
+            "attention": [row for row in result.attention if visible(row.scope_id, row.work_item_id)],
+            "required_ci_unreadable": [row for row in result.required_ci_unreadable
+                                       if visible(row.scope_id, row.work_item_id)],
+            "reminder_attention": [row for row in result.reminder_attention
+                                   if visible(row.scope_id, row.work_item_id, row.owner_slot_id)],
+        }
+        if result.waiting_input is not None:
+            update["waiting_input"] = [row for row in result.waiting_input if visible(None, slot_id=row.slot_id)]
+        observation = result.supervisor_observation
+        if observation is not None and observation.attention and not visible(None):
+            update["supervisor_observation"] = observation.model_copy(update={"attention": None})
+        return result.model_copy(update=update)
 
 
 agent_team_summary_service = AgentTeamSummaryService()
