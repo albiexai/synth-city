@@ -544,6 +544,11 @@ class GithubApprovalService:
         if "escalation_reason" in c:
             # Only a caller that admitted a state through the reason fences it; None compares as IS NULL.
             clauses.append(GithubWorkItem.escalation_reason == c["escalation_reason"])
+        return [*clauses, *GithubApprovalService._attempt_actor_conditions(c)]
+
+    @staticmethod
+    def _attempt_actor_conditions(c):
+        clauses = []
         for member_id, slot_id in ((c["owner_member_id"], c["owner_slot_id"]),
                                    (c["leader_member_id"], c["leader_slot_id"])):
             member, newer = aliased(MailTeamMember), aliased(MailTeamMember)
@@ -2401,6 +2406,42 @@ class GithubApprovalService:
             raise GithubApprovalError("approval_request_not_found", status_code=404)
         return request
 
+    async def _escalated_initial_rejection_conditions(self, db, item, request, owner, leader, actor):
+        scope = await db.get(TeamGithubScope, item.scope_id, populate_existing=True)
+        if scope is None:
+            raise GithubApprovalError("scope_not_found", status_code=404)
+        context = dict(team_id=scope.preset_id, owner_member_id=owner.id, owner_slot_id=owner.team_slot_id,
+            leader_member_id=leader.id, leader_slot_id=leader.team_slot_id)
+        await self.bind_actor_session(db, context, actor)
+        if context.get("actor_session") and context["actor_session"]["team_slot_id"] != leader.team_slot_id:
+            raise GithubApprovalError("current_mail_session_required", status_code=403)
+        root = await db.get(MailMessage, request.request_message_id, populate_existing=True)
+        if root is None or not self.matches_linked_request_message(
+                request, root, delivery_key=f"github-approval:{request.id}:request"):
+            raise GithubApprovalError("approval_request_link_mismatch")
+        return (
+            GithubWorkItem.dispatch_status == "escalated",
+            GithubWorkItem.scope_id == scope.id,
+            GithubWorkItem.escalation_reason == item.escalation_reason,
+            GithubWorkItem.launch_id == item.launch_id,
+            GithubWorkItem.active_scope_revision == item.active_scope_revision,
+            GithubWorkItem.pr_number == item.pr_number,
+            GithubWorkItem.handoff_state == item.handoff_state,
+            _settled_handoff_condition(),
+            exists(select(TeamGithubScope.id).where(
+                TeamGithubScope.id == scope.id, TeamGithubScope.preset_id == context["team_id"])),
+            exists(select(AgentTeamPreset.id).where(
+                AgentTeamPreset.id == context["team_id"], AgentTeamPreset.leader_slot_id == leader.team_slot_id)),
+            ~exists(select(GithubOwnerObservationPause.id).where(
+                GithubOwnerObservationPause.work_item_id == item.id,
+                GithubOwnerObservationPause.status.in_(("waiting", "paused")))),
+            exists(select(MailMessage.id).where(
+                MailMessage.id == root.id, MailMessage.kind == "context_request", MailMessage.thread_root_id.is_(None),
+                MailMessage.request_status == "pending", MailMessage.sender_member_id == owner.id,
+                MailMessage.recipient_member_id == leader.id, MailMessage.delivery_key == root.delivery_key)),
+            *self._attempt_actor_conditions(context),
+        )
+
     async def decide(
         self,
         db: AsyncSession,
@@ -2417,6 +2458,8 @@ class GithubApprovalService:
         A caller that supplies its trusted ``actor`` gets one applied decision
         fact in the decision commit. An exact replay records nothing.
         """
+        from app.services.github_coordination_service import hold_code
+
         decision_item_id = item.id
         decision_scope_id = item.scope_id
         request = await self.resolve_for_decision(
@@ -2436,6 +2479,9 @@ class GithubApprovalService:
             raise GithubApprovalError("stale_nonce")
         if request.request_message_id is None:
             raise GithubApprovalError("approval_request_delivery_pending")
+        escalated_rejection = item.dispatch_status == "escalated" and decision == "rejected"
+        if escalated_rejection and (stop := hold_code()):
+            raise GithubApprovalError(stop)
         if request.status != "pending":
             if request.status not in {"approved", "rejected"}:
                 raise GithubApprovalError("request_not_pending")
@@ -2447,26 +2493,50 @@ class GithubApprovalService:
                     raise GithubApprovalError("approval_round_mismatch")
                 return request, False
             raise GithubApprovalError("approval_request_already_decided")
-        if item.dispatch_status == "escalated":
+        if item.dispatch_status == "escalated" and not escalated_rejection:
             raise GithubApprovalError("item_escalated")
         if request.approval_round != item.approval_round_count:
             raise GithubApprovalError("approval_round_mismatch")
         if owner.team_slot_id is None:
             raise GithubApprovalError("stale_approval_owner")
+        item_conditions = (
+            GithubWorkItem.id == item.id,
+            GithubWorkItem.dispatch_nonce == request.dispatch_nonce,
+            GithubWorkItem.approval_round_count == request.approval_round,
+            GithubWorkItem.owner_slot_id == owner.team_slot_id,
+        )
+        request_conditions = (
+            GithubApprovalRequest.id == request.id,
+            GithubApprovalRequest.work_item_id == item.id,
+            GithubApprovalRequest.status == "pending",
+            GithubApprovalRequest.request_kind == "initial_plan",
+            GithubApprovalRequest.dispatch_nonce == item.dispatch_nonce,
+            GithubApprovalRequest.approval_round == item.approval_round_count,
+            GithubApprovalRequest.owner_member_id == owner.id,
+            GithubApprovalRequest.leader_member_id == leader.id,
+        )
+        if escalated_rejection:
+            item_conditions += await self._escalated_initial_rejection_conditions(
+                db, item, request, owner, leader, actor)
+            request_conditions += (
+                GithubApprovalRequest.scope_revision_id.is_(None),
+                GithubApprovalRequest.request_message_id == request.request_message_id,
+                GithubApprovalRequest.request_fingerprint == request.request_fingerprint,
+                GithubApprovalRequest.decided_at.is_(None),
+                GithubApprovalRequest.decision_message_id.is_(None),
+            )
+        else:
+            item_conditions += (GithubWorkItem.dispatch_status != "escalated",)
         item_guard = await db.execute(
             update(GithubWorkItem)
-            .where(
-                GithubWorkItem.id == item.id,
-                GithubWorkItem.dispatch_status != "escalated",
-                GithubWorkItem.dispatch_nonce == request.dispatch_nonce,
-                GithubWorkItem.approval_round_count == request.approval_round,
-                GithubWorkItem.owner_slot_id == owner.team_slot_id,
-            )
+            .where(*item_conditions)
             .values(updated_at=GithubWorkItem.updated_at)
             .execution_options(synchronize_session=False)
         )
         if item_guard.rowcount != 1:
             await db.rollback()
+            if escalated_rejection:
+                raise GithubApprovalError("stale_approval_context")
             await db.refresh(item)
             if item.dispatch_status == "escalated":
                 raise GithubApprovalError("item_escalated")
@@ -2478,23 +2548,8 @@ class GithubApprovalService:
         result = await db.execute(
             update(GithubApprovalRequest)
             .where(
-                GithubApprovalRequest.id == request.id,
-                GithubApprovalRequest.status == "pending",
-                GithubApprovalRequest.request_kind == "initial_plan",
-                GithubApprovalRequest.dispatch_nonce == item.dispatch_nonce,
-                GithubApprovalRequest.approval_round == item.approval_round_count,
-                GithubApprovalRequest.owner_member_id == owner.id,
-                GithubApprovalRequest.leader_member_id == leader.id,
-                exists(
-                    select(GithubWorkItem.id).where(
-                        GithubWorkItem.id == request.work_item_id,
-                        GithubWorkItem.dispatch_status != "escalated",
-                        GithubWorkItem.dispatch_nonce == request.dispatch_nonce,
-                        GithubWorkItem.approval_round_count
-                        == request.approval_round,
-                        GithubWorkItem.owner_slot_id == owner.team_slot_id,
-                    )
-                ),
+                *request_conditions,
+                exists(select(GithubWorkItem.id).where(*item_conditions)),
             )
             .values(
                 status=decision,
@@ -2516,12 +2571,17 @@ class GithubApprovalService:
                 request_kind="initial_plan",
                 decision=decision,
             )
+        if escalated_rejection and (stop := hold_code()):
+            await db.rollback()
+            raise GithubApprovalError(stop)
         await db.commit()
         await db.refresh(request)
         if result.rowcount == 1:
             return request, True
         if request.status == decision and request.reason == reason:
             return request, False
+        if escalated_rejection:
+            raise GithubApprovalError("stale_approval_context")
         await db.refresh(item)
         if item.dispatch_status == "escalated":
             raise GithubApprovalError("item_escalated")

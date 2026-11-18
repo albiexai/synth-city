@@ -623,6 +623,7 @@ async def decide_work_item(
     decision_item_id = item.id
     decision_scope_id = item.scope_id
     decided = False
+    escalated_rejection = item.dispatch_status == "escalated" and request.decision == "rejected"
     try:
         approval, _decided = await github_approval_service.decide(
             db,
@@ -672,15 +673,16 @@ async def decide_work_item(
             db, actor=actor, scope_id=decision_scope_id, item_id=decision_item_id,
             request_id=request.approval_request_id, outcome="applied",
             reason="decision notice delivered")
-        await github_dispatch_service.apply_approval_decision(
-            db,
-            item,
-            scope,
-            decision=request.decision,
-            approval_round=approval.approval_round,
-            dispatch_nonce=approval.dispatch_nonce,
-            owner_member_id=approval.owner_member_id,
-        )
+        if not escalated_rejection:
+            await github_dispatch_service.apply_approval_decision(
+                db,
+                item,
+                scope,
+                decision=request.decision,
+                approval_round=approval.approval_round,
+                dispatch_nonce=approval.dispatch_nonce,
+                owner_member_id=approval.owner_member_id,
+            )
         await agent_mail_service.auto_nudge_members(
             db,
             {approval.owner_member_id},
