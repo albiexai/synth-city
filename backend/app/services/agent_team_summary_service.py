@@ -20,6 +20,7 @@ from app.models.factory_schemas import (
 from app.services.github_coordination_service import hold_code
 from app.services.github_dispatch_service import ESCALATION_REASONS
 from app.services.github_operator_attention_service import github_operator_attention_service
+from app.services.github_operator_context_service import bind_attempt
 from app.services.github_work_progress_service import github_work_progress_service
 from app.services.agent_team_campaign_service import agent_team_campaign_service
 from app.services import required_ci_attention
@@ -148,6 +149,37 @@ class AgentTeamSummaryService:
                    GithubWorkItem.escalation_reason == _LEGACY_OBSERVATION_PAUSE_REASON)
             .order_by(GithubOwnerObservationPause.id).limit(65))).all())
 
+    async def _inspection_reasons(self, db, preset_id, actions, dispatch_nonces):
+        keys = {
+            (action["scope_id"], action["issue_number"], action["work_item_id"], action["dispatch_epoch"])
+            for action in actions
+            if action["kind"] == "inspect_attempt" and action["state"] in {"requested", "context_pending"}
+            and action.get("assessment_current") is True and action.get("work_item_id") in dispatch_nonces
+            and action.get("dispatch_epoch")
+        }
+        if not keys:
+            return {}
+        # The visible inspections have their own cap. Pending progress rows cannot crowd this read out.
+        rows = (await db.execute(select(
+            GithubWorkItem.id, GithubWorkItem.scope_id, GithubWorkItem.issue_number,
+            GithubWorkItem.dispatched_at, GithubWorkItem.created_at, GithubWorkItem.approval_round_count,
+            GithubWorkItem.active_scope_revision, GithubWorkItem.dispatch_nonce, GithubWorkItem.escalation_reason,
+        ).join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id).where(
+            TeamGithubScope.preset_id == preset_id,
+            GithubWorkItem.id.in_({key[2] for key in keys}),
+            GithubWorkItem.dispatch_status.in_(ATTENTION_STATUSES),
+        ))).all()
+        reasons = {}
+        for row in rows:
+            if row.dispatch_nonce != dispatch_nonces[row.id] or row.escalation_reason not in _INSPECTION_REASONS:
+                continue
+            binding = {}
+            bind_attempt(binding, row)
+            key = (row.scope_id, row.issue_number, row.id, binding["dispatch_epoch"])
+            if key in keys:
+                reasons[key] = row.escalation_reason
+        return reasons
+
     async def summary(self, db, preset_id, scope_id=None, provider=None):
         started = datetime.now(timezone.utc)
         deadline = asyncio.get_running_loop().time() + self.observation_seconds
@@ -160,7 +192,8 @@ class AgentTeamSummaryService:
         complete = (total <= self.item_limit and len(items) == total
                     and len(scope_rows) <= 32 and len(approvals) <= 64)
         scopes = [SimpleNamespace(**row._mapping) for row in scope_rows[:32]]
-        attention, human_actions, actors, observations = [], [], set(), []
+        attention, visible_actions, actors, observations = [], [], set(), []
+        dispatch_nonces = {}
         waiting_input, native_fence, native_known = None, {}, False
         native_states, native_ok = {}, False
         expires = [started + timedelta(seconds=15)]
@@ -207,6 +240,8 @@ class AgentTeamSummaryService:
             expires.append(_utc(native.valid_until))
             dispatch = await bounded(lambda: self.attention.dispatch_snapshot(db, scopes))
             complete = complete and dispatch["complete"]
+            # Capture scalars before another dispatch read can refresh the ORM rows.
+            dispatch_nonces = {entry.id: entry.dispatch_nonce for entry in dispatch.get("items", ())}
             for action in dispatch["actions"]:
                 kind = action.get("kind")
                 code = {"inspect_attempt": "attempt_stopped", "inspect_checkpoint": "recovery_decision",
@@ -231,27 +266,13 @@ class AgentTeamSummaryService:
             human = await bounded(lambda: self.attention.summary(db, preset_id))
             complete = complete and human["coverage_complete"]
             expires.append(_utc(human["observation_expires_at"]))
-            attempt_reasons = {
-                (item.scope_id, item.issue_number, item.id): item.escalation_reason
-                for item in items[:self.item_limit]
-                if item.dispatch_status in ATTENTION_STATUSES and item.escalation_reason in _INSPECTION_REASONS
-            }
             for action in human["actions"][:64]:
-                # Existing action data also contains private context and prose. Use a narrow allowlist.
                 kind, state = action.get("kind"), action.get("state")
                 if kind not in _KINDS or state not in _STATES:
                     complete = False
                     continue
-                scope, issue, work_item = action["scope_id"], action["issue_number"], action.get("work_item_id")
-                if matcher is not None and not matcher.visible(scope, work_item):
-                    continue
-                human_actions.append(TeamSummaryHumanAction(scope_id=scope, issue_number=issue, work_item_id=work_item,
-                    kind=kind, state=state, source=action.get("source") if action.get("source") in {
-                        "leader", "dispatch"} else "unknown", assessment_current=action.get("assessment_current") is True,
-                    pull_request_number=action.get("pull_request_number"),
-                    escalation_reason=attempt_reasons.get((scope, issue, work_item)) if kind == "inspect_attempt" else None))
-                if state != "resolved":
-                    actors.add("operator")
+                if matcher is None or matcher.visible(action["scope_id"], action.get("work_item_id")):
+                    visible_actions.append(action)
             complete = complete and len(human["actions"]) <= 64
             for item in items[:self.item_limit]:
                 value = await bounded(lambda: self.progress.summary(db, item.id))
@@ -282,6 +303,31 @@ class AgentTeamSummaryService:
         final = await self._snapshot(db, preset_id, scope_id, provider)
         if final is None:
             return None
+        try:
+            attempt_reasons = await bounded(
+                lambda: self._inspection_reasons(db, preset_id, visible_actions, dispatch_nonces))
+        except (TimeoutError, OSError, ValueError, OperationalError):
+            # A reason is optional. Keep the action and its usual detail if the lookup is unavailable.
+            attempt_reasons = {}
+            if db.in_transaction():
+                await db.rollback()
+        human_actions = []
+        for action in visible_actions:
+            # Existing action data also contains private context and prose. Use a narrow allowlist.
+            kind, state = action["kind"], action["state"]
+            scope_id, issue_number = action["scope_id"], action["issue_number"]
+            work_item_id = action.get("work_item_id")
+            assessment_current = action.get("assessment_current") is True
+            reason = None
+            if kind == "inspect_attempt" and state in {"requested", "context_pending"} and assessment_current:
+                reason = attempt_reasons.get((scope_id, issue_number, work_item_id, action.get("dispatch_epoch")))
+            human_actions.append(TeamSummaryHumanAction(
+                scope_id=scope_id, issue_number=issue_number, work_item_id=work_item_id,
+                kind=kind, state=state, source=action.get("source") if action.get("source") in {"leader", "dispatch"}
+                else "unknown", assessment_current=assessment_current,
+                pull_request_number=action.get("pull_request_number"), escalation_reason=reason))
+            if state != "resolved":
+                actors.add("operator")
         changed = final != initial or hold_code() != hold
         now = datetime.now(timezone.utc)
         complete = complete and not changed and min(expires) > now
