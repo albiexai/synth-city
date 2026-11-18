@@ -10,6 +10,8 @@ from app.database import Base
 from app.models.database import AgentTeamPreset, AgentTeamSlot, GithubOwnerObservationPause, GithubWorkItem, TeamGithubScope
 from app.models.github_work_progress_schemas import GithubPublicationObservation, GithubWorkProgressResponse, GithubWorkRemainingView
 from app.services.agent_team_summary_service import AgentTeamSummaryService
+from app.services.github_operator_attention_service import github_operator_attention_service
+from app.services.github_operator_context_service import bind_attempt
 
 
 @pytest_asyncio.fixture
@@ -81,6 +83,11 @@ class Attention:
 
     async def dispatch_snapshot(self, db, scopes):
         return {"complete": True, "actions": []}
+
+
+class InspectionAttention(Attention):
+    async def dispatch_snapshot(self, db, scopes):
+        return await github_operator_attention_service.dispatch_snapshot(db, scopes)
 
 
 def service(monkeypatch, values=None, attention=None, hold=None, **kwargs):
@@ -317,6 +324,109 @@ async def test_human_actions_preserve_pending_details_and_drop_private_fields(db
     assert (result.remaining_work.state, result.remaining_work.unfinished_items) == ("known", 0)
     assert result.next_actors == ["operator"]
     assert "private-" not in result.model_dump_json()
+
+
+@pytest.mark.parametrize("status,reason,kind,expected", [
+    ("escalated", "leader_ack_timeout", "inspect_attempt", "leader_ack_timeout"),
+    ("failed", "retry_count_exhausted", "inspect_attempt", "retry_count_exhausted"),
+    ("escalated", "owner_observation_pause", "inspect_attempt", "owner_observation_pause"),
+    ("escalated", "private-arbitrary-reason", "inspect_attempt", None),
+    ("escalated", "leader_ack_timeout", "inspect_checkpoint", None),
+    ("dispatched", "leader_ack_timeout", "inspect_attempt", None),
+])
+@pytest.mark.asyncio
+async def test_human_action_exposes_only_a_known_attempt_reason(db, monkeypatch, status, reason, kind, expected):
+    team, scope, (item,) = await seed(db, (status,))
+    item.escalation_reason = reason
+    await db.commit()
+    action = {"scope_id": scope.id, "issue_number": item.issue_number, "work_item_id": item.id,
+              "kind": kind, "state": "context_pending", "source": "dispatch", "assessment_current": True,
+              "gate_reason": "private-action-gate"}
+    bind_attempt(action, item)
+
+    class PendingAction(InspectionAttention):
+        async def summary(self, db, preset_id):
+            result = await super().summary(db, preset_id)
+            result["actions"] = [action, {**action, "issue_number": item.issue_number + 1}]
+            return result
+
+    summary, _ = service(monkeypatch, attention=PendingAction())
+    result = await summary.summary(db, team.id)
+    assert result.human_actions[0].model_dump()["escalation_reason"] == expected
+    assert result.human_actions[1].model_dump()["escalation_reason"] is None
+    assert all(entry.state == "context_pending" for entry in result.human_actions)
+    assert "private-" not in result.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_inspection_reason_is_omitted_if_the_attempt_is_replaced(db, monkeypatch):
+    team, scope, (item,) = await seed(db, ("escalated",))
+    item.escalation_reason = "owner_offline"
+    await db.commit()
+    item_id = item.id
+
+    class ReplacedAttempt(InspectionAttention):
+        async def summary(self, db, preset_id):
+            replacement = await db.get(GithubWorkItem, item_id)
+            replacement.dispatch_nonce = "private-replacement"
+            replacement.dispatched_at = datetime.utcnow()
+            replacement.escalation_reason = "leader_ack_timeout"
+            await db.commit()
+            observed = await self.dispatch_snapshot(db, [scope])
+            return {**await super().summary(db, preset_id), "actions": observed["actions"]}
+
+    summary, _ = service(monkeypatch, attention=ReplacedAttempt())
+    result = await summary.summary(db, team.id)
+    (action,) = result.human_actions
+    assert action.kind == "inspect_attempt"
+    assert action.work_item_id == item_id
+    assert action.escalation_reason is None
+    assert not result.coverage_complete
+
+
+@pytest.mark.asyncio
+async def test_inspection_reason_survives_the_unfinished_item_limit(db, monkeypatch):
+    team, scope, items = await seed(db, ("pending",) * 64 + ("escalated",))
+    item = items[-1]
+    item.escalation_reason = "leader_ack_timeout"
+    await db.commit()
+
+    class CurrentInspection(InspectionAttention):
+        async def summary(self, db, preset_id):
+            observed = await self.dispatch_snapshot(db, [scope])
+            return {**await super().summary(db, preset_id), "actions": observed["actions"]}
+
+    summary, _ = service(monkeypatch, attention=CurrentInspection())
+    result = await summary.summary(db, team.id)
+    (action,) = result.human_actions
+    assert action.work_item_id == item.id
+    assert action.escalation_reason == "leader_ack_timeout"
+    assert not result.coverage_complete
+
+
+@pytest.mark.asyncio
+async def test_inspection_scope_does_not_narrow_a_provider_only_campaign(db, monkeypatch):
+    team, scope, (stopped, active) = await seed(db, ("escalated", "dispatched"))
+    other_scope = TeamGithubScope(preset_id=team.id, repo_owner="example", repo_name="other",
+                                  repo_path="/private/other", enabled=True)
+    db.add(other_scope)
+    await db.flush()
+    active.scope_id = other_scope.id
+    stopped.escalation_reason = "leader_ack_timeout"
+    await db.commit()
+
+    class CurrentInspection(InspectionAttention):
+        async def summary(self, db, preset_id):
+            observed = await self.dispatch_snapshot(db, [scope, other_scope])
+            return {**await super().summary(db, preset_id), "actions": observed["actions"]}
+
+    summary, _ = service(monkeypatch, attention=CurrentInspection())
+    result = await summary.needs_you(db, team.id, provider="codex-cli")
+    (action,) = result.human_actions
+    assert action.scope_id == scope.id
+    assert action.escalation_reason == "leader_ack_timeout"
+    assert result.campaign.under_way_count == 1
+    assert result.campaign.attention_count == 1
 
 
 @pytest.mark.asyncio

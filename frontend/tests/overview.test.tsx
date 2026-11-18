@@ -107,6 +107,33 @@ describe('Needs you', () => {
     expect(within(screen.getByRole('heading', { name: /Needs you/ }).closest('section')!).getAllByRole('listitem')).toHaveLength(1)
   })
 
+  it('shows the attempt escalation reason even when action details are pending', async () => {
+    const inspection = {
+      scope_id: 1, issue_number: 47, work_item_id: 9, kind: 'inspect_attempt',
+      state: 'context_pending', source: 'dispatch', assessment_current: true,
+    } as const
+    const withReason = { ...inspection, escalation_reason: 'leader_ack_timeout' }
+    serve({
+      presets: [preset(1, 'Release crew', true)],
+      summaries: {
+        1: summary({
+          human_actions: [withReason, { ...inspection, issue_number: 48, work_item_id: 10 }],
+          attention: [{ code: 'attempt_stopped', issue_number: 47, work_item_id: 9 }],
+        }),
+      },
+      overview: overviewWith({}),
+    })
+    await open()
+    const list = screen.getByRole('heading', { name: /Needs you/ }).closest('section')!
+    const affectedLink = within(list).getByRole('link', { name: /Open #47/ })
+    expect(affectedLink).toHaveAttribute('href', '/work/9')
+    const affected = within(affectedLink.closest('li')!)
+    expect(affected.getByText(/^on #47 · Leader acknowledgement timed out/)).toBeInTheDocument()
+    expect(affected.queryByText(/details pending/)).not.toBeInTheDocument()
+    expect(within(list).getByText(/^on #48 · details pending/)).toBeInTheDocument()
+    expect(within(list).getAllByRole('listitem')).toHaveLength(2)
+  })
+
   it('never shows an action that no summary reports', async () => {
     serve({
       presets: [preset(1, 'Release crew', true)],

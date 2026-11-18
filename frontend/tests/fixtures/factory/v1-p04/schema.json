@@ -969,6 +969,18 @@
               "title": "Assessment Current",
               "type": "boolean"
             },
+            "escalation_reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Escalation Reason"
+            },
             "issue_number": {
               "exclusiveMinimum": 0,
               "title": "Issue Number",
