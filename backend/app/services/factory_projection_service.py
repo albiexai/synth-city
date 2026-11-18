@@ -20,6 +20,7 @@ from app.models.database import (
 from app.models import factory_schemas as wire
 from app.services.agent_mail_service import MCP_HEARTBEAT_TTL_SECONDS
 from app.services.github_dispatch_scheduler import github_dispatch_scheduler
+from app.services.github_dispatch_service import ESCALATION_REASONS
 from app.services.github_work_item_projection import _load_work_item_authority, _work_item_response
 from app.services.providers import get_providers
 from app.services.work_item_states import ATTENTION_STATUSES, DONE_STATUSES
@@ -60,10 +61,8 @@ REASON_SUMMARIES = {
     "workspace_lease_required": "Recovery requires the current workspace lease.",
     "continuation_budget_exhausted": "The existing continuation budget is exhausted.",
 }
-KNOWN_ESCALATIONS = {
-    "abandoned_by_operator", "plan_blocked", "verification_failed", "verification_timeout",
-    "ack_timeout", "owner_idle", "owner_unavailable", "continuation_budget_exhausted",
-}
+# #1181: the dispatcher's own list, so the projection never falls behind it.
+KNOWN_ESCALATIONS = ESCALATION_REASONS
 
 
 class FactoryReadError(ValueError):
@@ -327,8 +326,14 @@ def waiting(item, legacy, owner_session):
         actor, code = "human", "human_review"
     elif status in ("escalated", "failed"):
         actor = "operator"
-        code = ("abandoned_by_operator" if item.escalation_reason == "abandoned_by_operator" else
-                "attempt_escalated" if item.escalation_reason in KNOWN_ESCALATIONS else "unknown")
+        # Every escalated or failed item is attempt_escalated unless an operator stopped it (#1181). A reason the
+        # dispatcher does not know, or none, gets the same fixed code; the persisted text is never echoed.
+        if item.escalation_reason == "abandoned_by_operator":
+            code = "abandoned_by_operator"
+        elif item.escalation_reason in KNOWN_ESCALATIONS:
+            code = "attempt_escalated"
+        else:
+            code = "attempt_escalated"
     else:
         actor, code = "unknown", "unknown"
     return wire.WaitingActor(actor=actor, reason_code=code, summary=REASON_SUMMARIES[code])

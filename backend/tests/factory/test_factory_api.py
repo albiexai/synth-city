@@ -267,7 +267,7 @@ async def test_unknown_private_reason_is_generic_and_finished_is_tracking_only(f
                          .values(escalation_reason=PRIVATE))
         await db.commit()
     failed = await get_ok(factory_client, f"work-items/{factory_store.ids.by_status['failed']}")
-    assert failed["work_item"]["waiting"]["reason_code"] == "unknown"
+    assert failed["work_item"]["waiting"]["reason_code"] == "attempt_escalated"  # #1181: a fixed, generic code
     assert PRIVATE not in json.dumps(failed)
     completed = await get_ok(factory_client, f"work-items/{factory_store.ids.by_status['completed']}")
     assert completed["work_item"]["category"] == "finished"
