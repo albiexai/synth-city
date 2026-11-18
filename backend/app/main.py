@@ -6,7 +6,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from sqlalchemy.exc import OperationalError
 from mcp_shim.environment_warning import warn_legacy_environment
 
 from app.api.v1.router import router as api_v1_router
@@ -115,6 +116,23 @@ class FrontendFiles(StaticFiles):
         else:
             response.headers["Cache-Control"] = REVALIDATE
         return response
+
+
+async def database_busy_exception_handler(request, exc):
+    """#1149: a lock that outlasts the busy timeout is retryable, so answer 503 instead of 500."""
+    message = str(getattr(exc, "orig", exc)).lower()
+    if "database is locked" in message or "database is busy" in message:
+        logger.warning("database_busy path=%s", request.url.path)
+        return JSONResponse({"detail": "database_busy"}, status_code=503, headers={"Retry-After": "1"})
+    logger.error("Unhandled database error on %s", request.url.path, exc_info=exc)
+    return PlainTextResponse("Internal Server Error", status_code=500)
+
+
+def install_database_busy_handler(target: FastAPI) -> None:
+    target.add_exception_handler(OperationalError, database_busy_exception_handler)
+
+
+install_database_busy_handler(app)
 
 
 async def spa_not_found_exception_handler(request, exc):
