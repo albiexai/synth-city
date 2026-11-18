@@ -2,7 +2,7 @@
 
 Use this playbook when an operator delegates a GitHub backlog to a supervising agent and a Albiex Synth City team. It covers preparation, autonomous delivery, independent review, maintenance, recovery and completion.
 
-This process comes from the product reposition work and the Deck v3 release. It describes the operating practice for Deck 3.0.0. Check the installed version before using a command. Team names, issue numbers, model choices and machine paths are campaign settings.
+This process comes from the product reposition work. Check the installed version before using a command, because routes and fields change between releases. Team names, issue numbers, model choices and machine paths are campaign settings.
 
 For the roles, the hierarchy and the factory boundary, see the [Factory operating model](./operating-model.md).
 
@@ -108,7 +108,7 @@ Use explicit delegation. This example is a starting point, not a default permiss
 | Prepare workspaces, roster and startup evidence | Supervisor may proceed |
 | Enable autonomy after successful preflight | Already authorized by the campaign brief |
 | Approve implementation plans | Team Leader, through Synth City |
-| Merge accepted implementation PRs into integration | Supervisor or configured automatic policy |
+| Merge accepted implementation PRs into integration | Automatic policy under Auto merge, after an accepted verifier verdict. Under Human merge policy, a person merges on GitHub |
 | Repair a factory bug and deploy a reviewed fix | Supervisor, with recorded maintenance evidence |
 | Change models, credentials, authority or budgets | Operator decision unless specifically delegated |
 | Accept a pilot or milestone | Named human decision; keep its evidence gate |
@@ -327,7 +327,7 @@ Final hosted gates must still cover the actual PR head and current workflow exec
 
 Complete one bounded correction batch before final review. Keep one finding register with stable IDs, requirements, locations, decisive checks and state. Repair in-scope findings under valid existing authority. Use a new approved scope when the existing continuation no longer authorizes the change.
 
-The effective delivery policy belongs to each repository and attempt. New scope defaults do not silently update an active attempt. See the [Factory API](../api/factory.md) and the [delivery practices source](https://github.com/albiexai/synth-city/blob/master/docs/deploy/factory-delivery-practices.md).
+The effective delivery policy belongs to each repository and attempt. New scope defaults do not silently update an active attempt. See the [Factory API](../api/factory.md) and the [delivery policy fields](../api/agent-teams.md#delivery-policy-fields-and-attempt-snapshots).
 
 ### Companion paths
 
@@ -445,7 +445,7 @@ Use `synth_city_prepare_operator_action_contexts` and the Leader's current asses
 Before you write the request, run a preflight on the target:
 
 - **Startup migrations.** Read the target's compatibility migrations. A column added at startup changes the retained-authority snapshot. Controllers before #654 then fail after cutover. For those, add nullable columns to the live database after a backup and before the operation, and measure the snapshot on a database copy.
-- **Owner checkpoints.** Controllers before #654 refuse a checkpoint from an owner whose session runs outside the dispatch workspace. For those, run the upgrade when no item is dispatched or verifying. Hold a pending item by removing its dispatch label; Synth City resets it when the label returns.
+- **Owner checkpoints.** Controllers before #654 refuse a checkpoint from an owner whose session runs outside the dispatch workspace. For those, run the upgrade when no item is dispatched or verifying. Hold a pending item by removing its dispatch label. Removing the label from a dispatched, verifying or awaiting-review item escalates it. An escalated or failed item retries automatically only after a later issue update, and only when it has no PR, its scope revision is 0, no retry is requested and no approval is pending.
 - **Accepted pulls.** Each accepted pull must be merged, with all of its head's checks complete and successful.
 - **Proof receipts.** Run the proof in a clean checkout that the checking user owns. A test may write into the tree. The receipt binds the commit and tree, not the path.
 - **Refusal codes.** Older CLIs print only the exception type. Call the operation's function directly to read the reason code.
@@ -530,13 +530,13 @@ For Synth City releases, follow [Documentation publishing](https://github.com/al
 After the outcome is verified:
 
 1. Record final sources, checks, evidence limits and rollback in the parent issue.
-2. Close completed issues and reconcile the Leader's assessments and operator actions.
+2. Confirm completed issues are closed. A PR body with `Closes #N` closes its issue only when the PR merges to the default branch. Synth City does not close issues. Reconcile the Leader's assessments and operator actions.
 3. Confirm no active implementations, pending authority or leased work remains.
 4. Disable completed team dispatch and repository intake. Disarm its dedicated watcher as appropriate. Leave unrelated teams unchanged.
 5. State which services, previews and native sessions remain running. Stop sessions through supported controls when requested or planned.
 6. Mark the goal complete. Report the goal tool's final usage when its rules require it.
 
-The Deck v3 publication record is an example: [release issue #490](https://github.com/albiexai/synth-city/issues/490). The records establish that campaign's result. They do not establish performance or cost gains for other teams.
+A past release's publication record is an example: [release issue #490](https://github.com/albiexai/synth-city/issues/490). The records establish that campaign's result. They do not establish performance or cost gains for other teams.
 
 ## Templates
 
