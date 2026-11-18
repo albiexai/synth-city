@@ -107,18 +107,30 @@ def test_an_empty_shard_or_an_empty_full_collection_fails():
     assert any("full collection is empty" in problem for problem in ident.check([], good())[0])
 
 
+def _write_artifact(root, index, *, attempt=None, outcome="passed", skip=()):
+    name = f"backend-test-timings-{index}"
+    if attempt is not None:
+        name += f"-attempt-{attempt}"
+    folder = root / name
+    folder.mkdir()
+    ids = FULL[(index - 1) * 3:index * 3]
+    rows = [
+        {"id": item, "outcome": outcome if item == ids[0] else "passed", "runs": 1}
+        for item in ids
+    ]
+    files = {
+        f"backend-shard-{index}-collected.txt": "\n".join(ids) + "\n",
+        f"backend-shard-{index}-executed.jsonl": "".join(json.dumps(row) + "\n" for row in rows),
+        f"backend-junit-{index}.xml": f'<testsuites><testsuite tests="{len(ids)}"/></testsuites>',
+    }
+    for name, text in files.items():
+        if name not in skip:
+            (folder / name).write_text(text, encoding="utf-8")
+
+
 def _write_artifacts(root, count=2, skip=()):
     for index in range(1, count + 1):
-        folder = root / f"backend-test-timings-{index}"
-        folder.mkdir()
-        ids = FULL[(index - 1) * 3:index * 3]
-        files = {f"backend-shard-{index}-collected.txt": "\n".join(ids) + "\n",
-                 f"backend-shard-{index}-executed.jsonl": "".join(
-                     json.dumps({"id": item, "outcome": "passed", "runs": 1}) + "\n" for item in ids),
-                 f"backend-junit-{index}.xml": f'<testsuites><testsuite tests="{len(ids)}"/></testsuites>'}
-        for name, text in files.items():
-            if name not in skip:
-                (folder / name).write_text(text, encoding="utf-8")
+        _write_artifact(root, index, skip=skip)
 
 
 def _run(root, full_ids=FULL, shards=2):
@@ -134,6 +146,76 @@ def test_the_command_passes_a_complete_set_of_artifacts(tmp_path):
     done = _run(tmp_path)
     assert done.returncode == 0, done.stdout + done.stderr
     assert "executed 6" in done.stdout
+
+
+@pytest.mark.parametrize(("original", "rerun", "expected"), [
+    ("failed", "passed", 0),
+    ("failed", "failed", 1),
+    ("passed", "failed", 1),
+])
+def test_the_gate_uses_the_newest_artifact_per_shard_for_a_partial_rerun(tmp_path, original, rerun, expected):
+    art = tmp_path / "art"
+    art.mkdir()
+    _write_artifact(art, 1, attempt=1, outcome=original)
+    _write_artifact(art, 2, attempt=1)
+    _write_artifact(art, 1, attempt=2, outcome=rerun)
+    done = _run(tmp_path)
+    assert done.returncode == expected, done.stdout + done.stderr
+    assert "shard 1: backend-test-timings-1-attempt-2" in done.stdout
+    assert "shard 2: backend-test-timings-2-attempt-1" in done.stdout
+    assert ("ended as failed" in done.stdout) == (expected == 1)
+
+
+def test_the_gate_orders_attempts_numerically(tmp_path):
+    art = tmp_path / "art"
+    art.mkdir()
+    _write_artifact(art, 1, attempt=10)
+    _write_artifact(art, 1, attempt=9, outcome="failed")
+    _write_artifact(art, 2, attempt=1)
+    done = _run(tmp_path)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "shard 1: backend-test-timings-1-attempt-10" in done.stdout
+
+
+def test_the_gate_refuses_a_newer_incomplete_artifact_even_with_an_older_success(tmp_path):
+    art = tmp_path / "art"
+    art.mkdir()
+    _write_artifact(art, 1, attempt=1)
+    _write_artifact(art, 2, attempt=1)
+    _write_artifact(art, 1, attempt=2, skip=("backend-shard-1-executed.jsonl",))
+    done = _run(tmp_path)
+    assert done.returncode == 1
+    assert "shard 1: backend-test-timings-1-attempt-2" in done.stdout
+    assert "shard 1: backend-shard-1-executed.jsonl is missing or empty" in done.stdout
+
+
+@pytest.mark.parametrize("folder", [
+    "backend-test-timings-1-attempt-0",
+    "backend-test-timings-1-attempt-last",
+    "backend-test-timings-1-attempt-02",
+    "backend-test-timings-3-attempt-1",
+])
+def test_the_gate_refuses_invalid_attempt_or_shard_names(tmp_path, folder):
+    art = tmp_path / "art"
+    art.mkdir()
+    _write_artifact(art, 1, attempt=1)
+    _write_artifact(art, 2, attempt=1)
+    (art / folder).mkdir()
+    done = _run(tmp_path)
+    assert done.returncode == 1
+    assert [line for line in done.stdout.splitlines() if line.startswith("PROBLEM:")] == [
+        f"PROBLEM: unexpected artifact {folder}",
+    ]
+
+
+def test_the_gate_refuses_mixed_legacy_and_attempt_artifacts(tmp_path):
+    art = tmp_path / "art"
+    art.mkdir()
+    _write_artifacts(art)
+    _write_artifact(art, 1, attempt=2)
+    done = _run(tmp_path)
+    assert done.returncode == 1
+    assert "cannot mix legacy and attempt-named artifacts" in done.stdout
 
 
 @pytest.mark.parametrize("skip", ["backend-shard-2-collected.txt", "backend-shard-2-executed.jsonl", "backend-junit-2.xml"])
