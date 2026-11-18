@@ -250,6 +250,8 @@ proposal fields as a continuation, with `phase: implementation`. The server assi
 `origin_kind: scope_amendment`; ordinary continuations retain their escalation and PR requirements.
 The corresponding MCP tool is `synth_city_request_scope_amendment`.
 
+`allowed_paths` is the amendment's whole effective path set: name every approved path you keep as well as the new ones, because completion checks changed files against exactly this list. List each approved path you deliberately drop in the optional `withdrawn_paths`. If approved paths are missing and `withdrawn_paths` doesn't list exactly those, the request is refused before anything is stored: `409 amendment_base_paths_omitted` when nothing is withdrawn, `409 amendment_withdrawn_paths_invalid` otherwise. Companion paths count as named. Existing revisions keep the allowed paths they were approved with.
+
 A healthy amendment works before a PR exists. It reads the assigned branch's committed head
 and tree without discarding held edits. Its path baseline must come from structured approved
 initial-plan metadata or the preceding approved implementation revision. Legacy plans without

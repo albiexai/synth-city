@@ -14,6 +14,7 @@ export const UNKNOWN_REASON = "The reason is not known to this page.";
 // code. The code stays in the event detail.
 export const REFUSAL_REASONS: Record<string, string> = {
   amendment_added_path_limit: "This attempt has reached its limit for added file paths.",
+  amendment_base_paths_omitted: "The amendment leaves out approved file paths without listing them as withdrawn.",
   amendment_baseline_unverifiable: "The previous approved file scope could not be verified.",
   amendment_closed_file_paths_required: "The amendment must name individual files.",
   amendment_context_unavailable: "The attempt is paused or its current authority is unavailable.",
@@ -24,6 +25,7 @@ export const REFUSAL_REASONS: Record<string, string> = {
   amendment_origin_unverifiable: "The recorded amendment does not match its approved request.",
   amendment_prior_revision_unsettled: "The previous revision must end before this amendment can proceed.",
   amendment_workspace_unverifiable: "The assigned checkout head could not be verified.",
+  amendment_withdrawn_paths_invalid: "The listed withdrawn paths are not exactly the approved paths the amendment leaves out.",
   current_independent_reviewer_required: "The current assigned independent reviewer must record this review.",
   current_leader_and_review_required: "The current Leader must settle a current independent review.",
   current_mail_session_required: "Use a current authenticated team session.",

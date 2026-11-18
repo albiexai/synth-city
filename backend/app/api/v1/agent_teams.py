@@ -1541,10 +1541,33 @@ async def request_github_work_item_continuation(
     # R07: once the request commits, a later failure concerns only its notice.
     committed_request: tuple[int, int] | None = None
     try:
-        revision, approval, _created = (
-            await (github_approval_service.create_scope_amendment_request
-                   if isinstance(request, GithubScopeAmendmentCreate)
-                   else github_approval_service.create_continuation_request)(
+        # Two explicit calls (no ** splat), so the state-namespace guard can see every field written (#1154).
+        if isinstance(request, GithubScopeAmendmentCreate):
+            revision, approval, _created = await github_approval_service.create_scope_amendment_request(
+                db,
+                item,
+                scope,
+                authenticated_owner_member_id=session.member_id,
+                authenticated_owner_slot_id=slot_id,
+                dispatch_nonce=request.dispatch_nonce,
+                phase=request.phase,
+                execution_target=request.execution_target,
+                summary=request.summary,
+                allowed_paths=request.allowed_paths,
+                allowed_actions=request.allowed_actions,
+                allowed_commands=request.allowed_commands,
+                prohibited_actions=request.prohibited_actions,
+                max_failed_heads=request.max_failed_heads,
+                tool_fallbacks={
+                    name: fallback.model_dump()
+                    for name, fallback in request.tool_fallbacks.items()
+                },
+                lease_token=request.lease_token,
+                actor=request_actor,
+                withdrawn_paths=request.withdrawn_paths,
+            )
+        else:
+            revision, approval, _created = await github_approval_service.create_continuation_request(
                 db,
                 item,
                 scope,
@@ -1566,7 +1589,6 @@ async def request_github_work_item_continuation(
                 lease_token=request.lease_token,
                 actor=request_actor,
             )
-        )
         committed_request = (approval.id, revision.id)
         if isinstance(request, GithubScopeAmendmentCreate) and not _created and approval.status != "pending":
             return GithubContinuationRequestResponse(

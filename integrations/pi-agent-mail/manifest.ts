@@ -1583,7 +1583,7 @@ export const manifest = [
   },
   {
     "name": "synth_city_request_scope_amendment",
-    "description": "Request a bounded healthy scope amendment. Fresh Leader decision and owner activation are required.",
+    "description": "Request a bounded healthy scope amendment. Fresh Leader decision and owner activation are required.\n\n    allowed_paths is the whole effective set: name every approved path you keep, not only the new ones. List each\n    approved path you deliberately drop in withdrawn_paths; otherwise the request is refused with\n    amendment_base_paths_omitted (a wrong withdrawal is amendment_withdrawn_paths_invalid).\n    ",
     "inputSchema": {
       "properties": {
         "work_item_id": {
@@ -1642,6 +1642,21 @@ export const manifest = [
         "lease_token": {
           "title": "Lease Token",
           "type": "string"
+        },
+        "withdrawn_paths": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Withdrawn Paths"
         }
       },
       "required": [

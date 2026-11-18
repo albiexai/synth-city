@@ -2115,6 +2115,8 @@ class GithubContinuationProposalCreate(BaseModel):
 
 class GithubScopeAmendmentCreate(GithubContinuationProposalCreate):
     phase: Literal["implementation"] = "implementation"
+    # #1154: approved base paths the amendment deliberately leaves out. Optional; must equal the omission exactly.
+    withdrawn_paths: List[str] = Field(default_factory=list, max_length=64)
 
 
 class GithubRevisionReviewCreate(BaseModel):
