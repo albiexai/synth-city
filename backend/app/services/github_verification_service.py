@@ -1375,7 +1375,10 @@ class GithubVerificationService:
         head_sha = self._head_sha(pull)
         if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
             raise ValueError("merged PR head SHA is unavailable")
-        if revision is not None and head_sha != revision.submitted_head_sha and not (
+        # #1164: a superseded revision never settles by its own head; only an exact active acceptance does.
+        submitted_head = None if revision is not None and revision.status == "superseded" else (
+            revision.submitted_head_sha if revision is not None else None)
+        if revision is not None and head_sha != submitted_head and not (
                 verdict == "merged" and await db.scalar(select(exists().where(
                     GithubHeadReview.work_item_id == item.id,
                     GithubHeadReview.dispatch_nonce == expected["dispatch_nonce"],
@@ -2188,7 +2191,9 @@ class GithubVerificationService:
     ) -> GithubAttemptScopeRevision | None:
         """The escalated attempt's current implementation revision when a merge may settle it (#1079).
 
-        Unlike the active-revision lookup, an exhausted revision is returned too; any other status is not.
+        Unlike the active-revision lookup, an exhausted revision is returned too, and so is a superseded one (#1164:
+        cancelled through the Leader's tool while escalated). A superseded revision has no submitted head, so it
+        settles only by an active acceptance of the merged head. Any other status is not returned.
         """
         revision = await db.scalar(select(GithubAttemptScopeRevision).where(
             GithubAttemptScopeRevision.work_item_id == item.id,
@@ -2196,7 +2201,7 @@ class GithubVerificationService:
             GithubAttemptScopeRevision.revision == item.active_scope_revision,
         ).execution_options(populate_existing=True))
         if (revision is None or revision.phase != "implementation" or item.attempt_phase != revision.phase
-                or revision.status not in ("active", "submitted", "exhausted")):
+                or revision.status not in ("active", "submitted", "exhausted", "superseded")):
             return None
         return revision
 
