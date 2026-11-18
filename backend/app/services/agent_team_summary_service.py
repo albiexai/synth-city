@@ -36,6 +36,37 @@ def _utc(value):
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
+class _FilterMatch:
+    """Which rows of one team a Repository and Assigned-harness filter keeps (#1141, #1142).
+
+    scope_id keeps rows of that repository. provider keeps rows whose owner slot has that harness (a work item's
+    owner, a reminder's or waiting member's slot); a repository row with no owner has no harness and is dropped.
+    A team-level row (no scope, no owner) shows only when the team owns the repository and has a slot of that harness.
+    """
+
+    def __init__(self, scope_id, provider, team_scopes, slots, owners):
+        self.scope_id, self.provider = scope_id, provider
+        self.team_scopes, self.slots, self.owners = team_scopes, slots, owners
+
+    @property
+    def team_matches(self):
+        return ((self.scope_id is None or self.scope_id in self.team_scopes)
+                and (self.provider is None or self.provider in self.slots.values()))
+
+    def visible(self, scope, work_item_id=None, slot_id=None):
+        if self.scope_id is not None:
+            # A row without a scope belongs to the team: it shows only when the team owns the repository.
+            if scope is None and self.scope_id not in self.team_scopes or scope is not None and scope != self.scope_id:
+                return False
+        if self.provider is None:
+            return True
+        owner = slot_id if slot_id is not None else self.owners.get(work_item_id)
+        if owner is not None:
+            return self.slots.get(owner) == self.provider
+        # Team-level rows follow the configured roster; a repository row without an owner has no harness.
+        return scope is None and work_item_id is None and self.provider in self.slots.values()
+
+
 class AgentTeamSummaryService:
     def __init__(self, *, progress=None, attention=None, campaign=None, observation_seconds=8, item_limit=64):
         self.progress = progress or github_work_progress_service
@@ -44,7 +75,20 @@ class AgentTeamSummaryService:
         self.observation_seconds = min(8, max(0.001, observation_seconds))
         self.item_limit = min(64, max(1, item_limit))
 
-    async def _snapshot(self, db, preset_id):
+    async def _matcher(self, db, preset_id, scope_id, provider):
+        if scope_id is None and provider is None:
+            return None
+        team_scopes = set((await db.execute(
+            select(TeamGithubScope.id).where(TeamGithubScope.preset_id == preset_id))).scalars())
+        slots = {row.id: row.provider for row in (await db.execute(
+            select(AgentTeamSlot.id, AgentTeamSlot.provider).where(AgentTeamSlot.preset_id == preset_id))).all()}
+        owners = {row.id: row.owner_slot_id for row in (await db.execute(
+            select(GithubWorkItem.id, GithubWorkItem.owner_slot_id).join(
+                TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id).where(
+                TeamGithubScope.preset_id == preset_id))).all()}
+        return _FilterMatch(scope_id, provider, team_scopes, slots, owners)
+
+    async def _snapshot(self, db, preset_id, scope_id=None, provider=None):
         team = (await db.execute(select(AgentTeamPreset.id, AgentTeamPreset.description,
             AgentTeamPreset.parent_issue_url, AgentTeamPreset.autonomy_enabled, AgentTeamPreset.updated_at,
             AgentTeamPreset.backlog_milestone, AgentTeamPreset.planned_decisions,
@@ -63,6 +107,13 @@ class AgentTeamSummaryService:
         selected = (select(GithubWorkItem).join(TeamGithubScope,
             TeamGithubScope.id == GithubWorkItem.scope_id).where(TeamGithubScope.preset_id == preset_id,
             GithubWorkItem.dispatch_status.not_in(DONE_STATUSES)))
+        # #1142: a repository or harness filter narrows the unfinished items themselves, so remaining work, next
+        # actors and coverage are computed over the same work. A harness keeps only owned work.
+        if scope_id is not None:
+            selected = selected.where(GithubWorkItem.scope_id == scope_id)
+        if provider is not None:
+            selected = selected.join(AgentTeamSlot, AgentTeamSlot.id == GithubWorkItem.owner_slot_id).where(
+                AgentTeamSlot.preset_id == preset_id, AgentTeamSlot.provider == provider)
         count = await db.scalar(select(func.count()).select_from(selected.subquery()))
         # Private bindings exist only in the local equality check. Never serialize them.
         items = tuple((await db.execute(selected.with_only_columns(
@@ -94,11 +145,12 @@ class AgentTeamSummaryService:
                    GithubWorkItem.escalation_reason == "owner_observation_pause")
             .order_by(GithubOwnerObservationPause.id).limit(65))).all())
 
-    async def summary(self, db, preset_id):
+    async def summary(self, db, preset_id, scope_id=None, provider=None):
         started = datetime.now(timezone.utc)
         deadline = asyncio.get_running_loop().time() + self.observation_seconds
         await observe_supervisor(db, preset_id, now=started)
-        initial = await self._snapshot(db, preset_id)
+        matcher = await self._matcher(db, preset_id, scope_id, provider)
+        initial = await self._snapshot(db, preset_id, scope_id, provider)
         if initial is None:
             return None
         team, scope_rows, items, total, approvals = initial
@@ -156,12 +208,14 @@ class AgentTeamSummaryService:
                 kind = action.get("kind")
                 code = {"inspect_attempt": "attempt_stopped", "inspect_checkpoint": "recovery_decision",
                         "review_pr": "human_review"}.get(kind)
-                if code:
+                if code and (matcher is None or matcher.visible(action["scope_id"], action.get("work_item_id"))):
                     attention.append(TeamSummaryAttention(code=code, work_item_id=action.get("work_item_id"),
                         scope_id=action["scope_id"], issue_number=action["issue_number"]))
             pauses = await bounded(lambda: self._pauses(db, preset_id))
             complete = complete and len(pauses) <= 64
             for pause in pauses[:64]:
+                if matcher is not None and not matcher.visible(pause.scope_id, pause.work_item_id):
+                    continue
                 attention.append(TeamSummaryAttention(code="observation_pause", pause_id=pause.id,
                     work_item_id=pause.work_item_id, scope_id=pause.scope_id, issue_number=pause.issue_number,
                     observed_at=pause.paused_at, resume_deadline=pause.resume_deadline))
@@ -179,6 +233,8 @@ class AgentTeamSummaryService:
                 kind, state = action.get("kind"), action.get("state")
                 if kind not in _KINDS or state not in _STATES:
                     complete = False
+                    continue
+                if matcher is not None and not matcher.visible(action["scope_id"], action.get("work_item_id")):
                     continue
                 human_actions.append(TeamSummaryHumanAction(scope_id=action["scope_id"],
                     issue_number=action["issue_number"], work_item_id=action.get("work_item_id"),
@@ -214,7 +270,7 @@ class AgentTeamSummaryService:
         # Reuse fresh scalar rows after all asynchronous reads. Never use expired ORM attributes.
         if db.in_transaction():
             await db.rollback()
-        final = await self._snapshot(db, preset_id)
+        final = await self._snapshot(db, preset_id, scope_id, provider)
         if final is None:
             return None
         changed = final != initial or hold_code() != hold
@@ -254,7 +310,7 @@ class AgentTeamSummaryService:
                 # The summary lists a provider refusal, but it is not a wait on someone else (#1091).
                 external_wait=any(counts_as_external_wait(w.reason) for w in (waiting_input or []))
                 or any(a.state not in {"resolved", "historical"} for a in human_actions)))
-            if await self._snapshot(db, preset_id) != final or hold_code() != hold:
+            if await self._snapshot(db, preset_id, scope_id, provider) != final or hold_code() != hold:
                 idle = []
             for entry in idle:
                 attention.append(TeamSummaryAttention(code="team_idle", **entry))
@@ -276,7 +332,9 @@ class AgentTeamSummaryService:
             attention.append(TeamSummaryAttention(code="unanswered_request_incomplete",
                 coverage_reason=stall.reason, omitted_count=stall.omitted_count or None))
         supervisor["unanswered_requests"] = stall
-        campaign = await self.campaign.summary(db, preset_id, human_actions if not changed else ())
+        # The unfiltered call keeps its exact arguments; a filter is passed only when set (#1142).
+        campaign_filter = {"scope_id": scope_id, "provider": provider} if matcher is not None else {}
+        campaign = await self.campaign.summary(db, preset_id, human_actions if not changed else (), **campaign_filter)
         unreadable = []
         for item in final[2][:self.item_limit]:
             signal = required_ci_attention.signal(item, now=now)
@@ -295,39 +353,17 @@ class AgentTeamSummaryService:
             next_actor_coverage_complete=complete and len(observations) == total, campaign=campaign)
 
     async def needs_you(self, db, preset_id, *, scope_id=None, provider=None):
-        """The summary with only its Needs-you inputs narrowed to a repository and an assigned harness (#1141).
+        """The summary narrowed to a repository and an assigned harness (#1141, #1142).
 
-        No filter is the plain summary. Counts, the campaign, remaining work and the coverage flags are never
-        changed: only the lists that the Overview reads as 'Needs you' are trimmed.
+        The work-based parts (unfinished items, remaining work, next actors, the campaign, the human actions)
+        are narrowed where they are built. The lists that come from team-wide services (reminders, waiting
+        members, the supervisor row, the stored attention rows) are trimmed here by the same rule.
         """
-        result = await self.summary(db, preset_id)
+        result = await self.summary(db, preset_id, scope_id=scope_id, provider=provider)
         if result is None or (scope_id is None and provider is None):
             return result
-        team_scopes = set((await db.execute(
-            select(TeamGithubScope.id).where(TeamGithubScope.preset_id == preset_id))).scalars())
-        slots = {row.id: row.provider for row in (await db.execute(
-            select(AgentTeamSlot.id, AgentTeamSlot.provider).where(AgentTeamSlot.preset_id == preset_id))).all()}
-        work_ids = {row.work_item_id for rows in (result.human_actions, result.attention, result.required_ci_unreadable,
-                                                  result.reminder_attention) for row in rows if row.work_item_id}
-        owners = {}
-        if work_ids:
-            owners = {row.id: row.owner_slot_id for row in (await db.execute(
-                select(GithubWorkItem.id, GithubWorkItem.owner_slot_id).where(
-                    GithubWorkItem.id.in_(work_ids), GithubWorkItem.scope_id.in_(team_scopes)))).all()}
-
-        def visible(scope, work_item_id=None, slot_id=None):
-            if scope_id is not None:
-                # A row without a scope belongs to the team: it shows only when the team owns the repository.
-                if scope is None and scope_id not in team_scopes or scope is not None and scope != scope_id:
-                    return False
-            if provider is None:
-                return True
-            owner = slot_id if slot_id is not None else owners.get(work_item_id)
-            if owner is not None:
-                return slots.get(owner) == provider
-            # Team-level rows follow the configured roster; a repository row without an owner has no harness.
-            return scope is None and work_item_id is None and provider in slots.values()
-
+        match = await self._matcher(db, preset_id, scope_id, provider)
+        visible = match.visible
         update = {
             "human_actions": [row for row in result.human_actions if visible(row.scope_id, row.work_item_id)],
             "attention": [row for row in result.attention if visible(row.scope_id, row.work_item_id)],

@@ -129,20 +129,25 @@ async def _service(db, w, monkeypatch):
     service = AgentTeamSummaryService(progress=_Progress(), attention=_Attention())
     base = await service.summary(db, w.ids["team"])
     full = base.model_copy(update=_rows(w))
+    asked = []
 
-    async def summary(db, preset_id):
+    async def summary(db, preset_id, **filters):
+        asked.append(filters)
         return full if preset_id == w.ids["team"] else await AgentTeamSummaryService(
-            progress=_Progress(), attention=_Attention()).summary(db, preset_id)
+            progress=_Progress(), attention=_Attention()).summary(db, preset_id, **filters)
 
     monkeypatch.setattr(service, "summary", summary)
+    service.asked = asked
     return service, full
 
 
 def _picture(result, w):
     """What 'Needs you' would show, as comparable names."""
     reverse = {v: k for k, v in w.items.items()}
-    work = lambda rows: sorted(reverse.get(r.work_item_id, f"scope{r.scope_id}-{getattr(r, 'issue_number', None)}")
-                               for r in rows)
+    def work(rows):
+        return sorted(reverse.get(r.work_item_id, f"scope{r.scope_id}-{getattr(r, 'issue_number', None)}")
+                      for r in rows)
+
     return {
         "actions": work(result.human_actions), "attention": sorted(
             f"{r.code}:{reverse.get(r.work_item_id, r.scope_id)}" for r in result.attention),
@@ -238,16 +243,17 @@ async def test_both_filters_must_match(db, world, monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("filters", [{"scope_id": "a1"}, {"provider": "codex-cli"}, {"scope_id": "b1"},
                                      {"scope_id": "a1", "provider": "claude-code"}])
-async def test_a_filter_never_changes_counts_campaign_remaining_work_or_coverage(db, world, monkeypatch, filters):
+async def test_the_filter_reaches_the_summary_and_the_trim_only_touches_the_team_wide_lists(
+        db, world, monkeypatch, filters):
+    """The work-based parts are narrowed where the summary builds them (see test_team_campaign_filters.py); this
+    method passes the filter down and trims only the lists that come from team-wide services."""
     service, full = await _service(db, world, monkeypatch)
     kwargs = {k: (world.ids[v] if k == "scope_id" else v) for k, v in filters.items()}
     result = await service.needs_you(db, world.ids["team"], **kwargs)
+    assert service.asked == [{"scope_id": kwargs.get("scope_id"), "provider": kwargs.get("provider")}]
     trimmed = {"human_actions", "attention", "required_ci_unreadable", "reminder_attention",
                "waiting_input", "supervisor_observation"}
     assert result.model_dump(exclude=trimmed) == full.model_dump(exclude=trimmed)
-    assert result.campaign == full.campaign and result.remaining_work == full.remaining_work
-    assert result.coverage_complete == full.coverage_complete
-    assert result.reminder_attention_complete == full.reminder_attention_complete
 
 
 @pytest.mark.asyncio
@@ -282,7 +288,7 @@ async def test_http_filters_are_validated_and_optional(db, world, client, monkey
     assert (await client.get(url, params={"provider": ""})).status_code == 422
     assert (await client.get(url, params={"scope_id": 999999})).status_code == 404
     assert (await client.get(url, params={"scope_id": 0})).status_code == 422
-    assert (await client.get(f"/api/v1/agent-teams/presets/999999/summary",
+    assert (await client.get("/api/v1/agent-teams/presets/999999/summary",
                              params={"scope_id": world.ids["a1"]})).status_code == 404
 
 
