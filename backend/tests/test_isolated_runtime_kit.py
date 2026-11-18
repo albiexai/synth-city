@@ -134,6 +134,23 @@ def _root_users(root: Path) -> list[int]:
     return found
 
 
+def _host_pids_in_kit(outer_pid: int, local_pids: set[int]) -> set[int]:
+    pid_namespace = os.readlink(f"/proc/{outer_pid}/ns/pid")
+    found = set()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if os.readlink(entry / "ns" / "pid") != pid_namespace:
+                continue
+            line = next(line for line in (entry / "status").read_text().splitlines() if line.startswith("NSpid:"))
+            if int(line.split()[-1]) in local_pids:
+                found.add(int(entry.name))
+        except (OSError, StopIteration):
+            continue
+    return found
+
+
 def test_host_provides_what_the_kit_needs():
     # Report the missing piece by name instead of failing deep inside the kit.
     for tool in ("bash", "tmux", "unshare", "nsenter", "ip", "timeout", "setsid"):
@@ -309,29 +326,43 @@ def test_down_never_signals_or_deletes_outside_its_own_instance(tmp_path, state)
         victim.wait()
 
 
-def test_down_refuses_an_unrecorded_process_before_any_signal(kit_root):
+def test_down_refuses_a_process_in_the_kit_network_but_outside_its_pid_namespace(kit_root):
     _needs_namespaces()
     summary = _up(kit_root)
-    started = _kit("exec", "--root", str(kit_root), "--", "sh", "-c",
-                   'cd / && setsid env -i sleep 300 </dev/null >/dev/null 2>&1 & echo $!')
-    assert started.returncode == 0, started.stderr
-    child = int(started.stdout.split()[-1])
-    time.sleep(0.2)
-    recorded_child = _identity(child)
-    down = _kit("down", "--root", str(kit_root))
-    assert down.returncode == 1 and "unrecorded" in down.stderr and str(child) in down.stderr, down.stderr
-    # Nothing was signalled: the child and every kit process still run, and the root is kept.
-    assert _alive(child) and kit_root.exists()
-    assert all(_alive(pid) for pid in summary["pids"].values())
-    _pidfd_kill(recorded_child)
-    time.sleep(0.3)
+    # This fixture-owned outsider joins only the kit network. The host PID remains the
+    # Popen child of this test and may never be a signal target of the kit.
+    outsider = subprocess.Popen(
+        ["nsenter", "--preserve-credentials", "-U", "-n", "-t", str(summary["pids"]["outer"]), "sleep", "15"],
+        start_new_session=True,
+    )
+    recorded_child = None
+    try:
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            if os.readlink(f"/proc/{outsider.pid}/ns/net") == summary["net_namespace"]:
+                if Path(f"/proc/{outsider.pid}/cmdline").read_bytes().startswith(b"sleep\x00"):
+                    break
+            time.sleep(0.05)
+        assert os.readlink(f"/proc/{outsider.pid}/ns/net") == summary["net_namespace"]
+        assert os.readlink(f"/proc/{outsider.pid}/ns/pid") == os.readlink("/proc/self/ns/pid")
+        assert Path(f"/proc/{outsider.pid}/cmdline").read_bytes().startswith(b"sleep\x00")
+        recorded_child = _identity(outsider.pid)
+        down = _kit("down", "--root", str(kit_root))
+        assert down.returncode == 1 and "outside the kit PID namespace" in down.stderr, down.stderr
+        assert str(outsider.pid) in down.stderr
+        assert _identity(outsider.pid) == recorded_child and kit_root.exists()
+        assert all(_alive(pid) for pid in summary["pids"].values())
+    finally:
+        if recorded_child is not None and outsider.poll() is None:
+            _pidfd_kill(recorded_child)
+        outsider.wait(timeout=20)
     again = _kit("down", "--root", str(kit_root))
     assert again.returncode == 0, again.stderr
     assert not kit_root.exists() and not [pid for pid in summary["pids"].values() if _alive(pid)]
 
 
 def test_down_stops_unrecorded_members_of_the_cli_group_and_nothing_outside(kit_root):
-    """#1010: a real OpenCode starts its server and Mail shim in the pane's process group; down stops them."""
+    """The kit also stops ordinary child and grandchild processes in the pane's process group."""
     _needs_namespaces()
     victim = subprocess.Popen(["sleep", "300"], start_new_session=True)  # outside the kit, in a group of its own
     victim_id = None
@@ -343,7 +374,7 @@ def test_down_stops_unrecorded_members_of_the_cli_group_and_nothing_outside(kit_
         deadline = time.monotonic() + 10
         while not marker.exists() and time.monotonic() < deadline:
             time.sleep(0.1)
-        members = [int(pid) for pid in marker.read_text().split()]
+        members = _host_pids_in_kit(summary["pids"]["outer"], set(map(int, marker.read_text().split())))
         assert len(members) == 2 and all(_alive(pid) for pid in members)
         down = _kit("down", "--root", str(kit_root))
         assert down.returncode == 0, down.stderr
@@ -360,6 +391,45 @@ def test_down_stops_unrecorded_members_of_the_cli_group_and_nothing_outside(kit_
             # Popen.kill() polls first, so it does nothing after an exit.
             victim.kill()
             victim.wait(timeout=10)
+
+
+def test_down_stops_fake_cli_daemon_in_its_own_session(kit_root):
+    _needs_namespaces()
+    summary = _up(kit_root, RUNTIME_KIT_TEST_FAULT="cli_separate_session")
+    marker = kit_root / "run" / "fake-cli" / "daemon-pid"
+    deadline = time.monotonic() + 5
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    daemon_identity = None
+    try:
+        proof = _kit(
+            "exec", "--root", str(kit_root), "--", "python3", "-I", "-c",
+            "import os, sys; "
+            "pid = int(sys.argv[1]); "
+            "assert pid == os.getsid(pid) == os.getpgid(pid); "
+            "assert os.readlink(f'/proc/{pid}/ns/pid') == os.readlink('/proc/self/ns/pid'); "
+            "print(os.readlink('/proc/self/ns/pid'))",
+            marker.read_text().strip(),
+        )
+        assert proof.returncode == 0, proof.stderr
+        daemon_pids = _host_pids_in_kit(summary["pids"]["outer"], {int(marker.read_text())})
+        assert len(daemon_pids) == 1
+        daemon_pid = daemon_pids.pop()
+        assert Path(f"/proc/{daemon_pid}/cmdline").read_bytes().split(b"\0")[0] == os.fsencode(marker.parent / "setsid-daemon")
+        daemon_identity = _identity(daemon_pid)
+        down = _kit("down", "--root", str(kit_root))
+        assert down.returncode == 0, down.stderr
+        assert proof.stdout.strip() != os.readlink("/proc/self/ns/pid")
+        assert not kit_root.exists()
+        assert not _root_users(kit_root)
+        assert not _alive(daemon_pid)
+        assert not [pid for pid in summary["pids"].values() if _alive(pid)]
+    finally:
+        if kit_root.exists():
+            # On failure, stop only the fixture-owned daemon if it still has its recorded identity.
+            if daemon_identity is not None and _alive(daemon_identity["pid"]):
+                _pidfd_kill(daemon_identity)
+            _teardown_kit(kit_root)
 
 
 def test_up_refuses_a_retained_root_before_starting_anything(kit_root):
@@ -521,6 +591,49 @@ def test_model_plan_proves_every_role_and_orders_children_first():
     world, procs, inst = _model()
     module = _bind(_helper_module(), world, procs, inst)
     assert module["plan"](ROOT_MODEL) == {"targets": ["cli", "stub", "backend", "tmux", "inner", "outer"], "members": [], "problems": []}
+
+
+def _pid_namespace_model():
+    world, procs, inst = _model()
+    inst.update(pid="pid:[53]", mnt="mnt:[54]")
+    for name, entry in procs.items():
+        pid = entry["pid"]
+        world[pid].update(pid="pid:[1]" if name == "launcher" else inst["pid"], mnt=inst["mnt"])
+        if name != "launcher":
+            entry["local_pid"] = pid - 100
+    module = _bind(_helper_module(), world, procs, inst)
+    module["HOST"].update(pid="pid:[1]", mnt="mnt:[1]")
+    module["namespace_pid"] = lambda pid: pid - 100
+    return module, world, procs, inst
+
+
+def test_pid_namespace_plan_targets_only_its_proved_init():
+    module, world, _, inst = _pid_namespace_model()
+    world[107] = {
+        "ppid": 106, "start": "1107", "argv": [b"daemon"], "pgid": 107,
+        "net": inst["net"], "pid": inst["pid"],
+    }
+    assert module["plan"](ROOT_MODEL) == {"targets": ["outer"], "members": [], "problems": []}
+
+
+@pytest.mark.parametrize("fault", ["host_pid", "foreign_pid", "wrong_local_pid", "recycled_init", "unreadable"])
+def test_pid_namespace_plan_refuses_unproved_membership_or_init(fault):
+    module, world, procs, inst = _pid_namespace_model()
+    if fault == "wrong_local_pid":
+        procs["outer"]["local_pid"] = 2
+    elif fault == "recycled_init":
+        world[101]["start"] = "recycled"
+    elif fault == "unreadable":
+        world[106]["unreadable"] = True
+    else:
+        world[107] = {
+            "ppid": 1, "start": "1107", "argv": [b"outside"],
+            "net": inst["net"], "pid": "pid:[1]" if fault == "host_pid" else "pid:[90]",
+        }
+    result = module["plan"](ROOT_MODEL)
+    assert result["problems"] and not result["members"]
+    if fault in ("wrong_local_pid", "recycled_init"):
+        assert "outer" not in result["targets"]
 
 
 @pytest.mark.parametrize("role", ["outer", "inner", "tmux", "stub", "backend", "cli"])
