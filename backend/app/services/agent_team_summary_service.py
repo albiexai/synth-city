@@ -315,14 +315,14 @@ class AgentTeamSummaryService:
         for action in visible_actions:
             # Existing action data also contains private context and prose. Use a narrow allowlist.
             kind, state = action["kind"], action["state"]
-            scope_id, issue_number = action["scope_id"], action["issue_number"]
+            action_scope_id, issue_number = action["scope_id"], action["issue_number"]
             work_item_id = action.get("work_item_id")
             assessment_current = action.get("assessment_current") is True
             reason = None
             if kind == "inspect_attempt" and state in {"requested", "context_pending"} and assessment_current:
-                reason = attempt_reasons.get((scope_id, issue_number, work_item_id, action.get("dispatch_epoch")))
+                reason = attempt_reasons.get((action_scope_id, issue_number, work_item_id, action.get("dispatch_epoch")))
             human_actions.append(TeamSummaryHumanAction(
-                scope_id=scope_id, issue_number=issue_number, work_item_id=work_item_id,
+                scope_id=action_scope_id, issue_number=issue_number, work_item_id=work_item_id,
                 kind=kind, state=state, source=action.get("source") if action.get("source") in {"leader", "dispatch"}
                 else "unknown", assessment_current=assessment_current,
                 pull_request_number=action.get("pull_request_number"), escalation_reason=reason))

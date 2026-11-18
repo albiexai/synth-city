@@ -405,6 +405,31 @@ async def test_inspection_reason_survives_the_unfinished_item_limit(db, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_inspection_scope_does_not_narrow_a_provider_only_campaign(db, monkeypatch):
+    team, scope, (stopped, active) = await seed(db, ("escalated", "dispatched"))
+    other_scope = TeamGithubScope(preset_id=team.id, repo_owner="example", repo_name="other",
+                                  repo_path="/private/other", enabled=True)
+    db.add(other_scope)
+    await db.flush()
+    active.scope_id = other_scope.id
+    stopped.escalation_reason = "leader_ack_timeout"
+    await db.commit()
+
+    class CurrentInspection(InspectionAttention):
+        async def summary(self, db, preset_id):
+            observed = await self.dispatch_snapshot(db, [scope, other_scope])
+            return {**await super().summary(db, preset_id), "actions": observed["actions"]}
+
+    summary, _ = service(monkeypatch, attention=CurrentInspection())
+    result = await summary.needs_you(db, team.id, provider="codex-cli")
+    (action,) = result.human_actions
+    assert action.scope_id == scope.id
+    assert action.escalation_reason == "leader_ack_timeout"
+    assert result.campaign.under_way_count == 1
+    assert result.campaign.attention_count == 1
+
+
+@pytest.mark.asyncio
 async def test_unknown_team_returns_none(db, monkeypatch):
     summary, _ = service(monkeypatch)
     assert await summary.summary(db, 999999) is None
