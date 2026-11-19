@@ -62,7 +62,7 @@ two hours on an unanswered decision, flaky tests, nine minutes of GitHub rate li
 | Live view placement | A health panel on Overview; the full view in Insights (2026-11-18) |
 | Cost | API-equivalent cost as the headline; unknown is never zero; every harness eventually (2026-11-18). This version: Claude Code and Codex. |
 | Acting on a bottleneck | Four kinds of fix: setting, repository change, standing decision, Synth City defect (2026-11-19) |
-| Apply | Mid-campaign. **This version:** a link to the settings UI with the value prefilled (2026-11-19) |
+| Apply | Mid-campaign. **This version:** a link to the settings UI with **no value prefilled**, next to a what-if table; the value comes from the Director or an agent asked for one (2026-11-19) |
 | Verdicts | **This version:** before-and-after medians with n at each change marker, no verdict label (2026-11-19) |
 | Agents | Ask the Leader / Supervisor on a pinned snapshot; both asked at the finish. **This version:** the reply is free text, shown as judgement (2026-11-19) |
 | Verifiers | Verifiers are asked too: automatically at the finish, on demand mid-campaign. Each role gets its own question, so views don't overlap (2026-11-19) |
