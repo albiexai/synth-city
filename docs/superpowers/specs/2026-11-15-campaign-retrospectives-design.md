@@ -203,9 +203,25 @@ Documents and UI name harnesses, providers and models. They never say which plat
 
 ### Suggestions and Apply (mid-campaign)
 
-Rules and the target registry are as revision 2. A rule offers a setting change only when its evidence identifies
-that setting as the constraint; otherwise it offers an investigation or a product-defect draft. At most three are
-shown, ranked by the stage time they account for. What changes in revision 3:
+Rules and the target registry are as revision 2. At most three suggestions are shown, ranked by the stage time they
+account for.
+
+**Four kinds of fix** (Director, 2026-11-19). Each suggestion says which kind it is, because each kind travels by a
+different route. CI is the worked example:
+
+| Kind | Who changes it | What the page offers | CI example |
+|---|---|---|---|
+| **Synth City setting** | the Director | a suggestion with **Apply** (mid-campaign), or a lesson | `accepted_base_update: merge`; the required checks list |
+| **Repository change**: code or configuration Synth City doesn't own | the team, through a normal issue and PR | a suggestion that **drafts an issue** (evidence plus proposed change). The Director edits and approves it; it's filed with the campaign's ready label and the Leader dispatches it like any other item | shard e2e across parallel jobs (#1235); run only affected journeys on PRs |
+| **Standing decision**: a rule an agent applies | the Leader or the Supervisor, by rule | a suggestion that adds a **standing decision** to the scope's settings (#1114, #1115), with a count of each use on the page | "a failure of a known flaky test gets one full rerun"; "update a stale branch from the base" |
+| **Synth City defect** | the Synth City developers | **copy evidence**, as a bug report | a gate that can't pass a partial rerun (#1199) |
+
+A rule offers a setting or standing decision only when its evidence identifies that target as the constraint. It
+offers a repository change when the constraint is in the repository (for example a required check's duration).
+Otherwise it offers an investigation, naming the next responsible actor. Repository-change drafts carry the measured
+evidence and the expected effect, so the next campaign's verdict can check them like an applied setting.
+
+What changes in revision 3:
 
 - **Apply is on the live view only.** A frozen retrospective shows its suggestions as **lessons**, without Apply.
 - Each suggestion states up front:
@@ -327,4 +343,5 @@ trusted-agent Apply, as revision 2 describes.
 | Ask the Leader / Ask the Supervisor on a pinned snapshot, with a dedicated tool; both asked at the finish | Director |
 | Finish flow: prompt, finish, agents asked, freeze on answers or time limit | Director |
 | Analyst session, trusted-agent Apply and export stay later; statistical cross-campaign comparison stays out | unchanged |
+| Four kinds of fix (setting, repository change, standing decision, Synth City defect), each with its own route; repository changes are drafted as issues for the team | Director, 2026-11-19, with CI as the worked example |
 | Builder check: one metrics function; `calculation_version` added; serving provider as a slot setting; attribution by native session identity; all decision flows counted; Mail per PR is partly recorded; the panel extends `CampaignProgress`; campaigns created on upgrade for existing teams | independent builder review of revision 3 |
