@@ -181,8 +181,39 @@ real repository with different CI (for example Tizonia).
 
 ### 5. Bottlenecks and how to act on them
 
-The page shows the **top three bottlenecks**, ranked by the waiting time they account for. Each names its kind of fix
-and offers the matching action:
+The section has two parts that behave differently (Director, 2026-11-19): a deterministic **ranking**, and a
+**diagnosis** that comes from a few rules or from an agent.
+
+**Ranking (deterministic).**
+- A bottleneck is a stage from "Where the time went" in the **waiting on someone** or **process** groups, for one
+  responsible actor (for example "waiting for the Leader", "required check: e2e").
+- Ranked by the time it accounts for: over the **whole campaign so far** on the live page, and over the **last 4
+  hours** on the Overview panel.
+- **Against flicker:** a bottleneck counts only with a minimum share (default 10% of waiting-and-process time) and a
+  minimum number of items (default 5). When the top bottleneck has changed since the Director's last visit, the
+  page says "new since your last visit".
+- Every number shows its n, and the ranking is reproducible from the recorded data.
+
+**Diagnosis: a few rules, then an agent.**
+- **Rules** are code, each with a stated condition the page shows when it fires. They are used only where the
+  evidence is unambiguous. The starter set for 4.4:
+
+  | Rule | Condition (defaults configurable) | Kind of fix |
+  |---|---|---|
+  | Small correction batches wait on a decision | ≥ 5 waits on correction-batch decisions, all approved | standing decision |
+  | Effort ceiling hit for factory reasons | ≥ 2 items over `max_item_effort_minutes` with time lost to Synth City errors or refusals | setting |
+  | One required check dominates | one check ≥ 25% of item time across ≥ 10 items | repository change |
+  | Flaky check | the same check name fails then passes on the same head ≥ 3 times | repository change (known-flakes policy, #1236) |
+  | Queue grows under load | median queue time ≥ 2× its quiet-time value when 3+ PRs run checks at once | repository change (take non-required jobs off PRs) |
+
+- **No rule fires → "Investigate".** The bottleneck shows its responsible actor and a button **"Ask the Leader /
+  Supervisor / verifier about this"**. The request carries that bottleneck's evidence (the stage, its items and its
+  longest waits). The agent's diagnosis appears under the bottleneck, marked as judgement, and can propose a fix of
+  any of the four kinds. The Director acts on it through the same routes.
+- Rules are kept few on purpose. From v4.5, the structured agent tool (Appendix A) lets agent-proposed fixes become
+  first-class suggestions.
+
+Each suggested fix names its kind and offers the matching action:
 
 | Kind | Action on the page |
 |---|---|
@@ -284,9 +315,9 @@ change, with n. It never labels the change as confirmed or failed.
 | 4 | Cost spike, then the Claude Code and Codex readers | 3 |
 | 5 | Insights rename and redirect; the live and frozen page, with the repository and team filters and the per-repository view | 5 |
 | 6 | Overview health panel | 1 |
-| 7 | Top three bottlenecks with their actions, before-and-after | 2 |
+| 7 | Top three bottlenecks: deterministic ranking, five starter rules, Investigate-then-ask; their actions; before-and-after | 3 |
 | 8 | Ask by Mail; the finish flow | 2 |
-| | **Total** | **about 24 items, 17–19 active builder hours** |
+| | **Total** | **about 25 items, 18–20 active builder hours** |
 
 Order: 1 first, then 2 and 3, with 4 in parallel, then 5 to 8.
 
@@ -332,6 +363,7 @@ Order: 1 first, then 2 and 3, with 4 in parallel, then 5 to 8.
 | A flaky check is named per check, fail then pass on the same head | Review: GitHub check runs carry no test names |
 | The finish freezes at once when no member session is live | Review |
 | Section 2 becomes "Where the time went": one split bar of waiting on someone, process and active, with waiting on someone first and broken down by who had to act ("waited" mislabelled active work) | Director, 2026-11-19 |
+| Top bottlenecks: deterministic ranking with anti-flicker thresholds; five starter rules with stated conditions; anything else is "Investigate" with an agent asked about that bottleneck's evidence | Director, 2026-11-19: static rules alone would be brittle |
 | Verifiers' views (quality and rework) alongside the Leader's and Supervisor's: asked at the finish, on demand mid-campaign; a different question per role | Director, 2026-11-19 |
 | Recording takes every check run on a head (required or not), Actions queue and run times and the workflow path; the page is generic by construction across repositories and CI apps, with a two-fixture acceptance test and a check on a second real repository | Director, 2026-11-19 |
 | A campaign is one team's campaign across all its repositories; repository and team filters, grouping and a per-repository view; product releases across teams deferred | Director, 2026-11-19 |
