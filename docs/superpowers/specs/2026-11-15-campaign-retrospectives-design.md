@@ -31,7 +31,7 @@ two hours on an unanswered decision, flaky tests, nine minutes of GitHub rate li
 4. The core measure is **where the time went**: active work, process steps, and **waiting on someone**, shown first and broken down by who had to act. Around it: size, flow, CI, friction, cost.
 5. **The top three bottlenecks**, each with its **kind of fix** and a way to act on it.
 6. A **campaign health panel** on Overview.
-7. **Ask the Leader or the Supervisor** for their view of a snapshot; both are asked at the finish.
+7. **Ask the Leader, the Supervisor or a verifier** for their view of a snapshot; all of them are asked at the finish.
 
 ## Non-goals (this version, all in "Later phases")
 
@@ -65,6 +65,7 @@ two hours on an unanswered decision, flaky tests, nine minutes of GitHub rate li
 | Apply | Mid-campaign. **This version:** a link to the settings UI with the value prefilled (2026-11-19) |
 | Verdicts | **This version:** before-and-after medians with n at each change marker, no verdict label (2026-11-19) |
 | Agents | Ask the Leader / Supervisor on a pinned snapshot; both asked at the finish. **This version:** the reply is free text, shown as judgement (2026-11-19) |
+| Verifiers | Verifiers are asked too: automatically at the finish, on demand mid-campaign. Each role gets its own question, so views don't overlap (2026-11-19) |
 | Finish | Synth City prompts; the Director finishes; the agents are asked; the snapshot freezes (2026-11-18) |
 | Scope | The v4.4 slice in this revision; the rest in later phases (2026-11-19) |
 | Grouping | **A campaign is one team's campaign**, across every repository that team watches. Filter and group by team and repository. A product release worked on by several teams is several campaigns, side by side. Grouping campaigns into a product release is deferred (2026-11-19) |
@@ -202,22 +203,30 @@ A suggestion that would invalidate an approved plan or an active item isn't offe
 **Before and after:** at each change marker, the page shows the median item time and stage waits before and after the
 change, with n. It never labels the change as confirmed or failed.
 
-### 6. Asking the Leader or the Supervisor
+### 6. Asking the Leader, the Supervisor or a verifier
 
-- **Ask the Leader** and **Ask the Supervisor** (the second only when the team has a Supervisor binding). They are
-  Director-triggered, with an optional question.
-- Synth City freezes the current snapshot and sends it by **Agent Mail**: a link to the snapshot plus its key numbers.
-- The agent replies in Mail. The page shows the reply as "**Leader's view** (or Supervisor's view), based on the
-  snapshot of HH:MM", next to the measurements and marked as judgement. It's marked stale when the live numbers have
-  moved past a threshold.
-- One open request per agent per campaign.
+- Buttons **Ask the Leader**, **Ask the Supervisor** (only when the team has a Supervisor binding) and **Ask a verifier**
+  (one per verifier slot, for example V1 and V2). They are Director-triggered, with an optional extra question.
+- **Each role gets its own question,** written into the request, so the views add rather than overlap:
+  - **Leader:** coordination and flow: queue, assignments, decisions, what held items up.
+  - **Supervisor:** the factory and the process: hand merges, quotas and rate limits, merge gates, cross-team effects.
+  - **Verifier:** quality and rework: what was wrong in submissions, why items needed further rounds (missing tests,
+    unclear acceptance, scope drift, item size, builder or model patterns), and what would have prevented it.
+- Synth City freezes the current snapshot and sends it by **Agent Mail**: a link to the snapshot, its key numbers
+  (for a verifier, the review and rework numbers first), and the role's question.
+- The agent replies in Mail. The page shows the reply under its role, "**Leader's view**" (or Supervisor's,
+  V1's, V2's), "based on the snapshot of HH:MM", next to the measurements and marked as judgement. It's marked stale
+  when the live numbers have moved past a threshold.
+- One open request per agent per campaign. **Mid-campaign, asking a verifier is on demand only**, because review is
+  often the busiest lane and the request takes the verifier away from it.
 
 ### 7. Finishing a campaign
 
 1. Synth City prompts the Director when every member issue is merged, closed, deferred or superseded.
 2. The Director presses **Finish**.
-3. Synth City takes the final snapshot and asks the Leader and the Supervisor (if any).
-4. The snapshot **freezes** when both have answered, or after the Director's time limit (default 2 hours). It freezes
+3. Synth City takes the final snapshot and asks the Leader, the Supervisor (if any) and **every verifier**, each with
+   its role's question.
+4. The snapshot **freezes** when all of them have answered, or after the Director's time limit (default 2 hours). It freezes
    **at once** when no member session is live. A missing view shows as "not received".
 5. The frozen page is read-only. Its **lessons** list the changes made, with their before-and-after numbers, the
    suggestions not acted on, and the agents' views.
@@ -248,7 +257,7 @@ change, with n. It never labels the change as confirmed or failed.
   6. friction;
   7. size;
   8. the top three bottlenecks with actions (or lessons when frozen);
-  9. agents' views.
+  9. agents' views, one per role (Leader, Supervisor, each verifier).
 
   Charts use Recharts, as in `frontend/src/features/usage`, and link to the Audit log filtered to their events.
 - **The Overview health panel** extends the existing `CampaignProgress` card, one per team. It adds:
@@ -323,6 +332,7 @@ Order: 1 first, then 2 and 3, with 4 in parallel, then 5 to 8.
 | A flaky check is named per check, fail then pass on the same head | Review: GitHub check runs carry no test names |
 | The finish freezes at once when no member session is live | Review |
 | Section 2 becomes "Where the time went": one split bar of waiting on someone, process and active, with waiting on someone first and broken down by who had to act ("waited" mislabelled active work) | Director, 2026-11-19 |
+| Verifiers' views (quality and rework) alongside the Leader's and Supervisor's: asked at the finish, on demand mid-campaign; a different question per role | Director, 2026-11-19 |
 | Recording takes every check run on a head (required or not), Actions queue and run times and the workflow path; the page is generic by construction across repositories and CI apps, with a two-fixture acceptance test and a check on a second real repository | Director, 2026-11-19 |
 | A campaign is one team's campaign across all its repositories; repository and team filters, grouping and a per-repository view; product releases across teams deferred | Director, 2026-11-19 |
 | Corrected code claims: PR lines and commits weren't stored; item time was a median only; check runs kept no timestamps | Review, verified against the code |
