@@ -1,0 +1,862 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Campaign retrospectives in Insights: reference mockup</title>
+<style>
+/* Tokens copied from frontend/src/index.css (light theme). */
+:root{
+  --background:hsl(0 0% 99%);--foreground:hsl(0 0% 9%);--card:hsl(0 0% 100%);
+  --primary:hsl(142 60% 29%);--primary-foreground:#fff;
+  --secondary:hsl(0 0% 94%);--muted:hsl(0 0% 96%);--muted-foreground:hsl(0 0% 40%);
+  --accent:hsl(0 0% 92%);--border:hsl(0 0% 88%);--destructive:hsl(0 70% 45%);
+  --amber:#f59e0b;--amber-text:#92400e;--radius:.5rem;
+  /* Chart groups. Validated for colour-blind separation; always paired with a text label. */
+  --g-wait:#b45309;--g-proc:#2563a8;--g-act:#2a8a52;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;font:14px/1.5 ui-sans-serif,system-ui,sans-serif;background:var(--background);color:var(--foreground)}
+h1,h2,h3,h4,h5,p,ul,ol,dl,dd,figure{margin:0}ul,ol{padding:0;list-style:none}
+a{color:inherit;text-decoration:underline;text-underline-offset:4px}
+button,select,input,textarea{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.num{font-variant-numeric:tabular-nums}
+.muted{color:var(--muted-foreground)}.xs{font-size:12px}.sm{font-size:13px}.b{font-weight:600}
+.wrap{overflow-wrap:anywhere}
+
+/* Mockup chrome (not product UI) */
+.mockbar{position:sticky;top:0;z-index:20;background:#171717;color:#fff;padding:8px 16px;display:flex;gap:8px 16px;align-items:center;flex-wrap:wrap}
+.mockbar h1{font-size:14px;font-weight:600}
+.mocktabs{display:flex;gap:4px;flex-wrap:wrap}
+.mocktabs button{background:#2a2a2a;color:#e5e5e5;border:0;border-radius:6px;padding:6px 10px;font-size:13px;cursor:pointer;min-height:32px}
+.mocktabs button[aria-selected=true]{background:var(--primary);color:#fff}
+.mocktabs button:focus-visible{outline-color:#fff}
+.mockbar .illus{font-size:12px;border:1px dashed #a3a3a3;border-radius:6px;padding:2px 8px}
+.note{margin:12px 16px 0;border:1px dashed hsl(0 0% 60%);border-radius:var(--radius);padding:8px 12px;font-size:13px;background:var(--muted)}
+.note b:first-child{text-transform:uppercase;font-size:11px;letter-spacing:.04em;margin-right:6px}
+body.embed .mockbar,body.embed .note{display:none}
+
+/* App shell (Header.tsx, Sidebar.tsx, MainLayout.tsx) */
+.shell{margin:12px 16px 32px;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;background:var(--background)}
+body.embed .shell{margin:0;border:0;border-radius:0}
+.apphead{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:56px;padding:8px 16px;border-bottom:1px solid var(--border)}
+.logo{font-weight:700;letter-spacing:-.01em}.logo span{color:var(--primary)}
+.body{display:flex;min-height:640px}
+.side{width:56px;flex-shrink:0;border-right:1px solid var(--border);padding:8px}
+.side a{display:flex;align-items:center;gap:8px;min-height:44px;padding:8px;border-left:4px solid transparent;border-radius:4px;color:var(--muted-foreground);text-decoration:none;font-size:14px}
+.side a[aria-current=page]{border-color:var(--primary);background:var(--accent);color:var(--foreground);font-weight:600}
+.side svg{width:16px;height:16px;flex-shrink:0;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.side span{display:none}
+main{flex:1;min-width:0;padding:16px}
+.shell.plain .side,.shell.plain .apphead{display:none}
+@media(min-width:768px){.side{width:240px}.side span{display:inline}main{padding:24px}}
+.screen{display:none}.screen.on{display:block}
+.stack>*+*{margin-top:16px}
+
+/* Type scale as in the product: page title text-2xl, section text-lg */
+.pt{font-size:24px;font-weight:600;line-height:1.25}
+.st{font-size:18px;font-weight:600}
+.ct{font-size:14px;font-weight:600}
+.row{display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+.between{justify-content:space-between}.baseline{align-items:baseline}.end{align-items:flex-end}
+
+/* shadcn-style primitives */
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px}
+.card.tight{padding:12px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:36px;padding:0 16px;border-radius:6px;border:1px solid transparent;font-size:14px;font-weight:500;cursor:pointer;white-space:nowrap;text-decoration:none;background:none}
+.btn.sm{height:32px;padding:0 12px;font-size:12px}
+.btn.pri{background:var(--primary);color:var(--primary-foreground)}
+.btn.out{border-color:var(--border);background:var(--background)}.btn.out:hover{background:var(--accent)}
+.btn[disabled]{opacity:.5;cursor:default}
+.btn.wraps{white-space:normal;height:auto;min-height:36px;text-align:left;padding-block:6px}
+.badge{display:inline-flex;align-items:center;gap:6px;border-radius:6px;border:1px solid transparent;padding:1px 8px;font-size:12px;font-weight:600;white-space:nowrap;vertical-align:middle}
+.badge.pri{background:var(--primary);color:#fff}.badge.sec{background:var(--secondary)}.badge.out{border-color:var(--border)}
+.badge.amber{border-color:var(--amber);color:var(--amber-text)}
+.dot{width:8px;height:8px;border-radius:99px;background:currentColor}
+.unk{display:inline-block;border:1px dashed hsl(0 0% 45%);border-radius:6px;padding:0 6px;font-size:12px;font-weight:600}
+.tabs{display:inline-flex;height:40px;align-items:center;border-radius:6px;background:var(--muted);padding:4px;color:var(--muted-foreground)}
+.tabs a{padding:6px 12px;border-radius:4px;font-size:14px;font-weight:500;text-decoration:none}
+.tabs a[aria-current=page]{background:var(--background);color:var(--foreground);box-shadow:0 1px 2px rgb(0 0 0/.08)}
+label.f{display:grid;gap:4px;font-size:14px}
+select,.input{height:36px;border:1px solid var(--border);border-radius:6px;background:var(--background);padding:0 8px;max-width:100%}
+textarea.input{height:auto;padding:8px;width:100%;resize:vertical}
+.alert{border:1px solid var(--border);border-radius:var(--radius);padding:10px 14px;background:var(--card)}
+.alert.amber{border:2px solid rgb(245 158 11/.6)}
+
+/* Tables */
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{text-align:left;padding:8px;border-bottom:1px solid var(--border);vertical-align:top}
+th{font-size:12px;font-weight:600;color:var(--muted-foreground);white-space:nowrap}
+tr:last-child>td{border-bottom:0}
+tbody th{white-space:normal;font-size:14px;font-weight:400;color:var(--foreground)}
+.two>*,.dgrid>*,.dlg>*,.cols>*,.tiles>*{min-width:0}
+.r{text-align:right}td.r,th.r{font-variant-numeric:tabular-nums}td.r{white-space:nowrap}.dlg th{white-space:normal}.dlg td.r,.stk td.r{white-space:normal}
+tr.grp>th,tr.grp>td{background:var(--muted);font-size:13px;color:var(--foreground);white-space:normal}
+.scroll{overflow-x:auto}
+table.stk thead th{white-space:normal}
+.dlg .badge.sec{border:0;padding:1px 8px}
+caption{text-align:left;font-size:12px;color:var(--muted-foreground);padding:0 8px 6px}
+/* Stacked rows on small screens: each cell carries its own label */
+@media(max-width:700px){
+  table.stk thead{display:none}
+  table.stk,table.stk tbody,table.stk tr,table.stk td,table.stk th{display:block}
+  table.stk tr{border-bottom:1px solid var(--border);padding:8px 0}
+  table.stk td,table.stk tbody th{border:0;padding:2px 8px;text-align:left}
+  table.stk td[data-l]::before{content:attr(data-l) ": ";color:var(--muted-foreground);font-size:12px}
+  .hide-s{display:none!important}
+  th,td{padding:6px 4px}thead th{white-space:normal}table .barcell{width:22%;min-width:36px}.card{padding:12px}.dlg{padding:16px}
+}
+@media(min-width:701px){.only-s{display:none!important}}
+
+/* Tiles */
+.tiles{display:grid;gap:12px;grid-template-columns:repeat(2,minmax(0,1fr))}
+@media(min-width:1000px){.tiles{grid-template-columns:repeat(5,minmax(0,1fr))}.tiles.four{grid-template-columns:repeat(4,minmax(0,1fr))}}
+.tile dt{font-size:13px;color:var(--muted-foreground)}
+.tile .v{font-size:24px;font-weight:600;line-height:1.3;font-variant-numeric:tabular-nums}
+.tile .v small{font-size:13px;font-weight:400;color:var(--muted-foreground)}
+.tile .s{font-size:12px;color:var(--muted-foreground)}
+
+/* Where the time went */
+.split{display:flex;gap:2px;height:20px}
+.split i{display:block;border-radius:4px}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px}
+.legend{display:flex;flex-wrap:wrap;gap:4px 20px;font-size:13px}
+.w{background:var(--g-wait)}.p{background:var(--g-proc)}.a{background:var(--g-act)}
+.barcell{width:26%;min-width:90px}
+.bar{display:block;height:10px;border-radius:0 4px 4px 0;min-width:2px}
+.two{display:grid;gap:16px}
+@media(min-width:1180px){.two{grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);align-items:start}}
+
+/* Bottleneck cards */
+.bn{padding:12px 0;border-bottom:1px solid var(--border)}.bn:last-of-type{border-bottom:0}
+.bn .rank{display:inline-flex;width:22px;height:22px;align-items:center;justify-content:center;border-radius:99px;background:var(--foreground);color:var(--background);font-size:12px;font-weight:600;flex-shrink:0}
+.bn h4{font-size:14px;font-weight:600}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;font-size:13px}.kv dt{color:var(--muted-foreground)}
+details>summary{cursor:pointer;font-size:13px;text-decoration:underline;text-underline-offset:4px;width:fit-content}
+details[open]>summary{margin-bottom:6px}
+.judge{border:1px solid var(--border);border-left:3px double var(--foreground);border-radius:var(--radius);padding:10px 12px;background:var(--muted)}
+.judge blockquote{margin:6px 0 0;font-size:13px}
+
+/* Flow chart */
+.plotwrap{position:relative;padding-left:26px;padding-top:26px}
+.plot{position:relative;height:150px;display:flex;align-items:flex-end;gap:2px;border-bottom:1px solid hsl(0 0% 60%)}
+.plot .col{flex:1;height:100%;display:flex;align-items:flex-end}
+.plot .col i{display:block;width:100%;background:var(--g-act);border-radius:3px 3px 0 0}
+.plot .col:hover i{filter:brightness(.8)}
+.grid{position:absolute;left:0;right:0;border-top:1px solid var(--border)}
+.ytick{position:absolute;left:-26px;width:20px;text-align:right;font-size:11px;color:var(--muted-foreground);transform:translateY(-50%)}
+.mark{position:absolute;top:-26px;bottom:0;border-left:2px dashed var(--foreground);z-index:1}
+.mark b{position:absolute;top:0;left:-11px;width:20px;height:20px;border-radius:99px;background:var(--card);border:2px solid var(--foreground);font-size:11px;display:flex;align-items:center;justify-content:center}
+.pin{display:inline-flex;width:20px;height:20px;border-radius:99px;border:2px solid var(--foreground);font-size:11px;font-weight:700;align-items:center;justify-content:center}
+.xax{position:relative;height:18px;margin-left:26px;font-size:11px;color:var(--muted-foreground)}
+.xax span{position:absolute;top:2px;white-space:nowrap}
+
+/* Views grid, dialogs */
+.cols{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr))}
+.dlg{background:var(--background);border:1px solid var(--border);border-radius:var(--radius);box-shadow:0 10px 30px rgb(0 0 0/.12);padding:24px;display:grid;gap:14px;align-content:start}
+.dlg h3{font-size:18px;font-weight:600;line-height:1.2}
+.dlg h4{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--muted-foreground);margin-bottom:4px}
+.dlg .foot{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;border-top:1px solid var(--border);padding-top:14px}
+.dlg .sec{border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px}
+.size{font-size:11px;font-family:ui-monospace,monospace;color:var(--muted-foreground)}
+.dgrid{display:grid;gap:20px}
+@media(min-width:1100px){.dgrid{grid-template-columns:1fr 1fr;align-items:start}}
+dialog{border:0;padding:0;background:none;width:calc(100% - 24px);max-height:90vh}
+dialog::backdrop{background:rgb(0 0 0/.6)}
+dialog .dlg{max-height:90vh;overflow-y:auto}
+dialog.SM{max-width:672px}dialog.MD{max-width:768px}dialog.LG{max-width:896px}
+.empty{font-style:normal;border:1px dashed hsl(0 0% 45%);border-radius:6px;padding:8px;color:var(--muted-foreground);font-size:13px}
+pre{margin:0;font:12px/1.5 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--muted);border-radius:6px;padding:10px}
+.chk li{display:grid;grid-template-columns:64px 1fr;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);font-size:13px}.chk li:last-child{border:0}
+.phone{width:390px;max-width:100%;height:780px;border:8px solid #171717;border-radius:28px;display:block;margin:0 auto;background:#fff}
+.statehead{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--muted-foreground);margin-bottom:6px}
+</style>
+</head>
+<body>
+
+<div class="mockbar">
+  <h1>Campaign retrospectives in Insights: reference mockup (design revision 4)</h1>
+  <div class="mocktabs" role="tablist" aria-label="Mockup screens">
+    <button role="tab" data-s="overview">1 · Overview panel</button>
+    <button role="tab" data-s="list">2 · Insights list</button>
+    <button role="tab" data-s="live">3 · Live campaign</button>
+    <button role="tab" data-s="acting">4 · Dialogs</button>
+    <button role="tab" data-s="finished">5 · Finished campaign</button>
+    <button role="tab" data-s="states">6 · States</button>
+    <button role="tab" data-s="phone">7 · Live at 390 px</button>
+  </div>
+  <span class="illus">Illustrative data. Not real measurements.</span>
+</div>
+<p class="note" id="note"></p>
+
+<div class="shell" id="shell">
+  <header class="apphead">
+    <div class="logo">Albiex <span>Synth City</span></div>
+    <span class="badge out">factory · 4.4.0</span>
+  </header>
+  <div class="body">
+    <nav class="side" aria-label="Main navigation" id="side"></nav>
+    <main>
+
+<!-- ============ 1 OVERVIEW ============ -->
+<section class="screen stack" id="overview">
+  <div class="row between">
+    <div class="row baseline"><h2 class="pt">Overview</h2><span class="sm muted">Updated 1 minute ago</span></div>
+    <button class="btn out">Refresh</button>
+  </div>
+  <div class="row end">
+    <label class="f">Repository<select><option>All repositories</option></select></label>
+    <label class="f">Team<select><option>All teams</option></select></label>
+  </div>
+
+  <section class="card" style="padding:0;border:2px solid rgb(245 158 11/.6)" aria-labelledby="ny">
+    <h3 id="ny" class="st row" style="padding:12px 16px;border-bottom:1px solid rgb(245 158 11/.4);gap:8px">Needs you <span style="background:var(--amber);border-radius:99px;padding:0 8px;font-size:14px;color:#000">1</span></h3>
+    <div class="row between" style="padding:12px 16px">
+      <div><p class="b">#1263 · The plan is over the effort ceiling</p><p class="sm muted">95 of 60 minutes · asked 12 minutes ago · synth-city-v4.4</p></div>
+      <a class="btn out sm" href="#">Decide</a>
+    </div>
+  </section>
+
+  <section aria-labelledby="pg" class="stack" style="--g:8px">
+    <div class="row between baseline"><h3 id="pg" class="st">Progress <span class="sm muted" style="font-weight:400">1 campaign</span></h3><a href="#">All work ›</a></div>
+    <div class="card" style="padding:0">
+      <article class="stack" style="padding:16px" aria-label="Progress: v4.4">
+        <div class="row between baseline">
+          <h4 style="font-size:16px;font-weight:600">v4.4 <span class="sm muted" style="font-weight:400">synth-city-v4.4 · label release:v4.4</span></h4>
+          <p class="sm muted"><strong style="font-size:16px;color:var(--foreground)">41</strong> of 63 done</p>
+        </div>
+        <div class="split" role="img" aria-label="41 done, 6 under way, 16 still to do" style="height:10px">
+          <i style="width:65%;background:var(--primary)"></i><i style="width:10%;background:#8b5cf6"></i><i style="width:25%;background:hsl(0 0% 80%)"></i>
+        </div>
+
+        <!-- NEW: campaign health -->
+        <section aria-labelledby="ch" style="border:1px solid var(--border);border-radius:var(--radius);padding:12px">
+          <div class="row between baseline" style="margin-bottom:8px">
+            <h5 id="ch" class="ct">Campaign health <span class="xs muted" style="font-weight:400">day 2 · snapshot 14:20</span></h5>
+            <a href="#live" class="b">Live retrospective ›</a>
+          </div>
+          <dl class="tiles" style="grid-template-columns:repeat(auto-fit,minmax(min(100%,200px),1fr))">
+            <div class="tile"><dt>Item time, dispatch to merge</dt><dd class="v">38 min <small>median</small></dd><dd class="s">p85 71 min · n = 41</dd></div>
+            <div class="tile"><dt>Cost so far (API-equivalent)</dt><dd class="v">≈ $412 <span class="badge out">partial</span></dd><dd class="s">covers 6 of 7 members · 1 unknown</dd></div>
+            <div class="tile" style="border-left:1px solid var(--border);padding-left:12px"><dt>Top bottleneck, last 4 hours</dt><dd class="b" style="font-size:16px;line-height:1.9">Waiting for the Leader</dd><dd class="s">62% of the time spent waiting on someone · 9 waits open now · <a href="#live">2 of the top 3 have a suggested fix</a></dd></div>
+          </dl>
+        </section>
+
+        <div class="cols sm" style="grid-template-columns:repeat(auto-fit,minmax(min(100%,180px),1fr))">
+          <div><p class="b">Done 41</p><p>Shard the e2e job<span class="xs muted" style="display:block">finished 20 minutes ago</span></p><a class="muted" href="#">and 40 more ›</a></div>
+          <div><p class="b">Under way 6</p><p>Retry after a 409 on amendment<span class="xs muted" style="display:block">B2 is building</span></p><a class="muted" href="#">and 5 more ›</a></div>
+          <div><p class="b">Still to do 16</p><p class="muted">13 not started · 3 deferred</p></div>
+        </div>
+        <div class="row between sm" style="border-top:1px dashed var(--border);padding-top:12px">
+          <span class="muted">Your decisions ahead: <span class="badge amber" style="border-radius:99px">Plan over the ceiling · now</span></span>
+          <span class="row"><a href="#">Work ›</a><a href="#live">Live retrospective ›</a><a href="#">Parent issue #1201 ›</a></span>
+        </div>
+      </article>
+    </div>
+    <p class="sm" style="margin-top:8px">Finished: <a href="#finished">v4.3 retrospective</a> <span class="muted">· synth-city-v4.3 · finished 18 Nov · </span><a href="#list">All retrospectives ›</a></p>
+  </section>
+  <p class="sm muted">The rest of Overview (status tiles, teams, active work) is unchanged and not drawn here.</p>
+</section>
+
+<!-- ============ 2 LIST ============ -->
+<section class="screen stack" id="list">
+  <h2 class="pt">Insights</h2>
+  <nav class="tabs" aria-label="Insights sections"><a href="#list" aria-current="page">Retrospectives</a><a href="#">Audit log</a></nav>
+  <div class="row end">
+    <label class="f">Repository<select><option>All repositories (3)</option><option>albiexai/synth-city</option></select></label>
+    <label class="f">Team<select><option>All teams (3)</option></select></label>
+    <label class="f">Status<select><option>Live and finished</option><option>Live</option><option>Finished</option></select></label>
+    <label class="f">Group by<select><option>Team</option><option>Repository</option><option>No grouping</option></select></label>
+  </div>
+  <p class="sm muted" role="status">4 campaigns · 2 live · 2 finished before recording began in 4.4</p>
+  <div class="card" style="padding:0">
+  <table class="stk">
+    <thead><tr><th>Campaign</th><th>Status</th><th class="r">Merged / in scope</th><th class="r">Item time (median)</th><th class="r">Cost (API-equivalent)</th><th>Top bottleneck</th><th>Repositories (issues)</th></tr></thead>
+    <tbody>
+      <tr class="grp"><th colspan="7" scope="colgroup">Team synth-city-v4.4</th></tr>
+      <tr>
+        <th scope="row"><a href="#live" class="b">v4.4</a><span class="xs muted" style="display:block;font-weight:400">label release:v4.4 · 20 Nov, running</span></th>
+        <td data-l="Status"><span class="badge pri"><span class="dot"></span>Live</span></td>
+        <td class="r" data-l="Merged / in scope">41 / 63</td>
+        <td class="r" data-l="Item time (median)">38 min<span class="xs muted" style="display:block">n = 41</span></td>
+        <td class="r" data-l="Cost">≈ $412<span class="xs muted" style="display:block">6 of 7 members</span></td>
+        <td data-l="Top bottleneck">Waiting for the Leader<span class="xs muted" style="display:block">4.2 h · 27%</span></td>
+        <td data-l="Repositories" class="sm wrap">albiexai/synth-city (58)<br>albiexai/synth-city-website (5)</td>
+      </tr>
+      <tr class="grp"><th colspan="7" scope="colgroup">Team synth-city-v4.3</th></tr>
+      <tr>
+        <th scope="row"><a href="#finished" class="b">v4.3</a><span class="xs muted" style="display:block;font-weight:400">label release:v4.3 · 17–18 Nov</span></th>
+        <td data-l="Status"><span class="badge sec">Finished</span></td>
+        <td class="r" data-l="Merged / in scope">79 / 98</td>
+        <td class="r" data-l="Item time (median)">42 min<span class="xs muted" style="display:block">n = 79</span></td>
+        <td class="r" data-l="Cost"><span class="unk">unknown</span></td>
+        <td data-l="Top bottleneck"><span class="unk">unknown</span></td>
+        <td data-l="Repositories" class="sm wrap">albiexai/synth-city (98)</td>
+      </tr>
+      <tr class="grp"><th colspan="7" scope="colgroup">Team tizonia-2026</th></tr>
+      <tr>
+        <th scope="row"><a href="#" class="b">Tizonia 0.23</a><span class="xs muted" style="display:block;font-weight:400">milestone 0.23 · 21 Nov, running</span></th>
+        <td data-l="Status"><span class="badge pri"><span class="dot"></span>Live</span></td>
+        <td class="r" data-l="Merged / in scope">9 / 30</td>
+        <td class="r" data-l="Item time (median)">64 min<span class="xs muted" style="display:block">n = 9</span></td>
+        <td class="r" data-l="Cost">≈ $96<span class="xs muted" style="display:block">3 of 3 members</span></td>
+        <td data-l="Top bottleneck">Required check: build (meson)<span class="xs muted" style="display:block">1.9 h · 41%</span></td>
+        <td data-l="Repositories" class="sm wrap">tizonia/tizonia-openmax-il (30)</td>
+      </tr>
+      <tr>
+        <th scope="row"><a href="#" class="b">Tizonia 0.22</a><span class="xs muted" style="display:block;font-weight:400">milestone 0.22 · 2–5 Nov</span></th>
+        <td data-l="Status"><span class="badge sec">Finished</span></td>
+        <td class="r" data-l="Merged / in scope">24 / 26</td>
+        <td class="r" data-l="Item time (median)">71 min<span class="xs muted" style="display:block">n = 24</span></td>
+        <td class="r" data-l="Cost"><span class="unk">unknown</span></td>
+        <td data-l="Top bottleneck"><span class="unk">unknown</span></td>
+        <td data-l="Repositories" class="sm wrap">tizonia/tizonia-openmax-il (26)</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="sm muted"><span class="unk">unknown</span> means the data was not recorded: these campaigns ran before 4.4 began recording cost, checks and waits. It never means zero.</p>
+</section>
+
+<!-- ============ 3 LIVE ============ -->
+<section class="screen stack" id="live">
+  <p class="sm"><a href="#list">Insights</a> › <a href="#list">Retrospectives</a> › v4.4</p>
+  <div class="row between" style="align-items:flex-start">
+    <div>
+      <h2 class="pt">v4.4 <span class="badge pri"><span class="dot"></span>Live</span></h2>
+      <p class="sm muted">Team synth-city-v4.4 · label release:v4.4 · started 20 Nov 09:00 · day 2</p>
+      <p class="sm muted" role="status">Snapshot 14:20 · updates every minute</p>
+    </div>
+    <div class="row end">
+      <label class="f">Repository<select aria-describedby="repo-note"><option>All in this campaign (2)</option><option>albiexai/synth-city</option><option>albiexai/synth-city-website</option></select></label>
+      <button class="btn out">Refresh</button>
+      <button class="btn out" data-open="d-finish" data-size="SM">Finish campaign…</button>
+    </div>
+  </div>
+
+  <dl class="tiles" aria-label="Headline">
+    <div class="card tight tile"><dt>Merged against scope</dt><dd class="v">41 <small>of 63</small></dd><dd class="s">65% · 3 deferred · 1 closed without delivery</dd></div>
+    <div class="card tight tile"><dt>Item time, dispatch to merge</dt><dd class="v">38 min <small>median</small></dd><dd class="s">p85 71 min · n = 41</dd></div>
+    <div class="card tight tile"><dt>Cost so far (API-equivalent)</dt><dd class="v">≈ $412 <span class="badge out">partial</span></dd><dd class="s">covers 6 of 7 members · B3 unknown: its harness is not read yet · prices as of 15 Nov</dd></div>
+    <div class="card tight tile"><dt>Hand merges</dt><dd class="v">2 <small>of 41 merges</small></dd><dd class="s">merged by a person, not Synth City</dd></div>
+    <div class="card tight tile"><dt>Waits on a decision</dt><dd class="v">23 <small>6.8 h</small></dd><dd class="s">median 9 min · longest 1 h 48 min</dd></div>
+  </dl>
+
+  <nav aria-label="On this page" class="row sm" style="gap:4px 14px">
+    <span class="muted">On this page:</span><a href="#" data-j="j-time">Where the time went</a><a href="#" data-j="j-bn">Top bottlenecks</a><a href="#" data-j="j-repo">By repository</a><a href="#" data-j="j-flow">Flow</a><a href="#" data-j="j-ci">CI</a><a href="#" data-j="j-fr">Friction and size</a><a href="#" data-j="j-views">Agents' views</a>
+  </nav>
+
+  <div class="two">
+    <!-- Where the time went -->
+    <section class="card stack" aria-labelledby="j-time">
+      <div class="row between baseline">
+        <h3 id="j-time" class="st">Where the time went</h3>
+        <span class="sm muted">41 merged items · 27.7 h of item time · <a href="#">events ›</a></span>
+      </div>
+      <figure>
+        <ul class="legend" style="margin-bottom:6px">
+          <li><span class="sw w"></span><b>Waiting on someone</b> 25% · 6.8 h</li>
+          <li><span class="sw p"></span><b>Process</b> 31% · 8.7 h</li>
+          <li><span class="sw a"></span><b>Active</b> 44% · 12.2 h</li>
+        </ul>
+        <div class="split" role="img" aria-label="Waiting on someone 25%, process 31%, active 44%"><i class="w" style="width:25%"></i><i class="p" style="width:31%"></i><i class="a" style="width:44%"></i></div>
+      </figure>
+      <table>
+        <caption>Bars share one scale, so stages compare across groups.</caption>
+        <thead><tr><th>Stage</th><th class="hide-s">Who had to act</th><th class="barcell"><span class="sr">Time, drawn</span></th><th class="r">Time</th><th class="r hide-s">Share</th><th class="r">Count</th></tr></thead>
+        <tbody>
+          <tr class="grp"><th colspan="6" scope="colgroup"><span class="sw w"></span>Waiting on someone · 6.8 h <span class="muted" style="font-weight:400">· the waits to act on</span></th></tr>
+          <tr><td>Leader decisions<span class="only-s xs muted" style="display:block">Leader</span></td><td class="hide-s">Leader</td><td class="barcell"><span class="bar w" style="width:37.5%"></span></td><td class="r">4.2 h</td><td class="r hide-s">15%</td><td class="r">14 waits</td></tr>
+          <tr><td>Supervisor decisions<span class="only-s xs muted" style="display:block">Supervisor</span></td><td class="hide-s">Supervisor</td><td class="barcell"><span class="bar w" style="width:20.5%"></span></td><td class="r">2.3 h</td><td class="r hide-s">8%</td><td class="r">8 waits</td></tr>
+          <tr><td>Waiting for dispatch<span class="only-s xs muted" style="display:block">Synth City</span></td><td class="hide-s">Synth City</td><td class="barcell"><span class="bar w" style="width:1.8%"></span></td><td class="r">0.2 h</td><td class="r hide-s">1%</td><td class="r">41 items</td></tr>
+          <tr><td>Director decisions<span class="only-s xs muted" style="display:block">Director (you)</span></td><td class="hide-s">Director (you)</td><td class="barcell"><span class="bar w" style="width:.9%"></span></td><td class="r">0.1 h</td><td class="r hide-s">&lt; 1%</td><td class="r">1 wait</td></tr>
+          <tr class="grp"><th colspan="6" scope="colgroup"><span class="sw p"></span>Process · 8.7 h <span class="muted" style="font-weight:400">· necessary steps; their speed is under CI</span></th></tr>
+          <tr><td>Required checks (CI)</td><td class="hide-s">CI</td><td class="barcell"><span class="bar p" style="width:48.2%"></span></td><td class="r">5.4 h</td><td class="r hide-s">19%</td><td class="r">41 items</td></tr>
+          <tr><td>Review</td><td class="hide-s">V1, V2</td><td class="barcell"><span class="bar p" style="width:29.5%"></span></td><td class="r">3.3 h</td><td class="r hide-s">12%</td><td class="r">41 items</td></tr>
+          <tr class="grp"><th colspan="6" scope="colgroup"><span class="sw a"></span>Active · 12.2 h <span class="muted" style="font-weight:400">· the work itself</span></th></tr>
+          <tr><td>Building</td><td class="hide-s">Builders</td><td class="barcell"><span class="bar a" style="width:100%"></span></td><td class="r">11.2 h</td><td class="r hide-s">40%</td><td class="r">41 items</td></tr>
+          <tr><td>Planning</td><td class="hide-s">Builders, Leader</td><td class="barcell"><span class="bar a" style="width:8.9%"></span></td><td class="r">1.0 h</td><td class="r hide-s">4%</td><td class="r">41 items</td></tr>
+        </tbody>
+      </table>
+      <div class="sm">
+        <p class="b">Longest single waits on someone</p>
+        <ul>
+          <li><a href="#">#1252</a> · 1 h 48 min for a Leader decision on a correction batch</li>
+          <li><a href="#">#1260</a> · 41 min for the Supervisor (effort past the ceiling)</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- Top bottlenecks -->
+    <section class="card" aria-labelledby="j-bn">
+      <div class="row between baseline">
+        <h3 id="j-bn" class="st">Top bottlenecks, and what to do</h3>
+        <span class="badge out">1 new since your last visit</span>
+      </div>
+      <details style="margin-top:4px"><summary>How this is ranked</summary>
+        <p class="sm muted">Ranked by the time each one accounts for over the whole campaign so far. Counted only at 10% or more of waiting-and-process time (15.5 h) and 5 or more items. Synth City counts the evidence and names the kind of fix. It never chooses the value or the change.</p></details>
+
+      <article class="bn stack" style="--g:8px">
+        <div class="row" style="align-items:flex-start;flex-wrap:nowrap"><span class="rank" aria-hidden="true">1</span>
+          <div><h4><span class="sr">1. </span>Waiting for the Leader</h4><p class="sm"><span class="num">4.2 h · 27% · 14 items</span> <span class="badge out">New</span></p></div></div>
+        <p class="sm"><span class="badge out">Standing decision</span> Small correction batches wait for a decision that is always yes.</p>
+        <details><summary>Evidence and effect</summary>
+          <dl class="kv"><dt>Rule that fired</dt><dd>5 or more waits on correction-batch decisions, all approved: 14 of 14, 3.1 h.</dd><dt>Takes effect</dt><dd>Next decision</dd><dt>Disruption</dt><dd>None</dd><dt>Items</dt><dd><a href="#">14 items in Work ›</a> · <a href="#">events in the Audit log ›</a></dd></dl></details>
+        <div class="row"><button class="btn out sm" data-open="d-lesson" data-size="SM">Record as a lesson…</button></div>
+      </article>
+
+      <article class="bn stack">
+        <div class="row" style="align-items:flex-start;flex-wrap:nowrap"><span class="rank" aria-hidden="true">2</span>
+          <div><h4><span class="sr">2. </span>Required check: e2e</h4><p class="sm num">3.1 h · 20% · 41 items</p></div></div>
+        <p class="sm"><span class="badge out">Repository change</span> The check queues for a runner when several pull requests run checks at once.</p>
+        <details><summary>Evidence and effect</summary>
+          <dl class="kv"><dt>Rule that fired</dt><dd>Median queue time 2.6 times its quiet-time value when 3 or more pull requests run checks at once (22 items). Checks that are not required use 16 runner-minutes per pull request.</dd><dt>Takes effect</dt><dd>Once the change is merged</dd><dt>Disruption</dt><dd>None</dd><dt>Items</dt><dd><a href="#">22 items in Work ›</a> · <a href="#" data-j="j-ci">CI section ›</a></dd></dl></details>
+        <div class="row"><button class="btn out sm" data-open="d-issue" data-size="MD">Draft an issue…</button></div>
+      </article>
+
+      <article class="bn stack">
+        <div class="row" style="align-items:flex-start;flex-wrap:nowrap"><span class="rank" aria-hidden="true">3</span>
+          <div><h4><span class="sr">3. </span>Waiting for the Supervisor</h4><p class="sm num">2.3 h · 15% · 8 items</p></div></div>
+        <p class="sm"><span class="badge out">Setting</span> <span class="badge out">Synth City defect</span> Items passed the effort ceiling after losing time to Synth City errors.</p>
+        <details><summary>Evidence and effect</summary>
+          <dl class="kv"><dt>Rule that fired</dt><dd>2 or more items over the effort ceiling (120 min) with time lost to Synth City errors or refusals: 4 items, 84 min lost.</dd><dt>Takes effect</dt><dd>Next attempt</dd><dt>Disruption</dt><dd>None</dd><dt>Items</dt><dd><a href="#">#1252</a>, <a href="#">#1260</a>, <a href="#">#1266</a>, <a href="#">#1271</a></dd></dl></details>
+        <div class="row"><button class="btn out sm" data-open="d-setting" data-size="MD">Evidence and what-if…</button><button class="btn out sm" data-open="d-defect" data-size="SM">Copy defect evidence…</button></div>
+      </article>
+      <p class="sm muted" style="border-top:1px solid var(--border);padding-top:10px">Also above the thresholds: Review by V1 (1.9 h · 12%) · Required check: backend tests (1.7 h · 11%).</p>
+    </section>
+  </div>
+
+  <!-- By repository -->
+  <section class="card stack" aria-labelledby="j-repo">
+    <h3 id="j-repo" class="st">By repository</h3>
+    <table class="stk">
+      <thead><tr><th>Repository</th><th class="r">Issues</th><th class="r">Merged</th><th class="r">Item time (median)</th><th class="r">CI share of item time</th><th>Top bottleneck</th></tr></thead>
+      <tbody>
+        <tr><th scope="row" class="wrap"><a href="#">albiexai/synth-city</a></th><td class="r" data-l="Issues">58</td><td class="r" data-l="Merged">38</td><td class="r" data-l="Item time (median)">39 min · n = 38</td><td class="r" data-l="CI share">20%</td><td data-l="Top bottleneck">Waiting for the Leader</td></tr>
+        <tr><th scope="row" class="wrap"><a href="#">albiexai/synth-city-website</a></th><td class="r" data-l="Issues">5</td><td class="r" data-l="Merged">3</td><td class="r" data-l="Item time (median)">22 min · n = 3 <span class="badge out">small sample</span></td><td class="r" data-l="CI share">9%</td><td data-l="Top bottleneck" class="muted">None above the thresholds (needs 5 items)</td></tr>
+      </tbody>
+    </table>
+    <p class="sm muted" id="repo-note">Choosing a repository recalculates every section for it. Cost and Agent Mail stay team-wide: they belong to members, not repositories.</p>
+  </section>
+
+  <!-- Flow -->
+  <section class="card stack" aria-labelledby="j-flow">
+    <div class="row between baseline"><h3 id="j-flow" class="st">Flow</h3><span class="sm muted">Merges per hour · 41 merges · <a href="#">events ›</a></span></div>
+    <figure aria-label="Bar chart of merges per hour, with two change markers. The same data is in the tables below.">
+      <div class="plotwrap"><div class="plot" id="plot">
+        <span class="grid" style="bottom:50%"></span><span class="grid" style="bottom:100%"></span>
+        <span class="ytick" style="bottom:-8px">0</span><span class="ytick" style="bottom:calc(50% - 8px)">2</span><span class="ytick" style="bottom:calc(100% - 8px)">4</span>
+      </div></div>
+      <div class="xax"><span style="left:0">20 Nov 09:00</span><span style="left:51.7%">21 Nov 00:00</span><span style="right:0">14:00</span></div>
+    </figure>
+    <div>
+      <h4 class="ct">Before and after each change</h4>
+      <table class="stk">
+        <thead><tr><th>Change</th><th>Measure</th><th class="r">Before</th><th class="r">After</th></tr></thead>
+        <tbody>
+          <tr><th scope="row" rowspan="2"><span class="pin" aria-hidden="true">1</span> Base updates accepted as merges<span class="xs muted" style="display:block;font-weight:400">Setting · 20 Nov 14:05</span></th><td data-l="Measure">Item time (median)</td><td class="r" data-l="Before">44 min · n = 5 <span class="badge out">small sample</span></td><td class="r" data-l="After">37 min · n = 36</td></tr>
+          <tr><td data-l="Measure">CI share of item time</td><td class="r" data-l="Before">22% · n = 5</td><td class="r" data-l="After">18% · n = 36</td></tr>
+          <tr><th scope="row"><span class="pin" aria-hidden="true">2</span> e2e split into 4 shards<span class="xs muted" style="display:block;font-weight:400">Repository change · <a href="#">#1235</a> · 21 Nov 08:40</span></th><td data-l="Measure">e2e check duration (median)</td><td class="r" data-l="Before">12.1 min · n = 26</td><td class="r" data-l="After">5.3 min · n = 15</td></tr>
+        </tbody>
+      </table>
+      <p class="sm muted">Medians before and after, with their sample counts. Other things changed at the same time, so the page does not say what caused a difference.</p>
+    </div>
+    <div>
+      <h4 class="ct">Item time by size</h4>
+      <table><thead><tr><th>Pull request size</th><th class="r">Items</th><th class="r">Median</th><th class="r">p85</th></tr></thead>
+        <tbody><tr><td>Up to 100 lines</td><td class="r">12</td><td class="r">24 min</td><td class="r">41 min</td></tr><tr><td>101 to 400 lines</td><td class="r">21</td><td class="r">38 min</td><td class="r">66 min</td></tr><tr><td>Over 400 lines</td><td class="r">8</td><td class="r">71 min</td><td class="r">118 min</td></tr></tbody></table>
+    </div>
+  </section>
+
+  <!-- CI -->
+  <section class="card stack" aria-labelledby="j-ci">
+    <div class="row between baseline"><h3 id="j-ci" class="st">CI</h3><span class="sm muted">From each repository's delivery policy · any check app · <a href="#">events ›</a></span></div>
+    <dl class="tiles four">
+      <div class="tile"><dt>CI share of item time</dt><dd class="v">19%</dd><dd class="s">5.4 h of 27.7 h</dd></div>
+      <div class="tile"><dt>Slowest required check</dt><dd class="b" style="font-size:16px;line-height:1.9">Full backend regression tests</dd><dd class="s">median 9.1 min</dd></div>
+      <div class="tile"><dt>Reruns</dt><dd class="v">6 <small>· 41 min</small></dd><dd class="s">counted apart from the share</dd></div>
+      <div class="tile"><dt>Queue under load <span class="badge out">inferred</span></dt><dd class="v">9 min <small>p85</small></dd><dd class="s">1.1 min when quiet; rises when 3 or more pull requests run checks. The runner limit itself cannot be read.</dd></div>
+    </dl>
+    <div class="scroll" tabindex="0" role="region" aria-label="Required checks table">
+    <table style="min-width:640px"><caption>Required checks. Durations in minutes.</caption>
+      <thead><tr><th>Check</th><th>App</th><th class="r">Median</th><th class="r">p85</th><th class="r">Queue (median)</th><th class="r">Reruns</th><th class="r">Flaky: failed then passed on the same head</th></tr></thead>
+      <tbody>
+        <tr><td>e2e <span class="xs muted">e2e.yml · 4 shards since change 2</span></td><td>Actions</td><td class="r">5.3</td><td class="r">7.0</td><td class="r">1.8</td><td class="r">4</td><td class="r">3 times <span class="badge out">flaky</span></td></tr>
+        <tr><td>Full backend regression tests <span class="xs muted">backend-tests.yml</span></td><td>Actions</td><td class="r">9.1</td><td class="r">10.4</td><td class="r">0.9</td><td class="r">2</td><td class="r">1 time</td></tr>
+        <tr><td>Product CI gate <span class="xs muted">ci.yml</span></td><td>Actions</td><td class="r">3.2</td><td class="r">3.9</td><td class="r">0.6</td><td class="r">0</td><td class="r">0</td></tr>
+        <tr><td>Changed Python undefined names <span class="xs muted">ci.yml</span></td><td>Actions</td><td class="r">0.4</td><td class="r">0.6</td><td class="r">0.3</td><td class="r">0</td><td class="r">0</td></tr>
+      </tbody></table></div>
+    <div class="scroll" tabindex="0" role="region" aria-label="Checks that are not required">
+    <table style="min-width:560px"><caption>Not required, but competing for the same runners. Minutes per pull request.</caption>
+      <thead><tr><th>Check</th><th>App</th><th class="r">Runner time</th><th class="r">Queue (median)</th></tr></thead>
+      <tbody>
+        <tr><td>Analyze (python), Analyze (javascript-typescript) <span class="xs muted">codeql.yml</span></td><td>Actions</td><td class="r">6.8</td><td class="r">1.1</td></tr>
+        <tr><td>e2e-flicker-loop, e2e-pending <span class="xs muted">e2e.yml</span></td><td>Actions</td><td class="r">9.5</td><td class="r">1.4</td></tr>
+        <tr><td>Cloudflare Pages <span class="xs muted">website repository</span></td><td>Cloudflare Pages</td><td class="r">1.2</td><td class="r"><span class="unk">unknown</span></td></tr>
+      </tbody></table></div>
+    <p class="sm muted"><span class="unk">unknown</span> Cloudflare Pages does not report queue time. Only GitHub Actions does.</p>
+  </section>
+
+  <!-- Friction and size -->
+  <div class="two" style="grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr))">
+    <section class="card stack" aria-labelledby="j-fr">
+      <div class="row between baseline"><h3 id="j-fr" class="st">Friction</h3><a class="sm" href="#">events in the Audit log ›</a></div>
+      <dl class="tiles" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+        <div class="tile"><dt>Waits on a decision</dt><dd class="v">23</dd><dd class="s">median 9 min · longest 1 h 48 min</dd></div>
+        <div class="tile"><dt>Hand merges</dt><dd class="v">2 <small>of 41</small></dd><dd class="s"><a href="#">#1249</a>, <a href="#">#1257</a></dd></div>
+        <div class="tile"><dt>GitHub rate limit</dt><dd class="v">0 min</dd><dd class="s">no exhausted windows recorded</dd></div>
+        <div class="tile"><dt>Synth City errors that blocked an agent</dt><dd class="v">5</dd><dd class="s">409 three times · 500 once · refusal once</dd></div>
+      </dl>
+    </section>
+    <section class="card stack" aria-labelledby="j-size">
+      <h3 id="j-size" class="st">Size</h3>
+      <dl class="tiles" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+        <div class="tile"><dt>Issues in scope</dt><dd class="v">63</dd><dd class="s">41 merged · 3 deferred · 1 closed without delivery · 18 open</dd></div>
+        <div class="tile"><dt>Pull requests merged</dt><dd class="v">41</dd><dd class="s">7,930 lines changed in total</dd></div>
+        <div class="tile"><dt>Lines changed per pull request</dt><dd class="v">210 <small>median</small></dd><dd class="s">largest 1,140 · files: median 6, largest 31</dd></div>
+        <div class="tile"><dt>Team</dt><dd class="v">7 <small>members</small></dd><dd class="s">1 model change (B2, 20 Nov) · no member changes</dd></div>
+        <div class="tile"><dt>Agent Mail messages</dt><dd class="v">2,140</dd><dd class="s">Leader 41% · builders 31% · verifiers 22% · Supervisor 6%</dd></div>
+      </dl>
+    </section>
+  </div>
+
+  <!-- Agents' views -->
+  <section class="stack" aria-labelledby="j-views">
+    <div><h3 id="j-views" class="st">Agents' views</h3>
+    <p class="sm muted">Judgement, not measurement. Each role answers its own question about a pinned snapshot. One open request per agent.</p></div>
+    <div class="cols">
+      <article class="judge"><div class="row between"><h4 class="ct">Leader's view</h4><span class="badge out">Judgement</span></div>
+        <p class="xs muted">Coordination and flow · snapshot 11:05</p>
+        <p class="xs"><span class="badge amber">Out of date</span> The numbers have moved since 11:05.</p>
+        <blockquote>“Most of my waits are correction batches I approve anyway. The e2e queue is worst right after merges to the release branch.”</blockquote>
+        <p style="margin-top:8px"><button class="btn out sm" data-open="d-ask" data-size="SM">Ask again…</button></p></article>
+      <article class="judge"><div class="row between"><h4 class="ct">V1's view</h4><span class="badge out">Judgement</span></div>
+        <p class="xs muted">Quality and rework · snapshot 12:30</p>
+        <blockquote>“Second rounds were mostly missing failure-path tests (9 of 14), and two issues had no acceptance examples. Suggest a charter rule for failure-path tests, and acceptance examples in issues.”</blockquote></article>
+      <article class="judge"><div class="row between"><h4 class="ct">Supervisor's view</h4><span class="badge sec">Asked 13:52</span></div>
+        <p class="xs muted">The factory and the process · snapshot 13:52</p>
+        <p class="sm" style="margin-top:6px">Waiting for the reply in Agent Mail. <a href="#">Open the request ›</a></p></article>
+      <article class="judge"><div class="row between"><h4 class="ct">V2's view</h4><span class="badge out">Not asked</span></div>
+        <p class="xs muted">Quality and rework</p>
+        <p class="sm" style="margin-top:6px">Asking takes V2 away from review. It is asked automatically at the finish.</p>
+        <p style="margin-top:8px"><button class="btn out sm" data-open="d-ask" data-size="SM">Ask V2…</button></p></article>
+    </div>
+  </section>
+</section>
+
+<!-- ============ 4 DIALOGS ============ -->
+<section class="screen stack" id="acting">
+  <h2 class="pt">Acting on a bottleneck</h2>
+  <p class="sm muted" style="max-width:80ch">Each dialog has the same three parts in the same order. <b>Evidence</b> is counted by Synth City. <b>Lever</b> is the kind of change, named only when a rule fired. <b>Your decision</b> is always empty until the Director or an agent fills it. The buttons on the live page open these as real dialogs.</p>
+  <div class="dgrid">
+
+    <div><p class="size">Setting · MODAL_SIZES.MD</p>
+    <div class="dlg" id="d-setting">
+      <div><h3>Effort ceiling: evidence and what-if</h3><p class="sm muted">Bottleneck 3 · Waiting for the Supervisor · v4.4, snapshot 14:20</p></div>
+      <div><h4>Evidence · counted</h4>
+        <p class="sm">Rule that fired: 2 or more items over the effort ceiling with time lost to Synth City errors or refusals.</p>
+        <table class="sm"><thead><tr><th>Item</th><th class="r">Effort used</th><th class="r">Lost to errors</th><th>Cause</th></tr></thead><tbody>
+          <tr><td><a href="#">#1252</a></td><td class="r">134 min</td><td class="r">22 min</td><td>amendment refused</td></tr>
+          <tr><td><a href="#">#1260</a></td><td class="r">141 min</td><td class="r">35 min</td><td>409 on amendment</td></tr>
+          <tr><td><a href="#">#1266</a></td><td class="r">128 min</td><td class="r">18 min</td><td>409 on amendment</td></tr>
+          <tr><td><a href="#">#1271</a></td><td class="r">176 min</td><td class="r">9 min</td><td>409 on amendment</td></tr></tbody></table></div>
+      <div><h4>Lever</h4><p class="sm"><span class="badge out">Setting</span> Maximum effort per item, in Repository settings › albiexai/synth-city › Effort. Now 120 minutes. Takes effect on the next attempt. No member restarts.</p></div>
+      <div><h4>What if · computed from these four items</h4>
+        <table class="sm"><thead><tr><th class="r">Ceiling (min)</th><th class="r">Items still over it</th><th class="r">Supervisor waits avoided</th></tr></thead><tbody>
+          <tr><td class="r">120 <span class="muted">now</span></td><td class="r">4 of 4</td><td class="r">0</td></tr><tr><td class="r">130</td><td class="r">3</td><td class="r">1</td></tr><tr><td class="r">150</td><td class="r">1 (#1271)</td><td class="r">3</td></tr><tr><td class="r">180</td><td class="r">0</td><td class="r">4</td></tr></tbody></table>
+        <p class="xs muted">Replays this campaign's four items. It does not predict later items.</p></div>
+      <div><h4>Your decision</h4>
+        <p class="empty">Synth City does not suggest a value. Choose one in the setting, or ask the Supervisor for a proposal.</p>
+        <div class="judge" style="margin-top:8px"><div class="row between"><b class="sm">Supervisor's proposal</b><span class="badge out">Judgement</span></div><p class="xs muted">Asked 13:40 · answered 13:52</p><blockquote>“150. Three of the four would have fit, and the fourth (#1271) should have been split at planning. Raising further would hide that.”</blockquote></div></div>
+      <div class="foot"><button class="btn out" data-close>Close</button><button class="btn out" data-open="d-ask" data-size="SM">Ask the Supervisor for a value…</button><a class="btn pri" href="#">Open the setting ›</a></div>
+      <p class="xs muted">The setting opens with its current value and nothing prefilled. The evidence and this table stay visible beside the field. Saving there adds a change marker here.</p>
+    </div></div>
+
+    <div><p class="size">Repository change · MODAL_SIZES.MD</p>
+    <div class="dlg" id="d-issue">
+      <div><h3>Draft an issue</h3><p class="sm muted">Bottleneck 2 · Required check: e2e · for albiexai/synth-city</p></div>
+      <label class="f">Title<input class="input" value="ci: e2e queues for a runner under load"></label>
+      <div><h4>Problem · filled in</h4><p class="sm sec">The e2e check waits for a runner when several pull requests run checks at once.</p></div>
+      <div><h4>Evidence · counted</h4><p class="sm sec">Median queue time 2.6 times its quiet-time value with 3 or more pull requests; p85 9 min; 22 items, 1.2 h. Checks that are not required use 16 runner-minutes per pull request (codeql.yml, e2e.yml: e2e-flicker-loop, e2e-pending).</p></div>
+      <label class="f">Target · filled in, edit if needed<input class="input" value="e2e queue p85 under 3 minutes at busy times"></label>
+      <label class="f">Proposed change · your decision<textarea class="input" rows="3" placeholder="Left empty for the builder who takes the issue. Or ask the Leader to propose one."></textarea></label>
+      <p class="xs muted">Synth City does not read workflow files, so it cannot say what to change.</p>
+      <div><h4>Labels</h4><p class="row" style="gap:6px"><span class="badge sec">release:v4.4</span><span class="badge sec">ci</span><span class="badge sec">synth-city-v44-ready</span></p><p class="xs muted">The ready label lets the Leader dispatch it like any other item. Takes effect once merged.</p></div>
+      <div class="foot"><button class="btn out" data-close>Cancel</button><button class="btn out" data-open="d-ask" data-size="SM">Ask the Leader to propose the change…</button><button class="btn pri">File issue</button></div>
+    </div></div>
+
+    <div><p class="size">Standing decision · MODAL_SIZES.SM</p>
+    <div class="dlg" id="d-lesson">
+      <div><h3>Record as a lesson</h3><p class="sm muted">Bottleneck 1 · Waiting for the Leader</p></div>
+      <div><h4>Evidence · counted</h4><p class="sm sec">14 of 14 correction batches were approved by the Leader. Each was inside the approved files, for V1's findings only, and estimated at 15 minutes or less. They waited 3.1 h in total.</p></div>
+      <div><h4>Lever</h4><p class="sm"><span class="badge out">Standing decision</span> The rule this implies: allow such batches without a Leader decision.</p></div>
+      <label class="f">Your note · optional<textarea class="input" rows="2"></textarea></label>
+      <p class="xs muted">Synth City cannot apply a standing decision yet. The lesson appears on the frozen page for the next team or campaign.</p>
+      <div class="foot"><button class="btn out" data-close>Cancel</button><button class="btn pri">Record lesson</button></div>
+    </div></div>
+
+    <div><p class="size">Synth City defect · MODAL_SIZES.SM</p>
+    <div class="dlg" id="d-defect">
+      <div><h3>Copy evidence for a bug report</h3><p class="sm muted">Built only from recorded events</p></div>
+      <pre>409 amendment_context_unavailable, 3 times
+  #1252  WI 4411  20 Nov 15:12  audit event 88213
+  #1260  WI 4419  20 Nov 19:40  audit event 88977
+  #1266  WI 4425  21 Nov 09:05  audit event 90112
+Time lost: 75 min across 3 items
+Synth City 4.4.0 · team synth-city-v4.4 · albiexai/synth-city</pre>
+      <p class="sm" role="status">Copied to the clipboard.</p>
+      <div class="foot"><button class="btn out" data-close>Close</button><a class="btn out" href="#">Events in the Audit log ›</a><button class="btn pri">Copy evidence</button></div>
+    </div></div>
+
+    <div><p class="size">Ask an agent · MODAL_SIZES.SM · used for a view, a diagnosis, a value or a proposed change</p>
+    <div class="dlg" id="d-ask">
+      <div><h3>Ask the Supervisor</h3><p class="sm muted">Sent by Agent Mail with the snapshot of 14:20</p></div>
+      <div><h4>The Supervisor's question</h4><p class="sm sec">The factory and the process: hand merges, quotas and rate limits, merge gates, cross-team effects. What slowed this campaign, and what would you change?</p></div>
+      <div><h4>Sent with it</h4><ul class="sm" style="list-style:disc;padding-left:18px"><li>A link to the pinned snapshot</li><li>Key numbers: item time, where the time went, hand merges, rate limit</li><li>When asked from a bottleneck: its stage, items and longest waits</li></ul></div>
+      <label class="f">Your extra question · optional<textarea class="input" rows="2"></textarea></label>
+      <p class="xs muted">The reply appears on the page as the Supervisor's view, marked as judgement. One open request per agent.</p>
+      <div class="foot"><button class="btn out" data-close>Cancel</button><button class="btn pri">Send by Agent Mail</button></div>
+    </div></div>
+
+    <div><p class="size">Finish · AlertDialog (confirmation)</p>
+    <div class="dlg" id="d-finish">
+      <div><h3>Finish the v4.4 campaign?</h3><p class="sm muted">This cannot be undone. The page becomes a read-only snapshot.</p></div>
+      <div class="alert amber sm"><b>18 issues are still open.</b> They are frozen as open, not as deferred. <a href="#">See them in Work ›</a></div>
+      <div><h4>What happens</h4><ol class="sm" style="list-style:decimal;padding-left:18px"><li>Synth City takes the final snapshot.</li><li>It asks the Leader, the Supervisor, V1 and V2 for their views.</li><li>The page freezes when all four have answered, or at the time limit.</li></ol></div>
+      <label class="f">Time limit for the views<select><option>2 hours</option><option>30 minutes</option><option>Freeze at once, without views</option></select></label>
+      <div class="foot"><button class="btn out" data-close>Cancel</button><button class="btn pri">Finish campaign</button></div>
+    </div></div>
+
+    <div><p class="size">Restart checklist · inline in a bottleneck card, when a fix needs a member restart</p>
+    <div class="card stack">
+      <h4 class="ct">This change needs B2 to restart</h4>
+      <ol class="chk">
+        <li><span class="badge pri">Done</span><span>1. Ask B2 for a safe point and a handoff · <a href="#">sent 14:02 ›</a></span></li>
+        <li><span class="badge out">To do</span><span>2. Apply the change · <a href="#">Open slot settings ›</a></span></li>
+        <li><span class="badge out">To do</span><span>3. Restart B2 in resume mode · <a href="#">Teams › B2 ›</a></span></li>
+        <li><span class="badge out">To do</span><span>4. Check that B2 is observed · <a href="#">Member status ›</a></span></li>
+      </ol>
+      <p class="xs muted">The Director ticks each step. Synth City does not run them in this version.</p>
+    </div></div>
+
+  </div>
+</section>
+
+<!-- ============ 5 FINISHED ============ -->
+<section class="screen stack" id="finished">
+  <p class="sm"><a href="#list">Insights</a> › <a href="#list">Retrospectives</a> › v4.4</p>
+  <div class="row between" style="align-items:flex-start">
+    <div>
+      <h2 class="pt">v4.4 <span class="badge sec">Finished</span></h2>
+      <p class="sm muted">Team synth-city-v4.4 · label release:v4.4 · 20–26 Nov · finished by the Director</p>
+    </div>
+    <div class="row end">
+      <label class="f">Repository<select><option>All in this campaign (2)</option></select></label>
+      <label class="f">Snapshot<select><option>Version 1 · calculation 3</option></select></label>
+      <button class="btn out">Recompute…</button>
+    </div>
+  </div>
+  <p class="alert sm" role="note"><b>Frozen 26 Nov 18:40.</b> A read-only snapshot. Same sections as the live page, in the same order. The bottlenecks have become lessons.</p>
+
+  <dl class="tiles" aria-label="Headline">
+    <div class="card tight tile"><dt>Merged against scope</dt><dd class="v">59 <small>of 63</small></dd><dd class="s">94% · 4 deferred to v4.5</dd></div>
+    <div class="card tight tile"><dt>Item time, dispatch to merge</dt><dd class="v">36 min <small>median</small></dd><dd class="s">p85 64 min · n = 59</dd></div>
+    <div class="card tight tile"><dt>Cost (API-equivalent)</dt><dd class="v">≈ $1,180 <span class="badge out">partial</span></dd><dd class="s">covers 6 of 7 members · B3 unknown · ≈ $20 per merged pull request</dd></div>
+    <div class="card tight tile"><dt>Hand merges</dt><dd class="v">3 <small>of 59 merges</small></dd><dd class="s">merged by a person, not Synth City</dd></div>
+    <div class="card tight tile"><dt>Waits on a decision</dt><dd class="v">38 <small>7.4 h</small></dd><dd class="s">median 8 min · longest 1 h 52 min</dd></div>
+  </dl>
+
+  <div class="two">
+    <section class="card stack" aria-labelledby="f-time">
+      <div class="row between baseline"><h3 id="f-time" class="st">Where the time went</h3><span class="sm muted">59 merged items · 38.8 h of item time</span></div>
+      <figure>
+        <ul class="legend" style="margin-bottom:6px"><li><span class="sw w"></span><b>Waiting on someone</b> 19% · 7.4 h</li><li><span class="sw p"></span><b>Process</b> 30% · 11.6 h</li><li><span class="sw a"></span><b>Active</b> 51% · 19.8 h</li></ul>
+        <div class="split" role="img" aria-label="Waiting on someone 19%, process 30%, active 51%"><i class="w" style="width:19%"></i><i class="p" style="width:30%"></i><i class="a" style="width:51%"></i></div>
+      </figure>
+      <table>
+        <thead><tr><th>Stage</th><th class="hide-s">Who had to act</th><th class="barcell"><span class="sr">Time, drawn</span></th><th class="r">Time</th><th class="r hide-s">Share</th><th class="r">Count</th></tr></thead>
+        <tbody>
+          <tr class="grp"><th colspan="6" scope="colgroup"><span class="sw w"></span>Waiting on someone · 7.4 h</th></tr>
+          <tr><td>Leader decisions</td><td class="hide-s">Leader</td><td class="barcell"><span class="bar w" style="width:27.6%"></span></td><td class="r">5.0 h</td><td class="r hide-s">13%</td><td class="r">26 waits</td></tr>
+          <tr><td>Supervisor decisions</td><td class="hide-s">Supervisor</td><td class="barcell"><span class="bar w" style="width:9.9%"></span></td><td class="r">1.8 h</td><td class="r hide-s">5%</td><td class="r">9 waits</td></tr>
+          <tr><td>Director decisions</td><td class="hide-s">Director</td><td class="barcell"><span class="bar w" style="width:2.2%"></span></td><td class="r">0.4 h</td><td class="r hide-s">1%</td><td class="r">3 waits</td></tr>
+          <tr><td>Waiting for dispatch</td><td class="hide-s">Synth City</td><td class="barcell"><span class="bar w" style="width:1.1%"></span></td><td class="r">0.2 h</td><td class="r hide-s">1%</td><td class="r">59 items</td></tr>
+          <tr class="grp"><th colspan="6" scope="colgroup"><span class="sw p"></span>Process · 11.6 h</th></tr>
+          <tr><td>Required checks (CI)</td><td class="hide-s">CI</td><td class="barcell"><span class="bar p" style="width:36.5%"></span></td><td class="r">6.6 h</td><td class="r hide-s">17%</td><td class="r">59 items</td></tr>
+          <tr><td>Review</td><td class="hide-s">V1, V2</td><td class="barcell"><span class="bar p" style="width:27.6%"></span></td><td class="r">5.0 h</td><td class="r hide-s">13%</td><td class="r">59 items</td></tr>
+          <tr class="grp"><th colspan="6" scope="colgroup"><span class="sw a"></span>Active · 19.8 h</th></tr>
+          <tr><td>Building</td><td class="hide-s">Builders</td><td class="barcell"><span class="bar a" style="width:100%"></span></td><td class="r">18.1 h</td><td class="r hide-s">47%</td><td class="r">59 items</td></tr>
+          <tr><td>Planning</td><td class="hide-s">Builders, Leader</td><td class="barcell"><span class="bar a" style="width:9.4%"></span></td><td class="r">1.7 h</td><td class="r hide-s">4%</td><td class="r">59 items</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="card stack" aria-labelledby="f-les">
+      <div><h3 id="f-les" class="st">Lessons for the next team or campaign</h3><p class="sm muted">Changes made, with medians before and after, then suggestions not acted on.</p></div>
+      <table class="stk">
+        <thead><tr><th>Lesson</th><th>What happened</th><th>Before → after (median)</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Accept base updates as merges<span style="display:block;margin-top:2px"><span class="badge out">Setting</span></span></th><td data-l="What happened">Applied 20 Nov</td><td data-l="Before → after" class="num">Item time 44 → 36 min<span class="xs muted" style="display:block">n = 5 → 54</span></td></tr>
+          <tr><th scope="row">Split e2e into shards<span style="display:block;margin-top:2px"><span class="badge out">Repository change</span></span></th><td data-l="What happened">Merged 21 Nov, <a href="#">#1235</a></td><td data-l="Before → after" class="num">e2e duration 12.1 → 5.3 min<span class="xs muted" style="display:block">n = 26 → 33</span></td></tr>
+          <tr><th scope="row">Effort ceiling set to 150 minutes<span style="display:block;margin-top:2px"><span class="badge out">Setting</span></span></th><td data-l="What happened">Applied 22 Nov by the Director</td><td data-l="Before → after" class="num">Supervisor waits 8 → 1<span class="xs muted" style="display:block">n = 41 → 18 items</span></td></tr>
+          <tr><th scope="row">Agent Mail 409 on amendment after a branch update<span style="display:block;margin-top:2px"><span class="badge out">Synth City defect</span></span></th><td data-l="What happened">Evidence copied · filed as <a href="#">#1288</a></td><td data-l="Before → after" class="muted">No change made</td></tr>
+          <tr><th scope="row">Allow small correction batches without a Leader decision<span style="display:block;margin-top:2px"><span class="badge out">Standing decision</span></span></th><td data-l="What happened">Recorded as a lesson. Not applied: Synth City has no standing-decision settings yet.</td><td data-l="Before → after" class="muted">26 waits, 4.6 h, all approved</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </div>
+
+  <section class="card stack" aria-label="Other sections">
+    <p class="sm muted">By repository, Flow, CI, Friction and Size follow, exactly as on the live page, with final numbers. Collapsed here to keep the mockup short; they are open in the product.</p>
+    <details><summary>By repository</summary><p class="sm">albiexai/synth-city 54 of 58 merged · albiexai/synth-city-website 5 of 5 merged</p></details>
+    <details><summary>Flow · 59 merges, 3 change markers</summary><p class="sm">Same chart and before-and-after table as the live page.</p></details>
+    <details><summary>CI · 17% of item time</summary><p class="sm">Same tables as the live page.</p></details>
+    <details><summary>Friction and size · 38 waits on a decision, 3 hand merges</summary><p class="sm">Same tiles as the live page.</p></details>
+  </section>
+
+  <section class="card stack" aria-labelledby="f-size">
+      <h3 id="f-size" class="st">Size</h3>
+      <dl class="tiles" style="grid-template-columns:repeat(4,minmax(0,1fr))">
+        <div class="tile"><dt>Issues in scope</dt><dd class="v">63</dd><dd class="s">59 merged · 4 deferred · 0 open</dd></div>
+        <div class="tile"><dt>Pull requests merged</dt><dd class="v">59</dd><dd class="s">11,480 lines changed in total</dd></div>
+        <div class="tile"><dt>Team</dt><dd class="v">7 <small>members</small></dd><dd class="s">1 model change (B2, 20 Nov)</dd></div>
+        <div class="tile"><dt>Agent Mail messages</dt><dd class="v">3,310</dd><dd class="s">Leader 40% · builders 32% · verifiers 22% · Supervisor 6%</dd></div>
+      </dl>
+    </section>
+
+    <section class="stack" aria-labelledby="f-views">
+    <div><h3 id="f-views" class="st">Agents' views at the finish</h3><p class="sm muted">Judgement, not measurement. All four were asked automatically, each with its role's question, on the final snapshot.</p></div>
+    <div class="cols">
+      <article class="judge"><div class="row between"><h4 class="ct">Leader's view</h4><span class="badge out">Judgement</span></div><p class="xs muted">Coordination and flow</p><blockquote>“Decisions were my bottleneck again, mostly small batches. Sharding paid off from day two. Next team: start with the base-update setting on and the 150-minute ceiling.”</blockquote></article>
+      <article class="judge"><div class="row between"><h4 class="ct">Supervisor's view</h4><span class="badge out">Judgement</span></div><p class="xs muted">The factory and the process</p><blockquote>“Three hand merges, all for an expired check row after a long pause. Two members restarted once each for a charter change; the checklist kept both observed.”</blockquote></article>
+      <article class="judge"><div class="row between"><h4 class="ct">V1's view</h4><span class="badge out">Judgement</span></div><p class="xs muted">Quality and rework</p><blockquote>“Rework fell after the failure-path test rule went into the charters on day 3 (second rounds 31% to 12%). Items over 400 lines still needed a second round half the time.”</blockquote></article>
+      <article class="judge"><div class="row between"><h4 class="ct">V2's view</h4><span class="badge out">Not received</span></div><p class="xs muted">Quality and rework</p><p class="sm" style="margin-top:6px">V2 did not answer within the 2-hour limit.</p></article>
+    </div>
+  </section>
+</section>
+
+<!-- ============ 6 STATES ============ -->
+<section class="screen stack" id="states">
+  <h2 class="pt">States a builder needs</h2>
+  <div class="dgrid">
+    <div><p class="statehead">List · no campaign yet</p>
+      <div class="card stack"><h3 class="ct">No campaigns yet</h3><p class="sm">A campaign starts when a team has a backlog label or milestone and its first matching item is admitted. From then on Synth City records checks, waits and cost.</p><p><a class="btn out" href="#">Open Teams</a></p></div></div>
+
+    <div><p class="statehead">List · filters match nothing</p>
+      <div class="card stack"><h3 class="ct">No campaigns match these filters</h3><p><a href="#">Clear filters</a></p></div></div>
+
+    <div><p class="statehead">Loading · first read (text status, as in Overview)</p>
+      <p class="card sm" role="status">Reading the campaign snapshot…</p></div>
+
+    <div><p class="statehead">Stale · the latest read failed, the last snapshot is kept</p>
+      <div class="alert amber sm row between" role="status"><span><b>Showing the snapshot of 14:20.</b> The latest read failed.</span><button class="btn out sm">Retry</button></div></div>
+
+    <div><p class="statehead">Unknown · one reason for the whole page (a campaign from before 4.4)</p>
+      <div class="stack"><p class="alert sm" role="note"><b>Recorded before 4.4.</b> Checks, waits, rate limits and cost were not recorded for this campaign, so those sections show unknown. Counts and item time are shown.</p>
+      <dl class="tiles" style="grid-template-columns:repeat(auto-fit,minmax(130px,1fr))"><div class="card tight tile"><dt>Merged against scope</dt><dd class="v">79 <small>of 98</small></dd></div><div class="card tight tile"><dt>Cost</dt><dd class="v"><span class="unk" style="font-size:16px">unknown</span></dd><dd class="s">not recorded</dd></div><div class="card tight tile"><dt>Hand merges</dt><dd class="v"><span class="unk" style="font-size:16px">unknown</span></dd><dd class="s">not recorded</dd></div></dl>
+      <div class="card"><h3 class="ct">Where the time went</h3><p class="sm"><span class="unk">unknown</span> Waits and check timings were not recorded. No bar is drawn.</p></div></div></div>
+
+    <div><p class="statehead">Partial coverage and unknown cost</p>
+      <dl class="tiles" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+        <div class="card tight tile"><dt>Cost so far (API-equivalent)</dt><dd class="v">≈ $412 <span class="badge out">partial</span></dd><dd class="s">covers 6 of 7 members · B3 unknown: its harness is not read yet · $9 not attributed to a member</dd></div>
+        <div class="card tight tile"><dt>Cost so far (API-equivalent)</dt><dd class="v"><span class="unk" style="font-size:16px">unknown</span></dd><dd class="s">Synth City cannot read the members' usage records on this host.</dd></div>
+      </dl></div>
+
+    <div><p class="statehead">Too few items · early in a campaign</p>
+      <div class="card stack"><h3 class="ct">Top bottlenecks, and what to do</h3><p class="sm">No bottleneck is above the thresholds yet. 3 items are merged; a bottleneck needs 5 items and a 10% share.</p>
+      <p class="sm muted">Largest so far: Required check: e2e, 0.4 h, 3 items.</p></div></div>
+
+    <div><p class="statehead">One repository chosen in a two-repository campaign</p>
+      <dl class="tiles" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+        <div class="card tight tile"><dt>Item time, dispatch to merge</dt><dd class="v">22 min <small>median</small></dd><dd class="s">n = 3 <span class="badge out">small sample</span></dd></div>
+        <div class="card tight tile"><dt>Cost so far <span class="badge sec">team-wide</span></dt><dd class="v">≈ $412</dd><dd class="s">not split by repository</dd></div>
+      </dl></div>
+
+    <div style="grid-column:1/-1"><p class="statehead">Bottleneck with no rule: Investigate, in its three steps</p>
+      <div class="cols">
+        <article class="card stack"><h4 class="ct">Review by V1 <span class="badge out">Investigate</span></h4><p class="sm num">1.9 h · 12% · 41 items</p><p class="sm">No rule matched, so Synth City names no kind of fix. Longest: #1244, 38 min.</p><div class="row"><button class="btn out sm">Ask V1 about this…</button><button class="btn out sm">Ask the Leader…</button></div></article>
+        <article class="card stack"><h4 class="ct">Review by V1 <span class="badge out">Investigate</span></h4><p class="sm num">1.9 h · 12% · 41 items</p><p class="sm"><span class="badge sec">Asked 14:25</span> Waiting for V1's reply in Agent Mail.</p></article>
+        <article class="card stack"><h4 class="ct">Review by V1 <span class="badge out">Investigate</span></h4><p class="sm num">1.9 h · 12% · 41 items</p>
+          <div class="judge"><div class="row between"><b class="sm">V1's diagnosis</b><span class="badge out">Judgement</span></div><p class="xs muted">Snapshot 14:25</p><blockquote>“Large pull requests queue behind each other. Proposed fix (repository change): a size limit in the issue template.”</blockquote></div>
+          <div class="row"><button class="btn out sm">Draft an issue…</button><button class="btn out sm">Record as a lesson…</button></div></article>
+      </div></div>
+
+    <div><p class="statehead">Ready to finish · banner on the live page, and a Needs you row on Overview</p>
+      <div class="alert amber row between"><span class="sm"><b>Every issue in v4.4 is merged, deferred or superseded.</b> Finish the campaign to freeze its retrospective.</span><button class="btn pri sm">Finish campaign…</button></div></div>
+
+    <div><p class="statehead">Finishing · between Finish and the freeze</p>
+      <div class="stack"><h3 class="pt" style="font-size:20px">v4.4 <span class="badge out">Finishing</span></h3>
+      <p class="alert sm" role="status"><b>Final snapshot taken 16:40.</b> 2 of 4 views received. The page freezes when the Supervisor and V2 answer, or at 18:40. <button class="btn out sm" style="margin-left:8px">Freeze now</button></p></div></div>
+
+    <div><p class="statehead">No Supervisor on the team</p>
+      <p class="sm card">The Supervisor's view card and its Ask buttons are left out. Nothing says "not requested" for a role the team does not have.</p></div>
+
+    <div><p class="statehead">Unknown, anatomy</p>
+      <p class="sm card"><span class="unk">unknown</span> A dashed chip with the word, never a colour alone, never "0" or a dash. The reason is visible text next to it or in one note per table. It is not a hover tooltip.</p></div>
+  </div>
+</section>
+
+<!-- ============ 7 PHONE ============ -->
+<section class="screen stack" id="phone">
+  <h2 class="pt">Live campaign at 390 px</h2>
+  <p class="sm muted" style="max-width:80ch">The same page in a 390 px frame. The sidebar is the product's icon rail. Tiles go two across, the two-column band stacks (time first, then bottlenecks), wide tables become labelled rows, and the CI tables scroll sideways inside their card.</p>
+  <iframe class="phone" id="phoneframe" title="Live campaign page at 390 pixels wide"></iframe>
+</section>
+
+    </main>
+  </div>
+</div>
+
+<dialog id="modal" aria-label="Dialog"></dialog>
+
+<script>
+var NAV=[['Overview','M3 3h7v9H3zM14 3h7v5h-7zM14 12h7v9h-7zM3 16h7v5H3z'],['Work','M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01'],['Repositories','M4 20V5a2 2 0 0 1 2-2h5l2 3h7v14z'],['Teams','M16 21v-2a4 4 0 0 0-8 0v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z'],['Live sessions','M3 4h18v12H3zM8 20h8M12 16v4'],['Harnesses','M4 6h10M18 6h2M4 12h2M10 12h10M4 18h8M16 18h4'],['Agent Mail','M3 5h18v14H3zM3 7l9 6 9-6'],['Insights','M4 20V10M10 20V4M16 20v-7M22 20H2']];
+var SCREENS={
+ overview:{nav:'Overview',note:'Overview. The existing Progress card keeps its layout and gains one block, Campaign health. It links to the live page and never applies anything.'},
+ list:{nav:'Insights',note:'Insights › Retrospectives. Audit becomes Insights with two tabs. A campaign is one team\'s campaign across the repositories it watches. The campaign name is the link.'},
+ live:{nav:'Insights',note:'Live campaign. The first screen answers three questions: how it is going (tiles), what is slowing it down (where the time went), what to do (top bottlenecks, beside it). The evidence sections follow. Try the buttons: they open the dialogs.'},
+ acting:{plain:1,note:'Dialogs. One per kind of fix, plus Ask and Finish. All share the order evidence, lever, your decision. Sizes use MODAL_SIZES.'},
+ finished:{nav:'Insights',note:'Finished campaign. Same sections in the same order as the live page; bottlenecks become lessons; no actions except Recompute.'},
+ states:{plain:1,note:'States: empty, loading, stale, unknown, partial coverage, small samples, Investigate, ready to finish, finishing.'},
+ phone:{plain:1,note:'The live page at 390 px.'}};
+var embed=/-embed$/.test(location.hash);
+if(embed)document.body.classList.add('embed');
+document.getElementById('side').innerHTML=NAV.map(function(n){return '<a href="#" data-n="'+n[0]+'"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="'+n[1]+'"/></svg><span>'+n[0]+'</span></a>'}).join('');
+function show(id){
+  if(!SCREENS[id])id='overview';var s=SCREENS[id];
+  document.querySelectorAll('.screen').forEach(function(e){e.classList.toggle('on',e.id===id)});
+  document.querySelectorAll('.mocktabs button').forEach(function(b){b.setAttribute('aria-selected',b.dataset.s===id)});
+  document.querySelectorAll('#side a').forEach(function(a){if(a.dataset.n===s.nav)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current')});
+  document.getElementById('shell').classList.toggle('plain',!!s.plain);
+  document.getElementById('note').innerHTML='<b>Design note</b>'+s.note;
+  if(id==='phone'&&!embed){var f=document.getElementById('phoneframe');if(!f.src)f.src=location.href.split('#')[0]+'#live-embed'}
+  window.scrollTo(0,0);
+}
+document.querySelectorAll('.mocktabs button').forEach(function(b){b.onclick=function(){location.hash=b.dataset.s}});
+window.onhashchange=function(){show(location.hash.slice(1).replace('-embed',''))};
+show(location.hash.slice(1).replace('-embed',''));
+
+/* In-page jumps and dialogs */
+var modal=document.getElementById('modal');
+document.addEventListener('click',function(e){
+  var j=e.target.closest('[data-j]');
+  if(j){e.preventDefault();var t=document.getElementById(j.dataset.j);t.scrollIntoView({block:'start'});return}
+  var o=e.target.closest('[data-open]');
+  if(o){var src=document.getElementById(o.dataset.open);modal.className=o.dataset.size||'SM';modal.innerHTML='<div class="dlg">'+src.innerHTML+'</div>';
+    modal.setAttribute('aria-label',src.querySelector('h3').textContent);if(modal.open)modal.close();modal.showModal();return}
+  if(e.target.closest('[data-close]')&&modal.open)modal.close();
+  if(e.target===modal)modal.close();
+});
+
+/* Flow chart: merges per hour, 20 Nov 09:00 to 21 Nov 14:00. Recharts in the product, with its tooltip. */
+var M=[0,1,1,2,1,2,1,2,2,1,2,1,1,1,0,1,0,1,1,0,1,2,1,2,3,2,3,3,3],plot=document.getElementById('plot');
+M.forEach(function(v,i){var h=(9+i)%24,d=i<15?'20 Nov':'21 Nov',c=document.createElement('div');c.className='col';
+  c.title=d+' '+('0'+h).slice(-2)+':00, '+v+(v===1?' merge':' merges');c.innerHTML=v?'<i style="height:'+v/4*100+'%"></i>':'';plot.appendChild(c)});
+[[5.08,'1','Change 1: base updates accepted as merges, 20 Nov 14:05'],[23.67,'2','Change 2: e2e split into 4 shards, 21 Nov 08:40']].forEach(function(m){
+  var e=document.createElement('span');e.className='mark';e.style.left=m[0]/M.length*100+'%';e.title=m[2];e.innerHTML='<b>'+m[1]+'</b>';plot.appendChild(e)});
+</script>
+</body>
+</html>
