@@ -124,7 +124,8 @@ real repository with different CI (for example Tizonia).
 ### 2. Campaign record
 
 - A `campaigns` row: the team's lifetime key, a selector (`label:` or `milestone:`), started_at, finished_at,
-  finished_by, and a status (`active` or `finished`). At most one active campaign per team.
+  finished_by, and a status: `active`, `finishing` (between Finish and the freeze) or `finished`. At most one active or
+  finishing campaign per team.
 - **Repositories:** a campaign covers **every repository its team watches** (the team's scopes). The selector is matched
   in each one: a label by name, a milestone by title, since GitHub milestones are per repository.
 - **Membership** is the set of issues matching the selector in those repositories, plus the deferral and supersede
@@ -186,13 +187,18 @@ The section has two parts that behave differently (Director, 2026-11-19): a dete
 
 **Ranking (deterministic).**
 - A bottleneck is a stage from "Where the time went" in the **waiting on someone** or **process** groups, for one
-  responsible actor (for example "waiting for the Leader", "required check: e2e").
+  responsible actor (for example "waiting for the Leader", "required check: e2e"). **Process stages are split for
+  ranking:** required checks per check, and review per verifier. Otherwise "CI" as a whole would always rank first.
 - Ranked by the time it accounts for: over the **whole campaign so far** on the live page, and over the **last 4
-  hours** on the Overview panel.
+  hours** on the Overview panel. The two can name different top bottlenecks, so **every place that shows a ranking
+  labels its window**.
 - **Against flicker:** a bottleneck counts only with a minimum share (default 10% of waiting-and-process time) and a
   minimum number of items (default 5). When the top bottleneck has changed since the Director's last visit, the
   page says "new since your last visit".
 - Every number shows its n, and the ranking is reproducible from the recorded data.
+- **Below the thresholds:** when nothing qualifies, the section says "none above the thresholds" and names the largest
+  stage anyway. Medians below the minimum sample size are shown with their n and a **"small sample"** label, not
+  hidden.
 
 **Diagnosis: a few rules, then an agent.**
 - **Rules** are code, each with a stated condition the page shows when it fires. They are used only where the
@@ -209,7 +215,8 @@ The section has two parts that behave differently (Director, 2026-11-19): a dete
 - **No rule fires → "Investigate".** The bottleneck shows its responsible actor and a button **"Ask the Leader /
   Supervisor / verifier about this"**. The request carries that bottleneck's evidence (the stage, its items and its
   longest waits). The agent's diagnosis appears under the bottleneck, marked as judgement, and can propose a fix of
-  any of the four kinds. The Director acts on it through the same routes.
+  any of the four kinds. The Director acts on it through the same routes, or **records it as a lesson**, so fixes that
+  agents propose reach the frozen page's lessons too.
 - Rules are kept few on purpose. From v4.5, the structured agent tool (Appendix A) lets agent-proposed fixes become
   first-class suggestions.
 
@@ -226,7 +233,7 @@ Each suggested fix names its kind and offers the matching action:
 
 | Kind | Action on the page |
 |---|---|
-| **Synth City setting** | a link to the setting in the v4.4 settings UI (#1115), **with no value prefilled**. Next to it, a **what-if table** computed from this campaign's data (for example, for an effort ceiling: how many of the affected items would still have hit 130, 150 or 180 minutes). A button **"Ask the Supervisor (or Leader) for a value"** sends the evidence. The Director chooses and saves; the change appears as a change marker. |
+| **Synth City setting** | a **dialog on the retrospective** shows the evidence and a **what-if table**, then **"Open the setting"** goes to the v4.4 settings UI (#1115), **with no value prefilled**. The settings page shows the retrospective's evidence in a context panel beside the field, so the Director doesn't have to remember it. The what-if table is computed from this campaign's data (for example, for an effort ceiling: how many of the affected items would still have hit 130, 150 or 180 minutes). A button **"Ask the Supervisor (or Leader) for a value"** sends the evidence. The Director chooses and saves; the change appears as a change marker. |
 | **Repository change** | **draft an issue**, pre-filled with the **problem, the evidence and a measurable target** (for example "e2e queue p85 under 3 minutes"). Its **Proposed change** section is left for the team, or filled by **"Ask the Leader / Supervisor to propose one"**: they can read the repository's workflows, which Synth City deliberately doesn't. The Director edits it and files it with the campaign's ready label; the Leader dispatches it like any other item. |
 | **Standing decision** | shown as a **lesson** stating the **observed pattern** (for example "14 of 14 batches like this were approved") and the rule it implies, until #1114 and #1115 make standing decisions settings |
 | **Synth City defect** | **copy evidence** for a bug report (fully deterministic) |
@@ -263,11 +270,13 @@ change, with n. It never labels the change as confirmed or failed.
 ### 7. Finishing a campaign
 
 1. Synth City prompts the Director when every member issue is merged, closed, deferred or superseded.
-2. The Director presses **Finish**.
+2. The Director presses **Finish** and confirms. **Finishing early** is allowed: the confirmation lists the open
+   issues, and they are frozen as **open**, not deferred. The status becomes `finishing`.
 3. Synth City takes the final snapshot and asks the Leader, the Supervisor (if any) and **every verifier**, each with
    its role's question.
 4. The snapshot **freezes** when all of them have answered, or after the Director's time limit (default 2 hours). It freezes
-   **at once** when no member session is live. A missing view shows as "not received".
+   **at once** when no member session is live, and the Director can **Freeze now** at any time. A missing view
+   shows as "not received". The status becomes `finished`.
 5. The frozen page is read-only. Its **lessons** list the changes made, with their before-and-after numbers, the
    suggestions not acted on, and the agents' views.
 
@@ -289,21 +298,27 @@ change, with n. It never labels the change as confirmed or failed.
     - arriving from a repository filter pre-selects that repository.
 - **The page, top to bottom:**
   1. header;
-  2. headline tiles (item time, merged against scope, cost with coverage, Agent Mail messages, hand merges);
-  3. **where the time went** (a split bar of waiting on someone, process and active; waiting on someone listed first, by
-     who had to act);
-  4. flow, with change markers and before-and-after;
-  5. CI;
-  6. friction;
-  7. size;
-  8. the top three bottlenecks with actions (or lessons when frozen);
-  9. agents' views, one per role (Leader, Supervisor, each verifier).
+  2. headline tiles (merged against scope, item time, cost with coverage, hand merges, **waits on a decision**);
+  3. **where the time went** and, **beside it, the top three bottlenecks with actions** (or lessons when frozen), so the
+     first screen answers "how is it going, what is slowing it down, what should I do";
+  4. by repository (for a campaign across several repositories);
+  5. flow, with change markers and before-and-after;
+  6. CI;
+  7. friction;
+  8. size, including **Agent Mail messages** (total and by role);
+  9. agents' views, one per role (Leader, Supervisor, each verifier), each with its own Ask button.
+
+  The live and frozen pages are **the same page**: same header, sections and order. Frozen shows lessons in the
+  bottlenecks' position and drops Ask and Finish. The header holds only the repository picker, Refresh and Finish.
+  The **reference mockup** is `2026-11-15-campaign-retrospectives-mockup/retrospectives-mockup.html` next to this file:
+  the five screens, the dialogs, every state, and the 390 px layout. Where it and this text disagree, this text wins.
 
   Charts use Recharts, as in `frontend/src/features/usage`, and link to the Audit log filtered to their events.
 - **The Overview health panel** extends the existing `CampaignProgress` card, one per team. It adds:
   - item time;
   - cost so far with coverage;
-  - the top bottleneck (the largest "waiting on someone" stage or process step), with its responsible actor;
+  - the top bottleneck over the last 4 hours (the largest "waiting on someone" stage or process step), with its
+    responsible actor and its window labelled;
   - a link to the live view.
 
   It never applies anything.
@@ -372,6 +387,7 @@ Order: 1 first, then 2 and 3, with 4 in parallel, then 5 to 8.
 | A flaky check is named per check, fail then pass on the same head | Review: GitHub check runs carry no test names |
 | The finish freezes at once when no member session is live | Review |
 | Section 2 becomes "Where the time went": one split bar of waiting on someone, process and active, with waiting on someone first and broken down by who had to act ("waited" mislabelled active work) | Director, 2026-11-19 |
+| UI review (Fable, 2026-11-19): bottlenecks beside "Where the time went" on the first screen; one page for live and frozen; the what-if table in a dialog, with the evidence beside the setting; process stages split per check and per verifier for ranking; a `finishing` status with Freeze now; finishing early freezes open issues as open; lessons from agent diagnoses; small-sample and below-threshold states; ranking windows labelled; the waits-on-a-decision tile replaces Agent Mail, which moves to Size; a reference mockup | Director, 2026-11-19 |
 | Evidence, lever, prescription: Synth City fills in the evidence and the lever, never the prescription. Settings open with no value, next to a what-if table; issue drafts carry the problem and a measurable target, with the proposed change left to the team or an agent | Director, 2026-11-19: static logic can't choose values or repository-specific changes |
 | Top bottlenecks: deterministic ranking with anti-flicker thresholds; five starter rules with stated conditions; anything else is "Investigate" with an agent asked about that bottleneck's evidence | Director, 2026-11-19: static rules alone would be brittle |
 | Verifiers' views (quality and rework) alongside the Leader's and Supervisor's: asked at the finish, on demand mid-campaign; a different question per role | Director, 2026-11-19 |
