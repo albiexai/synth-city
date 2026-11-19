@@ -67,6 +67,7 @@ two hours on an unanswered decision, flaky tests, nine minutes of GitHub rate li
 | Agents | Ask the Leader / Supervisor on a pinned snapshot; both asked at the finish. **This version:** the reply is free text, shown as judgement (2026-11-19) |
 | Finish | Synth City prompts; the Director finishes; the agents are asked; the snapshot freezes (2026-11-18) |
 | Scope | The v4.4 slice in this revision; the rest in later phases (2026-11-19) |
+| Grouping | **A campaign is one team's campaign**, across every repository that team watches. Filter and group by team and repository. A product release worked on by several teams is several campaigns, side by side. Grouping campaigns into a product release is deferred (2026-11-19) |
 
 ## The design
 
@@ -95,8 +96,10 @@ New append-only records, written by the paths that already see the facts:
 
 - A `campaigns` row: the team's lifetime key, a selector (`label:` or `milestone:`), started_at, finished_at,
   finished_by, and a status (`active` or `finished`). At most one active campaign per team.
-- **Membership** is the set of issues matching the selector, plus the deferral and supersede events that #1219
-  records. There is no separate membership history in this version.
+- **Repositories:** a campaign covers **every repository its team watches** (the team's scopes). The selector is matched
+  in each one: a label by name, a milestone by title, since GitHub milestones are per repository.
+- **Membership** is the set of issues matching the selector in those repositories, plus the deferral and supersede
+  events that #1219 records. There is no separate membership history in this version.
 - **On upgrade,** every team that has a backlog milestone or parent issue set (as `CampaignProgress` uses) gets an
   active campaign. Its start is the first admission of a matching item; the Director can adjust it.
 
@@ -194,6 +197,15 @@ change, with n. It never labels the change as confirmed or failed.
     **Audit log**.
   - `/audit` redirects to `/insights/audit`, keeping the query and hash.
   - `/insights/retrospectives/:campaignId` is live while the campaign is active, frozen after.
+  - **The list** has filters for **Repository** (the same control as Overview's), **Team** and **Status**, and groups
+    rows by team, by repository or not at all. Each row lists the campaign's repositories, with the issue count in
+    each. Filtering by a repository keeps every campaign that includes it.
+  - **Inside a campaign** that spans several repositories:
+    - a repository picker recalculates every section for the chosen repository;
+    - a per-repository table shows issues, merged, item time, CI share and the top bottleneck;
+    - cost and Agent Mail stay team-wide, because they belong to members rather than repositories, and the page
+      says so;
+    - arriving from a repository filter pre-selects that repository.
 - **The page, top to bottom:**
   1. header;
   2. headline tiles (item time, merged against scope, cost with coverage, Agent Mail messages, hand merges);
@@ -228,11 +240,11 @@ change, with n. It never labels the change as confirmed or failed.
 | 2 | Campaign record, membership, creation on upgrade | 2 |
 | 3 | Campaign snapshot service, with its cache | 4 |
 | 4 | Cost spike, then the Claude Code and Codex readers | 3 |
-| 5 | Insights rename and redirect; the live and frozen page | 4 |
+| 5 | Insights rename and redirect; the live and frozen page, with the repository and team filters and the per-repository view | 5 |
 | 6 | Overview health panel | 1 |
 | 7 | Top three bottlenecks with their actions, before-and-after | 2 |
 | 8 | Ask by Mail; the finish flow | 2 |
-| | **Total** | **about 23 items, 16–18 active builder hours** |
+| | **Total** | **about 24 items, 17–19 active builder hours** |
 
 Order: 1 first, then 2 and 3, with 4 in parallel, then 5 to 8.
 
@@ -245,7 +257,10 @@ Order: 1 first, then 2 and 3, with 4 in parallel, then 5 to 8.
     "Agent access");
   - comparison between campaigns, over frozen snapshots;
   - builder utilisation, from activity transitions;
-  - standing decisions as settings, with a use count (after #1114 and #1115).
+  - standing decisions as settings, with a use count (after #1114 and #1115);
+  - **product releases across teams:** a release record grouping several teams' campaigns (for example, a product
+    release built by a product team and a website team). It gets a combined page, with totals across teams and each
+    team's campaign underneath, and a Release filter on the list. About 4–6 more items (Director, 2026-11-19).
 - **v4.6:**
   - guided restart sequences;
   - an editable price table and a serving-provider slot setting;
@@ -274,6 +289,7 @@ Order: 1 first, then 2 and 3, with 4 in parallel, then 5 to 8.
 | Cost: Claude Code and Codex readers, a dated price table in code, a spike first | Review: per-member attribution is unproven |
 | A flaky check is named per check, fail then pass on the same head | Review: GitHub check runs carry no test names |
 | The finish freezes at once when no member session is live | Review |
+| A campaign is one team's campaign across all its repositories; repository and team filters, grouping and a per-repository view; product releases across teams deferred | Director, 2026-11-19 |
 | Corrected code claims: PR lines and commits weren't stored; item time was a median only; check runs kept no timestamps | Review, verified against the code |
 
 ## Appendix A: revision 2 mechanisms (for the later phases)
