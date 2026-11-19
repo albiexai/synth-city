@@ -1,347 +1,431 @@
 # Campaign retrospectives in Insights — design
 
-Date: 2026-11-15, revised 2026-11-18. Revision 3 (redefined with the Director). Status: draft for approval,
-target release v4.4. Not approved for building.
+Date: 2026-11-15, revised 2026-11-19. **Revision 4: the v4.4 slice.** Status: for Director approval; target release v4.4.
+Not approved for building.
 
-Revision 3 redefines the feature with the Director, using the v4.3 campaign as the worked example. The main
-changes from revision 2: the feature is for **understanding a campaign and its bottlenecks**, with a **live view
-during the campaign**; **Apply happens mid-campaign**, not after it; the page shows **cost** and **size KPIs**;
-the Director can **ask the Leader or the Supervisor** for a view; and a **campaign health panel** goes on Overview.
-"Changes in revision 3" at the end lists each change. Mechanisms from revision 2 that still apply (the snapshot
-built from `build_metrics_window`, stages, guardrails, uncertainty, exposure, the target registry, preview and
-confirm, append-only integrity) are kept.
+Revision 4 keeps the Director's intent from revision 3 and cuts the build to what v4.4 can carry. An independent review
+(2026-11-19) sized revision 3 at **75–85 work items, the largest feature in v4.4**. This slice is **about 23 items**.
+Everything cut is listed under "Later phases", nothing is dropped. Revision 2's mechanisms (exposure, preview token,
+verdicts, the structured agent tool) are kept in **Appendix A** for those phases. The Director accepted every
+simplification on 2026-11-19.
 
 ## Intent
 
-The Director opens the page to understand **how the campaign and the team are performing**, and to find
-**what slows them down**:
-- the team (who waited for whom);
-- the process (charters, review rules, effort and amendment limits, merge gates);
-- the infrastructure (CI duration, flaky tests, quotas and rate limits).
+The Director opens the page to understand **how the campaign and the team are performing**, and to find **what slows
+them down**:
+- the team: who waited for whom;
+- the process: charters, review rules, limits, merge gates;
+- the infrastructure: CI duration, flaky checks, quotas and rate limits.
 
-The aim is campaigns that deliver quickly and efficiently. The page also gives a feel for **how big a campaign
-was**, and lets the Director compare it with earlier campaigns.
+The aim is campaigns that deliver quickly and efficiently. The page also gives a feel for **how big a campaign was**.
 
-Why: in v4.3 the Supervisor reconstructed all of this by hand, from SQL, GitHub and Mail. Examples: item time,
-rework rates, about 20 hand merges, a builder idle for two hours waiting on one decision, nine minutes of GitHub
-rate limiting, a flaky test rerun on four PRs. The changes that helped (merge cap, model swaps, a Leader standing
-rule) were made **during** the campaign, and they were judged within it.
+Why: in v4.3 the Supervisor reconstructed all of this by hand: item times, rework, about 30 hand merges, a builder idle
+two hours on an unanswered decision, flaky tests, nine minutes of GitHub rate limiting.
 
-## Goals
+## Goals (this version)
 
-1. A campaign is a first-class record: a team, a selector (the label or milestone the team works from), a start
-   and a finish.
-2. A **live view** while the campaign runs shows the measurements, the suggestions, and the agents' views on request.
-3. The measurements show **where work waited and who had to act**, together with **size, activity, flow, friction,
-   cost and quality** KPIs (below).
-4. **Apply is a mid-campaign action:** the Director applies a suggestion while the team that produced the evidence
-   is still running, and only when the team can absorb the change.
-5. Each applied change gets a **verdict within the same campaign**: items after it compared with items before it.
-6. The Director can **ask the Leader or the Supervisor** for their view of a snapshot, at any time, and both are
-   asked automatically at the finish.
-7. **Finishing** freezes a retrospective that explains the campaign and lists **lessons for the next team or
-   campaign**.
-8. A simple **comparison** of finished campaigns side by side.
+1. A campaign is a record: a team, a selector, a start and a finish.
+2. **Recording first.** Data that isn't recorded can't be recovered later, so the recording items are the first v4.4
+   items. That way the v4.4 campaign itself is measured.
+3. A **live view** while the campaign runs, and a **frozen** one after the finish.
+4. The core measure is **where work waited, by who had to act**. Around it: size, flow, CI, friction, cost.
+5. **The top three bottlenecks**, each with its **kind of fix** and a way to act on it.
+6. A **campaign health panel** on Overview.
+7. **Ask the Leader or the Supervisor** for their view of a snapshot; both are asked at the finish.
 
-## Non-goals (this version)
+## Non-goals (this version, all in "Later phases")
 
-- Applying changes after a campaign has finished. Lessons are carried forward by the Director, for example into
-  charter templates (#1113) or the next campaign's settings, not applied with one click.
-- Agents applying changes. Agents read and propose; the Director applies.
-- An analyst-agent session launched by Synth City.
-- Statistical comparison between campaigns. Comparison is side by side, labelled as association.
-- Export to Markdown or a GitHub Discussion.
+- In-page one-click Apply with a preview token; within-campaign verdicts with keep or revert; exposure tracking.
+- A structured agent findings tool with validated citations; proposals that become appliable suggestions.
+- Guided restart sequences.
+- Comparison between campaigns.
+- Builder-utilisation charts; standing decisions as settings (wait for #1114 and #1115).
+- An editable price table, a serving-provider slot setting, the subscription share, cost readers beyond Claude Code
+  and Codex.
+- Test-level flaky detection (it needs test names that GitHub check runs don't carry).
 
-## Anti-goals (failure even if it works)
+## Anti-goals
 
 - A team that loosens its own limits.
-- Numbers that cannot be traced to the events behind them.
-- Agent judgement presented as measurement, or measurements hidden because an agent disagrees with them.
+- Numbers that can't be traced to the events behind them.
+- Agent judgement presented as measurement, or measurements hidden because an agent disagrees.
 - Associations presented as proof that a change caused an improvement.
-- Speed improved by worse work (smaller scope, skipped review, rubber-stamped plans) without the page showing it.
 - A cost shown as complete when some members' usage is unknown.
-- Weakening Audit's existing guarantees (write-time redaction, events in the same transaction as the change).
+- Weakening Audit's existing guarantees.
 
 ## Decisions made with the Director
 
 | Topic | Decision |
 |---|---|
-| Purpose | Understand performance and bottlenecks (team, process, infrastructure); size KPIs; simple comparison (2026-11-18) |
+| Purpose | Understand performance and bottlenecks; size KPIs (2026-11-18) |
 | Where it lives | Insights (Audit renamed), tabs Retrospectives and Audit log (2026-11-15) |
-| Live view placement | **Option B:** a campaign health panel on Overview, full live view in Insights (2026-11-18) |
-| Cost | API-equivalent cost as the headline, subscription share beside it; priced by the approved provider that serves each model; every harness counts; unknown is never zero (2026-11-18) |
-| Apply | Mid-campaign only, both immediate and restart-type changes, with "takes effect" and "disruption" shown; restart changes as a guided sequence (2026-11-18) |
-| Verdicts | Within the same campaign (2026-11-18) |
-| After finish | For understanding; lessons for the next team or campaign; no Apply (2026-11-18) |
-| Agents | Ask the Leader and Ask the Supervisor, Director-triggered, on a pinned snapshot; both asked at the finish; the Leader is not otherwise involved while the campaign runs (2026-11-18) |
-| Finish | Synth City prompts; the Director finishes; the Leader and Supervisor are asked; the retrospective freezes when both answer or after a time limit (2026-11-18) |
-| Who applies | The Director only (2026-11-15) |
-| Agent reads of audit | A restricted agent view, limited to the agent's own team (2026-11-15) |
-| Loosening | Charter edits and any target not in the registry count as loosening (2026-11-15) |
+| Live view placement | A health panel on Overview; the full view in Insights (2026-11-18) |
+| Cost | API-equivalent cost as the headline; unknown is never zero; every harness eventually (2026-11-18). This version: Claude Code and Codex. |
+| Acting on a bottleneck | Four kinds of fix: setting, repository change, standing decision, Synth City defect (2026-11-19) |
+| Apply | Mid-campaign. **This version:** a link to the settings UI with the value prefilled (2026-11-19) |
+| Verdicts | **This version:** before-and-after medians with n at each change marker, no verdict label (2026-11-19) |
+| Agents | Ask the Leader / Supervisor on a pinned snapshot; both asked at the finish. **This version:** the reply is free text, shown as judgement (2026-11-19) |
+| Finish | Synth City prompts; the Director finishes; the agents are asked; the snapshot freezes (2026-11-18) |
+| Scope | The v4.4 slice in this revision; the rest in later phases (2026-11-19) |
 
 ## The design
 
-### Navigation and placement
+### 1. Recording (first in v4.4)
 
-- The sidebar entry **Audit** (`/audit`) becomes **Insights** (`/insights`), with tabs **Retrospectives** (default)
-  and **Audit log** (the current page, unchanged). `/audit` redirects to `/insights/audit`, keeping the query and hash.
-- `/insights/retrospectives/:campaignId` shows one campaign: **live** while it's active, **frozen** after the finish.
-  The team page links to the team's campaigns.
-- **Campaign health panel on Overview**, one per active campaign in the current filter:
-  - item time (median), merged against scope, cost so far (with its coverage);
-  - the **top bottleneck** (the stage with the most waiting time in the last N hours, with the responsible actor);
-  - at most **one** suggestion, as a link;
+New append-only records, written by the paths that already see the facts:
+
+1. **Check runs:** for each required check run on a head, the check name, run id, run attempt, queued_at, started_at,
+   completed_at and conclusion. Source: the check runs that `github_check_observation.py` already reads. Today it keeps
+   status, conclusion and `run_attempt`, but no timestamps, and `GithubRequiredCheckWatch.observed_at` is overwritten on
+   every observation.
+2. **PR facts at merge:** additions, deletions, changed files, commit count and `merged_by`, recorded as a delivery fact
+   next to `record_merged_delivery`. `merged_by` gives the hand-merge count without a separate intervention event.
+   Nothing under `backend/app` stores these today.
+3. **Waits on a decision:** each request to the Leader, Supervisor or Director, with who asked, who must answer, and
+   when it was asked and answered:
+   - every structured decision flow: plan approvals, continuation decisions, effort extensions, scope amendments,
+     Director and Supervisor decision requests;
+   - Mail requests with a `request_status`;
+   - the input-wait observations `agent_activity_service._record_input_waits` already writes, so a plain question
+     that leaves a builder idle is counted.
+4. **GitHub rate-limit windows:** start, reset and the source of each. #1197 already reports the current state; it
+   needs keeping as history.
+
+### 2. Campaign record
+
+- A `campaigns` row: the team's lifetime key, a selector (`label:` or `milestone:`), started_at, finished_at,
+  finished_by, and a status (`active` or `finished`). At most one active campaign per team.
+- **Membership** is the set of issues matching the selector, plus the deferral and supersede events that #1219
+  records. There is no separate membership history in this version.
+- **On upgrade,** every team that has a backlog milestone or parent issue set (as `CampaignProgress` uses) gets an
+  active campaign. Its start is the first admission of a matching item; the Director can adjust it.
+
+### 3. Campaign snapshot
+
+- A **campaign snapshot function**, separate from `build_metrics_window`. It reuses that module's coverage and sample
+  helpers, so coverage rules stay shared. `build_metrics_window` itself is a time-window summary of single-value
+  samples, so it can't carry stage breakdowns or series.
+- Every number carries its sample count and coverage. A partial history shows as unknown, never zero.
+- `FactoryMetricSample` gains a `calculation_version` field, so frozen snapshots say which calculation produced them.
+- **Cached** per campaign, with a short lifetime, because the Overview panel polls.
+
+**Measures in this version:**
+- **Size:** issues in scope, merged, closed without delivery, deferred; PRs merged; lines and files changed (median
+  and largest); team size; model and member changes.
+- **Flow:** item time from dispatch to merge (median and p85, by size band); throughput over time, with change
+  markers from the existing `policy_change` audit events.
+- **Where work waited:** stages per attempt, derived from the existing work-lifecycle transitions, approval requests,
+  delivery facts and the new records:
+  - waiting for dispatch, planning and approval, building, required checks (from the check-run records), review;
+  - waiting on a decision, by who had to answer.
+
+  Finer stages, such as acknowledgement and the merge gate, come later.
+- **CI:** duration per required check (median and p85, slowest named); queue time against run time; CI's share of
+  item time; reruns. A check is **flaky** when it fails and then passes on the same head through a new `run_attempt`.
+  It is named per check, not per test, in this version.
+- **Friction:** hand merges (from `merged_by`); waits on decisions; GitHub rate-limit time; Synth City errors that
+  blocked an agent (refusals, 409s, 500s, from the audit log).
+- **Cost:** see below.
+- **Activity:** Agent Mail messages, total and by sender role.
+
+### 4. Cost
+
+- **API-equivalent cost** = tokens × price, per member and model, over the campaign window.
+- **Readers:** Claude Code (per-message usage in the transcripts) and Codex CLI (`token_count` events,
+  `total_token_usage`). Usage is attributed to a member through the native session identity Synth City binds for
+  activity observation. Unattributed usage is shown as such, never dropped.
+- **Prices:** a dated table in code, extending `pricing_service.MODEL_PRICING` (today Claude-only and keyed by model).
+  The page says "at prices as of <date>".
+- The headline shows coverage: "≈ $X, covering 4 of 5 members". A member whose harness isn't read yet is **unknown**.
+- **A one-item spike comes first:**
+  - prove per-member, per-window token reads for both harnesses;
+  - confirm the controller can read the agent user's transcripts.
+
+  If the spike fails, cost ships as "unknown" with the reason, and the rest of the slice is unaffected.
+
+### 5. Bottlenecks and how to act on them
+
+The page shows the **top three bottlenecks**, ranked by the waiting time they account for. Each names its kind of fix
+and offers the matching action:
+
+| Kind | Action on the page |
+|---|---|
+| **Synth City setting** | a link to the setting in the v4.4 settings UI (#1115), with the suggested value prefilled. The Director confirms there. The change appears as a change marker. |
+| **Repository change** | **draft an issue**: the evidence and the proposed change, which the Director edits and files with the campaign's ready label. The Leader dispatches it like any other item. |
+| **Standing decision** | shown as a **lesson** until #1114 and #1115 make standing decisions settings |
+| **Synth City defect** | **copy evidence** for a bug report |
+
+Each suggestion states **takes effect** (next poll, next attempt, or after a member restart) and **disruption** (none,
+or which members restart). A restart change shows a **checklist** that links to the existing actions:
+1. ask the members for a safe point and a handoff;
+2. apply the change;
+3. restart the members in resume mode;
+4. check that each member is observed.
+
+A suggestion that would invalidate an approved plan or an active item isn't offered mid-flight.
+
+**Before and after:** at each change marker, the page shows the median item time and stage waits before and after the
+change, with n. It never labels the change as confirmed or failed.
+
+### 6. Asking the Leader or the Supervisor
+
+- **Ask the Leader** and **Ask the Supervisor** (the second only when the team has a Supervisor binding). They are
+  Director-triggered, with an optional question.
+- Synth City freezes the current snapshot and sends it by **Agent Mail**: a link to the snapshot plus its key numbers.
+- The agent replies in Mail. The page shows the reply as "**Leader's view** (or Supervisor's view), based on the
+  snapshot of HH:MM", next to the measurements and marked as judgement. It's marked stale when the live numbers have
+  moved past a threshold.
+- One open request per agent per campaign.
+
+### 7. Finishing a campaign
+
+1. Synth City prompts the Director when every member issue is merged, closed, deferred or superseded.
+2. The Director presses **Finish**.
+3. Synth City takes the final snapshot and asks the Leader and the Supervisor (if any).
+4. The snapshot **freezes** when both have answered, or after the Director's time limit (default 2 hours). It freezes
+   **at once** when no member session is live. A missing view shows as "not received".
+5. The frozen page is read-only. Its **lessons** list the changes made, with their before-and-after numbers, the
+   suggestions not acted on, and the agents' views.
+
+### 8. Navigation and the page
+
+- **Navigation:**
+  - The sidebar entry **Audit** (`/audit`) becomes **Insights** (`/insights`), with tabs **Retrospectives** and
+    **Audit log**.
+  - `/audit` redirects to `/insights/audit`, keeping the query and hash.
+  - `/insights/retrospectives/:campaignId` is live while the campaign is active, frozen after.
+- **The page, top to bottom:**
+  1. header;
+  2. headline tiles (item time, merged against scope, cost with coverage, Agent Mail messages, hand merges);
+  3. **where work waited**;
+  4. flow, with change markers and before-and-after;
+  5. CI;
+  6. friction;
+  7. size;
+  8. the top three bottlenecks with actions (or lessons when frozen);
+  9. agents' views.
+
+  Charts use Recharts, as in `frontend/src/features/usage`, and link to the Audit log filtered to their events.
+- **The Overview health panel** extends the existing `CampaignProgress` card, one per team. It adds:
+  - item time;
+  - cost so far with coverage;
+  - the top bottleneck, with its responsible actor;
   - a link to the live view.
-  The panel never applies anything, and it only reads data the live view also shows.
-- The panel **extends the existing `CampaignProgress` panel** on Overview (one panel per team, keeping its counts and
-  merge bar), rather than adding a second panel *(Supervisor's call)*.
-- `/insights/compare?campaigns=a,b,c` shows finished campaigns side by side.
 
-### Campaign record and membership
+  It never applies anything.
 
-Unchanged from revision 2:
-- Table `campaigns` keyed on the team's immutable lifetime key, with a selector (`label:` or `milestone:`), status
-  `active` or `finished`, and at most one active campaign per team.
-- Membership over **repository issue identities** (including issues that never started), with an append-only
-  history: joined, left, deferred.
-- Deferral is a recorded Director action. A selector change seen on GitHub is evidence to reconcile, not an
-  authorized deferral.
+### 9. Integrity
 
-Note: the v4.4 milestone routing (#1223) and the end-as-deferred action (#1219) produce the deferral events this
-history needs.
+- Frozen snapshots are **append-only and immutable**. Only the Director recomputes one, which creates a new version.
+- The new recording tables are append-only by design (no update paths). Database triggers on them come in a later
+  phase.
 
-### Measurements
+## Work items (estimate)
 
-The snapshot is built by `factory_metrics_service.build_metrics_window`, **extended in place** with an optional
-campaign argument (the campaign's window and team key) and the measures below. There is one function, so the Audit
-metrics panel and the retrospective share coverage rules *(Supervisor's call)*. Every measure is a
-`FactoryMetricSample`-shaped record: value, sample count, unknown and excluded counts, coverage, source. A
-**`calculation_version` field is added** to `FactoryMetricSample` (it doesn't exist today), so snapshots record
-which calculation produced them. Partial history shows as unknown, never as zero.
-The revision 2 rules on uncertainty (n on every tile, medians and p85 with intervals, "not distinguishable",
-"too few to compare") still apply.
+| # | Item group | Items |
+|---|---|---|
+| 1 | Recording: check runs, PR facts at merge, waits on decisions, rate-limit windows | 5 |
+| 2 | Campaign record, membership, creation on upgrade | 2 |
+| 3 | Campaign snapshot service, with its cache | 4 |
+| 4 | Cost spike, then the Claude Code and Codex readers | 3 |
+| 5 | Insights rename and redirect; the live and frozen page | 4 |
+| 6 | Overview health panel | 1 |
+| 7 | Top three bottlenecks with their actions, before-and-after | 2 |
+| 8 | Ask by Mail; the finish flow | 2 |
+| | **Total** | **about 23 items, 16–18 active builder hours** |
 
-Legend: **R** = recorded today; **P** = partly recorded; **N** = needs new recording.
+Order: 1 first, then 2 and 3, with 4 in parallel, then 5 to 8.
 
-**Size**
-- issues in scope, merged, closed without delivery, deferred (R);
-- PRs merged and lines changed, median and largest (R, from GitHub);
-- splits and scope growth: issues added during the campaign, split parents and their parts (P: the "Split from #N"
-  convention isn't a recorded link; needs a structured split record, see #1114);
-- duration, team size, member and model changes (P: needs the slot change event).
+## Later phases
 
-**Activity**
-- Agent Mail messages: total and by sender role (R, from `mail_messages`); per merged PR (P: through the work item
-  a message is addressed to, where it has one; messages with no work item count as "not linked");
-- decisions requested and who answered them, with their wait (N: the decision-request lifecycle from revision 2). It
-  covers **every decision flow**: plan approval (`GithubApprovalRequest`), continuation decisions, effort extensions,
-  scope amendments, and Director or Supervisor decision requests. The stage breakdown needs to know who held each
-  wait;
-- reviews per PR and rework rounds, i.e. items with three or more commits (R);
-- CI runs, reruns and flaky tests (P, see CI below).
-
-**Flow**
-- item time from dispatch to merge: median, p85, by size band (R, from the delivery ledger);
-- throughput over time, with change markers (R, plus the change markers);
-- **where work waited:** stages per attempt, with the responsible actor (N, as revision 2: dispatch, acknowledgement,
-  plan approval, building, required checks, review, waiting for the Leader / Supervisor / Director, merge gate);
-- builder utilisation: working, idle, blocked per member over time (P: activity states exist but aren't kept as
-  history; needs an activity transition record).
-
-**CI durations (added)**
-- duration per required check: median and p85, slowest check named;
-- queue time against run time;
-- CI's share of item time, with reruns counted separately;
-- failures by test, with flaky tests and how often each was rerun.
-
-The factory watches required checks (`github_required_check_watches`) but keeps no per-run timing. It needs a
-check-run record (check name, run id, attempt, head, queued_at, started_at, completed_at, conclusion), taken from
-the check runs the watcher already reads, and failed test names where CI reports them. N.
-
-**Friction**
-- hand interventions: Supervisor recovery merges, operator force-releases and overrides, with reasons (P: some are
-  audit events, some are only PR comments; needs one recorded intervention event);
-- blocks by cause: merge guard, effort limit, amendment refusals, stopped items, quota, and **Synth City errors**
-  (refusals, 409s, 500s that blocked an agent) (P);
-- quota and rate-limit time lost: GitHub rate-limit windows, harness usage limits, forced model swaps (P: #1197
-  reports the GitHub rate limit; harness limits need recording).
-
-**Cost and quality**
-- cost so far (see Cost);
-- quality guardrails, as revision 2: reverts and follow-up fixes within N days, reopened issues, CI failures on the
-  release branch after merge, closed without delivery, unknown outcomes.
-
-### Cost
-
-**A. API-equivalent cost: the headline.**
-- Cost = tokens × price, per member and model, summed over the campaign window.
-- Price comes from a **price table keyed by approved provider and model**: the price of the provider that actually
-  serves the model for that member, since the same model can cost differently through different providers.
-- The serving provider is a **new slot setting**, chosen from a Director-managed list of approved providers. It is
-  not `AgentTeamSlot.provider`, which names the harness. A slot without it has unknown cost *(Supervisor's call)*.
-- The price table is a **setting with a source and a date**, editable by the Director, not a code constant. Every
-  cost figure says "at prices as of <date>".
-- Today's `pricing_service.MODEL_PRICING` is Claude-only and keyed by model alone. It becomes the default seed for
-  the new table, not the source of truth.
-- Token sources, per harness:
-  - **Claude Code:** per-message usage in the transcripts (as the Usage page reads them).
-  - **Codex CLI:** `token_count` events in the rollout log (`total_token_usage`: input, cached input, cache write,
-    output, reasoning).
-  - **Muse, Antigravity, OpenCode, Copilot, Pi:** one reader each, where the harness records usage.
-- A member whose harness reports no usage is **unknown, never zero**. The headline says "≈ $X, covering 4 of 5
-  members". Usage is attributed to a member through the **native session identity** Synth City binds for activity observation
-  (the Claude Code session id, the Codex rollout id), not the Mail session key. Usage that matches no bound session is
-  shown as unattributed, never dropped *(Supervisor's call; the builder verifies the identifier formats first)*.
-
-**B. Subscription share, beside it.**
-- The percentage of each plan's limit the campaign used, where the harness reports it. Codex writes `rate_limits`
-  with `used_percent` and the window into its rollout log. Other harnesses where available.
-- Attribution is only claimed when the account served nothing else in the window. Otherwise it's shown as "account
-  shared; share not attributable".
-
-Documents and UI name harnesses, providers and models. They never say which platform serves a particular factory.
-
-### Suggestions and Apply (mid-campaign)
-
-Rules and the target registry are as revision 2. At most three suggestions are shown, ranked by the stage time they
-account for.
-
-**Four kinds of fix** (Director, 2026-11-19). Each suggestion says which kind it is, because each kind travels by a
-different route. CI is the worked example:
-
-| Kind | Who changes it | What the page offers | CI example |
-|---|---|---|---|
-| **Synth City setting** | the Director | a suggestion with **Apply** (mid-campaign), or a lesson | `accepted_base_update: merge`; the required checks list |
-| **Repository change**: code or configuration Synth City doesn't own | the team, through a normal issue and PR | a suggestion that **drafts an issue** (evidence plus proposed change). The Director edits and approves it; it's filed with the campaign's ready label and the Leader dispatches it like any other item | shard e2e across parallel jobs (#1235); run only affected journeys on PRs |
-| **Standing decision**: a rule an agent applies | the Leader or the Supervisor, by rule | a suggestion that adds a **standing decision** to the scope's settings (#1114, #1115), with a count of each use on the page | "a failure of a known flaky test gets one full rerun"; "update a stale branch from the base" |
-| **Synth City defect** | the Synth City developers | **copy evidence**, as a bug report | a gate that can't pass a partial rerun (#1199) |
-
-A rule offers a setting or standing decision only when its evidence identifies that target as the constraint. It
-offers a repository change when the constraint is in the repository (for example a required check's duration).
-Otherwise it offers an investigation, naming the next responsible actor. Repository-change drafts carry the measured
-evidence and the expected effect, so the next campaign's verdict can check them like an applied setting.
-
-What changes in revision 3:
-
-- **Apply is on the live view only.** A frozen retrospective shows its suggestions as **lessons**, without Apply.
-- Each suggestion states up front:
-  - **takes effect:** next poll, next attempt, or after a member restart;
-  - **disruption:** none, restart of named members, or not offered (see below).
-- **Immediate changes** (caps, limits, hold rules): preview and confirm, as in revision 2.
-- **Restart changes** (a charter edit, a model or provider change for a slot): a **guided sequence**, not one click:
-  1. ask the affected members to reach a safe point, with a handoff where the session will be new;
-  2. apply the change;
-  3. restart each member in resume mode where possible;
-  4. check that each member is observed (activity known, tool catalog current) before the sequence is complete.
-  Each step shows progress and can stop with a reason. The sequence is recorded as one change.
-- **Not offered mid-flight:** a change that would invalidate an approved plan or an active item (for example
-  lowering an effort ceiling below an active item's spend). The page says why, and offers it as a lesson.
-- **Verdicts within the campaign.** For each applied change, the live view compares the items exposed to it (as
-  revision 2 defines exposure) with the items before it: confirmed, not confirmed, too few items, or mixed (other
-  changes overlapping are listed). Keep or revert is offered while the campaign runs. The frozen retrospective
-  records the final verdicts.
-
-### Asking the Leader or the Supervisor
-
-- Buttons **Ask the Leader** and **Ask the Supervisor** on the live view (the second only when the team has a
-  Supervisor binding). Director-triggered only, with an optional question.
-- Synth City **freezes a snapshot** of what the Director sees (version, time, the measures and their item and event
-  ids) and sends it by Agent Mail, using a server-prepared bundle. The agent does not rebuild the facts itself.
-- The agent answers through a dedicated Mail tool, `synth_city_submit_campaign_view`, in a fixed shape:
-  - **findings:** each with text and the item or event ids it relies on, which the server validates against the
-    snapshot;
-  - **proposed changes:** each pointing at a measured chart and a registry target. These appear as suggestions the
-    Director can apply.
-  - or **decline**, with a reason ("will answer at the next checkpoint").
-- The page shows "**Leader's view** (or Supervisor's view), based on the snapshot of HH:MM" next to the measurements,
-  marked as judgement. It is marked stale when the live numbers have moved past a threshold since the snapshot.
-- Limits: one open request per agent per campaign; a time budget for the answer; the measurements are always shown
-  next to an agent's view, never replaced by it.
-- The agent read projection and team boundary are as revision 2.
-
-### Finishing a campaign
-
-1. Synth City **prompts** the Director when every member issue is merged, closed or deferred and backlog coverage
-   is known (unknown coverage blocks the prompt and says why).
-2. The Director presses **Finish** (Director-only).
-3. Synth City takes the **final snapshot** and asks **the Leader and the Supervisor** (if any) for their view of it,
-   as above.
-4. The retrospective **freezes** when both have answered, or when a time limit set by the Director (default 2 hours)
-   runs out. A missing view is shown as "not received".
-5. The frozen retrospective is read-only. Its **lessons** list holds the changes that worked (with their verdicts),
-   the suggestions not applied, and the agents' proposals, as "start the next team or campaign with these".
-   The Director can copy a lesson into a charter template or a team's settings by hand. There is no Apply.
-
-### The page
-
-Live and frozen share one layout, read top to bottom:
-1. Header: campaign, team, selector, dates, status (live or frozen), items in scope and merged.
-2. Headline tiles: item time, merged against scope, cost so far (A, with coverage, and B), Agent Mail messages,
-   hand interventions.
-3. **Where work waited**: stage breakdown with the responsible actor; decision-request waits.
-4. Flow: throughput over time with change markers; builder utilisation.
-5. CI: durations per check, queue and run time, reruns, flaky tests.
-6. Friction: blocks by cause (including Synth City errors); quota and rate-limit time.
-7. Quality guardrails, next to the speed measures.
-8. Size: issues, PRs, lines, splits and scope growth, team and model changes.
-9. **What to change** (live: up to three suggestions with Apply; frozen: **lessons**).
-10. **Applied changes and their verdicts.**
-11. **Agents' views**: Leader's and Supervisor's views, with their snapshot times.
-
-Charts use Recharts (as in `frontend/src/features/usage`). Each chart links to the Audit log tab filtered to its events.
-
-**Comparison page:** a table of finished campaigns, one column each, for the size, activity, flow, cost and CI
-KPIs, with n per cell. Labelled "side by side, not a controlled comparison".
-
-### Integrity
-
-As revision 2:
-- append-only triggers on audit events, snapshots, membership events, agent views and proposals;
-- immutable snapshots, where only the Director recomputes a frozen one, creating a new version;
-- "lower bound" labels on counts drawn from best-effort observations.
-
-The new records (check runs, activity transitions, interventions, decision requests, cost readings) are append-only too.
-
-## Phases
-
-1. **Recording:** check runs; activity transitions; the decision-request lifecycle; intervention events; slot and
-   preset change events; the PR-first-seen delivery fact; cost readers for Claude Code and Codex; the price table.
-2. **Live view and health panel:** campaign record and membership; the extended metrics window; the live page;
-   the Overview panel.
-3. **Mid-campaign Apply:** target registry; immediate changes with preview and confirm; verdicts within the campaign.
-4. **Agents:** the snapshot bundle; Ask the Leader / Supervisor; `synth_city_submit_campaign_view`; the agent read view.
-5. **Finish and compare:** the finish flow with the final agent views; frozen retrospectives and lessons; the
-   comparison page.
-6. **Restart changes:** the guided restart sequence for charter and model changes.
-
-Later phases: more harness cost readers (Muse, Antigravity, OpenCode, Copilot, Pi) as each records usage;
-trusted-agent Apply, as revision 2 describes.
+- **v4.5:**
+  - in-page Apply with a preview token and compare-and-set, with verdicts and keep or revert (Appendix A:
+    "Change markers and exposure", "Apply");
+  - the structured agent tool with validated citations, and agent proposals as suggestions (Appendix A:
+    "Agent access");
+  - comparison between campaigns, over frozen snapshots;
+  - builder utilisation, from activity transitions;
+  - standing decisions as settings, with a use count (after #1114 and #1115).
+- **v4.6:**
+  - guided restart sequences;
+  - an editable price table and a serving-provider slot setting;
+  - the subscription share;
+  - cost readers for Muse, Antigravity, OpenCode, Copilot and Pi;
+  - test-level flaky detection (it needs a test-result source per repository);
+  - append-only triggers on every recording table;
+  - membership history, with reconciliation of selector edits made on GitHub.
 
 ## Left to the builder
 
-- Table and column names and migration shape.
-- **Teams that already exist when the feature ships** *(Supervisor's call)*: the upgrade creates an `active` campaign
-  for each team that has a backlog milestone or parent issue set (the campaign settings `CampaignProgress` already
-  uses). Its start is the first admission of a matching item. The Director can adjust the start or finish it. Teams
-  without those settings get no campaign until the Director starts one.
-- Rule thresholds (configurable per team) and minimum sample sizes.
-- The exact allowlists for change markers and the agent audit view, within the rules above.
-- The "top bottleneck" window for the Overview panel (default suggestion: the last 4 hours).
-- The staleness threshold for an agent's view.
+- Table and column names; migration shape.
+- Thresholds and minimum sample sizes.
+- The cache lifetime and the staleness threshold for an agent's view.
+- The Overview panel's "top bottleneck" window (suggested: the last 4 hours).
 
-## Changes in revision 3
+## Changes in revision 4
 
 | Change | Reason |
 |---|---|
-| Purpose: understanding performance and bottlenecks; size KPIs; simple comparison brought back | Director, 2026-11-18 |
-| Live view during the campaign carries suggestions, Apply and agents' views; Overview gets a health panel (option B) | Director |
-| Apply moved to mid-campaign only; the frozen retrospective gives lessons instead | Director: after a campaign there may be no next one, or the team differs |
-| Verdicts within the same campaign | Director; matches how v4.3's changes were judged |
-| Restart changes as a guided sequence; "takes effect" and "disruption" on every suggestion | Director: "only if the team can absorb them"; v4.3 swap caused an observation gap |
-| Cost: API-equivalent headline, subscription share beside it, by approved provider and model, every harness, unknown never zero | Director |
-| KPI groups: size, activity, flow, CI durations, friction, cost and quality; "factory defects found" dropped; "Synth City errors" as a block cause | Director |
-| Ask the Leader / Ask the Supervisor on a pinned snapshot, with a dedicated tool; both asked at the finish | Director |
-| Finish flow: prompt, finish, agents asked, freeze on answers or time limit | Director |
-| Analyst session, trusted-agent Apply and export stay later; statistical cross-campaign comparison stays out | unchanged |
-| Four kinds of fix (setting, repository change, standing decision, Synth City defect), each with its own route; repository changes are drafted as issues for the team | Director, 2026-11-19, with CI as the worked example |
-| Builder check: one metrics function; `calculation_version` added; serving provider as a slot setting; attribution by native session identity; all decision flows counted; Mail per PR is partly recorded; the panel extends `CampaignProgress`; campaigns created on upgrade for existing teams | independent builder review of revision 3 |
+| Cut to the v4.4 slice (about 23 items), with later phases listed | Independent review sized revision 3 at 75–85 items; Director, 2026-11-19 |
+| The body is self-contained; revision 2's mechanisms are in Appendix A | Review: revision 3 pointed to text that no longer existed |
+| Recording comes first, with PR facts at merge, check-run timings, waits on decisions (including input waits) and rate-limit windows | Review: unrecorded data is lost; several "recorded" measures weren't |
+| A separate campaign snapshot function with a cache | Review: `build_metrics_window` can't carry stages or series |
+| Before-and-after medians instead of verdicts; Apply as a settings link; a restart checklist; Ask by free-text Mail | Review simplifications, accepted by the Director |
+| Cost: Claude Code and Codex readers, a dated price table in code, a spike first | Review: per-member attribution is unproven |
+| A flaky check is named per check, fail then pass on the same head | Review: GitHub check runs carry no test names |
+| The finish freezes at once when no member session is live | Review |
+| Corrected code claims: PR lines and commits weren't stored; item time was a median only; check runs kept no timestamps | Review, verified against the code |
+
+## Appendix A: revision 2 mechanisms (for the later phases)
+
+Kept verbatim from revision 2 (commit ab8d8fbc), as the starting point for the later phases above. Where it conflicts
+with the body of revision 4, the body wins for v4.4.
+
+#### Revision 2 design (verbatim)
+
+#### Navigation
+
+- The sidebar entry **Audit** (`/audit`) becomes **Insights** (`/insights`) with tabs **Retrospectives** (default)
+  and **Audit log** (the current page, unchanged). `/audit` redirects to `/insights/audit` keeping query and hash.
+- `/insights/retrospectives/:campaignId` shows one campaign. The team page links to its campaigns.
+
+#### Campaign record and membership
+
+- Table `campaigns`: id, team context key (the immutable team lifetime key, not the numeric preset id), name,
+  selector (`label:<name>` or `milestone:<title>`), started_at, finished_at, finished_by, status (`active`, `finished`).
+  At most one active campaign per team. v4.1 ran on the label `release:v4.1`; 29 of its closed issues had no milestone.
+- Membership is a set of **repository issue identities**, not work items, so issues that never started are included.
+  It is computed from the selector and kept as an append-only history table (`campaign_membership_events`:
+  joined, left, deferred, with time, actor and evidence). A work item links to a membership row when one exists.
+- **Deferral** is a recorded Director action. A selector change seen on GitHub (label or milestone removed) is recorded
+  as evidence to reconcile, shown to the Director, and not treated as an authorized deferral.
+- The "looks done" prompt covers the whole scope: every member issue is merged, closed or deferred, and backlog
+  coverage is known. Unknown coverage blocks the prompt and says why.
+- Items carried over to the next campaign keep their earlier history in the earlier campaign; durations in the new
+  campaign start when the item joined it.
+
+#### Measurements
+
+- The snapshot is built by **`factory_metrics_service.build_metrics_window`** over the campaign window and team key,
+  extended with the measures below. The Audit metrics panel and the retrospective therefore cannot disagree.
+- Every measure is a `FactoryMetricSample`-shaped record: value, sample count, unknown and excluded counts, coverage,
+  source, and calculation version. Imported or partial history shows as unknown, never as zero.
+- Merge time comes from the existing immutable delivery fact (`record_merged_delivery`, `fact_time` = the PR's
+  `merged_at`), and auto-merge from `auto_merged_at`. No mutable timestamp columns are added to `github_work_items`
+  (their timestamps are overwritten per attempt). One new delivery fact is added: **PR first seen**.
+- Counting units are explicit: distinct failed heads by event time (not the cumulative `failed_head_count`), with a
+  deduplication key and retained source references.
+
+**Stages (the core measure).** Each attempt and head is split into stages with a reason and a next responsible actor:
+waiting for dispatch, dispatch to acknowledgement, plan approval wait, building, waiting for required checks,
+waiting for review, waiting for a Director or Supervisor decision, merge wait. Sources: approval request and decision
+times, check watches, head reviews, delivery facts, workspace release. Overlapping waits and unknown intervals stay
+explicit. Elapsed time and declared effort are reported separately; active time is never derived by subtraction.
+
+**Decision requests.** Replace "Supervisor latency" with a correlated decision-request lifecycle: request id, target
+actor, decision needed, acknowledged_at, resolved_at, outcome evidence. Unrelated Mail and check-ins do not resolve a
+request. (Today a check-in overwrites one column and is not kept as history; this needs a new event.)
+
+**Quality guardrails.** Each speed measure is shown with guardrails: reverts and follow-up fix PRs within N days,
+reopened issues, master CI failures after merge, `closed_without_delivery` and `unknown_outcomes` from the existing
+service, and operator interventions.
+
+**Conditions.** The snapshot records what else changed: issue mix and size (lines and files changed), model and
+provider per slot over time, hours lost to quota or harness failures, and human-wait time. Throughput is shown per
+active agent-hour as well as per wall-clock hour.
+
+**Uncertainty.** Each tile shows n. Durations use medians and p85 with a bootstrap interval; rates use a Wilson
+interval. A tile says "not distinguishable" unless the intervals separate and the change exceeds a minimum size, and
+"too few to compare" below a minimum n. The cycle-time section shows individual items, not only a summary.
+
+**Comparisons.** In a team's first retrospective, comparisons split at the change markers (before and after each
+change), group items by dispatch time, and show items in flight at the split as their own group. The first
+retrospective is labelled a baseline. Comparisons are always described as associations.
+
+#### Change markers and exposure
+
+- Markers come from an allowlist of `policy_change` sources (Supervisor health transitions also use that kind and
+  are excluded), plus two new events: a slot change event and an event for campaign-relevant preset fields
+  (selector, parent issue, planned decisions; today only autonomy is audited).
+- The slot change event uses a bounded projection: changed field names, typed model and provider values, and opaque
+  revision references for charter and launch configuration. Charter text and launch arguments are never stored in audit.
+- **Exposure.** A saved change is not the same as work running under it. Active attempts keep their captured delivery
+  policy until adoption, and charters load at the next resume restart. The snapshot records which policy and charter
+  revisions each measured attempt ran with. Before/after comparisons only count attempts exposed to the change;
+  "configured, not yet active" is shown.
+
+#### Suggestions
+
+- **Rules** live in a code registry. Each rule declares: the eligible population, denominator, the blocking evidence
+  that must be present, exclusions, the expected effect, and the guardrail that can veto it. A rule offers a setting
+  change only when its evidence identifies that setting as the constraint; otherwise it offers an investigation
+  (with the next responsible actor) or a product-defect draft.
+- First rules, all backed by recorded data: auto-merge cap (fires only when items waited on the cap for X hours with
+  no rise in reverts); plan rejection rate; manual merge share. Thresholds are "suggest only" until two campaigns of data exist.
+- A test asserts that every setting rule targets an entry in the target registry.
+- Suggestions are ranked by the stage time they account for; at most three are shown. When none clears the bar, the
+  page says so and names the largest wait.
+- **Agent findings** (from the Leader, Supervisor or another team agent, via a Mail tool) appear in a collapsed
+  **Hypotheses** block. Each must cite item or event ids that the server validates; the page shows "based on n items".
+  An agent finding can carry a proposed setting change only if it references a measured chart.
+- **Product defects** offer "copy evidence" (a prepared issue body); a person files the issue.
+
+#### Apply (Director only in this version)
+
+- A **target registry** lists every appliable target as `(model.column, unit, tightening direction, effect timing)`,
+  using real columns: `max_auto_merges_per_day`, `max_build_parallelism`, `max_approval_rounds`,
+  `max_continuation_revisions`, `max_continuation_failed_heads`, `max_failed_heads_per_revision`, `review_hold_label`,
+  slot charter, and so on. A target not in the registry cannot be applied; the suggestion becomes a product defect.
+  (Effort ceilings and the scope-amendment limit are not settings today; the latter is a code constant.)
+- **Preview and confirm.** Preview returns the canonical patch, the before values, the classification of every changed
+  field, the affected attempts, and a preview token. Confirm must present the token; the server checks that the
+  current values still equal the previewed before values and applies the change, or refuses with no write.
+- **Classification** is per field, and a patch takes its least restrictive component. `review_hold_label`: only
+  null → label is tightening; replacing or clearing it is loosening (replacement releases every PR held by the old label).
+- **Transaction.** Apply owns the transaction: the configuration change, its existing audit facts, the
+  `process_change_applied` event and the suggestion state commit together. Shared helpers that commit internally
+  (`agent_team_service.update_slot`, `update_scope_policy`) get a non-committing variant. An idempotency key prevents
+  double application after a lost response.
+- **Effect timing.** Each target states whether it affects the next campaign, future attempts, or current attempts.
+  Retrospective changes default to future work. Apply never rewrites an approved plan, renews a lease, retries an
+  item, restarts a member or lifts a hold. Charter changes are written to the slot; the result shows the member's
+  current copy and "pending until restart" per member.
+- **Expected effect.** The confirm dialog records the measure expected to move, its direction and rough size
+  (pre-filled from the suggestion), and a review point (for example "after 15 items or the next retrospective").
+- **Verdicts.** The next retrospective shows each applied change with confirmed, not confirmed, too few items, or
+  mixed (other changes within the same window are listed), with keep and revert. Revert uses the same preview and confirm.
+- Actor attribution needs #945 (v4.2): every write records who made it and through which path.
+
+#### Agent access (this version)
+
+- Mail tools: `synth_city_list_retrospectives`, `synth_city_get_retrospective`, `synth_city_propose_process_change`,
+  `synth_city_submit_retrospective_finding`.
+- **Agent view of audit.** Agents read a separate projection, not the operator read: an allowlist of event kinds and
+  fields; no free-text reasons written by other actors; no refusal details from guards.
+- **Team boundary.** The server derives the authorized team context keys from the authenticated principal: a member's
+  current team lifetime; for an external actor, the presets it supervises now, and only events since the binding.
+  Every caller filter is intersected with that boundary before pagination and totals. Unbound sessions are refused.
+  Missing or conflicting provenance fails closed. Events that carry only a slot id get their team resolved at write time.
+- **Proposals** reach the Director with the server-computed diff and server-linked evidence, shown apart from the
+  agent's own text. At most one open proposal per team and target; a rate limit per agent; proposals expire at
+  campaign finish; approval uses the same preview-token check and happens only in the UI.
+
+#### The page (option A)
+
+1. Header: campaign, dates, team, selector, items in scope and merged.
+2. Headline tiles with n, intervals and "not distinguishable" where it applies.
+3. Timeline: throughput with change markers, and exposure shading.
+4. Where work waited: stage breakdown with the responsible actor; decision-request times.
+5. Quality guardrails next to the speed measures; conditions (issue mix, models, quota and human-wait time).
+6. What to change: at most three suggestions with evidence; investigations; product defects.
+7. Applied changes and their verdicts, with keep and revert.
+8. Hypotheses (collapsed): agent findings with their citations.
+Charts use Recharts (as in `frontend/src/features/usage`). Each chart links to the Audit log tab filtered to its events.
+
+#### Integrity
+
+- Append-only triggers (`BEFORE UPDATE/DELETE` abort) on audit events, snapshots, membership events, findings and proposals.
+- Snapshots are immutable; only the Director recomputes, which creates a new version with fresh rule suggestions.
+  Applied changes and findings link to the campaign, so they carry over.
+- Rejection counts drawn from best-effort observations are labelled lower bounds.
+
