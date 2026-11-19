@@ -213,14 +213,23 @@ The section has two parts that behave differently (Director, 2026-11-19): a dete
 - Rules are kept few on purpose. From v4.5, the structured agent tool (Appendix A) lets agent-proposed fixes become
   first-class suggestions.
 
+**Evidence, lever, prescription** (Director, 2026-11-19). Every suggestion has three layers, and Synth City only
+fills in the first two:
+- **Evidence:** what happened, counted from recorded data. Always shown, always checkable.
+- **Lever:** which setting, or what kind of change. Named by a rule only when its condition fires; otherwise
+  "Investigate".
+- **Prescription:** the value to set, or the exact change to build. **Synth City never invents it.** It comes from
+  the Director, helped by a what-if table where one can be computed, or from an agent asked for a proposal, which
+  is shown as judgement.
+
 Each suggested fix names its kind and offers the matching action:
 
 | Kind | Action on the page |
 |---|---|
-| **Synth City setting** | a link to the setting in the v4.4 settings UI (#1115), with the suggested value prefilled. The Director confirms there. The change appears as a change marker. |
-| **Repository change** | **draft an issue**: the evidence and the proposed change, which the Director edits and files with the campaign's ready label. The Leader dispatches it like any other item. |
-| **Standing decision** | shown as a **lesson** until #1114 and #1115 make standing decisions settings |
-| **Synth City defect** | **copy evidence** for a bug report |
+| **Synth City setting** | a link to the setting in the v4.4 settings UI (#1115), **with no value prefilled**. Next to it, a **what-if table** computed from this campaign's data (for example, for an effort ceiling: how many of the affected items would still have hit 130, 150 or 180 minutes). A button **"Ask the Supervisor (or Leader) for a value"** sends the evidence. The Director chooses and saves; the change appears as a change marker. |
+| **Repository change** | **draft an issue**, pre-filled with the **problem, the evidence and a measurable target** (for example "e2e queue p85 under 3 minutes"). Its **Proposed change** section is left for the team, or filled by **"Ask the Leader / Supervisor to propose one"**: they can read the repository's workflows, which Synth City deliberately doesn't. The Director edits it and files it with the campaign's ready label; the Leader dispatches it like any other item. |
+| **Standing decision** | shown as a **lesson** stating the **observed pattern** (for example "14 of 14 batches like this were approved") and the rule it implies, until #1114 and #1115 make standing decisions settings |
+| **Synth City defect** | **copy evidence** for a bug report (fully deterministic) |
 
 Each suggestion states **takes effect** (next poll, next attempt, or after a member restart) and **disruption** (none,
 or which members restart). A restart change shows a **checklist** that links to the existing actions:
@@ -363,6 +372,7 @@ Order: 1 first, then 2 and 3, with 4 in parallel, then 5 to 8.
 | A flaky check is named per check, fail then pass on the same head | Review: GitHub check runs carry no test names |
 | The finish freezes at once when no member session is live | Review |
 | Section 2 becomes "Where the time went": one split bar of waiting on someone, process and active, with waiting on someone first and broken down by who had to act ("waited" mislabelled active work) | Director, 2026-11-19 |
+| Evidence, lever, prescription: Synth City fills in the evidence and the lever, never the prescription. Settings open with no value, next to a what-if table; issue drafts carry the problem and a measurable target, with the proposed change left to the team or an agent | Director, 2026-11-19: static logic can't choose values or repository-specific changes |
 | Top bottlenecks: deterministic ranking with anti-flicker thresholds; five starter rules with stated conditions; anything else is "Investigate" with an agent asked about that bottleneck's evidence | Director, 2026-11-19: static rules alone would be brittle |
 | Verifiers' views (quality and rework) alongside the Leader's and Supervisor's: asked at the finish, on demand mid-campaign; a different question per role | Director, 2026-11-19 |
 | Recording takes every check run on a head (required or not), Actions queue and run times and the workflow path; the page is generic by construction across repositories and CI apps, with a two-fixture acceptance test and a check on a second real repository | Director, 2026-11-19 |
