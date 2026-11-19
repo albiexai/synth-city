@@ -39,6 +39,17 @@ def capability(state: str, label: str, reason: str | None = None) -> dict[str, s
 
 
 PROVIDER_CAPABILITY_MATRIX: dict[str, dict[str, dict[str, str]]] = {
+    # Launch is implemented. #736 installs Agent Mail, but a Mail tool call through agy is not proven,
+    # so MCP, hooks and permissions stay unknown. Sessions are observed read-only (#737).
+    "antigravity-cli": {
+        "spawn": capability("write_capable", "Spawn Sessions", "Albiex Synth City can launch the Antigravity CLI (agy)."),
+        "resume": capability("write_capable", "Resume Sessions", "agy --conversation resumes a conversation by its UUID."),
+        "sessions": capability("read_only", "Agent Bridge Sessions", "Read an Antigravity CLI member's conversation state and discover its conversation from the live process."),
+        "mcp": capability("unknown", "MCP Servers", "Agent Mail can install an Antigravity CLI MCP entry; a Mail tool call through agy is not proven yet."),
+        "hooks": capability("unknown", "Hooks", "Agent Mail can install Antigravity CLI SessionStart, PreInvocation and question hooks; registration through them is not proven yet."),
+        "permissions": capability("unknown", "Permissions", "A team member's ask_question is denied by its own PreToolUse hook; other permission rules are not managed."),
+        "config": capability("unknown", "Configuration", "Antigravity CLI settings, including workspace trust, are not managed yet."),
+    },
     "muse-cli": {
         "spawn": capability("write_capable", "Spawn Sessions", "Albiex Synth City can launch Muse Code on a Muse subscription or API key."),
         "resume": capability("write_capable", "Resume Sessions", "Exact Muse Code sessions can be resumed by UUID."),

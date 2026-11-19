@@ -265,7 +265,7 @@ async def setup_preflight(
         "github_app_configuration_missing": "Configure the GitHub App and its bot login before using App authentication.",
         "github_app_installation_missing": "Install the configured GitHub App on this repository.",
         "dispatch_token_missing": "Configure the dispatch GitHub token or select a configured GitHub App.",
-        "operator_token_missing": "Configure operator_token in backend/.env, then apply the documented backend restart.",
+        "operator_token_missing": "Configure operator_token in the backend environment file (see the Installation guide, Configuration section), then apply the documented backend restart.",
     }
     for name, check in list(checks.items()):
         if check.status == "ready":
@@ -285,7 +285,7 @@ async def setup_preflight(
         "github_app_bot_login": bool(settings.github_app_bot_login),
     }
     host_guidance = [
-        "Configure github_token and operator_token in backend/.env.",
+        "Configure github_token and operator_token in the backend environment file (see the Installation guide, Configuration section).",
         "Configure the existing GitHub App settings only when App authentication is selected.",
         "Install the required harness and Agent Mail integration for team activation.",
         "Apply the documented backend restart when settings change, then repeat this check.",

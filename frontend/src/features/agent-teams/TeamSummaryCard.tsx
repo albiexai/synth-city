@@ -8,8 +8,8 @@ import { formatServerTime } from '@/lib/serverTime'
 import type {
   AgentTeamPresetListResponse, AgentTeamSummary, TeamRemainingWork,
 } from '@/types/agentTeams'
-import { ACTION_TEXT, ATTENTION_TEXT, incompleteRequestText, unansweredRequestText } from './summaryText'
-import { waitingText } from './supervisorText'
+import { ACTION_TEXT, ATTENTION_TEXT, incompleteRequestText, teamCoverageReasonText, unansweredRequestText } from './summaryText'
+import { blockedText, waitingText } from './supervisorText'
 import { parseReminders, reminderAge } from './reminderText'
 import { SupervisorStatus } from './SupervisorStatus'
 
@@ -61,8 +61,10 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 }
 
 // Display only: the card grants no approval, retry or merge action.
-export function TeamSummaryCard({ presetId, name, running, showChecked = true, compact = false, slotNames }: {
+export function TeamSummaryCard({ presetId, name, running, showChecked = true, compact = false, slotNames, query }: {
   presetId: number
+  // The Overview's Repository and Assigned-harness filter (#1142): the card then reads the same filtered summary.
+  query?: string
   name?: string
   // The team's autonomy switch. Shown as a plain word beside the name.
   running?: boolean
@@ -73,10 +75,11 @@ export function TeamSummaryCard({ presetId, name, running, showChecked = true, c
   // Member names by slot id, for the "waiting for input" row.
   slotNames?: Record<number, string>
 }) {
-  const state = useObservation<AgentTeamSummary>(`agent-teams/presets/${presetId}/summary`)
+  const state = useObservation<AgentTeamSummary>(`agent-teams/presets/${presetId}/summary${query ? `?${query}` : ''}`)
   const summary = state.data
   const unreadable = summary?.required_ci_unreadable ?? []
-  const waiting = summary?.waiting_input ?? []
+  const waiting = (summary?.waiting_input ?? []).filter((entry) => entry.label === 'Waiting for input')
+  const blocked = (summary?.waiting_input ?? []).filter((entry) => entry.label === 'Blocked: provider refusal')
   const overdue = summary?.supervisor_observation?.attention ?? null
   const reminders = parseReminders(summary?.reminder_attention)
   const actions = summary?.human_actions.filter(
@@ -184,6 +187,15 @@ export function TeamSummaryCard({ presetId, name, running, showChecked = true, c
                 </ul>
               </Row>
             )}
+            {blocked.length > 0 && (
+              <Row label="Blocked: provider refusal">
+                <ul className="space-y-1">
+                  {blocked.map((entry) => (
+                    <li key={entry.slot_id}>{blockedText(entry, slotNames)}</li>
+                  ))}
+                </ul>
+              </Row>
+            )}
             <Row label="Remaining">{remainingText(summary.remaining_work)}</Row>
             <Row label="Next actor">
               {summary.next_actors.length
@@ -204,7 +216,18 @@ export function TeamSummaryCard({ presetId, name, running, showChecked = true, c
               </Row>
             )}
           </dl>
-          {(!summary.coverage_complete || !summary.next_actor_coverage_complete || summary.reminder_attention_complete === false) && (
+          {!!summary.coverage_reason?.length ? (
+            <div role="note" className="text-xs text-muted-foreground">
+              <p>Some team observations are incomplete.</p>
+              <ul className="list-disc pl-4">
+                {summary.coverage_reason.map((reason, index) => (
+                  <li key={`${reason.code}-${reason.slot_id ?? reason.work_item_id ?? index}`}>
+                    {teamCoverageReasonText(reason, slotNames)}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : (!summary.coverage_complete || !summary.next_actor_coverage_complete || summary.reminder_attention_complete === false) && (
             <p role="note" className="text-xs text-muted-foreground">
               This summary may be incomplete: Synth City did not read every item.
             </p>
@@ -217,14 +240,25 @@ export function TeamSummaryCard({ presetId, name, running, showChecked = true, c
 }
 
 // One card for each team. A team filter limits the list to that team.
-export function TeamSummaries({ teamId, onOverview = false }: { teamId?: string | null; onOverview?: boolean }) {
+export function TeamSummaries({ teamId, onOverview = false, filterQuery = '', onlyIds = null }: {
+  teamId?: string | null
+  onOverview?: boolean
+  // The Overview's Repository and Assigned-harness filter, and the teams that it keeps (null: every team).
+  filterQuery?: string
+  onlyIds?: number[] | null
+}) {
   const state = useObservation<AgentTeamPresetListResponse>('agent-teams/presets')
   const presets = (state.data?.presets ?? []).filter(
-    (preset) => !teamId || String(preset.id) === teamId,
+    (preset) => (!teamId || String(preset.id) === teamId) && (onlyIds === null || onlyIds.includes(preset.id)),
   )
   return (
     <section aria-label="Teams" className={onOverview ? 'space-y-2' : 'space-y-3'}>
       <h3 className="text-lg font-semibold">Teams</h3>
+      {filterQuery && (
+        <p className="text-sm text-muted-foreground">
+          Filtered by repository or harness. Totals cover matching work only.
+        </p>
+      )}
       <ReadStatus state={state} />
       {state.data && presets.length === 0 && <p>No teams to show.</p>}
       <div className="grid gap-4 lg:grid-cols-2">
@@ -236,6 +270,7 @@ export function TeamSummaries({ teamId, onOverview = false }: { teamId?: string 
             running={preset.autonomy_enabled}
             showChecked={!onOverview}
             compact={onOverview}
+            query={filterQuery || undefined}
             slotNames={Object.fromEntries(preset.slots.map((slot) => [slot.id, slot.display_name]))}
           />
         ))}

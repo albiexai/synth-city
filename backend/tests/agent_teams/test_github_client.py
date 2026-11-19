@@ -1,16 +1,155 @@
+from datetime import datetime, timedelta, timezone
+
 import httpx
 import pytest
 
+from app.config import settings
 from app.services.github_client import (
     GithubClient,
     GithubClientResponseError,
     GithubTreeEntry,
 )
+from app.services.github_rate_limit_service import GithubRateLimited, GithubRateLimitService, github_rate_limit_service
 
 
 COMMIT_SHA = "a" * 40
 TREE_SHA = "b" * 40
 BLOB_SHA = "c" * 40
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_stops_other_repositories_and_check_reads():
+    reset = int((datetime.now(timezone.utc) + timedelta(minutes=5)).timestamp())
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        if len(seen) == 1:
+            return httpx.Response(403, headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(reset)})
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://api.github.com") as http:
+        client = GithubClient(http=http, token="quota-test-shared")
+        second = GithubClient(http=http, token="quota-test-shared")
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.list_issues_with_label("o", "one", "ready")
+        with pytest.raises(httpx.HTTPStatusError, match="github_rate_limited"):
+            await second.get_pull("o", "two", 1)
+        with pytest.raises(httpx.HTTPStatusError, match="github_rate_limited"):
+            await second.list_check_runs_for_ref("o", "two", COMMIT_SHA)
+        assert seen == ["/repos/o/one/issues"]
+        assert await GithubClient(http=http, token="quota-test-other").get_pull("o", "two", 1) == {}
+
+
+@pytest.mark.asyncio
+async def test_permission_403_does_not_pause_the_client():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        if len(seen) == 1:
+            return httpx.Response(403, headers={"x-ratelimit-remaining": "120"}, json={"message": "Forbidden"})
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://api.github.com") as http:
+        client = GithubClient(http=http, token="quota-test-permission")
+        with pytest.raises(httpx.HTTPStatusError, match="403 Forbidden"):
+            await client.get_pull("o", "one", 1)
+        assert await client.get_pull("o", "one", 2) == {}
+    assert seen == ["/repos/o/one/pulls/1", "/repos/o/one/pulls/2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [403, 429])
+async def test_rate_limit_resumes_at_the_later_deadline(monkeypatch, status):
+    now = datetime(2026, 11, 18, tzinfo=timezone.utc)
+    start = now
+    monkeypatch.setattr(github_rate_limit_service, "_now", lambda: now)
+    reset = int((now + timedelta(seconds=30)).timestamp())
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        if len(seen) == 1:
+            return httpx.Response(status, headers={
+                "x-ratelimit-remaining": "0", "x-ratelimit-reset": str(reset), "retry-after": "90",
+            })
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://api.github.com") as http:
+        client = GithubClient(http=http, token=f"quota-test-deadline-{status}")
+        with pytest.raises(GithubRateLimited) as first:
+            await client.get_pull("o", "r", 1)
+        assert first.value.retry_at == start + timedelta(seconds=90)
+        now = start + timedelta(seconds=89)
+        with pytest.raises(GithubRateLimited):
+            await client.get_pull("o", "r", 2)
+        assert len(seen) == 1
+        now += timedelta(seconds=1)
+        assert await client.get_pull("o", "r", 3) == {}
+        assert seen == ["/repos/o/r/pulls/1", "/repos/o/r/pulls/3"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("other_limited", [False, True])
+async def test_active_cooldown_survives_quota_cache_pressure(monkeypatch, other_limited):
+    now = datetime(2026, 11, 18, tzinfo=timezone.utc)
+    reset = now + timedelta(minutes=10)
+    store = GithubRateLimitService(now=lambda: now)
+    monkeypatch.setattr("app.services.github_client.github_rate_limit_service", store)
+    monkeypatch.setattr(settings, "github_token", "quota-test-capacity")
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        limited = len(seen) == 1 or other_limited
+        return httpx.Response(403 if limited else 200, json={}, headers={
+            "x-ratelimit-remaining": "0" if limited else "12", "x-ratelimit-reset": str(int(reset.timestamp())),
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://api.github.com") as http:
+        polling = GithubClient(http=http)
+        with pytest.raises(GithubRateLimited):
+            await polling.get_pull("o", "r", 1)
+        for number in range(128):
+            client = GithubClient(http=http, token=f"quota-test-capacity-other-{number}")
+            if other_limited:
+                with pytest.raises(GithubRateLimited):
+                    await client.get_pull("o", "r", 2)
+            else:
+                await client.get_pull("o", "r", 2)
+
+        quota = store.polling_status()
+        assert quota is not None and quota["reason"] == "github_rate_limited"
+        assert quota["remaining"] == 0 and quota["retry_at"] == reset.isoformat()
+        with pytest.raises(GithubRateLimited):
+            await polling.get_pull("o", "r", 3)
+        assert len(seen) == 129
+
+
+@pytest.mark.asyncio
+async def test_reordered_responses_preserve_the_current_window_and_lowest_count(monkeypatch):
+    now = datetime(2026, 11, 18, tzinfo=timezone.utc)
+    new = int((now + timedelta(minutes=5)).timestamp())
+    old = int((now - timedelta(seconds=1)).timestamp())
+    store = GithubRateLimitService(now=lambda: now)
+    monkeypatch.setattr("app.services.github_client.github_rate_limit_service", store)
+    monkeypatch.setattr(settings, "github_token", "quota-test-reordered")
+    observations = iter([(new, 4999), (old, 1), (old, 0), (new, 8), (new, 12), (new + 3600, 4998)])
+
+    def handler(request):
+        reset, remaining = next(observations)
+        return httpx.Response(200, json={}, headers={
+            "x-ratelimit-remaining": str(remaining), "x-ratelimit-reset": str(reset),
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://api.github.com") as http:
+        client = GithubClient(http=http)
+        for expected in (4999, 4999, 4999, 8, 8, 4998):
+            await client.get_pull("o", "r", 1)
+            quota = store.polling_status()
+            assert quota is not None and quota["remaining"] == expected
+            assert quota["reason"] is None
 
 
 @pytest.mark.asyncio
@@ -50,6 +189,41 @@ async def test_exact_source_import_ancestry_response(case):
             with pytest.raises(GithubClientResponseError):
                 await client.is_commit_ancestor("owner", "repo", COMMIT_SHA, TREE_SHA,
                     token="explicit-token")
+    assert seen[0].url.path == endpoint and seen[0].method == "GET"
+    assert seen[0].headers["Authorization"] == "Bearer explicit-token"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "ahead", "identical", "behind", "diverged", "wrong_base", "foreign_url", "missing_url", "user_url",
+    "missing_common", "malformed_common", "unknown_status", "foreign_endpoint",
+])
+async def test_exact_merge_base_response(case):
+    """#1030: the merge base of a base tip and a head, from a bound comparison response; anything else is refused."""
+    endpoint = f"/repos/owner/repo/compare/{COMMIT_SHA}...{TREE_SHA}"
+    seen = []
+    def handler(request):
+        seen.append(request)
+        body = {"url": "https://api.github.com" + endpoint, "base_commit": {"sha": COMMIT_SHA},
+                "merge_base_commit": {"sha": BLOB_SHA}, "status": "diverged"}
+        if case in {"ahead", "identical", "behind"}: body["status"] = case
+        elif case == "wrong_base": body["base_commit"]["sha"] = BLOB_SHA
+        elif case == "foreign_url": body["url"] = "https://example.invalid" + endpoint
+        elif case == "missing_url": body.pop("url")
+        elif case == "user_url": body["url"] = "https://user@api.github.com" + endpoint
+        elif case == "missing_common": body.pop("merge_base_commit")
+        elif case == "malformed_common": body["merge_base_commit"]["sha"] = "invalid"
+        elif case == "unknown_status": body["status"] = "unknown"
+        return httpx.Response(200, request=request, json=body)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url=(
+        "https://example.invalid" if case == "foreign_endpoint" else "https://api.github.com")) as http:
+        client = GithubClient(http=http, token="ambient-token")
+        if case in {"ahead", "identical", "behind", "diverged"}:
+            assert await client.get_merge_base("owner", "repo", COMMIT_SHA, TREE_SHA,
+                token="explicit-token") == BLOB_SHA
+        else:
+            with pytest.raises(GithubClientResponseError):
+                await client.get_merge_base("owner", "repo", COMMIT_SHA, TREE_SHA, token="explicit-token")
     assert seen[0].url.path == endpoint and seen[0].method == "GET"
     assert seen[0].headers["Authorization"] == "Bearer explicit-token"
 

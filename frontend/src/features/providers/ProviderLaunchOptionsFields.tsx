@@ -87,7 +87,8 @@ export function ProviderLaunchOptionsFields({
   const isCopilot = provider === 'copilot-cli'
   const isOpenCode = provider === 'opencode-cli'
   const isMuse = provider === 'muse-cli'
-  const usesSimpleModelInput = isCopilot || isOpenCode || isMuse || provider === 'pi-cli' || ((isCodex || isClaude) && isBedrock)
+  const isAntigravity = provider === 'antigravity-cli'
+  const usesSimpleModelInput = isCopilot || isOpenCode || isMuse || isAntigravity || provider === 'pi-cli' || ((isCodex || isClaude) && isBedrock)
   const simpleModelKey: keyof SlotLaunchOptions = (isCodex || isClaude) && isBedrock ? 'bedrock_model' : 'model'
   const simpleModelValue = (isCodex || isClaude) && isBedrock ? bedrockModel : model
 
@@ -133,6 +134,9 @@ export function ProviderLaunchOptionsFields({
     <div className="grid gap-4">
       {isMuse && (
         <p className="text-sm text-muted-foreground">Meta · runs on your Muse subscription through Muse Code. Questions are detected and sent to the Supervisor; Muse cannot block them.</p>
+      )}
+      {isAntigravity && (
+        <p className="text-sm text-muted-foreground">Google · runs through Antigravity CLI. Team launch stays blocked until a Mail tool call through agy is proven and the agent user has completed agy onboarding.</p>
       )}
       {provider === 'pi-cli' && (
         <p className="text-sm text-muted-foreground">OpenRouter · default moonshotai/kimi-k3. Agent Mail requires the Synth City extension; Pi tools are not sandboxed by Synth City.</p>

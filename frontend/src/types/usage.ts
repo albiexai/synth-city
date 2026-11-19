@@ -1,6 +1,7 @@
 /**
  * TypeScript types for usage tracking
  */
+import type { HarnessReadScope } from './harnessScope'
 
 export interface TokenCounts {
   input_tokens: number
@@ -121,4 +122,5 @@ export interface BlockUsageListResponse {
 
 export interface UsageSummaryResponse {
   summary: UsageSummary
+  scope?: HarnessReadScope | null
 }

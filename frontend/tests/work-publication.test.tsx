@@ -5,10 +5,10 @@ import { apiClient } from '../src/lib/api'
 import type { GithubWorkItem } from '../src/types/agentTeams'
 
 vi.mock('../src/lib/api', () => ({ apiClient: vi.fn() }))
-const item = { id: 1, dispatch_nonce: 'dispatch', owner_slot_id: 2, repo_owner: 'owner', repo_name: 'repo',
+const item = { id: 1, dispatch_generation: 'dispatch', owner_slot_id: 2, repo_owner: 'owner', repo_name: 'repo',
   dispatch_head_ref: 'task', dispatch_status: 'dispatched', issue_number: 10 } as GithubWorkItem
 function progress(changes = {}) {
-  return { work_item_id: 1, dispatch_nonce: 'dispatch', owner_slot_id: 2,
+  return { work_item_id: 1, dispatch_generation: 'dispatch', owner_slot_id: 2,
     checked_at: new Date(Date.now()).toISOString(), valid_until: new Date(Date.now() + 15000).toISOString(),
     phase: 'implementation', next_actor: 'owner', next_action: 'Continue approved work.',
     next_poll_expected_at: null, last_check_head: null,
@@ -183,7 +183,7 @@ describe('Work publication observations', () => {
     expect(screen.queryByText('Continue approved work.')).toBeNull()
   })
   it('rejects mismatched dispatch data and cancels a request on unmount', async () => {
-    vi.mocked(apiClient).mockResolvedValue(progress({ dispatch_nonce: 'old-dispatch' }))
+    vi.mocked(apiClient).mockResolvedValue(progress({ dispatch_generation: 'old-dispatch' }))
     const view = render(<WorkPublicationPanel item={item} />)
     expect(await screen.findByText(/Unable to refresh progress/)).toBeTruthy()
     expect(screen.queryByText('2 unpublished commits')).toBeNull()
@@ -205,7 +205,7 @@ it('does not restore prior current data across A to B to A', async () => {
   vi.mocked(apiClient).mockResolvedValueOnce(progress()).mockImplementation(() => new Promise(() => {}))
   const view = render(<WorkPublicationPanel item={item} />)
   await screen.findByText('2 unpublished commits')
-  view.rerender(<WorkPublicationPanel item={{ ...item, id: 2, dispatch_nonce: 'other' }} />)
+  view.rerender(<WorkPublicationPanel item={{ ...item, id: 2, dispatch_generation: 'other' }} />)
   view.rerender(<WorkPublicationPanel item={item} />)
   expect(screen.queryByText('2 unpublished commits')).toBeNull()
   expect(screen.queryByText('Continue approved work.')).toBeNull()

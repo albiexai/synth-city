@@ -1,4 +1,5 @@
 // Generated from accepted P01 schema1; provenance: tests/fixtures/factory/PROVENANCE.md.
+import type { AgentStatus } from './agentStatus';
 import type { RequiredCIUnreadableSignal } from './agentTeams';
 export type FactoryErrorDetail = {
   code:
@@ -189,6 +190,8 @@ export type SafeWorkItem = {
 };
 
 export type SessionAssociation = {
+  /** Display facts for the member (#1073). The strict state below stays what it is; these only add evidence. */
+  agent_status?: AgentStatus | null;
   bridge_target: BridgeTarget | null;
   observed_provider: string | null;
   state: "bound" | "offline" | "ambiguous" | "unknown";

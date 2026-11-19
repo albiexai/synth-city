@@ -767,6 +767,78 @@ async def test_github_scope_create_missing_preset_returns_404(client, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_github_work_item_feed_total_counts_items_beyond_page(client, db, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    async def make_preset_with_scope(name):
+        preset = await agent_team_service.create_preset(
+            db,
+            AgentTeamPresetCreate(
+                name=name,
+                slots=[
+                    AgentTeamSlotCreate(
+                        display_name="Backend SME",
+                        provider="codex-cli",
+                        repo_path=str(repo),
+                    )
+                ],
+            ),
+        )
+        scope = TeamGithubScope(
+            preset_id=preset.id,
+            repo_owner="adrirubio",
+            repo_name="snazzyemail",
+            repo_path=str(repo),
+        )
+        db.add(scope)
+        await db.flush()
+        return preset, scope
+
+    paged, paged_scope = await make_preset_with_scope("Paged team")
+    other, other_scope = await make_preset_with_scope("Other team")
+    db.add_all(
+        [
+            GithubWorkItem(
+                scope_id=paged_scope.id,
+                issue_number=number,
+                issue_title=f"Paged item {number}",
+                issue_url=f"https://github.com/adrirubio/snazzyemail/issues/{number}",
+                github_updated_at=datetime.utcnow(),
+                dispatch_status="dispatched",
+            )
+            for number in (30, 31, 32)
+        ]
+        + [
+            GithubWorkItem(
+                scope_id=other_scope.id,
+                issue_number=40,
+                issue_title="Other team item",
+                issue_url="https://github.com/adrirubio/snazzyemail/issues/40",
+                github_updated_at=datetime.utcnow(),
+                dispatch_status="dispatched",
+            )
+        ]
+    )
+    await db.commit()
+
+    page = await client.get(
+        f"/api/v1/agent-teams/presets/{paged.id}/github-work-items",
+        params={"limit": 1},
+    )
+    assert page.status_code == 200
+    assert len(page.json()["items"]) == 1
+    assert page.json()["total"] == 3
+
+    full = await client.get(f"/api/v1/agent-teams/presets/{paged.id}/github-work-items")
+    assert len(full.json()["items"]) == 3
+    assert full.json()["total"] == 3
+
+    other_feed = await client.get(f"/api/v1/agent-teams/presets/{other.id}/github-work-items")
+    assert other_feed.json()["total"] == 1
+
+
+@pytest.mark.asyncio
 async def test_github_work_item_feed_and_retry_guard(client, db, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -3491,6 +3563,36 @@ async def test_readiness_confirms_muse_identity_by_its_registered_executable(
     await db.flush()
     (await db.get(AgentTeamSlot, preset.slots[1].id)).provider = "muse-cli"
     (await db.get(MailAgentSession, 8107)).provider = "muse-cli"
+    monkeypatch.setattr("app.utils.peer_process.pane_agent_argv", lambda pane_pid, proc_start: argv)
+    await db.commit()
+    readiness = await client.get(f"/api/v1/agent-teams/github-scopes/{scope.id}/activation-readiness")
+    codes = {blocker["code"] for blocker in readiness.json()["blockers"]}
+    assert ("owner_binding_native_identity" not in codes) is confirmed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("argv,confirmed", [
+    (["/home/u/.local/bin/agy", "--conversation", "x"], True),
+    (["agy", "-i", "hello"], True),
+    (["agyx"], False),
+    (["/usr/bin/yes", "agy"], False),
+    (["gemini"], False),
+    # The provider id is not the executable, and argv[0] is never split on whitespace.
+    (["antigravity-cli"], False),
+    (["/tmp/agy arbitrary-file"], False),
+    (["agy-old"], False),
+])
+async def test_readiness_confirms_antigravity_identity_by_its_registered_executable(
+    client, db, monkeypatch, tmp_path, argv, confirmed
+):
+    """An Antigravity CLI member is the agy binary itself."""
+    from app.models.database import AgentTeamSlot, MailAgentSession
+
+    preset, scope, _repo = await _readiness_team(db, monkeypatch, tmp_path, "AgyId", 1)
+    _bind_owner(db, preset, preset.slots[1].id, 1007, 8107, last_seen=datetime.utcnow())
+    await db.flush()
+    (await db.get(AgentTeamSlot, preset.slots[1].id)).provider = "antigravity-cli"
+    (await db.get(MailAgentSession, 8107)).provider = "antigravity-cli"
     monkeypatch.setattr("app.utils.peer_process.pane_agent_argv", lambda pane_pid, proc_start: argv)
     await db.commit()
     readiness = await client.get(f"/api/v1/agent-teams/github-scopes/{scope.id}/activation-readiness")

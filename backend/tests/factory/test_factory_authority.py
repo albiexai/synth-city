@@ -38,8 +38,10 @@ async def test_runtime_intake_polling_partitions(factory_client, factory_store, 
     automation = response.json()["automation"]
     assert len(calls) == 1
     assert automation["configured_scopes"] == automation["enabled_scopes"] + automation["paused_scopes"] == 3
-    assert automation["enabled_scopes"] == sum(automation[f"intake_{s}_scopes"] for s in ("eligible", "blocked", "unknown")) == 2
-    assert automation[f"intake_{intake_state}_scopes"] == 2
+    # #1104: intake is counted for every configured scope; the paused scope's intake is blocked (scope_paused).
+    assert automation["configured_scopes"] == sum(automation[f"intake_{s}_scopes"] for s in ("eligible", "blocked", "unknown")) == 3
+    assert automation[f"intake_{intake_state}_scopes"] == (3 if intake_state == "blocked" else 2)
+    assert automation["intake_blocked_scopes"] == (3 if intake_state == "blocked" else 1)
     assert automation["runtime"]["observed_at"] != response.json()["generated_at"]
     if intake_state != "eligible":
         assert automation["never_polled_scopes"] == automation["stale_scopes"] == 0
@@ -53,6 +55,24 @@ async def test_runtime_intake_polling_partitions(factory_client, factory_store, 
     assert all(r["intake"]["reason_code"] == reason for r in enabled)
     assert all(r["poll"]["freshness"] == "suspended" for r in enabled) if intake_state == "blocked" else True
     assert all(r["poll"]["freshness"] == "unknown" for r in enabled) if intake_state == "unknown" else True
+
+
+@pytest.mark.parametrize("team_paused", [False, True])
+async def test_overview_intake_counts_equal_the_repositories_intake_tally(factory_client, factory_store, team_paused):
+    """#1104 (U10): one definition of intake per scope. With the team paused every scope is blocked (team_paused)."""
+    if team_paused:
+        async with factory_store.maker() as db:
+            await db.execute(update(AgentTeamPreset).values(autonomy_enabled=False))
+            await db.commit()
+    automation = (await factory_client.get("/api/v1/factory/overview")).json()["automation"]
+    repos = (await factory_client.get("/api/v1/factory/repositories")).json()["repositories"]
+    tally = {state: sum(r["intake"]["state"] == state for r in repos) for state in ("eligible", "blocked", "unknown")}
+    assert {state: automation[f"intake_{state}_scopes"] for state in tally} == tally
+    if team_paused:
+        assert automation["paused_scopes"] == automation["intake_blocked_scopes"] == len(repos) == 3
+        assert {r["intake"]["reason_code"] for r in repos} == {"team_paused"}
+    # Poll freshness is still counted only for switched-on scopes.
+    assert automation["never_polled_scopes"] == (0 if team_paused else 1)
 
 
 async def test_runtime_observer_never_initializes_scheduler_or_exposes_gate(monkeypatch):
@@ -239,3 +259,26 @@ async def test_representative_existing_mutations_persist_update_timestamp(factor
         await github_verification_service._promote_verified_item(db, scope, item, client, pull, "a" * 40)
         await db.refresh(item)
         assert item.updated_at > original_time and item.dispatch_status == "ready_for_review"
+
+
+@pytest.mark.parametrize("condition", ["mismatched_pane", "retired_pane"])
+async def test_an_online_owner_without_a_verified_pane_stays_unknown_and_carries_its_agent_status(
+        factory_client, factory_store, condition):
+    """#1073: "bound" stays strict (it feeds offline_slot and the owner_offline escalation). The Work page words the
+    owner's session from the agent status that is already on the same object, so an online owner that has no verified
+    pane is shown as that, not as a bare "unknown". The wire carries both, and adds no value."""
+    ids = factory_store.ids
+    async with factory_store.maker() as db:
+        session = (await db.execute(select(MailAgentSession).where(MailAgentSession.team_slot_id == ids.owners[1]))).scalar_one()
+        if condition == "mismatched_pane": session.bound_pane_proc_start = "wrong-start"
+        if condition == "retired_pane":
+            db.add(MailPaneLifecycle(pane_pid=session.bound_pane_pid,
+                                    pane_proc_start=session.bound_pane_proc_start, retired_at=NOW.replace(tzinfo=None)))
+        await db.commit()
+    body = (await factory_client.get(f"/api/v1/factory/work-items/{ids.items[1]}")).json()["work_item"]
+    assert body["session"]["state"] == "unknown"
+    assert body["session"]["bridge_target"] is None and body["links"]["bridge_target"] is None
+    # offline_slot stays strict: the owner is not offline, so no launch hint names the owner's slot (the offline
+    # Leader's own hint, if any, is a different slot)
+    assert (body["links"]["launch_plan"] or {}).get("slot_id") != ids.owners[1]
+    assert body["session"]["agent_status"]["session_state"] == "online"

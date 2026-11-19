@@ -33,12 +33,51 @@ function folderName(path: string): string {
   return path.split('/').filter(Boolean).pop() ?? path;
 }
 
+function normalizePath(path: string): string {
+  return path.replace(/\/+$/, '') || '/';
+}
+
+// Comparison only: "." and empty segments are dropped. ".." is not resolved and nothing is read from disk.
+function pathKey(path: string): string {
+  const segments = path.split('/').filter((segment) => segment !== '' && segment !== '.');
+  return (path.startsWith('/') ? '/' : '') + segments.join('/');
+}
+
+interface TeamSlot {
+  provider: string;
+  path: string;
+  name: string;
+}
+
+function teamFoldersOf(slots: TeamSlot[]): KnownFolder[] {
+  const byPath = new Map<string, string[]>();
+  for (const slot of slots) byPath.set(slot.path, [...(byPath.get(slot.path) ?? []), slot.name]);
+  return [...byPath.entries()].map(([path, members]) => ({
+    path,
+    name: folderName(path),
+    source: 'team' as const,
+    detail: members.join(', '),
+  }));
+}
+
+// /harnesses/folders is the Projects page, not a harness.
+function pageHarness(pathname: string): string | null {
+  const parts = pathname.split('/').filter(Boolean);
+  if (parts[0] !== 'harnesses' || parts.length < 2 || parts[1] === 'folders') return null;
+  return parts[1];
+}
+
 interface ProjectContextType {
   projects: ProjectResponse[];
   /** The project that this page's URL (?project=) names, or null. Per page and per browser. */
   activeProject: ProjectResponse | null;
+  /** The folders this page offers. A harness page offers only its own members' folders. */
+  pageFolders: KnownFolder[];
   knownFolders: KnownFolder[];
   setProjectPath: (path: string | null) => void;
+  /** The OS user whose global scope this Harnesses page shows (?scope_user=), or null for the default. */
+  scopeUser: string | null;
+  setScopeUser: (name: string | null) => void;
   loading: boolean;
   error: string | null;
   fetchProjects: () => Promise<void>;
@@ -55,9 +94,15 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const [projects, setProjects] = useState<ProjectResponse[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [teamFolders, setTeamFolders] = useState<KnownFolder[]>([]);
+  const [teamSlots, setTeamSlots] = useState<TeamSlot[] | null>(null);
   const [searchParams, setSearchParams] = useSearchParams();
   const { pathname } = useLocation();
+  const harness = pageHarness(pathname);
+  const [rosterHarness, setRosterHarness] = useState(harness);
+  if (rosterHarness !== harness) {
+    setRosterHarness(harness);
+    setTeamSlots(null);
+  }
 
   const fetchProjects = useCallback(async () => {
     setLoading(true);
@@ -157,22 +202,37 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   }, [fetchProjects]);
 
   const knownFolders = useMemo<KnownFolder[]>(() => {
-    const byPath = new Map<string, KnownFolder>();
-    for (const folder of teamFolders) byPath.set(folder.path, folder);
+    const byKey = new Map<string, KnownFolder>();
+    for (const folder of teamFoldersOf(teamSlots ?? [])) byKey.set(pathKey(folder.path), folder);
     for (const project of projects) {
-      if (!byPath.has(project.path)) byPath.set(project.path, { path: project.path, name: project.name, source: 'tracked' });
+      const key = pathKey(project.path);
+      if (!byKey.has(key)) byKey.set(key, { path: normalizePath(project.path), name: project.name, source: 'tracked' });
     }
-    return [...byPath.values()];
-  }, [teamFolders, projects]);
+    return [...byKey.values()];
+  }, [teamSlots, projects]);
+
+  const pageFolders = useMemo<KnownFolder[]>(() => {
+    if (harness === null) return knownFolders;
+    if (teamSlots === null) return [];
+    const teamKeys = new Set(teamSlots.map((slot) => pathKey(slot.path)));
+    const byKey = new Map<string, KnownFolder>();
+    for (const folder of teamFoldersOf(teamSlots.filter((slot) => slot.provider === harness))) byKey.set(pathKey(folder.path), folder);
+    for (const project of projects) {
+      const key = pathKey(project.path);
+      if (!byKey.has(key) && !teamKeys.has(key)) byKey.set(key, { path: normalizePath(project.path), name: project.name, source: 'tracked' });
+    }
+    return [...byKey.values()];
+  }, [harness, knownFolders, teamSlots, projects]);
 
   // The project comes from this page's URL. A missing or unknown value is no project, with no error.
   const scoped = projectScopedSurface(pathname) !== null;
   const projectParam = scoped ? searchParams.get('project') : null;
   const activeProject = useMemo<ProjectResponse | null>(() => {
     if (!projectParam) return null;
-    const known = knownFolders.find((folder) => folder.path === projectParam);
+    const key = pathKey(projectParam);
+    const known = pageFolders.find((folder) => pathKey(folder.path) === key);
     if (!known) return null;
-    const tracked = projects.find((project) => project.path === known.path);
+    const tracked = projects.find((project) => pathKey(project.path) === key);
     return {
       id: tracked?.id ?? -1,
       name: known.name,
@@ -181,7 +241,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       last_accessed: tracked?.last_accessed ?? '',
       created_at: tracked?.created_at ?? '',
     };
-  }, [projectParam, knownFolders, projects]);
+  }, [projectParam, pageFolders, projects]);
 
   const setProjectPath = useCallback((path: string | null) => {
     setSearchParams((current) => {
@@ -192,32 +252,38 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     }, { replace: true });
   }, [setSearchParams]);
 
+  const scopeUser = pathname.startsWith('/harnesses') ? searchParams.get('scope_user') : null;
+  const setScopeUser = useCallback((name: string | null) => {
+    setSearchParams((current) => {
+      const next = new URLSearchParams(current);
+      if (name) next.set('scope_user', name);
+      else next.delete('scope_user');
+      return next;
+    }, { replace: true });
+  }, [setSearchParams]);
+
+  // Membership is read again on each harness page entry, so a member folder moved since the last visit is not stale.
   useEffect(() => {
     let cancelled = false;
     fetchAgentTeamPresets()
       .then((response) => {
         if (cancelled) return;
-        const byPath = new Map<string, string[]>();
+        const slots: TeamSlot[] = [];
         for (const preset of response.presets) {
           for (const slot of preset.slots) {
             if (!slot.repo_path) continue;
-            byPath.set(slot.repo_path, [...(byPath.get(slot.repo_path) ?? []), slot.display_name]);
+            slots.push({ provider: slot.provider, path: normalizePath(slot.repo_path), name: slot.display_name });
           }
         }
-        setTeamFolders([...byPath.entries()].map(([path, members]) => ({
-          path,
-          name: folderName(path),
-          source: 'team' as const,
-          detail: members.join(', '),
-        })));
+        setTeamSlots(slots);
       })
       .catch(() => {
-        if (!cancelled) setTeamFolders([]);
+        if (!cancelled) setTeamSlots(null);
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [harness]);
 
   // Fetch projects on mount
   useEffect(() => {
@@ -229,8 +295,11 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       value={{
         projects,
         activeProject,
+        pageFolders,
         knownFolders,
         setProjectPath,
+        scopeUser,
+        setScopeUser,
         loading,
         error,
         fetchProjects,

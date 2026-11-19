@@ -58,3 +58,11 @@ export const surfaceInfo: Partial<Record<NativeSurface, SurfaceInfo>> = {
   usage: { group: 'History & usage', name: 'Usage', purpose: 'Tokens and estimated cost', icon: BarChart3 },
   backup: { group: 'Safety', name: 'Backup & restore', purpose: 'Save and restore these settings', icon: Archive },
 }
+
+const providerSurfaceNames: Record<string, Partial<Record<string, string>>> = {
+  'codex-cli': { memory: 'Memory' },
+}
+
+export function surfaceName(provider: string, surface: string): string | undefined {
+  return providerSurfaceNames[provider]?.[surface] ?? surfaceInfo[surface as NativeSurface]?.name
+}

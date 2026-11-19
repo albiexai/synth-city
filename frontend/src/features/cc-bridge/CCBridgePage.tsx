@@ -35,10 +35,11 @@ const PROVIDER_FILTERS: { value: ProviderFilter; label: string }[] = [
   { value: 'all', label: 'All agents' },
   { value: 'claude-code', label: 'Claude Code' },
   { value: 'codex-cli', label: 'Codex' },
-  { value: 'copilot-cli', label: 'Copilot' },
+  { value: 'copilot-cli', label: 'GitHub Copilot CLI' },
   { value: 'opencode-cli', label: 'OpenCode' },
   { value: 'pi-cli', label: 'Pi' },
   { value: 'muse-cli', label: 'Muse Code' },
+  { value: 'antigravity-cli', label: 'Antigravity CLI' },
 ]
 
 function addTarget(prev: string[], target: string): string[] {
@@ -172,6 +173,7 @@ export function CCBridgePage() {
     'opencode-cli': sessions.filter((session) => session.provider === 'opencode-cli').length,
     'pi-cli': sessions.filter((session) => session.provider === 'pi-cli').length,
     'muse-cli': sessions.filter((session) => session.provider === 'muse-cli').length,
+    'antigravity-cli': sessions.filter((session) => session.provider === 'antigravity-cli').length,
   }
 
   const initialDialogProvider = providerFilter === 'all' ? selectedProviderId : providerFilter
@@ -514,6 +516,7 @@ export function CCBridgePage() {
                           setLayoutMode(isThisFullscreen ? { kind: 'grid' } : { kind: 'single', target })
                         }
                         onClose={() => removeTarget(target)}
+                        onDetach={() => removeTarget(target)}
                         instance={instance}
                         session={session}
                       />

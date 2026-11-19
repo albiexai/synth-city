@@ -10,6 +10,7 @@ import { anchor, panel } from "../components/styles";
 import { Time } from "../components/Time";
 import { stateLabel } from "../filterHelpers";
 import { useObservation } from "../reads";
+import { ownerSessionEvidence, useNow } from "../sessionEvidence";
 import { waitingActorLabel } from "../waitingActor";
 
 export function WorkDetailPage() {
@@ -18,6 +19,7 @@ export function WorkDetailPage() {
     `factory/work-items/${encodeURIComponent(workItemId ?? "")}`,
   );
   const w = state.data?.work_item;
+  const now = useNow();
   const title = w ? `#${w.item.issue_number} ${w.item.issue_title}` : null;
   return (
     <section className="space-y-5">
@@ -134,7 +136,7 @@ export function WorkDetailPage() {
               <p>
                 Approver slot {w.approver?.slot_id ?? "unknown"} (
                 {w.approver?.source ?? "unknown"}) · owner session{" "}
-                {w.session.state} · runtime seen{" "}
+                {ownerSessionEvidence(w.session, now)} · runtime seen{" "}
                 {w.session.observed_provider ?? "unknown"}
               </p>
               <p className="break-all">

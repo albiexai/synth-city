@@ -639,3 +639,61 @@ async def test_codex_capture_does_not_replace_changed_or_duplicate_slot(db, code
     await db.refresh(slot)
     assert "session_id" not in slot.launch_options
     assert result.slots[0].state == "unknown"
+
+
+def _codex_long_turn(native, session_id, *, start_age, filler_bytes, progress_age=1, completed=False):
+    """A Codex turn whose task_started is followed by filler_bytes of tool records (#1201)."""
+    now = native["now"]
+    at = lambda age: (now - timedelta(seconds=age)).isoformat()
+    rows = [{"type": "session_meta", "payload": {"id": session_id, "cwd": str(native["cwd"])}},
+            {"type": "event_msg", "payload": {"type": "task_started"}, "timestamp": at(start_age)}]
+    chunk = "x" * 1000
+    for _ in range(filler_bytes // 1000 + 1):
+        rows.append({"type": "response_item", "payload": {"type": "custom_tool_call_output", "output": chunk},
+                     "timestamp": at(start_age)})
+    rows.append({"type": "event_msg", "payload": {"type": "token_count"}, "timestamp": at(progress_age)})
+    if completed:
+        rows.append({"type": "event_msg", "payload": {"type": "task_complete"}, "timestamp": at(progress_age)})
+    native["log"].write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+
+def test_codex_long_turn_keeps_its_start_beyond_the_tail(native, monkeypatch):
+    # #1201: a long turn pushed task_started out of the tail, so a working member read "unknown".
+    monkeypatch.setattr(activity, "_TAIL_BYTES", 4096)
+    session_id = str(uuid4())
+    _codex_long_turn(native, session_id, start_age=60, filler_bytes=3 * 4096)
+    assert native["log"].stat().st_size > 3 * 4096
+    result = activity._native_state(native["log"], session_id, str(native["cwd"]),
+                                    native["now"], native["now"] - timedelta(seconds=120))
+    assert result[:2] == ("working", "native_turn_started")
+
+
+def test_codex_lookback_never_uses_a_start_from_before_the_process(native, monkeypatch):
+    monkeypatch.setattr(activity, "_TAIL_BYTES", 4096)
+    session_id = str(uuid4())
+    _codex_long_turn(native, session_id, start_age=600, filler_bytes=3 * 4096)
+    result = activity._native_state(native["log"], session_id, str(native["cwd"]),
+                                    native["now"], native["now"] - timedelta(seconds=120))
+    assert result[0] == "unknown"
+
+
+def test_codex_lookback_is_bounded(native, monkeypatch):
+    monkeypatch.setattr(activity, "_TAIL_BYTES", 4096)
+    monkeypatch.setattr(activity, "_MAX_HISTORY_BYTES", 8192, raising=False)
+    session_id = str(uuid4())
+    _codex_long_turn(native, session_id, start_age=60, filler_bytes=4 * 4096)
+    result = activity._native_state(native["log"], session_id, str(native["cwd"]),
+                                    native["now"], native["now"] - timedelta(seconds=120))
+    assert result[0] == "unknown"
+
+
+def test_codex_long_turn_completion_beyond_the_tail_reads_idle(native, monkeypatch):
+    # #1201 review: the same long turn, then a task_complete, settles as idle.
+    monkeypatch.setattr(activity, "_TAIL_BYTES", 4096)
+    session_id = str(uuid4())
+    _codex_long_turn(native, session_id, start_age=60, filler_bytes=3 * 4096, completed=True)
+    metadata = {}
+    result = activity._native_state(native["log"], session_id, str(native["cwd"]),
+                                    native["now"], native["now"] - timedelta(seconds=120), provenance=metadata)
+    assert result[:2] == ("idle", "native_turn_completed")
+    assert metadata["event_source"] == "task_complete"

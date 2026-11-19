@@ -5,10 +5,10 @@ import { apiClient } from '../src/lib/api'
 import type { GithubWorkItem } from '../src/types/agentTeams'
 
 vi.mock('../src/lib/api', () => ({ apiClient: vi.fn() }))
-const item = { id: 1, dispatch_nonce: 'dispatch', owner_slot_id: 2, repo_owner: 'owner', repo_name: 'repo',
+const item = { id: 1, dispatch_generation: 'dispatch', owner_slot_id: 2, repo_owner: 'owner', repo_name: 'repo',
   dispatch_head_ref: 'task', dispatch_status: 'dispatched', issue_number: 10 } as GithubWorkItem
 function progress(state = 'current') {
-  return { work_item_id: 1, dispatch_nonce: 'dispatch', owner_slot_id: 2,
+  return { work_item_id: 1, dispatch_generation: 'dispatch', owner_slot_id: 2,
     checked_at: new Date().toISOString(), valid_until: new Date(Date.now() + 15000).toISOString(),
     phase: 'implementation', next_actor: 'owner', next_action: 'Continue approved work.',
     next_poll_expected_at: null, last_check_head: null,
@@ -57,7 +57,7 @@ it('expires a report while refresh hangs and does not restore it after A to B to
   expect(screen.getByText('Next:').parentElement?.textContent).toContain('B2 publishes')
   await act(async () => { await vi.advanceTimersByTimeAsync(3000) })
   expect(screen.getByText('Estimate:').parentElement?.textContent).toBe('Estimate: Unknown.')
-  view.rerender(<WorkPublicationPanel item={{ ...item, id: 2, dispatch_nonce: 'other' }} />)
+  view.rerender(<WorkPublicationPanel item={{ ...item, id: 2, dispatch_generation: 'other' }} />)
   view.rerender(<WorkPublicationPanel item={item} />)
   expect(screen.queryByText(/B2 publishes/)).toBeNull()
 })

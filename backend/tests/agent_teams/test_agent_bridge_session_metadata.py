@@ -258,6 +258,93 @@ async def test_agent_bridge_mail_projection_marks_stale_binding_without_mutation
 
 
 @pytest.mark.asyncio
+async def test_agent_bridge_projection_keeps_opencode_version_refusal(db, monkeypatch):
+    from app.api.v1.agent_bridge.router import _project_mail_wake_state
+    from app.services.agent_mail_service import AgentMailService, MailWakeError
+    from app.services.opencode_version import BLOCK_CODE
+
+    preset = AgentTeamPreset(name="OpenCode", description="", created_by="test")
+    db.add(preset)
+    await db.flush()
+    slot = AgentTeamSlot(
+        preset_id=preset.id,
+        position=0,
+        display_name="OpenCode pane",
+        provider="opencode-cli",
+        repo_id="opencode-repo",
+        repo_path="/tmp/opencode-repo",
+        repo_name="opencode-repo",
+        launch_mode="plain",
+        launch_options={},
+        enabled=True,
+    )
+    db.add(slot)
+    await db.flush()
+    member = MailTeamMember(
+        identity_key=f"slot:opencode-repo:{slot.id}",
+        repo_id="opencode-repo",
+        repo_path="/tmp/opencode-repo",
+        repo_name="opencode-repo",
+        display_name="OpenCode",
+        participant_kind="team_slot",
+        team_preset_id=preset.id,
+        team_slot_id=slot.id,
+    )
+    db.add(member)
+    await db.flush()
+    observed = MailAgentSession(
+        member_id=member.id,
+        provider="opencode-cli",
+        source="observed",
+        session_key="tmux:%opencode",
+        pane_id="%opencode",
+        pid=8200,
+        tmux_target="deck:opencode.0",
+        team_preset_id=preset.id,
+        team_slot_id=slot.id,
+        mailbox_status="observed",
+        last_seen_at=datetime.utcnow(),
+    )
+    observed.wake_enabled = True
+    db.add(observed)
+    mcp = MailAgentSession(
+        member_id=member.id,
+        provider="opencode-cli",
+        source="mcp",
+        session_key="mcp:opencode",
+        team_preset_id=preset.id,
+        team_slot_id=slot.id,
+        mailbox_status="connected",
+        last_seen_at=datetime.utcnow(),
+        capability_token_hash=agent_mail_service.hash_capability_token("opencode-secret"),
+        bound_pane_pid=8200,
+        bound_pane_proc_start="start-8200",
+    )
+    mcp.wake_enabled = True
+    db.add(mcp)
+    await db.commit()
+    monkeypatch.setattr(peer_process, "pane_is_alive", lambda _pid, _start: True)
+
+    def refuse_old_opencode(_session):
+        raise MailWakeError(BLOCK_CODE)
+
+    monkeypatch.setattr(
+        AgentMailService, "_require_opencode_2_pane", staticmethod(refuse_old_opencode)
+    )
+
+    projected = await _project_mail_wake_state([{
+        "provider": "opencode-cli",
+        "tmux_target": "deck:opencode.0",
+        "pane_id": "%opencode",
+        "cwd": "/tmp/opencode-repo",
+        "pid": "8200",
+    }], db)
+
+    assert projected[0]["agent_status"]["wake_state"] == "cannot_wake"
+    assert projected[0]["agent_status"]["wake_reason"] == BLOCK_CODE
+
+
+@pytest.mark.asyncio
 async def test_agent_bridge_projection_does_not_expose_wrong_context_binding(db, monkeypatch):
     from app.api.v1.agent_bridge.router import _project_mail_wake_state
 

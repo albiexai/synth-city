@@ -44,6 +44,9 @@ SAFE_VALUE_FIELDS = {
     "supervisor_actor_id", "supervisor_grace_seconds", "supervisor_status",
     "origin_kind", "previous_scope_revision", "review_id", "reviewer_member_id",
     "head_sha", "verdict", "outcome",
+    "target_milestone", "superseding_pr_number", "merge_commit_sha",
+    # #945: a campaign change stores the milestone title and only the number of planned decisions.
+    "backlog_milestone", "planned_decisions_count",
 }
 
 # C10: typed, named fields for event-time snapshots. Values are primitive
@@ -54,6 +57,8 @@ SAFE_SNAPSHOT_FIELDS = {
     "team_created_at", "team_display_name", "slot_display_name",
     "issue_number", "pr_number", "issue_type", "artifact", "fact_source",
     "event_time_labels",
+    # #945: the session token on an operator write was not usable, so the write is unattributed (a flag, never the token).
+    "session_invalid",
     # C06/C12: stable non-secret attempt identities and the retry class.
     "attempt", "launch_attempt", "retry_class",
     # A20: native runtime observation results; no argument value is stored.
@@ -219,38 +224,58 @@ def project_review_evidence(evidence: dict[str, Any] | None) -> dict[str, Any] |
     return safe or None
 
 
+# #945: how an operator-key write reached the server. ``mail_tool`` is derived from a validated Mail session; ``ui`` and
+# ``api`` are labels from the request's Origin header and are not proof of who called.
+ACCESS_PATHS = {"ui", "mail_tool", "api"}
+
+
 def derive_actor(
     *,
     actor_kind: str,
     member_id: int | None = None,
     session_id: int | None = None,
     scheduler: str | None = None,
+    via: str | None = None,
+    external_actor_id: int | None = None,
 ) -> dict[str, Any]:
     """Derive the recorded actor from actual authentication context.
 
     ``operator`` records the shared operator credential with no invented
     personal identity. ``member`` records an authenticated member reference.
     ``scheduler`` records the scheduler identity used by scheduled work.
+    ``external_actor`` records an external actor (such as a Supervisor) by its actor id.
+    ``via`` records the access path of an operator-key write (#945). The operator key is still the authority; ``via``
+    is attribution. An operator write may carry a session id only through ``mail_tool``, where the server derived it.
     """
-    if actor_kind not in {"operator", "member", "scheduler", "system"}:
+    if actor_kind not in {"operator", "member", "scheduler", "system", "external_actor"}:
         raise ValueError(f"unsupported actor kind: {actor_kind}")
+    if via is not None and via not in ACCESS_PATHS:
+        raise ValueError(f"unsupported access path: {via}")
     # C08: client-supplied identity claims are never trusted. The shared
     # operator credential cannot also assert a personal member identity.
-    if actor_kind == "operator" and (member_id is not None or session_id is not None):
+    if actor_kind == "operator" and (member_id is not None or (session_id is not None and via != "mail_tool")):
         raise ValueError("operator_role_cannot_assert_identity")
+    if actor_kind == "external_actor" and (
+            external_actor_id is None or member_id is not None or session_id is not None):
+        raise ValueError("external_actor_requires_actor_id_only")
     reference = None
-    if actor_kind == "operator":
+    if actor_kind == "external_actor":
+        reference = f"external_actor:{external_actor_id}"
+    elif actor_kind == "operator":
         reference = "shared-operator-credential"
     elif actor_kind == "scheduler":
         reference = scheduler
     elif actor_kind == "member" and member_id is not None:
         reference = f"member:{member_id}"
-    return {
+    actor = {
         "actor_kind": actor_kind,
         "actor_member_id": member_id if actor_kind == "member" else None,
         "actor_session_id": session_id,
         "actor_reference": reference,
     }
+    if via is not None:
+        actor["via"] = via
+    return actor
 
 
 async def current_context_key(
@@ -695,6 +720,20 @@ async def record_revision_outcome(
         operation_id=operation_id, correlation_id=correlation_id or operation_id, context_snapshot=snapshot)
 
 
+async def record_merged_settlement(
+    db: AsyncSession, *, item_id: int, revision_id: int | None, reason: str, source: str,
+) -> FactoryAuditEvent:
+    """#1038: why a merged PR settled its work item, in the settlement transaction.
+
+    Every fenced settlement of a merged PR records this one event; ``reason`` names the state it settled from.
+    """
+    return await record_event(
+        db, event_kind="merged_settlement", source=source, occurred_at=datetime.utcnow(),
+        actor=derive_actor(actor_kind="scheduler", scheduler="github_dispatch_scheduler"),
+        item_id=item_id, revision_id=revision_id, after_values={"dispatch_status": "merged"},
+        action_outcome="applied", sanitized_reason=reason)
+
+
 def replay_key_for(
     operation_id: str,
     event_kind: str,
@@ -833,6 +872,7 @@ async def record_event(
         actor_member_id=actor.get("actor_member_id"),
         actor_session_id=actor.get("actor_session_id"),
         actor_reference=actor.get("actor_reference"),
+        via=actor.get("via"),
         team_preset_id=team_preset_id,
         team_slot_id=team_slot_id,
         scope_id=scope_id,

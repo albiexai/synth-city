@@ -2256,6 +2256,147 @@ async def test_decision_route_returns_stable_delivery_integrity_error(
     assert response.json()["detail"] == "delivery_key_conflict"
 
 
+async def _escalated_initial_approval(client, db, monkeypatch):
+    monkeypatch.setattr(settings, "mail_capability_tokens_required", True)
+    item, _members, tokens = await _dispatch_approval_fixture(db)
+    headers = [{"X-Synth-City-Session-Token": token} for token in tokens]
+    approval = await client.post("/api/v1/agent-mail/approval-requests", headers=headers[1], json={
+        "work_item_id": item.id, "dispatch_nonce": item.dispatch_nonce, "summary": "bounded plan",
+    })
+    assert approval.status_code == 200
+    item.dispatch_status = "escalated"
+    item.escalation_reason = "owner_offline"
+    await db.commit()
+    decision = {"work_item_id": item.id, "dispatch_nonce": item.dispatch_nonce,
+        "approval_request_id": approval.json()["id"], "decision": "rejected", "reason": "Plan stranded after escalation"}
+    return item, headers, decision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("leased", [False, True], ids=["released", "retained_lease"])
+async def test_leader_rejects_pending_initial_approval_on_escalation_before_retry(client, db, monkeypatch, tmp_path, leased):
+    item, (leader_headers, owner_headers), decision_body = await _escalated_initial_approval(client, db, monkeypatch)
+    workspace = None
+    if leased:
+        workspace = GithubWorkspace(scope_id=item.scope_id, path=str(tmp_path), leased_item_id=item.id,
+            leased_at=datetime.utcnow(), lease_token="fixture-lease")
+        db.add(workspace)
+        await db.commit()
+    retry_path = f"/api/v1/agent-teams/github-work-items/{item.id}/retry"
+
+    blocked = await client.post(retry_path, headers=leader_headers)
+    assert (blocked.status_code, blocked.json()["detail"]["block_code"]) == (409, "approval_pending")
+    wrong_caller = await client.post("/api/v1/agent-mail/decisions", headers=owner_headers, json=decision_body)
+    assert (wrong_caller.status_code, wrong_caller.json()["detail"]) == (403, "not_designated_leader")
+    approved = await client.post("/api/v1/agent-mail/decisions", headers=leader_headers,
+                                 json={**decision_body, "decision": "approved"})
+    assert (approved.status_code, approved.json()["detail"]) == (409, "item_escalated")
+
+    rejected = await client.post("/api/v1/agent-mail/decisions", headers=leader_headers, json=decision_body)
+    assert rejected.status_code == 200, rejected.text
+    replay = await client.post("/api/v1/agent-mail/decisions", headers=leader_headers, json=decision_body)
+    assert replay.status_code == 200 and replay.json()["id"] == rejected.json()["id"]
+    await db.refresh(item)
+    assert (item.dispatch_status, item.escalation_reason, item.approval_round_count) == ("escalated", "owner_offline", 1)
+    assert item.dispatch_nonce == decision_body["dispatch_nonce"] and item.ack_received_at is None
+    assert item.retry_requested_at is None
+    if workspace is not None:
+        await db.refresh(workspace)
+        assert (workspace.leased_item_id, workspace.lease_token) == (item.id, "fixture-lease")
+    stored = await db.get(GithubApprovalRequest, decision_body["approval_request_id"], populate_existing=True)
+    root = await db.get(MailMessage, stored.request_message_id, populate_existing=True)
+    assert stored.status == "rejected" and stored.decision_message_id == rejected.json()["id"]
+    assert root.request_status == "answered"
+
+    retried = await client.post(retry_path, headers=leader_headers)
+    assert retried.status_code == 200, retried.text
+    await db.refresh(item)
+    if leased:
+        assert item.dispatch_status == "escalated" and item.retry_requested_at is not None
+    else:
+        assert item.dispatch_status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_escalated_initial_rejection_blocks_retry_until_decision_mail_is_durable(client, db, monkeypatch):
+    item, (headers, _), decision = await _escalated_initial_approval(client, db, monkeypatch)
+    approval_id = decision["approval_request_id"]
+    retry_path = f"/api/v1/agent-teams/github-work-items/{item.id}/retry"
+    create_message = agent_mail_service._create_message_row
+
+    async def interrupt_after_writing_answer(session, request, **kwargs):
+        message = await create_message(session, request, **kwargs)
+        if request.decision == "rejected":
+            raise MailDeliveryIntegrityError("fixture interrupted decision delivery")
+        return message
+
+    with monkeypatch.context() as patch:
+        patch.setattr(agent_mail_service, "_create_message_row", interrupt_after_writing_answer)
+        interrupted = await client.post("/api/v1/agent-mail/decisions", headers=headers, json=decision)
+        assert (interrupted.status_code, interrupted.json()["detail"]) == (409, "delivery_key_conflict")
+    attempt = await client.post(retry_path, headers=headers)
+    assert attempt.status_code == 409, "Retry must remain blocked until the rejection and Mail answer are durable"
+    assert attempt.json()["detail"]["block_code"] == "approval_pending"
+    pending = await db.get(GithubApprovalRequest, approval_id, populate_existing=True)
+    root = await db.get(MailMessage, pending.request_message_id, populate_existing=True)
+    assert pending.status == "pending" and pending.decision_message_id is None
+    assert root.request_status == "pending"
+
+    replay = await client.post("/api/v1/agent-mail/decisions", headers=headers, json=decision)
+    assert replay.status_code == 200, replay.text
+    await db.refresh(pending)
+    await db.refresh(root)
+    assert pending.status == "rejected" and pending.decision_message_id == replay.json()["id"]
+    assert root.request_status == "answered"
+    retry = await client.post(retry_path, headers=headers)
+    assert retry.status_code == 200 and retry.json()["dispatch_status"] == "pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("change", "detail"), [
+    ("hold", "hold"),
+    ("paused", "stale_approval_context"),
+    ("waiting", "stale_approval_context"),
+    ("request_link", "approval_request_link_mismatch"),
+    ("caller_session", "stale_approval_context"),
+    ("new_attempt", "stale_approval_context"),
+])
+async def test_escalated_initial_rejection_preserves_stops_and_current_authority(client, db, monkeypatch, change, detail):
+    from app.models.database import GithubOwnerObservationPause
+    from app.services import github_coordination_service
+
+    item, (leader_headers, _), decision = await _escalated_initial_approval(client, db, monkeypatch)
+    saved = await db.get(GithubApprovalRequest, decision["approval_request_id"])
+    if change in ("paused", "waiting"):
+        db.add(GithubOwnerObservationPause(work_item_id=item.id, wait_key="fixture-wait",
+            authority_sha256="fixture-authority", deadline=datetime.utcnow(), status=change))
+    elif change == "request_link":
+        root = await db.get(MailMessage, saved.request_message_id)
+        root.request_status = "superseded"
+    else:
+        capture = github_approval_service._escalated_initial_rejection_conditions
+
+        async def change_before_write(*args):
+            conditions = await capture(*args)
+            if change == "hold":
+                monkeypatch.setattr(github_coordination_service, "external_hold_code", lambda: "hold")
+            elif change == "caller_session":
+                caller = await db.scalar(select(MailAgentSession).where(MailAgentSession.member_id == saved.leader_member_id))
+                caller.closed_at = datetime.utcnow()
+            else:
+                item.dispatch_nonce = "replacement"
+            await db.commit()
+            return conditions
+
+        monkeypatch.setattr(github_approval_service, "_escalated_initial_rejection_conditions", change_before_write)
+    await db.commit()
+
+    response = await client.post("/api/v1/agent-mail/decisions", headers=leader_headers, json=decision)
+    assert (response.status_code, response.json()["detail"]) == (409, detail)
+    await db.refresh(saved)
+    assert saved.status == "pending" and saved.decision_message_id is None
+
+
 @pytest.mark.asyncio
 async def test_decision_update_refuses_database_current_escalation(
     client, db, monkeypatch

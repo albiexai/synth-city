@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.services import provider_readiness_service
 from app.services.provider_readiness_service import agent_mail_ready_reason, configuration_readiness
 from app.services import provider_operations_service as ops
 from app.services.providers import get_providers
@@ -23,6 +24,7 @@ def configured(**changes):
         opencode_version_ready=True,
         pi_mail_ready=True, pi_mail_reason=None,
         muse_cli_available=True, muse_mcp_installed=True, muse_hooks_missing=[],
+        antigravity_cli_available=True, antigravity_mcp_installed=True, antigravity_hooks_missing=[],
     )
     values.update(changes)
     return SimpleNamespace(**values)
@@ -33,8 +35,10 @@ def configured(**changes):
 def test_binary_and_shared_mail_agreement(provider, installed):
     status = configured()
     readiness = configuration_readiness(provider.id, provider.display_name, installed, status)
-    assert (readiness.state == "ready") == (installed is True and agent_mail_ready_reason(provider.id, status) is None)
-    assert readiness.state == ("ready" if installed else "blocked" if installed is False else "unknown")
+    reason = agent_mail_ready_reason(provider.id, status)
+    assert (readiness.state == "ready") == (installed is True and reason is None)
+    # Antigravity CLI keeps unproven gates after its Agent Mail install (#736), so a complete snapshot still blocks it.
+    assert readiness.state == ("blocked" if installed is False or reason else "ready" if installed else "unknown")
 
 
 @pytest.mark.parametrize("provider,key", [
@@ -306,3 +310,120 @@ def test_launch_plan_refuses_opencode_v1_with_its_own_block_code(monkeypatch):
     assert launch.block_code == BLOCK_CODE
     assert launch.reasons.count(REASON_REQUIRED) == 1
     assert service._blocked_result_status(BLOCK_CODE) == "blocked_opencode_version_unsupported"
+
+
+UNPROVEN_MAIL = "Agent Mail for Antigravity CLI is installed, but its Mail tool calls and registration are not proven yet"
+ONBOARDING = "Complete Antigravity CLI onboarding (terms and data-use choices) once as this user before launching agents"
+
+
+@pytest.mark.parametrize("changes,reason", [
+    ({"antigravity_cli_available": False}, "Antigravity CLI is not available on this machine"),
+    ({"antigravity_mcp_installed": False}, "Antigravity CLI Agent Mail MCP is not installed"),
+    ({"antigravity_hooks_missing": ["PreToolUse"]}, "Antigravity CLI Agent Mail hooks are missing"),
+    # Installed is still not ready: a Mail tool call through agy is not proven (#736).
+    ({}, UNPROVEN_MAIL),
+])
+def test_antigravity_readiness_reasons(changes, reason):
+    status = configured(**changes)
+    assert agent_mail_ready_reason("antigravity-cli", status) == reason
+    readiness = configuration_readiness("antigravity-cli", "Antigravity CLI", True, status)
+    assert readiness.state == "blocked"
+    assert [check.code for check in readiness.checks] == ["binary_installed", "agent_mail_not_configured"]
+
+
+def test_antigravity_legacy_snapshot_is_not_proven():
+    # A snapshot from before these fields existed proves neither the binary nor the install.
+    legacy = SimpleNamespace(**{k: v for k, v in vars(configured()).items() if k != "antigravity_cli_available"})
+    assert agent_mail_ready_reason("antigravity-cli", legacy) == "Antigravity CLI is not available on this machine"
+    assert configuration_readiness("antigravity-cli", "Antigravity CLI", True, legacy).state == "unknown"
+    older = SimpleNamespace(**{k: v for k, v in vars(configured()).items()
+                               if k not in ("antigravity_mcp_installed", "antigravity_hooks_missing")})
+    assert agent_mail_ready_reason("antigravity-cli", older) == "Antigravity CLI Agent Mail MCP is not installed"
+    assert configuration_readiness("antigravity-cli", "Antigravity CLI", True, older).state == "unknown"
+
+
+@pytest.fixture
+def agy_home(tmp_path, monkeypatch):
+    """A scratch HOME. The onboarding signal is cache/onboarding.json, as the Director's human trial
+    recorded it on #995 (key names only); readiness only reads it."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cache = tmp_path / ".gemini" / "antigravity-cli" / "cache"
+    cache.mkdir(parents=True)
+    return cache
+
+
+def test_antigravity_mail_gate_stays_first_and_unchanged(agy_home):
+    # #994 (lifting the Mail gate) is in v4.3: Antigravity stays blocked with the Mail reason, even
+    # after onboarding is complete.
+    (agy_home / "onboarding.json").write_text('{"onboardingComplete": true}')
+    assert provider_readiness_service.ANTIGRAVITY_UNPROVEN_GATES == (UNPROVEN_MAIL,)
+    assert agent_mail_ready_reason("antigravity-cli", configured()) == UNPROVEN_MAIL
+    assert configuration_readiness("antigravity-cli", "Antigravity CLI", True, configured()).state == "blocked"
+
+
+def test_antigravity_onboarding_gate_follows_the_recorded_signal(agy_home, monkeypatch):
+    monkeypatch.setattr(provider_readiness_service, "ANTIGRAVITY_UNPROVEN_GATES", ())
+    assert provider_readiness_service.ANTIGRAVITY_ONBOARDING_REASON == ONBOARDING
+    # Missing file: onboarding not completed (fail closed), never an error.
+    assert agent_mail_ready_reason("antigravity-cli", configured()) == ONBOARDING
+    assert configuration_readiness("antigravity-cli", "Antigravity CLI", True, configured()).state == "blocked"
+    (agy_home / "onboarding.json").write_text('{"onboardingComplete": true, "enterpriseOnboardingComplete": false}')
+    assert agent_mail_ready_reason("antigravity-cli", configured()) is None
+    # The install checks still come first.
+    assert agent_mail_ready_reason("antigravity-cli", configured(antigravity_cli_available=False)) == (
+        "Antigravity CLI is not available on this machine")
+
+
+@pytest.mark.parametrize("content", [
+    '{"onboardingComplete": false}', '{"onboardingComplete": "true"}', '{"onboardingComplete": 1}', "{}",
+    '{"consumerOnboardingComplete": true}', "[true]", "not json", "",
+])
+def test_antigravity_onboarding_signal_fails_closed(agy_home, content):
+    from app.services.providers.antigravity_cli import antigravity_onboarding_complete
+    (agy_home / "onboarding.json").write_text(content)
+    assert antigravity_onboarding_complete() is False
+
+
+def test_antigravity_onboarding_signal_refuses_a_symlink_or_an_oversized_file(agy_home, tmp_path):
+    from app.services.providers.antigravity_cli import antigravity_onboarding_complete
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text('{"onboardingComplete": true}')
+    (agy_home / "onboarding.json").symlink_to(elsewhere)
+    assert antigravity_onboarding_complete() is False
+    (agy_home / "onboarding.json").unlink()
+    (agy_home / "onboarding.json").write_text('{"onboardingComplete": true, "pad": "' + "x" * 70000 + '"}')
+    assert antigravity_onboarding_complete() is False
+
+
+def test_antigravity_onboarding_check_never_opens_sign_in_files_or_writes(agy_home, monkeypatch):
+    import builtins
+    import os
+    from app.services.providers.antigravity_cli import antigravity_onboarding_complete
+    (agy_home / "onboarding.json").write_text('{"onboardingComplete": true}')
+    before = sorted(str(p) for p in agy_home.parent.parent.parent.rglob("*"))
+    opened = []
+    real_open, real_os_open = builtins.open, os.open
+    monkeypatch.setattr(builtins, "open", lambda path, *a, **k: opened.append(str(path)) or real_open(path, *a, **k))
+    monkeypatch.setattr(os, "open", lambda path, flags, *a, **k: opened.append(str(path)) or real_os_open(path, flags, *a, **k))
+    assert antigravity_onboarding_complete() is True
+    assert opened and all(path.endswith("onboarding.json") for path in opened)
+    assert not any("oauth" in path or "credential" in path for path in opened)
+    assert sorted(str(p) for p in agy_home.parent.parent.parent.rglob("*")) == before
+
+
+# Review 5926506377: a deeply nested JSON document under the size cap makes the decoder recurse.
+NESTED = "[" * 30000 + "]" * 30000
+
+
+def test_antigravity_onboarding_signal_survives_a_recursion_bomb(agy_home):
+    from app.services.providers.antigravity_cli import antigravity_onboarding_complete
+    (agy_home / "onboarding.json").write_text(NESTED)
+    assert len(NESTED) < 65536
+    assert antigravity_onboarding_complete() is False
+
+
+def test_antigravity_readiness_stays_blocked_for_a_recursion_bomb(agy_home, monkeypatch):
+    monkeypatch.setattr(provider_readiness_service, "ANTIGRAVITY_UNPROVEN_GATES", ())
+    (agy_home / "onboarding.json").write_text(NESTED)
+    assert agent_mail_ready_reason("antigravity-cli", configured()) == ONBOARDING
+    assert configuration_readiness("antigravity-cli", "Antigravity CLI", True, configured()).state == "blocked"

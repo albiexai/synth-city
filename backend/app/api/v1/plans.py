@@ -1,9 +1,13 @@
 """Plan history browser API endpoints."""
+import os
+from pathlib import Path
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from app.services.codex_plan_service import CodexPlanService
 from app.services.plan_service import PlanService
+from app.utils.path_utils import get_claude_plans_dir, get_user_home
+from app.api.v1.harness_scope import current_scope
 from app.models.schemas import (
     PlanDetailResponse,
     PlanListResponse,
@@ -15,6 +19,22 @@ router = APIRouter()
 
 
 PLAN_PROVIDERS = {"claude-code", "codex-cli"}
+
+
+def _claude_plans_dir(project_path: Optional[str]) -> Path:
+    """The Claude plans directory for this request.
+
+    Listing a directory that cannot be read yields nothing instead of an error, so an unreadable plans folder of
+    another user's home would look like "no plans". Under a non-controller scope the home's own plans folder is
+    opened first, so a denial raises and the scope answers 403 with the directory named (#1065). Only that folder is
+    opened, never a path the request chose: a plansDirectory setting that points elsewhere is not the home's data.
+    The controller's own scope is unchanged.
+    """
+    plans_dir = PlanService.resolve_plans_dir(project_path)
+    home_plans = get_claude_plans_dir()
+    if plans_dir == home_plans and get_user_home() != Path.home() and home_plans.is_dir():
+        os.scandir(home_plans).close()
+    return plans_dir
 
 
 def _validate_provider(provider: str) -> str:
@@ -41,11 +61,17 @@ async def list_plans(
     try:
         provider = _validate_provider(provider)
         if provider == "codex-cli":
-            plans = CodexPlanService().list_plans(project_path)
+            codex = CodexPlanService()
+            plans = codex.list_plans(project_path)
+            data_dir = codex.codex_home
         else:
-            plans_dir = PlanService.resolve_plans_dir(project_path)
+            plans_dir = _claude_plans_dir(project_path)
             plans = PlanService.list_plans(plans_dir)
-        return {"plans": plans, "total": len(plans)}
+            # Judge readability by the home's own plans folder only, never by a configured one (see _claude_plans_dir).
+            # The folder handed on is the home's own, not plans_dir: plans_dir can come from the request.
+            home_plans = get_claude_plans_dir()
+            data_dir = home_plans if plans_dir == home_plans else None
+        return {"plans": plans, "total": len(plans), "scope": current_scope(data_dir)}
     except HTTPException:
         raise
     except Exception as e:
@@ -63,7 +89,7 @@ async def get_plan_stats(
         if provider == "codex-cli":
             return CodexPlanService().get_plan_stats(project_path)
 
-        plans_dir = PlanService.resolve_plans_dir(project_path)
+        plans_dir = _claude_plans_dir(project_path)
         return PlanService.get_plan_stats(plans_dir)
     except HTTPException:
         raise
@@ -83,7 +109,7 @@ async def search_plans(
         if provider == "codex-cli":
             results = CodexPlanService().search_plans(q, project_path)
         else:
-            plans_dir = PlanService.resolve_plans_dir(project_path)
+            plans_dir = _claude_plans_dir(project_path)
             results = PlanService.search_plans(plans_dir, q)
         return {"results": results, "query": q, "total": len(results)}
     except HTTPException:
@@ -104,7 +130,7 @@ async def get_plan_detail(
         if provider == "codex-cli":
             plan_data = CodexPlanService().get_plan(filename, project_path)
         else:
-            plans_dir = PlanService.resolve_plans_dir(project_path)
+            plans_dir = _claude_plans_dir(project_path)
             plan_data = PlanService.get_plan(plans_dir, filename)
 
         if not plan_data:

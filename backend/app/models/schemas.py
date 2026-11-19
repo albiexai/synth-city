@@ -4,6 +4,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional
 from pydantic import AfterValidator, BaseModel as PydanticBaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 from app.models.api_model import ApiModel as BaseModel, naive_utc_confirmation
 from app.config import settings
+from mcp_shim.work_remaining_protocol import public_generation
 
 
 class TerminalRevisionReconcileRequest(BaseModel):
@@ -1165,11 +1166,27 @@ class SessionListResponse(BaseModel):
     total: int
 
 
+class ScopeInfo(BaseModel):
+    """Whose home a Harnesses view read, and whether what it read could be listed (#1066).
+
+    `readable` is about the folder the view reads (the projects folder, the plans folder, the Codex home), not only
+    `.claude`, so an empty answer that came from a folder that cannot be listed is told apart from a truly empty one.
+    """
+
+    user: str
+    claude_dir: str
+    exists: bool
+    readable: bool
+    # The server-derived folder this view reads. Configured Plans paths remain undisclosed.
+    data_dir: Optional[str] = None
+
+
 class SessionProjectListResponse(BaseModel):
     """List of projects with session counts."""
 
     projects: List[SessionProject]
     total_sessions: int
+    scope: Optional[ScopeInfo] = None
 
 
 class SessionDetailResponse(BaseModel):
@@ -1335,6 +1352,7 @@ class UsageSummaryResponse(BaseModel):
     """Usage summary response."""
 
     summary: UsageSummary
+    scope: Optional[ScopeInfo] = None
 
 
 # Settings Update Schemas
@@ -1672,6 +1690,7 @@ class ActiveSessionsResponse(BaseModel):
     """List of active sessions with context info."""
 
     sessions: List[ActiveSessionContext]
+    scope: Optional[ScopeInfo] = None
 
 
 # Plan History Browser Schemas
@@ -1752,6 +1771,7 @@ class PlanListResponse(BaseModel):
 
     plans: List[PlanSummary]
     total: int
+    scope: Optional[ScopeInfo] = None
 
 
 class PlanDetailResponse(BaseModel):
@@ -1841,11 +1861,35 @@ MAIL_MESSAGE_KINDS = ["message", "broadcast", "context_request", "handoff", "ans
 MAIL_REQUEST_KINDS = ["context_request", "handoff"]
 
 
+# The label a wait carries is fixed by its reason. A provider refusal is a block, not a wait for input (#1091).
+WAIT_LABELS = {
+    "question": "Waiting for input", "trust": "Waiting for input", "sign_in": "Waiting for input",
+    "provider_refusal": "Blocked: provider refusal",
+}
+
+
+def wait_label_from_reason(values):
+    """Fill a missing label from the reason and refuse a label that does not match it."""
+    if not isinstance(values, dict):
+        return values
+    expected = WAIT_LABELS.get(values.get("reason"))
+    if expected is None:
+        return values  # an unknown reason is refused by the Literal
+    label = values.get("label")
+    if label is None:
+        return {**values, "label": expected}
+    if label != expected:
+        raise ValueError("The label does not match the reason")
+    return values
+
+
 class NativeInputWait(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    reason: Literal["question", "trust", "sign_in"]
-    label: Literal["Waiting for input"] = "Waiting for input"
+    reason: Literal["question", "trust", "sign_in", "provider_refusal"]
+    label: Literal["Waiting for input", "Blocked: provider refusal"] = "Waiting for input"
     observed_at: datetime
+
+    _label_follows_reason = model_validator(mode="before")(classmethod(lambda cls, values: wait_label_from_reason(values)))
 
 
 class AgentStatus(BaseModel):
@@ -1860,6 +1904,17 @@ class AgentStatus(BaseModel):
     waiting_input: NativeInputWait | None = None
     checked_at: datetime
     valid_until: datetime
+
+
+class AgentStatusWithCatalog(AgentStatus):
+    """The shared display facts plus whether the member's Mail tool list is the deployed one (#960).
+
+    A separate model on purpose: the frozen factory contract embeds ``AgentStatus`` and stays unchanged, while the
+    Mail and roster views embed this one. It grants no authority.
+    """
+
+    tool_catalog_state: Literal["current", "stale", "unknown"] = "unknown"
+    tool_catalog_reason: Optional[str] = None
 
 
 class MailSessionResponse(BaseModel):
@@ -1898,7 +1953,8 @@ class TeamIdleItem(BaseModel):
 
 
 UnansweredRequestReason = Literal[
-    "candidate_limit", "native_unknown", "ambiguous_legacy_request", "reply_scan_limit", "entry_limit"]
+    "candidate_limit", "native_unknown", "stall_timeout", "inputs_changing", "fence_changed",
+    "ambiguous_legacy_request", "reply_scan_limit", "entry_limit"]
 
 
 class UnansweredRequestItem(BaseModel):
@@ -1987,7 +2043,7 @@ class MailMemberResponse(BaseModel):
     wake_state: str = "delivered_waiting"
     last_inbox_checked_at: Optional[datetime] = None
     sessions: List[MailSessionResponse] = Field(default_factory=list)
-    agent_status: Optional[AgentStatus] = None
+    agent_status: Optional[AgentStatusWithCatalog] = None
 
 
 class TeamListResponse(BaseModel):
@@ -2062,6 +2118,8 @@ class GithubContinuationProposalCreate(BaseModel):
 
 class GithubScopeAmendmentCreate(GithubContinuationProposalCreate):
     phase: Literal["implementation"] = "implementation"
+    # #1154: approved base paths the amendment deliberately leaves out. Optional; must equal the omission exactly.
+    withdrawn_paths: List[str] = Field(default_factory=list, max_length=64)
 
 
 class GithubRevisionReviewCreate(BaseModel):
@@ -2081,6 +2139,14 @@ class GithubHeadReviewCreate(BaseModel):
     verdict: str = Field(pattern=r"^(changes_required|accepted)$")
     summary: str = Field(min_length=1, max_length=12000)
     evidence_url: str = Field(min_length=1, max_length=2000)
+
+
+class GithubReviewBindingResponse(BaseModel):
+    """#999: only what a current reviewer needs to record a head or revision review. Never a lease token."""
+    work_item_id: int
+    pr_number: int
+    dispatch_nonce: str
+    active_scope_revision: int
 
 
 class GithubHeadReviewResponse(BaseModel):
@@ -2123,10 +2189,22 @@ class GithubRevisionReviewResponse(BaseModel):
     settlement_reason: Optional[str] = None
 
 
+class GithubEffortView(BaseModel):
+    """The recorded estimate and effort limit of a work item (#968): plain minutes, no ledger time and no secret."""
+
+    estimate_minutes: Optional[int] = None
+    limit_minutes: int
+    extension_minutes: int = 0
+    effective_limit_minutes: int
+    ceiling_minutes: Optional[int] = None
+    extension_cap_minutes: int = 0
+
+
 class GithubScopeRevisionResponse(BaseModel):
     id: int
     work_item_id: int
     dispatch_nonce: str
+    dispatch_generation: Optional[str] = None
     revision: int
     owner_slot_id: int
     owner_member_id: int
@@ -2141,6 +2219,8 @@ class GithubScopeRevisionResponse(BaseModel):
     allowed_actions: List[str]
     allowed_commands: List[str]
     prohibited_actions: List[str]
+    # #1185: prohibitions bind only while the revision is active or submitted.
+    prohibitions_in_force: bool = False
     tool_fallbacks: Dict[str, Any]
     baseline_head_sha: str
     baseline_tree_sha: str
@@ -2169,6 +2249,16 @@ class GithubScopeRevisionResponse(BaseModel):
     expires_at: Optional[datetime] = None
     created_at: datetime
     approval_request: Optional["GithubApprovalRequestResponse"] = None
+    # The item's recorded estimate and limit, shown beside the revision (#968); ``None`` when none is recorded.
+    effort: Optional[GithubEffortView] = None
+
+
+    @model_validator(mode="after")
+    def _public_generation(self):
+        """A public, non-authorizing name for the dispatch, so a caller never needs the nonce to tell attempts apart."""
+        if self.dispatch_generation is None and self.dispatch_nonce:
+            self.dispatch_generation = public_generation(self.work_item_id, self.dispatch_nonce)
+        return self
 
 
 class GithubContinuationRequestResponse(BaseModel):
@@ -2358,6 +2448,8 @@ class MailAgentRegisterRequest(BaseModel):
     pid: Optional[int] = None
     team_preset_id: Optional[int] = None
     team_slot_id: Optional[int] = None
+    # A digest of the Mail tool names the session started with (#960). Display only.
+    tool_catalog: Optional[str] = Field(default=None, max_length=64)
 
 
 class MailAgentRegisterResponse(BaseModel):
@@ -2385,6 +2477,12 @@ class AgentMailInstallStatus(BaseModel):
     muse_hooks: List[str] = Field(default_factory=list)
     muse_hooks_missing: List[str] = Field(default_factory=list)
     muse_settings_path: Optional[str] = None
+    antigravity_cli_available: bool = False
+    antigravity_mcp_installed: bool = False
+    antigravity_hooks: List[str] = Field(default_factory=list)
+    antigravity_hooks_missing: List[str] = Field(default_factory=list)
+    antigravity_mcp_config_path: Optional[str] = None
+    antigravity_hooks_path: Optional[str] = None
     copilot_cli_available: bool = False
     copilot_mcp_installed: bool = False
     copilot_hooks: List[str] = Field(default_factory=list)
@@ -2703,6 +2801,7 @@ class TeamGithubScopeCreate(BaseModel):
     max_concurrent_dispatched: int = Field(default=3, ge=1)
     max_verification_retries: int = Field(default=2, ge=0)
     max_auto_merges_per_day: int = Field(default=5, ge=0)
+    max_item_effort_minutes: int = Field(default=120, ge=15, le=1440)
     base_ref: str = "origin/HEAD"
     github_auth_mode: Literal["unknown", "ambient", "app"] = "unknown"
     builds_out_of_tree: bool = False
@@ -2724,6 +2823,7 @@ class TeamGithubScopeUpdate(BaseModel):
     max_concurrent_dispatched: Optional[int] = Field(default=None, ge=1)
     max_verification_retries: Optional[int] = Field(default=None, ge=0)
     max_auto_merges_per_day: Optional[int] = Field(default=None, ge=0)
+    max_item_effort_minutes: Optional[int] = Field(default=None, ge=15, le=1440)
     base_ref: Optional[str] = None
     github_auth_mode: Optional[Literal["unknown", "ambient", "app"]] = None
     builds_out_of_tree: Optional[bool] = None
@@ -2731,6 +2831,14 @@ class TeamGithubScopeUpdate(BaseModel):
     build_command_hint: Optional[str] = None
     max_build_parallelism: Optional[int] = Field(default=None, ge=1)
     enabled: Optional[bool] = None
+
+
+class GithubRateLimitStatus(BaseModel):
+    reason: Literal["github_rate_limited"] | None
+    remaining: int | None
+    reset_at: datetime | None
+    retry_at: datetime | None
+    observed_at: datetime
 
 
 class TeamGithubScopeResponse(BaseModel):
@@ -2748,10 +2856,13 @@ class TeamGithubScopeResponse(BaseModel):
     github_auth_mode: str
     github_auth_configured: bool
     github_poll_token_configured: bool
+    github_rate_limit: GithubRateLimitStatus | None = None
     max_approval_rounds: int
     max_concurrent_dispatched: int
     max_verification_retries: int
     max_auto_merges_per_day: int
+    max_item_effort_minutes: int = 120
+    auto_merges_last_24h: Optional[int] = None
     base_ref: str
     builds_out_of_tree: bool
     build_dir_template: Optional[str] = None
@@ -2871,7 +2982,7 @@ class AgentActivityObservation(BaseModel):
 
 
 class AgentActivityDisplayObservation(AgentActivityObservation):
-    agent_status: Optional[AgentStatus] = None
+    agent_status: Optional[AgentStatusWithCatalog] = None
 
 
 class AgentTeamActivityResponse(BaseModel):
@@ -2915,6 +3026,7 @@ class GithubWorkItemResponse(BaseModel):
     ack_approver_member_id: Optional[int] = None
     ack_evidence_message_id: Optional[int] = None
     dispatch_nonce: Optional[str] = None
+    dispatch_generation: Optional[str] = None
     ack_enforcement_epoch: Optional[int] = None
     ack_approval_round: Optional[int] = None
     dispatch_head_ref: Optional[str] = None
@@ -2954,9 +3066,17 @@ class GithubWorkItemResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    @model_validator(mode="after")
+    def _public_generation(self):
+        """A public, non-authorizing name for the dispatch, so a caller never needs the nonce to tell attempts apart."""
+        if self.dispatch_generation is None and self.dispatch_nonce:
+            self.dispatch_generation = public_generation(self.id, self.dispatch_nonce)
+        return self
+
 
 class GithubWorkItemListResponse(BaseModel):
     items: List[GithubWorkItemResponse] = Field(default_factory=list)
+    total: int | None = None
 
 
 class GithubWorkItemContinuationResponse(BaseModel):
@@ -2983,6 +3103,8 @@ class GithubWorkItemContinuationResponse(BaseModel):
     continuation_block_code: Optional[str] = None
     review_rework_guidance: Optional[str] = None
     continuation_budget: Dict[str, int] = Field(default_factory=dict)
+    # The recorded estimate, approved effort limit and any extension (#968); ``None`` when none is recorded.
+    effort: Optional[GithubEffortView] = None
 
 
 class AgentTeamLaunchPlanItem(BaseModel):

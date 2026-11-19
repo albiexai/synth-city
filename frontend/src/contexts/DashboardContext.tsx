@@ -109,7 +109,7 @@ async function safeFetch<T>(
 }
 
 export function DashboardProvider({ children }: { children: ReactNode }) {
-  const { activeProject } = useProjectContext();
+  const { activeProject, scopeUser } = useProjectContext();
   const { selectedProviderId, selectedProvider } = useProviderContext();
   const { getDashboardStats } = useSessionsApi();
   const { getActiveSessions } = useContextApi();
@@ -119,8 +119,8 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastFetched, setLastFetched] = useState<Date | null>(null);
-  const prevProjectPath = useRef<string | undefined>(undefined);
-  const prevProviderId = useRef<string | undefined>(undefined);
+  // undefined is a real value for the project (Global scope), so "not initialised yet" is its own flag.
+  const watchedScope = useRef<{ project?: string; user: string | null; provider?: string } | null>(null);
   const fetchId = useRef(0);
 
   const fetchStats = useCallback(async () => {
@@ -399,20 +399,18 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   // getDashboardStats and getActiveSessions have stable refs (empty deps).
   // getPlanStats changes with activeProject?.path and selectedProviderId; those are handled below.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeProject?.path, selectedProvider?.display_name, selectedProviderId]);
+  }, [activeProject?.path, scopeUser, selectedProvider?.display_name, selectedProviderId]);
 
-  // Re-fetch when active project or provider changes (but not on initial mount)
+  // Re-fetch when the project, the global user or the provider changes (but not on initial mount).
+  // The first change away from Global (project undefined) counts, as does a project that hydrates late.
   useEffect(() => {
-    const currentPath = activeProject?.path;
-    const currentProvider = selectedProviderId;
-    const projectChanged = prevProjectPath.current !== undefined && prevProjectPath.current !== currentPath;
-    const providerChanged = prevProviderId.current !== undefined && prevProviderId.current !== currentProvider;
-    if (projectChanged || providerChanged) {
+    const current = { project: activeProject?.path, user: scopeUser ?? null, provider: selectedProviderId };
+    const previous = watchedScope.current;
+    watchedScope.current = current;
+    if (previous && (previous.project !== current.project || previous.user !== current.user || previous.provider !== current.provider)) {
       fetchStats();
     }
-    prevProjectPath.current = currentPath;
-    prevProviderId.current = currentProvider;
-  }, [activeProject?.path, selectedProviderId, fetchStats]);
+  }, [activeProject?.path, scopeUser, selectedProviderId, fetchStats]);
 
   return (
     <DashboardContext.Provider

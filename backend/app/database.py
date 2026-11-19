@@ -42,7 +42,7 @@ engine = create_async_engine(
 # WAL permits readers and a writer to overlap. SQLite still has one writer;
 # stale read snapshots may need rollback before a write can succeed. A busy
 # timeout alone does not recover that condition. WAL persists in the DB header.
-SQLITE_BUSY_TIMEOUT_MS = 5000
+SQLITE_BUSY_TIMEOUT_MS = 15000  # #1149: writes take milliseconds; ride out a burst, then answer 503
 
 
 def configure_sqlite_connection(dbapi_conn, busy_timeout_ms: int = SQLITE_BUSY_TIMEOUT_MS) -> None:
@@ -744,6 +744,8 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         await conn.execute(
             text("ALTER TABLE mail_agent_sessions ADD COLUMN bound_pane_proc_start TEXT")
         )
+    if session_columns and "tool_catalog" not in session_columns:
+        await conn.execute(text("ALTER TABLE mail_agent_sessions ADD COLUMN tool_catalog VARCHAR"))
     if session_columns and "wake_enabled" not in session_columns:
         await conn.execute(
             text("ALTER TABLE mail_agent_sessions ADD COLUMN wake_enabled BOOLEAN DEFAULT 0 NOT NULL")
@@ -852,6 +854,10 @@ async def _run_sqlite_compat_migrations(conn) -> None:
     if scope_columns and "max_auto_merges_per_day" not in scope_columns:
         await conn.execute(
             text("ALTER TABLE team_github_scopes ADD COLUMN max_auto_merges_per_day INTEGER DEFAULT 5 NOT NULL")
+        )
+    if scope_columns and "max_item_effort_minutes" not in scope_columns:
+        await conn.execute(
+            text("ALTER TABLE team_github_scopes ADD COLUMN max_item_effort_minutes INTEGER DEFAULT 120 NOT NULL")
         )
     if scope_columns and "base_ref" not in scope_columns:
         await conn.execute(
@@ -1008,6 +1014,24 @@ async def _run_sqlite_compat_migrations(conn) -> None:
                 "ALTER TABLE github_work_items ADD COLUMN continuation_nudged_at DATETIME"
             )
         )
+    for column, definition in (
+        ("effort_estimate_minutes", "INTEGER"),
+        ("effort_limit_minutes", "INTEGER"),
+        ("effort_elapsed_seconds", "INTEGER DEFAULT 0 NOT NULL"),
+        ("effort_last_tick_at", "DATETIME"),
+        ("effort_extension_minutes", "INTEGER DEFAULT 0 NOT NULL"),
+        ("effort_extension_decided_at", "DATETIME"),
+        ("effort_extension_reason", "VARCHAR"),
+        ("summary_comment_id", "BIGINT"),
+        ("summary_comment_author", "VARCHAR"),
+        ("summary_published_digest", "VARCHAR"),
+        ("summary_published_head_sha", "VARCHAR"),
+        ("summary_published_status", "VARCHAR"),
+        ("summary_published_at", "DATETIME"),
+        ("summary_publish_claim_at", "DATETIME"),
+    ):
+        if work_item_columns and column not in work_item_columns:
+            await conn.execute(text(f"ALTER TABLE github_work_items ADD COLUMN {column} {definition}"))
     if work_item_columns and "continuation_activated_at" not in work_item_columns:
         await conn.execute(
             text(
@@ -1193,7 +1217,10 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         await conn.run_sync(lambda sync_conn: _install_context_key_lifetime_ddl(None, sync_conn))
     # C12: install the stable forward-coverage marker and import the observed
     # work state once. A later run finds the marker and changes nothing.
-    if await _sqlite_columns(conn, "factory_audit_events"):
+    audit_columns = await _sqlite_columns(conn, "factory_audit_events")
+    if audit_columns and "via" not in audit_columns:
+        await conn.execute(text("ALTER TABLE factory_audit_events ADD COLUMN via VARCHAR"))
+    if audit_columns:
         from app.services.factory_audit_service import install_forward_coverage
 
         await install_forward_coverage(conn)

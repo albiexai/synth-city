@@ -26,7 +26,7 @@ vi.mock('../src/hooks/useProviders', () => ({
 vi.mock('../src/contexts/ProviderContext', () => ({
   useProviderContext: () => ({
     selectedProviderId: 'claude-code',
-    providers: [{ id: 'claude-code', display_name: 'Claude Code', installed: true }, { id: 'codex-cli', display_name: 'Codex CLI', installed: true }, { id: 'muse-cli', display_name: 'Muse Code', installed: true }, { id: 'opencode-cli', display_name: 'OpenCode CLI', installed: true }],
+    providers: [{ id: 'claude-code', display_name: 'Claude Code', installed: true }, { id: 'codex-cli', display_name: 'Codex CLI', installed: true }, { id: 'muse-cli', display_name: 'Muse Code', installed: true }, { id: 'antigravity-cli', display_name: 'Antigravity CLI', installed: true }, { id: 'opencode-cli', display_name: 'OpenCode CLI', installed: true }],
   }),
 }))
 const folders = vi.hoisted(() => ({ value: [] as Array<{ path: string; name: string; source: 'team' | 'tracked'; detail?: string }> }))
@@ -51,12 +51,12 @@ beforeEach(() => {
 afterEach(() => { cleanup(); clearOperatorToken() })
 
 describe('KillSessionDialog', () => {
-  it('names the full product name first when the operator token is rejected', async () => {
+  it('names the full product name first when the Director key is rejected', async () => {
     setOperatorToken('token-123')
     vi.mocked(killSession).mockRejectedValue(new ApiHttpError('unauthorized', 401))
     render(<MemoryRouter><KillSessionDialog open onOpenChange={() => {}} session={{ session_name: 'deck:1.0' } as never} onKilled={() => {}} /></MemoryRouter>)
     fireEvent.click(screen.getByRole('button', { name: 'Kill' }))
-    expect(await screen.findByText('The Albiex Synth City operator token was rejected. Enter a valid token and retry.')).toBeInTheDocument()
+    expect(await screen.findByText('The Albiex Synth City Director key was rejected. Enter a valid key and retry.')).toBeInTheDocument()
   })
 })
 
@@ -112,6 +112,45 @@ describe('NewSessionDialog', () => {
     const request = vi.mocked(spawnSession).mock.calls[0][0]
     expect(request).toMatchObject({ provider: 'muse-cli', mode: 'plain' })
     expect(JSON.stringify(request)).not.toMatch(/bedrock|aws_region/)
+  })
+
+  it('starts an Antigravity CLI session with only its own modes and no platform', async () => {
+    setOperatorToken('stored-key')
+    open()
+    fireEvent.change(selects()[0], { target: { value: 'antigravity-cli' } })
+
+    expect(within(selects()[1]).getAllByRole('option').map(option => option.textContent).filter(Boolean)).toEqual(['New session', 'Resume a previous session'])
+    fireEvent.change(selects()[2], { target: { value: TEAM } })
+    fireEvent.change(screen.getByLabelText('Initial Prompt'), { target: { value: 'check the inbox' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Start session' }))
+
+    await waitFor(() => expect(spawnSession).toHaveBeenCalledTimes(1))
+    const request = vi.mocked(spawnSession).mock.calls[0][0]
+    expect(request).toMatchObject({ provider: 'antigravity-cli', mode: 'plain', prompt: 'check the inbox' })
+    expect(JSON.stringify(request)).not.toMatch(/bedrock|aws_region|platform|use_last/)
+  })
+
+  it('resumes an Antigravity CLI member only by its exact conversation id', async () => {
+    setOperatorToken('stored-key')
+    open()
+    fireEvent.change(selects()[0], { target: { value: 'antigravity-cli' } })
+    fireEvent.change(selects()[1], { target: { value: 'resume' } })
+    fireEvent.change(selects()[2], { target: { value: TEAM } })
+
+    const start = screen.getByRole('button', { name: 'Start session' })
+    expect(start).toBeDisabled()
+    fireEvent.change(screen.getByLabelText('Antigravity conversation ID'), { target: { value: 'last' } })
+    expect(start).toBeDisabled()
+    fireEvent.change(screen.getByLabelText('Antigravity conversation ID'), { target: { value: 'E6A5A8D6-8A84-4090-B249-33A98C43F756' } })
+    expect(start).toBeDisabled()
+    fireEvent.change(screen.getByLabelText('Antigravity conversation ID'), { target: { value: 'e6a5a8d6-8a84-4090-b249-33a98c43f756' } })
+    expect(start).toBeEnabled()
+    fireEvent.click(start)
+
+    await waitFor(() => expect(spawnSession).toHaveBeenCalledTimes(1))
+    const request = vi.mocked(spawnSession).mock.calls[0][0]
+    expect(request).toMatchObject({ provider: 'antigravity-cli', mode: 'resume', session_id: 'e6a5a8d6-8a84-4090-b249-33a98c43f756' })
+    expect(request).not.toHaveProperty('use_last')
   })
 
   it('resumes an OpenCode member only by its exact ses… session id, never "use last"', async () => {

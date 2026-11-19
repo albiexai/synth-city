@@ -97,7 +97,7 @@ function windowBody(marker: string): MetricsWindow {
         name: "cost", counting_unit: "usage_attribution", value: null,
         sample_count: 0, unknown_count: 1, excluded_count: 0,
         unknown_reasons: ["no measured usage attribution"],
-        source: "factory_audit_events", coverage: "unknown",
+        source: "factory_audit_events", coverage: "unknown; cost has no usage source in this window",
       },
     ],
   };
@@ -171,7 +171,16 @@ describe("AuditMetricsPage at the HTTP boundary", () => {
 
     // #517: the plain summary comes first. The definitions sit behind the "?" buttons.
     const summary = screen.getByRole("region", { name: "Delivery in this window" });
-    expect(within(summary).getByText(/Recording started .*2026\. The whole window has data\./)).toBeInTheDocument();
+    expect(within(summary).getByText(/Recording started .*2026\. Some metrics do not have full coverage of this window\./)).toBeInTheDocument();
+    const noteCells = [...new Set(screen.getAllByRole("link")
+      .filter((link) => link.getAttribute("href")?.startsWith("#metric-note-"))
+      .map((link) => link.closest("td")))];
+    expect(noteCells.length).toBeGreaterThan(0);
+    for (const cell of noteCells) {
+      const refs = [...cell!.querySelectorAll("a")].map((link) => link.textContent);
+      expect(cell!.textContent).toBe(refs.join(", "));
+    }
+    expect(noteCells.some((cell) => cell!.querySelectorAll("a").length > 1)).toBe(true);
     expect(within(summary).getByText("3 code PRs merged, 4 design")).toBeInTheDocument();
     expect(within(summary).getByText("not measured")).toBeInTheDocument();
     expect(screen.queryByText(/Terminal tracking is not delivery/)).not.toBeInTheDocument();
@@ -412,6 +421,56 @@ describe("AuditMetricsPage at the HTTP boundary", () => {
     expect(screen.queryByText(/Page \d+ of \d+/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Unlock events" })).toBeInTheDocument();
     expect(stub.audit()).toHaveLength(0);
+  });
+
+  it("keeps the Team and Repository selects locked while the first read is pending", async () => {
+    const stub = stubFetch();
+    render(<AuditMetricsPage />);
+    await waitFor(() => expect(stub.metrics()).toHaveLength(1));
+    expect(screen.getByLabelText("Team")).toBeDisabled();
+    expect(screen.getByLabelText("Repository")).toBeDisabled();
+    expect(screen.getByText("Unlock events to choose a team or repository.")).toBeInTheDocument();
+  });
+
+  it("keeps the Team and Repository selects locked after a cancelled key request", async () => {
+    const stub = stubFetch();
+    render(<AuditMetricsPage />);
+    await waitFor(() => expect(stub.metrics()).toHaveLength(1));
+    stub.metrics()[0].respond(windowBody("mount"));
+    fireEvent.click(await screen.findByRole("button", { name: "Unlock events" }));
+    await waitFor(() => expect(stub.metrics()).toHaveLength(2));
+    stub.metrics()[1].respond(windowBody("again"));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    await screen.findByText(/Events are not shown\. The Director key request was cancelled\./);
+    expect(screen.getByLabelText("Team")).toBeDisabled();
+    expect(screen.getByLabelText("Repository")).toBeDisabled();
+    expect(screen.getByText("Unlock events to choose a team or repository.")).toBeInTheDocument();
+  });
+
+  it("keeps the Team and Repository selects locked after a refused key", async () => {
+    const stub = stubFetch();
+    setOperatorToken("synthetic-refused");
+    render(<AuditMetricsPage />);
+    await waitFor(() => expect(stub.metrics()).toHaveLength(1));
+    stub.metrics()[0].respond(windowBody("mount"));
+    await waitFor(() => expect(stub.audit()).toHaveLength(1));
+    stub.audit()[0].respond({ detail: "operator_token_invalid" }, 401);
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(
+      "The Director key was rejected. Clear it and enter a valid key."));
+    expect(screen.getByLabelText("Team")).toBeDisabled();
+    expect(screen.getByLabelText("Repository")).toBeDisabled();
+  });
+
+  it("enables the Team and Repository selects once the key options have loaded", async () => {
+    const stub = stubFetch();
+    setOperatorToken("synthetic-operator");
+    await mountWith(stub);
+    await screen.findByRole("option", { name: "Team A" }, { timeout: 3000 });
+    expect(screen.getByLabelText("Team")).toBeEnabled();
+    expect(screen.getByLabelText("Repository")).toBeEnabled();
+    expect(screen.queryByText("Unlock events to choose a team or repository.")).not.toBeInTheDocument();
   });
 
   it("opens with a stored key and loads the events with no dialog (#515)", async () => {

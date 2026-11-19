@@ -18,6 +18,7 @@ from app.models.factory_schemas import (
 )
 from app.models.schemas import PlannedCampaignDecision
 from app.services.github_dispatch_priority import dispatch_order_key, effective_priority
+from app.services.work_item_states import is_done, needs_attention
 
 _PARENT = re.compile(r"https://github\.com/([^/]+)/([^/]+)/issues/([1-9][0-9]*)\Z")
 _STATE_PHRASES = {
@@ -25,7 +26,6 @@ _STATE_PHRASES = {
     "verifying": "waiting for checks",
     "ready_for_review": "reviewing it",
     "awaiting_human_review": "waiting for you",
-    "escalated": "waiting for you",
 }
 _DECISION_TEXT = {
     "review_pr": "Review the pull request.",
@@ -138,8 +138,19 @@ class AgentTeamCampaignService:
             self._cache.pop(oldest)
         self._cache[key] = BacklogObservation(started + self.interval_seconds, issues)
 
-    async def summary(self, db, preset_id, human_actions=()):
+    async def summary(self, db, preset_id, human_actions=(), scope_id=None, provider=None):
+        """The campaign counts. scope_id narrows them to one repository and provider to the work that an owner of
+        that harness holds (#1142), as the Work page does; work without an owner has no harness and is not counted."""
         scopes = await self._scopes(db, preset_id=preset_id)
+        owned = {scope.id for scope in scopes}
+        roster = provider is None or await db.scalar(select(AgentTeamSlot.id).where(
+            AgentTeamSlot.preset_id == preset_id, AgentTeamSlot.provider == provider).limit(1)) is not None
+        if scope_id is not None:
+            scopes = [scope for scope in scopes if scope.id == scope_id]
+        # A team outside the filter has no campaign to show.
+        matches = roster and (scope_id is None or scope_id in owned)
+        if not matches:
+            scopes = []
         by_scope = {scope.id: scope for scope in scopes}
         now = self.clock()
         observations = {scope.id: self._cache.get(self._key(scope)) for scope in scopes}
@@ -157,7 +168,10 @@ class AgentTeamCampaignService:
             AgentTeamSlot.display_name).join(TeamGithubScope,
                 TeamGithubScope.id == GithubWorkItem.scope_id).outerjoin(AgentTeamSlot,
                 AgentTeamSlot.id == GithubWorkItem.owner_slot_id).where(
-                TeamGithubScope.preset_id == preset_id).order_by(GithubWorkItem.id))).all()
+                TeamGithubScope.preset_id == preset_id,
+                *([GithubWorkItem.scope_id.in_([scope.id for scope in scopes])] if scope_id is not None or not matches else []),
+                *([AgentTeamSlot.provider == provider] if provider is not None else [])
+            ).order_by(GithubWorkItem.id))).all()
         # Dispatch watches the scope, while campaign counts may watch only a
         # milestone. Keep the complete pending queue independent of those counts.
         positions, dispatch_order = Counter(), []
@@ -179,11 +193,20 @@ class AgentTeamCampaignService:
             if not available or key in backlog:
                 work[key] = row
         done, under_way, queued = [], [], []
+        other_branch = attention = 0
         for row in work.values():
             scope = by_scope[row.scope_id]
-            if (row.dispatch_status == "merged" and _branch(row.dispatch_base_ref)
-                    and _branch(row.dispatch_base_ref) == _branch(scope.base_ref)):
+            if is_done(row.dispatch_status):
+                # One definition of done in every view (#1106). A merge into a branch other than the scope's is still
+                # done; it is disclosed rather than dropped from every bucket. Only a recorded base is evidence of
+                # another branch: rows from before dispatch_base_ref existed have none and are not claimed.
                 done.append(row)
+                merged_base = _branch(row.dispatch_base_ref)
+                if row.dispatch_status == "merged" and merged_base is not None and merged_base != _branch(scope.base_ref):
+                    other_branch += 1
+            elif needs_attention(row.dispatch_status):
+                # Escalated or failed: someone must act, so it is never under way (#1129), as on the tiles.
+                attention += 1
             elif row.dispatch_status in _STATE_PHRASES:
                 under_way.append(CampaignUnderWayItem(title=row.issue_title,
                     owner_short_name=row.display_name.split()[0] if row.display_name and row.display_name.split() else None,
@@ -192,7 +215,7 @@ class AgentTeamCampaignService:
                 queued.append(CampaignQueuedItem(title=row.issue_title))
         done.sort(key=lambda row: (row.auto_merged_at or datetime.min, row.id), reverse=True)
         groups = Counter()
-        if available:
+        if available and provider is None:
             slot_labels = (await db.scalars(select(AgentTeamSlot.area_labels).where(
                 AgentTeamSlot.preset_id == preset_id).order_by(AgentTeamSlot.position, AgentTeamSlot.id))).all()
             areas = list(dict.fromkeys(label for labels in slot_labels for label in (labels or []) if isinstance(label, str)))
@@ -208,7 +231,7 @@ class AgentTeamCampaignService:
                 if decision not in decisions:
                     decisions.append(decision)
         planned = await db.scalar(select(AgentTeamPreset.planned_decisions).where(AgentTeamPreset.id == preset_id))
-        for value in planned or []:
+        for value in (planned or []) if matches else []:
             # Legacy or manually damaged data cannot insert raw objects into the response.
             try:
                 decision = PlannedCampaignDecision.model_validate(value)
@@ -216,9 +239,9 @@ class AgentTeamCampaignService:
                 continue
             decisions.append(CampaignDecision(text=decision.text, state=decision.state))
         return TeamCampaignSummary(backlog_state="available" if available else "backlog unavailable",
-            done_count=len(done), latest_done=[CampaignDoneItem(title=row.issue_title,
+            done_count=len(done), done_on_other_branch_count=other_branch, latest_done=[CampaignDoneItem(title=row.issue_title,
                 merged_at=row.auto_merged_at) for row in done[:3]],
-            under_way_count=len(under_way), under_way=under_way, queued_count=len(queued), queued=queued,
+            under_way_count=len(under_way), under_way=under_way, attention_count=attention, queued_count=len(queued), queued=queued,
             dispatch_order=dispatch_order,
             not_started_count=sum(groups.values()) if available else None,
             not_started_groups=[CampaignAreaGroup(area=area, count=count) for area, count in sorted(groups.items())],

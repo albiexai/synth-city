@@ -1,4 +1,4 @@
-export type AgentProviderId = 'claude-code' | 'codex-cli' | 'copilot-cli' | 'opencode-cli' | 'pi-cli' | 'muse-cli'
+export type AgentProviderId = 'claude-code' | 'codex-cli' | 'copilot-cli' | 'opencode-cli' | 'pi-cli' | 'muse-cli' | 'antigravity-cli'
 
 export const providerOperationKeys = [
   'launch', 'observe_session', 'mail_identity', 'receive_work', 'report_work_status',
@@ -87,6 +87,11 @@ export interface AgentProviderStatus {
   installed: boolean
   binary_path: string | null
   version: string | null
+  /** With a non-controller scope, the claude-code status names whose install the version was read from (#1069). */
+  version_user?: string | null
+  version_source?: string | null
+  /** The exact message to show when the scoped user's version cannot be read. */
+  version_unknown_reason?: string | null
   unavailable_reason?: string | null
   unavailable_code?: string | null
   capabilities: AgentProviderCapabilities

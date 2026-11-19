@@ -9,6 +9,8 @@ from typing import Dict, List, Optional, Tuple
 
 import httpx
 
+from app.utils.path_utils import get_user_home
+
 logger = logging.getLogger(__name__)
 
 # Cache settings
@@ -234,9 +236,9 @@ class SkillsRegistryService:
             # Fallback: scan common directories
             installed = set()
             for skills_dir in [
-                Path.home() / ".claude" / "skills",
-                Path.home() / ".agents" / "skills",
-                Path.home() / ".openclaw" / "skills",
+                get_user_home() / ".claude" / "skills",
+                get_user_home() / ".agents" / "skills",
+                get_user_home() / ".openclaw" / "skills",
             ]:
                 if skills_dir.exists():
                     for item in skills_dir.iterdir():

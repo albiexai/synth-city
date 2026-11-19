@@ -137,11 +137,23 @@ GET /api/v1/agent-mail/agent/inbox?member_id={member_id}&unread_only=false
 POST /api/v1/agent-mail/hooks/session-start
 POST /api/v1/agent-mail/hooks/user-prompt-submit
 POST /api/v1/agent-mail/hooks/post-tool-use
+POST /api/v1/agent-mail/hooks/pre-tool-use
 POST /api/v1/agent-mail/hooks/session-end
 POST /api/v1/agent-mail/hooks/activity
 ```
 
 Use the MCP tools from agent sessions instead of calling these directly unless you are debugging the integration.
+
+### Pre-tool-use edit guard
+
+`POST /api/v1/agent-mail/hooks/pre-tool-use` backs the Claude Code edit guard. The managed hook sends `tool_name`, `session_id`, `provider` and `team_slot_id`. The route answers one of three things: `{"guard": "allow"}`, a `hookSpecificOutput` with `permissionDecision: "deny"`, or `{"guard": "unavailable"}`. The hook accepts only those; any other answer is treated as unavailable.
+
+The member is the one whose slot owns the tmux pane that the loopback request came from. That is the same kernel-verified pane binding that registration uses. The route never selects a member from a session key or from the claimed slot alone, because native hooks, MCP registration and this hook name sessions differently. A claimed slot that the pane does not confirm, or a pane with no binding, answers `unavailable`.
+
+- It refuses only `Edit`, `Write`, `MultiEdit`, `NotebookEdit` and Mail tools that change state. `synth_city_check_inbox`, `synth_city_whoami` and the `get_`, `list_`, `render_` and `prepare_` tools are never refused.
+- It refuses only while the calling member has an unread message that counts as a stop (see [Edit guard](../features/agent-mail.md#edit-guard-for-unread-stop-and-hold-mail)). Reading the message with `synth_city_check_inbox` lifts the refusal on the next call.
+- Like the other native hooks it is unauthenticated, so the refusal reason names only the message id. It never carries the subject or body.
+- A non-team event, an unguarded tool, or a slot that has not registered yet answers `allow`. A lookup failure or an unverifiable pane answers `unavailable`.
 
 ## Install Endpoints
 
@@ -191,6 +203,52 @@ External broadcasts require `audience_type` and `audience_id`. Supported scoped 
 
 Receipt recipients are snapshotted when the message is stored. A keyed replay uses those receipts, not current membership. Existing messages retain their historical receipts and have no inferred audience.
 
+## Check a request before submitting it
+
+`POST /api/v1/agent-mail/preflight-request` (MCP tool `synth_city_preflight_request`) reports every mechanical problem of a plan, scope amendment or continuation request. It is read-only: it creates no request, Mail, nudge or audit row. It needs the owner's member session, and only the item's owner may ask (`403 not_item_owner` otherwise).
+
+```json
+{
+  "kind": "continuation",
+  "work_item_id": 193,
+  "dispatch_nonce": "...",
+  "summary": "Apply the approved bounded fix",
+  "phase": "implementation",
+  "execution_target": "workspace",
+  "allowed_paths": ["src/a.py"],
+  "allowed_actions": ["push_pr_head", "request_verification"],
+  "allowed_commands": ["pytest -q"],
+  "prohibited_actions": [],
+  "max_failed_heads": 1,
+  "tool_fallbacks": {},
+  "estimate_active_minutes": {"low": 20, "high": 40}
+}
+```
+
+`kind` is `initial_plan` (send `summary` and `plan_metadata`), `scope_amendment` or `continuation`. `lease_token` is optional and is checked, never echoed. The answer is `{"passed": bool, "problems": [...], "warnings": [...]}`. Each entry has a `code`, a `field` and a `message`. All problems are listed at once, so one call replaces a round trip per rejection.
+
+Rules, each with a code the server also uses:
+
+- **Phase and actions:** `continuation_phase_invalid`; an amendment must be implementation (`amendment_diagnostic_restoration_required`); `execution_target_invalid`; unknown actions (`allowed_actions_invalid`); an implementation needs `push_pr_head` and `request_verification` (`implementation_completion_actions_required`); a diagnostic needs `revert_diagnostic_changes` (`diagnostic_revert_required`) and, when hosted-only, no local build command; `install_hosted_ci_tool` and `tool_fallbacks` go together (`hosted_tool_fallback_required`, `tool_fallbacks_invalid`, `hosted_tool_target_required`).
+- **Paths:** repo-relative, no `..`, no absolute or backslash form, no glob characters (`allowed_paths_invalid`, `allowed_paths_required`); an amendment names closed files (`amendment_closed_file_paths_required`). Companion paths from the checked-in map that the request omits are listed as a warning (`companion_paths_added`). They are counted on their own bound of 32 per request (`continuation_path_limit_exceeded` when over it), not against the scope's path limit, which counts only the named paths, and they never count toward an amendment's added-path cap. Only companions recorded in the amendment's digest-verified trailer are counted this way; any other path counts as named.
+- **Submit schema:** the limits the real submit routes enforce with a 422 are reported as problems too (`request_schema_invalid`, with the field and the constraint, never the value you sent): `max_failed_heads` of at least 1, a summary of at most 12000 characters, a tool-fallback package of at most 200 characters, and the field types. The submit responses are unchanged.
+- **Field types:** a value of the wrong type for any field, such as a list or object given as `phase`, `execution_target` or `summary`, is a problem on that field (never a server error), and the other fields are still checked.
+- **Independent fields:** each field is judged on its own, so one bad field does not hide another field's problem, including the path and command limits and the companion bound.
+- **Action rule:** an implementation needs `push_pr_head` and `request_verification`, as the submit routes have always required; `edit_production` is not required, so a tests-only implementation stays a tests-only grant.
+- **Limits:** paths, commands and failed heads per revision, from the scope (`continuation_path_limit_exceeded`, `continuation_command_limit_exceeded`, `continuation_failed_head_limit_exceeded`); an empty summary or the reserved companion trailer in a summary.
+- **Initial plan:** `plan_metadata.allowed_paths` must be a non-empty list of closed file paths (`plan_allowed_paths_missing`); later amendments read it. Reserved keys are refused.
+- **Stale authority:** unread stop, hold or decision Mail for the owner (`unread_authority_mail`, which names only the message id).
+- **Estimate:** an optional `estimate_active_minutes` (a number, or an object with `high` and optionally `low`) is compared with the scope's `max_item_effort_minutes` (default 120). An upper bound above it is `estimate_exceeds_window`; within 10 minutes of it is a warning, `estimate_near_window`; an unusable value is `estimate_invalid`. Preflight never stores the estimate; approval turns it into the item's effort limit (see [Effort limits and extensions](#effort-limits-and-extensions)). The one-hour proposal expiry (`github_continuation_proposal_expiry_seconds`) only bounds the path from proposal to activation and does not judge an estimate.
+
+The continuation and amendment submit routes run the same checks and refuse with the same first code and status as before, so a request that passes preflight is not refused for these rules. Rules that need stored state, such as budgets, a pending request or the repository head, are still checked only when you submit.
+
+## Effort limits and extensions
+
+- `POST /api/v1/agent-mail/effort-extensions` takes a Mail session of the item's current Leader. The body has `work_item_id`, `dispatch_nonce`, `minutes` (a whole number, at most the step cap), `expected_extension_minutes` (the extension total the Leader saw), `reason` and `evidence`. The MCP tool is `synth_city_extend_effort_limit`.
+- A refusal's `detail` is one code: `effort_extension_stale`, `not_item_leader`, `extension_reason_required`, `extension_evidence_required`, `expected_extension_minutes_required`, `effort_limit_not_set`, `extension_exceeds_cap`, `effort_extension_total_changed`, `extension_exceeds_ceiling`, `effort_extension_not_acknowledged`, `effort_extension_paused` or `effort_extension_no_recent_activity`.
+- At approval an estimate over the ceiling is refused with `effort_estimate_exceeds_ceiling`, and an unreadable estimate with `effort_estimate_invalid`.
+- The scope setting is `max_item_effort_minutes`, changed with `PATCH /api/v1/agent-teams/github-scopes/{scope_id}` (operator token). It accepts 15 to 1440 and defaults to 120.
+
 ## Healthy scope amendments and submitted review settlement
 
 These routes use the `/api/v1/agent-teams` prefix and current member session authentication.
@@ -198,6 +256,8 @@ The owner requests `POST /github-work-items/{id}/scope-amendments` with the same
 proposal fields as a continuation, with `phase: implementation`. The server assigns immutable
 `origin_kind: scope_amendment`; ordinary continuations retain their escalation and PR requirements.
 The corresponding MCP tool is `synth_city_request_scope_amendment`.
+
+`allowed_paths` is the amendment's whole effective path set: name every approved path you keep as well as the new ones, because completion checks changed files against exactly this list. List each approved path you deliberately drop in the optional `withdrawn_paths`. If approved paths are missing and `withdrawn_paths` doesn't list exactly those, the request is refused before anything is stored: `409 amendment_base_paths_omitted` when nothing is withdrawn, `409 amendment_withdrawn_paths_invalid` otherwise. Companion paths count as named. Existing revisions keep the allowed paths they were approved with.
 
 A healthy amendment works before a PR exists. It reads the assigned branch's committed head
 and tree without discarding held edits. Its path baseline must come from structured approved
@@ -253,6 +313,60 @@ visible and inconclusive, consume no product-failure unit, and cannot satisfy re
 A real failed check in the same observation still charges the head once.
 
 
+### Leader-run standard recoveries
+
+The current Leader can use `synth_city_leader_cancel_revision`, `synth_city_leader_finalize_merged`,
+`synth_city_leader_release_workspace` and `synth_city_leader_end_stopped`. Their routes are under
+`POST /github-work-items/{id}/leader-recovery/`. Each one calls the
+operator service, so it keeps every operator guard, and adds these checks: the caller is the current Leader
+and differs from the owner, there is no pause or HOLD, and a Supervisor is bound.
+
+- **Cancel** needs the revision number, nonce and a reason, and cancels one active or submitted revision.
+- **Finalize merged** first reads fresh merge evidence and a digest (`dry_run`, the default in the tool),
+  then records the merge only if the digest still matches. It performs no merge and releases nothing.
+- **Release workspace** uses the `workspace_id` and exact `leased_at` from
+  `synth_city_get_work_item_context(work_item_id, leader_release=True)`
+  (`GET /github-work-items/{id}/leader-recovery/release-workspace/context`). The current Leader
+  passes those values as `workspace_id` and `expected_leased_at`. This read leaves the workspace
+  lease in place and returns only the work item ID, workspace ID, and UTC lease start.
+  Release requires a terminal item and a clean, readable tree. Commits outside the local base must
+  match the head, branch and source repository of the recorded PR, including a closed unmerged PR.
+- **End stopped work** uses the generation and scope revision from `synth_city_list_work_items`. It records
+  `deferred` with a target milestone or `superseded` with the delivering merged PR. It releases a verified clean
+  lease and clears the stopped item's current attention. See [Maintenance](agent-teams.md#maintenance).
+
+Every request carries an `operation_id`. The same request again is a replay and never repeats the action; a
+different request under the same id is refused as `operation_conflict`. The action keeps its existing audit
+fact. One notice per action goes to the bound Supervisor, from the Leader's own member identity, with a stable
+key. If the action committed but the notice failed, the response is `recovery_notice_failed` (502), the failure
+is recorded, and repeating the same request sends only the notice. Policy changes, limit raises, approval,
+merge, and dirty or unknown-state releases remain operator-only. These tools grant no other authority.
+
+A refused cancel or finalize that committed nothing frees its `operation_id` for a corrected request. The id is
+freed by one statement that also proves no effect committed, and every execution that rests on the id re-checks
+inside its own transaction that the id still holds its request, so a refused caller cannot erase a winner's record
+or let a conflicting request commit. A HOLD that arrives during these checks stops the action.
+
+A release commits an execution marker on its id before any external effect can start. The id is freed for a
+corrected request only when that attempt provably never started the credential revoker, that is, the final
+authority check refused it before the first external step. Once the revoker may have run (it failed, its result
+is unknown, or the process stopped), the id stays bound to the exact request: a corrected request is refused as
+`operation_conflict` and the same request retries. A retry that adopts such a marker inherits its uncertainty, so
+a later attempt that is refused before its own revoker still cannot free the id. A plain legacy claim from the
+earlier interim is read the same way. The retry is guarded and can fail: if the revoker refuses, the response is
+its error (503), the id stays bound, the lease stays, and no success notice is sent. Use a new `operation_id` only
+after the operator confirms the earlier attempt's effect.
+A release records its outcome on the id's ledger row. A new release claim is `claimed:r2`; the attempt moves it to
+`executing:<attempt>` before any external step, and the row becomes `done:<attempt>` in the same transaction that
+clears the lease and records the release audit, so a committed release always has its done row. The success notice
+is sent only when the row is that attempt's own done row. A replay (an exact repeat that did not run the release)
+answers `already_released`, with the one keyed notice, only when the row of its `operation_id` holds the exact
+request and is a done row. A plain `claimed` row, which only the earlier interim wrote, may answer the same way
+once the release is committed (the historical exception). An executing row, a clean `claimed:r2` row, a missing
+row or another request is refused (`recovery_context_changed`) and sends nothing. Limit: the committed release
+audit belongs to the lease, so a legacy plain `claimed` row cannot be told apart from a release that another
+operation id made; that row is answered as released.
+
 ### Continuation phases
 
 A continuation or amendment request names one phase. The Leader's decision prompt and the recovery proposal
@@ -262,6 +376,20 @@ prompt use this wording:
 
 - **Example, `diagnostic`:** add a temporary log line to a probe script and read the hosted run's output. The PR returns to its approved baseline with `revert_diagnostic_changes` before the attempt can continue.
 - **Example, `implementation`:** re-add a test that an earlier revision removed. The test is a permanent change, so the revision allows `push_pr_head` and `request_verification`, and the test stays in the PR.
+
+### Reviewer binding (#999)
+
+`synth_city_get_review_binding`, or `GET /github-work-items/{id}/review-binding`, gives an assigned reviewer exactly what it needs to record a head or revision review, and nothing more: `work_item_id`, `pr_number`, `dispatch_nonce` and `active_scope_revision`. It never returns the lease token, the owner binding, the plan, the workspace or Mail history. The nonce is private: use it only in the review tools and never publish it.
+
+The caller comes from the authenticated session (no session: 401 `session_token_required`; a session without a team slot: 403 `session_not_slot_bound`). Exactly two callers are allowed, and every check reads fresh values:
+
+- **The team's current verifier**, by the same rule as a head review: the current member of an enabled slot of this team whose role is `verifier`, not the owner or the Leader.
+- **The reviewer named on the item's required-check watch.** The watch must be for the current nonce, the current scope revision, the pull request's **exact current head** (read from GitHub, with the checks used when the watch is registered: open, not merged, the item's branch, this repository) and the **current delivery policy**. The reviewer must still be the current member of an enabled slot of the team, and not the owner or the Leader. After the GitHub read, the whole authority is checked again: a healthy context, and the same attempt, revision, pull request, owner, team, Leader, branch, repository and delivery policy. The observed pull request, the watch and the reviewer are checked against those post-read values.
+
+Everyone else gets 403 `current_independent_reviewer_required`.
+
+- **For the named reviewer,** 409 `review_binding_unavailable` means: the item has no pull request, the context isn't healthy, the GitHub read fails, the pull request doesn't match, or the authority or policy changed during the read. There is no fallback to a stored head.
+- **For the verifier,** the route uses the head-review authority: the current verifier and the item's fresh attempt. It doesn't require a healthy context and makes no GitHub read. It answers 409 only when the item has no pull request or no attempt nonce. The review tools then enforce their own head and revision rules.
 
 ### Reviewer verdict for the exact head and the auto-merge gate
 
@@ -282,3 +410,33 @@ the pull request's current head is `accepted` and its reviewer still qualifies w
 check does not depend on a required-check watch. The review hold label still blocks first, and the
 gate runs again at the merge boundary. The work view shows the state through the item's status note:
 `Waiting for reviewer acceptance at <sha>`, `Head changed since acceptance (accepted at <sha>, head is <sha>)`, `Reviewer requires changes at <sha>` or `Reviewer accepted head <sha>`.
+
+## Remaining-work report context
+
+`synth_city_prepare_work_remaining_summary` reads the current Leader's context from
+`GET /github-work-items/{id}/remaining-work-context` and turns it into the three short lines (Remaining, Estimate,
+Next) that the owner publishes. Only the current Leader may read it.
+
+- **In-flight item.** The context exists only while a leased workspace's local head equals the published head. It is
+  bound to that head.
+- **Terminal item.** A merged, completed or closed item has no workspace to observe. Its context is bound to the
+  recorded verified head (`last_verified_sha`) instead, so the post-merge summary can still be prepared after the
+  workspace is released. Without a valid recorded head, or while the workspace is still leased, or when the item,
+  its verified head or its workspace changes while the route reads, the route returns `409
+  progress_context_unavailable`. The route checks the terminal facts again against the item before it answers.
+- **No authority value.** The context, the published marker and the route response carry no dispatch nonce, lease
+  token or other authority value. The marker holds only public references: `work_item_id`, `owner_slot_id`,
+  `scope_revision`, `source_sha`, `phase` and a public `generation`. The generation is the full SHA-256 digest of a
+  versioned domain string, the work-item id and the dispatch nonce. It names one dispatch, changes with every
+  replacement dispatch (a retry reset included, even for the same owner and the same published commit), and is not
+  a secret, a MAC or a capability: no endpoint accepts it, and every authority check still compares the raw private
+  nonce. The route compares the nonce with the live item and does not return it (`dispatch_nonce` is null in the
+  response). A published block that still carries a `dispatch_nonce`, or an old counter-only `attempt`, is treated
+  as invalid and is never trusted; the product does not rewrite old blocks, so the operator removes them by hand.
+- **Final fence.** After its last awaited Leader check the route reads one joined projection of the item and its
+  workspace lease, then compares nonce, owner slot, scope revision, generation and the item status the context was
+  built under (`remaining_work_context_status`) before it answers; a recorded-head context also needs a terminal
+  status, no leased workspace and the same verified head. Nothing awaits after that projection. Any difference
+  returns `409 progress_context_unavailable`.
+- **No GitHub write.** The tool and the route write nothing to GitHub. The owner publishes the block, or the
+  system-owned PR comment shows the generated summary.

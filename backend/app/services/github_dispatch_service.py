@@ -50,6 +50,7 @@ from app.services.github_approval_service import (
 from app.services.github_client import github_client
 from app.services.github_dispatch_priority import dispatch_order_key, priority_from_labels
 from app.services.github_recovery_gate import GithubRecoveryOnlyAttempt
+from app.services.session_recovery import recover_session
 from app.services.github_workspace_service import (
     _RELEASABLE_STATUSES,
     GithubWorkspaceConfigError,
@@ -124,6 +125,7 @@ DISPATCH_STATUSES = frozenset(
         "awaiting_human_review",
         "merged",
         "completed",
+        "cancelled",
         "escalated",
         "failed",
     }
@@ -152,6 +154,15 @@ ESCALATION_REASONS = frozenset(
         "pr_closed_unmerged",
     }
 )
+
+
+def restored_escalation_reason(revision) -> str:
+    """The reason an attempt returns to escalation with when its revision ends (#1139).
+
+    A scope amendment starts from a healthy attempt, so its originating reason is empty; the attempt then needs a
+    fresh bounded proposal, which is "plan_blocked", the Leader-cancel path's fallback too. Never empty.
+    """
+    return revision.originating_escalation_reason or "plan_blocked"
 
 PENDING_REASONS = frozenset(
     {
@@ -1238,6 +1249,9 @@ class GithubDispatchService:
         pending.sort(key=dispatch_order_key)
         await db.commit()
 
+        # #1081: owner slots a higher-ranked item found busy in this poll. A slot that frees during the walk goes to
+        # the top-ranked waiting item on the next poll, not to whichever item is checked next.
+        busy_slots: set[int] = set()
         for item in pending:
             pending_identity = _item_identity(item)
             issue_labels = issue_labels_by_number.get(item.issue_number, [])
@@ -1302,6 +1316,14 @@ class GithubDispatchService:
                 )
                 await db.commit()
                 continue
+            # A prepared attempt may itself be what holds the slot, so it is never locked out of it.
+            if owner_slot_id in busy_slots and state is not AttemptState.PREPARED:
+                await self._update_current_item(
+                    db, item, pending_identity, owner_slot_id=owner_slot_id, routing_method=method,
+                    pending_reason="queued_slot_busy",
+                )
+                await db.commit()
+                continue
             owner_slot = slots_by_id.get(owner_slot_id)
             ambiguity_note = await self._session_ambiguity_note(db, owner_slot_id)
             if ambiguity_note is not None:
@@ -1317,6 +1339,8 @@ class GithubDispatchService:
                 db, scope, item, owner_slot_id=owner_slot_id,
                 routing_method=method, require_autonomy=require_autonomy,
             ):
+                if item.pending_reason == "queued_slot_busy":
+                    busy_slots.add(owner_slot_id)
                 continue
             start_identity = _item_identity(item)
             workspace = await github_workspace_service.acquire(db, scope, item)
@@ -1899,9 +1923,10 @@ class GithubDispatchService:
                 "This attempt is stopped, terminal or in an unrecognized state. "
                 "Do not make ordinary review corrections under its old approval "
                 "or lease. Escalated attempts require supported recovery; terminal "
-                "attempts require a separately authorized new attempt. This guidance "
-                "does not grant approval, retry or release authority. Respect "
-                "operator pauses and safety holds."
+                "attempts require a separately authorized new attempt. An ended "
+                "revision's prohibited actions no longer apply. Releasing a merged "
+                "item's workspace is never prohibited. This guidance does not grant "
+                "approval or retry authority. Respect operator pauses and safety holds."
             )
         if item is not None and (
             item.active_scope_revision > 0 or item.attempt_phase != "implementation"
@@ -1910,8 +1935,9 @@ class GithubDispatchService:
                 "This attempt uses a scoped or diagnostic continuation. Follow its "
                 "current approved revision, paths, commands and finite budgets. A "
                 "completed revision does not authorize another head; use supported "
-                "continuation recovery if additional work is needed. This guidance "
-                "does not grant approval. Respect operator pauses and safety holds."
+                "continuation recovery if additional work is needed. A revision's "
+                "prohibited actions apply only while it is active or submitted. This "
+                "guidance does not grant approval. Respect operator pauses and safety holds."
             )
         return (
             "ORDINARY PR REVIEW CORRECTIONS: For an initial implementation attempt "
@@ -2069,7 +2095,8 @@ class GithubDispatchService:
             item.brief_message_id = message.id
             item.brief_delivery_nudge_at = None
             item.brief_delivery_nudge_count = None
-        except Exception:
+        except Exception as caught_error:
+            await recover_session(db, caught_error)
             logger.exception("Failed to send autonomous dispatch brief for item %s", item.id)
 
     async def _session_ambiguity_note(
@@ -2084,7 +2111,8 @@ class GithubDispatchService:
         )
         try:
             await agent_mail_service.sync_observed_sessions(db, strict=True)
-        except Exception:
+        except Exception as caught_error:
+            await recover_session(db, caught_error)
             logger.exception(
                 "session discovery failed while checking slot %s for ambiguity",
                 owner_slot_id,
@@ -2216,7 +2244,8 @@ class GithubDispatchService:
                 None,
                 owner_may_be_active=True,
             )
-        except Exception:
+        except Exception as caught_error:
+            await recover_session(db, caught_error)
             logger.exception(
                 "Failed to notify after approval rounds exhausted for item %s",
                 item.id,
@@ -2442,10 +2471,10 @@ class GithubDispatchService:
                     **notice_fields,
                 )
                 await db.commit()
-            except Exception:
+            except Exception as caught_error:
                 # The notice is already sent; a missing observation never
                 # replays it.
-                await db.rollback()
+                await recover_session(db, caught_error, discard=True)
 
     async def accept_handoff(
         self,
@@ -2560,7 +2589,7 @@ class GithubDispatchService:
             if active_revision is not None:
                 item_update = item_update.values(
                     dispatch_status="escalated",
-                    escalation_reason=active_revision.originating_escalation_reason,
+                    escalation_reason=restored_escalation_reason(active_revision),
                     pending_reason=None,
                     continuation_nudged_at=None,
                     status_note=(
@@ -2757,6 +2786,10 @@ class GithubDispatchService:
         preset_slots: list[AgentTeamSlot],
         wake_state_by_slot: dict[int, str] | None = None,
     ) -> None:
+        # #938: advance the advisory effort ledger of this scope's limited items; it never ends or expires work.
+        from app.services.github_effort_limit_service import effort_limit_service
+
+        await effort_limit_service.tick_scope(db, scope)
         enabled = sorted(
             [slot for slot in preset_slots if slot.enabled],
             key=lambda slot: slot.position,
@@ -3197,7 +3230,8 @@ class GithubDispatchService:
                             item,
                             cancelled_revision,
                         )
-                    except Exception:
+                    except Exception as caught_error:
+                        await recover_session(db, caught_error)
                         logger.exception(
                             "Recovery monitor could not repair active continuation "
                             "cancellation notice for work item %s",
@@ -3321,7 +3355,8 @@ class GithubDispatchService:
                         note,
                         owner_may_be_active=False,
                     )
-                except Exception:
+                except Exception as caught_error:
+                    await recover_session(db, caught_error)
                     logger.exception(
                         "Failed to send continuation budget escalation for item %s",
                         item.id,
@@ -3772,7 +3807,10 @@ class GithubDispatchService:
                 return False
             if pane_is_alive_strict(binding.pane_pid, binding.pane_start) is not True:
                 return False
-            if observed.waiting_input is not None or observed.state == "stopped":
+            # A provider refusal is not a wait on someone else: the Leader stays ordinary idle (#1091).
+            waiting = (observed.waiting_input is not None
+                       and activity.counts_as_external_wait(observed.waiting_input.reason))
+            if waiting or observed.state == "stopped":
                 return False
             recent = now - timedelta(seconds=fresh_seconds) <= session.last_seen_at <= now
             observed_at = observed.observed_at
@@ -4018,12 +4056,12 @@ class GithubDispatchService:
             )
             if reason == "dispatch_label_removed":
                 await self._send_label_removed_owner_message(db, item)
-        except Exception:
+        except Exception as caught_error:
+            await recover_session(db, caught_error, discard=True)
             logger.exception(
                 "Failed to send autonomous dispatch escalation notification for item %s",
                 item.id,
             )
-            await db.rollback()
             self._apply_escalation(item, reason, note, preserve_existing_reason=False)
 
     async def abandon_by_operator(
@@ -4077,7 +4115,8 @@ class GithubDispatchService:
                 sanitized_reason="abandon notice delivered",
                 operation_id=f"{operation}:notice:applied", **notice_fields)
             await db.commit()
-        except Exception:
+        except Exception as caught_error:
+            await recover_session(db, caught_error)
             logger.exception("Failed to send the abandon notification for item %s", item_id)
             await _audit.record_observation(
                 db, occurred_at=datetime.utcnow(), action_outcome="uncertain",

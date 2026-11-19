@@ -24,11 +24,11 @@ import { UsagePage } from "@/features/usage/UsagePage";
 import type { AgentProviderId } from "@/types/providers";
 import { useProviderOperations } from "@/hooks/useProviders";
 import { nativeAdapter, nativeAccess } from "./surfaceRegistry";
-import { ProjectSelector } from "@/features/projects/ProjectSelector";
+import { ScopedPage, SurfaceScopeSelector } from "@/features/projects/ScopeSelector";
 import { projectScopedSurface } from "./projectScope";
 import { HarnessBreadcrumb, HarnessSubNav } from "@/features/harnesses/HarnessNav";
 import { useDocumentTitle } from "@/features/harnesses/harnessPages";
-import { surfaceInfo } from "@/features/harnesses/surfaceCatalog";
+import { surfaceName } from "@/features/harnesses/surfaceCatalog";
 import { harnesses } from "@/features/factory/filterHelpers";
 import { Lock } from "lucide-react";
 const pages = {
@@ -66,7 +66,8 @@ export function NativeRoute({
   const Page = Object.hasOwn(pages, surface) ? pages[surface as keyof typeof pages] : undefined;
   const catalog = useProviderOperations(entry && Page && metadata && !context.loading && !context.error ? metadata.id : undefined);
   const access = nativeAccess(provider, surface, metadata, catalog.catalog ?? undefined);
-  const pageName = surfaceInfo[surface as keyof typeof surfaceInfo]?.name ?? null;
+  const pageName = surfaceName(provider, surface) ?? null;
+  const sessionsUnavailable = provider === "codex-cli" && surface === "sessions";
   const harnessName = harnesses[provider as AgentProviderId] ?? provider;
   useDocumentTitle(pageName && metadata ? `${pageName} · ${harnessName} · Albiex Synth City` : null);
   if (context.loading) return <p role="status">Loading harness registry…</p>;
@@ -75,12 +76,18 @@ export function NativeRoute({
   if (!entry || !Page || !access || context.error || !metadata)
     return (
       <section className="space-y-3">
-        <h2 className="text-xl font-semibold">Native page unavailable</h2>
-        <p>
-          {provider}/{surface} has no available matching native page adapter.
-          CLI or Agent Mail integration capabilities do not enable a settings
-          editor.
-        </p>
+        {sessionsUnavailable ? (
+          <h2 className="text-xl font-semibold">Session history isn't available for Codex CLI yet</h2>
+        ) : (
+          <>
+            <h2 className="text-xl font-semibold">Native page unavailable</h2>
+            <p>
+              {provider}/{surface} has no available matching native page adapter.
+              CLI or Agent Mail integration capabilities do not enable a settings
+              editor.
+            </p>
+          </>
+        )}
         {context.error && <p role="alert">{context.error}</p>}
         {catalog.state === "error" && <p role="alert">Operating catalog unavailable. Native pages require a valid current catalog.</p>}
         <Link className="text-primary underline" to="/harnesses">
@@ -120,14 +127,16 @@ export function NativeRoute({
             {access === "read_only" && (
               <p className="inline-flex items-center gap-1 text-sm text-muted-foreground"><Lock className="h-3 w-3" aria-hidden="true" />View only</p>
             )}
-            {!detail && projectScopedSurface(`/harnesses/${provider}/${surface}`) && <ProjectSelector />}
-            {detail === "session" ? (
-              <SessionViewPage />
-            ) : detail === "plan" ? (
-              <PlanDetailPage />
-            ) : (
-              <Page />
-            )}
+            {!detail && projectScopedSurface(`/harnesses/${provider}/${surface}`) && <SurfaceScopeSelector providerId={provider} surface={surface} />}
+            <ScopedPage>
+              {detail === "session" ? (
+                <SessionViewPage />
+              ) : detail === "plan" ? (
+                <PlanDetailPage />
+              ) : (
+                <Page />
+              )}
+            </ScopedPage>
           </div>
         </div>
       </div>

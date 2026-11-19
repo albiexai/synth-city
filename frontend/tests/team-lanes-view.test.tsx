@@ -68,8 +68,8 @@ describe('TeamLanesView with 8 members', () => {
     expect(screen.getByText('Showing 1–4 of 8')).toBeInTheDocument()
     const strip = screen.getByRole('navigation', { name: 'Team members' })
     expect(within(strip).getAllByRole('button')).toHaveLength(8)
-    expect(within(strip).getByRole('button', { name: /Member 1 / })).toHaveAttribute('aria-pressed', 'true')
-    expect(within(strip).getByRole('button', { name: /Member 5 / })).toHaveAttribute('aria-pressed', 'false')
+    expect(within(strip).getByRole('button', { name: /^Member 1(?!\d)/ })).toHaveAttribute('aria-pressed', 'true')
+    expect(within(strip).getByRole('button', { name: /^Member 5(?!\d)/ })).toHaveAttribute('aria-pressed', 'false')
     expect(within(strip).getAllByText('Activity unknown')).toHaveLength(8)
     expect(screen.queryByText(/not shown/)).toBeNull()
   })
@@ -96,7 +96,7 @@ describe('TeamLanesView with 8 members', () => {
   it('brings a member from the strip into view', () => {
     render(<Harness />)
 
-    fireEvent.click(within(screen.getByRole('navigation', { name: 'Team members' })).getByRole('button', { name: /Member 7 / }))
+    fireEvent.click(within(screen.getByRole('navigation', { name: 'Team members' })).getByRole('button', { name: /^Member 7(?!\d)/ }))
 
     expect(screen.getByText('Showing 4–7 of 8')).toBeInTheDocument()
     expect(terminals()).toContain('terminal-t:0.6')
@@ -125,7 +125,7 @@ describe('TeamLanesView with 8 members', () => {
     render(<Harness />)
     fireEvent.click(screen.getByRole('button', { name: 'Zoom t:0.1' }))
 
-    fireEvent.click(within(screen.getByRole('navigation', { name: 'Team members' })).getByRole('button', { name: /Member 6 / }))
+    fireEvent.click(within(screen.getByRole('navigation', { name: 'Team members' })).getByRole('button', { name: /^Member 6(?!\d)/ }))
 
     expect(screen.getByText('Showing 3–6 of 8')).toBeInTheDocument()
     expect(screen.getByTestId('terminal-t:0.5').closest('.hidden')).toBeNull()

@@ -16,11 +16,11 @@ from app.models.database import (AgentTeamPreset, FactoryAuditEvent,
 from app.services.factory_audit_service import sanitize_text
 from app.services.github_coordination_service import hold_code
 from app.services.github_ci_watch_service import github_ci_watch_service
+from app.services.work_item_states import FINISHED_STATUSES
 
 _MUTATIONS = {'owner_status_report', 'approval_decision', 'handoff_reassignment', 'handoff_acceptance',
     'continuation_decision', 'continuation_request', 'prepared_attempt_resume', 'recovery_cancellation',
     'request_cancellation', 'workspace_release', 'review_acceptance_declared'}
-_TERMINAL = ('merged', 'completed')
 
 
 def _utc(value):
@@ -33,7 +33,7 @@ def _digest(value):
 
 class GithubTeamIdleService:
     async def projection(self, db, preset_id, *, now=None):
-        from app.services.agent_activity_service import observe_team, _team_inputs
+        from app.services.agent_activity_service import counts_as_external_wait, observe_team, _team_inputs
         from app.services.github_operator_attention_service import github_operator_attention_service
         async def read():
             fence = {}
@@ -43,7 +43,9 @@ class GithubTeamIdleService:
             current = {entry[0]: entry for entry in await _team_inputs(db, preset_id, 256)}
             complete = (current == fence and human["coverage_complete"]
                 and len(human["actions"]) <= 64 and all(s.state != "unknown" for s in native.slots))
-            external_wait = (any(s.waiting_input is not None for s in native.slots)
+            # A provider refusal is not a wait on someone else: the member stays ordinary idle (#1091).
+            external_wait = (any(s.waiting_input is not None and counts_as_external_wait(s.waiting_input.reason)
+                                 for s in native.slots)
                 or any(a.get("state") not in {"resolved", "historical"} for a in human["actions"]))
             return await self.observe(db, preset_id, now=now, coverage_complete=complete,
                                       external_wait=external_wait)
@@ -72,7 +74,7 @@ class GithubTeamIdleService:
             return []
         rows = (await db.execute(select(GithubWorkItem, TeamGithubScope).join(TeamGithubScope,
             TeamGithubScope.id == GithubWorkItem.scope_id).where(TeamGithubScope.preset_id == preset_id,
-            GithubWorkItem.dispatch_status.not_in(_TERMINAL)).order_by(GithubWorkItem.id).limit(65)
+            GithubWorkItem.dispatch_status.not_in(FINISHED_STATUSES)).order_by(GithubWorkItem.id).limit(65)
             .execution_options(populate_existing=True))).all()
         if len(rows) > 64 or not coverage_complete:
             return await self._unavailable(db, preset_id, now)

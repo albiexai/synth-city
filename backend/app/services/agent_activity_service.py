@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import pwd
 import re
@@ -24,6 +25,7 @@ from pathlib import Path
 from uuid import UUID
 
 from sqlalchemy import JSON, and_, exists, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import (
@@ -34,10 +36,17 @@ from app.models.schemas import (
     NativeInputWait,
 )
 from app.services.pi_activity_service import observe_pi
+from app.services.provider_refusal_notice_service import send_provider_refusal_notices
 from app.services.claude_activity_service import observe_claude
 from app.services.muse_activity_service import discover_muse_session, observe_muse
+from app.services.antigravity_activity_worker import discover_antigravity_conversation, observe_antigravity
+
+logger = logging.getLogger(__name__)
 
 _TAIL_BYTES = 1_048_576
+# A long Codex turn can push its task_started out of the tail (#1201). Read earlier chunks up to this bound.
+_MAX_HISTORY_BYTES = 8 * _TAIL_BYTES
+_CODEX_TURN_BOUNDARIES = {"task_started", "task_complete", "turn_aborted", "error"}
 _MAX_PROCESS_DESCRIPTORS = 256
 _WORK_FRESHNESS_SECONDS = 180
 _STOPPED_STATES = {"T", "t", "Z", "X", "x"}
@@ -83,6 +92,58 @@ def recognize_native_input_wait(provider: str, screen: str) -> str | None:
     return None
 
 
+PROVIDER_REFUSAL = "provider_refusal"
+
+
+def counts_as_external_wait(reason: str) -> bool:
+    """Does a member in this wait count as waiting on someone else?
+
+    A provider refusal does not. The member stays ordinary idle, so idle nudges and the re-wake still try to
+    recover it. Dispatch, the idle service and the team summary all ask this one question (#1091).
+    """
+    return reason != PROVIDER_REFUSAL
+
+
+# The Codex content-filter notice. The three lines are a real capture (#1062): a header at column 0, an indented
+# detail line, and an optional indented "Learn more" line whose URL can change.
+_REFUSAL_HEADER = re.compile(r"^ⓘ\s+This content can[’']t be shown$")
+_REFUSAL_DETAIL = "  We take extra care with some cybersecurity requests."
+_REFUSAL_MORE = re.compile(r"^ {2}Learn more: \S+$")
+
+
+def recognize_provider_refusal(provider: str, screen: str) -> str | None:
+    """Recognize a provider refusal or content-filter notice that is the current state of a pane.
+
+    Returns "provider_refusal" or None. None means the screen is unknown, not that no refusal happened.
+    Codex only: there is no real Claude Code capture yet, so Claude Code is not recognized and no fixture text
+    is invented for it.
+
+    The last notice block counts only when nothing happened after it. Every non-blank line after the block
+    must be indented (composer continuation, footer, elapsed time) or start with the composer glyph. A new
+    top-level line (assistant output, a work item, another notice) means the member moved on. Only the three
+    notice lines are real capture, not the layout around them, so a miss is preferred to marking a working
+    member as blocked.
+    """
+    if provider != "codex-cli" or not screen or len(screen) > 65536:
+        return None
+    plain = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", screen)
+    plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", plain)
+    lines = [line.rstrip() for line in plain.splitlines()]
+    headers = [index for index, line in enumerate(lines) if _REFUSAL_HEADER.match(line)]
+    if not headers:
+        return None
+    start = headers[-1]
+    if start + 1 >= len(lines) or lines[start + 1] != _REFUSAL_DETAIL:
+        return None
+    end = start + 2
+    if end < len(lines) and _REFUSAL_MORE.match(lines[end]):
+        end += 1
+    for line in lines[end:]:
+        if line.strip() and not line.startswith(("›", " ")):
+            return None
+    return "provider_refusal"
+
+
 @dataclass(frozen=True)
 class ActivityBinding:
     pane_pid: int
@@ -118,7 +179,9 @@ def _capture_native_input_wait(provider: str, binding: ActivityBinding) -> str |
         state, start = _process(binding.pane_pid)
         if captured.returncode != 0 or before != after or start != binding.pane_start or state in _STOPPED_STATES:
             return None
-        return recognize_native_input_wait(provider, captured.stdout)
+        # A refusal screen also reads as an idle composer ("clear"), so the refusal is tried first.
+        return (recognize_provider_refusal(provider, captured.stdout)
+                or recognize_native_input_wait(provider, captured.stdout))
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
@@ -271,6 +334,21 @@ def _process_started_at(start: str) -> datetime:
         seconds=1 / ticks_per_second)
 
 
+def _codex_has_turn_boundary(data: bytes, offset: int) -> bool:
+    """Whether the read window holds a Codex turn boundary. The parser below still validates every event."""
+    lines = data.splitlines()
+    for line in lines[1:] if offset else lines:  # the first line can be a partial record
+        if b'"event_msg"' not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            return True  # stop widening; the parser reports the invalid record
+        if record.get("type") == "event_msg" and record.get("payload", {}).get("type") in _CODEX_TURN_BOUNDARIES:
+            return True
+    return False
+
+
 def _native_state(path: Path, session_id: str, cwd: str, now: datetime, started_at: datetime,
                   *, provenance: dict | None = None
                   ) -> tuple[str, str, datetime | None]:
@@ -285,6 +363,20 @@ def _native_state(path: Path, session_id: str, cwd: str, now: datetime, started_
         offset = max(0, size - _TAIL_BYTES)
         stream.seek(offset)
         tail = stream.read(_TAIL_BYTES)
+        # A long turn can push its task_started out of the tail (#1201). Read adjacent earlier
+        # chunks until a turn boundary is in view, within a fixed history bound. Progress alone
+        # still never starts a turn.
+        if tail.endswith(b"\n"):
+            while offset and not _codex_has_turn_boundary(tail, offset):
+                remaining = _MAX_HISTORY_BYTES - len(tail)
+                if remaining <= 0:
+                    break
+                previous = max(0, offset - min(_TAIL_BYTES, remaining))
+                stream.seek(previous)
+                prefix = stream.read(offset - previous)
+                if len(prefix) != offset - previous:
+                    return "unknown", "observation_incomplete", None
+                tail, offset = prefix + tail, previous
     if not tail.endswith(b"\n"):
         return "unknown", "observation_incomplete", None
     lines = tail.splitlines()
@@ -394,9 +486,13 @@ def _observe(slot_id: int, provider: str, session_id: str | None,
             if provenance is not None and provenance.get("session_id"):
                 provenance.update(pane_pid=pid, pane_start=start, provider=provider)
             return result(state, reason, observed_at)
-        if provider == "muse-cli":
+        if provider in {"muse-cli", "antigravity-cli"}:
+            if provider == "antigravity-cli" and duplicate_identity:
+                # Another slot is configured with this conversation: its events cannot be attributed.
+                return result("unknown", "duplicate_native_identity")
             if not session_id:
-                identity = discover_muse_session(pid, cwd)
+                discover = discover_muse_session if provider == "muse-cli" else discover_antigravity_conversation
+                identity = discover(pid, cwd)
                 process_state, current_start = _process(pid)
                 if current_start != start or process_state in _STOPPED_STATES:
                     return result("unknown", "binding_changed")
@@ -406,9 +502,13 @@ def _observe(slot_id: int, provider: str, session_id: str | None,
                               else "session_identity_unavailable")
             if _canonical_session_id(session_id) != session_id:
                 return result("unknown", "session_identity_unavailable")
-            options = {"provenance": provenance} if provenance is not None else {}
-            state, reason, observed_at = observe_muse(
-                pid, session_id, cwd, now, _process_started_at(start), **options)
+            if provider == "muse-cli":
+                options = {"provenance": provenance} if provenance is not None else {}
+                state, reason, observed_at = observe_muse(
+                    pid, session_id, cwd, now, _process_started_at(start), **options)
+            else:
+                state, reason, observed_at = observe_antigravity(
+                    pid, session_id, cwd, now, _process_started_at(start))
             process_state, current_start = _process(pid)
             if current_start != start:
                 return result("unknown", "binding_changed")
@@ -499,6 +599,11 @@ def _observe(slot_id: int, provider: str, session_id: str | None,
         return result("unknown", "observation_unavailable")
 
 
+# Providers whose slots keep a native session id in their launch options. Every place that counts or compares those
+# ids reads this one list, so the factory snapshot and the team read cannot drift apart (#982).
+SESSION_ID_PROVIDERS = ("claude-code", "codex-cli", "muse-cli", "antigravity-cli")
+
+
 async def _team_inputs(db: AsyncSession, preset_id: int, max_rows: int | None = None, identity: dict | None = None):
     async def rows(query):
         if max_rows is not None:
@@ -511,7 +616,7 @@ async def _team_inputs(db: AsyncSession, preset_id: int, max_rows: int | None = 
     slots = [row[0] for row in await rows(select(AgentTeamSlot).where(
         AgentTeamSlot.preset_id == preset_id).execution_options(populate_existing=True))]
     options = await rows(select(AgentTeamSlot.launch_options).where(
-        AgentTeamSlot.provider.in_(["codex-cli", "claude-code", "muse-cli"])))
+        AgentTeamSlot.provider.in_(SESSION_ID_PROVIDERS)))
     members = [row[0] for row in await rows(select(MailTeamMember).where(
         MailTeamMember.team_preset_id == preset_id).order_by(
             MailTeamMember.updated_at.desc(), MailTeamMember.id.desc()).execution_options(
@@ -590,7 +695,8 @@ async def _bounded_native_read(read):
 
 async def observe_team(db: AsyncSession, preset_id: int, *, include_agent_status: bool = True,
                        persist_identities: bool = True, max_input_rows: int | None = None,
-                       input_fence: dict | None = None) -> AgentTeamActivityResponse:
+                       input_fence: dict | None = None, record_input_waits: bool = True,
+                       validity_seconds: int = 15) -> AgentTeamActivityResponse:
     inputs = await _team_inputs(db, preset_id) if max_input_rows is None else await _team_inputs(db, preset_id, max_input_rows)
     now = datetime.now(timezone.utc)
     metadata = [{} for _ in inputs]
@@ -607,7 +713,8 @@ async def observe_team(db: AsyncSession, preset_id: int, *, include_agent_status
             observation.reason = "binding_changed"
             observation.observed_at = None
             observation.waiting_input = None
-    notices_changed = await _record_input_waits(db, preset_id, inputs, metadata, current, now=now)
+    # #1149: status projections (GET /agent-bridge/sessions, Mail status reads) pass False, so a read never writes.
+    notices_changed = record_input_waits and await _record_input_waits(db, preset_id, inputs, metadata, current, now=now)
     if persist_identities and await _save_codex_identities(db, inputs, metadata, current):
         await db.commit()
     if notices_changed:
@@ -622,7 +729,7 @@ async def observe_team(db: AsyncSession, preset_id: int, *, include_agent_status
     else:
         observations = [AgentActivityDisplayObservation(**entry.model_dump()) for entry in observations]
     return AgentTeamActivityResponse(preset_id=preset_id, checked_at=now,
-                                    valid_until=now + timedelta(seconds=15), slots=observations)
+                                    valid_until=now + timedelta(seconds=validity_seconds), slots=observations)
 
 
 async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) -> bool:
@@ -630,7 +737,7 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
     changed = False
     for entry, details in zip(inputs, metadata):
         reason = details.get("input_wait_reason")
-        if (not details.get("input_wait_known") or reason not in {"question", "trust", "sign_in", "clear"}
+        if (not details.get("input_wait_known") or reason not in {"question", "trust", "sign_in", PROVIDER_REFUSAL, "clear"}
                 or current.get(entry[0]) != entry):
             continue
         matching = [binding for binding in entry[3] if binding.binding_id == details.get("input_wait_binding_id")]
@@ -663,9 +770,13 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
                 waiting_input_started_at=None, waiting_input_notice_id=None, waiting_input_observed_at=now).execution_options(synchronize_session=False))
             changed = changed or result.rowcount == 1
             continue
-        kept = await db.execute(update(AgentPaneBinding).where(*conditions,
-            AgentPaneBinding.waiting_input_reason.is_not(None)).values(waiting_input_observed_at=now)
-            .execution_options(synchronize_session=False))
+        # One continuous episode keeps its first reason (a question may become a trust prompt). A refusal is not
+        # a wait for input, so a change into or out of one is a new episode with its own reason and notice.
+        refused = AgentPaneBinding.waiting_input_reason == PROVIDER_REFUSAL
+        same_kind = refused if reason == PROVIDER_REFUSAL else and_(
+            AgentPaneBinding.waiting_input_reason.is_not(None), ~refused)
+        kept = await db.execute(update(AgentPaneBinding).where(*conditions, same_kind)
+            .values(waiting_input_observed_at=now).execution_options(synchronize_session=False))
         if kept.rowcount == 1:
             changed = True
             continue
@@ -685,7 +796,7 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
                 continue
         same_route = exists(select(AgentTeamPreset.id).where(AgentTeamPreset.id == preset_id,
             AgentTeamPreset.supervisor_actor_id.is_(None) if actor_id is None else AgentTeamPreset.supervisor_actor_id == actor_id,
-            AgentTeamPreset.leader_slot_id == leader_slot_id if actor_id is None else True))
+            AgentTeamPreset.leader_slot_id == leader_slot_id if actor_id is None or reason == PROVIDER_REFUSAL else True))
         if recipient is not None:
             leader_current = (select(MailTeamMember.id).where(MailTeamMember.team_preset_id == preset_id,
                 MailTeamMember.team_slot_id == leader_slot_id).order_by(MailTeamMember.updated_at.desc(),
@@ -693,9 +804,30 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
             conditions.extend([leader_current == recipient, exists(select(AgentTeamSlot.id).where(
                 AgentTeamSlot.id == leader_slot_id, AgentTeamSlot.preset_id == preset_id,
                 AgentTeamSlot.enabled.is_(True)))])
-        result = await db.execute(update(AgentPaneBinding).where(*conditions, same_route,
-            AgentPaneBinding.waiting_input_reason.is_(None)).values(waiting_input_reason=reason,
-            waiting_input_started_at=now, waiting_input_observed_at=now).execution_options(synchronize_session=False))
+        claim = update(AgentPaneBinding).where(*conditions, same_route,
+            or_(AgentPaneBinding.waiting_input_reason.is_(None), ~same_kind)).values(waiting_input_reason=reason,
+            waiting_input_started_at=now, waiting_input_observed_at=now).execution_options(synchronize_session=False)
+        if reason == PROVIDER_REFUSAL:
+            # A refusal is not a wait for input: it has its own notices, to the Leader and the Supervisor (#1092).
+            # The claim and both notices are one unit. A failure that is not a duplicate delivery rolls all of it
+            # back, so an incomplete delivery is never latched as complete and the next observation retries it.
+            try:
+                async with db.begin_nested():
+                    if (await db.execute(claim)).rowcount != 1:
+                        continue
+                    notice_id = await send_provider_refusal_notices(db, preset_id=preset_id, slot_id=entry[0],
+                        binding_id=binding.binding_id, started_at=now, supervisor_actor_id=actor_id,
+                        leader_slot_id=leader_slot_id)
+                    if notice_id is not None:
+                        await db.execute(update(AgentPaneBinding).where(AgentPaneBinding.id == binding.binding_id)
+                            .values(waiting_input_notice_id=notice_id).execution_options(synchronize_session=False))
+            except IntegrityError:
+                logger.warning("A provider-refusal notice could not be stored; the episode will be retried",
+                               exc_info=True)
+                continue
+            changed = True
+            continue
+        result = await db.execute(claim)
         if result.rowcount != 1:
             continue
         payload = {"notice": "native_input_wait", "slot_id": entry[0], "reason": reason}
@@ -716,7 +848,7 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
 
 
 # First-launch session ids that Albiex Synth City discovers from the live process.
-_DISCOVERED_IDENTITY_PROVIDERS = {"codex-cli", "muse-cli"}
+_DISCOVERED_IDENTITY_PROVIDERS = {"codex-cli", "muse-cli", "antigravity-cli"}
 
 
 async def _save_codex_identities(db, inputs, metadata, current) -> bool:
@@ -735,7 +867,7 @@ async def _save_codex_identities(db, inputs, metadata, current) -> bool:
             continue
         duplicate = exists(select(AgentTeamSlot.id).where(
             AgentTeamSlot.id != slot.id,
-            AgentTeamSlot.provider.in_(["claude-code", "codex-cli", "muse-cli"]),
+            AgentTeamSlot.provider.in_(SESSION_ID_PROVIDERS),
             AgentTeamSlot.launch_options["session_id"].as_string() == identity))
         options_match = (or_(AgentTeamSlot.launch_options.is_(None),
                              AgentTeamSlot.launch_options == JSON.NULL)
