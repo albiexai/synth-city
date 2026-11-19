@@ -75,10 +75,15 @@ two hours on an unanswered decision, flaky tests, nine minutes of GitHub rate li
 
 New append-only records, written by the paths that already see the facts:
 
-1. **Check runs:** for each required check run on a head, the check name, run id, run attempt, queued_at, started_at,
-   completed_at and conclusion. Source: the check runs that `github_check_observation.py` already reads. Today it keeps
-   status, conclusion and `run_attempt`, but no timestamps, and `GithubRequiredCheckWatch.observed_at` is overwritten on
-   every observation.
+1. **Check runs:** **every** check run on each PR head, not only the required ones, each marked required or not
+   by the scope's delivery policy. Each record holds the check name, the app that reported it, the head, the
+   conclusion, `started_at` and `completed_at`. GitHub returns them all in the same list, so there are no extra calls.
+   - **For GitHub Actions checks,** also the Actions job's `created_at` (so queue time = `started_at − created_at`),
+     the run attempt, and the workflow's name and file path (for example `.github/workflows/e2e.yml`).
+   - Recorded **once, when the run completes**, not on every poll, so the shared GitHub quota hardly moves.
+   - Source: the check runs that `github_check_observation.py` already reads. It already follows Actions checks to
+     their job and keeps the workflow run id. Today it keeps no timestamps, ignores non-required checks, and
+     `GithubRequiredCheckWatch.observed_at` is overwritten on every observation.
 2. **PR facts at merge:** additions, deletions, changed files, commit count and `merged_by`, recorded as a delivery fact
    next to `record_merged_delivery`. `merged_by` gives the hand-merge count without a separate intervention event.
    Nothing under `backend/app` stores these today.
@@ -91,6 +96,29 @@ New append-only records, written by the paths that already see the facts:
      that leaves a builder idle is counted.
 4. **GitHub rate-limit windows:** start, reset and the source of each. #1197 already reports the current state; it
    needs keeping as history.
+
+### 1b. Generic by construction (Director, 2026-11-19)
+
+The same page must work for any repository a team watches: Synth City, Tizonia, or a project with different CI.
+So:
+- **Nothing is keyed to a check name or a workflow file.** "Required", "CI share" and the CI table come from each
+  scope's own delivery policy (names and apps). No rule names `e2e`, `backend` or any Synth City job.
+- **Any check app.** Durations and conclusions come from check runs, which every CI that reports to GitHub produces.
+  Fields that only GitHub Actions provides (queue time, workflow name and path, run attempt) are **unknown** for other
+  apps, never zero, and the page says why: "this check's CI doesn't report queue time".
+- **Flaky checks, generically:** the same check name fails and then passes on the same head. That works for reruns
+  through a new Actions run attempt and for other CI apps' new check runs alike.
+- **No repository conventions are assumed.** The retrospective doesn't depend on shard layouts, gate jobs, docs-only
+  skips or known-flakes lists. Those belong to a repository's own CI.
+- **Not available through GitHub's API to non-admins,** so not shown as a number: the organisation's concurrency limit
+  and plan. Their effect is **inferred** from queue times that rise when several PRs push together.
+- **Workflow files aren't read** in this version. The workflow path on each run is enough for a repository-change
+  suggestion to say which file to change. Reading triggers and shard counts is a later phase.
+
+**Acceptance:** the snapshot tests run against two fixture scopes: one with GitHub Actions checks named like
+Synth City's, and one with **different check names from a non-Actions app**. Both produce the same sections, with
+unknowns where the second can't report. Before the campaign starts, the live page is checked once against a second
+real repository with different CI (for example Tizonia).
 
 ### 2. Campaign record
 
@@ -126,9 +154,10 @@ New append-only records, written by the paths that already see the facts:
 
   The page shows one split bar with the three groups' shares, then each group's stages. Finer stages, such as
   acknowledgement and the merge gate, come later.
-- **CI:** duration per required check (median and p85, slowest named); queue time against run time; CI's share of
-  item time; reruns. A check is **flaky** when it fails and then passes on the same head through a new `run_attempt`.
-  It is named per check, not per test, in this version.
+- **CI:** duration per required check (median and p85, slowest named); queue time against run time, where the CI
+  reports it; CI's share of item time; reruns. A check is **flaky** when the same check name fails and then passes on
+  the same head (see 1b). It is named per check, not per test, in this version. **Non-required checks** are listed
+  separately with their runner time, because they compete for the same runners.
 - **Friction:** hand merges (from `merged_by`); waits on decisions; GitHub rate-limit time; Synth City errors that
   blocked an agent (refusals, 409s, 500s, from the audit log).
 - **Cost:** see below.
@@ -294,6 +323,7 @@ Order: 1 first, then 2 and 3, with 4 in parallel, then 5 to 8.
 | A flaky check is named per check, fail then pass on the same head | Review: GitHub check runs carry no test names |
 | The finish freezes at once when no member session is live | Review |
 | Section 2 becomes "Where the time went": one split bar of waiting on someone, process and active, with waiting on someone first and broken down by who had to act ("waited" mislabelled active work) | Director, 2026-11-19 |
+| Recording takes every check run on a head (required or not), Actions queue and run times and the workflow path; the page is generic by construction across repositories and CI apps, with a two-fixture acceptance test and a check on a second real repository | Director, 2026-11-19 |
 | A campaign is one team's campaign across all its repositories; repository and team filters, grouping and a per-repository view; product releases across teams deferred | Director, 2026-11-19 |
 | Corrected code claims: PR lines and commits weren't stored; item time was a median only; check runs kept no timestamps | Review, verified against the code |
 
