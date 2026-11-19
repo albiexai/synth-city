@@ -28,7 +28,7 @@ two hours on an unanswered decision, flaky tests, nine minutes of GitHub rate li
 2. **Recording first.** Data that isn't recorded can't be recovered later, so the recording items are the first v4.4
    items. That way the v4.4 campaign itself is measured.
 3. A **live view** while the campaign runs, and a **frozen** one after the finish.
-4. The core measure is **where work waited, by who had to act**. Around it: size, flow, CI, friction, cost.
+4. The core measure is **where the time went**: active work, process steps, and **waiting on someone**, shown first and broken down by who had to act. Around it: size, flow, CI, friction, cost.
 5. **The top three bottlenecks**, each with its **kind of fix** and a way to act on it.
 6. A **campaign health panel** on Overview.
 7. **Ask the Leader or the Supervisor** for their view of a snapshot; both are asked at the finish.
@@ -117,12 +117,15 @@ New append-only records, written by the paths that already see the facts:
   and largest); team size; model and member changes.
 - **Flow:** item time from dispatch to merge (median and p85, by size band); throughput over time, with change
   markers from the existing `policy_change` audit events.
-- **Where work waited:** stages per attempt, derived from the existing work-lifecycle transitions, approval requests,
-  delivery facts and the new records:
-  - waiting for dispatch, planning and approval, building, required checks (from the check-run records), review;
-  - waiting on a decision, by who had to answer.
+- **Where the time went:** stages per attempt, derived from the existing work-lifecycle transitions, approval
+  requests, delivery facts and the new records. Each stage belongs to one of three groups (Director, 2026-11-19):
+  - **Waiting on someone:** waits on a Leader, Supervisor or Director decision, by who had to answer; waiting for
+    dispatch. These are the bottlenecks to act on, and they are shown first.
+  - **Process:** required checks (CI) and review. These are necessary steps; their speed is covered in the CI section.
+  - **Active:** planning and building.
 
-  Finer stages, such as acknowledgement and the merge gate, come later.
+  The page shows one split bar with the three groups' shares, then each group's stages. Finer stages, such as
+  acknowledgement and the merge gate, come later.
 - **CI:** duration per required check (median and p85, slowest named); queue time against run time; CI's share of
   item time; reruns. A check is **flaky** when it fails and then passes on the same head through a new `run_attempt`.
   It is named per check, not per test, in this version.
@@ -209,7 +212,8 @@ change, with n. It never labels the change as confirmed or failed.
 - **The page, top to bottom:**
   1. header;
   2. headline tiles (item time, merged against scope, cost with coverage, Agent Mail messages, hand merges);
-  3. **where work waited**;
+  3. **where the time went** (a split bar of waiting on someone, process and active; waiting on someone listed first, by
+     who had to act);
   4. flow, with change markers and before-and-after;
   5. CI;
   6. friction;
@@ -221,7 +225,7 @@ change, with n. It never labels the change as confirmed or failed.
 - **The Overview health panel** extends the existing `CampaignProgress` card, one per team. It adds:
   - item time;
   - cost so far with coverage;
-  - the top bottleneck, with its responsible actor;
+  - the top bottleneck (the largest "waiting on someone" stage or process step), with its responsible actor;
   - a link to the live view.
 
   It never applies anything.
@@ -289,6 +293,7 @@ Order: 1 first, then 2 and 3, with 4 in parallel, then 5 to 8.
 | Cost: Claude Code and Codex readers, a dated price table in code, a spike first | Review: per-member attribution is unproven |
 | A flaky check is named per check, fail then pass on the same head | Review: GitHub check runs carry no test names |
 | The finish freezes at once when no member session is live | Review |
+| Section 2 becomes "Where the time went": one split bar of waiting on someone, process and active, with waiting on someone first and broken down by who had to act ("waited" mislabelled active work) | Director, 2026-11-19 |
 | A campaign is one team's campaign across all its repositories; repository and team filters, grouping and a per-repository view; product releases across teams deferred | Director, 2026-11-19 |
 | Corrected code claims: PR lines and commits weren't stored; item time was a median only; check runs kept no timestamps | Review, verified against the code |
 
