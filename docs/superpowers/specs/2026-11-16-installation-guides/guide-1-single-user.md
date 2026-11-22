@@ -2,7 +2,7 @@
 
 > [!NOTE]
 > **Status: current situation, 22 Nov 2026 (Synth City 4.3.0, 4.4 in preparation).** This guide describes what works **today** and the ideas for the 4.5 installation programme. It is a thinking aid for planning 4.5, and a guide for a first install on Ubuntu with **Claude Code** and **Codex**.
-> The companion guide is **Guide 2 — a dedicated factory** (next comment).
+> The companion guides are **Guide 2 — a dedicated factory** and **Guide 3 — operating the factory** (what to configure right after installing).
 
 ---
 

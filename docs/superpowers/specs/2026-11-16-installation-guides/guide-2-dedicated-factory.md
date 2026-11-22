@@ -2,7 +2,7 @@
 
 > [!NOTE]
 > **Status: current situation, 22 Nov 2026 (Synth City 4.3.0, 4.4 in preparation).** There is **no installer for a dedicated factory today**. The reference factory, which builds Synth City itself, was set up by hand between October and November 2026. This guide describes that layout, the manual steps, the problems we hit, and the 4.5 ideas. It is a thinking aid for planning 4.5, and a map for anyone who wants to try it now on Ubuntu with **Claude Code** and **Codex**.
-> **New to Synth City? Start with Guide 1 (single user).** Move up when you need unattended teams.
+> **New to Synth City? Start with Guide 1 (single user).** Move up when you need unattended teams. **Guide 3 — operating the factory** covers what to configure once either setup is installed.
 
 ---
 
