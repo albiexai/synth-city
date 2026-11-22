@@ -327,3 +327,234 @@ def test_claude_first_turn_with_launch_uuid_is_observed(native):
     native["write"]([native["user"]])
     result = native["observe"]()
     assert (result.state, result.reason) == ("working", "native_turn_started")
+
+
+# ---- compact_boundary and informational keep the state (#1072) -----------------------------------------
+#
+# The two real shapes below are the key sets of the events in Claude Code 2.1.292 transcripts (read as key
+# names and types only). The values are sanitized fixture values, not transcript content.
+_REAL_SHAPES = {
+    "compact_boundary": lambda: {
+        "content": "Conversation compacted", "level": "info", "logicalParentUuid": str(uuid4()), "parentUuid": None,
+        "compactMetadata": {"trigger": "auto", "preTokens": 1, "postTokens": 1, "durationMs": 1,
+                            "cumulativeDroppedTokens": 0, "preCompactDiscoveredTools": [], "precomputed": False,
+                            "preservedMessages": 0, "preservedSegment": {}},
+    },
+    "informational": lambda: {"content": "A notice", "level": "notice", "isMeta": False, "parentUuid": str(uuid4())},
+}
+_KEEPING = ["compact_boundary", "informational"]
+
+
+def _shaped(native, subtype, seconds, **overrides):
+    values = {"userType": "external", "entrypoint": "cli", "gitBranch": "main", "slug": "fixture",
+              "version": "2.1.292", **_REAL_SHAPES[subtype](), **overrides}
+    return native["row"]("system", seconds, subtype=subtype, **values)
+
+
+def _observed(native, rows):
+    native["write"](rows)
+    provenance = {}
+    return native["observe"](provenance=provenance), provenance
+
+
+def _view(result):
+    return result.state, result.reason, result.observed_at
+
+
+# (rows of the turn before the event, the event's time, the rows after it)
+_POSITIONS = {
+    "after the prompt": (1, -3.5),
+    "after a tool call": (2, -2.5),
+    "after a tool result": (3, -1.5),
+    "after the final answer": (4, -.8),
+    "after the settled turn": (5, 0),
+}
+
+
+@pytest.mark.parametrize("subtype", _KEEPING)
+@pytest.mark.parametrize("position", list(_POSITIONS))
+def test_claude_compact_and_informational_events_keep_the_state(native, subtype, position):
+    count, seconds = _POSITIONS[position]
+    records = native["records"]
+    plain, _ = _observed(native, records[:count])
+    with_event, _ = _observed(native, records[:count] + [_shaped(native, subtype, seconds)])
+
+    assert with_event.state != "unknown"
+    assert _view(with_event) == _view(plain)
+
+
+@pytest.mark.parametrize("subtype", _KEEPING)
+def test_claude_event_between_the_final_answer_and_its_duration_keeps_the_completion(native, subtype):
+    records = native["records"]
+    plain, plain_provenance = _observed(native, records)
+    rows = records[:4] + [_shaped(native, subtype, -.8)] + records[4:]
+    with_event, provenance = _observed(native, rows)
+
+    assert (with_event.state, with_event.reason) == ("idle", "native_turn_completed")
+    assert provenance["event_source"] == "claude_end_turn"
+    assert provenance["event_id"] == plain_provenance["event_id"]
+
+
+def test_claude_several_kept_events_in_a_row_keep_the_state(native):
+    records = native["records"]
+    plain, _ = _observed(native, records[:3])
+    rows = records[:3] + [_shaped(native, "compact_boundary", -1.9), _shaped(native, "informational", -1.8),
+                          _shaped(native, "compact_boundary", -1.7), _shaped(native, "informational", -1.6)]
+    with_events, _ = _observed(native, rows)
+
+    assert _view(with_events) == _view(plain)
+
+
+@pytest.mark.parametrize("subtype", _KEEPING)
+def test_claude_a_kept_event_does_not_move_the_idle_time(native, subtype):
+    """A notice or a compaction record is not member activity: idle_since must not move."""
+    plain, _ = _observed(native, native["records"])
+    later, _ = _observed(native, native["records"] + [_shaped(native, subtype, 0)])
+
+    assert later.state == "idle" and later.observed_at == plain.observed_at
+
+
+@pytest.mark.parametrize("subtype", ["input_requested", "api_error", "a_future_subtype"])
+def test_claude_other_system_subtypes_still_give_unknown(native, subtype):
+    rows = native["records"] + [native["row"]("system", 0, subtype=subtype)]
+    result, provenance = _observed(native, rows)
+
+    assert (result.state, result.reason) == ("unknown", "native_event_unsupported")
+    assert provenance.get("event_source") is None
+
+
+@pytest.mark.parametrize("subtype", _KEEPING)
+@pytest.mark.parametrize("field,value,reason", [
+    ("sessionId", str(uuid4()), "session_mismatch"),
+    ("cwd", "/different", "session_mismatch"),
+    ("timestamp", "2099-01-01T00:00:00Z", "observation_invalid"),
+])
+def test_claude_a_kept_event_is_validated_before_it_is_ignored(native, subtype, field, value, reason):
+    """Validation comes first: a kept subtype from another session, another cwd or the future is not trusted."""
+    event = _shaped(native, subtype, -.8, **{field: value})
+    result, _ = _observed(native, native["records"][:4] + [event])
+
+    assert (result.state, result.reason) == ("unknown", reason)
+
+
+@pytest.mark.parametrize("subtype", _KEEPING)
+def test_claude_a_kept_event_older_than_the_last_real_event_is_invalid(native, subtype):
+    event = _shaped(native, subtype, -1.5)  # earlier than the final answer, but written after it
+    result, _ = _observed(native, native["records"][:4] + [event])
+
+    assert (result.state, result.reason) == ("unknown", "observation_invalid")
+
+
+@pytest.mark.parametrize("subtype", _KEEPING)
+def test_claude_a_kept_event_in_a_side_chain_is_ignored_as_before(native, subtype):
+    plain, _ = _observed(native, native["records"][:2])
+    side, _ = _observed(native, native["records"][:2] + [_shaped(native, subtype, -2.5, isSidechain=True)])
+
+    assert _view(side) == _view(plain)
+
+
+@pytest.mark.parametrize("subtype", _KEEPING)
+def test_claude_a_kept_event_does_not_refresh_a_stale_working_turn(native, subtype):
+    """The known limit. A kept event does not move observed_at, so a working turn whose last real event is
+    older than the staleness window still reads as stale, even if a compaction was just recorded."""
+    from unittest.mock import patch
+
+    native["user"]["timestamp"] = (native["now"] - timedelta(seconds=200)).isoformat()
+    native["write"]([native["user"], _shaped(native, subtype, -1)])
+    with patch.object(activity, "_process_started_at", return_value=native["now"] - timedelta(seconds=300)):
+        assert native["observe"]().reason == "native_event_stale"
+
+
+# ---- the ordering fence includes kept events (review 5940065622) ----------------------------------------
+
+
+def test_claude_a_kept_event_then_an_earlier_kept_event_is_out_of_order(native):
+    """V1's first sequence: prompt, a kept event at a later time, then another kept event at an earlier time."""
+    rows = [native["user"], _shaped(native, "compact_boundary", -1), _shaped(native, "informational", -2)]
+    result, _ = _observed(native, rows)
+
+    assert (result.state, result.reason) == ("unknown", "observation_invalid")
+
+
+def test_claude_a_kept_event_then_an_earlier_real_event_is_out_of_order(native):
+    """V1's second sequence: prompt, a kept event at a later time, then an assistant event at an earlier time."""
+    rows = [native["user"], _shaped(native, "compact_boundary", -1), native["tool"]]  # user -4, kept -1, tool -3
+    result, _ = _observed(native, rows)
+
+    assert (result.state, result.reason) == ("unknown", "observation_invalid")
+
+
+@pytest.mark.parametrize("first,second", [("compact_boundary", "informational"), ("informational", "compact_boundary")])
+def test_claude_two_kept_events_out_of_order_are_invalid_in_either_order(native, first, second):
+    rows = native["records"][:3] + [_shaped(native, first, -1.5), _shaped(native, second, -1.7)]
+    result, _ = _observed(native, rows)
+
+    assert (result.state, result.reason) == ("unknown", "observation_invalid")
+
+
+@pytest.mark.parametrize("subtype", _KEEPING)
+def test_claude_a_real_event_after_a_kept_event_in_order_still_passes(native, subtype):
+    """The fence only refuses going backward. A later row after a kept row is fine and keeps the state."""
+    records = native["records"]
+    plain, _ = _observed(native, records[:3])
+    rows = records[:2] + [_shaped(native, subtype, -2.5), records[2]]  # user -4, tool -3, kept -2.5, result -2
+    result, _ = _observed(native, rows)
+
+    assert _view(result) == _view(plain)
+
+
+@pytest.mark.parametrize("subtype", _KEEPING)
+def test_claude_a_kept_event_with_the_same_time_as_the_last_real_event_is_in_order(native, subtype):
+    records = native["records"]
+    plain, _ = _observed(native, records[:4])
+    same_time = _shaped(native, subtype, -1)  # the final answer is at -1
+    result, _ = _observed(native, records[:4] + [same_time])
+
+    assert _view(result) == _view(plain)
+
+
+def _split_final_message(native, *, second_message_id="msg-final", first_message_id="msg-final", second_stop="end_turn"):
+    """The final message written as two rows, one per content block (#1205, Claude Code 2.1.292)."""
+    thinking = native["row"]("assistant", -1, message={
+        "id": first_message_id, "role": "assistant", "stop_reason": "end_turn", "content": [{"type": "thinking"}]})
+    text = native["row"]("assistant", -.8, parentUuid=thinking["uuid"], message={
+        "id": second_message_id, "role": "assistant", "stop_reason": second_stop, "content": [{"type": "text"}]})
+    duration = native["row"]("system", -.5, subtype="turn_duration", parentUuid=text["uuid"])
+    native["write"]([native["user"], native["tool"], native["result"], thinking, text, duration])
+
+
+def test_claude_final_message_split_into_rows_settles_idle(native):
+    _split_final_message(native)
+    metadata = {}
+    result = native["observe"](provenance=metadata)
+    assert (result.state, result.reason) == ("idle", "native_turn_completed")
+    assert metadata["event_source"] == "claude_end_turn"
+
+
+def test_claude_end_turn_from_another_message_cannot_continue_a_settled_turn(native):
+    _split_final_message(native, second_message_id="msg-other")
+    assert native["observe"]().state != "idle"
+
+
+def test_claude_split_final_message_keeps_one_settlement_identity(native):
+    # Reading between the two rows and after them must name the same completion (no double settlement).
+    thinking = native["row"]("assistant", -1, message={
+        "id": "msg-final", "role": "assistant", "stop_reason": "end_turn", "content": [{"type": "thinking"}]})
+    text = native["row"]("assistant", -.8, parentUuid=thinking["uuid"], message={
+        "id": "msg-final", "role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text"}]})
+    head = [native["user"], native["tool"], native["result"], thinking]
+    first, second = {}, {}
+    native["write"](head); native["observe"](provenance=first)
+    native["write"](head + [text]); native["observe"](provenance=second)
+    assert first["event_id"] == second["event_id"]
+
+
+@pytest.mark.parametrize("change", [
+    {"second_stop": "tool_use"},                             # the next block does not end the turn
+    {"first_message_id": "", "second_message_id": ""},       # no usable message identity
+    {"first_message_id": 7, "second_message_id": 7},
+])
+def test_claude_continuation_must_be_an_end_turn_block_of_an_identified_message(native, change):
+    # #1205 review: only another end_turn block of the same, identified message keeps the completion.
+    _split_final_message(native, **change)
+    assert native["observe"]().state != "idle"

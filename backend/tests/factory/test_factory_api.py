@@ -72,8 +72,9 @@ async def test_complete_counts_and_timestamp_id_pagination(factory_client, facto
 @pytest.mark.parametrize("category", (*projection.CATEGORY_STATUSES, "unknown"))
 async def test_category_counts_cover_complete_selected_set(factory_client, factory_store, category):
     response = await get_ok(factory_client, "work-items", category=category, limit=1)
+    statuses = tuple(projection.STATUS_CATEGORY) + ("future_status",)
     expected = sum(1 for i in range(132) if projection.STATUS_CATEGORY.get(
-        (tuple(projection.STATUS_CATEGORY) + ("future_status",))[i % 10], "unknown") == category)
+        statuses[i % len(statuses)], "unknown") == category)
     assert response["total"] == expected
     assert response["counts"][category] == expected
     assert response["counts"]["total"] == expected
@@ -83,19 +84,20 @@ async def test_category_counts_cover_complete_selected_set(factory_client, facto
 
 async def test_open_category_is_every_item_that_is_not_finished(factory_client, factory_store):
     statuses = tuple(projection.STATUS_CATEGORY) + ("future_status",)
-    expected = sum(1 for i in range(132) if projection.STATUS_CATEGORY.get(statuses[i % 10], "unknown") != "finished")
-    first = await get_ok(factory_client, "work-items", category="open", limit=100)
+    expected = sum(1 for i in range(132) if projection.STATUS_CATEGORY.get(
+        statuses[i % len(statuses)], "unknown") != "finished")
+    first = await get_ok(factory_client, "work-items", category="open", limit=60)
     assert first["filters"]["category"] == "open"
     assert first["total"] == expected
     assert first["counts"]["total"] == expected and first["counts"]["finished"] == 0
     assert first["has_more"] and first["next_cursor"]
-    second = await get_ok(factory_client, "work-items", category="open", limit=100, cursor=first["next_cursor"])
+    second = await get_ok(factory_client, "work-items", category="open", limit=60, cursor=first["next_cursor"])
     rows = first["items"] + second["items"]
     ids = [r["item"]["id"] for r in rows]
     assert len(ids) == len(set(ids)) == expected
     assert ids == sorted(ids, reverse=True)
     assert all(r["category"] != "finished" for r in rows)
-    assert not {"merged", "completed"} & {r["item"]["dispatch_status"] for r in rows}
+    assert not {"merged", "completed", "cancelled"} & {r["item"]["dispatch_status"] for r in rows}
     # A status that Deck does not know yet is not finished, so it is open.
     assert "future_status" in {r["item"]["dispatch_status"] for r in rows}
     assert {r["category"] for r in rows} == {"queued", "active", "review", "attention", "unknown"}
@@ -267,7 +269,7 @@ async def test_unknown_private_reason_is_generic_and_finished_is_tracking_only(f
                          .values(escalation_reason=PRIVATE))
         await db.commit()
     failed = await get_ok(factory_client, f"work-items/{factory_store.ids.by_status['failed']}")
-    assert failed["work_item"]["waiting"]["reason_code"] == "unknown"
+    assert failed["work_item"]["waiting"]["reason_code"] == "attempt_escalated"  # #1181: a fixed, generic code
     assert PRIVATE not in json.dumps(failed)
     completed = await get_ok(factory_client, f"work-items/{factory_store.ids.by_status['completed']}")
     assert completed["work_item"]["category"] == "finished"

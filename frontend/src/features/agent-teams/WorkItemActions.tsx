@@ -26,6 +26,7 @@ import type {
 } from '@/types/agentTeams'
 import { AgentActivityBadge } from './AgentActivityBadge'
 import { WorkPublicationPanel } from './WorkPublicationPanel'
+import { escalationReasonLabel } from './summaryText'
 import { workItemAttention, workItemStatusLabel } from './workItemAttention'
 
 export type ItemOperatorAction =
@@ -49,33 +50,6 @@ function phaseHelp(phase?: string | null) {
   if (phase === 'diagnostic') return 'Diagnostic: investigating failed checks within an approved recovery revision; it is not a product-ready PR.'
   if (phase === 'implementation') return 'Implementation: working on the issue and its product PR.'
   return 'The attempt has not started a phase.'
-}
-
-const escalationReasonLabels: Record<string, string> = {
-  plan_blocked: 'Plan blocked',
-  launch_outcome_unknown: 'Session launch outcome unknown',
-  approval_rounds_exhausted: 'Approval rounds exhausted',
-  leader_offline: 'Leader offline',
-  owner_offline: 'Owner offline',
-  brief_unread: 'Owner has not read the brief',
-  leader_ack_timeout: 'Leader acknowledgement timed out',
-  owner_idle_timeout: 'Owner idle timeout',
-  owner_observation_unavailable: 'Owner observation unavailable',
-  integration_update_conflict: 'Integration update needs coordination',
-  retry_count_exhausted: 'Verification retries exhausted',
-  continuation_revision_exhausted: 'Continuation revision exhausted',
-  continuation_budget_exhausted: 'Continuation budget exhausted',
-  continuation_invalid_state: 'Continuation state invalid',
-  continuation_pr_identity_invalid: 'Continuation PR identity invalid',
-  dispatch_label_removed: 'Dispatch label removed',
-  abandoned_by_operator: 'Abandoned by the Director',
-  prepared_owner_unavailable: 'Prepared owner unavailable',
-  pr_closed_unmerged: 'PR closed without merge',
-}
-
-function escalationReasonLabel(reason?: string | null) {
-  if (!reason) return 'Unknown reason'
-  return escalationReasonLabels[reason] ?? reason.replaceAll('_', ' ')
 }
 
 function approvalStatusLabel(status?: string | null) {
@@ -404,7 +378,7 @@ export function WorkItemActions({
                 {revisions.map((revision) => {
                   const approval = revision.approval_request
                   const links = safeEvidenceLinks(revision.evidence)
-                  const sameAttempt = item.dispatch_nonce === revision.dispatch_nonce
+                  const sameAttempt = item.dispatch_generation != null && item.dispatch_generation === revision.dispatch_generation
                     && item.owner_slot_id === revision.owner_slot_id
                   const holdEligible = sameAttempt && item.dispatch_status === 'escalated'
                     && item.escalation_reason === revision.originating_escalation_reason

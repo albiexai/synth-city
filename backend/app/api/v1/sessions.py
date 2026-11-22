@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.services.session_service import SessionService
+from app.api.v1.harness_scope import current_scope
 from app.models.schemas import (
     SessionListResponse,
     SessionProjectListResponse,
@@ -20,7 +21,9 @@ async def list_projects(db: AsyncSession = Depends(get_db)):
     """List all projects with session counts."""
     try:
         service = SessionService(db)
-        return await service.list_projects()
+        response = await service.list_projects()
+        response.scope = current_scope(service.projects_dir)
+        return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list projects: {str(e)}")
 

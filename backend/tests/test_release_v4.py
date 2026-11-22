@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_all_application_version_fields_match_the_release_version():
     version = (ROOT / "VERSION").read_text().strip()
-    assert version == "4.1.0"
+    assert version == "4.3.0"
     package = json.loads((ROOT / "frontend/package.json").read_text())
     lock = json.loads((ROOT / "frontend/package-lock.json").read_text())
     assert package["version"] == lock["version"] == lock["packages"][""]["version"] == version

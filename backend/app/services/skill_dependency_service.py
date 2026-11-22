@@ -14,7 +14,7 @@ from app.models.schemas import (
     SkillInstallResult,
     SkillSupportingFile,
 )
-from app.utils.path_utils import get_claude_user_skills_dir
+from app.utils.path_utils import get_claude_user_skills_dir, get_installed_plugins_file
 
 
 class SkillDependencyService:
@@ -85,7 +85,7 @@ class SkillDependencyService:
         elif location.startswith("plugin:"):
             # Plugin skills: need to find the plugin's install path
             plugin_name = location.replace("plugin:", "")
-            plugins_file = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
+            plugins_file = get_installed_plugins_file()
             if not plugins_file.exists():
                 return None
             try:

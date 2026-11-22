@@ -116,6 +116,7 @@ def test_t_i2_jsonc_edit_preserves_unrelated_bytes_and_rejects_duplicate_keys():
 @pytest.mark.parametrize("provider,functions", [
     ("claude-code", ["apply_claude_code_install", "uninstall_claude_code"]),
     ("muse-cli", ["apply_muse_install", "uninstall_muse"]),
+    ("antigravity-cli", ["apply_antigravity_install", "uninstall_antigravity"]),
     ("codex-cli", ["apply_codex_install", "uninstall_codex"]),
     ("copilot-cli", ["apply_copilot_install", "uninstall_copilot"]),
     ("opencode-cli", ["apply_opencode_install", "uninstall_opencode"]),

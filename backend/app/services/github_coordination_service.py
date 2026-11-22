@@ -33,6 +33,7 @@ from app.services.github_dispatch_service import (
 )
 from app.services.github_recovery_gate import configured_recovery_only_attempt
 from app.utils import peer_process
+from app.services.session_recovery import recover_session
 
 logger = logging.getLogger(__name__)
 _BOOT_ID = uuid4().hex
@@ -82,6 +83,14 @@ def hold_code() -> str | None:
     try:
         if configured_recovery_only_attempt() is not None:
             return "recovery_only"
+    except (OSError, ValueError):
+        return "hold_unavailable"
+    return external_hold_code()
+
+
+def external_hold_code() -> str | None:
+    """Read the external safety markers independently of recovery-only selection."""
+    try:
         for configured in settings.github_coordination_hold_paths:
             path = Path(configured).expanduser()
             if not path.is_absolute():
@@ -499,7 +508,8 @@ class GithubCoordinationService:
         except CoordinationError as exc:
             await self._record_error(db, scope_id, version, exc.code)
             return
-        except Exception:
+        except Exception as caught_error:
+            await recover_session(db, caught_error)
             await self._record_error(db, scope_id, version, "backlog_unavailable")
             return
         row = await self.state(db, scope_id)
@@ -540,7 +550,8 @@ class GithubCoordinationService:
                 pane = await agent_mail_service._nudge_session_for_member(db, leader.member_id, now)
                 if pane.pid != leader.bound_pane_pid:
                     raise CoordinationError("leader_unavailable")
-            except Exception:
+            except Exception as caught_error:
+                await recover_session(db, caught_error)
                 values["error_code"] = "leader_unavailable"
                 want_request = False
         if hold_code():

@@ -9,10 +9,9 @@ A request is reported only when all of these hold at observation time:
   * its addressee's native state is ``idle`` (working is active; stopped and unknown are not proven);
   * the addressee sent no ``message`` or ``answer`` in the request's canonical thread after it.
 
-The view is COMPLETE only when nothing was truncated or left unproven. Otherwise it carries a fixed
-reason word, in this priority: candidate_limit, native_unknown, ambiguous_legacy_request,
-reply_scan_limit, entry_limit. Nested pending requests (older releases allowed them) can never be
-cleared by a plain reply, so they are never entries; they make the view ambiguous instead.
+The view is complete only when nothing was truncated or left unproven. It uses the first applicable
+reason in ``REASON_PRIORITY``. Older nested pending requests make the view ambiguous because a plain
+reply cannot clear them.
 """
 from __future__ import annotations
 
@@ -38,8 +37,8 @@ ANCESTRY_READ_BUDGET = 512    # total ancestry reads in one observation
 MAX_ANCESTRY_HOPS = 32
 NATIVE_INPUT_ROWS = 256      # the native input read bound the fence is checked with
 SNAPSHOT_ATTEMPTS = 3        # coherent-snapshot attempts before the read fails closed
-REASON_PRIORITY = ("candidate_limit", "native_unknown", "ambiguous_legacy_request", "reply_scan_limit",
-                   "entry_limit")
+REASON_PRIORITY = ("candidate_limit", "stall_timeout", "inputs_changing", "fence_changed", "native_unknown",
+                   "ambiguous_legacy_request", "reply_scan_limit", "entry_limit")
 
 
 class _IncoherentRead(ValueError):
@@ -59,18 +58,37 @@ class MailRequestStallService:
     # -- native activity (read only) ---------------------------------------------------------------
 
     async def _native_states(self, db, preset_id) -> tuple[dict[int, str], bool, dict]:
-        """Slot states, whether the inputs were stable, and the fence they were observed against.
+        """Slot states and the refreshed fence supplied by the native observer.
 
-        The same bounded, read-only observation the summary uses. The fence is kept so the mail reads
-        can be revalidated against it afterwards.
+        The observer already marks a changed slot unknown. Revalidate the input fence for the addressees
+        whose state was used, since unrelated working slots do not determine the mail view.
         """
-        from app.services.agent_activity_service import _team_inputs, observe_team
+        from app.services.agent_activity_service import observe_team
 
         fence: dict = {}
         native = await observe_team(db, preset_id, include_agent_status=False, persist_identities=False,
                                     max_input_rows=256, input_fence=fence)
-        current = {entry[0]: entry for entry in await _team_inputs(db, preset_id, 256)}
-        return {entry.slot_id: entry.state for entry in native.slots}, current == fence, dict(fence)
+        return {entry.slot_id: entry.state for entry in native.slots}, True, dict(fence)
+
+    @staticmethod
+    def failure_reason(error):
+        if isinstance(error, TimeoutError):
+            return "stall_timeout"
+        if isinstance(error, _IncoherentRead):
+            return "inputs_changing"
+        return "native_unknown"
+
+    async def capture_baseline(self, db, preset_id, deadline):
+        """Capture the early binding fence within the caller's absolute budget."""
+        try:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError
+            return await asyncio.wait_for(self._coherent_snapshot(db, preset_id), timeout=remaining), None
+        except (TimeoutError, OSError, ValueError, OperationalError) as error:
+            if db.in_transaction():
+                await db.rollback()
+            return None, self.failure_reason(error)
 
     async def projection(self, db, preset_id, *, now: datetime | None = None) -> UnansweredRequestView:
         """The view for a caller that holds no observation of its own (the Supervisor check-in)."""
@@ -79,37 +97,31 @@ class MailRequestStallService:
         deadline = loop.time() + self.deadline_seconds
         # The baseline is taken BEFORE the native phase. A failed capture is None (untrusted); it is
         # never replaced by a later one.
-        try:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise TimeoutError
-            baseline = await asyncio.wait_for(self._coherent_snapshot(db, preset_id), timeout=remaining)
-        except (TimeoutError, OSError, ValueError, OperationalError):
-            if db.in_transaction():
-                await db.rollback()
-            baseline = None
+        baseline, failure = await self.capture_baseline(db, preset_id, deadline)
         try:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise TimeoutError
             states, ok, fence = await asyncio.wait_for(self._native_states(db, preset_id), timeout=remaining)
-        except (TimeoutError, OSError, ValueError, OperationalError):
+        except (TimeoutError, OSError, ValueError, OperationalError) as error:
             if db.in_transaction():
                 await db.rollback()
             states, ok, fence = {}, False, None
+            failure = failure or self.failure_reason(error)
         return await self.observe(db, preset_id, now=now or datetime.now(timezone.utc),
                                   native_states=states, native_ok=ok, deadline=deadline, native_fence=fence,
-                                  native_baseline=baseline)
+                                  native_baseline=baseline, native_failure=failure)
 
     # -- the view ----------------------------------------------------------------------------------
 
     async def observe(self, db, preset_id, *, now: datetime, native_states: dict[int, str],
                       native_ok: bool, deadline: float | None = None,
-                      native_fence: dict | None = None, native_baseline=_UNSET) -> UnansweredRequestView:
+                      native_fence: dict | None = None, native_baseline=_UNSET,
+                      native_failure: str | None = None) -> UnansweredRequestView:
         """``deadline`` is an absolute monotonic loop time; omitted, the view gets its own full budget.
 
         ``native_fence`` is the native input fence the states were observed against. When given, it is
-        compared with the current inputs after all mail reads; a difference is not a stable observation.
+        compared with the current inputs of relevant addressees after all mail reads.
         ``native_baseline`` is a coherent snapshot taken before the native phase: omitted, one is taken at
         the start of the view; None means the caller's early capture failed, which is never replaced.
         """
@@ -121,12 +133,12 @@ class MailRequestStallService:
                 raise TimeoutError
             return await asyncio.wait_for(
                 self._observe(db, preset_id, _naive_utc(now), native_states, native_ok, native_fence,
-                                native_baseline),
+                                native_baseline, native_failure),
                 timeout=remaining)
-        except (TimeoutError, OSError, ValueError, OperationalError):
+        except (TimeoutError, OSError, ValueError, OperationalError) as error:
             if db.in_transaction():
                 await db.rollback()
-            return UnansweredRequestView(items=[], complete=False, reason="native_unknown")
+            return UnansweredRequestView(items=[], complete=False, reason=self.failure_reason(error))
 
     @staticmethod
     def _request_filters(preset_id):
@@ -279,32 +291,26 @@ class MailRequestStallService:
                 return {entry[0]: entry for entry in entries}, identity
         raise _IncoherentRead("the native inputs kept changing")
 
-    async def _revalidate(self, db, preset_id, rows, native_fence, baseline):
+    async def _revalidate(self, db, preset_id, rows, native_fence, baseline, relevant_slots):
         """Entries still proven by ONE fresh coherent snapshot, and the reasons for dropping the rest.
 
         The snapshot is the last read of the view. Each entry needs: its addressee is the snapshot's
         current member of the slot, the slot's identity (member and sessions) equals the baseline's,
-        and, when a fence was passed, the snapshot's native inputs equal it.
+        and, when a fence was passed, the snapshot's native inputs equal its slot's observed inputs.
         """
+        if not relevant_slots:
+            return [], set()
         inputs, identity = await self._coherent_snapshot(db, preset_id)
-        reasons: set[str] = set()
-        kept = []
-        for row in rows:
-            now_id, base_id = identity.get(row.slot_id), baseline[1].get(row.slot_id)
-            if now_id is None or now_id != base_id or now_id[0] != row.recipient_member_id:
-                reasons.add("native_unknown")
-                continue
-            kept.append(row)
-        if native_fence is not None and inputs != native_fence:
-            reasons.add("native_unknown")
-            kept = []
-        return kept, reasons
+        changed = {slot_id for slot_id in relevant_slots
+                   if identity.get(slot_id) != baseline[1].get(slot_id)
+                   or (native_fence is not None and inputs.get(slot_id) != native_fence.get(slot_id))}
+        return [row for row in rows if row.slot_id not in changed], {"fence_changed"} if changed else set()
 
     async def _observe(self, db, preset_id, now, native_states, native_ok,
-                       native_fence=None, native_baseline=_UNSET) -> UnansweredRequestView:
+                       native_fence=None, native_baseline=_UNSET, native_failure=None) -> UnansweredRequestView:
         threshold = int(settings.mail_request_unanswered_seconds)
         page, more = await self._candidates(db, preset_id)
-        reasons: set[str] = set()
+        reasons: set[str] = {native_failure} if native_failure else set()
         if await self._nested_ambiguous(db, preset_id, now, threshold):
             reasons.add("ambiguous_legacy_request")
         before = dict(await self._signatures(db, {row.recipient_member_id for row in page}))
@@ -315,6 +321,7 @@ class MailRequestStallService:
         # neither evaluated nor counted. Every other examined root is unresolved, and the first
         # CANDIDATE_LIMIT of them are evaluated; one more means more than we evaluate.
         proven, cache, counter, rows_left, unresolved = [], {}, [0], REPLY_ROW_BUDGET, 0
+        relevant_slots = set()
         examining = True
         while examining and page:
             for row in page:
@@ -330,6 +337,7 @@ class MailRequestStallService:
                     # No trusted baseline, or the slot's native state describes another member.
                     found.append(("native_unknown", False))
                 else:
+                    relevant_slots.add(row.slot_id)
                     state = native_states.get(row.slot_id) if native_ok and row.slot_id is not None else None
                     if state == "working":
                         found.append((None, False))
@@ -367,16 +375,16 @@ class MailRequestStallService:
         stable = []
         for row in proven:
             if after.get(row.recipient_member_id) != before.get(row.recipient_member_id):
-                reasons.add("native_unknown")
+                reasons.add("fence_changed")
                 continue
             stable.append(row)
 
         # Names are read first; the revalidation is the last read before the entries are built.
         members, actors = await self._names(db, stable)
         if baseline is None:
-            stable, dropped = [], {"native_unknown"}
+            stable, dropped = [], {native_failure or "native_unknown"}
         else:
-            stable, dropped = await self._revalidate(db, preset_id, stable, native_fence, baseline)
+            stable, dropped = await self._revalidate(db, preset_id, stable, native_fence, baseline, relevant_slots)
         reasons |= dropped
         omitted = max(0, len(stable) - ENTRY_LIMIT)
         if omitted:

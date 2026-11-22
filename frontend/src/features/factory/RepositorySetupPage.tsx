@@ -17,7 +17,8 @@ import {
 import { clearOperatorToken, getOperatorToken, setOperatorToken } from "@/features/agent-teams/operatorAuth";
 import { OperatorTokenDialog } from "@/features/agent-teams/AutonomyPanel";
 import { useOptionalProjectContext } from "@/contexts/ProjectContext";
-import type { AgentTeamPreset, AgentTeamPresetInput, AgentTeamLaunchPlan, TeamGithubScope } from "@/types/agentTeams";
+import type { AgentTeamPreset, AgentTeamPresetInput, AgentTeamLaunchPlan, AgentTeamSlotInput, TeamGithubMergePolicy, TeamGithubScope } from "@/types/agentTeams";
+import { AUTO_MERGE_OWNER_REQUIREMENT, AUTO_MERGE_VERIFIER_REQUIREMENT, autoMergeSetupBlocker, VERIFIER_ROLE } from "./autoMergeReadiness";
 
 type Check = { status: "ready" | "blocked" | "unknown"; code: string; remedy: string };
 type Preflight = { status: "ready" | "blocked" | "unknown"; observed_at: string; checked_at?: string; checks: Record<string, Check>; configuration_presence?: Record<string, boolean>; host_guidance?: string[] };
@@ -25,6 +26,7 @@ type Draft = {
   owner: string; repo: string; path: string; dispatch: string; design: string; baseRef: string;
   authMode: "token" | "github_app"; teamMode: "existing" | "new"; teamId: number | "";
   teamName: string; leaderName: string; workerNames: string; provider: string;
+  mergePolicy: TeamGithubMergePolicy;
 };
 type Recovery = {
   kind: "team" | "scope";
@@ -42,12 +44,13 @@ type UncertainLaunch = { slotIds: number[]; planHash: string } | null;
 const initial: Draft = {
   owner: "", repo: "", path: "", dispatch: "albiex-synth-city-ready", design: "albiex-synth-city-design", baseRef: "origin/HEAD",
   authMode: "token", teamMode: "new", teamId: "", teamName: "", leaderName: "Leader", workerNames: "Worker",
-  provider: "codex-cli",
+  provider: "codex-cli", mergePolicy: "human",
 };
 const labelClass = "block text-sm font-medium";
 const inputClass = "mt-1 w-full rounded-md border bg-background px-3 py-2";
 const panelClass = "space-y-4 rounded-lg border bg-card p-4";
 const overlapWarning = "This can dispatch the same issue more than once";
+const DEFAULT_AUTO_MERGE_CAP = 5;
 
 // Owner and name from a GitHub URL, an SSH URL or "owner/name".
 function parseRepository(text: string): { owner: string; repo: string } | null {
@@ -83,7 +86,9 @@ function scopeMatchesDraft(scope: TeamGithubScope, draft: Draft) {
     scope.dispatch_label === draft.dispatch.trim() &&
     scope.design_label === draft.design.trim() &&
     scope.base_ref === draft.baseRef.trim() &&
-    scope.github_auth_mode === (draft.authMode === "github_app" ? "app" : "ambient");
+    scope.github_auth_mode === (draft.authMode === "github_app" ? "app" : "ambient") &&
+    (scope.merge_policy ?? "human") === draft.mergePolicy &&
+    (draft.mergePolicy === "human" || scope.max_auto_merges_per_day === DEFAULT_AUTO_MERGE_CAP);
 }
 
 function buildActivationSnapshot(scopes: TeamGithubScope[], teams: AgentTeamPreset[], team: AgentTeamPreset) {
@@ -98,6 +103,7 @@ function buildActivationSnapshot(scopes: TeamGithubScope[], teams: AgentTeamPres
       item.id, item.preset_id, item.enabled, item.repo_owner.toLowerCase(), item.repo_name.toLowerCase(),
       item.repo_path, item.base_ref, item.dispatch_label, item.design_label, item.github_auth_mode,
       item.github_auth_configured, item.github_poll_token_configured,
+      item.merge_policy, item.max_auto_merges_per_day,
     ]).sort((a, b) => Number(a[0]) - Number(b[0])),
   });
 }
@@ -135,25 +141,47 @@ function overlapDescription(overlap: ScopeOverlap) {
   return `${first.repo_owner}/${first.repo_name} label ${first.dispatch_label}: team ${first.preset_id}/scope ${first.id} and team ${second.preset_id}/scope ${second.id}`;
 }
 
+function draftTeamSlots(draft: Draft, routing: Record<string, { areaLabels: string; expertise: string }>): AgentTeamSlotInput[] {
+  const base = { provider: draft.provider, repo_path: draft.path.trim(), enabled: true };
+  const workers = draft.workerNames.split("\n").map((name) => name.trim()).filter(Boolean);
+  const slots: AgentTeamSlotInput[] = [
+    { ...base, display_name: draft.leaderName.trim(), role: "Leader", area_labels: [], expertise: null },
+    ...workers.map((name) => {
+      const route = routing[name];
+      return {
+        ...base, display_name: name, role: "Worker",
+        area_labels: (route?.areaLabels ?? "").split(",").map((item) => item.trim()).filter(Boolean),
+        expertise: route?.expertise.trim() || null,
+      };
+    }),
+  ];
+  if (draft.mergePolicy === "auto") {
+    const taken = new Set(slots.map((slot) => slot.display_name.toLowerCase()));
+    let name = "Verifier";
+    for (let suffix = 2; taken.has(name.toLowerCase()); suffix += 1) name = `Verifier ${suffix}`;
+    slots.push({ ...base, display_name: name, role: VERIFIER_ROLE, area_labels: [], expertise: null });
+  }
+  return slots;
+}
+
 function teamMatchesDraft(
   team: AgentTeamPreset, draft: Draft, routing: Record<string, { areaLabels: string; expertise: string }>,
 ) {
-  const workers = draft.workerNames.split("\n").map((name) => name.trim()).filter(Boolean);
-  const names = [draft.leaderName.trim(), ...workers];
+  const [expectedLeader, ...expectedSlots] = draftTeamSlots(draft, routing);
+  const names = [expectedLeader, ...expectedSlots].map((slot) => slot.display_name);
   if (team.name !== draft.teamName.trim() || team.autonomy_enabled || team.slots.length !== names.length ||
       new Set(names).size !== names.length) return false;
-  const leader = team.slots.find((slot) => slot.display_name === draft.leaderName.trim());
+  const leader = team.slots.find((slot) => slot.display_name === expectedLeader.display_name);
   // A pending Leader assignment is resumable; a conflicting assignment is not.
   const leaderAssigned = leader != null &&
     (team.leader_slot_id == null || team.leader_slot_id === leader.id);
   if (!leader || !leaderAssigned || !leader.enabled || leader.provider !== draft.provider ||
       leader.repo_path !== draft.path.trim() || (leader.role ?? "").toLowerCase() !== "leader") return false;
-  return workers.every((name) => {
-    const slot = team.slots.find((item) => item.display_name === name);
-    const expected = (routing[name]?.areaLabels ?? "").split(",").map((item) => item.trim()).filter(Boolean);
+  return expectedSlots.every((expected) => {
+    const slot = team.slots.find((item) => item.display_name === expected.display_name);
     return Boolean(slot && slot.enabled && slot.provider === draft.provider && slot.repo_path === draft.path.trim() &&
-      (slot.role ?? "").toLowerCase() === "worker" && (slot.expertise ?? "") === (routing[name]?.expertise.trim() ?? "") &&
-      JSON.stringify(slot.area_labels ?? []) === JSON.stringify(expected));
+      (slot.role ?? "").toLowerCase() === expected.role?.toLowerCase() && (slot.expertise ?? "") === (expected.expertise ?? "") &&
+      JSON.stringify(slot.area_labels ?? []) === JSON.stringify(expected.area_labels));
   });
 }
 
@@ -220,7 +248,7 @@ export function RepositorySetupPage() {
     ...JSON.parse(normalized(draft)),
     teamMode: draft.teamMode, teamId: draft.teamId, teamName: draft.teamName,
     leaderName: draft.leaderName, workerNames: draft.workerNames, provider: draft.provider,
-    slotRouting,
+    mergePolicy: draft.mergePolicy, slotRouting,
   });
   const currentSaveIntent = useRef(saveIntentKey);
   currentSaveIntent.current = saveIntentKey;
@@ -280,14 +308,14 @@ export function RepositorySetupPage() {
     setTokenError(null);
   }
 
-  async function withOperatorToken<Result>(action: (value: string) => Promise<Result>, reason?: string): Promise<Result> {
+  async function withOperatorToken<Result>(action: (value: string, attempt: number) => Promise<Result>, reason?: string): Promise<Result> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const value = await requestOperatorToken(attempt ? "The Director key was rejected. Enter a valid key to retry." : null, reason);
       // Typed pre-send credential cancellation: the prompt cancel sends
       // nothing. Recovery clears only when every attempted create was a
       // proven non-write; uncertain writes keep the latch.
       if (!value) throw new SaveIntentChangedError("The Director key is required for this action.");
-      try { return await action(value); }
+      try { return await action(value, attempt); }
       catch (cause) {
         if (!(cause instanceof ApiHttpError) || cause.status !== 401 || attempt > 0) throw cause;
         clearOperatorToken();
@@ -398,15 +426,12 @@ export function RepositorySetupPage() {
         ? { ...requestedRecord, confirmed: true }
         : requestedRecord;
       if (kind === "team") {
-        const names = [draft.leaderName.trim(), ...draft.workerNames.split("\n").map((name) => name.trim()).filter(Boolean)];
+        const names = draftTeamSlots(intent.draft, intent.routing).map((slot) => slot.display_name);
         const candidates = fresh.presets.filter((item) => item.name === draft.teamName.trim() &&
           item.slots.length === names.length && names.every((name) => item.slots.some((slot) => slot.display_name === name)));
         setRecovery({ kind, candidates: candidates.map((item) => ({ label: `${item.name} (#${item.id})`, id: item.id })), requestedDraft: intent.draft, requestedRouting: intent.routing, requestedRecord: record, requestedIntentKey });
       } else {
-        const candidates = fresh.scopes.filter((item) => item.preset_id === (teamId ?? team?.id) && item.repo_owner.toLowerCase() === draft.owner.trim().toLowerCase() &&
-          item.repo_name.toLowerCase() === draft.repo.trim().toLowerCase() && item.repo_path === draft.path.trim() &&
-          item.dispatch_label === draft.dispatch.trim() && item.design_label === draft.design.trim() && item.base_ref === draft.baseRef.trim() &&
-          item.github_auth_mode === (draft.authMode === "github_app" ? "app" : "ambient"));
+        const candidates = fresh.scopes.filter((item) => item.preset_id === (teamId ?? team?.id) && scopeMatchesDraft(item, intent.draft));
         setRecovery({ kind, candidates: candidates.map((item) => ({ label: `Repository record #${item.id} (${item.enabled ? "enabled" : "disabled"})`, id: item.id })), requestedDraft: intent.draft, requestedRouting: intent.routing, requestedRecord: record, requestedIntentKey });
       }
       setError("The create response was uncertain. Review fresh matching records and select one, or stop. Do not repeat the create request.");
@@ -449,20 +474,16 @@ export function RepositorySetupPage() {
       }
       let anyUncertainCreateAttempt = false;
       if (draft.teamMode === "new" && !selected) {
-        const names = draft.workerNames.split("\n").map((name) => name.trim()).filter(Boolean);
-        const allNames = [draft.leaderName.trim(), ...names];
+        const slots = draftTeamSlots(draft, slotRouting);
+        if (draft.mergePolicy === "auto" && !slots.some((slot) => slot.role === "Worker")) {
+          throw new Error(AUTO_MERGE_OWNER_REQUIREMENT);
+        }
+        const allNames = slots.map((slot) => slot.display_name);
         if (allNames.some((name) => !name) || new Set(allNames).size !== allNames.length) {
           throw new Error("Enter unique, non-empty names for the Leader and each worker.");
         }
         const input: AgentTeamPresetInput = {
-          name: draft.teamName.trim(), autonomy_enabled: false,
-          slots: [
-            { display_name: draft.leaderName.trim(), provider: draft.provider, repo_path: draft.path.trim(), role: "Leader", area_labels: [], expertise: null, enabled: true },
-            ...names.map((name) => {
-              const route = slotRouting[name] ?? { areaLabels: "", expertise: "" };
-              return { display_name: name, provider: draft.provider, repo_path: draft.path.trim(), role: "Worker", area_labels: route.areaLabels.split(",").map((item) => item.trim()).filter(Boolean), expertise: route.expertise.trim() || null, enabled: true };
-            }),
-          ],
+          name: draft.teamName.trim(), autonomy_enabled: false, slots,
         };
         setRecovery({ kind: "team", candidates: [], requestedDraft: { ...draft }, requestedRouting: { ...slotRouting } });
         try {
@@ -526,7 +547,8 @@ export function RepositorySetupPage() {
         throw new Error("The existing team has no explicit Leader assignment. Keep its settings unchanged and resolve its authority separately.");
       }
       setTeam(selected);
-      const sameScope = fresh.scopes.find((item) => item.preset_id === selected!.id && item.repo_owner.toLowerCase() === draft.owner.trim().toLowerCase() &&
+      const selectedTeam = selected;
+      const sameScope = fresh.scopes.find((item) => item.preset_id === selectedTeam.id && item.repo_owner.toLowerCase() === draft.owner.trim().toLowerCase() &&
         item.repo_name.toLowerCase() === draft.repo.trim().toLowerCase());
       let savedScope = sameScope ?? null;
       if (savedScope && !scopeMatchesDraft(savedScope, draft)) {
@@ -535,31 +557,48 @@ export function RepositorySetupPage() {
         throw new Error("This team already has a scope for the repository with different saved settings. The existing scope remains unchanged. Review it in Teams before making a separate edit.");
       }
       if (!savedScope) {
+        if (draft.mergePolicy === "auto") {
+          const blocker = autoMergeSetupBlocker(selectedTeam);
+          if (blocker) throw new Error(blocker);
+        }
         if (intentChanged()) {
           // A stale save must not issue a scope create for changed inputs.
           throw new Error("Inputs changed during the save. Review the saved records before continuing.");
         }
         setRecovery({ kind: "scope", candidates: [], requestedDraft: { ...draft }, requestedRouting: { ...slotRouting } });
         try {
-          savedScope = await withOperatorToken((operatorToken) => {
+          savedScope = await withOperatorToken(async (operatorToken, attempt) => {
+            if (draft.mergePolicy === "auto" && attempt > 0 && !intentChanged()) {
+              // The replacement credential may have waited while the roster changed.
+              const observation = await fetchConfigurationObservation(operatorToken).catch(() => {
+                throw new SaveIntentChangedError("Could not refresh the team before retrying the scope save. Review the team and save again.");
+              });
+              const retryTeam = observation.presets.find((item) => item.id === selectedTeam.id);
+              if (!retryTeam || retryTeam.leader_slot_id !== selectedTeam.leader_slot_id) {
+                throw new SaveIntentChangedError("The selected team or Leader changed before the retry. Review the team and save again.");
+              }
+              const blocker = autoMergeSetupBlocker(retryTeam);
+              if (blocker) throw new SaveIntentChangedError(blocker);
+            }
             if (intentChanged()) {
               // Checked immediately before the scope create callback, including
               // any credential-retry invocation of the same callback. This is a
               // pre-send cancellation, not an uncertain transport outcome.
               throw new SaveIntentChangedError("Inputs changed during the save. Review the saved records before continuing.");
             }
-            return Promise.resolve(createTeamGithubScope(selected.id, {
-            repo_owner: draft.owner.trim(), repo_name: draft.repo.trim(), repo_path: draft.path.trim(),
-            dispatch_label: draft.dispatch.trim(), design_label: draft.design.trim(), merge_policy: "human",
-            max_approval_rounds: 3, max_concurrent_dispatched: 1, max_verification_retries: 1,
-            max_auto_merges_per_day: 0, base_ref: draft.baseRef.trim(), github_auth_mode: draft.authMode === "github_app" ? "app" : "ambient",
-            builds_out_of_tree: false, max_build_parallelism: 1, enabled: false,
-          }, operatorToken)).catch((cause: unknown) => {
-            if (!(cause instanceof SaveIntentChangedError) && !isDefiniteCreateNonWrite(cause)) {
-              anyUncertainCreateAttempt = true;
-            }
-            throw cause;
-          });
+            return Promise.resolve(createTeamGithubScope(selectedTeam.id, {
+              repo_owner: draft.owner.trim(), repo_name: draft.repo.trim(), repo_path: draft.path.trim(),
+              dispatch_label: draft.dispatch.trim(), design_label: draft.design.trim(), merge_policy: draft.mergePolicy,
+              max_approval_rounds: 3, max_concurrent_dispatched: 1, max_verification_retries: 1,
+              max_auto_merges_per_day: draft.mergePolicy === "auto" ? DEFAULT_AUTO_MERGE_CAP : 0,
+              base_ref: draft.baseRef.trim(), github_auth_mode: draft.authMode === "github_app" ? "app" : "ambient",
+              builds_out_of_tree: false, max_build_parallelism: 1, enabled: false,
+            }, operatorToken)).catch((cause: unknown) => {
+              if (!(cause instanceof SaveIntentChangedError) && !isDefiniteCreateNonWrite(cause)) {
+                anyUncertainCreateAttempt = true;
+              }
+              throw cause;
+            });
           });
           if (!anyUncertainCreateAttempt) {
             setRecovery(null);
@@ -908,11 +947,30 @@ export function RepositorySetupPage() {
       <Button variant="outline" disabled={busy || !draft.owner || !draft.repo || !draft.path || !draft.dispatch || !draft.design || !draft.baseRef} onClick={() => setStep(1)}>Continue to configuration</Button>
     </div>}
     {step === 1 && <div className={panelClass}><label className={labelClass}>Team setup<select className={inputClass} value={draft.teamMode} onChange={(e) => update({ teamMode: e.target.value as Draft["teamMode"] })}><option value="new">Create an inactive team</option><option value="existing">Use an existing team</option></select></label>
-      {draft.teamMode === "existing" ? <label className={labelClass}>Team<select className={inputClass} value={draft.teamId} onChange={(e) => update({ teamId: Number(e.target.value) || "" })}><option value="">Select a team</option>{presets.map((item) => <option key={item.id} value={item.id}>{item.name} ({item.autonomy_enabled ? "active" : "paused"})</option>)}</select></label> : <><label className={labelClass}>Team name<input className={inputClass} value={draft.teamName} onChange={(e) => update({ teamName: e.target.value })} /></label><label className={labelClass}>Explicit Leader slot<input className={inputClass} value={draft.leaderName} onChange={(e) => update({ leaderName: e.target.value })} /></label><label className={labelClass}>Worker slots, one name per line<textarea className={inputClass} value={draft.workerNames} onChange={(e) => update({ workerNames: e.target.value })} /></label><label className={labelClass}>Worker and Leader provider<select className={inputClass} value={draft.provider} onChange={(e) => update({ provider: e.target.value })}>{["claude-code", "codex-cli", "copilot-cli", "opencode-cli", "pi-cli", "muse-cli"].map((item) => <option key={item}>{item}</option>)}</select></label></>}
+      {draft.teamMode === "existing" ? <label className={labelClass}>Team<select className={inputClass} value={draft.teamId} onChange={(e) => update({ teamId: Number(e.target.value) || "" })}><option value="">Select a team</option>{presets.map((item) => <option key={item.id} value={item.id}>{item.name} ({item.autonomy_enabled ? "active" : "paused"})</option>)}</select></label> : <><label className={labelClass}>Team name<input className={inputClass} value={draft.teamName} onChange={(e) => update({ teamName: e.target.value })} /></label><label className={labelClass}>Explicit Leader slot<input className={inputClass} value={draft.leaderName} onChange={(e) => update({ leaderName: e.target.value })} /></label><label className={labelClass}>Worker slots, one name per line<textarea className={inputClass} value={draft.workerNames} onChange={(e) => update({ workerNames: e.target.value })} /></label><label className={labelClass}>Worker and Leader provider<select className={inputClass} value={draft.provider} onChange={(e) => update({ provider: e.target.value })}>{["claude-code", "codex-cli", "copilot-cli", "opencode-cli", "pi-cli", "muse-cli", "antigravity-cli"].map((item) => <option key={item}>{item}</option>)}</select></label></>}
       <p className="text-sm">New teams remain inactive. Existing roster, Leader, policy, and activation stay unchanged.</p><Button disabled={draft.teamMode === "existing" && !draft.teamId} onClick={() => setStep(2)}>Continue</Button></div>}
     {step === 2 && <div className={panelClass}><p>Repository dispatch and design labels apply to the scope. Worker routes are separate for each slot. The Leader has no worker route.</p>{draft.teamMode === "new" ? draft.workerNames.split("\n").map((rawName) => rawName.trim()).filter(Boolean).map((name) => <fieldset key={name} className="space-y-2 rounded border p-3"><legend className="font-medium">{name}</legend><label className={labelClass}>Area labels, comma separated<input className={inputClass} value={slotRouting[name]?.areaLabels ?? ""} onChange={(e) => { setConfirmSave(false); setSlotRouting((current) => ({ ...current, [name]: { areaLabels: e.target.value, expertise: current[name]?.expertise ?? "" } })); }} /></label><label className={labelClass}>Expertise<input className={inputClass} value={slotRouting[name]?.expertise ?? ""} onChange={(e) => { setConfirmSave(false); setSlotRouting((current) => ({ ...current, [name]: { areaLabels: current[name]?.areaLabels ?? "", expertise: e.target.value } })); }} /></label></fieldset>) : <p>Existing team routing stays unchanged.</p>}<p>Potential enabled overlaps: {matchingOverlap.map((item) => `team ${item.preset_id}/scope ${item.id}`).join(", ") || "none found in loaded data"}.</p><div className="flex flex-wrap gap-2"><Button onClick={() => setStep(3)}>Continue</Button><Button variant="outline" onClick={() => setStep(4)}>Skip optional steps</Button></div></div>}
-    {step === 3 && <div className={panelClass}><h3 className="font-semibold">Policy</h3><p>Merge policy: human approval.</p><p>New scope limits: concurrency 1; verification retries 1; automatic merges 0.</p><p>Base branch: {draft.baseRef}. Scope is saved disabled, even when checks have gaps.</p><p>Existing team settings remain unchanged. Launch and activation require separate choices.</p><Button onClick={() => setStep(4)}>Review setup</Button></div>}
-    {step === 4 && <div className={panelClass}><h3 className="font-semibold">Review</h3><p>Repository: {draft.owner}/{draft.repo}</p><p>Checkout: {draft.path}</p><p>Base: {draft.baseRef}</p><p>Labels: {draft.dispatch} / {draft.design}</p><p>Authentication: {draft.authMode}; credentials are not stored in this draft.</p><p>Preflight: {currentPreflight?.status ?? "not checked or stale"}. Saving remains disabled and does not need ready checks.</p>{currentPreflight && <p className="text-sm">Configuration presence, boolean only: {Object.entries(currentPreflight.configuration_presence ?? {}).map(([name, present]) => `${name}: ${present ? "present" : "missing"}`).join(", ") || "not reported"}.</p>}{(currentPreflight?.host_guidance ?? []).length > 0 && <div className="text-sm"><p className="font-medium">Host procedure</p><ol className="list-decimal pl-5">{(currentPreflight?.host_guidance ?? []).map((line) => <li key={line}>{line}</li>)}</ol></div>}<p className="text-sm">Runtime recovery-only restrictions are separate from credential readiness. Activation needs every required check ready in a fresh observation.</p><p>Team: {draft.teamMode === "existing" ? presets.find((item) => item.id === draft.teamId)?.name ?? "Select a team" : draft.teamName || "New team"}; Leader: {draft.teamMode === "new" ? draft.leaderName : "preserved"}; worker slots: {draft.teamMode === "new" ? draft.workerNames.split("\n").filter((name) => name.trim()).length : "preserved"}.</p><p>Potential overlap: {matchingOverlap.map((item) => `team ${item.preset_id}/scope ${item.id}`).join(", ") || "none found"}.</p><label className="flex gap-2 text-sm"><input type="checkbox" checked={confirmSave} onChange={(e) => setConfirmSave(e.target.checked)} />Save configuration only. Keep launch, team activation, scope activation, and merge decisions separate.</label><div className="flex flex-wrap gap-2"><Button disabled={busy || Boolean(recovery) || !confirmSave || (draft.teamMode === "existing" && !draft.teamId)} onClick={() => void saveSetup()}>{busy ? "Saving…" : "Save configuration"}</Button><Link className="self-center underline" to="/teams">Manage teams</Link></div></div>}
+    {step === 3 && <div className={panelClass}>
+      <h3 className="font-semibold">Policy</h3>
+      <label className={labelClass}>Merge policy
+        <select className={inputClass} value={draft.mergePolicy} onChange={(event) => update({ mergePolicy: event.target.value as TeamGithubMergePolicy })}>
+          <option value="human">Human review and merge</option>
+          <option value="auto">Automatic merge</option>
+        </select>
+      </label>
+      <p>{AUTO_MERGE_VERIFIER_REQUIREMENT} The verifier reviews the exact PR commit. Required checks must pass before merging.</p>
+      {draft.mergePolicy === "auto" && <p>{AUTO_MERGE_OWNER_REQUIREMENT}</p>}
+      <p>New scopes allow one active work item and one verification retry. Setup saves the scope disabled.</p>
+      <Button onClick={() => setStep(4)}>Review setup</Button>
+    </div>}
+    {step === 4 && <div className={panelClass}><h3 className="font-semibold">Review</h3><p>Repository: {draft.owner}/{draft.repo}</p><p>Checkout: {draft.path}</p><p>Base: {draft.baseRef}</p>
+      {draft.mergePolicy === "auto" ? <>
+        <p>Automatic merge, up to {DEFAULT_AUTO_MERGE_CAP} per day.</p>
+        <p>{draft.teamMode === "new"
+          ? `${draftTeamSlots(draft, slotRouting).find((slot) => slot.role === VERIFIER_ROLE)?.display_name} will be added as a separate verifier slot.`
+          : AUTO_MERGE_VERIFIER_REQUIREMENT}</p>
+      </> : <p>Human review and merge. {AUTO_MERGE_VERIFIER_REQUIREMENT}</p>}
+      <p>Labels: {draft.dispatch} / {draft.design}</p><p>Authentication: {draft.authMode}; credentials are not stored in this draft.</p><p>Preflight: {currentPreflight?.status ?? "not checked or stale"}. Saving remains disabled and does not need ready checks.</p>{currentPreflight && <p className="text-sm">Configuration presence, boolean only: {Object.entries(currentPreflight.configuration_presence ?? {}).map(([name, present]) => `${name}: ${present ? "present" : "missing"}`).join(", ") || "not reported"}.</p>}{(currentPreflight?.host_guidance ?? []).length > 0 && <div className="text-sm"><p className="font-medium">Host procedure</p><ol className="list-decimal pl-5">{(currentPreflight?.host_guidance ?? []).map((line) => <li key={line}>{line}</li>)}</ol></div>}<p className="text-sm">Runtime recovery-only restrictions are separate from credential readiness. Activation needs every required check ready in a fresh observation.</p><p>Team: {draft.teamMode === "existing" ? presets.find((item) => item.id === draft.teamId)?.name ?? "Select a team" : draft.teamName || "New team"}; Leader: {draft.teamMode === "new" ? draft.leaderName : "preserved"}; worker slots: {draft.teamMode === "new" ? draft.workerNames.split("\n").filter((name) => name.trim()).length : "preserved"}.</p><p>Potential overlap: {matchingOverlap.map((item) => `team ${item.preset_id}/scope ${item.id}`).join(", ") || "none found"}.</p><label className="flex gap-2 text-sm"><input type="checkbox" checked={confirmSave} onChange={(e) => setConfirmSave(e.target.checked)} />Save configuration only. Keep launch, team activation, scope activation, and merge decisions separate.</label><div className="flex flex-wrap gap-2"><Button disabled={busy || Boolean(recovery) || !confirmSave || (draft.teamMode === "existing" && !draft.teamId)} onClick={() => void saveSetup()}>{busy ? "Saving…" : "Save configuration"}</Button><Link className="self-center underline" to="/teams">Manage teams</Link></div></div>}
     {step === 5 && team && scope && <div className={panelClass}><h3 className="font-semibold">Saved configuration</h3><p>Team {team.name} (#{team.id}) is {team.autonomy_enabled ? "active" : "paused"}. Repository record #{scope.id} is {scope.enabled ? "enabled" : "disabled"}.</p><p>Saving did not launch workers or activate this scope.</p>
       <section className="space-y-2 rounded border p-3" aria-live="polite"><h4 className="font-semibold">Saved-stage preflight</h4>
         {preflight ? (<>

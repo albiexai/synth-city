@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import pty
+import signal
 import struct
 import subprocess
 import sys
@@ -16,6 +17,7 @@ import pytest
 from starlette.websockets import WebSocketState
 
 from app.services.cc_bridge import pty_relay
+from tests import stray_children
 
 
 class FakeProcess:
@@ -213,6 +215,8 @@ import fcntl, os, pty, signal, sys, termios
 pid, inner = pty.fork()
 if pid == 0:
     os.execvp("sh", ["sh", "-c", sys.argv[1]])
+with open(sys.argv[2], "w") as handle:
+    handle.write(str(pid))
 def sync(*_):
     fcntl.ioctl(inner, termios.TIOCSWINSZ, fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8))
 signal.signal(signal.SIGWINCH, sync)
@@ -239,16 +243,35 @@ def get_winsize(fd):
     return rows, cols
 
 
-def start_attach_like(argv):
+@pytest.fixture
+def owned():
+    children = stray_children.Owned()
+    yield children
+    children.reap()
+
+
+def start_attach_like(owned, argv):
     """Start argv the way the relay starts `tmux attach-session`, on a fresh pty."""
     master, slave = pty.openpty()
     set_winsize(master, 24, 80)
     process = subprocess.Popen(
         argv, stdin=slave, stdout=slave, stderr=subprocess.PIPE, preexec_fn=pty_relay._child_preexec
     )
+    owned.adopt(process)
     os.close(slave)
     os.set_blocking(master, False)
     return master, process
+
+
+def adopt_inner(owned, path, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        text = path.read_text().strip() if path.exists() else ""
+        if text:
+            pid = int(text)
+            return owned.adopt(pid) if stray_children.start_identity(pid) is not None else None
+        time.sleep(0.02)
+    return None
 
 
 def read_until(fd, needle: bytes, timeout=5.0) -> bytes:
@@ -266,14 +289,6 @@ def read_until(fd, needle: bytes, timeout=5.0) -> bytes:
             break
         seen += chunk
     return seen
-
-
-def stop(process, master):
-    process.kill()
-    process.wait(timeout=5)
-    if process.stderr:
-        process.stderr.close()
-    os.close(master)
 
 
 def never_signal(monkeypatch):
@@ -325,9 +340,9 @@ def test_relay_resize_never_signals_the_attach_process(monkeypatch):
         os.close(slave)
 
 
-def test_attach_child_gets_the_kernel_resize_signal_and_back(monkeypatch):
+def test_attach_child_gets_the_kernel_resize_signal_and_back(monkeypatch, owned):
     """Same user: the child sees every size change, with no signal sent by the controller."""
-    master, process = start_attach_like(["sh", "-c", WINCH_SHELL])
+    master, _ = start_attach_like(owned, ["sh", "-c", WINCH_SHELL])
     try:
         read_until(master, b"ready")
         never_signal(monkeypatch)
@@ -336,12 +351,13 @@ def test_attach_child_gets_the_kernel_resize_signal_and_back(monkeypatch):
             read_until(master, f"WINCH:{rows} {cols}".encode())
     finally:
         monkeypatch.undo()
-        stop(process, master)
+        os.close(master)
 
 
-def test_resize_reaches_a_command_behind_a_second_pty(monkeypatch):
+def test_resize_reaches_a_command_behind_a_second_pty(monkeypatch, owned, tmp_path):
     """Emulation of sudo with use_pty. Supporting evidence only, not a cross-user trial."""
-    master, process = start_attach_like([sys.executable, "-c", SUDO_LIKE, WINCH_SHELL])
+    pid_file = tmp_path / "inner.pid"
+    master, _ = start_attach_like(owned, [sys.executable, "-c", SUDO_LIKE, WINCH_SHELL, str(pid_file)])
     try:
         read_until(master, b"ready")
         never_signal(monkeypatch)
@@ -350,7 +366,27 @@ def test_resize_reaches_a_command_behind_a_second_pty(monkeypatch):
             read_until(master, f"WINCH:{rows} {cols}".encode())
     finally:
         monkeypatch.undo()
-        stop(process, master)
+        adopt_inner(owned, pid_file)
+        os.close(master)
+
+
+def test_orphaned_inner_shell_is_reaped_when_sighup_is_ignored(owned, tmp_path):
+    """Regression: with SIGHUP ignored, closing the relay pty used to leave the inner shell running."""
+    pid_file = tmp_path / "inner.pid"
+    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        master, process = start_attach_like(owned, [sys.executable, "-c", SUDO_LIKE, WINCH_SHELL, str(pid_file)])
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+    try:
+        read_until(master, b"ready")
+    finally:
+        inner = adopt_inner(owned, pid_file)
+        os.close(master)
+    killed = owned.reap()
+    assert inner in killed and process.pid in killed
+    assert stray_children.start_identity(inner) is None
+    assert stray_children.start_identity(process.pid) is None
 
 
 class RecordingWebSocket(FakeWebSocket):

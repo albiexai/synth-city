@@ -20,6 +20,7 @@ from sqlalchemy.orm import aliased
 from app.api.v1.deps import (
     mail_session,
     require_mail_session_or_operator,
+    operator_write_context,
     require_operator,
     require_session_slot,
     resolve_request_pane_detailed,
@@ -28,6 +29,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.factory_schemas import AgentTeamSummaryResponse
 from app.services.agent_team_summary_service import agent_team_summary_service
+from app.services.github_effort_limit_service import effort_limit_service
 from app.models.database import (
     AgentTeamSlot,
     AgentTeamPreset,
@@ -41,10 +43,14 @@ from app.models.database import (
     MailTeamMember,
     TeamGithubScope,
 )
+from app.services.github_leader_recovery_service import (
+    CancelRevisionRequest, FinalizeMergedLeaderRequest, ReleaseWorkspaceRequest, WorkspaceReleaseContext,
+)
+from app.services.github_end_stopped_item_service import EndStoppedItemRequest
 from app.models.schemas import (
     GithubScopeAmendmentCreate, GithubRevisionReviewCreate, GithubRevisionReviewWithdraw,
     GithubSubmittedRevisionEnd, GithubRevisionReviewResponse,
-    GithubHeadReviewCreate, GithubHeadReviewResponse,
+    GithubHeadReviewCreate, GithubHeadReviewResponse, GithubReviewBindingResponse,
     AgentTeamActivityResponse,
     AgentTeamCreateFromBridgeRequest,
     AgentTeamCreateFromMailRequest,
@@ -131,6 +137,18 @@ def _operator_actor() -> dict:
     return _audit.derive_actor(actor_kind="operator")
 
 
+def _write_actor(context: dict | None) -> dict:
+    """#945: the operator key authorized the write; the context says how it arrived (server-derived, see deps).
+
+    Only the dependency supplies a context. A direct call of the route function has none, and records the plain operator.
+    """
+    from app.services import factory_audit_service as _audit
+    if not isinstance(context, dict):
+        return _audit.derive_actor(actor_kind="operator")
+    return _audit.derive_actor(
+        actor_kind="operator", via=context["via"], session_id=context["session_id"])
+
+
 def _session_actor(session) -> dict:
     """C08: an authenticated Mail session acts as its member and session.
 
@@ -154,6 +172,7 @@ async def _observe_refusal(
     item_id: int | None = None,
     revision_id: int | None = None,
     request_id: int | None = None,
+    context_snapshot: dict | None = None,
 ) -> None:
     """C09: record a refused action with its actual resource context.
 
@@ -174,6 +193,7 @@ async def _observe_refusal(
         item_id=item_id,
         revision_id=revision_id,
         request_id=request_id,
+        context_snapshot=context_snapshot,
         action_outcome="rejected",
         sanitized_reason=code,
         correlation_id=f"{event_kind}:rejected:{resource}:{code}",
@@ -300,6 +320,7 @@ async def _observe_handoff_rejection(db, session, *, item_id: int, scope_id: int
         item_id=item_id,
     )
 from app.services.github_client import GithubClientResponseError, github_client
+from app.services.github_rate_limit_service import github_rate_limit_service
 from app.services.github_app_auth_service import (
     GithubAppAuthError,
     GithubAppMintRejected,
@@ -320,6 +341,7 @@ from app.services.github_verification_service import (
     github_verification_service,
 )
 from app.services.agent_team_service import PlanConflictError, TeamDeletionConflictError, agent_team_service
+from app.services.providers import get_providers
 from app.services.providers.base import ProviderLaunchError
 
 from app.services.github_work_item_projection import (
@@ -462,7 +484,9 @@ def _scope_auth_configured(scope: TeamGithubScope) -> bool:
     )
 
 
-def _scope_response(scope: TeamGithubScope) -> TeamGithubScopeResponse:
+def _scope_response(
+    scope: TeamGithubScope, auto_merges_last_24h: int | None = None
+) -> TeamGithubScopeResponse:
     return TeamGithubScopeResponse(
         id=scope.id,
         preset_id=scope.preset_id,
@@ -478,10 +502,13 @@ def _scope_response(scope: TeamGithubScope) -> TeamGithubScopeResponse:
         github_auth_mode=scope.github_auth_mode,
         github_auth_configured=_scope_auth_configured(scope),
         github_poll_token_configured=bool(settings.github_token),
+        github_rate_limit=github_rate_limit_service.polling_status(),
         max_approval_rounds=scope.max_approval_rounds,
         max_concurrent_dispatched=scope.max_concurrent_dispatched,
         max_verification_retries=scope.max_verification_retries,
         max_auto_merges_per_day=scope.max_auto_merges_per_day,
+        max_item_effort_minutes=scope.max_item_effort_minutes,
+        auto_merges_last_24h=auto_merges_last_24h,
         base_ref=scope.base_ref,
         builds_out_of_tree=scope.builds_out_of_tree,
         build_dir_template=scope.build_dir_template,
@@ -563,7 +590,11 @@ def _scope_revision_response(
     *,
     include_commands: bool = True,
     approval: GithubApprovalRequest | None = None,
+    effort: dict | None = None,
+    current_view: bool = False,
 ) -> GithubScopeRevisionResponse:
+    """``current_view``: the owner's current context, where an ended revision's prohibitions are not shown (#1185)."""
+    in_force = revision.status in ("active", "submitted")
     return GithubScopeRevisionResponse(
         id=revision.id,
         work_item_id=revision.work_item_id,
@@ -581,7 +612,8 @@ def _scope_revision_response(
         allowed_paths=revision.allowed_paths,
         allowed_actions=revision.allowed_actions,
         allowed_commands=revision.allowed_commands if include_commands else [],
-        prohibited_actions=revision.prohibited_actions,
+        prohibited_actions=revision.prohibited_actions if in_force or not current_view else [],
+        prohibitions_in_force=in_force,
         tool_fallbacks=revision.tool_fallbacks,
         baseline_head_sha=revision.baseline_head_sha,
         baseline_tree_sha=revision.baseline_tree_sha,
@@ -612,6 +644,7 @@ def _scope_revision_response(
         approval_request=(
             _approval_authority_response(approval) if approval is not None else None
         ),
+        effort=effort,
     )
 
 
@@ -678,7 +711,7 @@ async def _scope_identity_in_use(db: AsyncSession, scope_id: int) -> bool:
 _SCOPE_CONFIGURATION_FIELDS = (
     "preset_id", "repo_owner", "repo_name", "repo_path", "dispatch_label", "design_label",
     "merge_policy", "review_hold_label", "max_approval_rounds", "max_concurrent_dispatched", "max_verification_retries",
-    "max_auto_merges_per_day", "base_ref", "builds_out_of_tree", "build_dir_template",
+    "max_auto_merges_per_day", "max_item_effort_minutes", "base_ref", "builds_out_of_tree", "build_dir_template",
     "build_command_hint", "max_build_parallelism", "github_auth_mode", "github_app_installation_id",
     "continuation_enabled", "max_continuation_revisions", "max_continuation_failed_heads",
     "max_failed_heads_per_revision", "max_scope_paths", "max_scope_commands", "enabled",
@@ -789,6 +822,8 @@ def _apply_scope_create(
         scope.max_verification_retries = request.max_verification_retries
     if request.max_auto_merges_per_day is not None:
         scope.max_auto_merges_per_day = request.max_auto_merges_per_day
+    if request.max_item_effort_minutes is not None:
+        scope.max_item_effort_minutes = request.max_item_effort_minutes
     if request.base_ref is not None:
         scope.base_ref = _clean_required(request.base_ref, "Base ref")
     if request.github_auth_mode is not None:
@@ -1514,10 +1549,33 @@ async def request_github_work_item_continuation(
     # R07: once the request commits, a later failure concerns only its notice.
     committed_request: tuple[int, int] | None = None
     try:
-        revision, approval, _created = (
-            await (github_approval_service.create_scope_amendment_request
-                   if isinstance(request, GithubScopeAmendmentCreate)
-                   else github_approval_service.create_continuation_request)(
+        # Two explicit calls (no ** splat), so the state-namespace guard can see every field written (#1154).
+        if isinstance(request, GithubScopeAmendmentCreate):
+            revision, approval, _created = await github_approval_service.create_scope_amendment_request(
+                db,
+                item,
+                scope,
+                authenticated_owner_member_id=session.member_id,
+                authenticated_owner_slot_id=slot_id,
+                dispatch_nonce=request.dispatch_nonce,
+                phase=request.phase,
+                execution_target=request.execution_target,
+                summary=request.summary,
+                allowed_paths=request.allowed_paths,
+                allowed_actions=request.allowed_actions,
+                allowed_commands=request.allowed_commands,
+                prohibited_actions=request.prohibited_actions,
+                max_failed_heads=request.max_failed_heads,
+                tool_fallbacks={
+                    name: fallback.model_dump()
+                    for name, fallback in request.tool_fallbacks.items()
+                },
+                lease_token=request.lease_token,
+                actor=request_actor,
+                withdrawn_paths=request.withdrawn_paths,
+            )
+        else:
+            revision, approval, _created = await github_approval_service.create_continuation_request(
                 db,
                 item,
                 scope,
@@ -1539,7 +1597,6 @@ async def request_github_work_item_continuation(
                 lease_token=request.lease_token,
                 actor=request_actor,
             )
-        )
         committed_request = (approval.id, revision.id)
         if isinstance(request, GithubScopeAmendmentCreate) and not _created and approval.status != "pending":
             return GithubContinuationRequestResponse(
@@ -1791,6 +1848,7 @@ async def list_github_work_item_scope_revisions(
                 )
             ),
             approval=approval_by_revision_id.get(revision.id),
+            effort=effort_limit_service.effort_view(item, scope),
         )
         for revision in revisions
     ]
@@ -2208,6 +2266,7 @@ async def claim_github_work_item_continuation(
         continuation_block_code = "continuation_budget_exhausted"
     else:
         continuation_block_code = None
+    effort_view = effort_limit_service.effort_view(item, scope)
     result = GithubWorkItemContinuationResponse(
         work_item_id=item.id,
         issue_number=item.issue_number,
@@ -2225,9 +2284,9 @@ async def claim_github_work_item_continuation(
         workspace_path=workspace.path if workspace is not None else None,
         lease_token=workspace.lease_token if workspace is not None else None,
         leader_member_id=leader_member.id if leader_member is not None else None,
-        status_note=item.status_note,
+        status_note=github_rate_limit_service.work_item_note(item.dispatch_status, item.status_note),
         active_revision=(
-            _scope_revision_response(active_revision)
+            _scope_revision_response(active_revision, effort=effort_view, current_view=True)
             if active_revision is not None
             else None
         ),
@@ -2237,7 +2296,7 @@ async def claim_github_work_item_continuation(
             else None
         ),
         pending_revision=(
-            _scope_revision_response(pending_revision)
+            _scope_revision_response(pending_revision, effort=effort_view)
             if pending_revision is not None
             else None
         ),
@@ -2252,6 +2311,7 @@ async def claim_github_work_item_continuation(
             "max_paths": scope.max_scope_paths,
             "max_commands": scope.max_scope_commands,
         },
+        effort=effort_view,
     )
     await db.commit()
     response.headers["Cache-Control"] = "no-store"
@@ -2402,9 +2462,28 @@ async def get_preset(preset_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/presets/{preset_id}/summary", response_model=AgentTeamSummaryResponse)
-async def get_team_summary(preset_id: int, response: Response, db: AsyncSession = Depends(get_db)):
+async def get_team_summary(
+    preset_id: int,
+    response: Response,
+    scope_id: int | None = Query(None, ge=1),
+    provider: str | None = Query(None, min_length=1, max_length=64),
+    work_item_id: int | None = Query(None, ge=1),
+    db: AsyncSession = Depends(get_db),
+):
     response.headers["Cache-Control"] = "no-store"
-    result = await agent_team_summary_service.summary(db, preset_id)
+    if work_item_id is not None:
+        if scope_id is not None or provider is not None:
+            raise HTTPException(status_code=422, detail="invalid_filter")
+        result = await agent_team_summary_service.for_work_item(db, preset_id, work_item_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="resource_not_found")
+        return result
+    # Optional Needs-you filters (#1141): the same checks as the factory filters. Without them the read is unchanged.
+    if provider is not None and provider not in {p.id for p in get_providers()}:
+        raise HTTPException(status_code=422, detail="invalid_filter")
+    if scope_id is not None and await db.get(TeamGithubScope, scope_id) is None:
+        raise HTTPException(status_code=404, detail="resource_not_found")
+    result = await agent_team_summary_service.needs_you(db, preset_id, scope_id=scope_id, provider=provider)
     if result is None:
         raise HTTPException(status_code=404, detail="preset_not_found")
     return result
@@ -2426,11 +2505,16 @@ async def update_preset(
     request: AgentTeamPresetUpdate,
     _operator: None = Depends(require_operator),
     db: AsyncSession = Depends(get_db),
+    write_context: dict | None = Depends(operator_write_context),
 ):
+    # A direct call (no request) leaves write_context as the dependency marker, not a dict: no attribution then.
+    session_invalid = isinstance(write_context, dict) and write_context["session_invalid"]
     try:
         response = await agent_team_service.update_preset(
             db,
             preset_id,
+            actor=_write_actor(write_context),
+            session_invalid=session_invalid,
             name=request.name,
             description=request.description,
             autonomy_enabled=request.autonomy_enabled,
@@ -2448,8 +2532,9 @@ async def update_preset(
                 db,
                 event_kind="policy_change",
                 source="agent_team_service.update_preset",
-                actor=_operator_actor(),
+                actor=_write_actor(write_context),
                 code="leader_assignment_required",
+                context_snapshot={"session_invalid": True} if session_invalid else None,
                 team_preset_id=preset_id,
             )
         raise _bad_request(exc) from exc
@@ -2526,7 +2611,10 @@ async def list_github_scopes(preset_id: int, db: AsyncSession = Depends(get_db))
             .order_by(TeamGithubScope.repo_owner, TeamGithubScope.repo_name, TeamGithubScope.id)
         )
     ).scalars().all()
-    return TeamGithubScopeListResponse(scopes=[_scope_response(scope) for scope in scopes])
+    return TeamGithubScopeListResponse(scopes=[
+        _scope_response(scope, await github_verification_service.auto_merges_last_24h(db, scope.id))
+        for scope in scopes
+    ])
 
 
 @router.post(
@@ -2562,7 +2650,8 @@ async def create_github_scope(
     except ValueError as exc:
         raise _bad_request(exc) from exc
     await _sync_github_jobs(db)
-    return _scope_response(scope)
+    return _scope_response(
+        scope, await github_verification_service.auto_merges_last_24h(db, scope.id))
 
 
 @router.patch("/github-scopes/{scope_id}", response_model=TeamGithubScopeResponse)
@@ -2674,7 +2763,8 @@ async def update_github_scope(
     except ValueError as exc:
         raise _bad_request(exc) from exc
     await _sync_github_jobs(db)
-    return _scope_response(scope)
+    return _scope_response(
+        scope, await github_verification_service.auto_merges_last_24h(db, scope.id))
 
 
 @router.patch(
@@ -2721,7 +2811,8 @@ async def update_github_scope_continuation_policy(
     )
     await db.commit()
     await db.refresh(scope)
-    return _scope_response(scope)
+    return _scope_response(
+        scope, await github_verification_service.auto_merges_last_24h(db, scope.id))
 
 
 @router.get("/github-recovery-gate/active")
@@ -3013,7 +3104,12 @@ async def list_github_work_items(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     rows = (
         await db.execute(
-            select(GithubWorkItem, TeamGithubScope, GithubWorkspace.path)
+            select(
+                GithubWorkItem,
+                TeamGithubScope,
+                GithubWorkspace.path,
+                func.count().over().label("total"),
+            )
             .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
             .outerjoin(GithubWorkspace, GithubWorkspace.leased_item_id == GithubWorkItem.id)
             .where(TeamGithubScope.preset_id == preset_id)
@@ -3023,7 +3119,7 @@ async def list_github_work_items(
     ).all()
     authority_by_item = await _load_work_item_authority(
         db,
-        [item for item, _scope, _workspace_path in rows],
+        [item for item, _scope, _workspace_path, _total in rows],
     )
     return GithubWorkItemListResponse(
         items=[
@@ -3036,9 +3132,10 @@ async def list_github_work_items(
                 pending_revision=authority_by_item[item.id].pending_revision,
                 continuation_revision_count=authority_by_item[item.id].revision_count,
                 continuation_failed_head_count=authority_by_item[item.id].failed_head_count,
-            )
-            for item, scope, workspace_path in rows
-        ]
+            ).model_copy(update={"dispatch_nonce": None})  # unauthenticated read: the public generation names the dispatch
+            for item, scope, workspace_path, _total in rows
+        ],
+        total=rows[0].total if rows else 0,
     )
 
 
@@ -3449,6 +3546,12 @@ async def read_activation_readiness(
                 from app.services.providers.muse_cli import is_muse_command
                 if not is_muse_command(argv[0]):
                     return False, "native_identity", member.id, None, None
+            elif slot.provider == "antigravity-cli":
+                # The agy binary itself; the provider id is not an executable name
+                # (app/services/providers/antigravity_cli.py::is_agy_executable).
+                from app.services.providers.antigravity_cli import is_agy_executable
+                if not is_agy_executable(argv[0]):
+                    return False, "native_identity", member.id, None, None
             elif not (argv0 == marker or argv0 == slot.provider):
                 return False, "native_identity", member.id, None, None
             if slot.provider == "opencode-cli":
@@ -3800,6 +3903,122 @@ async def record_github_revision_review(item_id: int, request: GithubRevisionRev
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
 
+def _binding_unavailable():
+    return HTTPException(status_code=409, detail='review_binding_unavailable')
+
+
+def _not_reviewer():
+    return HTTPException(status_code=403, detail='current_independent_reviewer_required')
+
+
+async def _named_reviewer_binding(db, item, scope, member_id):
+    """#999: the reviewer named on the watch for the PR's exact current head and the current policy, or refuse.
+
+    Every check runs on fresh values, the current PR is read the way register() reads it, a failed read fails
+    closed, and the authority is checked again after that remote await.
+    """
+    import re
+    from app.models.database import GithubRequiredCheckWatch
+    from app.services.factory_delivery_policy import effective_policy
+    from app.services.github_approval_service import GithubApprovalError, github_approval_service
+    from app.services.github_ci_watch_service import _digest, github_ci_watch_service as watches
+    from app.services.github_head_acceptance_service import _fresh_item
+    from app.services.github_terminal_revision_service import read_current_named_review_attempt
+    fresh = await _fresh_item(db, item.id)
+    named = fresh is not None and await db.scalar(select(GithubRequiredCheckWatch.id).where(
+        GithubRequiredCheckWatch.work_item_id == item.id,
+        GithubRequiredCheckWatch.dispatch_nonce == fresh.dispatch_nonce,
+        GithubRequiredCheckWatch.scope_revision == fresh.active_scope_revision,
+        GithubRequiredCheckWatch.reviewer_member_id == member_id).limit(1))
+    if not named:
+        raise _not_reviewer()  # not named for this attempt and revision: no remote read for a stranger
+    capture = (github_approval_service.revision_review_attempt_context if fresh.active_scope_revision
+               else github_approval_service.healthy_scope_context)
+    try:
+        context, owner, _leader, _workspace = await capture(db, item, scope)
+        digest = _digest(effective_policy(item, scope))
+    except GithubApprovalError:
+        raise _binding_unavailable() from None
+    def fence(values):
+        # The PR's identity too (#1027 review): the item's branch and the scope's repository.
+        return (values['dispatch_nonce'], values['active_scope_revision'], values['pr_number'],
+                values['owner_slot_id'], values['team_id'], values['leader_slot_id'], values['dispatch_head_ref'],
+                values['scope']['repo_owner'], values['scope']['repo_name'])
+    before = fence(context)
+    if context['pr_number'] is None:
+        raise _binding_unavailable()
+    try:
+        pull = await watches._read_pull(scope, context['pr_number'])
+    except Exception:
+        raise _binding_unavailable() from None
+    # After the remote await, the whole authority is read and fenced again (#1027 review): a current context,
+    # the same attempt, revision, PR, owner, team, Leader, branch and repository, and the same effective policy.
+    # Only these post-read values are used below, starting with the observed pull request.
+    try:
+        context, owner, _leader, _workspace = await capture(db, item, scope)
+        digest_after = _digest(effective_policy(item, scope))
+    except GithubApprovalError:
+        raise _binding_unavailable() from None
+    if fence(context) != before or digest_after != digest:
+        raise _binding_unavailable()
+    head = (pull.get('head') or {}) if isinstance(pull, dict) else {}
+    sha = head.get('sha')
+    if (not isinstance(pull, dict) or type(pull.get('number')) is not int or pull['number'] != context['pr_number']
+            or pull.get('merged_at', True) is not None or pull.get('state') != 'open'
+            or head.get('ref') != context['dispatch_head_ref']
+            or (head.get('repo') or {}).get('full_name')
+            != f"{context['scope']['repo_owner']}/{context['scope']['repo_name']}"
+            or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha)):
+        raise _binding_unavailable()
+    watch = await db.scalar(select(GithubRequiredCheckWatch).where(
+        GithubRequiredCheckWatch.work_item_id == item.id,
+        GithubRequiredCheckWatch.dispatch_nonce == context['dispatch_nonce'],
+        GithubRequiredCheckWatch.scope_revision == context['active_scope_revision'],
+        GithubRequiredCheckWatch.head_sha == sha).execution_options(populate_existing=True))
+    member_slot = await db.scalar(select(MailTeamMember.team_slot_id).where(MailTeamMember.id == member_id))
+    if (watch is None or watch.pr_number != context['pr_number'] or watch.owner_slot_id != context['owner_slot_id']
+            or watch.reviewer_member_id != member_id or watch.policy_digest != digest_after
+            or member_id == owner.id or member_slot is None or member_slot == context['leader_slot_id']):
+        raise _not_reviewer()
+    try:
+        await watches._reviewer(db, context, member_id)
+    except ValueError:
+        raise _not_reviewer() from None
+    try:
+        return await read_current_named_review_attempt(db, context, watch, member_slot)
+    except GithubApprovalError:
+        raise _binding_unavailable() from None
+
+
+@router.get('/github-work-items/{item_id}/review-binding', response_model=GithubReviewBindingResponse)
+async def get_github_review_binding(item_id: int, session: MailAgentSession | None = Depends(mail_session),
+    db: AsyncSession = Depends(get_db)):
+    """#999: the binding a current reviewer needs to record a head or revision review, and nothing more.
+
+    Allowed: the team's current verifier (the same rule as head reviews), or the reviewer named on the item's
+    required-check watch for the PR's exact current head, revision and policy. Everyone else is refused. The
+    nonce is private: it is returned to the reviewer only and must never be published.
+    """
+    from app.services.github_head_acceptance_service import _fresh_item, current_reviewer
+    if session is None:
+        raise HTTPException(status_code=401, detail='session_token_required')
+    require_session_slot(session)
+    item = await db.get(GithubWorkItem, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail='work_item_not_found')
+    scope = await db.get(TeamGithubScope, item.scope_id)
+    if scope is None:
+        raise _binding_unavailable()
+    if await current_reviewer(db, scope, item, session.member_id) == session.member_id:
+        fresh = await _fresh_item(db, item.id)
+    else:
+        fresh = await _named_reviewer_binding(db, item, scope, session.member_id)
+    if fresh is None or fresh.pr_number is None or not fresh.dispatch_nonce:
+        raise _binding_unavailable()
+    return GithubReviewBindingResponse(work_item_id=item.id, pr_number=fresh.pr_number,
+        dispatch_nonce=fresh.dispatch_nonce, active_scope_revision=fresh.active_scope_revision)
+
+
 @router.post('/github-work-items/{item_id}/head-reviews', response_model=GithubHeadReviewResponse)
 async def record_github_head_review(item_id: int, request: GithubHeadReviewCreate,
     session: MailAgentSession | None = Depends(mail_session), db: AsyncSession = Depends(get_db)):
@@ -3858,6 +4077,106 @@ async def settle_github_accepted_revision(item_id: int, request: GithubSubmitted
     except GithubApprovalError as exc:
         await db.rollback()
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+async def _leader_recovery(item_id, session, db, source, run):
+    from sqlalchemy.exc import IntegrityError, InvalidRequestError, OperationalError
+    from sqlalchemy.exc import MissingGreenlet
+    """One Leader recovery: session identity from the authenticated row, refusals observed like the operator routes."""
+    from app.services.github_leader_recovery_service import LeaderRecoveryError
+    if session is None:
+        raise HTTPException(status_code=401, detail='session_token_required')
+    require_session_slot(session)
+    item = await db.get(GithubWorkItem, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail='work_item_not_found')
+    actor = _session_actor(session)  # plain values first: a rollback below expires the session row
+    try:
+        return await run(item)
+    except LeaderRecoveryError as exc:
+        await db.rollback()
+        await _observe_refusal(db, event_kind='leader_recovery', source=source, actor=actor,
+            code=exc.code, item_id=item_id)
+        raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+    except (IntegrityError, OperationalError, InvalidRequestError, MissingGreenlet) as exc:
+        # A residual race (a lost claim, a locked row, an expired row) is a clean refusal; the caller repeats the
+        # same request and the operation id makes it a replay.
+        await db.rollback()
+        await _observe_refusal(db, event_kind='leader_recovery', source=source, actor=actor,
+            code='recovery_context_changed', item_id=item_id)
+        raise HTTPException(status_code=409, detail='recovery_context_changed') from exc
+
+
+async def _merged_pull_reader(db, item_id):
+    from app.api.v1.factory_maintenance import read_merged_pull
+    item = await db.get(GithubWorkItem, item_id)
+    scope = await db.get(TeamGithubScope, item.scope_id)
+
+    async def read():
+        return await read_merged_pull(db, scope, item)
+    return read
+
+
+@router.post('/github-work-items/{item_id}/leader-recovery/cancel-revision')
+async def leader_cancel_revision(item_id: int, request: CancelRevisionRequest,
+    session: MailAgentSession | None = Depends(mail_session), db: AsyncSession = Depends(get_db)):
+    from app.services import github_leader_recovery_service as recovery
+    return await _leader_recovery(item_id, session, db, 'agent_teams.leader_cancel_revision',
+        lambda item: recovery.cancel_revision(db, item, session, revision_number=request.revision_number,
+            dispatch_nonce=request.dispatch_nonce, operation_id=request.operation_id, reason=request.reason))
+
+
+@router.post('/github-work-items/{item_id}/leader-recovery/finalize-merged/preview')
+async def leader_finalize_merged_preview(item_id: int,
+    session: MailAgentSession | None = Depends(mail_session), db: AsyncSession = Depends(get_db)):
+    from app.services import github_leader_recovery_service as recovery
+    return await _leader_recovery(item_id, session, db, 'agent_teams.leader_finalize_merged_preview',
+        lambda item: _with_reader(db, item_id, lambda read: recovery.finalize_preview(db, item, session, read_pull=read)))
+
+
+@router.post('/github-work-items/{item_id}/leader-recovery/finalize-merged')
+async def leader_finalize_merged(item_id: int, request: FinalizeMergedLeaderRequest,
+    session: MailAgentSession | None = Depends(mail_session), db: AsyncSession = Depends(get_db)):
+    from app.services import github_leader_recovery_service as recovery
+    return await _leader_recovery(item_id, session, db, 'agent_teams.leader_finalize_merged',
+        lambda item: _with_reader(db, item_id, lambda read: recovery.finalize_merged(db, item, session,
+            read_pull=read, operation_id=request.operation_id,
+            expected_context_sha256=request.expected_context_sha256, reason=request.reason)))
+
+
+@router.get('/github-work-items/{item_id}/leader-recovery/release-workspace/context',
+            response_model=WorkspaceReleaseContext)
+async def leader_workspace_release_context(
+    item_id: int,
+    response: Response,
+    session: MailAgentSession | None = Depends(mail_session),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services import github_leader_recovery_service as recovery
+    response.headers["Cache-Control"] = "no-store"
+    return await _leader_recovery(item_id, session, db, 'agent_teams.leader_workspace_release_context',
+        lambda item: recovery.release_workspace_context(db, item, session))
+
+
+@router.post('/github-work-items/{item_id}/leader-recovery/release-workspace')
+async def leader_release_workspace(item_id: int, request: ReleaseWorkspaceRequest,
+    session: MailAgentSession | None = Depends(mail_session), db: AsyncSession = Depends(get_db)):
+    from app.services import github_leader_recovery_service as recovery
+    return await _leader_recovery(item_id, session, db, 'agent_teams.leader_release_workspace',
+        lambda item: recovery.release_workspace(db, item, session, workspace_id=request.workspace_id,
+            expected_leased_at=request.leased_at(), operation_id=request.operation_id, reason=request.reason))
+
+
+@router.post('/github-work-items/{item_id}/leader-recovery/end-stopped')
+async def leader_end_stopped(item_id: int, request: EndStoppedItemRequest,
+    session: MailAgentSession | None = Depends(mail_session), db: AsyncSession = Depends(get_db)):
+    from app.services import github_leader_recovery_service as recovery
+    return await _leader_recovery(item_id, session, db, 'agent_teams.leader_end_stopped',
+        lambda item: recovery.end_stopped(db, item, session, request))
+
+
+async def _with_reader(db, item_id, call):
+    return await call(await _merged_pull_reader(db, item_id))
 
 
 @router.post('/github-work-items/{item_id}/submitted-revision/end', response_model=GithubScopeRevisionResponse)

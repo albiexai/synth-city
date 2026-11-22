@@ -1,5 +1,7 @@
 import { updateNativeMetadata, updateNativeCatalog, clearNativeCatalogs } from '@/features/native-settings/surfaceRegistry'
-import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { useLocation } from 'react-router-dom'
+import { withoutClaudeVersion } from '@/features/harnesses/versionLine'
 import { providerOperationKeys } from '@/types/providers'
 import { apiClient } from '@/lib/api'
 import type {
@@ -166,22 +168,40 @@ export function useProviderOperations(provider?: AgentProviderId) {
   return { ...state, refresh }
 }
 
+/**
+ * Which user's scope the registry is fetched under: the scope_user of a /harnesses page, and none anywhere else. It is
+ * the same rule as scopeUserHeaders() in lib/api.ts, which decides the header at request time (#1069).
+ */
+export function registryScopeKey(pathname: string, search: string): string {
+  if (!pathname.startsWith('/harnesses')) return ''
+  return new URLSearchParams(search).get('scope_user') ?? ''
+}
+
 export function useProviders() {
-  const [providers, setProviders] = useState<AgentProviderStatus[]>([])
+  const { pathname, search } = useLocation()
+  const scopeKey = registryScopeKey(pathname, search)
+  // The registry is kept with the scope it was fetched under, so a registry for another user is never shown as this one's.
+  const [fetched, setFetched] = useState<{ scopeKey: string; providers: AgentProviderStatus[] }>({ scopeKey, providers: [] })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const requests = useRef(0)
 
   const refresh = useCallback(async () => {
+    const request = ++requests.current
+    // Read the scope the same way the request header will be built, at the moment the request is made.
+    const fetchedFor = registryScopeKey(window.location.pathname, window.location.search)
     try {
       const data = await apiClient<ProvidersResponse>('providers')
+      if (request !== requests.current) return // a newer request (another scope) superseded this one: its answer is stale
       updateNativeMetadata(data.providers)
-      setProviders(data.providers)
+      setFetched({ scopeKey: fetchedFor, providers: data.providers })
       setError(null)
     } catch (err) {
+      if (request !== requests.current) return
       updateNativeMetadata([])
       setError(err instanceof Error ? err.message : 'Failed to load providers')
     } finally {
-      setLoading(false)
+      if (request === requests.current) setLoading(false)
     }
   }, [])
 
@@ -189,7 +209,14 @@ export function useProviders() {
     refresh()
     const timer = setInterval(refresh, POLL_INTERVAL_MS)
     return () => clearInterval(timer)
-  }, [refresh])
+  }, [refresh, scopeKey]) // a scope change fetches again at once, under the new scope
+
+  // While the registry on hand belongs to another scope, it carries no Claude Code version: never the old user's, and
+  // never the controller's in its place.
+  const providers = useMemo(
+    () => (fetched.scopeKey === scopeKey ? fetched.providers : fetched.providers.map(withoutClaudeVersion)),
+    [fetched, scopeKey],
+  )
 
   return { providers, loading, error, refresh }
 }

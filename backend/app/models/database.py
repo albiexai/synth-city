@@ -268,6 +268,7 @@ class TeamGithubScope(Base):
     max_concurrent_dispatched: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
     max_verification_retries: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
     max_auto_merges_per_day: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
+    max_item_effort_minutes: Mapped[int] = mapped_column(Integer, default=120, server_default="120", nullable=False)
     base_ref: Mapped[str] = mapped_column(String, default="origin/HEAD", nullable=False)
     builds_out_of_tree: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     build_dir_template: Mapped[str | None] = mapped_column(String, default="build", nullable=True)
@@ -436,6 +437,22 @@ class GithubWorkItem(Base):
     continuation_activated_at: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True
     )
+    # Effort limit (#938): advisory elapsed working time against the approved estimate; it never expires work.
+    effort_estimate_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    effort_limit_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    effort_elapsed_seconds: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    effort_last_tick_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    effort_extension_minutes: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    effort_extension_decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    effort_extension_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Generated summary comment (#940): one system-owned PR comment, edited by id. All nullable.
+    summary_comment_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    summary_comment_author: Mapped[str | None] = mapped_column(String, nullable=True)
+    summary_published_digest: Mapped[str | None] = mapped_column(String, nullable=True)
+    summary_published_head_sha: Mapped[str | None] = mapped_column(String, nullable=True)
+    summary_published_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    summary_published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    summary_publish_claim_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
@@ -710,6 +727,8 @@ class MailAgentSession(Base):
     bound_pane_pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     bound_pane_proc_start: Mapped[str | None] = mapped_column(String, nullable=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # The digest of the Mail tool names this session started with (#960); display only.
+    tool_catalog: Mapped[str | None] = mapped_column(String, nullable=True)
     wake_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     mailbox_status: Mapped[str] = mapped_column(String, default="connected", nullable=False)
     activity: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -1114,6 +1133,8 @@ class FactoryAuditEvent(Base):
     actor_member_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     actor_session_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     actor_reference: Mapped[str | None] = mapped_column(String, nullable=True)
+    # #945: how an operator-key write reached the server (ui, mail_tool or api); empty for older events.
+    via: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # Deletion-safe live references. ON DELETE SET NULL keeps the event and
     # its snapshots after guard-permitted deletion; events never cascade
@@ -1170,3 +1191,39 @@ class FactoryResultCursor(Base):
         Integer, ForeignKey("team_github_scopes.id", ondelete="CASCADE"), primary_key=True)
     last_event_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class OperationsFinding(Base):
+    """A stuck state or silent background failure the factory found in itself (#941).
+
+    One open row per (kind, subject); a resolved row stays as history, and the same condition appearing
+    again opens a new row, so the operator is told once per episode. The detail is public-safe: it names
+    identifiers and counts, never prompts, tokens or raw errors.
+    """
+
+    __tablename__ = "operations_findings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    subject: Mapped[str] = mapped_column(String, nullable=False)
+    scope_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("team_github_scopes.id", ondelete="CASCADE"), nullable=True, index=True)
+    work_item_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("github_work_items.id", ondelete="SET NULL"), nullable=True)
+    detail: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, default="open", nullable=False, index=True)
+    occurrences: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uix_operations_findings_open",
+            "kind",
+            "subject",
+            unique=True,
+            sqlite_where=text("status = 'open'"),
+        ),
+    )

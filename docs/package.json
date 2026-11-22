@@ -3,9 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "prebuild": "python3 ../scripts/sync-docs-changelog.py",
     "dev": "vitepress dev",
     "build": "vitepress build",
-    "preview": "vitepress preview"
+    "preview": "vitepress preview",
+    "check:changelog": "python3 ../scripts/sync-docs-changelog.py --check"
   },
   "devDependencies": {
     "vitepress": "^1.6.4"

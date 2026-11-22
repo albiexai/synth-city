@@ -69,6 +69,15 @@ const hold = summary({
 
 const cases = [
   {
+    name: 'a team with a native restart and a transient observation gap',
+    data: summary({ coverage_complete: false, coverage_reason: [
+      { code: 'native_unknown', slot_id: 4, activity_reason: 'restart_needed_for_observation' },
+      { code: 'native_unknown', slot_id: 6, activity_reason: 'no_native_event' },
+    ] }),
+    expects: ['Some team observations are incomplete.', 'Slot 4 · Restart in resume mode through Synth City to observe this session.',
+      'Slot 6 · Waiting for a supported native turn event.'],
+  },
+  {
     name: 'a team with no semantic progress',
     data: summary({ attention: [{ code: 'team_idle', work_item_id: 9, scope_id: 1, issue_number: 839,
       last_actor: 'Reviewer Ada', last_progress_at: stamp }], next_actors: ['leader'] }),

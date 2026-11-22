@@ -270,7 +270,14 @@ class AgentTeamService:
         planned_decisions: list | None | object = _UNSET,
         leader_ack_timeout_seconds: int | None | object = _UNSET,
         leader_ack_max_wait_seconds: int | None | object = _UNSET,
+        actor: dict | None = None,
+        session_invalid: bool = False,
     ) -> AgentTeamPresetResponse:
+        from app.services import factory_audit_service as _audit
+        # #945: the route says how the operator-key write arrived; a direct caller records the plain operator.
+        audit_actor = actor or _audit.derive_actor(actor_kind="operator")
+        # The session token was unusable: the event is unattributed and says so (a flag, never the token).
+        audit_snapshot = {"session_invalid": True} if session_invalid else None
         campaign_changes = {}
         if backlog_milestone is not _UNSET:
             campaign_changes["backlog_milestone"] = backlog_milestone
@@ -289,11 +296,39 @@ class AgentTeamService:
         preset.leader_ack_max_wait_seconds = maximum
         if parent_issue_url is not _UNSET:
             preset.parent_issue_url = parent_issue_url
+        campaign_before: dict = {}
+        campaign_after: dict = {}
         if backlog_milestone is not _UNSET:
+            if validated_campaign.backlog_milestone != preset.backlog_milestone:
+                campaign_before["backlog_milestone"] = preset.backlog_milestone
+                campaign_after["backlog_milestone"] = validated_campaign.backlog_milestone
             preset.backlog_milestone = validated_campaign.backlog_milestone
         if planned_decisions is not _UNSET:
-            preset.planned_decisions = ([decision.model_dump() for decision in validated_campaign.planned_decisions]
-                                        if validated_campaign.planned_decisions is not None else None)
+            new_decisions = ([decision.model_dump() for decision in validated_campaign.planned_decisions]
+                             if validated_campaign.planned_decisions is not None else None)
+            if new_decisions != preset.planned_decisions:
+                campaign_before["planned_decisions_count"] = (
+                    len(preset.planned_decisions) if preset.planned_decisions is not None else None)
+                campaign_after["planned_decisions_count"] = (
+                    len(new_decisions) if new_decisions is not None else None)
+            preset.planned_decisions = new_decisions
+        if campaign_after:
+            # #945: a campaign change persists its event in the same transaction, like the other policy changes. The
+            # event stores the milestone title and the number of decisions, never the decision text.
+            await _audit.record_event(
+                db,
+                event_kind="policy_change",
+                source="agent_team_service.update_preset",
+                occurred_at=datetime.utcnow(),
+                actor=audit_actor,
+                team_preset_id=preset.id,
+                before_values=campaign_before,
+                after_values=campaign_after,
+                context_snapshot=audit_snapshot,
+                sanitized_reason="team campaign change",
+                action_outcome="applied",
+                correlation_id=f"policy:campaign:{preset.id}",
+            )
         if name is not None:
             cleaned_name = self._clean_required(name, "Team name")
             await self._ensure_preset_name_is_unique(db, cleaned_name, exclude_preset_id=preset.id)
@@ -312,14 +347,14 @@ class AgentTeamService:
             # C09: team autonomy policy changes persist their event in the
             # same transaction. An audit-write failure rolls back the change.
             # update_preset is the real autonomy method.
-            from app.services import factory_audit_service as _audit
             await _audit.record_event(
                 db,
                 event_kind="policy_change",
                 source="agent_team_service.update_preset",
                 occurred_at=datetime.utcnow(),
-                actor=_audit.derive_actor(actor_kind="operator"),
+                actor=audit_actor,
                 team_preset_id=preset.id,
+                context_snapshot=audit_snapshot,
                 before_values={"autonomy_enabled": preset.autonomy_enabled},
                 after_values={"autonomy_enabled": autonomy_enabled},
                 sanitized_reason="team autonomy policy change",

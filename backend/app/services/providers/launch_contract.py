@@ -12,10 +12,13 @@ PROVIDER_COPILOT_CLI = "copilot-cli"
 PROVIDER_OPENCODE_CLI = "opencode-cli"
 PROVIDER_PI_CLI = "pi-cli"
 PROVIDER_MUSE_CLI = "muse-cli"
+PROVIDER_ANTIGRAVITY_CLI = "antigravity-cli"
 
 CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 CLAUDE_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 MUSE_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+# `agy --effort`: "low through max, depending on the model" (Antigravity CLI reference).
+ANTIGRAVITY_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 COPILOT_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 COPILOT_CONTEXT_TIERS = ("default", "long_context")
 
@@ -26,6 +29,7 @@ PROVIDER_LAUNCH_MODES: dict[str, tuple[str, ...]] = {
     PROVIDER_COPILOT_CLI: ("plain", "resume"),
     PROVIDER_OPENCODE_CLI: ("plain", "resume"),
     PROVIDER_MUSE_CLI: ("plain", "resume"),
+    PROVIDER_ANTIGRAVITY_CLI: ("plain", "resume"),
 }
 
 PROVIDER_REASONING_EFFORTS: dict[str, tuple[str, ...]] = {
@@ -34,6 +38,7 @@ PROVIDER_REASONING_EFFORTS: dict[str, tuple[str, ...]] = {
     PROVIDER_CODEX_CLI: CODEX_REASONING_EFFORTS,
     PROVIDER_COPILOT_CLI: COPILOT_REASONING_EFFORTS,
     PROVIDER_MUSE_CLI: MUSE_REASONING_EFFORTS,
+    PROVIDER_ANTIGRAVITY_CLI: ANTIGRAVITY_EFFORTS,
 }
 
 PROVIDER_BEDROCK_SUPPORT: dict[str, bool] = {
@@ -42,11 +47,13 @@ PROVIDER_BEDROCK_SUPPORT: dict[str, bool] = {
     PROVIDER_COPILOT_CLI: False,
     PROVIDER_OPENCODE_CLI: True,
     PROVIDER_MUSE_CLI: False,
+    PROVIDER_ANTIGRAVITY_CLI: False,
 }
 
 PROVIDER_OPTION_KEYS: dict[str, tuple[str, ...]] = {
     PROVIDER_PI_CLI: ("model", "platform", "reasoning_effort", "prompt", "use_last", "session_id"),
     PROVIDER_MUSE_CLI: ("model", "reasoning_effort", "skip_permissions", "prompt", "session_id"),
+    PROVIDER_ANTIGRAVITY_CLI: ("model", "reasoning_effort", "skip_permissions", "prompt", "session_id"),
     PROVIDER_CLAUDE_CODE: (
         "model",
         "reasoning_effort",

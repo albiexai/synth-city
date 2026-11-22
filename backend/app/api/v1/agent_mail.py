@@ -5,7 +5,7 @@ import logging
 import os
 import sqlite3
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -27,9 +27,12 @@ from app.config import settings
 from app.database import get_db
 from app.models.api_model import format_utc_time
 from app.utils import peer_process
+from mcp_shim.team_question_hook import is_guarded_tool
+from app.services import request_preflight
 from app.models.database import (
     GithubApprovalRequest,
     GithubWorkItem,
+    GithubWorkspace,
     MailAgentSession,
     MailPaneLifecycle,
     MailMessage,
@@ -65,6 +68,7 @@ from app.services.agent_mail_service import (
     agent_mail_service,
 )
 from app.services.github_dispatch_service import github_dispatch_service
+from app.services.github_effort_limit_service import effort_limit_service
 from app.services.mail_redaction import redact_lease_message, redact_lease_thread
 from app.services.github_approval_service import (
     GithubApprovalError,
@@ -467,6 +471,75 @@ def _is_sqlite_busy(db: AsyncSession, exc: OperationalError) -> bool:
     )
 
 
+class MailPreflightRequest(BaseModel):
+    """A plan, amendment or continuation request to check. Fields mirror the submit tools."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["initial_plan", "scope_amendment", "continuation"]
+    work_item_id: int
+    dispatch_nonce: str
+    summary: Any = ""
+    plan_metadata: Any = Field(default_factory=dict)
+    phase: Any = None
+    execution_target: Any = None
+    # Typed loosely on purpose: a wrong type is a problem to report, not a 422 that hides the rest.
+    allowed_paths: Any = Field(default_factory=list)
+    allowed_actions: Any = Field(default_factory=list)
+    allowed_commands: Any = Field(default_factory=list)
+    prohibited_actions: Any = Field(default_factory=list)
+    max_failed_heads: Any = None
+    tool_fallbacks: Any = Field(default_factory=dict)
+    estimate_active_minutes: Any = None
+    lease_token: Optional[str] = None
+
+
+@router.post("/preflight-request")
+async def preflight_request(
+    request: MailPreflightRequest,
+    session: MailAgentSession = Depends(require_mail_session),
+    db: AsyncSession = Depends(get_db),
+):
+    """Report every mechanical problem of a request before it is submitted (#937).
+
+    Read-only: it creates no request, Mail, nudge or audit row. Only the item's owner may ask, and
+    neither the nonce nor the lease token is echoed back.
+    """
+    item = await db.get(GithubWorkItem, request.work_item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="work_item_not_found")
+    if session.team_slot_id is None or item.owner_slot_id != session.team_slot_id:
+        raise HTTPException(status_code=403, detail="not_item_owner")
+    scope = await db.get(TeamGithubScope, item.scope_id)
+    if scope is None:
+        raise HTTPException(status_code=404, detail="scope_not_found")
+    try:
+        blocking = await agent_mail_service.blocking_unread_authority(db, session.member_id)
+    except Exception as exc:
+        logger.warning("preflight mail check failed: %s", exc)
+        blocking = None
+    result = request_preflight.preflight(
+        request.kind, summary=request.summary, scope=scope, plan_metadata=request.plan_metadata,
+        phase=request.phase, attempt_phase=item.attempt_phase, execution_target=request.execution_target,
+        allowed_paths=request.allowed_paths, allowed_actions=request.allowed_actions,
+        allowed_commands=request.allowed_commands, prohibited_actions=request.prohibited_actions,
+        max_failed_heads=request.max_failed_heads, tool_fallbacks=request.tool_fallbacks,
+        estimate=request.estimate_active_minutes,
+        unread_authority_message_id=blocking.id if blocking is not None else None)
+    if item.dispatch_nonce != request.dispatch_nonce:
+        result.problems.insert(0, request_preflight.problem("stale_nonce"))
+    if request.lease_token is not None:
+        workspace = (await db.execute(
+            select(GithubWorkspace).where(
+                GithubWorkspace.scope_id == scope.id, GithubWorkspace.leased_item_id == item.id)
+        )).scalar_one_or_none()
+        if (workspace is None or workspace.lease_token is None
+                or not hmac.compare_digest(workspace.lease_token, request.lease_token)):
+            result.problems.insert(0, request_preflight.problem("lease_token_mismatch", 403))
+    # The recorded estimate and effort limit (#968): read-only numbers, beside the findings and never part of them.
+    return {**result.as_dict(), "effort": effort_limit_service.effort_view(item, scope)}
+
+
 @router.post(
     "/approval-requests",
     response_model=GithubApprovalRequestResponse,
@@ -550,6 +623,7 @@ async def decide_work_item(
     decision_item_id = item.id
     decision_scope_id = item.scope_id
     decided = False
+    escalated_rejection = item.dispatch_status == "escalated" and request.decision == "rejected"
     try:
         approval, _decided = await github_approval_service.decide(
             db,
@@ -562,6 +636,8 @@ async def decide_work_item(
         )
         decided = True
         decision_delivery_key = f"github-approval:{approval.id}:decision"
+        decision_message = github_approval_service.initial_decision_message(approval)
+        linked_message = None
         if approval.decision_message_id is not None:
             linked_message = await db.get(MailMessage, approval.decision_message_id)
             if (
@@ -569,45 +645,40 @@ async def decide_work_item(
                 or linked_message.delivery_key != decision_delivery_key
             ):
                 raise GithubApprovalError("approval_decision_link_mismatch")
-        message = await agent_mail_service.send_authoritative_decision(
-            db,
-            MailMessageCreate(
-                kind="answer",
-                sender_member_id=session.member_id,
-                thread_root_id=approval.request_message_id,
-                body_markdown=request.reason,
-                payload={
-                    "approval_request_id": approval.id,
-                    "request_kind": approval.request_kind,
-                    "work_item_id": approval.work_item_id,
-                },
-                decision=request.decision,
-            ),
-            authenticated_sender_member_id=session.member_id,
-            approval_round=approval.approval_round,
-            delivery_key=decision_delivery_key,
-        )
-        if approval.decision_message_id is None:
-            approval.decision_message_id = message.id
-            await db.commit()
-            await db.refresh(approval)
-        elif approval.decision_message_id != message.id:
-            raise GithubApprovalError("approval_decision_link_mismatch")
+        if escalated_rejection and linked_message is not None:
+            if not await agent_mail_service._same_delivery(
+                db, linked_message, decision_message, sender_actor_id=None, sender_type="member",
+                operator_authorized=False,
+            ):
+                raise GithubApprovalError("approval_decision_link_mismatch")
+            message = linked_message
+        else:
+            message = await agent_mail_service.send_authoritative_decision(
+                db, decision_message, authenticated_sender_member_id=session.member_id,
+                approval_round=approval.approval_round, delivery_key=decision_delivery_key,
+            )
+            if approval.decision_message_id is None:
+                approval.decision_message_id = message.id
+                await db.commit()
+                await db.refresh(approval)
+            elif approval.decision_message_id != message.id:
+                raise GithubApprovalError("approval_decision_link_mismatch")
         # C09: the decision notice is settled; its fact is separate from the
         # decision fact and keyed by the stable decision delivery key.
         await _record_decision_notice(
             db, actor=actor, scope_id=decision_scope_id, item_id=decision_item_id,
             request_id=request.approval_request_id, outcome="applied",
             reason="decision notice delivered")
-        await github_dispatch_service.apply_approval_decision(
-            db,
-            item,
-            scope,
-            decision=request.decision,
-            approval_round=approval.approval_round,
-            dispatch_nonce=approval.dispatch_nonce,
-            owner_member_id=approval.owner_member_id,
-        )
+        if not escalated_rejection:
+            await github_dispatch_service.apply_approval_decision(
+                db,
+                item,
+                scope,
+                decision=request.decision,
+                approval_round=approval.approval_round,
+                dispatch_nonce=approval.dispatch_nonce,
+                owner_member_id=approval.owner_member_id,
+            )
         await agent_mail_service.auto_nudge_members(
             db,
             {approval.owner_member_id},
@@ -685,6 +756,34 @@ async def _record_decision_notice(
         await db.commit()
     except Exception:
         await db.rollback()
+
+
+class MailEffortExtensionRequest(BaseModel):
+    work_item_id: int
+    dispatch_nonce: str
+    minutes: Any = None
+    reason: Any = None
+    expected_extension_minutes: Any = None
+    evidence: Any = None
+
+
+@router.post("/effort-extensions")
+async def extend_effort_limit(
+    request: MailEffortExtensionRequest,
+    session: MailAgentSession = Depends(require_mail_session),
+    db: AsyncSession = Depends(get_db),
+):
+    """One Leader extension step of an item's effort limit (#938, #1101), guarded by the expected total (#1100)."""
+    from app.services.github_effort_limit_service import EffortLimitError, effort_limit_service
+
+    try:
+        result = await effort_limit_service.extend(
+            db, work_item_id=request.work_item_id, dispatch_nonce=request.dispatch_nonce,
+            leader_member_id=session.member_id, minutes=request.minutes, reason=request.reason,
+            expected_extension_minutes=request.expected_extension_minutes, evidence=request.evidence)
+    except EffortLimitError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+    return result
 
 
 @router.post("/continuation-decisions", response_model=MailMessageResponse)
@@ -1202,7 +1301,25 @@ async def agent_inbox(
 
 def _hook_provider(payload: dict) -> str:
     provider = str(payload.get("provider") or "claude-code")
-    return provider if provider in {"claude-code", "codex-cli", "copilot-cli", "opencode-cli", "muse-cli"} else "unknown"
+    return provider if provider in {
+        "claude-code", "codex-cli", "copilot-cli", "opencode-cli", "muse-cli", "antigravity-cli"} else "unknown"
+
+
+def _hook_tool_name(payload: dict) -> Optional[str]:
+    """The tool a PreToolUse hook names: agy sends toolCall.name, the others tool_name."""
+    if _hook_provider(payload) == "antigravity-cli":
+        call = payload.get("toolCall")
+        name = call.get("name") if isinstance(call, dict) else None
+        return name if isinstance(name, str) else None
+    name = payload.get("tool_name")
+    return name if isinstance(name, str) else None
+
+
+def _record_antigravity_question_denied(payload: dict) -> None:
+    """The member's own hook denied ask_question (#736). Records no question content."""
+    conversation = payload.get("conversationId") or payload.get("session_id")
+    logger.info("antigravity_question_denied conversation=%s team_slot=%s",
+                str(conversation)[:64] if conversation else None, _payload_int(payload, "team_slot_id"))
 
 
 def _hook_session_key(payload: dict) -> Optional[str]:
@@ -1216,6 +1333,7 @@ def _hook_session_key(payload: dict) -> Optional[str]:
         "copilot-cli": "copilot",
         "opencode-cli": "opencode",
         "muse-cli": "muse",
+        "antigravity-cli": "antigravity",
     }
     prefix = prefix_by_provider.get(provider, "unknown")
     team_slot_id = _payload_int(payload, "team_slot_id")
@@ -1376,6 +1494,69 @@ async def hook_input_wait(
     return {}
 
 
+_GUARD_ALLOW = {"guard": "allow"}
+_GUARD_UNAVAILABLE = {"guard": "unavailable"}
+
+
+@router.post("/hooks/pre-tool-use")
+async def hook_pre_tool_use(
+    http_request: Request,
+    payload: dict[str, Any] = Body(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Refuse edit and state-changing Mail tools while the member has unread stop Mail (#930).
+
+    The answer is one of three: `{"guard": "allow"}`, a PreToolUse deny, or
+    `{"guard": "unavailable"}`, which the hook shows as a fixed warning and then allows. The
+    member is the one whose slot owns the pane this loopback request came from, the same
+    kernel-verified binding registration uses. A session key or a claimed slot alone never
+    selects the member, because native hooks, MCP registration and this hook name sessions
+    differently. The route is unauthenticated like the other native hooks, so a refusal names
+    only the message id.
+    """
+    try:
+        if _hook_provider(payload) == "antigravity-cli":
+            # The agy hook shim denies ask_question itself, without waiting for this route (#736).
+            # The #930 edit guard covers Claude Code only; extending it to agy is a separate decision.
+            slot = _payload_int(payload, "team_slot_id")
+            # Logged only where the shim denies: a team member with a positive slot id.
+            if _hook_tool_name(payload) == "ask_question" and slot is not None and slot > 0:
+                _record_antigravity_question_denied(payload)
+            return _GUARD_ALLOW
+        claimed_slot = _payload_int(payload, "team_slot_id")
+        if claimed_slot is None or not is_guarded_tool(payload.get("tool_name")):
+            return _GUARD_ALLOW
+        pane = resolve_request_pane(http_request)
+        binding = await agent_mail_service.resolve_pane_binding(db, pane) if pane is not None else None
+        if binding is None or binding.slot_id is None or binding.slot_id != claimed_slot:
+            return _GUARD_UNAVAILABLE
+        member_id = (
+            await db.execute(
+                select(MailTeamMember.id)
+                .where(MailTeamMember.team_slot_id == binding.slot_id)
+                .order_by(MailTeamMember.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if member_id is None:
+            # The slot has not registered with Agent Mail yet, so no Mail can be waiting for it.
+            return _GUARD_ALLOW
+        blocking = await agent_mail_service.blocking_unread_authority(db, member_id)
+        if blocking is None:
+            return _GUARD_ALLOW
+        return {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                f"unread stop or hold message {blocking.id}: read your inbox "
+                "(synth_city_check_inbox) first"
+            ),
+        }}
+    except Exception as exc:
+        logger.warning("pre-tool-use hook failed: %s", exc)
+        return _GUARD_UNAVAILABLE
+
+
 @router.post("/hooks/post-tool-use")
 async def hook_post_tool_use(
     http_request: Request,
@@ -1495,6 +1676,38 @@ async def uninstall_muse(
     _require_confirmed(body)
     try:
         return await agent_mail_install_service.uninstall_muse(db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/install/antigravity/apply",
+    response_model=AgentMailInstallStatus,
+    dependencies=INSTALL_WRITES,
+)
+async def install_antigravity(
+    body: dict[str, Any] | None = Body(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_confirmed(body)
+    try:
+        return await agent_mail_install_service.apply_antigravity_install(db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/install/antigravity/uninstall",
+    response_model=AgentMailInstallStatus,
+    dependencies=INSTALL_WRITES,
+)
+async def uninstall_antigravity(
+    body: dict[str, Any] | None = Body(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_confirmed(body)
+    try:
+        return await agent_mail_install_service.uninstall_antigravity(db)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

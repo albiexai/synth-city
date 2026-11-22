@@ -2,7 +2,7 @@
 # Fake harness binary for the Albiex Synth City E2E instance. No network, no credentials.
 #
 # scripts/e2e-instance.sh copies this file to <tmp>/bin/<name> for each
-# provider (claude, codex, copilot, opencode, pi, muse). The name comes from $0.
+# provider (claude, codex, copilot, opencode, pi, muse, agy). The name comes from $0.
 # - Probes (--version, --help, any --json call) return at once.
 # - Without a terminal on stdin it exits 0, so an Albiex Synth City subprocess never hangs.
 # - In a terminal (a tmux pane) it echoes its input with argv[0] set to the
@@ -24,6 +24,26 @@ case "${1:-}" in
     exit 0
     ;;
 esac
+
+# agy (Antigravity CLI, #952) takes its prompt only as one -i argument. Like the real CLI it
+# accepts the provider's argv (--model <m>, --effort <e>, --dangerously-skip-permissions,
+# --conversation <id> or --conversation=<id>, -i <prompt>) and rejects a stray positional
+# argument with exit code 2.
+if [[ "$name" == agy ]]; then
+  args=("$@")
+  i=0
+  while (( i < ${#args[@]} )); do
+    case "${args[i]}" in
+      --model | --effort | --conversation | -i) i=$((i + 2)) ;;
+      --conversation=* | --dangerously-skip-permissions) i=$((i + 1)) ;;
+      -*) i=$((i + 1)) ;;
+      *)
+        echo "Prompts are read only from -p/--print, -i/--prompt-interactive, or stdin" >&2
+        exit 2
+        ;;
+    esac
+  done
+fi
 
 for arg in "$@"; do
   if [[ "$arg" == --json ]]; then

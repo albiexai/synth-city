@@ -8,7 +8,8 @@ import { campaignBarLabel } from "./campaign";
 export function CampaignBar({ campaign: c }: { campaign: TeamCampaignSummary }) {
   const known = c.backlog_state === "available";
   const todo = c.queued_count + (c.not_started_count ?? 0);
-  const total = c.done_count + c.under_way_count + todo;
+  const attention = c.attention_count ?? 0;
+  const total = c.done_count + c.under_way_count + attention + todo;
   if (total === 0) return null;
   // With an unknown remainder the known work fills 80% of the bar.
   const scale = known ? 100 : 80;
@@ -21,7 +22,8 @@ export function CampaignBar({ campaign: c }: { campaign: TeamCampaignSummary }) 
     >
       <span className="bg-primary" style={{ width: width(c.done_count) }} />
       <span className="bg-violet-500" style={{ width: width(c.under_way_count) }} />
-      <span className="bg-muted-foreground/50" style={{ width: width(todo) }} />
+      <span className="bg-amber-500" style={{ width: width(attention) }} />
+      <span data-testid="campaign-bar-todo" className="bg-muted-foreground/50" style={{ width: width(todo) }} />
       {!known && (
         <span
           data-testid="unknown-remainder"

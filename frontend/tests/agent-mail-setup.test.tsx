@@ -1,6 +1,7 @@
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { ApiHttpError } from '@/lib/api'
 import { AgentMailPage } from '@/features/agent-mail/AgentMailPage'
 import { HarnessMailDetails, HarnessMailSetup } from '@/features/agent-mail/HarnessMailSetup'
 import {
@@ -139,7 +140,7 @@ describe('mailSetupState', () => {
   })
 
   it('names the full product name first in every install and remove confirmation', () => {
-    for (const provider of ['codex-cli', 'copilot-cli', 'muse-cli', 'opencode-cli'] as const) {
+    for (const provider of ['codex-cli', 'copilot-cli', 'muse-cli', 'opencode-cli', 'antigravity-cli'] as const) {
       for (const action of ['setup', 'remove'] as const) {
         expect(mailConfirm(provider, action, status()).description).toContain('before Albiex Synth City')
       }
@@ -314,5 +315,29 @@ describe('Agent Mail page', () => {
     const link = await screen.findByRole('link', { name: /Set up in Harnesses/ })
     expect(link).toHaveAttribute('href', '/harnesses')
     expect(screen.queryByText(/Mail is set up for/)).not.toBeInTheDocument()
+  })
+
+  it('asks for the Director key after a 401 instead of saying Mail is not set up', async () => {
+    vi.mocked(fetchAgentMailTeam).mockResolvedValue({ members: [] })
+    vi.mocked(fetchAgentMailMessages).mockResolvedValue([])
+    vi.mocked(fetchAgentMailInstallStatus).mockRejectedValue(new ApiHttpError('Refused', 401))
+    render(<MemoryRouter><AgentMailPage /></MemoryRouter>)
+    expect(await screen.findByText('Enter the Director key to see Agent Mail')).toBeInTheDocument()
+    expect(screen.queryByText('Agent setup required')).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: /Set up in Harnesses/ })).not.toBeInTheDocument()
+  })
+
+  it('lists every harness in the setup notes and names no Install tab', async () => {
+    vi.mocked(fetchAgentMailTeam).mockResolvedValue({ members: [] })
+    vi.mocked(fetchAgentMailMessages).mockResolvedValue([])
+    vi.mocked(fetchAgentMailInstallStatus).mockResolvedValue(status())
+    render(<MemoryRouter><AgentMailPage /></MemoryRouter>)
+    fireEvent.click(await screen.findByRole('button', { name: 'How it works' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Agent Mail setup' })
+    for (const name of ['Claude Code', 'Codex', 'GitHub Copilot CLI', 'OpenCode CLI', 'Muse Code', 'Antigravity CLI', 'Pi']) {
+      expect(within(dialog).getByText(new RegExp(`^${name}:`))).toBeInTheDocument()
+    }
+    expect(dialog.textContent).not.toContain('Install tab')
+    expect(dialog.textContent).toContain('Open Harnesses')
   })
 })

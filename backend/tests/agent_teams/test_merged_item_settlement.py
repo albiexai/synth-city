@@ -12,13 +12,15 @@ from sqlalchemy import func, select, update
 from app.config import settings
 from app.database import get_db
 from app.models.database import (
-    FactoryAuditEvent, GithubAttemptScopeRevision, GithubHeadReview, GithubMaintenanceEvent, GithubWorkItem,
+    FactoryAuditEvent, GithubApprovalRequest, GithubAttemptScopeRevision, GithubHeadReview, GithubMaintenanceEvent,
+    GithubWorkItem, MailTeamMember,
 )
+from app.services.github_approval_service import github_approval_service
 from app.services.github_terminal_revision_service import TERMINAL_ITEMS, finalize_merged_item, finalize_merged_preview
 from app.services.github_verification_service import github_verification_service
 from app.services.github_watcher_service import github_watcher_service
 from tests.agent_teams.test_github_verification_service import (  # noqa: F401  (fixtures and helpers shared with the verification tests)
-    _Client, _implementation_revision, _item, _owner, _scope, db,
+    _Client, _escalated_merge_fixture, _implementation_revision, _item, _owner, _row_values, _scope, db,
 )
 from tests.agent_teams.test_github_watcher_service import _FakeClient, _issue, _make_scope
 from tests.agent_teams.test_head_acceptance import twin  # noqa: F401
@@ -586,3 +588,244 @@ async def test_finalize_refuses_when_only_the_second_read_differs(db):
     assert len(reads) == 2
     await db.refresh(item)
     assert item.dispatch_status == "verifying"
+
+
+# ---- #1078: a dispatched item whose PR merged while its revision was still active ----
+
+async def _dispatched_active(db, *, pull_head="accepted-head", accepted=True, pull=None, client_class=_Client):
+    """A dispatched item on an active implementation revision (no submitted head) and a PR that GitHub reports as given."""
+    scope = await _scope(db)
+    slot, member = await _owner(db, scope)
+    item = await _item(db, scope, dispatch_status="dispatched", pr_number=5, owner_slot_id=slot.id,
+                       dispatch_nonce="attempt-1", active_scope_revision=1, attempt_phase="implementation",
+                       ack_received_at=datetime.utcnow())
+    revision, _workspace = await _implementation_revision(db, scope, item, slot, member, status="active")
+    if accepted:
+        db.add(GithubHeadReview(work_item_id=item.id, dispatch_nonce="attempt-1", pr_number=5, head_sha=pull_head,
+                                scope_revision=1, reviewer_member_id=1, verdict="accepted", summary="ok",
+                                evidence_url="https://github.com/o/r/pull/5#pullrequestreview-1"))
+        await db.commit()
+    client = client_class()
+    client.pull.update(pull or MERGED)
+    client.pull["head"] = dict(client.pull["head"], sha=pull_head)
+    return scope, item, revision, client
+
+
+async def _settlements(db):
+    return (await db.execute(select(FactoryAuditEvent).where(FactoryAuditEvent.event_kind == "merged_settlement"))
+            ).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_a_dispatched_item_merged_at_an_accepted_head_settles_with_its_active_revision(db):
+    scope, item, revision, client = await _dispatched_active(db)
+    await _tick(db, scope, client, item, revision)
+    assert item.dispatch_status == "merged"
+    assert revision.status == "completed" and revision.completed_at is not None
+    events = await _settlements(db)
+    assert [(e.item_id, e.revision_id, e.sanitized_reason) for e in events] == [
+        (item.id, revision.id, "pr_merged_with_active_revision")]
+    await _tick(db, scope, client, item, revision)  # a later poll records nothing more
+    assert len(await _settlements(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_dispatched_item_merged_at_an_unaccepted_head_escalates_for_the_operator(db):
+    scope, item, revision, client = await _dispatched_active(db, pull_head="unreviewed-head", accepted=False)
+    await _tick(db, scope, client, item, revision)
+    assert item.dispatch_status == "escalated" and item.escalation_reason == "continuation_invalid_state"
+    assert "unreviewed-head" in item.status_note and "no merge was recorded" in item.status_note
+    assert revision.status == "superseded"
+    assert await _settlements(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_lost_fence_while_the_merge_is_read_again_changes_nothing(db):
+    class _ChangingClient(_Client):
+        reads = 0
+
+        async def get_pull(self, owner, repo, number):
+            self.reads += 1
+            if self.reads == 2:  # the settlement's final read: the revision changes meanwhile
+                await db.execute(update(GithubAttemptScopeRevision).values(summary="changed meanwhile"))
+                await db.commit()
+            return await super().get_pull(owner, repo, number)
+
+    scope, item, revision, client = await _dispatched_active(db, client_class=_ChangingClient)
+    await _tick(db, scope, client, item, revision)
+    assert client.reads >= 2
+    assert item.dispatch_status == "dispatched" and revision.status == "active"
+    assert await _settlements(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_dispatched_item_with_an_open_pr_is_left_as_it_is(db):
+    scope, item, revision, client = await _dispatched_active(db, pull=dict(state="open", merged=False, merged_at=None))
+    await _tick(db, scope, client, item, revision)
+    assert item.dispatch_status == "dispatched" and revision.status == "active"
+    assert await _settlements(db) == []
+
+
+@pytest.mark.asyncio
+async def test_the_submitted_settlement_records_the_shared_reason_once(db):
+    scope, item, revision, workspace, client = await _submitted(db, unacknowledged_amendment=False)
+    await _tick(db, scope, client, item, revision)
+    assert item.dispatch_status == "merged"
+    assert [e.sanitized_reason for e in await _settlements(db)] == ["pr_merged_with_submitted_revision"]
+
+
+# ---- #1079: an escalated item whose PR merged while its revision was not submitted ----
+
+HEAD = "a" * 40  # the merged head in _escalated_merge_fixture
+
+
+async def _escalated_with(db, status, *, submitted=HEAD, accepted=None):
+    """An escalated item on revision 1 in the given status, whose PR merged at HEAD."""
+    scope, item, workspace, client = await _escalated_merge_fixture(db)
+    slot, owner = await _owner(db, scope)
+    item.owner_slot_id = slot.id
+    item.active_scope_revision = 1
+    workspace.leased_item_id = None
+    workspace.lease_token = None
+    await db.commit()
+    revision, _workspace = await _implementation_revision(db, scope, item, slot, owner, status="submitted")
+    revision.status = status
+    revision.submitted_head_sha = submitted
+    # a live owner lease, so a closed PR would reach the supersede path if it applied to this revision
+    revision.expected_lease_token_hash = github_approval_service.lease_token_hash(_workspace.lease_token)
+    if accepted:
+        db.add(GithubHeadReview(work_item_id=item.id, dispatch_nonce=item.dispatch_nonce, pr_number=5,
+                                head_sha=accepted, scope_revision=1, reviewer_member_id=1, verdict="accepted",
+                                summary="ok", evidence_url="https://github.com/o/r/pull/5#pullrequestreview-1"))
+    await db.commit()
+    return scope, item, revision, client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authority", ["submitted_head", "accepted_head"])
+@pytest.mark.parametrize("status", ["exhausted", "active", "submitted"])
+async def test_an_escalated_item_whose_pr_merged_settles_whatever_its_revision_state(db, status, authority):
+    submitted, accepted = (HEAD, None) if authority == "submitted_head" else (None, HEAD)
+    scope, item, revision, client = await _escalated_with(db, status, submitted=submitted, accepted=accepted)
+    await _tick(db, scope, client, item, revision)
+    assert item.dispatch_status == "merged" and item.escalation_reason is None
+    if status == "exhausted":  # Q2: an exhausted revision stays exhausted
+        assert revision.status == "exhausted" and revision.completed_at is None
+    else:
+        assert revision.status == "completed" and revision.completed_at is not None
+    events = await _settlements(db)
+    assert [(e.item_id, e.revision_id, e.sanitized_reason) for e in events] == [
+        (item.id, revision.id, f"pr_merged_while_escalated_with_{status}_revision")]
+    await _tick(db, scope, client, item, revision)
+    assert len(await _settlements(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_escalated_item_without_a_revision_records_the_shared_reason(db):
+    scope, item, _workspace, client = await _escalated_merge_fixture(db)
+    await _tick(db, scope, client, item)
+    assert item.dispatch_status == "merged"
+    assert [(e.revision_id, e.sanitized_reason) for e in await _settlements(db)] == [
+        (None, "pr_merged_while_escalated")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "unauthorized_head", "pending_approval", "handoff", "closed_active", "closed_exhausted", "lost_fence",
+])
+async def test_an_escalated_merge_is_still_refused_without_authority_or_on_a_changed_context(db, case):
+    status = "active" if case == "closed_active" else "exhausted"
+    submitted = "c" * 40 if case == "unauthorized_head" else HEAD  # Q1: nobody submitted or accepted HEAD
+    scope, item, revision, client = await _escalated_with(db, status, submitted=submitted)
+    if case == "pending_approval":
+        _, owner = await _owner(db, scope)
+        leader = MailTeamMember(identity_key="pending-leader-1079", repo_id="r", repo_path="/tmp/r", repo_name="r",
+                                display_name="Leader", participant_kind="external")
+        db.add(leader)
+        await db.flush()
+        db.add(GithubApprovalRequest(work_item_id=item.id, dispatch_nonce=item.dispatch_nonce, approval_round=1,
+                                     owner_member_id=owner.id, leader_member_id=leader.id, status="pending",
+                                     request_kind="continuation", request_fingerprint="pending-1079"))
+    elif case == "handoff":
+        item.handoff_state = "requested"
+    elif case in {"closed_active", "closed_exhausted"}:  # only a submitted revision is superseded by a closed PR
+        client.pull.update(merged=False, merged_at=None, state="closed")
+    elif case == "lost_fence":
+        original = client.get_pull
+
+        async def changed_meanwhile(*args):
+            await db.execute(update(GithubAttemptScopeRevision).values(summary="changed meanwhile"))
+            await db.commit()
+            return await original(*args)
+        client.get_pull = changed_meanwhile
+    await db.commit()
+    item_before, revision_before = _row_values(item), _row_values(revision)
+    await _tick(db, scope, client, item, revision)
+    if case == "lost_fence":
+        revision_before["summary"] = "changed meanwhile"
+    assert _row_values(item) == item_before
+    assert _row_values(revision) == revision_before
+    assert await _settlements(db) == []
+
+
+# ---- #1080: a verifying item on a completed revision that is not a positive settlement ----
+
+async def _verifying_completed(db, *, submitted=None, completed=True, accepted=None, pull_head="accepted-head",
+                               pull=None):
+    """A verifying item whose current revision is completed but fails the settled shape, so the poll skips it."""
+    scope = await _scope(db)
+    slot, member = await _owner(db, scope)
+    item = await _item(db, scope, dispatch_status="verifying", pr_number=5, owner_slot_id=slot.id,
+                       dispatch_nonce="attempt-1", active_scope_revision=1, attempt_phase="implementation",
+                       ack_received_at=datetime.utcnow())
+    revision, _workspace = await _implementation_revision(db, scope, item, slot, member, status="submitted")
+    revision.status = "completed"
+    revision.submitted_head_sha = submitted
+    revision.completed_at = datetime(2026, 11, 16, 9, 30) if completed else None
+    if accepted:
+        db.add(GithubHeadReview(work_item_id=item.id, dispatch_nonce="attempt-1", pr_number=5, head_sha=accepted,
+                                scope_revision=1, reviewer_member_id=1, verdict="accepted", summary="ok",
+                                evidence_url="https://github.com/o/r/pull/5#pullrequestreview-1"))
+    await db.commit()
+    client = _Client()
+    client.pull.update(pull or MERGED)
+    client.pull["head"] = dict(client.pull["head"], sha=pull_head)
+    return scope, item, revision, client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["no_submitted_head", "no_completed_time"])
+async def test_a_skipped_verifying_item_on_a_completed_revision_settles_its_merge(db, shape):
+    if shape == "no_submitted_head":  # authorized by an accepted review
+        scope, item, revision, client = await _verifying_completed(db, accepted="accepted-head")
+    else:  # authorized by its own submitted head
+        scope, item, revision, client = await _verifying_completed(db, submitted="sha", completed=False, pull_head="sha")
+    completed_at = revision.completed_at
+    await _tick(db, scope, client, item, revision)
+    assert item.dispatch_status == "merged"
+    assert revision.status == "completed" and revision.completed_at == completed_at  # its history is kept (Q2)
+    assert [(e.item_id, e.sanitized_reason) for e in await _settlements(db)] == [
+        (item.id, "pr_merged_with_completed_revision")]
+    assert item.id not in github_verification_service.skipped_item_ids
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_verifying_item_merged_at_an_unauthorized_head_escalates_for_the_operator(db):
+    scope, item, revision, client = await _verifying_completed(db, pull_head="unreviewed-head")
+    revision_before = _row_values(revision)
+    await _tick(db, scope, client, item, revision)
+    assert item.dispatch_status == "escalated" and item.escalation_reason == "continuation_invalid_state"
+    assert "no merge was recorded" in item.status_note
+    assert _row_values(revision) == revision_before
+    assert await _settlements(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_verifying_item_with_an_open_pr_is_still_skipped(db):
+    scope, item, revision, client = await _verifying_completed(
+        db, accepted="accepted-head", pull=dict(state="open", merged=False, merged_at=None))
+    revision_before = _row_values(revision)
+    await _tick(db, scope, client, item, revision)
+    assert item.dispatch_status == "verifying" and _row_values(revision) == revision_before
+    assert item.id in github_verification_service.skipped_item_ids  # still a stuck item for #941
+    assert await _settlements(db) == []

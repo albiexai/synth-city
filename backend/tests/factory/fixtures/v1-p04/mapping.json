@@ -58,7 +58,7 @@
     "retry": {
       "path": "backend/app/services/github_dispatch_service.py",
       "projection": "shared legacy _work_item_response.retry_allowed/retry_block_code",
-      "required_actor": "leader",
+      "required_actor": "stopped-attempt next actor (leader or operator), otherwise leader",
       "source": "GithubDispatchService.retry_eligibility",
       "states": [
         "eligible",
@@ -78,7 +78,8 @@
     ],
     "finished": [
       "merged",
-      "completed"
+      "completed",
+      "cancelled"
     ],
     "queued": [
       "pending"

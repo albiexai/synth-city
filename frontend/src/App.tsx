@@ -16,6 +16,7 @@ import { BridgeEntry, MailEntry } from './features/factory/ContextPages'
 import { AgentTeamsPage } from './features/agent-teams/AgentTeamsPage'
 import { RepositorySetupPage } from './features/factory/RepositorySetupPage'
 import { AuditMetricsPage } from './features/factory/AuditMetricsPanel'
+import { NotFoundPage } from './components/shared/NotFoundPage'
 
 function HarnessSummaryAlias() { const { providerId } = useParams(); const { search, hash } = useLocation(); return <Navigate replace to={`/harnesses/${encodeURIComponent(providerId ?? '')}${search}${hash}`} /> }
 function TeamsAlias() { const { search, hash } = useLocation(); return <Navigate replace to={`/teams${search}${hash}`} /> }
@@ -68,6 +69,7 @@ function App() {
                 <Route path="plans" element={<LegacyNativeRedirect />} />
                 <Route path="context" element={<LegacyNativeRedirect />} />
                 <Route path="usage" element={<LegacyNativeRedirect />} />
+                <Route path="*" element={<NotFoundPage />} />
               </Route>
             </Routes>
 

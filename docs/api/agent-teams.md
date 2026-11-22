@@ -149,7 +149,7 @@ DELETE /api/v1/agent-teams/slots/{slot_id}
 POST /api/v1/agent-teams/presets/{preset_id}/slots/reorder
 ```
 
-Slots store provider, repository path, display name, role, charter, UI color, bootstrap prompt, launch mode, provider options, and enabled state.
+Slots store provider, repository path, display name, role, charter, UI color, bootstrap prompt, launch mode, provider options, enabled state, `area_labels` and `expertise`. `area_labels` is a list of GitHub label names that route an issue to the slot; the match is exact and case-sensitive. `expertise` is stored but does not route work yet.
 
 Slots also store `controlled_language_enabled`. The default is `true` for new and existing slots.
 Send `false` on creation or slot update to disable ASD-STE100 guidance for that member. Omit the field on update to keep its value.
@@ -240,7 +240,7 @@ The existing progress service can refresh its derived observation cache.
 
 The summary limits observations to eight seconds and 64 unfinished tracked items.
 The existing human-actions read also limits coverage to 32 repository scopes.
-It excludes `merged` and `completed` items from effort totals.
+It excludes `merged`, `completed` and `cancelled` items from effort totals.
 The total is known only when every included report is current and has validated numeric bounds.
 Incomplete, stale, unknown, expired, or changed-context observations keep the whole estimate Unknown.
 The total excludes waiting time. Its confidence is the lowest reported confidence.
@@ -249,6 +249,10 @@ An empty complete observation has zero remaining effort.
 Consumers must check `valid_until` and coverage. These observations grant no execution authority.
 
 MCP tools: `synth_city_get_team_summary` reads the summary.
+For a PR's final hold check, pass its tracked `work_item_id` to that tool or to the summary route.
+The response keeps attention and human actions for that item and signals with no work-item binding.
+It uses the same team coverage, freshness deadline, HOLD and native waiting evidence as the unfiltered read.
+The selected item must belong to the preset. This selector is separate from the repository and harness filters.
 `synth_city_update_team_parent_issue` changes only the link. Its required nullable argument clears the link with `null`.
 `synth_city_create_team` accepts `parent_issue_url`. Existing preset reads return the link.
 
@@ -260,11 +264,19 @@ Historical reports do not expose current numeric bounds.
 The view contains three short fields: `remaining`, `estimate`, and `next_action`.
 It includes report state, author, time, source SHA, and optional completed work and assumptions.
 The ordinary progress read makes no GitHub writes and changes no dispatch authority.
+The progress read is not authenticated, so it names a dispatch by `dispatch_generation`, a public one-way digest of the
+work-item id and the dispatch nonce, and never returns the nonce: `dispatch_nonce` is `null`. The same holds for the
+preset work-item list. The authenticated routes (scope revisions, approval requests, workspaces) keep the nonce that
+operator actions need, and add the same `dispatch_generation`. The generation is a public reference, not a secret,
+and no endpoint accepts it as a capability. Limit: the dispatch branch name still embeds the nonce and is public on
+GitHub; that exposure is tracked separately from this field.
 
 The current Leader uses `synth_city_prepare_work_remaining_summary` to prepare a report.
 The tool reads `/github-work-items/{item_id}/remaining-work-context` with its Agent Mail capability.
 That route requires the current Leader for this item's scope. It checks the Leader again after asynchronous observations.
 An unavailable published source returns `progress_context_unavailable`. It does not create a report for an unconfirmed checkpoint.
+A merged, completed or closed item has no workspace to observe; its context rests on the recorded verified head, is read
+once more after the last Leader check, and the response carries no nonce.
 
 Tool inputs are `work_item_id`, `remaining`, and `next_action`.
 For a time estimate, supply ordered `effort_low_minutes` and `effort_high_minutes`, `confidence`, and `effort_scope`.
@@ -393,7 +405,47 @@ These routes need the operator token. They are generic references; IDs in paths 
 | PATCH `/api/v1/agent-teams/github-work-items/{item_id}/delivery-policy` | Applies the current scope policy to one existing attempt. The body has `expected_dispatch_nonce`, `expected_scope_revision`, `expected_policy_revision`, `target_policy_revision` and `reason`. A changed context returns 409 `attempt_delivery_policy_context_changed`. |
 | GET `/api/v1/agent-teams/github-scopes/{scope_id}/delivery-policy/history` | Lists the latest 100 policy change events for the scope. The history is append-only. |
 
+### Delivery policy fields and attempt snapshots
+
+`policy` takes the fields below. Unknown fields are rejected, and every field has a default. The policy is data: it grants no approval, merge, scope or execution authority.
+
+| Field | Values (default) | Effect |
+| --- | --- | --- |
+| `required_checks` | Up to 32 `{name, app_slug}` entries; `app_slug` defaults to `github-actions` (`[]`) | Names the hosted checks a candidate commit must pass. Each identity must be unique. |
+| `owner_contact` | `reports` or `native` (`reports`) | `native` lets fresh, bound native work renew owner contact. |
+| `owner_idle_seconds` | 60 to 86400, or unset | Owner idle timeout. Unset uses the server setting. |
+| `owner_nudge_grace_seconds` | 30 to 3600, or unset | Nudge grace period. Unset uses the server setting. |
+| `owner_observation_wait_seconds` | 30 to 1800, or unset; requires `native` | Bounded wait for unknown native evidence, after the usual nudge. |
+| `owner_observation_resume_seconds` | 60 to 3600 (`900`) | Resume deadline for a recorded observation pause. Only the operator can resume it. |
+| `accepted_base_update` | `disabled`, `fast_forward` or `merge` (`disabled`) | Allows an accepted-base integration update in that mode. `disabled` refuses it. The accepted pull must also carry every required check, from the named app. |
+| `broad_checks` | `local` or `hosted` (`local`); `hosted` requires `required_checks` | `hosted` makes the required hosted broad checks the final evidence. |
+| `checkpoint_delay_report_seconds` | 60 to 86400, or unset (`1800`) | Owner instruction to report a checkpoint publication delay after this many seconds. |
+| `caller_inventory_required` | boolean (`false`) | Owner instruction to record and review the caller inventory before shared-consumer edits. |
+| `regression_proof_required` | boolean (`false`) | Owner instruction to show each regression fail on its defective source and pass on the candidate. |
+
+The API rejects duplicate check identities, hosted broad checks without `required_checks`, and an observation wait unless `owner_contact` is `native`.
+
+Attempt snapshots follow these rules:
+
+- A new dispatch copies the scope's current policy and revision into the attempt. Later scope changes do not alter that attempt.
+- An attempt created before the upgrade has no stored policy. It keeps the legacy rules until it is adopted.
+- The scope PATCH applies only when `expected_revision` is current. A success records a history event and increments the revision.
+- The attempt PATCH copies the scope's current policy into the attempt. It runs only while the attempt is `pending`, `dispatched` or `escalated`, its nonce, scope revision and policy revision match the request, and the scope is still at `target_policy_revision`. Any other state returns 409 `attempt_delivery_policy_context_changed`.
+- History returns up to 100 events for the scope, newest first. Attempt adoptions appear with `work_item_id` set.
+
 ### Maintenance
+
+`POST /api/v1/agent-teams/presets/{preset_id}/work-items/{item_id}/end-stopped` ends an escalated or failed item.
+Send `operation_id`, `expected_dispatch_generation`, `expected_scope_revision`, `outcome` and `reason`.
+Read the generation and revision from the item list. Send a null generation when the item has no generation.
+For `deferred`, supply `target_milestone`. For `superseded`, supply `superseding_pr_number` for the delivering PR
+in the same repository and target branch. The route verifies the PR merge.
+
+The current Leader can use `synth_city_leader_end_stopped` with the same fields and the tracked `work_item_id`.
+The service records the reason and destination in the audit, releases any verified clean lease and retires the item's
+current attention. The item's dispatch state becomes `cancelled`. A dirty or unpublished workspace, a changed attempt,
+or a hold refuses the action. An identical operation can be replayed with the same ID. GitHub issues and milestones
+remain under their existing repository workflows.
 
 | Route | Behavior |
 | --- | --- |

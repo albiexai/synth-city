@@ -14,6 +14,8 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
+from app.services.github_rate_limit_service import GithubRateLimited
+
 _ACTIONS_APP_ID = 15368
 _PENDING = {"queued", "requested", "waiting", "pending", "in_progress"}
 _CONCLUSIONS = {
@@ -194,7 +196,9 @@ class _Reader:
         action_checks: dict[int, dict] = {}
         for check in checks:
             _require(check.get("head_sha") == self.sha, "check_head_mismatch")
-            _state(check)
+            # The strict state check applies to the rows that count, below (a latest external row, or a current
+            # job that its check must equal): a superseded attempt can keep an inconsistent row next to its green
+            # rerun, and it must not refuse the whole observation (#1125).
             app = check.get("app")
             _require(isinstance(app, dict), "invalid_check_application")
             app_id = _positive(app.get("id"))
@@ -204,6 +208,7 @@ class _Reader:
                 # Preserve GitHub's existing latest-check policy for other
                 # applications. Actions need their separate execution proof.
                 if check["id"] in latest_ids:
+                    _state(check)
                     external.append(check)
                 continue
             suite_row = check.get("check_suite")
@@ -293,5 +298,7 @@ async def observe_checks(http: httpx.AsyncClient, headers: dict, owner: str, rep
     try:
         async with asyncio.timeout(_DEADLINE_SECONDS):
             return await _Reader(http, headers, owner, repo, sha).observe()
+    except GithubRateLimited:
+        raise
     except (httpx.HTTPError, TimeoutError) as exc:
         raise GithubCheckObservationError("github_checks_unavailable") from exc

@@ -782,8 +782,9 @@ async def test_owner_releases_clean_squash_merged_pr_head(client_and_db, monkeyp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("auth_mode", ["ambient", "app"])
-async def test_owner_release_after_real_squash_merge_uses_normal_route(
-    client_and_db, monkeypatch, tmp_path, auth_mode
+@pytest.mark.parametrize("merged", [True, False], ids=["squash_merged", "closed_unmerged"])
+async def test_owner_releases_the_pushed_head_of_the_recorded_pr(
+    client_and_db, monkeypatch, tmp_path, auth_mode, merged
 ):
     ac, maker = client_and_db
     home = tmp_path / "home"
@@ -820,13 +821,16 @@ async def test_owner_release_after_real_squash_merge_uses_normal_route(
     run_git("commit", "-m", "change", cwd=worktree)
     pushed_sha = run_git("rev-parse", "HEAD", cwd=worktree)
     run_git("push", "-u", "origin", "deck/test-attempt", cwd=worktree)
-    run_git("merge", "--squash", "deck/test-attempt", cwd=repo)
-    run_git("commit", "-m", "squash", cwd=repo)
-    run_git("push", "origin", "master", cwd=repo)
+    if merged:
+        run_git("merge", "--squash", "deck/test-attempt", cwd=repo)
+        run_git("commit", "-m", "squash", cwd=repo)
+        run_git("push", "origin", "master", cwd=repo)
     run_git("update-ref", "refs/remotes/origin/master", base_sha, cwd=repo)
     assert int(run_git("rev-list", "--count", "origin/master..HEAD", cwd=worktree)) > 0
 
-    item_id, owner_id, _, workspace_id, _ = await _seed_leased_item(maker)
+    item_id, owner_id, _, workspace_id, _ = await _seed_leased_item(
+        maker, dispatch_status="merged" if merged else "completed",
+    )
     async with maker() as db:
         item = await db.get(GithubWorkItem, item_id)
         scope = await db.get(TeamGithubScope, item.scope_id)
@@ -860,7 +864,7 @@ async def test_owner_release_after_real_squash_merge_uses_normal_route(
         pull_tokens.append(kwargs.get("token"))
         return {
             "state": "closed",
-            "merged_at": "2026-09-29T08:46:06Z",
+            "merged_at": "2026-09-29T08:46:06Z" if merged else None,
             "head": {
                 "sha": pushed_sha,
                 "ref": "deck/test-attempt",

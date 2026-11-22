@@ -94,7 +94,13 @@ export function RepositorySettings({ scope, autonomyEnabled, refresh, onRemoved 
         <Row label="Work at the same time">{scope.max_concurrent_dispatched} {scope.max_concurrent_dispatched === 1 ? 'issue' : 'issues'}</Row>
         <Row label="Review rounds">up to {scope.max_approval_rounds}</Row>
         <Row label="Verification retries">up to {scope.max_verification_retries}</Row>
-        {scope.merge_policy === 'auto' && <Row label="Automatic merges a day">up to {scope.max_auto_merges_per_day}</Row>}
+        {scope.merge_policy === 'auto' && (
+          <Row label="Automatic merges a day">
+            {typeof scope.auto_merges_last_24h === 'number'
+              ? `${scope.auto_merges_last_24h} of ${scope.max_auto_merges_per_day} in the last 24 hours`
+              : `up to ${scope.max_auto_merges_per_day}`}
+          </Row>
+        )}
       </Section>
       <Section
         title="Recovery"

@@ -46,12 +46,15 @@ function SetupProbe() {
 }
 
 describe('Agent Mail authentication', () => {
-  it('requests the shared Director key before protected reads and stops after Cancel', async () => {
+  it('waits for the person to enter the shared Director key, and reads nothing after Cancel', async () => {
     const interval = vi.spyOn(window, 'setInterval')
     render(<MemoryRouter><AgentMailPage /></MemoryRouter>)
-    const dialog = await screen.findByRole('dialog')
+    expect(await screen.findByText('Enter the Director key to see Agent Mail')).toBeInTheDocument()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     expect(fetchAgentMailTeam).not.toHaveBeenCalled()
     expect(fetchAgentMailMessages).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Enter key' }))
+    const dialog = await screen.findByRole('dialog')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     await waitFor(() => expect(dialog).not.toBeInTheDocument())
     for (const [callback] of interval.mock.calls) {

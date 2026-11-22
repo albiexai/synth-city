@@ -70,7 +70,8 @@ SENSITIVE_TOML_ASSIGNMENT_PATTERN = re.compile(
 
 def get_backup_storage_dir() -> Path:
     """Get the backup storage directory."""
-    backup_dir = get_user_home() / ".albiex-synth-city" / "backups"
+    # The controller's own data: never follows the harness scope.
+    backup_dir = Path.home() / ".albiex-synth-city" / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     return backup_dir
 

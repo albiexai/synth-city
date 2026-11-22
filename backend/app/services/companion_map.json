@@ -61,6 +61,7 @@
         {"path": "backend/tests/agent_mail/test_tool_rename.py", "kind": "test"},
         {"path": "backend/tests/agent_mail/test_pi_manifest.py", "kind": "test"},
         {"path": "backend/tests/upgrade/test_provider_upgrade_startup.py", "kind": "test"},
+        {"path": "backend/tests/upgrade/test_provider_upgrade_interruption.py", "kind": "test"},
         {"path": "integrations/pi-agent-mail/manifest.ts", "kind": "contract"},
         {"path": "docs/api/agent-mail.md", "kind": "doc"}
       ]
@@ -69,7 +70,8 @@
       "source": "backend/app/services/provider_upgrade.py",
       "companions": [
         {"path": "backend/tests/agent_mail/test_pi_shim.py", "kind": "test"},
-        {"path": "backend/tests/upgrade/test_provider_upgrade_startup.py", "kind": "test"}
+        {"path": "backend/tests/upgrade/test_provider_upgrade_startup.py", "kind": "test"},
+        {"path": "backend/tests/upgrade/test_provider_upgrade_interruption.py", "kind": "test"}
       ]
     }
   ]

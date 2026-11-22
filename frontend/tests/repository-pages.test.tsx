@@ -65,6 +65,35 @@ describe("Repositories list", () => {
     await settle();
     expect(await screen.findAllByText("release/v3.1")).not.toHaveLength(0);
   });
+
+  it("warns when an automatic scope has no enabled verifier separate from its Leader", async () => {
+    serve({
+      "agent-teams/presets/1/github-scopes": () => jsonResponse({ scopes: [{ ...scope, merge_policy: "auto" }] }),
+      "agent-teams/presets": () => jsonResponse({ presets: [{ id: 1, leader_slot_id: 101, slots: [
+        { id: 101, role: "verifier", enabled: true },
+        { id: 102, role: "verifier", enabled: false },
+        { id: 103, role: "Worker", enabled: true },
+      ] }] }),
+    });
+    renderRoute(<RepositoriesPage />, "/repositories", "/repositories");
+    const links = await screen.findAllByRole("link", { name: "Open fixture/shared" });
+    const row = links.find((link) => link.getAttribute("href") === "/repositories/1")!.closest("tr")!;
+    const warning = await within(row).findByText(/automatic merge is blocked.*no enabled verifier/i);
+    expect(within(warning).getByRole("link", { name: "Manage team" })).toHaveAttribute("href", "/teams/1");
+  });
+
+  it("omits the warning when the team has an enabled verifier", async () => {
+    serve({
+      "agent-teams/presets/1/github-scopes": () => jsonResponse({ scopes: [{ ...scope, merge_policy: "auto" }] }),
+      "agent-teams/presets": () => jsonResponse({ presets: [{ id: 1, leader_slot_id: 101, slots: [
+        { id: 102, role: " Verifier ", enabled: true },
+      ] }] }),
+    });
+    renderRoute(<RepositoriesPage />, "/repositories", "/repositories");
+    await screen.findByText("release/v3.1");
+    await settle();
+    expect(screen.queryByText(/automatic merge is blocked/i)).not.toBeInTheDocument();
+  });
 });
 
 function renderRepository(path = "/repositories/1") {

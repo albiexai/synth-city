@@ -152,16 +152,43 @@ async def test_poll_interval_cache_expires_and_configuration_invalidates(db, mon
 
 
 @pytest.mark.asyncio
-async def test_other_branch_merge_is_not_done_and_parent_is_never_counted(db, monkeypatch):
+async def test_other_branch_merge_is_done_and_disclosed_and_parent_is_never_counted(db, monkeypatch):
+    # #1106: one definition of done in every view. A merge into another branch is done, and it stays visible.
     team, scope, items, summary = await fixed_campaign(db, monkeypatch, ("merged", "merged", "pending"))
     items[0].dispatch_base_ref = "origin/another-branch"
     items[2].issue_number = 506
     await db.commit()
     await observe_backlog(db, scope, summary, Backlog([issue(1, "Other branch"), issue(2, "Done"), issue(506, "Parent")]))
     result = await summary.summary(db, team.id)
-    assert result.campaign.done_count == 1
+    assert result.campaign.done_count == 2
+    assert result.campaign.done_on_other_branch_count == 1
     assert result.campaign.queued_count == 0
     assert result.campaign.not_started_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_merge_without_a_recorded_base_is_done_but_not_claimed_as_another_branch(db, monkeypatch):
+    # dispatch_base_ref was added without a backfill, so historical merged rows can have none. Such a row is done,
+    # and only a recorded base that differs is evidence of another branch (V1 review 5945503487).
+    team, scope, items, summary = await fixed_campaign(db, monkeypatch, ("merged", "completed", "merged"))
+    items[0].dispatch_base_ref = None
+    items[2].dispatch_base_ref = "origin/known-other"
+    await db.commit()
+    await observe_backlog(db, scope, summary, Backlog([issue(1, "No base"), issue(2, "Completed"), issue(3, "Other")]))
+    result = await summary.summary(db, team.id)
+    assert result.campaign.done_count == 3
+    assert result.campaign.done_on_other_branch_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_completed_item_counts_as_done(db, monkeypatch):
+    # #1106 (U9): deck-website-plan's completed item was in no campaign bucket.
+    team, scope, items, summary = await fixed_campaign(db, monkeypatch, ("completed", "merged", "pending"))
+    await observe_backlog(db, scope, summary, Backlog([issue(1, "Completed"), issue(2, "Merged"), issue(3, "Queued")]))
+    result = await summary.summary(db, team.id)
+    assert result.campaign.done_count == 2 and result.campaign.done_on_other_branch_count == 0
+    assert {row.title for row in result.campaign.latest_done} == {"Work 1", "Work 2"}
+    assert result.campaign.queued_count == 1
 
 
 @pytest.mark.asyncio
@@ -174,12 +201,25 @@ async def test_under_way_phrases_and_planned_decisions_are_plain(db, monkeypatch
     await db.commit()
     await observe_backlog(db, scope, summary, Backlog([issue(n, f"Work {n}") for n in range(1, 6)]))
     result = await summary.summary(db, team.id)
-    assert result.campaign.under_way_count == 5
+    # #1129 (U27): the escalated item needs attention; it is not under way.
+    assert (result.campaign.under_way_count, result.campaign.attention_count) == (4, 1)
     assert [item.state_phrase for item in result.campaign.under_way] == [
-        "building it", "waiting for checks", "reviewing it", "waiting for you", "waiting for you"]
+        "building it", "waiting for checks", "reviewing it", "waiting for you"]
     assert [(item.text, item.state) for item in result.campaign.decisions_ahead] == [
         ("Decide promotion.", "later"), ("Choose the trial.", "now"), ("Approve the plan.", "done")]
     assert "dispatched" not in result.campaign.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_escalated_and_failed_items_need_attention_and_every_item_has_one_bucket(db, monkeypatch):
+    # #1129 (U27): escalated was counted as under way and failed in no bucket at all.
+    statuses = ("merged", "dispatched", "escalated", "failed", "pending")
+    team, scope, _, summary = await fixed_campaign(db, monkeypatch, statuses)
+    await observe_backlog(db, scope, summary, Backlog([issue(n, f"Work {n}") for n in range(1, 6)]))
+    c = (await summary.summary(db, team.id)).campaign
+    assert (c.done_count, c.under_way_count, c.attention_count, c.queued_count) == (1, 1, 2, 1)
+    assert c.done_count + c.under_way_count + c.attention_count + c.queued_count == len(statuses)
+    assert [item.state_phrase for item in c.under_way] == ["building it"]
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,7 @@ import {
   cleanup,
   fireEvent,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -176,7 +177,7 @@ describe("delivery read authority and filters", () => {
       screen.getByText(/Recovery-only mode blocks normal intake/),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/Intake: 0 ready · 2 blocked/),
+      screen.getByText(/Intake: 0 ready · 3 blocked/),
     ).toBeInTheDocument();
   });
   it("keeps configuration-only empty factories useful", async () => {
@@ -413,7 +414,7 @@ describe("work details and protected controls", () => {
             items: [{
               id: record.id, scope_id: record.scope_id, repo_owner: "fixture", repo_name: "shared",
               issue_number: record.issue_number, issue_title: record.issue_title, issue_url: "https://github.com/fixture/shared/issues/1",
-              github_updated_at: record.updated_at, issue_type: "code", dispatch_status: "completed", approval_round_count: 0,
+              github_updated_at: record.updated_at, issue_type: "code", dispatch_status: "completed", dispatch_generation: "a".repeat(64), approval_round_count: 0,
               retry_count: 0, active_scope_revision: 0, attempt_phase: "implementation", diagnostic_retry_count: 0,
               retry_allowed: false, created_at: record.created_at, updated_at: record.updated_at,
             }],
@@ -829,6 +830,32 @@ describe("name filters", () => {
     await settle();
     expect(sent(requests, "team_id")).toEqual([]);
     expect(requests.length).toBeGreaterThan(0);
+  });
+
+  it("reads no team summary while the scope value is unconfirmed", async () => {
+    let release!: (response: Response) => void;
+    const presetList = {
+      presets: [{ id: 1, name: "Release crew", autonomy_enabled: false, slots: [] }],
+    };
+    const { requests, optionRequests } = fixtureFetch((path, query) => {
+      if (path === "factory/repositories" && query.get("limit") === "100")
+        return new Promise<Response>((resolve) => {
+          release = resolve;
+        });
+      if (path === "agent-teams/presets") return jsonResponse(presetList);
+      if (path.startsWith("agent-teams/presets/"))
+        return jsonResponse({ detail: "Unknown scope" }, 404);
+      return withNames(path, query);
+    });
+    renderRoute(<OverviewPage />, "/?scope_id=999", "/");
+    await waitFor(() =>
+      expect(optionRequests.map((r) => r.path)).toContain("agent-teams/presets"),
+    );
+    await settle();
+    expect(requests.filter((r) => r.path.startsWith("agent-teams/presets/"))).toEqual([]);
+    await act(async () => release(jsonResponse(repositories.normal.response)));
+    await settle();
+    expect(sent(requests, "scope_id")).toEqual([]);
   });
 
   it("sends a valid-looking value when the names cannot be read, and still drops text", async () => {

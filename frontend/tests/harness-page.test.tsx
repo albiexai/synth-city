@@ -13,7 +13,7 @@ vi.mock('../src/contexts/DashboardContext', () => ({
   DashboardProvider: ({ children }: { children: React.ReactNode }) => children,
   useDashboard: () => ({ stats: { providerId: 'claude-code', warnings: [], unsupportedFeatures: [], sessionMetricKind: 'live', settingsKeys: 3, mcpServerCount: 1, commandCount: 0, hookCount: 3, sessionCount: 214, planCount: 31, contextActiveCount: null }, loading: false, error: null, lastFetched: null, refreshDashboard: () => undefined }),
 }))
-vi.mock('../src/contexts/ProjectContext', () => ({ useProjectContext: () => ({ projects: [], activeProject: null, knownFolders: [], setProjectPath: () => undefined, addProject: async () => undefined }) }))
+vi.mock('../src/contexts/ProjectContext', () => ({ useProjectContext: () => ({ projects: [], activeProject: null, knownFolders: [], pageFolders: [], setProjectPath: () => undefined, addProject: async () => undefined }) }))
 
 const catalogs = fixture.providers as unknown as Record<AgentProviderId, ProviderOperations>
 const ids = Object.keys(catalogs) as AgentProviderId[]

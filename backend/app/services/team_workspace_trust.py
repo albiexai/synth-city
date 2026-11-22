@@ -123,7 +123,7 @@ def _atomic_write(path: Path, text: str, uid: int, before) -> None:
 
 def prepare_workspace_trust(provider: str, directory: str) -> bool:
     """Return whether trust changed. Never expose native configuration values."""
-    if provider not in {"claude-code", "codex-cli"}:
+    if provider not in {"claude-code", "codex-cli", "antigravity-cli"}:
         return False
     try:
         user = native_user()
@@ -134,6 +134,10 @@ def prepare_workspace_trust(provider: str, directory: str) -> bool:
             workspace = _primary_checkout(workspace)
             configured = user.environment.get("CLAUDE_CONFIG_DIR")
             path = Path(configured) / ".claude.json" if configured else user.home / ".claude.json"
+        elif provider == "antigravity-cli":
+            # Observed on agy 1.5.9 (#952) for a plain workspace directory: this entry registers the
+            # workspace. Whether it also suppresses a trust prompt was not observed.
+            path = user.home / ".gemini" / "antigravity-cli" / "settings.json"
         else:
             configured = user.environment.get("CODEX_HOME")
             path = (Path(configured) if configured else user.home / ".codex") / "config.toml"
@@ -157,6 +161,18 @@ def prepare_workspace_trust(provider: str, directory: str) -> bool:
                 if project.get("hasTrustDialogAccepted") is True:
                     return False
                 project["hasTrustDialogAccepted"] = True
+                updated = json.dumps(document, indent=2) + "\n"
+            elif provider == "antigravity-cli":
+                # Only the trust entry is written. Onboarding, terms and data-use choices stay the user's.
+                document = json.loads(content) if before else {}
+                if not isinstance(document, dict):
+                    raise ValueError(_ERROR)
+                trusted = document.setdefault("trustedWorkspaces", [])
+                if not isinstance(trusted, list) or not all(isinstance(entry, str) for entry in trusted):
+                    raise ValueError(_ERROR)
+                if str(workspace) in trusted:
+                    return False
+                trusted.append(str(workspace))
                 updated = json.dumps(document, indent=2) + "\n"
             else:
                 document = tomlkit.parse(content)

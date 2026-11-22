@@ -10,6 +10,7 @@ import {
   applyCopilotAgentMailInstall,
   applyOpenCodeAgentMailInstall,
   applyMuseAgentMailInstall,
+  applyAntigravityAgentMailInstall,
   fetchAgentMailAuthenticationStatus,
   fetchAgentMailInstallStatus,
   fetchAgentMailSnippets,
@@ -18,6 +19,7 @@ import {
   uninstallCopilotAgentMail,
   uninstallOpenCodeAgentMail,
   uninstallMuseAgentMail,
+  uninstallAntigravityAgentMail,
 } from './api'
 import { isCompleteInstallStatus, type MailActionHarness, type MailActionMode } from './mailSetup'
 
@@ -42,6 +44,10 @@ const ACTIONS: Record<MailActionHarness, Record<MailActionMode, { run: () => Pro
   'muse-cli': {
     setup: { run: applyMuseAgentMailInstall, label: 'Muse Code install updated' },
     remove: { run: uninstallMuseAgentMail, label: 'Muse Code install removed' },
+  },
+  'antigravity-cli': {
+    setup: { run: applyAntigravityAgentMailInstall, label: 'Antigravity CLI install updated' },
+    remove: { run: uninstallAntigravityAgentMail, label: 'Antigravity CLI install removed' },
   },
 }
 
@@ -69,7 +75,7 @@ export function useAgentMailAuthenticationStatus() {
 /** The Agent Mail install status, the fallback snippets on demand, and the Set up and Remove actions. */
 export function useAgentMailSetup() {
   const { directorKeyConfigured, requiresDirectorKey, readAuthenticationStatus } = useAgentMailAuthenticationStatus()
-  const { requestToken, tokenDialog } = useOperatorTokenFlow('Agent Mail requires the Director key.')
+  const { requestToken, tokenDialog } = useOperatorTokenFlow('to set up Agent Mail')
   const protectedReadsBlocked = useRef(false)
   const refusedKey = useRef<string | null>(null)
   const loadPromise = useRef<Promise<void> | null>(null)

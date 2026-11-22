@@ -137,6 +137,11 @@ class MemoryService:
             }
         )
 
+        # With no project chosen there is no project scope. The helpers below would resolve it against the working
+        # directory of the backend process, a controller path, so the project, local and rules entries are not built (#1068).
+        if not project_path:
+            return files
+
         # Project-level
         project_path_obj = cls._get_project_claude_md(project_path)
         project_alt_path = cls._get_project_alt_claude_md(project_path)
@@ -342,6 +347,9 @@ class MemoryService:
         Returns:
             List of rule info dicts
         """
+        if not project_path:
+            return []  # no project chosen: not the backend's working directory (#1068)
+
         rules_dir = cls._get_rules_dir(project_path)
         rules = []
 
@@ -393,6 +401,10 @@ class MemoryService:
         Returns:
             Dict with success status and path
         """
+        if not project_path:
+            # Nothing to create a rule in. Never create one in the backend's working directory (#1068).
+            return {"success": False, "error": "Choose a project first: there is no project to add a rule to.", "path": ""}
+
         rules_dir = cls._get_rules_dir(project_path)
         rules_dir.mkdir(parents=True, exist_ok=True)
 

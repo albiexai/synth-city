@@ -2,7 +2,7 @@ name: Factory source checks
 
 on:
   pull_request:
-    branches: [master, feature/software-delivery-product-reposition, release/v3.1, release/v4.0, release/v4.1, release/v4.2]
+    branches: [master, feature/software-delivery-product-reposition, release/v3.1, release/v4.0, release/v4.1, release/v4.2, release/v4.3]
     types: [opened, synchronize, reopened]
 
 permissions:
@@ -22,11 +22,13 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Reject unclassified old runtime names
         run: python scripts/ci/old_names.py
+      - name: Docs changelog matches CHANGELOG.md
+        run: python scripts/sync-docs-changelog.py --check
   python:
     name: Changed Python undefined names
     runs-on: ubuntu-latest
@@ -36,7 +38,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: python -m pip install ruff==0.14.10

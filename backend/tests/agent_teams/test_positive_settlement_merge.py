@@ -232,7 +232,7 @@ async def test_an_unreadable_pr_changes_nothing_and_logs_nothing_then_recovers_w
     before = await _unchanged(db, item, revision)
     with caplog.at_level(logging.DEBUG, logger=LOGGER):
         await _tick(db, scope, client, item, revision)
-        if pull is OPEN or failing_read == 1:  # a failed first read leaves nothing to compare
+        if failing_read == 1:  # a failed first read leaves nothing to compare
             assert await _unchanged(db, item, revision) == before
         client.get_pull = original
         for _ in range(2):
@@ -240,7 +240,11 @@ async def test_an_unreadable_pr_changes_nothing_and_logs_nothing_then_recovers_w
     assert _quiet(caplog) == []
     assert item.status_note is None or "failed" not in (item.status_note or "")
     if pull is OPEN:
-        assert await _unchanged(db, item, revision) == before
+        # #957: an open PR on a settled revision records why it is not promoted (here: no acceptance), and
+        # nothing else changes: not the status, the escalation, the revision or its time.
+        after = await _unchanged(db, item, revision)
+        assert (after[0], after[3], after[4], after[5]) == (before[0], before[3], before[4], before[5])
+        assert after[1].startswith("Settled revision not promoted:")
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.services.usage_service import UsageService
+from app.api.v1.harness_scope import current_scope
 from app.models.schemas import (
     UsageSummaryResponse,
     DailyUsageListResponse,
@@ -33,7 +34,9 @@ async def get_usage_summary(
     """Get overall usage statistics."""
     try:
         service = UsageService(db)
-        return await service.get_usage_summary(project_path)
+        response = await service.get_usage_summary(project_path)
+        response.scope = current_scope(service.projects_dir)
+        return response
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to get usage summary: {str(e)}"
