@@ -238,9 +238,13 @@ flowchart LR
 | 👥 Team kits | Start a team from a kit with charter templates, so you don't write charters from scratch (4.4 ships the first templates, #1113). |
 | ⬆️ Guided move to dedicated | Keep your teams and history when you move up to a dedicated factory. |
 
-### Questions to decide before the 4.5 campaign
+### Decisions for the 4.5 campaign (Director, 2026-11-24)
 
-1. Should Quick start install **release builds** (no dev servers, the backend serves the built UI, as the factory does) instead of `dev.sh`?
-2. Should `install.sh` offer to install Claude Code and Codex, or only check for them?
-3. Is a `systemd --user` service part of Quick start, or a reason to go dedicated?
-4. Which Ubuntu versions do we support: 24.04 only, or also 22.04 (Python 3.10 by default)?
+These are recorded in the installation design (PR #978, sections N–Q) and on #979.
+
+| Question | Decision | Why |
+|---|---|---|
+| **Release builds instead of `dev.sh`?** | **Yes.** A new default, `./scripts/start.sh`: the UI is built once, and the backend serves it on one port (`localhost:8000`), as the factory does. `dev.sh` stays for contributors. With the release archive, no Node is needed for Synth City itself. | One URL, no dev servers, nothing reloading while you work. |
+| **Should `install.sh` install Claude Code and Codex?** | **Check, then offer with confirmation.** For a missing harness it shows the official install command and runs it only if you say yes. Then it guides the login and verifies each harness with one real model call. | Never install silently: install methods change, and some people prefer the native installers. |
+| **A `systemd --user` service?** | **An option**, off by default: `./scripts/install.sh --service`. It needs `loginctl enable-linger` to keep running after you log out; the installer explains it. | It keeps Synth City up, but it isn't isolation: that's what a dedicated factory is for. |
+| **Which Ubuntu versions?** | **24.04 and 26.04 LTS**, including **WSL 2**. **22.04** works for Quick start with Python 3.11 added (deadsnakes). | The same as the dedicated factory, plus 22.04 for trying it. |

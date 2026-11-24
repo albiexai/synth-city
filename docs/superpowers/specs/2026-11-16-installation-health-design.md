@@ -219,6 +219,26 @@ Rollback: switch `current` back and restore the backup. The private v4.3 upgrade
 
 Ubuntu **24.04 LTS** and **26.04 LTS**, including on **WSL 2**, tested in CI on the versions GitHub's hosted runners provide. On WSL 2 the doctor checks that systemd is enabled (`/etc/wsl.conf`) and warns that a WSL shutdown stops the factory. Ubuntu 22.04 is supported for Quick start only, with the documented Python 3.11 workaround.
 
+## Decisions for Quick start (Director, 2026-11-24)
+
+From Guide 1's open questions (`2026-11-16-installation-guides/`), proposed by the Supervisor and accepted by the Director. Tracked on #979.
+
+### N. Run a release build, not dev servers
+
+A new default start command, `./scripts/start.sh`: it builds the UI once (or uses the release archive's built UI, section F) and starts the backend, which serves the UI on one port (`http://localhost:8000`), as the factory does. No dev servers and no reload on file changes. `./scripts/dev.sh` stays for contributors. With the release archive, Quick start needs no Node for Synth City itself.
+
+### O. Harnesses: check, then offer with confirmation
+
+`install.sh` checks for Claude Code and Codex (and the other supported harnesses). For a missing one it shows the **official install command** and runs it only after the user confirms. It never installs silently. Then it guides the login and **verifies** each harness with one real model call (section I applies to Quick start too).
+
+### P. An optional user service
+
+`./scripts/install.sh --service` installs `systemd --user` units, so Synth City keeps running after the terminal closes. It is **off by default**. It needs `loginctl enable-linger <user>` to survive logout and reboots; the installer explains this and prints the command. It is a convenience, not a reason to go Dedicated: Dedicated is about **isolation** (agents can't read the operator's secrets), not about staying up. The doctor checks the units when they are installed.
+
+### Q. Supported systems
+
+As section M: Ubuntu 24.04 and 26.04 LTS, including WSL 2. Ubuntu 22.04 is supported for Quick start with the documented Python 3.11 workaround.
+
 ## Left to the builder
 
 - The registry's module layout and the doctor command's packaging (backend console script vs. `productctl doctor`).
