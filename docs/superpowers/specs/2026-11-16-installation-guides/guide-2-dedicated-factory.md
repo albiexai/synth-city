@@ -335,14 +335,18 @@ flowchart LR
 
 **Fix rule:** one click only for what Synth City owns (for example, repair Agent Mail as the agent user through the `agent-config` helper). For anything that changes the security boundary (users, sudoers, units, capabilities), the page shows the **exact command to copy** and re-checks afterwards. The web app never gains a route to root.
 
-### Questions to decide before the 4.5 campaign
+### Decisions for the 4.5 campaign (Director, 2026-11-24)
 
-1. **Installer shape:** a `sudo` shell script, a Python command (`synth-city install --dedicated`), or a `.deb` package?
-2. **Source:** install from a release tag (git clone) or from a built release archive (no Node needed on the host)?
-3. **Names and paths:** fix the defaults (`synthctl`, `synthagent`, `/opt/synth-city`) and make them configurable in **one** layout file that the doctor, `productctl` and the units all read.
-4. **The second sudoers rule** for the `agent-config` helper: confirmed as the way to write the agent user's config?
-5. **Harness logins:** the installer can't log in for you. Is a guided "now run `claude` and `codex login` as the agent user" step enough?
-6. **Remote access:** SSH tunnel only, or also a documented reverse proxy with authentication?
-7. **Several teams on one factory** (the 4.4 multi-team core): one agent user for all teams, or one agent user per team?
-8. **Upgrades:** should `productctl upgrade <tag>` (backup, rollback, hook re-check, doctor) be part of the installer project?
-9. **Which Ubuntu versions:** 24.04 only for the first version?
+These are recorded in the installation design (PR #978, sections E–M) and on #979.
+
+| Question | Decision | Why |
+|---|---|---|
+| **Installer shape** | A Python command, `synth-city install --dedicated`. It shows a plan first, runs with `--execute`, is safe to run again, and runs each root step on its own through `sudo` with the command printed. It is tested in CI with real `sudo`. | It shares the layout file and checks with `synth-city doctor`: installing is "fix until the doctor passes". Shell scripts drifted; a `.deb` costs too much while the installer changes. |
+| **Source** | A **release archive** attached to each GitHub release: source, built UI, locked requirements, checksum. `git clone` stays for Quick start and development. | No Node is needed on the host for Synth City itself, and each version unpacks into its own folder. |
+| **Names and paths** | `synthctl`, `synthagent`, `synth-work`; `/opt/synth-city/releases/<version>` with a `current` link; `/etc/synth-city/layout.toml` and `/etc/synth-city/env`; state in `/var/lib/synth-city/`. Units are generated from the layout file. | One source of truth. An existing factory adopts a layout file with its current names, so nothing needs renaming. |
+| **The `agent-config` sudoers rule** | **Confirmed.** One helper, run as the agent user. It takes one typed request on standard input and writes only an allowlist of config entries (trust, MCP, hooks), with a backup. A minimal version (folder trust only) ships in **4.4** with #1262. | Group-write on the agents' files breaks, and a root helper widens the boundary. Missing hooks once blocked every Claude Code member. |
+| **Harness logins** | A **guided step**: the installer shows the exact login commands for the agent user, then **verifies** each harness with one real model call. The doctor warns before the Codex login expires. | The installer can't log in for you, and must never copy your credentials. |
+| **Remote access** | An **SSH tunnel** by default; **`tailscale serve`** documented; **no public reverse proxy** for now. The doctor warns if the backend listens beyond `127.0.0.1`. | Reads aren't authenticated, and live sessions can attach to agent terminals: exposing the port is close to a remote shell. |
+| **Several teams** | **One shared agent user** in the first version. The layout file maps team → agent user from the start. | A harness login belongs to an OS user: teams on different subscriptions or owners need their own agent user later. |
+| **Upgrades** | **Part of the installer project**: `productctl upgrade <version>` (preflight with nothing dispatched, backup, unpack, migrate, switch `current`, restart, re-apply hooks, doctor). Rollback: switch back and restore. It builds on `scripts/factory-maintenance.py upgrade`. | An install is the first upgrade; both use the same layout and checks. |
+| **Ubuntu versions** | **24.04 LTS and 26.04 LTS**, including **WSL 2** (the doctor checks that systemd is on, and warns that a WSL shutdown stops the factory). 22.04 for Quick start only. | The reference factory runs on WSL 2. |

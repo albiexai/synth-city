@@ -151,6 +151,74 @@ Guided setup offers three starting rosters as the first team kits: **Minimal** (
 
 Rule: settings about the **machine** stay per installation; settings about the **repository** stay per scope; settings about **how a team works** become an installation default with an optional team override, as the Leader ack windows already are (a `null` override restores the default). First candidates: owner idle and nudge timers, the Mail unanswered time, team idle, wake follow-up, publishing summaries. Move only those with an observed need; the 4.4 retrospectives show which ones cost time.
 
+## Decisions for the Dedicated installer and upgrades (Director, 2026-11-24)
+
+From Guide 2's open questions (`2026-11-16-installation-guides/`), proposed by the Supervisor and accepted by the Director. They shape project 2 (Dedicated installer) and the upgrade path. Tracked on #979.
+
+### E. Installer shape: a Python command
+
+`synth-city install --dedicated`, in the product, sharing the **layout file** and the **check engine** with `synth-city doctor`: installing is "apply the fixes until the doctor passes".
+- It shows a plan first and runs only with `--execute`. Running it again is safe.
+- Each root step (users, group, units, sudoers) runs through `sudo` on its own, with the exact command printed.
+- It is tested in CI on a hosted runner with real `sudo`, as `Hosted real-sudo attach` already is.
+- **Not** a shell script: the checked-in `productctl` and units drifted from the live factory. **Not** a `.deb` in the first version: packaging, an apt repository and signing cost more than they give while the installer is changing, and a package cannot do the harness logins anyway.
+
+### F. Source: a built release archive
+
+For Dedicated installs, `release.yml` attaches a **release archive** to each GitHub release. The archive holds the source, the built frontend and the locked requirements, with a published checksum. The host needs no Node for Synth City itself. `git clone` of a tag stays the way for Quick start and development.
+Each release is unpacked into its own folder; a `current` symlink selects the one in use (see L).
+
+### G. Names, paths and the layout file
+
+| Item | Default |
+|---|---|
+| Controller user, agent user, shared group | `synthctl`, `synthagent`, `synth-work` |
+| Program | `/opt/synth-city/releases/<version>/`, `current` → the running release |
+| Layout file | `/etc/synth-city/layout.toml` (root-owned, world-readable, no secrets) |
+| Server settings | `/etc/synth-city/env` (mode 600, owned by the controller user) |
+| State | `/var/lib/synth-city/` (database, backups, maintenance records) |
+| Work folders | `/home/synthctl/work/<campaign>/` (configurable) |
+
+The units are **generated** from the layout file at install time; the doctor and `productctl` read the layout file at run time. An existing installation **adopts** a layout file that describes its current names, so the reference factory (`deckproductctl`, `deckproduct`, `/opt/claude-deck-product`) needs no renaming.
+
+### H. The `agent-config` helper and its sudoers rule: confirmed
+
+One root-owned helper at a fixed path, run by the controller **as the agent user** through one command-scoped `sudoers` rule (`synthctl ALL=(synthagent) NOPASSWD: /opt/synth-city/libexec/agent-config`).
+- It takes **one typed request on standard input**, never file paths or values in its arguments.
+- It writes only an **allowlist**: Claude Code folder trust (`~/.claude.json` projects), Claude Code MCP servers and hooks (`~/.claude/settings.json`), Codex folder trust and MCP servers (`~/.codex/config.toml`), Codex hooks (`~/.codex/hooks.json`). It edits in place, keeps every other entry, and writes a backup and an audit line for each change.
+- It refuses symbolic links, never runs a shell, and never reads or prints credentials.
+- A **minimal first version** (folder trust only) ships in **4.4** with #1262; 4.5 extends it to the rest of the allowlist (Agent Mail repair, team kits).
+
+Rejected: group-write on the agent's configuration (the harnesses rewrite those files and their permissions, and it widens the controller's reach), and a root helper (it widens the boundary).
+
+### I. Harness logins: a guided, verified step
+
+The installer cannot log in for the operator. It shows the exact commands to run **as the agent user** (`sudo -iu synthagent claude`, `sudo -iu synthagent codex login`). Both work over SSH with a browser link or a device code. Then it **verifies** with one real model call per harness as the agent user. The doctor records the Codex login expiry and warns before it. The installer never copies a person's credentials into the agent's home.
+
+### J. Remote access: SSH tunnel by default; Tailscale documented; no public proxy yet
+
+Synth City's trust model is local: the operator token protects changes, but **reads are not authenticated** (source, Agent Mail, live sessions, which can attach to agent terminals). The supported access is an **SSH tunnel** to `127.0.0.1`; **`tailscale serve`** is documented as the second option. A public reverse proxy is not supported until Synth City has an authentication model for remote operators (the deferred external-operator design). The doctor warns when the backend listens on anything other than loopback.
+
+### K. Several teams: one agent user first, one per team later
+
+A harness login belongs to an **OS user**. Teams that use **different subscriptions**, or have different owners or trust levels, need different agent users. The first version supports **one shared agent user**. The layout file maps **team → agent user** from the start, so per-team agent users can follow without a migration. Teams with one owner (for example Synth City and Tizonia) share the agent user.
+
+### L. Upgrades: part of the installer project
+
+`productctl upgrade <version>` builds on the existing `scripts/factory-maintenance.py upgrade` operation, not a new design:
+1. preflight: autonomy off, zero dispatched items, no active owner checkpoints (#654);
+2. back up the database to `/var/lib/synth-city/backups/`;
+3. unpack and verify the release archive; run the migrations;
+4. switch `current`; restart the units;
+5. re-apply the managed harness configuration (Agent Mail hooks) through `agent-config`;
+6. run the doctor; report.
+
+Rollback: switch `current` back and restore the backup. The private v4.3 upgrade script is the checklist to cover.
+
+### M. Supported systems
+
+Ubuntu **24.04 LTS** and **26.04 LTS**, including on **WSL 2**, tested in CI on the versions GitHub's hosted runners provide. On WSL 2 the doctor checks that systemd is enabled (`/etc/wsl.conf`) and warns that a WSL shutdown stops the factory. Ubuntu 22.04 is supported for Quick start only, with the documented Python 3.11 workaround.
+
 ## Left to the builder
 
 - The registry's module layout and the doctor command's packaging (backend console script vs. `productctl doctor`).
