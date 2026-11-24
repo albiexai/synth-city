@@ -121,7 +121,7 @@ rpds-py==2026.6.3
     # via
     #   jsonschema
     #   referencing
-sqlalchemy==2.0.50
+sqlalchemy==2.1.9
     # via albiex-synth-city-backend
 sse-starlette==3.4.8
     # via mcp
