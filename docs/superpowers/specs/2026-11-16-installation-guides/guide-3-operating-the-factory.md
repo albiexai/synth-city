@@ -11,7 +11,7 @@ Most settings in this guide make sense once you know **three ideas**. If a setti
 
 | # | Idea | In plain words | The settings it explains |
 |---|---|---|---|
-| 1 | **Agree before you build** | A builder writes a **plan** first: which files it will change, which commands it will run, how long it will take. The Leader approves it. The approved plan becomes the builder's **permission**: it may change only those files. | Leader, plan approval, ack windows, approval rounds, amendments, continuation |
+| 1 | **Agree before you build** | A builder writes a **plan** first: which files it will change, which commands it will run, how long it will take. The Leader approves it. The approved plan becomes the **agreed scope** of the work. Who checks it depends on the stage: for the first plan, **the verifier** checks in review that the PR stayed inside it; for a continuation, **Synth City itself** refuses any changed file that isn't on the approved list. | Leader, plan approval, ack windows, approval rounds, amendments, continuation |
 | 2 | **Trust the checks, not the agent** | An agent saying "done, tests pass" proves nothing. A PR merges only when **CI is green** and a **different agent (a verifier) accepted that exact commit**. | Verifier role, review hold label, required checks, merge policy |
 | 3 | **Every attempt has a budget** | Agents don't get tired and don't give up. Without limits, a stuck item can loop for hours and burn your quota. Each kind of retry has a counter, and when one runs out the item **stops and asks for a human or the Supervisor**. | Rounds, retries, effort limit, continuation limits, daily merge cap |
 
@@ -22,7 +22,7 @@ flowchart LR
     A["📝 1. Issue gets<br/>the ready label"] --> B["🪑 2. Routed to a builder<br/>by its area label"]
     B --> C["🧱 3. Gets its own<br/>workspace (folder)"]
     C --> D["📋 4. Plan → Leader approves<br/>= the scope revision"]
-    D --> E["🔨 5. Builds inside<br/>the approved files"]
+    D --> E["🔨 5. Builds<br/>the plan"]
     E --> F["🔀 6. PR + review hold label"]
     F --> G["🔍 7. Verifier reviews<br/>the exact commit"]
     G --> H["✅ 8. Checks green + accepted<br/>+ hold removed → merge"]
@@ -34,9 +34,9 @@ Here is the same journey as a story, from the 4.4 campaign:
 2. **Synth City sees the label** on its next poll (every 60 s). Builder **B3** lists `v44-retro` in its `area_labels`, so it gets the issue. If B3 is busy, the issue waits as `pending`.
 3. **B3 gets a workspace**: a separate folder (`dispatch-8`) with a fresh branch, **leased** to this item. Nobody else writes there until the item ends.
 4. **B3 sends a plan**: "change `agent_activity_service.py` and two test files; run the focused tests; about 50 minutes". The Leader approves it. That approval is **scope revision 0**: the list of files B3 may now change.
-5. **B3 builds**, runs the focused tests, and pushes. Synth City later checks that every changed file was in the approved list.
+5. **B3 builds**, runs the focused tests, and pushes. Nothing stops it from touching other files at this point: for a first plan, staying inside the plan is **checked by the verifier** in step 7. (Synth City compares files automatically only for continuation revisions; see section 7.)
 6. **B3 opens the PR** with the `synth-city-v44-review-hold` label, so it can't merge yet, even if CI is green.
-7. **V1 reviews commit `a1b2c3d`**, the exact head. It records `accepted` and removes the hold label. If B3 pushes again, V1 must review the new commit.
+7. **V1 reviews commit `a1b2c3d`**, the exact head: the acceptance items, the tests, and that the changes **stay inside the issue and the approved plan**. It records `accepted` and removes the hold label. If B3 pushes again, V1 must review the new commit.
 8. **All five required checks are green**, V1's acceptance is for the current head, and the hold is gone, so Synth City merges. One of today's 80 automatic merges is used.
 
 **When something goes wrong**, the budgets take over:
@@ -354,7 +354,7 @@ Change it with `PATCH …/github-scopes/{id}/delivery-policy` with `expected_rev
 
 ### 🔁 Continuation policy: a second chance without starting over
 
-**The problem it solves.** Remember idea 1: the approved plan is the builder's permission, a fixed list of files and commands. Sometimes an item **stops** (it's *escalated*): CI failed twice, a check never appeared, the effort was far over the plan. Without continuation, you have two bad options:
+**The problem it solves.** Remember idea 1: the approved plan is the agreed list of files and commands. Sometimes an item **stops** (it's *escalated*): CI failed twice, a check never appeared, the effort was far over the plan. Without continuation, you have two bad options:
 
 | Option | What you lose |
 |---|---|
@@ -362,6 +362,9 @@ Change it with `PATCH …/github-scopes/{id}/delivery-policy` with `expected_rev
 | **Let the builder carry on outside its plan** | The guarantee that every change was approved: the builder now edits whatever it likes |
 
 **Continuation is the third option:** the same builder keeps the **same branch, PR and workspace**, and asks for a **new, small, approved revision**. The revision says exactly what the next step may change and do. The Leader approves it as it approved the first plan.
+
+> [!IMPORTANT]
+> **A continuation is enforced by Synth City, not only by review.** When the builder reports the revision complete, Synth City compares **every changed file** with the revision's approved list (`allowed_paths`). A file outside it is refused with `continuation_paths_out_of_scope`, unless it came in from the base branch or a recorded integration update. The first plan has no such automatic check: there, the verifier is the safeguard. That difference is a reason to keep continuations small and precise.
 
 ```mermaid
 sequenceDiagram
