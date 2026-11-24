@@ -155,7 +155,7 @@ tzdata==2026.3 ; sys_platform == 'win32'
     # via tzlocal
 tzlocal==5.4.4
     # via apscheduler
-uvicorn==0.48.0
+uvicorn==0.54.0
     # via
     #   albiex-synth-city-backend
     #   mcp
