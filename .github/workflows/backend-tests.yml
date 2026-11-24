@@ -156,7 +156,7 @@ jobs:
           MAIL_CAPABILITY_TOKENS_REQUIRED=true
           DEBUG=invalid
           EOF
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         if: steps.changes.outputs.run_suites != 'false'
         with:
           # Untouched shards can come from earlier attempts of this same run.
