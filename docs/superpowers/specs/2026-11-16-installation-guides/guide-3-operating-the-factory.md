@@ -5,6 +5,54 @@
 
 ---
 
+## 🧠 Before the settings: how the factory thinks
+
+Most settings in this guide make sense once you know **three ideas**. If a setting seems strange later, come back here.
+
+| # | Idea | In plain words | The settings it explains |
+|---|---|---|---|
+| 1 | **Agree before you build** | A builder writes a **plan** first: which files it will change, which commands it will run, how long it will take. The Leader approves it. The approved plan becomes the builder's **permission**: it may change only those files. | Leader, plan approval, ack windows, approval rounds, amendments, continuation |
+| 2 | **Trust the checks, not the agent** | An agent saying "done, tests pass" proves nothing. A PR merges only when **CI is green** and a **different agent (a verifier) accepted that exact commit**. | Verifier role, review hold label, required checks, merge policy |
+| 3 | **Every attempt has a budget** | Agents don't get tired and don't give up. Without limits, a stuck item can loop for hours and burn your quota. Each kind of retry has a counter, and when one runs out the item **stops and asks for a human or the Supervisor**. | Rounds, retries, effort limit, continuation limits, daily merge cap |
+
+### One issue's journey, with the vocabulary
+
+```mermaid
+flowchart LR
+    A["📝 1. Issue gets<br/>the ready label"] --> B["🪑 2. Routed to a builder<br/>by its area label"]
+    B --> C["🧱 3. Gets its own<br/>workspace (folder)"]
+    C --> D["📋 4. Plan → Leader approves<br/>= the scope revision"]
+    D --> E["🔨 5. Builds inside<br/>the approved files"]
+    E --> F["🔀 6. PR + review hold label"]
+    F --> G["🔍 7. Verifier reviews<br/>the exact commit"]
+    G --> H["✅ 8. Checks green + accepted<br/>+ hold removed → merge"]
+```
+
+Here is the same journey as a story, from the 4.4 campaign:
+
+1. **The Supervisor adds `synth-city-v44-ready`** to issue #1240 ("count Mail requests as waits"). It also carries `v44-retro` and `priority:4`.
+2. **Synth City sees the label** on its next poll (every 60 s). Builder **B3** lists `v44-retro` in its `area_labels`, so it gets the issue. If B3 is busy, the issue waits as `pending`.
+3. **B3 gets a workspace**: a separate folder (`dispatch-8`) with a fresh branch, **leased** to this item. Nobody else writes there until the item ends.
+4. **B3 sends a plan**: "change `agent_activity_service.py` and two test files; run the focused tests; about 50 minutes". The Leader approves it. That approval is **scope revision 0**: the list of files B3 may now change.
+5. **B3 builds**, runs the focused tests, and pushes. Synth City later checks that every changed file was in the approved list.
+6. **B3 opens the PR** with the `synth-city-v44-review-hold` label, so it can't merge yet, even if CI is green.
+7. **V1 reviews commit `a1b2c3d`**, the exact head. It records `accepted` and removes the hold label. If B3 pushes again, V1 must review the new commit.
+8. **All five required checks are green**, V1's acceptance is for the current head, and the hold is gone, so Synth City merges. One of today's 80 automatic merges is used.
+
+**When something goes wrong**, the budgets take over:
+
+```mermaid
+flowchart TD
+    P["Plan rejected"] -->|"up to max_approval_rounds (3)"| P2["→ escalated: needs a decision"]
+    E["Work takes longer than the plan"] -->|"advisory: messages at the limit"| E2["Leader may extend<br/>(within max_item_effort_minutes)"]
+    R["Review or CI keeps failing"] -->|"up to max_verification_retries (2)"| R2["→ escalated"]
+    X["Needs files outside the plan"] -->|"healthy item"| AM["Amendment: Leader approves new files"]
+    R2 -->|"continuation_enabled"| CO["Continuation: a new, bounded revision<br/>on the same branch"]
+    CO -->|"limits run out"| N["→ end it, or a new follow-up issue"]
+```
+
+---
+
 ## 1. The map: what you configure
 
 ```mermaid
@@ -51,6 +99,9 @@ flowchart TB
 > [!IMPORTANT]
 > **The operator token** (`OPERATOR_TOKEN` in `backend/.env`) protects every change to teams, scopes, autonomy and recovery. The UI asks for it once per browser tab. API calls send it as the header `X-Synth-City-Operator-Token`. Never paste it into Agent Mail, an issue or a chat.
 
+> [!TIP]
+> **💡 Why a token at all, when it's your own machine?** The agents can call Synth City's API too: that's how Agent Mail works. Without a token, any agent could switch its own team's autonomy on, change its limits, or approve its own work. The token marks a change as **the operator's**, not an agent's. In single-user mode this protection is weaker, because agents run as you and could read the file. That's one reason for a dedicated factory.
+
 ---
 
 ## 2. Day one, in order
@@ -92,6 +143,11 @@ Nothing here is needed to **start** Synth City. These matter when you run teams 
 | `GITHUB_COORDINATION_HOLD_PATHS` | *(none)* | `…/operations/HOLD.json` | Emergency stop: while this file exists, dispatch holds. |
 | `GITHUB_PUBLISH_SUMMARIES_ENABLED` | `false` | `true` | Synth City posts its own work summaries on issues and PRs. |
 
+> [!TIP]
+> **💡 Why so many timers?** An agent can't tell you it's stuck: it simply stops talking. Synth City notices **silence** instead. Each timer means "after this long without news, do something": nudge the builder, remind the Leader, tell the Supervisor, or escalate. The defaults come from three release campaigns. Change them only after you've seen a real problem; the retrospectives coming in 4.4 will show where time is lost.
+>
+> **🧪 Example:** B2 has been silent for 15 minutes (`GITHUB_OWNER_IDLE_TIMEOUT_SECONDS` = 900). Synth City sends it a nudge in its pane. If it still doesn't answer, the item is reported as stalled and the Supervisor sees it at its next check-in.
+
 <details>
 <summary>More timing and nudge settings (rarely changed)</summary>
 
@@ -123,6 +179,11 @@ flowchart LR
 | **CI checks** | `e2e`, `Product CI gate`, … | Named in the delivery policy's `required_checks`. |
 
 > [!TIP]
+> **💡 Why labels, instead of a queue inside Synth City?** GitHub is the place that **you, the agents and other people all see**. A label is visible on the issue, has a history, and can be changed from your phone. Synth City only reads them. To steer the factory, you change labels: you never need to open Synth City to say "do this next".
+>
+> **🧪 Example (lanes):** in 4.4, issues about dispatch carry `v44-core` and go to B1; UI issues carry `v44-ui` and go to B4. Two builders never get issues about the same part of the code at the same time, so their PRs rarely collide. An issue with no lane label is never picked up: that's how the tracking issues stay out of the queue.
+
+> [!TIP]
 > One label per lane, and one priority per issue, give the Leader and the builders a clear queue. Never hold a queue by removing ready labels: that escalates items. Give an item a higher priority number instead, or turn autonomy off.
 
 ---
@@ -140,6 +201,15 @@ flowchart LR
 | `leader_ack_max_wait_seconds` | server default (1800) | `1800` | The hard limit before escalation (≥ the timeout). |
 | **Leader** (`PUT …/presets/{id}/leader`) | *(none)* | slot L1 | Leader authority: approves plans, never owns an issue. Only while autonomy is off. |
 | `autonomy_enabled` | `false` | `false` until launch | The master switch for dispatch. |
+
+> [!TIP]
+> **💡 Why a Leader, and why does it have a deadline?** Builders are good at doing, but not at judging scope: they tend to do too much or wander outside the issue. The Leader reads each plan **before any code is written**, when a correction is cheap ("drop the refactor, and add a test for the failure case"). It never builds, so it never approves its own work.
+> The **ack windows** exist because a plan request blocks a builder: while the Leader is busy, the builder waits. After `leader_ack_timeout_seconds` (5 min) the Leader is reminded and the Supervisor is told. After `leader_ack_max_wait_seconds` (30 min) the request ends with `leader_ack_timeout`, so a busy or broken Leader can't hold builders forever.
+>
+> **🧪 Example:** the Leader is in the middle of a long analysis when B1 asks for approval. After 5 minutes it gets a reminder; it finishes its turn, approves, and B1 starts. If the Leader's session had crashed, the request would end at 30 minutes and the Supervisor would restart the Leader.
+
+> [!TIP]
+> **💡 Planned decisions** are your own to-do list for the campaign ("decide whether #1109 needs a second verifier", state `later`). The Leader sees them, so it doesn't ask you about something you've already planned to decide.
 
 > [!NOTE]
 > **Duplicate, don't rebuild.** `POST /presets/{id}/duplicate` copies every slot, its charter and launch options, and the Leader. Change what's new, and clear any copied `session_id` so each member starts a fresh conversation.
@@ -180,6 +250,14 @@ flowchart LR
 | `enabled` | `true` | `true` | A disabled slot gets no work and can't accept reviews. |
 | `ui_color`, `position` | — | — | Display only. |
 
+> [!TIP]
+> **💡 Why the verifier must be a different agent, and why "exact head"?** An agent reviewing its own work tends to see what it meant to write, not what it wrote. So the **owner** and the **Leader** can never accept a PR: only a slot with role `verifier`. The acceptance is tied to **one commit** (the "head"), because a push after the review could add code nobody reviewed. Any new push needs a new acceptance.
+>
+> **🧪 Example:** V1 accepts commit `a1b2c3d`. B3 then pushes a one-line typo fix (`e4f5a6b`). Synth City shows "Head changed since acceptance" and doesn't merge until V1 accepts `e4f5a6b`.
+
+> [!TIP]
+> **💡 Plain or resume?** `plain` starts a new conversation: the agent knows only its charter and bootstrap prompt. `resume` continues a saved conversation (`session_id`), with everything the agent learned. Start a new campaign with `plain`, then switch to `resume` so that restarts keep the context. For Codex, the switch to `resume` is also what lets Synth City **observe** the member's activity; until then it shows "activity unknown".
+
 ### Launch options for Claude Code and Codex
 
 | Option | Claude Code | Codex CLI | Example |
@@ -202,7 +280,7 @@ flowchart LR
 | Rule | Why |
 |---|---|
 | Plan size limit (about 60 active minutes, 150–400 lines) | Bigger plans fail review and stall; split them. |
-| Focused tests locally; full suites on CI | Saves an hour per item; CI runs in parallel with review. |
+| Focused tests locally; full suites on CI | Builders don't wait for the full suites; CI runs them in parallel with review. |
 | A test evidence block on every handoff | The verifier trusts the run without repeating it. |
 | Every PR carries the review hold label; only the accepting verifier removes it | The merge gate, until 4.4 makes it a product rule (#1114). |
 | Never use interactive question tools | No one answers; the agent waits for hours. |
@@ -227,12 +305,27 @@ flowchart LR
 | `merge_policy` | `human` | `auto` | `human`: PRs wait for a person. `auto`: merge when checks are green, a verifier accepted the exact head, and no hold label. |
 | `max_auto_merges_per_day` | `5` | `80` | A cap on automatic merges. |
 | `max_concurrent_dispatched` | `3` | `4` | Items running at once. Needs that many workspaces. |
-| `max_item_effort_minutes` | `120` | `120` | The most active effort for one item (15–1440; **API only today**). |
+| `max_item_effort_minutes` | `120` | `120` | The **ceiling** for a plan's estimate (15–1440; **API only today**). The approved estimate becomes the item's effort limit: advisory, not a stop (see below). |
 | `max_approval_rounds` | `3` | `3` | Plan rounds before escalation. |
 | `max_verification_retries` | `2` | `2` | Review/CI retries before escalation. |
 | `github_auth_mode` | `unknown` | `ambient` | `ambient` uses the host's login; `app` uses the GitHub App. |
 | `builds_out_of_tree`, `build_dir_template`, `build_command_hint`, `max_build_parallelism` | `false`, `build`, —, `4` | defaults | For compiled projects (for example, meson builds outside the source tree). |
 | `enabled` | `true` | **`false` until launch** | Whether the watcher polls this scope. |
+
+> [!TIP]
+> **💡 Why the limits on the scope?** Each one stops a different kind of runaway:
+>
+> | Limit | Without it… | Example |
+> |---|---|---|
+> | `max_concurrent_dispatched` | Builders pile up items they can't finish, and CI queues grow | `4` = one item per builder |
+> | `max_approval_rounds` | A builder and a Leader argue about a plan forever | 3 rejected plans → escalated: the issue probably needs splitting |
+> | `max_verification_retries` | A PR keeps failing CI and the builder keeps trying | 2 failed rounds → escalated |
+> | `max_item_effort_minutes` | Huge plans get approved | A plan estimating 300 minutes is refused at approval: split it |
+> | `max_auto_merges_per_day` | A bad rule or a broken check merges dozens of PRs before you notice | 80 is "no practical limit" for a busy team; use 5–10 while you build trust |
+>
+> **About effort:** the plan's estimate becomes the item's **effort limit**. Reaching it doesn't stop anything: the Leader and the builder each get one message. The Leader may then extend it in small steps (at most 30 minutes or 25% of the original each time), never past `max_item_effort_minutes`. It's a speedometer, not a brake.
+>
+> **Merge policy `human` or `auto`?** Start with `human` while you learn how your team works: PRs wait for you, and nothing reaches your branch without your click. Move to `auto` when you trust the verifier and the checks. Design work always waits for a human, whatever the policy.
 
 ### 📜 Delivery policy (per scope, versioned, with history) — API only today
 
@@ -240,7 +333,7 @@ flowchart LR
 |---|---|---|---|
 | `required_checks` | `[]` | 5 checks: `Full backend regression tests`, `Product CI gate`, `Changed Python undefined names`, `e2e`, `Rename old-name guard` (app `github-actions`) | The checks that must be green to merge. **A head with no check runs is not green.** |
 | `broad_checks` | `local` | `hosted` | `hosted`: full suites run on CI, builders run focused tests (needs required checks). |
-| `accepted_base_update` | `disabled` | `merge` | After acceptance, bring the PR up to date with its base by merge (or `fast_forward`). |
+| `accepted_base_update` | `disabled` | `merge` | Allows an operator **integration update**: a running item takes in a merged, accepted PR from its base (by `merge` or `fast_forward`). |
 | `owner_contact` | `reports` | `native` | `native`: Synth City reads the builder's own activity instead of waiting for reports. |
 | `owner_idle_seconds` | *(server)* | `1800` | Idle time before an owner nudge. |
 | `owner_nudge_grace_seconds` | *(server)* | `120` | Grace after a nudge. |
@@ -250,22 +343,86 @@ flowchart LR
 
 Change it with `PATCH …/github-scopes/{id}/delivery-policy` with `expected_revision` and a `reason`. Every change is kept in its history.
 
-### 🔁 Continuation policy (when an approved plan needs more)
+> [!TIP]
+> **💡 What the delivery policy is for:** it describes **your project's** rules for "delivered", so Synth City can work with any repository and any CI.
+>
+> - **`required_checks`**: your CI may run many jobs. Name the ones that **must** pass. Others (a slow nightly analysis, for example) never block a merge. Name them exactly as GitHub shows them, because a renamed CI job silently stops counting.
+> - **`broad_checks: hosted`**: the full test suites take 10–20 minutes. With `hosted`, builders run only the tests for what they changed, and the full suites run on CI **while** the verifier reviews, so builders don't wait for them.
+> - **`accepted_base_update`**: while an item is being built, other PRs merge into the base branch. Sometimes the builder **needs** one of them (a CI fix, a shared helper). This setting allows an **integration update**: an operator maintenance step (`scripts/factory-maintenance.py integration-update`) that brings the running item's workspace up to date with the base, by `fast_forward` or `merge`, after a checkpoint of the builder's work. The merged PR must be accepted and have every required check. The builder keeps its approval, lease and counters, and the files brought in don't count as changes outside its plan.
+>   🧪 *Example:* B1 is half-way through #1223 when the e2e sharding PR (#1235) merges into `release/v4.4`, and B1's PR needs it to get green checks. With `merge`, the Supervisor runs the integration update and B1 carries on with the new base. With `disabled`, the Supervisor uses GitHub's **Update branch** on B1's PR instead, by hand.
+> - **`owner_contact: native`**: how Synth City knows a builder is alive. With `reports`, it waits for the builder to send progress reports. With `native`, it reads the builder's own session activity (Claude Code transcripts, Codex logs), so a builder that's busy thinking isn't nudged for being "silent".
 
-| Field | Example | What it decides |
+### 🔁 Continuation policy: a second chance without starting over
+
+**The problem it solves.** Remember idea 1: the approved plan is the builder's permission, a fixed list of files and commands. Sometimes an item **stops** (it's *escalated*): CI failed twice, a check never appeared, the effort was far over the plan. Without continuation, you have two bad options:
+
+| Option | What you lose |
+|---|---|
+| **Retry from scratch** | The branch, the PR, the review history, and the time spent: the next attempt starts again from the base branch |
+| **Let the builder carry on outside its plan** | The guarantee that every change was approved: the builder now edits whatever it likes |
+
+**Continuation is the third option:** the same builder keeps the **same branch, PR and workspace**, and asks for a **new, small, approved revision**. The revision says exactly what the next step may change and do. The Leader approves it as it approved the first plan.
+
+```mermaid
+sequenceDiagram
+    participant B as 🔨 Builder
+    participant SC as Synth City
+    participant L as 🧭 Leader
+    Note over B,SC: Revision 0 (the approved plan): build, push, PR
+    SC->>B: escalated: verification retries exhausted
+    B->>L: continuation request: revision 1<br/>phase: diagnostic or implementation<br/>paths: [tests/test_x.py, ci/]<br/>actions: [push_pr_head, request_verification]
+    L-->>B: approve
+    Note over B,SC: Revision 1: only those paths and actions,<br/>same branch, same PR, same workspace
+    B->>SC: push the fix → checks run again
+    SC->>B: green → back to review
+```
+
+**Two kinds of continuation (the phase):**
+
+| Phase | For | Rule | Example |
+|---|---|---|---|
+| `diagnostic` | Finding out what's wrong | Temporary changes only; they're **reverted** before the item continues | Add a debug log to a flaky test, read the hosted CI output, then remove the log |
+| `implementation` | Fixing it | Changes stay in the PR; they're reviewed and tested again | Re-add a test that an earlier revision removed |
+
+**🧪 A real example (Synth City 3.0, October 2026).** A builder's PR #499 had **no check runs at all**: CI didn't run on PRs into the new release branch until another PR (#498) merged. The item used up its retries waiting for checks that never came, and escalated (`retry_count_exhausted`). The builder's local work was finished but not pushed. A continuation revision allowed exactly two actions (`push_pr_head`, `request_verification`), on that branch only. It also listed what was **not** allowed: no force push, no edits to #498, no workflow changes except one file, no tags or releases. The builder pushed, waited for #498, and the item went back to review **with all its work kept**.
+
+**And the limits?** A continuation can repeat. Without limits, a stubborn item could loop forever: fail, continue, fail, continue. Each limit stops one kind of loop:
+
+| Setting (4.4 value) | Counts | Stops this loop |
 |---|---|---|
-| `continuation_enabled` | `true` | Builders may ask for a bounded follow-up revision instead of a new issue. |
-| `max_continuation_revisions` | `19` | Revisions per item. |
-| `max_continuation_failed_heads` / `max_failed_heads_per_revision` | `19` / `2` | Failed pushes allowed. |
-| `max_scope_paths` / `max_scope_commands` | `48` / `24` | How big an approved scope may grow. |
+| `continuation_enabled` (`true`) | — | Off = an escalated item can only be retried from scratch or ended |
+| `max_continuation_revisions` (`19`) | Continuation revisions per item | "One more try" without end |
+| `max_continuation_failed_heads` (`19`) | Pushes whose checks failed, across all revisions | Pushing guesses until something passes |
+| `max_failed_heads_per_revision` (`2`) | Failed pushes inside one revision | One revision that keeps failing: ask for a new, better-scoped one |
+| `max_scope_paths` (`48`) | Files and folders one revision may list | A "small" continuation that quietly becomes a rewrite |
+| `max_scope_commands` (`24`) | Commands one revision may list | The same, for commands |
+
+When a limit runs out, the item stays escalated. The Leader or the operator then ends it (`end-stopped`) or files a follow-up issue.
+
+**Continuation, amendment, or a new issue?**
+
+| Situation | Use | Why |
+|---|---|---|
+| The item is **healthy**, and the builder finds it needs one more file (for example, a helper module) | **Amendment**: the Leader approves the extra files | Nothing failed; the plan just grows a little. Limits: 3 approved amendments, 8 requests, 16 added files per item |
+| The item is **escalated**, and the next step is small and clear | **Continuation** | Keeps the branch, PR and review history |
+| The work turns out to be **a different problem**, or much bigger | **A new issue** (a split) | A new plan, a new review, honest progress counts |
+| A **review asks for corrections** inside the approved files | **None of these**: the builder just fixes and pushes | The original plan still covers it |
 
 ### 🧩 Coordination policy (optional)
 
 The Leader reviews a list of issues and says which are eligible, blocked or need clarification. Fields: `enabled`, `issue_numbers` (up to 32), `fallback_seconds` (1800), `max_daily_requests` (12).
 
+> [!TIP]
+> **💡 Why:** labels say what is *ready*, but not what *depends on what*. With coordination on, the Leader looks at a set of issues and records, for each one, `eligible`, `dependency_blocked`, `human_decision_blocked`, `resource_blocked` or `needs_scope_clarification`. Builders then aren't sent work that can't be finished yet.
+>
+> **🧪 Example:** the retrospectives page (#1253) needs the snapshot service (#1244) first. The Leader marks #1253 `dependency_blocked` until #1244 merges. `max_daily_requests` keeps the Leader from spending its day re-assessing the list; `fallback_seconds` decides how long to wait for its answer. Most teams can leave coordination off and rely on the Supervisor adding ready labels in dependency order, as 4.4 does.
+
 ### 🧱 Dispatch workspaces
 
-One folder per item that may run at once: `POST …/github-scopes/{id}/workspaces` with `{"path": "…/dispatch-1"}`, a sibling of the main clone. **No workspaces = nothing dispatches, and no error is shown.** In 4.4, Synth City creates them itself (#948).
+One folder per item that may run at once: `POST …/github-scopes/{id}/workspaces` with `{"path": "…/dispatch-1"}`, a sibling of the main clone.
+
+> [!TIP]
+> **💡 Why separate folders?** Two builders in one folder would overwrite each other's files and branches. Each item gets its own folder, **leased** to it: Synth City records which item holds it, and nobody else may write there until the item ends. When the item merges, the lease is released and the folder is reused. If an item ends badly, the lease can stay behind, and **force-release** frees it. **No workspaces = nothing dispatches, and no error is shown.** In 4.4, Synth City creates them itself (#948).
 
 ---
 
@@ -286,6 +443,11 @@ sequenceDiagram
     L->>S: incidents, gates, stalls (Agent Mail)
     S->>D: only roster, models, budget, releases
 ```
+
+> [!TIP]
+> **💡 Why a supervisor, if there's already a Leader?** The Leader is **inside** the team: it coordinates the work, but it can't restart a crashed member, upgrade the factory, or notice that it is itself stuck. The Supervisor watches **from outside**: it checks in on a schedule, reads the team's state and Mail, and handles incidents. It can be you, another person, or an agent (in the Synth City campaigns, a Claude Code session). You, the Director, then deal only with decisions only you can make: the roster, models, budget and releases.
+>
+> **🧪 Example:** at 03:00 a Codex builder's login expires and it stops. The Leader sends Mail to the Supervisor. The Supervisor's next check-in sees it, restarts the member after a fresh login, and records what happened. The Director reads it in the morning.
 
 | Item | Example | Notes |
 |---|---|---|
@@ -313,6 +475,9 @@ stateDiagram-v2
     merged --> [*]
 ```
 
+> [!TIP]
+> **💡 What "escalated" means:** an item has **stopped and is waiting for a decision**. Nothing is lost: the branch, PR and workspace are kept. Common reasons: a budget ran out (rounds, retries), the ready label was removed during the attempt, the Leader didn't answer in time, or a safety rule refused an action. The Work page shows the reason. The usual next steps are a **continuation** (section 7), a **retry**, or **ending** the item and filing a follow-up.
+
 **Before autonomy on:**
 1. `GET …/github-scopes/{id}/activation-readiness`: must have no blockers (Leader bound, a distinct owner, each member's Mail session ready).
 2. Enable the scope; check `last_polled_at` advances.
@@ -334,6 +499,17 @@ stateDiagram-v2
 | End a stopped item | `POST …/work-items/{id}/end-stopped` | — |
 | Free a stale workspace | `POST …/workspaces/{id}/force-release` | Deleting the folder |
 | Change models or roster | Autonomy off, edit the slot, relaunch that member | Mid-item swaps |
+
+---
+
+> [!TIP]
+> **💡 Three ways to stop, from gentle to firm:**
+>
+> | | Autonomy off | STOP / HOLD Mail | `HOLD.json` |
+> |---|---|---|---|
+> | New work | stops | — | stops |
+> | Work in progress | continues | the member stops editing until it reads the message | dispatch holds |
+> | Use when | an orderly pause (upgrades, the end of the day) | one member must stop now | the whole factory must stop, even if the UI is down |
 
 ---
 
@@ -392,3 +568,24 @@ supervisor: external actor, bound with a check-in grace
 2. Should guided setup offer **presets** for common rosters (solo, small team, the 4.4 line-up)?
 3. Should the server settings in `.env` become visible (read-only) in the UI, so an operator sees what is in force?
 4. What is the minimum a new operator must set before autonomy is allowed? Should readiness enforce it?
+
+---
+
+## 📖 Glossary
+
+| Word | Meaning |
+|---|---|
+| **Attempt** | One try at an issue: from dispatch to merge or stop. A retry is a new attempt. |
+| **Dispatch** | Giving a ready issue to a builder, with a workspace and a brief. |
+| **Escalated** | Stopped, waiting for a decision. Work is kept. |
+| **Head** | The latest commit on a PR's branch. Reviews and checks apply to one exact head. |
+| **Lease** | An item's exclusive right to a workspace folder. |
+| **Plan / scope revision** | The approved list of files, commands and actions for an attempt. Revision 0 is the first plan; continuations are revisions 1, 2, … |
+| **Amendment** | Adding files to an approved plan while the item is healthy. |
+| **Continuation** | A new, bounded revision for an escalated item, on the same branch and PR. |
+| **Review hold** | A GitHub label that blocks automatic merge until the accepting verifier removes it. |
+| **Required check** | A CI job that must be green before merge, named in the delivery policy. |
+| **Scope** | One watched repository and the rules for working on it, per team. |
+| **Slot** | One seat in a team: its harness, model, folder, role and charter. The agent in it is the member. |
+| **Supervisor** | An external person or agent who watches the team from outside and handles incidents. |
+| **Director** | You: roster, models, budget, releases. |
