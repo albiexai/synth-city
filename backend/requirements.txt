@@ -40,7 +40,7 @@ cryptography==50.0.0
     #   pyjwt
 fastapi==0.162.2
     # via albiex-synth-city-backend
-greenlet==3.5.1
+greenlet==3.5.6
     # via sqlalchemy
 h11==0.16.0
     # via
