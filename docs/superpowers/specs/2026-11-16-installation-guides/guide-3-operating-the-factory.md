@@ -28,16 +28,72 @@ flowchart LR
     G --> H["✅ 8. Checks green + accepted<br/>+ hold removed → merge"]
 ```
 
-Here is the same journey as a story, from the 4.4 campaign:
+Here is the same journey from the 4.4 campaign, with **who does each action** spelled out. Nothing here is magic: every action is done either by a **person**, by **an agent using a tool**, by the **Synth City backend** (a program running on the factory), or by **GitHub** itself.
 
-1. **The Supervisor adds `synth-city-v44-ready`** to issue #1240 ("count Mail requests as waits"). It also carries `v44-retro` and `priority:4`.
-2. **Synth City sees the label** on its next poll (every 60 s). Builder **B3** lists `v44-retro` in its `area_labels`, so it gets the issue. If B3 is busy, the issue waits as `pending`.
-3. **B3 gets a workspace**: a separate folder (`dispatch-8`) with a fresh branch, **leased** to this item. Nobody else writes there until the item ends.
-4. **B3 sends a plan**: "change `agent_activity_service.py` and two test files; run the focused tests; about 50 minutes". The Leader approves it. That approval is **scope revision 0**: the list of files B3 may now change.
-5. **B3 builds**, runs the focused tests, and pushes. Nothing stops it from touching other files at this point: for a first plan, staying inside the plan is **checked by the verifier** in step 7. (Synth City compares files automatically only for continuation revisions; see section 7.)
-6. **B3 opens the PR** with the `synth-city-v44-review-hold` label, so it can't merge yet, even if CI is green.
-7. **V1 reviews commit `a1b2c3d`**, the exact head: the acceptance items, the tests, and that the changes **stay inside the issue and the approved plan**. It records `accepted` and removes the hold label. If B3 pushes again, V1 must review the new commit.
-8. **All five required checks are green**, V1's acceptance is for the current head, the Leader's approval is current, and the hold is gone. On its next poll, the **Synth City backend** re-checks all of this and calls GitHub's merge API itself, with the backend's `GITHUB_TOKEN` and the exact commit it checked (if anything was pushed in between, GitHub refuses). No agent issues the merge. GitHub records the merge under **the account that owns the token**. One of today's 80 automatic merges is used.
+| Icon | Actor | What it is |
+|---|---|---|
+| 🧑 | **Supervisor / Director** | A person, or an agent acting as Supervisor. Works on GitHub and in the Synth City UI. |
+| ⚙️ | **Synth City backend** | The server process. Its **watcher** loop runs every 60 seconds: it reads GitHub, updates its database, prepares folders and sends messages. It never writes code. |
+| 🧭 🔨 🔍 | **Leader, builder, verifier** | Claude Code or Codex sessions in `tmux`. They act through `git`, `gh` (the GitHub CLI) and **Agent Mail tools** (`synth_city_*`). |
+| 🐙 | **GitHub** | Runs CI (GitHub Actions) and closes issues from PR descriptions. |
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as 🧑 Supervisor
+    participant GH as 🐙 GitHub
+    participant SC as ⚙️ Synth City backend
+    participant B as 🔨 B3 (builder)
+    participant L as 🧭 L1 (Leader)
+    participant V as 🔍 V1 (verifier)
+    S->>GH: add labels: synth-city-v44-ready, v44-retro, priority:4
+    SC->>GH: poll issues (GITHUB_TOKEN)
+    SC->>SC: route to B3, lease dispatch-8, reset folder, set commit identity
+    SC->>B: brief by Agent Mail + wake the pane
+    B->>B: git switch -c <assigned branch>
+    B->>SC: plan (synth_city_request_work_item_approval)
+    SC->>L: approval request + wake
+    L->>SC: approve (synth_city_approve_work_item)
+    SC->>B: approval delivered → B3 acknowledges
+    B->>GH: git push · gh pr create --draft · add hold label
+    B->>SC: report pr_opened
+    GH->>GH: GitHub Actions runs the CI workflows
+    L->>V: route the review (Agent Mail)
+    V->>SC: verdict for the exact head (synth_city_record_head_review)
+    V->>GH: remove the hold label (gh)
+    B->>GH: mark the PR ready (not draft)
+    SC->>GH: re-check every gate, then merge (PUT …/merge, exact SHA)
+    GH->>GH: "Closes #1240" closes the issue
+```
+
+**Step by step:**
+
+1. 🧑 **The Supervisor adds labels** to issue #1240 on GitHub: `synth-city-v44-ready`, `v44-retro`, `priority:4`. (Web page, or `gh issue edit 1240 --add-label …`.)
+2. ⚙️ **The backend's watcher reads the issue** on its next poll, using `GITHUB_TOKEN`. It finds the first enabled builder whose `area_labels` include `v44-retro`: **B3**. It records a **work item** for #1240 in its database, with status `pending`.
+3. ⚙️ **The backend prepares a workspace** as soon as B3 is free and a registered folder is free:
+   - It **leases** `dispatch-8`: it records in its database that this folder now belongs to #1240.
+   - It **resets** the folder to the base branch: `git fetch`, `git switch --detach --force origin/release/v4.4`, `git reset --hard`, `git clean -fd`.
+   - It writes **B3's commit identity** into that folder's git config (`B3 Claude Opus 5.5 builder (retrospectives) (Synth City agent)`, `…+slot40@synth-city.local`), so the commits show which slot made them.
+   - It **chooses the branch name** (`deck/slot-40/issue-1240-<random>`) and writes the **brief**: the issue, the folder, the branch, the rules.
+   - It **delivers the brief** by Agent Mail and **wakes** B3: it types a short prompt into B3's `tmux` pane.
+
+   *And the folder itself?* It was created **when the operator registered it** (`POST …/workspaces`): if the folder didn't exist, the backend ran `git worktree add --detach <folder> origin/release/v4.4` from the main clone. If it already existed (as in 4.4, where the Supervisor created the folders by hand), the backend **adopted** it after checking that it's a worktree of the same repository.
+4. 🔨 **B3 creates its branch** (`git switch -c <assigned name>`), reads the issue, and **writes a plan**. It sends it with the Agent Mail tool `synth_city_request_work_item_approval`. ⚙️ The backend records the request, starts the Leader's clock (section 5) and wakes the Leader. 🧭 **L1 approves** with `synth_city_approve_work_item`. ⚙️ The backend records the approval as **scope revision 0** and delivers it; 🔨 B3 acknowledges it before editing.
+5. 🔨 **B3 builds**: it edits files, runs the focused tests, commits and pushes with `git`. Nothing stops it from touching other files at this point: for a first plan, staying inside the plan is **checked by the verifier** in step 7. (Synth City compares files automatically only for continuation revisions; see section 7.)
+6. 🔨 **B3 opens a draft PR** with `gh pr create --draft`, adds the `synth-city-v44-review-hold` label, and reports `pr_opened` with the PR number. (With a GitHub App, B3 reports `pr_ready` instead, and ⚙️ the **backend opens the draft PR** as the App's bot, titled `[B3 …] <issue title> (#1240)`, with `Closes #1240` in its description.) 🐙 **GitHub Actions runs the CI workflows** on the PR.
+7. 🧭 **L1 sends the review** to V1 by Agent Mail, and wakes it as soon as the checks finish. 🔍 **V1 reviews commit `a1b2c3d`**, the exact head, in its own review folder: the acceptance items, the tests, and that the changes **stay inside the issue and the approved plan**. It records `accepted` with `synth_city_record_head_review` and **removes the hold label** with `gh`. If B3 pushes again, V1 must review the new commit. 🔨 B3 then **marks the PR ready** (not draft) at the same commit.
+8. ⚙️ **The backend merges.** On its next poll it re-reads the PR and checks every gate: the **five required checks** are green, V1's acceptance is for the current head, the Leader's approval is current, the PR is not a draft, and the hold is gone. Then it calls GitHub's merge API itself, with the exact commit it checked (if anything was pushed in between, GitHub refuses). **No agent issues the merge.** GitHub records the merge under **the account that owns the backend's token** (section 4b). One of today's 80 automatic merges is used.
+
+   | Required check | Workflow | What it runs |
+   |---|---|---|
+   | `Full backend regression tests` | `backend-tests.yml` | A **gate** job: green only when all 4 parallel shards of the backend test suite (pytest) pass |
+   | `Product CI gate` | `product-ci.yml` | A gate job over the frontend tests and production build |
+   | `e2e` | `e2e.yml` | Browser end-to-end journeys (Playwright) against an isolated instance |
+   | `Changed Python undefined names` | `factory-checks.yml` | `ruff` on the Python files the PR changed, for undefined names |
+   | `Rename old-name guard` | `factory-checks.yml` | `scripts/ci/old_names.py`: no old product names outside the history folders |
+
+   *Gate jobs* exist so that the delivery policy can name **one** check for a group of jobs: if the suite is split into 4 shards tomorrow, the policy doesn't change. Other jobs (CodeQL, `Hosted real-sudo attach`, …) still run but **don't block** the merge, because they aren't listed.
+9. **Closing the issue** depends on the mode. With a **GitHub App**, the backend wrote `Closes #1240` into the PR description, so 🐙 **GitHub closes the issue** at merge. In **ambient** mode (the Synth City factory today), the builder's PR description usually doesn't say it, so nothing closes the issue automatically: 🧑 **the Supervisor closes it**, after checking that the work item is `merged` (never before: an issue whose work item isn't finished must stay open). ⚙️ The backend marks the work item `merged`, and the folder's **lease is released**. The next item that gets `dispatch-8` starts with a fresh reset (step 3).
 
 **When something goes wrong**, the budgets take over:
 
@@ -176,7 +232,7 @@ flowchart LR
 | **Priority labels** | `priority:1` … `priority:30` | Queue order: lowest first. |
 | **Milestone** | `v4.4` | The team's `backlog_milestone`: campaign progress on Overview. |
 | **Base branch** | `release/v4.4` | Where PRs go. **Its CI must run on PRs into that branch**, or no checks appear and nothing merges. |
-| **CI checks** | `e2e`, `Product CI gate`, … | Named in the delivery policy's `required_checks`. |
+| **CI checks** | the five in step 8 of the journey | Named in the delivery policy's `required_checks`. |
 
 > [!TIP]
 > **💡 Why labels, instead of a queue inside Synth City?** GitHub is the place that **you, the agents and other people all see**. A label is visible on the issue, has a history, and can be changed from your phone. Synth City only reads them. To steer the factory, you change labels: you never need to open Synth City to say "do this next".
@@ -187,6 +243,61 @@ flowchart LR
 > One label per lane, and one priority per issue, give the Leader and the builders a clear queue. Never hold a queue by removing ready labels: that escalates items. Give an item a higher priority number instead, or turn autonomy off.
 
 ---
+
+## 4b. Who is the GitHub user?
+
+Every action on GitHub is done **as some account**. The factory has three kinds of actor, and you choose which account each one uses.
+
+```mermaid
+flowchart LR
+    subgraph F["🏭 The factory"]
+        SC["⚙️ Synth City backend<br/>polls, opens PRs (App mode), merges"]
+        AG["🔨 Agents<br/>push branches, open PRs (ambient mode),<br/>labels, comments"]
+    end
+    H["🧑 People<br/>Director, Supervisor"]
+    SC -- "GITHUB_TOKEN<br/>(or the GitHub App)" --> GH["🐙 GitHub"]
+    AG -- "the agent user's gh / git login<br/>(or the App, through the lease)" --> GH
+    H -- "their own accounts" --> GH
+```
+
+| GitHub action | Done by | As which account |
+|---|---|---|
+| Read issues, PRs, checks, CI logs | ⚙️ Backend | The owner of `GITHUB_TOKEN` |
+| Push the branch | 🔨 Builder (`git push`) | **Ambient:** the agent user's own git/`gh` login. **App:** a short-lived App token, through a credential helper that works only while the builder holds the folder's lease |
+| Open the draft PR | 🔨 Builder (ambient) / ⚙️ backend (App) | Ambient: the agent's login. App: the App's bot |
+| Add or remove labels, comment | 🔨 Builder, 🔍 verifier (`gh`) | The agent user's `gh` login |
+| Merge | ⚙️ Backend | The owner of the token the backend merges with |
+| Commit author (inside the commits) | 🔨 Builder | **Not a GitHub account:** the slot identity the backend wrote, e.g. `B3 … (Synth City agent) <…+slot40@synth-city.local>` |
+
+**What the Synth City factory does today:** `github_auth_mode: ambient`, with **one personal account** for everything the factory does. The backend's token and the agent user's `gh` login belong to the Director. In v4.3, 51 merges show that account (the factory's automatic merges), and 34 show the Supervisor's own account (its hand merges and recoveries). That works, but it has costs:
+- **The agents can do anything that account can do**, on every repository it can reach, not only this one.
+- A merge by the Director and a merge by the factory look **the same** on GitHub.
+- If that token leaks, it's a personal token that leaked.
+
+### Best practice, from good to best
+
+| | 🥉 Your personal account | 🥈 A machine user | 🥇 A GitHub App |
+|---|---|---|---|
+| **What it is** | Your own login, for the agents and `GITHUB_TOKEN` | A **separate GitHub account** for the factory (for example `yourname-factory`), invited to the factory's repositories only | A GitHub App you create and install on the repositories; Synth City makes short-lived tokens from its private key |
+| **Setup** | None | 10 minutes: new account, invite with **Write** (not Admin), a **fine-grained token** for those repositories | 30 minutes: create the App, download its key, install it; set `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_BOT_LOGIN` |
+| **Blast radius if misused** | Everything you can do | Only the factory's repositories | Only the installed repositories, and pushes only while a lease is held |
+| **Who did what, on GitHub** | ❌ Can't tell you from the factory | ✅ The factory's account vs yours | ✅ The bot vs people |
+| **Good for** | Trying Synth City on a test repository | **A first real factory (recommended start)** | A long-running factory, or several teams |
+
+> [!TIP]
+> **Recommendation:** use **a machine user** for a dedicated factory from day one. Give its fine-grained token only these permissions, on only the factory's repositories:
+>
+> | Permission | Access | Why |
+> |---|---|---|
+> | Contents | Read and write | Push branches, merge |
+> | Pull requests | Read and write | Open PRs, mark ready, merge |
+> | Issues | Read and write | Labels, comments |
+> | Checks, Commit statuses, Actions | Read | Required checks, CI logs and queue times |
+> | Metadata | Read | Required by GitHub |
+>
+> Log the agent user in as that account (`gh auth login`, as the agent user), and use a token of the same account for `GITHUB_TOKEN`. Keep your own account for your own work. **Never give the agents an Owner or Admin token**, and keep branch protection with required checks on `main`/`master` as a safety net, even though Synth City checks the gates itself.
+>
+> In App mode you still need `GITHUB_TOKEN` for polling (a machine user's read-only token is enough).
 
 ## 5. The team (preset)
 
