@@ -37,7 +37,7 @@ Here is the same journey as a story, from the 4.4 campaign:
 5. **B3 builds**, runs the focused tests, and pushes. Nothing stops it from touching other files at this point: for a first plan, staying inside the plan is **checked by the verifier** in step 7. (Synth City compares files automatically only for continuation revisions; see section 7.)
 6. **B3 opens the PR** with the `synth-city-v44-review-hold` label, so it can't merge yet, even if CI is green.
 7. **V1 reviews commit `a1b2c3d`**, the exact head: the acceptance items, the tests, and that the changes **stay inside the issue and the approved plan**. It records `accepted` and removes the hold label. If B3 pushes again, V1 must review the new commit.
-8. **All five required checks are green**, V1's acceptance is for the current head, and the hold is gone, so Synth City merges. One of today's 80 automatic merges is used.
+8. **All five required checks are green**, V1's acceptance is for the current head, the Leader's approval is current, and the hold is gone. On its next poll, the **Synth City backend** re-checks all of this and calls GitHub's merge API itself, with the backend's `GITHUB_TOKEN` and the exact commit it checked (if anything was pushed in between, GitHub refuses). No agent issues the merge. GitHub records the merge under **the account that owns the token**. One of today's 80 automatic merges is used.
 
 **When something goes wrong**, the budgets take over:
 
