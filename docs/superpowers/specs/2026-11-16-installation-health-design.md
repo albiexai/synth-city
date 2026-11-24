@@ -119,6 +119,38 @@ Severity: everything a team launch would fail on is `required`; everything that 
 4. **Agent access (first version)**: a bound Supervisor (external actor) reads redacted results through a Mail tool.
    Agent-run fixes wait for the permission model of the retrospectives design (v4.3), which is not built yet.
 
+## Additions from the operator guide (Director, 2026-11-24)
+
+Proposed by the Supervisor in Guide 3's open questions (`2026-11-16-installation-guides/`), accepted by the Director for 4.4 or 4.5. Tracked on #979.
+
+### A. Settings in force (read-only)
+
+The Installation page has a **Settings** section that shows every server setting that is in force:
+- its **value and source**: the code default, `backend/.env`, or the process environment;
+- **secrets as "set" or "not set"** only (`OPERATOR_TOKEN`, `GITHUB_TOKEN`, the App key path's readability), never their values or fingerprints in the UI;
+- a **restart needed** marker when `backend/.env` differs from what the running process loaded.
+
+It is never editable from the web app: the page shows the command to copy instead (the "boundary-changing" fix kind above). A smaller read-only version may ship earlier as a 4.4 gap-filler (#1280); this page absorbs it.
+
+### B. Autonomy readiness: blockers and warnings
+
+`GET …/github-scopes/{id}/activation-readiness` and the check engine share one set of checks, so the readiness view and `synth-city doctor` never disagree. Two levels:
+
+| Level | Checks | Override |
+|---|---|---|
+| **Blocker**: dispatch would be unsafe or fail without any message | the operator token is configured; `GITHUB_TOKEN` (or the App) can read the repository; the base branch exists **and** a CI workflow runs on PRs into it; at least one dispatch workspace is registered and usable; the ready label exists on GitHub; every enabled builder's area labels match at least one label in use (or none are set); with `merge_policy: auto`, at least one enabled verifier and a non-empty `required_checks` | none |
+| **Warning**: a judgement call | no supervisor bound for a team with autonomy; no backup newer than the threshold; `merge_policy: auto` or a daily cap above 10 on a team's first campaign; the agents' GitHub token has Admin or Owner rights | the Director acknowledges once; the acknowledgement is recorded in the audit log with the check's evidence |
+
+Evidence for each blocker: CI not triggering on a new release branch (#499 in 3.0, #556 in 3.1); items silently `pending` without workspaces; `no_eligible_owner` from unmatched lane labels; operator protection off when no token is configured.
+
+### C. Team kits (project 3): roster presets
+
+Guided setup offers three starting rosters as the first team kits: **Minimal** (Leader, one builder, one verifier: the smallest roster that can auto-merge), **Small** (Leader, two builders, one verifier), **Large** (the 4.4 line-up: four builders, two verifiers). Each carries the 4.4 charter templates (#1113), lane labels and cautious scope defaults (`merge_policy: human`, a low daily cap). Presets fix **roles and harnesses, not models**: guided setup asks which harnesses and subscriptions the operator has, suggests models, and warns about quota for the large roster.
+
+### D. Team-level overrides of timing settings (4.4, #1115)
+
+Rule: settings about the **machine** stay per installation; settings about the **repository** stay per scope; settings about **how a team works** become an installation default with an optional team override, as the Leader ack windows already are (a `null` override restores the default). First candidates: owner idle and nudge timers, the Mail unanswered time, team idle, wake follow-up, publishing summaries. Move only those with an observed need; the 4.4 retrospectives show which ones cost time.
+
 ## Left to the builder
 
 - The registry's module layout and the doctor command's packaging (backend console script vs. `productctl doctor`).

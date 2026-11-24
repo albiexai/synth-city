@@ -676,12 +676,14 @@ supervisor: external actor, bound with a check-in grace
 | Campaign insight | Overview counts | Retrospectives: where the time went, bottlenecks, cost (#944) | — |
 | Checking the setup | By hand | — | `synth-city doctor` and an Installation page (#979) |
 
-### Questions to refine with this guide
+### Decisions on the open questions (Director, 2026-11-24)
 
-1. Which settings should be **per team** and which **per installation**? (Today, timing settings are per installation in `.env`, and limits are per scope.)
-2. Should guided setup offer **presets** for common rosters (solo, small team, the 4.4 line-up)?
-3. Should the server settings in `.env` become visible (read-only) in the UI, so an operator sees what is in force?
-4. What is the minimum a new operator must set before autonomy is allowed? Should readiness enforce it?
+| Question | Decision | Resolved in |
+|---|---|---|
+| **Which settings are per team, which per installation?** | About the **machine** (tokens, port, database, agent user, HOLD path, memory) → per installation. About the **repository** (checks, labels, merge policy, limits) → per scope. About **how a team works** (idle and nudge timers, Mail unanswered time, wake follow-up) → an installation default with an **optional team override**, as the Leader ack windows already work. | **4.4**: #1115 |
+| **Roster presets in guided setup?** | Yes, as the first **team kits**: **Minimal** (Leader, builder, verifier), **Small** (Leader, two builders, verifier), **Large** (the 4.4 line-up). Each carries the charter templates and cautious defaults (human merge policy, a low daily cap). Presets fix roles and harnesses, **not models**: you choose models for your subscriptions, and the large roster warns about quota. | **4.5**: team kits (#979) |
+| **Show the `.env` settings in the UI?** | Yes, **read-only**: each setting's value and where it comes from (default, `.env`, environment); secrets only as "set" or "not set"; a "restart needed" marker when the file differs from what's running. Never editable from the web app. | **4.4**: #1280, if reached; otherwise **4.5**: Installation page |
+| **The minimum before autonomy, enforced by readiness?** | Yes. **Blockers** (no override): operator token set; GitHub can read the repository; the base branch exists and CI runs on PRs into it; a dispatch workspace is registered; the ready label exists; builders' lane labels match; for auto merge, a verifier and required checks. **Warnings** (acknowledged once, recorded): no supervisor; no recent backup; auto merge or a high cap on a first campaign; an Admin token for the agents. The same checks as `synth-city doctor`. | **4.5**: installation health (#979) |
 
 ---
 
