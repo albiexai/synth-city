@@ -564,6 +564,8 @@ class GithubRateLimitWindow(Base):
     __tablename__ = "github_rate_limit_windows"
 
     source: Mapped[str] = mapped_column(String, primary_key=True)
+    # Extensions keep the first deadline as their logical window identity.
+    window_reset_at: Mapped[datetime] = mapped_column(DateTime, primary_key=True)
     reset_at: Mapped[datetime] = mapped_column(DateTime, primary_key=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 

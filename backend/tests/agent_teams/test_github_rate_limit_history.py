@@ -153,8 +153,8 @@ async def test_lifespan_records_without_awaiting_an_open_database_writer(history
 
     async with main.lifespan(main.app):
         await db.execute(text(
-            "INSERT INTO github_rate_limit_windows (source, started_at, reset_at) "
-            "VALUES ('core', '2029-01-01 00:00:00', '2029-01-01 00:01:00')"
+            "INSERT INTO github_rate_limit_windows (source, started_at, reset_at, window_reset_at) "
+            "VALUES ('core', '2029-01-01 00:00:00', '2029-01-01 00:01:00', '2029-01-01 00:01:00')"
         ))
         try:
             with pytest.raises(GithubRateLimited):
@@ -182,7 +182,7 @@ async def test_later_secondary_deadline_adds_only_its_extension(history_database
             await service._after_response(response(429, {"retry-after": delay}))
     await writer.drain()
     sample = await campaign_rate_limit_time(db, NOW, NOW + 10 * MINUTE)
-    assert (sample.seconds, sample.sample_count) == (301, 2)
+    assert (sample.seconds, sample.sample_count) == (301, 1)
     starts = (await db.scalars(text("SELECT started_at FROM github_rate_limit_windows ORDER BY started_at"))).all()
     assert [datetime.fromisoformat(value).replace(tzinfo=timezone.utc) for value in starts] == [NOW, NOW + MINUTE]
 
@@ -202,12 +202,14 @@ async def test_core_window_identity_uses_the_current_github_reset():
         with pytest.raises(GithubRateLimited) as result:
             await service._after_response(refusal(reset))
         assert result.value.retry_at == NOW + 30 * MINUTE
-    assert observed == [("core", NOW, NOW + 10 * MINUTE), ("core", NOW, NOW + 20 * MINUTE)]
+    assert observed == [
+        ("core", NOW, NOW + limit * MINUTE, NOW + limit * MINUTE) for limit in (10, 20)
+    ]
 
     service = GithubRateLimitService(now=lambda: started, window_observer=lambda *window: observed.append(window))
     with pytest.raises(GithubRateLimited):
         await service._after_response(refusal(NOW - MINUTE))
-    assert observed[-1] == ("core", NOW, NOW + 30 * MINUTE)
+    assert observed[-1] == ("core", NOW, NOW + 30 * MINUTE, NOW + 30 * MINUTE)
 
     def observer_error(*_):
         raise RuntimeError("fixture recorder error")
@@ -289,3 +291,66 @@ async def test_queue_overflow_leaves_a_durable_unknown_interval(history_database
     assert earlier.seconds == 60
     lost = await history.campaign_rate_limit_time(db, NOW + 5 * MINUTE, NOW + 6 * MINUTE)
     assert lost.seconds is None
+
+
+@pytest.mark.asyncio
+async def test_repeated_relative_retry_after_counts_one_window(history_database):
+    db, sessions = history_database
+    from app.services.github_rate_limit_history import GithubRateLimitHistory, campaign_rate_limit_time
+
+    writer = GithubRateLimitHistory(sessions)
+    now = NOW
+    service = GithubRateLimitService(now=lambda: now, window_observer=writer.observe)
+    for attempt in range(6):
+        now = NOW + timedelta(milliseconds=200 * attempt)
+        with pytest.raises(GithubRateLimited):
+            await service._after_response(response(429, {"retry-after": "60"}))
+    await writer.drain()
+    sample = await campaign_rate_limit_time(db, NOW, NOW + 10 * MINUTE)
+    assert (sample.seconds, sample.sample_count) == (61, 1)
+    assert await db.scalar(text(
+        "SELECT count(*) FROM github_rate_limit_windows WHERE reset_at = window_reset_at"
+    )) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["idle", "write"])
+async def test_unclean_restart_preserves_time_before_the_last_checkpoint(history_database, monkeypatch, trigger):
+    db, sessions = history_database
+    from app.services import github_rate_limit_history as history
+
+    now = NOW.replace(tzinfo=None)
+    monkeypatch.setattr(history, "_now", lambda: now, raising=False)
+    monkeypatch.setattr(history, "_CHECKPOINT_INTERVAL", 0.02 if trigger == "idle" else 60, raising=False)
+    writer = history.GithubRateLimitHistory(sessions)
+    with writer.install_on_startup():
+        await database.init_db()
+    now += 5 * MINUTE
+    checkpoint = now
+    if trigger == "write":
+        writer.observe("core", NOW + 10 * MINUTE, NOW + 11 * MINUTE)
+        await writer.drain()
+    async with asyncio.timeout(2):
+        while True:
+            marked = await db.scalar(text(
+                "SELECT started_at FROM github_rate_limit_history_gaps WHERE ended_at IS NULL"
+            ))
+            if datetime.fromisoformat(marked) == checkpoint:
+                break
+            await asyncio.sleep(0.02)
+
+    # Stop only the test's coroutine and leave the durable marker open.
+    writer._checkpoint_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await writer._checkpoint_task
+    now += MINUTE
+    replacement = history.GithubRateLimitHistory(sessions)
+    with replacement.install_on_startup():
+        await database.init_db()
+    try:
+        before = await history.campaign_rate_limit_time(db, NOW, checkpoint)
+        tail = await history.campaign_rate_limit_time(db, checkpoint, now)
+        assert before.seconds == 0
+        assert tail.seconds is None
+    finally:
+        await replacement.close()

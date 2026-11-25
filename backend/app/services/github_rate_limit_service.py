@@ -61,7 +61,7 @@ class _Observation:
     reset_at: datetime | None
     retry_at: datetime | None
     observed_at: datetime
-    history_resets: dict[str, datetime] = field(default_factory=dict)
+    history_resets: dict[str, tuple[datetime, datetime]] = field(default_factory=dict)
 
 
 class GithubRateLimited(httpx.HTTPStatusError):
@@ -74,7 +74,7 @@ class GithubRateLimited(httpx.HTTPStatusError):
 
 
 class GithubRateLimitService:
-    def __init__(self, now=None, *, window_observer: Callable[[str, datetime, datetime], None] | None = None):
+    def __init__(self, now=None, *, window_observer: Callable[[str, datetime, datetime, datetime], None] | None = None):
         self.window_observer = window_observer
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._observations: OrderedDict[bytes, _Observation] = OrderedDict()
@@ -125,18 +125,21 @@ class GithubRateLimitService:
             source = "core" if exhausted else "secondary"
             future_reset = reset_at if exhausted and reset_at is not None and reset_at > now else None
             history_reset = future_reset or retry_at
-            prior_reset = history_resets.get(source)
+            prior = history_resets.get(source)
+            prior_reset = prior[1] if prior else None
             active = prior_reset is not None and prior_reset > now
             new_deadline = prior_reset is not None and history_reset > prior_reset
             # Keep equal deadlines once. A later secondary deadline adds only its extension.
             if not active or (new_deadline and (source == "secondary" or future_reset is not None)):
-                history_start = max(now, prior_reset) if source == "secondary" and prior_reset is not None else now
+                history_start, window_reset = now, history_reset
+                if source == "secondary" and prior is not None and active:
+                    window_reset, history_start = prior
                 try:
-                    self.window_observer(source, history_start, history_reset)
+                    self.window_observer(source, history_start, history_reset, window_reset)
                 except Exception as exc:
                     logger.warning("github_rate_limit_history_enqueue_failed error_type=%s", type(exc).__name__)
                 else:
-                    history_resets[source] = history_reset
+                    history_resets[source] = (window_reset, history_reset)
         observed_at = now
         if previous and previous.retry_at and previous.retry_at > now:
             # A response from a request already in flight cannot shorten an observed pause.
