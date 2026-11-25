@@ -18,7 +18,10 @@ const flush = (ms = 0) => act(async () => { await vi.advanceTimersByTimeAsync(ms
 
 function stubServer() {
   // onWrite runs on the server when a write arrives, before the write is answered, like a real server.
-  const state = { n: 1, hold: false, onWrite: undefined as (() => void) | undefined };
+  const state = {
+    n: 1, hold: false, onWrite: undefined as (() => void) | undefined,
+    getStatus: 200, holdWrite: undefined as Promise<void> | undefined,
+  };
   const calls: { path: string; method: string }[] = [];
   const held: Array<() => void> = [];
   const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -26,12 +29,13 @@ function stubServer() {
     const method = init?.method ?? "GET";
     calls.push({ path, method });
     if (method !== "GET") {
+      if (state.holdWrite) await state.holdWrite;
       if (!path.includes("fail")) state.onWrite?.();
       return jsonResponse({ ok: true }, path.includes("fail") ? 500 : 200);
     }
     const value = state.n; // the data is fixed when the request is SENT, like a real server
     if (state.hold) await new Promise<void>((resolve) => held.push(resolve));
-    return jsonResponse({ n: value });
+    return state.getStatus === 200 ? jsonResponse({ n: value }) : jsonResponse({ detail: "unavailable" }, state.getStatus);
   });
   vi.stubGlobal("fetch", fetch);
   return { state, calls, held, gets: (path?: string) => calls.filter((c) => c.method === "GET" && (!path || c.path === path)) };
@@ -139,6 +143,35 @@ describe("summary polling cadence", () => {
   });
 });
 
+describe("automatic retries keep the summary interval as a floor", () => {
+  it("retries a failed summary read after 15 s, not 5 s, and keeps a longer backoff", async () => {
+    const server = stubServer();
+    server.state.getStatus = 503;
+    render(<Summaries ids={[1]} />);
+    await flush();
+    expect(server.gets(summaryUrl(1))).toHaveLength(1);
+    await flush(14000);
+    expect(server.gets(summaryUrl(1))).toHaveLength(1);
+    await flush(1000);
+    expect(server.gets(summaryUrl(1))).toHaveLength(2); // retry 1: max(5 s, 15 s)
+    await flush(15000);
+    expect(server.gets(summaryUrl(1))).toHaveLength(3); // retry 2: max(10 s, 15 s)
+    await flush(29000);
+    expect(server.gets(summaryUrl(1))).toHaveLength(3); // retry 3 keeps its longer backoff of 30 s
+    await flush(1000);
+    expect(server.gets(summaryUrl(1))).toHaveLength(4);
+  });
+
+  it("keeps the 5 s retry of every other read", async () => {
+    const server = stubServer();
+    server.state.getStatus = 503;
+    render(<Other />);
+    await flush();
+    await flush(5000);
+    expect(server.gets("agent-teams/presets")).toHaveLength(2);
+  });
+});
+
 describe("a write the user makes refreshes the summaries at once", () => {
   it("starts a fresh read after a write that finishes while an older read is still in flight, and drops the older answer", async () => {
     const server = stubServer();
@@ -178,6 +211,60 @@ describe("a write the user makes refreshes the summaries at once", () => {
     await flush();
     expect(server.gets()).toHaveLength(4);
     expect(screen.getByText("t1:2")).toBeInTheDocument();
+  });
+
+  it("makes no request while the tab is hidden, drops the pre-write data, and reads each summary once when the tab is visible", async () => {
+    const server = stubServer();
+    render(<Summaries ids={[1, 2, 3]} />);
+    await flush();
+    expect(server.gets()).toHaveLength(3);
+    setVisibility("hidden");
+    server.state.onWrite = () => { server.state.n = 2; };
+    await new ApiClient().post("agent-teams/presets/1/leader", {});
+    await flush();
+    expect(server.gets()).toHaveLength(3); // no read while hidden
+    setVisibility("visible");
+    await flush();
+    expect(server.gets()).toHaveLength(6); // one fresh read for each summary
+    expect(screen.getByText("t3:2")).toBeInTheDocument();
+  });
+
+  it("defers the refresh when a write that began while visible finishes after the user switched tabs", async () => {
+    const server = stubServer();
+    render(<Summaries ids={[1, 2, 3]} />);
+    await flush();
+    let finishWrite: () => void = () => undefined;
+    server.state.holdWrite = new Promise<void>((resolve) => { finishWrite = resolve; });
+    server.state.onWrite = () => { server.state.n = 2; };
+    const write = new ApiClient().post("agent-teams/presets/1/leader", {});
+    await flush();
+    setVisibility("hidden");
+    finishWrite();
+    await write;
+    await flush();
+    expect(server.gets()).toHaveLength(3);
+    setVisibility("visible");
+    await flush();
+    expect(server.gets()).toHaveLength(6);
+  });
+
+  it("drops a read that was in flight when a write finished while the tab was hidden", async () => {
+    const server = stubServer();
+    server.state.hold = true;
+    render(<Summaries ids={[1]} />);
+    await flush();
+    expect(server.gets(summaryUrl(1))).toHaveLength(1); // read A, old data
+    setVisibility("hidden");
+    server.state.onWrite = () => { server.state.n = 2; server.state.hold = false; };
+    await new ApiClient().post("agent-teams/presets/1/leader", {});
+    server.held.forEach((release) => release()); // A answers late with the old data
+    await flush();
+    expect(screen.queryByText("t1:1")).not.toBeInTheDocument();
+    expect(server.gets(summaryUrl(1))).toHaveLength(1);
+    setVisibility("visible");
+    await flush();
+    expect(screen.getByText("t1:2")).toBeInTheDocument();
+    expect(server.gets(summaryUrl(1))).toHaveLength(2);
   });
 
   it("starts no read after a write that fails, or after a read", async () => {

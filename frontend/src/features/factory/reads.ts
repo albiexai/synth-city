@@ -42,6 +42,8 @@ class Observation<T> {
   promise: Promise<void> | null = null;
   readonly endpoint: string;
   readonly pollMs: number;
+  // A write finished while the tab was hidden: the shown data is older than the write. The next visible read fixes it.
+  stale = false;
   constructor(endpoint: string) {
     this.endpoint = endpoint;
     this.pollMs = isSummaryEndpoint(endpoint) ? SUMMARY_POLL_MS : POLL_MS;
@@ -61,15 +63,23 @@ class Observation<T> {
     if (document.visibilityState === "visible") void this.refresh();
     else this.schedule(this.pollMs);
   };
-  // A read that starts now. The read in flight may hold data from before a write the user just made, so its
-  // answer is dropped and a new request follows.
+  // The data may be older than a write the user just made. A read in flight may hold pre-write data, so its
+  // answer is dropped at once. A visible page reads again now. A hidden page makes no request: it reads once
+  // when the tab is visible again.
   refreshNow = () => {
     this.generation++;
     this.promise = null;
+    if (document.visibilityState !== "visible") {
+      this.stale = true;
+      this.schedule(this.pollMs);
+      this.publish({ ...this.state, refreshing: false });
+      return Promise.resolve();
+    }
     return this.refresh();
   };
   refresh = () => {
     if (this.promise) return this.promise;
+    this.stale = false;
     const generation = this.generation;
     this.publish({ ...this.state, refreshing: true });
     const request: Promise<void> = apiClient<T>(this.endpoint)
@@ -96,7 +106,8 @@ class Observation<T> {
           retrying: !stopped,
           stopped,
         });
-        this.schedule(stopped ? null : retryDelay(this.failures));
+        // The poll interval is a floor for an automatic retry. A longer backoff stays.
+        this.schedule(stopped ? null : Math.max(retryDelay(this.failures), this.pollMs));
       })
       .finally(() => {
         // An older read must not clear the promise of the newer one.
@@ -106,7 +117,7 @@ class Observation<T> {
     return request;
   };
   visibleRefresh = () => {
-    if (document.visibilityState === "visible" && !this.state.stopped)
+    if (document.visibilityState === "visible" && (this.stale || !this.state.stopped))
       void this.refresh();
   };
   subscribe = (fn: () => void) => {
