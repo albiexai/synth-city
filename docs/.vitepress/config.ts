@@ -71,6 +71,7 @@ export default defineConfig({
             { text: 'Agent Bridge', link: '/features/agent-bridge' },
             { text: 'Agent Mail', link: '/features/agent-mail' },
             { text: 'Agent Teams', link: '/features/agent-teams' },
+            { text: 'Charter Templates', link: '/features/charter-templates' },
             { text: 'External Agent Orchestration', link: '/features/external-agent-orchestration' },
             { text: 'CC Bridge', link: '/features/cc-bridge' },
             { text: 'Usage Tracking', link: '/features/usage' },
