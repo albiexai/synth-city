@@ -217,19 +217,27 @@ async def defer_milestone_exit(db, scope, item, title):
     request = EndStoppedItemRequest(operation_id=f"milestone-{key}", expected_dispatch_generation=generation,
         expected_scope_revision=item.active_scope_revision, outcome="deferred",
         reason="The issue left this team's backlog milestone.", target_milestone=(title or "no milestone")[:120])
-    await end_stopped_item(db, item, scope, request, allow_unstarted=True,
-        actor=audit.derive_actor(actor_kind="scheduler", scheduler=_WATCHER_SCHEDULER))
+    try:
+        await end_stopped_item(db, item, scope, request, allow_unstarted=True,
+            actor=audit.derive_actor(actor_kind="scheduler", scheduler=_WATCHER_SCHEDULER))
+    except ValueError as exc:
+        if item.dispatch_status != "pending" or str(exc) != "item_not_stopped":
+            raise
+        await _notify_milestone_exit(db, scope, item, title)
 
 
 async def _notify_milestone_exit(db, scope, item, title):
     from app.models.schemas import MailMessageCreate
     from app.services.agent_mail_service import agent_mail_service
     from app.services.factory_audit_service import sanitize_text
+    from app.services.github_workspace_service import github_workspace_service
 
     item_id = item.id
     await _lock_repository(db, scope)
     item = await db.get(GithubWorkItem, item_id, populate_existing=True)
-    if item is None or item.dispatch_status not in _ACTIVE_STATUSES:
+    leased_pending = (item is not None and item.dispatch_status == "pending"
+                      and await github_workspace_service.get_leased_workspace(db, item_id) is not None)
+    if item is None or (item.dispatch_status not in _ACTIVE_STATUSES and not leased_pending):
         await db.commit()
         return
     subject = "Issue milestone changed"

@@ -104,9 +104,9 @@ async def end_stopped_item(db, item, scope, request, *, actor, before_commit=Non
     generation = public_generation(item_id, item.dispatch_nonce) if item.dispatch_nonce else None
     if generation != request.expected_dispatch_generation or item.active_scope_revision != request.expected_scope_revision:
         raise ValueError("end_stopped_item_context_changed")
+    # A reservation can leave preparation fields on a pending item without launching an agent.
     unstarted = (allow_unstarted and request.outcome == "deferred" and item.dispatch_status == "pending"
-                 and not any((item.dispatch_nonce, item.launch_id, item.pr_number, item.dispatch_head_ref,
-                              item.dispatch_base_ref, item.dispatched_at, item.active_scope_revision,
+                 and not any((item.launch_id, item.pr_number, item.active_scope_revision,
                               item.handoff_state, item.handoff_target_slot_id)))
     if item.dispatch_status not in ATTENTION_STATUSES and not unstarted:
         raise ValueError("item_not_stopped")

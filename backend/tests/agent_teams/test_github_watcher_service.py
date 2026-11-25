@@ -268,7 +268,8 @@ def _milestone_issue(scope, title):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reverse", [False, True])
-async def test_milestone_move_waits_for_original_owner_in_either_poll_order(db, reverse):
+@pytest.mark.parametrize("prepared", [False, True])
+async def test_milestone_move_waits_for_original_owner_in_either_poll_order(db, reverse, prepared):
     old = await _make_scope(db, preset_name="Old", milestone="V1")
     new = await _make_scope(db, preset_name="New", milestone="V2")
     fallback = await _make_scope(db, preset_name="Fallback")
@@ -278,6 +279,13 @@ async def test_milestone_move_waits_for_original_owner_in_either_poll_order(db, 
     await github_watcher_service.poll_scope(db, old, _FakeClient(labeled=[issue]))
     original = await db.scalar(select(GithubWorkItem))
     assert original.scope_id == old.id
+    if prepared:
+        original.dispatch_nonce = "prepared"
+        original.dispatch_base_ref = "release/v1"
+        original.dispatch_head_ref = "work/issue-1"
+        original.dispatched_at = original.github_updated_at
+        original.pending_reason = "queued_no_workspace"
+        await db.commit()
 
     moved = _milestone_issue(old, "V2")
     for scope in ([new, old] if reverse else [old, new]):
@@ -317,8 +325,8 @@ async def test_concurrent_label_only_polls_admit_at_most_one_owner(db):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["escalated", "failed", "dispatched", "verifying", "awaiting_human_review"])
-async def test_milestone_exit_defers_or_notifies_once(db, status):
+@pytest.mark.parametrize("status", ["escalated", "failed", "pending", "dispatched", "verifying", "awaiting_human_review"])
+async def test_milestone_exit_defers_or_notifies_once(db, status, caplog):
     from app.services.agent_team_supervisor_service import supervisor_inbox
 
     scope = await _make_scope(db, milestone="V1")
@@ -335,12 +343,21 @@ async def test_milestone_exit_defers_or_notifies_once(db, status):
     item = GithubWorkItem(scope_id=scope.id, issue_number=1, issue_title="Issue", issue_url="u",
                           github_updated_at=datetime(2026, 7, 1), dispatch_status=status, owner_slot_id=owner.id)
     db.add(item)
+    if status == "pending":
+        item.dispatch_nonce = "prepared"
+        await db.flush()
+        workspace = GithubWorkspace(scope_id=scope.id, path="/tmp/r-held", leased_item_id=item.id)
+        db.add(workspace)
     await db.commit()
     destination = await _make_scope(db, preset_name="Destination", milestone="V2")
     moved = dict(_milestone_issue(scope, "V2"), labels=[])
     client = _FakeClient(by_number={1: moved})
     for _ in range(2):
         await github_watcher_service.poll_scope(db, scope, client)
+    assert "Completion failed" not in caplog.text
+    if status == "pending":
+        await db.refresh(workspace)
+        assert workspace.leased_item_id == item.id
     if status in {"escalated", "failed"}:
         assert item.dispatch_status == "cancelled"
         assert await db.scalar(select(FactoryAuditEvent.id).where(

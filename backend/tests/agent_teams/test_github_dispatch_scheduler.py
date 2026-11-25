@@ -598,7 +598,7 @@ async def test_scheduler_blocks_launch_after_fresh_milestone_move(db, prepared):
     }))
 
     await db.refresh(item)
-    assert item.dispatch_status == ("pending" if prepared else "cancelled")
+    assert item.dispatch_status == "cancelled"
     assert item.launch_id is None
 
 
