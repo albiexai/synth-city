@@ -41,6 +41,7 @@ from app.services.github_client import (
     GithubTreeEntry,
     github_client,
 )
+from app.services.github_check_history_service import observe_tracked_checks
 from app.services.github_check_observation import GithubCheckObservationError
 from app.services import required_ci_attention
 from app.services.github_ci_watch_service import github_ci_watch_service
@@ -2387,11 +2388,7 @@ class GithubVerificationService:
             )
             await db.commit()
             return
-        checks = await client.list_check_runs_for_ref(
-            scope.repo_owner,
-            scope.repo_name,
-            head_sha,
-        )
+        checks = await observe_tracked_checks(db, scope, item, client, head_sha, policy)
         signal = "check_runs"
         evidence_rows = self._diagnostic_check_evidence(checks)
         if checks:
@@ -2774,11 +2771,7 @@ class GithubVerificationService:
             item.verification_head_sha = head_sha
             item.verification_started_at = started_at
             await db.commit()
-        checks = await client.list_check_runs_for_ref(
-            scope.repo_owner,
-            scope.repo_name,
-            head_sha or "",
-        )
+        checks = await observe_tracked_checks(db, scope, item, client, head_sha or "", policy)
         if ci_context is not None and policy.required_checks and not await self._completion_head_is_current(
                 db, scope, item, client, head_sha, revision=revision):
             return
@@ -3009,10 +3002,10 @@ class GithubVerificationService:
                         },
                     )
                     await db.commit()
-            elif effective_policy(item, scope).required_checks:
+            elif (policy := effective_policy(item, scope)).required_checks:
                 # Human review can remain open across reruns. Keep its check view
                 # current in the normal monitor, without polling from UI reads.
-                checks = await client.list_check_runs_for_ref(scope.repo_owner, scope.repo_name, current_head)
+                checks = await observe_tracked_checks(db, scope, item, client, current_head, policy)
                 if ci_context is not None and not await self._completion_head_is_current(
                         db, scope, item, client, current_head):
                     return
@@ -3493,9 +3486,7 @@ class GithubVerificationService:
         """Wait for head checks without charging implementation retries."""
         ci_context = await github_ci_watch_service.capture(db, scope, item)
         policy = effective_policy(item, scope)
-        checks = await client.list_check_runs_for_ref(
-            scope.repo_owner, scope.repo_name, head_sha,
-        )
+        checks = await observe_tracked_checks(db, scope, item, client, head_sha, policy)
         if ci_context is not None and policy.required_checks and not await self._completion_head_is_current(
                 db, scope, item, client, head_sha):
             return True
@@ -3576,7 +3567,7 @@ class GithubVerificationService:
             head = self._head_sha(pull)
             if not head or head != item.merge_wait_head_sha:
                 return None
-            checks = await client.list_check_runs_for_ref(scope.repo_owner, scope.repo_name, head)
+            checks = await observe_tracked_checks(db, scope, item, client, head, effective_policy(item, scope))
             status = await client.get_combined_status_for_ref(scope.repo_owner, scope.repo_name, head)
             if self._pending_merge_checks(checks, status, head):
                 return None

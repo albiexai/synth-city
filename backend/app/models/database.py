@@ -521,6 +521,43 @@ class GithubDeliveryPolicyEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class GithubCheckRunHistory(Base):
+    """A completed check, classified by the delivery policy at first observation."""
+
+    __tablename__ = "github_check_run_history"
+
+    repository: Mapped[str] = mapped_column(String, primary_key=True)
+    check_run_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    head_sha: Mapped[str] = mapped_column(String, nullable=False)
+    # Scalar attribution survives deletion of the scope or work item.
+    scope_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    pr_number: Mapped[int | None] = mapped_column(Integer)
+    policy_revision: Mapped[int | None] = mapped_column(Integer)
+    check_name: Mapped[str | None] = mapped_column(String)
+    app_id: Mapped[int | None] = mapped_column(BigInteger)
+    app_slug: Mapped[str | None] = mapped_column(String)
+    required: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    conclusion: Mapped[str | None] = mapped_column(String)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    job_created_at: Mapped[datetime | None] = mapped_column(DateTime)
+    run_attempt: Mapped[int | None] = mapped_column(Integer)
+    workflow_name: Mapped[str | None] = mapped_column(String)
+    workflow_path: Mapped[str | None] = mapped_column(String)
+    observed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    __table_args__ = (Index("ix_github_check_run_history_head", "repository", "head_sha"),)
+
+
+class GithubCheckRunHistoryCoverage(Base):
+    """The installation's forward coverage boundary, independent of its first poll."""
+
+    __tablename__ = "github_check_run_history_coverage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 class GithubMaintenanceEvent(Base):
     """An operator reports a maintenance outcome without granting execution authority."""
 

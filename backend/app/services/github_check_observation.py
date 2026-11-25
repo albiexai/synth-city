@@ -7,7 +7,10 @@ An incomplete observation raises an error. It never supplies a green fallback.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 import re
 from time import monotonic
 from urllib.parse import parse_qs, urlsplit
@@ -16,7 +19,7 @@ import httpx
 
 from app.services.github_rate_limit_service import GithubRateLimited
 
-_ACTIONS_APP_ID = 15368
+ACTIONS_APP_ID = 15368
 _PENDING = {"queued", "requested", "waiting", "pending", "in_progress"}
 _CONCLUSIONS = {
     "success", "failure", "neutral", "cancelled", "skipped", "timed_out",
@@ -62,6 +65,31 @@ class _Run:
     context: tuple
     status: str
     conclusion: str | None
+    # Metadata can be absent or change independently of the execution proof.
+    name: object = field(default=None, compare=False)
+    path: object = field(default=None, compare=False)
+
+
+@dataclass
+class RawCheckObservation:
+    checks: list[dict] = field(default_factory=list)
+    workflows: dict[int, _Run] = field(default_factory=dict)
+    jobs: dict[int, tuple[int, object]] = field(default_factory=dict)
+    complete: bool = False
+
+
+_raw_observation: ContextVar[RawCheckObservation | None] = ContextVar("raw_check_observation", default=None)
+
+
+@contextmanager
+def capture_raw_check_observation() -> Iterator[RawCheckObservation]:
+    """Capture raw facts for the tracked poll independently of its check verdict."""
+    observation = RawCheckObservation()
+    token = _raw_observation.set(observation)
+    try:
+        yield observation
+    finally:
+        _raw_observation.reset(token)
 
 
 class _Reader:
@@ -177,7 +205,7 @@ class _Reader:
                 _positive(row.get("id")), _positive(row.get("check_suite_id")),
                 _positive(row.get("run_number")), _positive(row.get("run_attempt")),
                 (_positive(row.get("workflow_id")), event, branch, head_repo_id, numbers),
-                row["status"], row.get("conclusion"),
+                row["status"], row.get("conclusion"), row.get("name"), row.get("path"),
             ))
         _require(len(repo_ids) <= 1, "execution_repository_mismatch")
         _require(len({run.suite for run in runs}) == len(runs), "duplicate_execution_suite")
@@ -186,9 +214,14 @@ class _Reader:
     async def observe(self) -> list[dict]:
         checks_path = self.prefix + f"/commits/{self.sha}/check-runs"
         checks = await self.pages(checks_path, "check_runs", {"filter": "all"})
+        raw = _raw_observation.get()
+        if raw is not None:
+            raw.checks = checks
         latest_checks = await self.pages(checks_path, "check_runs", {"filter": "latest"})
         runs = await self.runs()
         suites = {run.suite: run for run in runs}
+        if raw is not None:
+            raw.workflows = suites
         all_checks = {check["id"]: check for check in checks}
         _require(all(all_checks.get(check["id"]) == check for check in latest_checks), "observation_changed")
         latest_ids = {check["id"] for check in latest_checks}
@@ -202,7 +235,7 @@ class _Reader:
             app = check.get("app")
             _require(isinstance(app, dict), "invalid_check_application")
             app_id = _positive(app.get("id"))
-            is_actions = app_id == _ACTIONS_APP_ID
+            is_actions = app_id == ACTIONS_APP_ID
             _require(is_actions == (app.get("slug") == "github-actions"), "invalid_actions_application")
             if not is_actions:
                 # Preserve GitHub's existing latest-check policy for other
@@ -251,6 +284,8 @@ class _Reader:
                 check = action_checks.get(check_id)
                 _require(check is not None and check["check_suite"]["id"] == run.suite, "unresolved_job_check")
                 _require(check.get("status") == job.get("status") and check.get("conclusion") == job.get("conclusion"), "observation_changed")
+                if raw is not None:
+                    raw.jobs[check_id] = attempt, job.get("created_at")
                 effective.append({**check, "evidence_source": "github_actions_job", "workflow_run_id": run.id, "run_attempt": attempt})
             excluded = {
                 check_id for check_id, check in action_checks.items()
@@ -274,7 +309,10 @@ class _Reader:
                         _require(url.scheme == "https" and url.netloc == "api.github.com" and url.path.startswith(prefix) and not url.query and not url.fragment, "invalid_job_check_identity")
                         suffix = url.path[len(prefix):]
                         _require(suffix.isascii() and suffix.isdecimal(), "invalid_job_check_identity")
-                        proven_old.add(_positive(int(suffix)))
+                        check_id = _positive(int(suffix))
+                        proven_old.add(check_id)
+                        if raw is not None and check_id in excluded:
+                            raw.jobs[check_id] = attempt, job.get("created_at")
                 _require(excluded <= proven_old, "unresolved_current_checks")
             # This row is workflow evidence, not an invented aggregate check.
             effective.append({
@@ -289,6 +327,8 @@ class _Reader:
         final_checks = await self.pages(checks_path, "check_runs", {"filter": "all"})
         _require(checks == final_checks, "observation_changed")
         _require(latest_checks == await self.pages(checks_path, "check_runs", {"filter": "latest"}), "observation_changed")
+        if raw is not None:
+            raw.complete = True
         return effective
 
 
