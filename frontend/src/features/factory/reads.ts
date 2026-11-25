@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useRef, useSyncExternalStore } from "react";
-import { ApiHttpError, apiClient } from "@/lib/api";
+import { ApiHttpError, apiClient, onApiWrite } from "@/lib/api";
 
 // Shared per-URL read state. No mutation, credential, owner claim or GitHub poll.
 export interface ReadState<T> {
@@ -12,6 +12,12 @@ export interface ReadState<T> {
   stopped: boolean;
 }
 const POLL_MS = 5000;
+// #1173: a team summary changes slowly and can take about 2 s to build, so it is read less often.
+const SUMMARY_POLL_MS = 15000;
+const SUMMARY_ENDPOINT = /^agent-teams\/presets\/\d+\/summary(\?|$)/;
+function isSummaryEndpoint(endpoint: string) {
+  return SUMMARY_ENDPOINT.test(endpoint);
+}
 const RETRY_MS = [5000, 10000, 30000, 60000];
 // The request will fail again until the URL or the server data changes.
 const PERMANENT = new Set([400, 401, 404, 410, 422]);
@@ -35,8 +41,12 @@ class Observation<T> {
   generation = 0;
   promise: Promise<void> | null = null;
   readonly endpoint: string;
+  readonly pollMs: number;
+  // A write finished while the tab was hidden: the shown data is older than the write. The next visible read fixes it.
+  stale = false;
   constructor(endpoint: string) {
     this.endpoint = endpoint;
+    this.pollMs = isSummaryEndpoint(endpoint) ? SUMMARY_POLL_MS : POLL_MS;
   }
   publish(state: ReadState<T>) {
     this.state = state;
@@ -51,13 +61,28 @@ class Observation<T> {
   tick = () => {
     this.timer = null;
     if (document.visibilityState === "visible") void this.refresh();
-    else this.schedule(POLL_MS);
+    else this.schedule(this.pollMs);
+  };
+  // The data may be older than a write the user just made. A read in flight may hold pre-write data, so its
+  // answer is dropped at once. A visible page reads again now. A hidden page makes no request: it reads once
+  // when the tab is visible again.
+  refreshNow = () => {
+    this.generation++;
+    this.promise = null;
+    if (document.visibilityState !== "visible") {
+      this.stale = true;
+      this.schedule(this.pollMs);
+      this.publish({ ...this.state, refreshing: false });
+      return Promise.resolve();
+    }
+    return this.refresh();
   };
   refresh = () => {
     if (this.promise) return this.promise;
+    this.stale = false;
     const generation = this.generation;
     this.publish({ ...this.state, refreshing: true });
-    this.promise = apiClient<T>(this.endpoint)
+    const request: Promise<void> = apiClient<T>(this.endpoint)
       .then((data) => {
         if (generation !== this.generation) return;
         this.failures = 0;
@@ -68,7 +93,7 @@ class Observation<T> {
           retrying: false,
           stopped: false,
         });
-        this.schedule(POLL_MS);
+        this.schedule(this.pollMs);
       })
       .catch((error: Error) => {
         if (generation !== this.generation) return;
@@ -81,15 +106,18 @@ class Observation<T> {
           retrying: !stopped,
           stopped,
         });
-        this.schedule(stopped ? null : retryDelay(this.failures));
+        // The poll interval is a floor for an automatic retry. A longer backoff stays.
+        this.schedule(stopped ? null : Math.max(retryDelay(this.failures), this.pollMs));
       })
       .finally(() => {
-        this.promise = null;
+        // An older read must not clear the promise of the newer one.
+        if (this.promise === request) this.promise = null;
       });
-    return this.promise;
+    this.promise = request;
+    return request;
   };
   visibleRefresh = () => {
-    if (document.visibilityState === "visible" && !this.state.stopped)
+    if (document.visibilityState === "visible" && (this.stale || !this.state.stopped))
       void this.refresh();
   };
   subscribe = (fn: () => void) => {
@@ -116,6 +144,12 @@ class Observation<T> {
   snapshot = () => this.state;
 }
 const observations = new Map<string, Observation<unknown>>();
+// #1173: after a write the user made, every summary that is on screen is read again from the server at once.
+onApiWrite(() => {
+  observations.forEach((observation) => {
+    if (isSummaryEndpoint(observation.endpoint) && observation.listeners.size) void observation.refreshNow();
+  });
+});
 // A null endpoint holds the read until the caller can build a valid URL.
 const IDLE: ReadState<never> = {
   data: null,
