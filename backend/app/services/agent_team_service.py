@@ -48,6 +48,7 @@ from app.services.agent_bridge.discovery import discover_agent_sessions
 from app.services.agent_bridge.spawn import spawn_session
 from app.services.agent_mail_service import MCP_HEARTBEAT_TTL_SECONDS, agent_mail_service
 from app.services.github_recovery_gate import configured_recovery_only_attempt
+from app.services.github_terminal_revision_service import TERMINAL_ITEMS, TERMINAL_REVISIONS
 from app.services.providers import get_provider, get_providers
 from app.services.providers.base import ProviderLaunchError, SpawnCommandOptions
 from app.services.opencode_process_identity import new_session_id as new_opencode_session_id
@@ -423,16 +424,14 @@ class AgentTeamService:
             blockers.append({"kind": "automation", "id": preset_id, "scope_id": None,
                              "href": f"/api/v1/agent-teams/presets/{preset_id}"})
 
-        # The existing scope-deletion predicate includes queued, review,
-        # escalated and failed work. Only merged/completed are known safe.
         items = (await db.execute(
-            select(GithubWorkItem.id, GithubWorkItem.scope_id)
+            select(GithubWorkItem.id, GithubWorkItem.scope_id, GithubWorkItem.dispatch_status)
             .where(GithubWorkItem.id.in_(item_ids),
-                   GithubWorkItem.dispatch_status.not_in(("merged", "completed")))
+                   GithubWorkItem.dispatch_status.not_in(TERMINAL_ITEMS))
             .order_by(GithubWorkItem.id).limit(25)
         )).all()
         blockers.extend({"kind": "work_item", "id": row.id, "scope_id": row.scope_id,
-                         "href": work_href} for row in items)
+                         "href": work_href, "dispatch_status": row.dispatch_status} for row in items)
 
         # Residual identity is authority too, even without a leased item FK.
         workspaces = (await db.execute(
@@ -461,16 +460,18 @@ class AgentTeamService:
         blockers.extend({"kind": "approval", "id": approval_id, "scope_id": None,
                          "href": work_href} for approval_id in approvals)
         revisions = (await db.execute(
-            select(GithubAttemptScopeRevision.id, GithubAttemptScopeRevision.work_item_id).where(
+            select(GithubAttemptScopeRevision.id, GithubAttemptScopeRevision.work_item_id,
+                   GithubWorkItem.dispatch_status)
+            .outerjoin(GithubWorkItem, GithubWorkItem.id == GithubAttemptScopeRevision.work_item_id)
+            .where(
                 or_(GithubAttemptScopeRevision.work_item_id.in_(item_ids),
                     GithubAttemptScopeRevision.owner_slot_id.in_(slot_ids),
                     GithubAttemptScopeRevision.expected_workspace_id.in_(workspace_ids)),
-                GithubAttemptScopeRevision.status.not_in(
-                    ("completed", "exhausted", "rejected", "superseded", "expired")
-                ),
+                GithubAttemptScopeRevision.status.not_in(TERMINAL_REVISIONS),
             ).order_by(GithubAttemptScopeRevision.id).limit(25)
         )).all()
         blockers.extend({"kind": "revision", "id": row.id, "scope_id": None,
+                         "dispatch_status": row.dispatch_status,
                          "href": f"/api/v1/agent-teams/github-work-items/{row.work_item_id}/scope-revisions"}
                         for row in revisions)
         try:

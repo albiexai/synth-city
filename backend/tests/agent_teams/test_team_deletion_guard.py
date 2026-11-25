@@ -13,12 +13,13 @@ from sqlalchemy import event, select, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app import database as app_database
 from app.api.v1 import agent_teams
 from app.config import settings
 from app.database import Base, get_db
 from app.main import app
 from app.models.database import (
-    AgentTeamLaunch, AgentTeamPreset, AgentTeamSlot, GithubApprovalRequest,
+    AgentTeamLaunch, AgentTeamPreset, AgentTeamSlot, FactoryAuditEvent, GithubApprovalRequest,
     GithubAttemptScopeRevision, GithubWorkItem, GithubWorkspace, MailAgentSession,
     MailTeamMember, TeamGithubScope,
 )
@@ -188,8 +189,13 @@ async def test_api_safe_409_preserves_team_and_does_not_sync(fixture_store, case
     assert detail["block_code"] == "team_in_use"
     assert 0 < len(detail["message"]) < 300
     assert PRIVATE not in response.text
-    assert any(b["kind"] == case.partition(":")[0] for b in detail["blockers"])
-    assert all(set(b) == {"kind", "id", "scope_id", "href"} for b in detail["blockers"])
+    blocker = next(b for b in detail["blockers"] if b["kind"] == case.partition(":")[0])
+    keys = {"kind", "id", "scope_id", "href"}
+    if blocker["kind"] in {"work_item", "revision"}:
+        keys.add("dispatch_status")
+        expected_status = case.partition(":")[2] if blocker["kind"] == "work_item" else "merged"
+        assert blocker["dispatch_status"] == expected_status
+    assert set(blocker) == keys
     assert all(b["href"].startswith("/api/v1/agent-teams/") for b in detail["blockers"])
     agent_teams._sync_github_jobs.assert_not_awaited()
     assert await snapshot(maker) == before
@@ -212,10 +218,10 @@ async def api_client(maker, token=OPERATOR):
         app.dependency_overrides.update(previous)
 
 
-@pytest.mark.parametrize("status", ("merged", "completed"))
+@pytest.mark.parametrize("status", ("merged", "completed", "closed", "cancelled", "withdrawn"))
 @pytest.mark.parametrize("authority", ("none", "approved", "rejected", "superseded", "expired",
                                         "revision_completed", "revision_exhausted", "revision_rejected",
-                                        "revision_superseded", "revision_expired"))
+                                        "revision_superseded", "revision_expired", "revision_cancelled"))
 async def test_safe_delete_cascades_and_reassigns_sessions(fixture_store, status, authority):
     maker, ids = fixture_store
     async with maker() as db:
@@ -240,6 +246,90 @@ async def test_safe_delete_cascades_and_reassigns_sessions(fixture_store, status
         assert session.team_slot_id is None
         assert session.capability_token_hash == PRIVATE
         assert (await db.execute(text("PRAGMA foreign_key_check"))).all() == []
+
+
+@pytest.fixture
+def startup_database(fixture_store, monkeypatch):
+    maker, ids = fixture_store
+    engine = maker.kw["bind"]
+    monkeypatch.setattr(app_database, "engine", engine)
+    monkeypatch.setattr(settings, "database_url", str(engine.url))
+    monkeypatch.setattr(settings, "test_instance", True)
+    return maker, ids
+
+
+@pytest.mark.parametrize(("item_status", "revision_status", "repaired"), [
+    ("merged", "active", True),
+    ("completed", "submitted", True),
+    ("cancelled", "escalated", True),
+    ("closed", "active", False),
+    ("withdrawn", "active", False),
+    ("verifying", "active", False),
+    ("merged", "proposed", False),
+    ("merged", "approved", False),
+    ("merged", "cancelled", False),
+])
+async def test_startup_repairs_only_stale_terminal_item_revisions(startup_database, item_status, revision_status, repaired):
+    maker, ids = startup_database
+    async with maker.begin() as db:
+        await seed_blocker(db, ids, f"work_item:{item_status}")
+        record = revision(ids, revision_status)
+        db.add(record)
+        await db.flush()
+        revision_id = record.id
+
+    await app_database.init_db()
+    await app_database.init_db()
+
+    async with maker() as db:
+        item = await db.get(GithubWorkItem, ids.item)
+        assert item.dispatch_status == item_status
+        record = await db.get(GithubAttemptScopeRevision, revision_id)
+        events = (await db.scalars(select(FactoryAuditEvent).where(
+            FactoryAuditEvent.event_kind == "revision_outcome",
+        ))).all()
+        if repaired:
+            assert record.status == "superseded"
+            assert record.cancellation_reason == "item_terminal_at_upgrade"
+            assert record.cancelled_at is not None
+            event, = events
+            assert event.item_id == ids.item
+            assert event.revision_id == revision_id
+            assert event.sanitized_reason == "item_terminal_at_upgrade"
+            assert event.after_values == {"status": "superseded"}
+            await agent_team_service.delete_preset(db, ids.preset)
+        else:
+            assert record.status == revision_status
+            assert record.cancellation_reason is None
+            assert record.cancelled_at is None
+            assert events == []
+
+
+async def test_startup_rolls_back_revision_repair_if_audit_fails(startup_database):
+    maker, ids = startup_database
+    async with maker.begin() as db:
+        older = revision(ids)
+        newer = revision(ids, "submitted")
+        newer.revision = 2
+        db.add_all([older, newer])
+        await db.execute(text(
+            "CREATE TRIGGER refuse_second_revision_outcome BEFORE INSERT ON factory_audit_events "
+            "WHEN NEW.event_kind = 'revision_outcome' AND EXISTS "
+            "(SELECT 1 FROM factory_audit_events WHERE event_kind = 'revision_outcome') "
+            "BEGIN SELECT RAISE(ABORT, 'synthetic revision audit failure'); END"
+        ))
+
+    with pytest.raises(IntegrityError, match="synthetic revision audit failure"):
+        await app_database.init_db()
+
+    async with maker() as db:
+        records = (await db.scalars(select(GithubAttemptScopeRevision)
+                                    .order_by(GithubAttemptScopeRevision.revision))).all()
+        assert [record.status for record in records] == ["active", "submitted"]
+        assert all(record.cancellation_reason is None and record.cancelled_at is None for record in records)
+        assert await db.scalar(select(FactoryAuditEvent.id).where(
+            FactoryAuditEvent.event_kind == "revision_outcome",
+        )) is None
 
 
 async def test_api_success_and_missing_preserve_existing_contract(fixture_store):
