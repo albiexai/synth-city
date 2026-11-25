@@ -18,7 +18,7 @@ Select **Set up a repository** (`/repositories/new`) for a guided configuration.
 
 1. **Repository** — enter the owner, name, primary checkout, base branch, dispatch and design labels, and dispatch authentication. **Check access and labels** reads the checkout identity, repository access, labels, base branch and the presence of the selected authentication. It makes no changes. It needs the operator credential.
 2. **Team and roles** — create an inactive team with an explicit Leader slot and worker slots, or use an existing team. An existing team keeps its roster, Leader, policy and activation.
-3. **Routing** — set area labels and expertise for each new worker slot. Overlap advice uses the loaded data.
+3. **Routing** — set area labels and expertise for each new worker slot. Each new member can also start a charter from a [template](/features/charter-templates). A charter with a placeholder left blocks the save. Overlap advice uses the loaded data.
 4. **Policy** — a new scope uses human merge, concurrency 1, one verification retry and no automatic merges. It is saved disabled, even when checks have gaps.
 5. **Review** — confirm **Save configuration only**. Saving does not launch workers or activate the scope. Credentials are not stored in the draft.
 6. **Saved setup** — review a current launch plan and launch the selected slots as a separate action. Activation is also separate: it needs a fresh ready check, no shared readiness blockers and acknowledgement of each listed overlap. Enabling the team also resumes its other enabled scopes.
