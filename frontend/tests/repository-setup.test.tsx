@@ -1947,4 +1947,275 @@ describe("guided repository setup", () => {
       expect(screen.getByText(/Repository: example\/synthetic-product/)).toBeInTheDocument();
     });
   });
+
+  describe("charter templates in guided setup (#1309)", () => {
+    const READY = { status: "ready", code: "ok", remedy: "ready" };
+    const HOLD = "{{hold_label}}";
+    const SUPERVISOR = "{{supervisor_address}}";
+
+    function mockChecks(extra: Record<string, unknown> = {}) {
+      mocks.apiClient.mockImplementation((endpoint: string) => {
+        if (endpoint.startsWith("factory/setup-preflight")) return Promise.resolve({
+          status: "ready", observed_at: "2026-10-05T00:00:00Z", checked_at: "2026-10-05T00:00:00Z",
+          checks: { checkout_identity: READY, ...extra },
+        });
+        return Promise.resolve(connectedRoster);
+      });
+    }
+    function mockCreate() {
+      const created = (input: { slots: Array<Record<string, unknown>> }) => ({
+        ...teamFixture(false), leader_slot_id: null, slots: input.slots.map((slot, index) => ({ ...slot, id: 101 + index })),
+      });
+      mocks.createAgentTeamPreset.mockImplementation(async (input) => created(input));
+      mocks.updateAgentTeamLeader.mockImplementation(async () => ({ ...created(mocks.createAgentTeamPreset.mock.calls[0][0]), leader_slot_id: 101 }));
+      mocks.createTeamGithubScope.mockImplementation(async (presetId, input) => ({ ...input, id: 55, preset_id: presetId }));
+    }
+    async function toRouting(options: { baseRef?: string; workers?: string } = {}) {
+      render(<MemoryRouter><RepositorySetupPage /></MemoryRouter>);
+      fireEvent.change(screen.getByLabelText("Repository owner"), { target: { value: "example" } });
+      fireEvent.change(screen.getByLabelText("Repository name"), { target: { value: "synthetic-product" } });
+      fireEvent.change(screen.getByLabelText("Primary checkout path"), { target: { value: "/synthetic/checkout" } });
+      if (options.baseRef) fireEvent.change(screen.getByLabelText(/^Base branch/), { target: { value: options.baseRef } });
+      fireEvent.click(screen.getByRole("button", { name: "Check access and labels" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Continue to configuration" }));
+      fireEvent.change(screen.getByLabelText("Team name"), { target: { value: "Synthetic team" } });
+      fireEvent.change(screen.getByLabelText("Worker slots, one name per line"), { target: { value: options.workers ?? "Worker A" } });
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    }
+    const group = (name: string) => screen.getByRole("group", { name });
+    const charterBox = (name: string) => within(group(name)).getByLabelText("Charter") as HTMLTextAreaElement;
+    const template = (name: string) => fireEvent.click(within(group(name)).getByRole("button", { name: "Start from a template" }));
+    const edit = (name: string, text: string) => fireEvent.change(charterBox(name), { target: { value: text } });
+    function resolveHoldAndSupervisor(name: string) {
+      edit(name, charterBox(name).value.replaceAll(HOLD, "hold-x").replaceAll(SUPERVISOR, "Supervisor (sup-key)"));
+    }
+    function reviewAndSave() {
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+      fireEvent.click(screen.getByLabelText(/Save configuration only/));
+    }
+
+    it("fills a worker charter with verified values and its lane, and leaves the hold label and supervisor unresolved", async () => {
+      mockChecks({ base_branch: READY, dispatch_label: READY });
+      await toRouting({ baseRef: "origin/release/v4.4" });
+      fireEvent.change(within(group("Worker A")).getByLabelText("Area labels, comma separated"), { target: { value: "backend, api" } });
+      template("Worker A");
+      const text = charterBox("Worker A").value;
+      expect(text).toContain("release/v4.4");
+      expect(text).toContain("albiex-synth-city-ready");
+      expect(text).toContain("backend, api");
+      expect(text).toContain("at most 60 active minutes");
+      for (const left of ["release_branch", "ready_label", "lane_label", "plan_size_limit"]) expect(text).not.toContain(`{{${left}}}`);
+      expect(text).toContain(HOLD);
+      expect(within(group("Worker A")).getByRole("status")).toHaveTextContent(HOLD);
+    });
+
+    it("leaves the release branch and ready label unresolved without ready checks", async () => {
+      mockChecks();
+      await toRouting({ baseRef: "origin/release/v4.4" });
+      template("Worker A");
+      expect(charterBox("Worker A").value).toContain("{{release_branch}}");
+      expect(charterBox("Worker A").value).toContain("{{ready_label}}");
+    });
+
+    it("never takes the symbolic origin/HEAD as the release branch", async () => {
+      mockChecks({ base_branch: READY, dispatch_label: READY });
+      await toRouting();
+      template("Worker A");
+      expect(charterBox("Worker A").value).toContain("{{release_branch}}");
+      expect(charterBox("Worker A").value).toContain("albiex-synth-city-ready");
+    });
+
+    it("blocks Save while a charter has an unresolved placeholder, and allows it once they are replaced or cleared", async () => {
+      mockChecks({ base_branch: READY, dispatch_label: READY });
+      mockCreate();
+      await toRouting({ baseRef: "origin/release/v4.4" });
+      template("Leader");
+      template("Worker A");
+      expect(charterBox("Leader").value).toContain(SUPERVISOR);
+      expect(within(group("Leader")).getByRole("status")).toHaveTextContent(HOLD);
+      expect(within(group("Leader")).getByRole("status")).toHaveTextContent(SUPERVISOR);
+      reviewAndSave();
+      expect(screen.getByRole("button", { name: "Save configuration" })).toBeDisabled();
+      const blocked = screen.getByText(/Save is blocked/);
+      expect(blocked).toHaveTextContent("Leader");
+      expect(blocked).toHaveTextContent("Worker A");
+      expect(blocked).toHaveTextContent(HOLD);
+      expect(mocks.createAgentTeamPreset).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      resolveHoldAndSupervisor("Leader");
+      edit("Worker A", "");
+      reviewAndSave();
+      expect(screen.queryByText(/Save is blocked/)).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Save configuration" })).toBeEnabled();
+    });
+
+    it("creates the team with the edited charters, no placeholder left, and no cap sent for the new scope", async () => {
+      mockChecks({ base_branch: READY, dispatch_label: READY });
+      mockCreate();
+      await toRouting({ baseRef: "origin/release/v4.4" });
+      fireEvent.change(within(group("Worker A")).getByLabelText("Area labels, comma separated"), { target: { value: "backend" } });
+      template("Leader");
+      template("Worker A");
+      resolveHoldAndSupervisor("Leader");
+      resolveHoldAndSupervisor("Worker A");
+      edit("Worker A", `${charterBox("Worker A").value}\nDirector note.`);
+      reviewAndSave();
+      fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+      await screen.findByRole("heading", { name: "Saved configuration" });
+
+      const [leader, worker] = mocks.createAgentTeamPreset.mock.calls[0][0].slots;
+      expect(leader.charter).toMatch(/^# Leader charter/);
+      expect(worker.charter).toMatch(/^# Builder charter/);
+      expect(worker.charter).toContain("Director note.");
+      expect(worker.charter).toContain("backend");
+      expect(leader.charter + worker.charter).not.toContain("{{");
+      expect(mocks.createTeamGithubScope.mock.calls[0][1]).not.toHaveProperty("max_item_effort_minutes");
+    });
+
+    it("keeps the charter text when the operator leaves the step and comes back", async () => {
+      mockChecks();
+      await toRouting();
+      edit("Worker A", "Plain charter.");
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      expect(charterBox("Worker A").value).toBe("Plain charter.");
+    });
+
+    it("sends no charter key when no charter was written", async () => {
+      mockChecks();
+      mockCreate();
+      await toRouting({ workers: "Worker A\nWorker B" });
+      reviewAndSave();
+      fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+      await screen.findByRole("heading", { name: "Saved configuration" });
+      for (const slot of mocks.createAgentTeamPreset.mock.calls[0][0].slots) expect(slot).not.toHaveProperty("charter");
+    });
+
+    it("offers a verifier charter in the Policy step for automatic merge, and blocks Save until it is resolved", async () => {
+      mockChecks({ base_branch: READY, dispatch_label: READY });
+      mockCreate();
+      await toRouting({ baseRef: "origin/release/v4.4" });
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      expect(screen.queryByRole("group", { name: "Verifier" })).not.toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText("Merge policy"), { target: { value: "auto" } });
+      template("Verifier");
+      expect(charterBox("Verifier").value).toMatch(/^# Reviewer charter/);
+      fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+      fireEvent.click(screen.getByLabelText(/Save configuration only/));
+      expect(screen.getByRole("button", { name: "Save configuration" })).toBeDisabled();
+      expect(screen.getByText(/Save is blocked/)).toHaveTextContent("Verifier");
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      resolveHoldAndSupervisor("Verifier");
+      fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+      fireEvent.click(screen.getByLabelText(/Save configuration only/));
+      fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+      await screen.findByRole("heading", { name: "Saved configuration" });
+      const slots = mocks.createAgentTeamPreset.mock.calls[0][0].slots;
+      expect(slots[slots.length - 1]).toMatchObject({ role: "verifier" });
+      expect(slots[slots.length - 1].charter).toMatch(/^# Reviewer charter/);
+    });
+
+    it("keeps the verifier charter on the verifier when a worker is later named Verifier", async () => {
+      mockChecks();
+      mockCreate();
+      await toRouting();
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      fireEvent.change(screen.getByLabelText("Merge policy"), { target: { value: "auto" } });
+      edit("Verifier", "Reviewer text.");
+      for (let i = 0; i < 2; i += 1) fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      fireEvent.change(screen.getByLabelText("Worker slots, one name per line"), { target: { value: "Worker A\nVerifier" } });
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      expect(charterBox("Verifier").value).toBe("");
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      expect(charterBox("Verifier 2").value).toBe("Reviewer text.");
+      fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+      fireEvent.click(screen.getByLabelText(/Save configuration only/));
+      fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+      await screen.findByRole("heading", { name: "Saved configuration" });
+      const pairs = mocks.createAgentTeamPreset.mock.calls[0][0].slots
+        .map((slot: { display_name: string; role: string; charter?: string }) => [slot.display_name, slot.role, slot.charter ?? null]);
+      expect(pairs).toEqual([
+        ["Leader", "Leader", null], ["Worker A", "Worker", null], ["Verifier", "Worker", null], ["Verifier 2", "verifier", "Reviewer text."],
+      ]);
+    });
+
+    it("keeps the Leader charter when the Leader slot is renamed, and never gives it to a worker of the same name", async () => {
+      mockChecks();
+      mockCreate();
+      await toRouting({ workers: "Worker A" });
+      edit("Leader", "Leader text.");
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      fireEvent.change(screen.getByLabelText("Explicit Leader slot"), { target: { value: "Worker A" } });
+      fireEvent.change(screen.getByLabelText("Worker slots, one name per line"), { target: { value: "Chief" } });
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      expect(charterBox("Worker A").value).toBe("Leader text.");
+      expect(charterBox("Chief").value).toBe("");
+      reviewAndSave();
+      fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+      await screen.findByRole("heading", { name: "Saved configuration" });
+      const pairs = mocks.createAgentTeamPreset.mock.calls[0][0].slots
+        .map((slot: { display_name: string; charter?: string }) => [slot.display_name, slot.charter ?? null]);
+      expect(pairs).toEqual([["Worker A", "Leader text."], ["Chief", null]]);
+    });
+
+    it("gives worker names that differ only by a space or a hyphen separate Charter fields", async () => {
+      mockChecks();
+      await toRouting({ workers: "Data Team\nData-Team" });
+      const first = charterBox("Data Team");
+      const second = charterBox("Data-Team");
+      expect(first.id).not.toBe(second.id);
+      edit("Data-Team", "Second only.");
+      expect(first.value).toBe("");
+      expect(second.value).toBe("Second only.");
+    });
+
+    it("shows no charter field for an existing team and sends none", async () => {
+      mockChecks();
+      mocks.fetchAgentTeamPresets.mockResolvedValue({ presets: [teamFixture(false)] });
+      render(<MemoryRouter><RepositorySetupPage /></MemoryRouter>);
+      fireEvent.change(screen.getByLabelText("Repository owner"), { target: { value: "example" } });
+      fireEvent.change(screen.getByLabelText("Repository name"), { target: { value: "synthetic-product" } });
+      fireEvent.change(screen.getByLabelText("Primary checkout path"), { target: { value: "/synthetic/checkout" } });
+      fireEvent.click(await screen.findByRole("button", { name: "Continue to configuration" }));
+      fireEvent.change(screen.getByLabelText("Team setup"), { target: { value: "existing" } });
+      fireEvent.change(screen.getByLabelText("Team"), { target: { value: "12" } });
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      expect(screen.getByText("Existing team routing stays unchanged.")).toBeInTheDocument();
+      expect(screen.queryByLabelText("Charter")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Start from a template" })).not.toBeInTheDocument();
+    });
+
+    it("stops a stale save when a charter changes while the team is being created", async () => {
+      mockChecks();
+      let resolveCreate: ((value: unknown) => void) | undefined;
+      mocks.createAgentTeamPreset.mockImplementation(() => new Promise((resolve) => { resolveCreate = resolve; }));
+      await toRouting();
+      edit("Worker A", "Plain charter.");
+      reviewAndSave();
+      fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+      await waitFor(() => expect(resolveCreate).toBeDefined());
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      edit("Worker A", "A different charter.");
+      resolveCreate?.(teamFixture(false));
+      await screen.findByText(/Inputs changed during the save/);
+      expect(mocks.createTeamGithubScope).not.toHaveBeenCalled();
+    });
+
+    it("refuses a recovered team whose charter differs from the draft", async () => {
+      mockChecks();
+      mocks.fetchAgentTeamPresets.mockResolvedValue({ presets: [teamFixture(false)] });
+      mocks.createAgentTeamPreset.mockRejectedValue(new mocks.ApiHttpError("transport reset", 0));
+      await toRouting();
+      edit("Worker A", "Plain charter.");
+      reviewAndSave();
+      fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+      await screen.findByText(/Reconcile uncertain create/);
+      fireEvent.click(screen.getByRole("button", { name: /Use Synthetic team/ }));
+      await screen.findByText(/no longer matches this draft/);
+    });
+  });
 });

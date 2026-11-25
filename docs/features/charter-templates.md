@@ -4,7 +4,7 @@
 
 A charter is the text that tells one team member how to work. Albiex Synth City ships a charter template for each of three roles: Leader, builder and reviewer. The templates are Markdown files in `frontend/src/features/factory/charter-templates/`. A Director can edit any charter that a template produces.
 
-Each template holds the same eight rules. Each rule has a one-line reason, so a reader knows why the rule exists. Guided setup offers the templates in a later change (#1309).
+Each template holds the same eight rules. Each rule has a one-line reason, so a reader knows why the rule exists. [Guided setup](/features/repositories#guided-configuration) offers the templates for a new team.
 
 ## The rules and why they exist
 
@@ -74,5 +74,16 @@ Until the per-scope plan-size limit exists (#1114a), the default of 60 minutes i
 ## Edit and append
 
 Every charter stays editable. A template never replaces a charter that has text. It adds the template below the existing text.
+
+## Start from a template in guided setup
+
+In the Routing step, the Leader and each worker have a **Charter** field. In the Policy step, the verifier has one when the merge policy is automatic. Each field has a **Start from a template** button.
+
+- An empty field is filled with the template of its role. Values come only from the checked repository settings. A value that was not checked stays as a placeholder.
+- A field with text is never replaced. The page asks if it should append the template below your text.
+- A warning names each placeholder that is still in the text of the field.
+- A templated charter must be resolved before the team is created. **Save configuration** stays off while a placeholder is left. Replace each placeholder with a real value in the text, or clear the charter.
+- Guided setup cannot fill `{{hold_label}}` or `{{supervisor_address}}`. Type the real value in each charter that has it.
+- An existing team keeps its roster and charters. Guided setup shows no charter field for it.
 
 :::
