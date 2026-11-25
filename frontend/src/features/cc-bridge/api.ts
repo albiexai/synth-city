@@ -1,4 +1,4 @@
-import { ApiHttpError, apiClient, buildEndpoint, type ApiError } from '@/lib/api'
+import { ApiHttpError, apiClient, buildEndpoint, notifyApiWrite, type ApiError } from '@/lib/api'
 import { API_BASE_URL } from '@/lib/constants'
 import { getOperatorToken } from '@/features/agent-teams/operatorAuth'
 import type { AgentProviderId } from '@/types/providers'
@@ -53,6 +53,7 @@ async function attachmentRequest<T>(
     throw new ApiHttpError(apiErrorMessage(error), response.status)
   }
 
+  notifyApiWrite(options.method)
   return response.json()
 }
 
