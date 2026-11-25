@@ -3,21 +3,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import cast
 
-from sqlalchemy import Table, select
+from sqlalchemy import Table, delete, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker
 
-from app.models.database import GithubRateLimitHistoryCoverage, GithubRateLimitWindow
-from app.services.sqlite_busy_retry import SqliteBusyExhausted, retry_when_busy
+from app.models.database import GithubRateLimitHistoryCoverage, GithubRateLimitHistoryGap, GithubRateLimitWindow
 
 logger = logging.getLogger(__name__)
 _MAX_PENDING_WINDOWS = 256
+_active_writers: dict[AsyncEngine | AsyncConnection, GithubRateLimitHistory] = {}
+_starting_writer: ContextVar[GithubRateLimitHistory | None] = ContextVar("starting_rate_limit_writer", default=None)
 
 
 def _insert_once(table: Table, dialect: str):
@@ -31,7 +35,10 @@ def _utc(value: datetime) -> datetime:
 
 async def install_rate_limit_history_coverage(conn: AsyncConnection) -> None:
     table = cast(Table, GithubRateLimitHistoryCoverage.__table__)
-    await conn.execute(_insert_once(table, conn.dialect.name), {"id": 1, "started_at": datetime.utcnow()})
+    now = datetime.utcnow()
+    await conn.execute(_insert_once(table, conn.dialect.name), {"id": 1, "started_at": now})
+    if (writer := _starting_writer.get()) is not None:
+        await writer._install_guard(conn, now)
 
 
 class GithubRateLimitHistory:
@@ -40,44 +47,104 @@ class GithubRateLimitHistory:
     def __init__(self, sessions: async_sessionmaker[AsyncSession]):
         self._sessions = sessions
         self._pending: dict[tuple[str, datetime], datetime] = {}
+        self._gap: tuple[datetime, datetime] | None = None
         self._task: asyncio.Task[None] | None = None
+        self._bind: AsyncEngine | AsyncConnection | None = None
+        self.marker_id: int | None = None
+        self.version = 0
+
+    @contextmanager
+    def install_on_startup(self) -> Iterator[None]:
+        """Install the outage guard in the application's database startup transaction."""
+        token = _starting_writer.set(self)
+        try:
+            yield
+        finally:
+            _starting_writer.reset(token)
+        if self._bind is not None:
+            _active_writers[self._bind] = self
+
+    async def _install_guard(self, conn: AsyncConnection, now: datetime) -> None:
+        # An open guard survives a shutdown that cannot persist its pending windows.
+        # On restart its runtime becomes a bounded coverage gap.
+        await conn.execute(update(GithubRateLimitHistoryGap).where(
+            GithubRateLimitHistoryGap.ended_at.is_(None), GithubRateLimitHistoryGap.started_at <= now,
+        ).values(ended_at=now))
+        table = cast(Table, GithubRateLimitHistoryGap.__table__)
+        self.marker_id = await conn.scalar(table.insert().values(started_at=now).returning(table.c.id))
+        self._bind = conn.engine
 
     def observe(self, source: str, started_at: datetime, reset_at: datetime) -> None:
-        key = (source, _utc(reset_at))
+        start, reset = _utc(started_at), _utc(reset_at)
+        key = (source, reset)
         if key not in self._pending:
+            self.version += 1
             if len(self._pending) >= _MAX_PENDING_WINDOWS:
+                if self._gap is None:
+                    self._gap = (start, reset)
+                else:
+                    self._gap = (min(start, self._gap[0]), max(reset, self._gap[1]))
                 logger.warning("github_rate_limit_history_queue_full")
             else:
-                self._pending[key] = _utc(started_at)
-        if self._pending and (self._task is None or self._task.done()):
+                self._pending[key] = start
+        self._ensure_task()
+
+    def overlaps_unwritten(self, start: datetime, end: datetime) -> bool:
+        if self._gap is not None and self._gap[0] < end and self._gap[1] > start:
+            return True
+        return any(starts < end and reset > start for (_, reset), starts in self._pending.items())
+
+    def _ensure_task(self) -> None:
+        if (self._pending or self._gap is not None) and (self._task is None or self._task.done()):
             self._task = asyncio.get_running_loop().create_task(self._write_pending())
 
     async def drain(self) -> None:
         if self._task is not None:
             await self._task
+        self._ensure_task()
+        if self._task is not None:
+            await self._task
+
+    async def close(self) -> None:
+        try:
+            await self.drain()
+            if self.marker_id is not None and not self._pending and self._gap is None:
+                async with self._sessions.begin() as db:
+                    await db.execute(delete(GithubRateLimitHistoryGap).where(
+                        GithubRateLimitHistoryGap.id == self.marker_id,
+                    ))
+        except SQLAlchemyError as exc:
+            logger.warning("github_rate_limit_history_close_failed error_type=%s", type(exc).__name__)
+        finally:
+            if self._bind is not None and _active_writers.get(self._bind) is self:
+                del _active_writers[self._bind]
 
     async def _write_pending(self) -> None:
-        while self._pending:
-            batch = self._pending.copy()
+        while self._pending or self._gap is not None:
+            batch, gap = self._pending.copy(), self._gap
             rows = [
                 {"source": source, "reset_at": reset_at, "started_at": started_at}
                 for (source, reset_at), started_at in batch.items()
             ]
-            try:
-                async with self._sessions() as db:
-                    table = cast(Table, GithubRateLimitWindow.__table__)
-                    statement = _insert_once(table, db.get_bind().dialect.name)
-
-                    async def append() -> None:
-                        await db.execute(statement, rows)
-                        await db.commit()
-
-                    await retry_when_busy(db, append, route="github_rate_limit_history", attempts=2)
-            except (SQLAlchemyError, SqliteBusyExhausted) as exc:
-                logger.warning("github_rate_limit_history_write_failed error_type=%s", type(exc).__name__)
-                return
+            for attempt in range(2):
+                try:
+                    async with self._sessions.begin() as db:
+                        if rows:
+                            table = cast(Table, GithubRateLimitWindow.__table__)
+                            await db.execute(_insert_once(table, db.get_bind().dialect.name), rows)
+                        if gap is not None:
+                            db.add(GithubRateLimitHistoryGap(started_at=gap[0], ended_at=gap[1]))
+                except SQLAlchemyError as exc:
+                    if attempt == 1:
+                        logger.warning("github_rate_limit_history_write_failed error_type=%s", type(exc).__name__)
+                        return
+                    await asyncio.sleep(0.05)
+                else:
+                    break
             for key in batch:
                 del self._pending[key]
+            if self._gap == gap:
+                self._gap = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +161,10 @@ async def campaign_rate_limit_time(
     start, end = _utc(started_at), _utc(ended_at)
     if end <= start:
         raise ValueError("Campaign end must be after its start")
+
+    writer = _active_writers.get(db.bind) if db.bind is not None else None
+    version = writer.version if writer is not None else None
+    overlaps_unwritten = writer is not None and writer.overlaps_unwritten(start, end)
     coverage = await db.scalar(select(GithubRateLimitHistoryCoverage.started_at).where(
         GithubRateLimitHistoryCoverage.id == 1,
     ))
@@ -101,8 +172,19 @@ async def campaign_rate_limit_time(
         GithubRateLimitWindow.reset_at > start,
         GithubRateLimitWindow.started_at < end,
     ).order_by(GithubRateLimitWindow.started_at))).all()
-    if coverage is None or coverage > start:
-        return CampaignRateLimitTime(None, len(windows), coverage.replace(tzinfo=timezone.utc) if coverage else None)
+    gap_query = select(GithubRateLimitHistoryGap.id).where(
+        GithubRateLimitHistoryGap.started_at < end,
+        or_(GithubRateLimitHistoryGap.ended_at.is_(None), GithubRateLimitHistoryGap.ended_at > start),
+    )
+    if writer is not None and writer.marker_id is not None:
+        # The local writer accounts for its own pending data. Other open guards
+        # are incomplete from this reader's point of view.
+        gap_query = gap_query.where(GithubRateLimitHistoryGap.id != writer.marker_id)
+    has_gap = await db.scalar(gap_query.limit(1)) is not None
+    coverage_started_at = coverage.replace(tzinfo=timezone.utc) if coverage is not None else None
+    if (coverage is None or coverage > start or has_gap or overlaps_unwritten
+            or (writer is not None and writer.version != version)):
+        return CampaignRateLimitTime(None, len(windows), coverage_started_at)
     seconds = 0.0
     cursor = start
     for window_start, reset in windows:
@@ -110,4 +192,4 @@ async def campaign_rate_limit_time(
         if left < right:
             seconds += (right - left).total_seconds()
             cursor = right
-    return CampaignRateLimitTime(seconds, len(windows), coverage.replace(tzinfo=timezone.utc))
+    return CampaignRateLimitTime(seconds, len(windows), coverage_started_at)

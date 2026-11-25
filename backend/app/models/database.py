@@ -579,6 +579,16 @@ class GithubRateLimitHistoryCoverage(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
+class GithubRateLimitHistoryGap(Base):
+    """An unknown interval, or an open guard for a running recorder."""
+
+    __tablename__ = "github_rate_limit_history_gaps"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
 class GithubMaintenanceEvent(Base):
     """An operator reports a maintenance outcome without granting execution authority."""
 

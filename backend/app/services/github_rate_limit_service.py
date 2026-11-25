@@ -126,11 +126,13 @@ class GithubRateLimitService:
             future_reset = reset_at if exhausted and reset_at is not None and reset_at > now else None
             history_reset = future_reset or retry_at
             prior_reset = history_resets.get(source)
-            # In-flight secondary responses can advertise the same relative Retry-After.
-            # An explicit newer core reset identifies a distinct GitHub window.
-            if prior_reset is None or prior_reset <= now or (future_reset is not None and future_reset > prior_reset):
+            active = prior_reset is not None and prior_reset > now
+            new_deadline = prior_reset is not None and history_reset > prior_reset
+            # Keep equal deadlines once. A later secondary deadline adds only its extension.
+            if not active or (new_deadline and (source == "secondary" or future_reset is not None)):
+                history_start = max(now, prior_reset) if source == "secondary" and prior_reset is not None else now
                 try:
-                    self.window_observer(source, now, history_reset)
+                    self.window_observer(source, history_start, history_reset)
                 except Exception as exc:
                     logger.warning("github_rate_limit_history_enqueue_failed error_type=%s", type(exc).__name__)
                 else:

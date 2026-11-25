@@ -27,21 +27,22 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     warn_legacy_environment()
-    # Startup: Initialize database
-    await init_db()
-    # Provider recovery needs the migrated database and retargeted backup index.
-    # It must finish its attempt before cleanup or autonomous services start.
-    from app.services.provider_upgrade import upgrade_providers
-    await upgrade_providers()
-    try:
-        async with AsyncSessionLocal() as db:
-            await agent_bridge_attachment_service.cleanup_expired(db)
-    except Exception:
-        logger.exception("Failed to clean up expired Agent Bridge attachments")
     history = GithubRateLimitHistory(AsyncSessionLocal)
+    with history.install_on_startup():
+        await init_db()
     previous_observer = github_rate_limit_service.window_observer
-    github_rate_limit_service.window_observer = history.observe
     try:
+        # Provider recovery needs the migrated database and retargeted backup index.
+        # It must finish before cleanup or autonomous services start.
+        from app.services.provider_upgrade import upgrade_providers
+        await upgrade_providers()
+        try:
+            async with AsyncSessionLocal() as db:
+                await agent_bridge_attachment_service.cleanup_expired(db)
+        except Exception:
+            logger.exception("Failed to clean up expired Agent Bridge attachments")
+        if history.marker_id is not None:
+            github_rate_limit_service.window_observer = history.observe
         if settings.test_instance:
             # A test instance runs no autonomous dispatch and must not signal
             # tmux clients that belong to other servers on the host.
@@ -63,7 +64,7 @@ async def lifespan(app: FastAPI):
         await close_all_relays()
     finally:
         github_rate_limit_service.window_observer = previous_observer
-        await history.drain()
+        await history.close()
 
 
 # Create FastAPI application
