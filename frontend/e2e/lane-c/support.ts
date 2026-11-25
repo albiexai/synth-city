@@ -9,7 +9,7 @@ const KEY_STORAGE = 'albiex-synth-city.agent-teams.operator-token'
 /** Open Audit with the Director key already stored, so the events load. */
 export async function openUnlockedAudit(page: Page, query = ''): Promise<void> {
   await page.addInitScript(([key, value]) => window.sessionStorage.setItem(key, value), [KEY_STORAGE, DIRECTOR_KEY])
-  await page.goto(`/audit${query}`)
+  await page.goto(`/insights/audit${query}`)
   await expect(page.getByRole('heading', { name: /Audit/ }).first()).toBeVisible()
   await page.waitForLoadState('networkidle').catch(() => undefined)
 }

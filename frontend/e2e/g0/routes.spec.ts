@@ -87,8 +87,8 @@ test('@active Agent Mail shows unacknowledged messages', async ({ page }) => {
   await expect(page.getByText(/\d+ unread/).first()).toBeVisible()
 })
 
-test('@active Audit is locked, then opens with the Director key', async ({ page }) => {
-  await page.goto('/audit')
+test('@active Audit log is locked, then opens with the Director key', async ({ page }) => {
+  await page.goto('/insights/audit')
   await expect(page.getByRole('heading', heading('Audit coverage and delivery metrics'))).toBeVisible()
   // #515: the page opens locked with no dialog. The key is asked for only through Unlock events.
   await expect(page.getByRole('dialog')).toHaveCount(0)
@@ -112,4 +112,20 @@ test('@active a harness loads', async ({ page }) => {
 test('@active a harness settings page loads', async ({ page }) => {
   await page.goto('/harnesses/claude-code/config')
   await expect(page.getByRole('heading', heading('Configuration'))).toBeVisible()
+})
+
+// #1251: Audit became Insights. The old link still works and keeps its query and hash.
+test('@active the old /audit link opens the Audit log tab, with its query and hash', async ({ page }) => {
+  await page.goto('/audit?window=7d#events')
+  await expect(page).toHaveURL(/\/insights\/audit\?window=7d#events$/)
+  const tabs = page.getByRole('navigation', { name: 'Insights sections' })
+  await expect(tabs.getByRole('link', { name: 'Audit log' })).toHaveAttribute('aria-current', 'page')
+  await expect(page.getByRole('heading', heading('Audit coverage and delivery metrics'))).toBeVisible()
+})
+
+test('@active Insights opens the Retrospectives tab', async ({ page }) => {
+  await page.goto('/insights')
+  await expect(page).toHaveURL(/\/insights\/retrospectives$/)
+  await expect(page.getByRole('heading', heading('Insights'))).toBeVisible()
+  await expect(page.getByRole('navigation', { name: 'Insights sections' }).getByRole('link', { name: 'Retrospectives' })).toHaveAttribute('aria-current', 'page')
 })
