@@ -6,7 +6,7 @@ import { expect, test } from '../support/guard'
 // #546 is merged. These journeys are active.
 
 const ROUTES = [
-  '/', '/work', '/repositories', '/teams', '/agent-bridge', '/agent-mail', '/audit',
+  '/', '/work', '/repositories', '/teams', '/agent-bridge', '/agent-mail', '/insights', '/insights/audit', '/audit',
   '/harnesses', '/harnesses/claude-code', '/harnesses/claude-code/config', '/projects',
 ]
 

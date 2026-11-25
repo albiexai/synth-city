@@ -29,7 +29,7 @@ test('@active one seeded moment shows the same local time on Work and Audit', as
   await expect(page.getByText('Document the import format').first()).toBeVisible()
   const work = await timeText(page, 'Document the import format')
 
-  await page.goto('/audit')
+  await page.goto('/insights/audit')
   await chooseUnlockEvents(page)
   await enterDirectorKey(page)
   const audit = await timeText(page, 'dispatched')

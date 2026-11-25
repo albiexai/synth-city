@@ -4,6 +4,19 @@ import { API_BASE_URL } from './constants'
 
 const READ_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
 
+// #1173: pages that show server data read it again at once after a write the user made. A write that succeeds
+// calls notifyApiWrite. The shared reads register one listener. Every fetch that writes outside this file calls it too.
+const writeListeners = new Set<() => void>()
+export function onApiWrite(listener: () => void) {
+  writeListeners.add(listener)
+  return () => { writeListeners.delete(listener) }
+}
+/** Call after a write request succeeded. A read (GET, HEAD, OPTIONS) does nothing. */
+export function notifyApiWrite(method?: string) {
+  if (READ_METHODS.has((method ?? 'GET').toUpperCase())) return
+  writeListeners.forEach((listener) => listener())
+}
+
 /**
  * The stored Director key for a write request, so settings writes pass the
  * backend's guard when a key is configured. Reads never carry it.
@@ -122,6 +135,7 @@ export class ApiClient {
         throw httpError(response, error)
       }
 
+      notifyApiWrite(options?.method)
       return response.json()
     } catch (error) {
       if (error instanceof Error) {
@@ -171,6 +185,8 @@ export async function apiClient<T>(endpoint: string, options?: RequestInit): Pro
         ...options?.headers,
       },
     })
+
+    if (response.ok) notifyApiWrite(options?.method)
 
     // Handle 204 No Content responses
     if (response.status === 204) {

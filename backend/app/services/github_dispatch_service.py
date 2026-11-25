@@ -42,6 +42,7 @@ from app.services.github_app_auth_service import (
     GithubAppAuthError,
     github_app_auth_service,
 )
+from app.services import decision_wait_service as decision_waits
 from app.services.github_approval_service import (
     CONTINUABLE_ESCALATIONS,
     GithubApprovalError,
@@ -2684,6 +2685,10 @@ class GithubDispatchService:
                         .values(status="superseded", superseded_at=now)
                         .execution_options(synchronize_session=False)
                     )
+                    # #1239: their decision waits end with them, unattributed.
+                    await decision_waits.record_wait_ended(
+                        db, request_ids, outcome="superseded", ended_at=now,
+                        source="github_dispatch_service.accept_handoff")
                     if request_message_ids:
                         await db.execute(
                             update(MailMessage)

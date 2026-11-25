@@ -16,6 +16,7 @@ import { BridgeEntry, MailEntry } from './features/factory/ContextPages'
 import { AgentTeamsPage } from './features/agent-teams/AgentTeamsPage'
 import { RepositorySetupPage } from './features/factory/RepositorySetupPage'
 import { AuditMetricsPage } from './features/factory/AuditMetricsPanel'
+import { AuditAlias, InsightsIndexRedirect, InsightsPage, RetrospectivesTab } from './features/factory/InsightsPage'
 import { NotFoundPage } from './components/shared/NotFoundPage'
 
 function HarnessSummaryAlias() { const { providerId } = useParams(); const { search, hash } = useLocation(); return <Navigate replace to={`/harnesses/${encodeURIComponent(providerId ?? '')}${search}${hash}`} /> }
@@ -32,7 +33,12 @@ function App() {
               <Route path="/" element={<MainLayout />}>
                 <Route index element={<OverviewPage />} />
                 <Route path="work" element={<WorkPage />} />
-                <Route path="audit" element={<AuditMetricsPage />} />
+                <Route path="audit" element={<AuditAlias />} />
+                <Route path="insights" element={<InsightsPage />}>
+                  <Route index element={<InsightsIndexRedirect />} />
+                  <Route path="retrospectives" element={<RetrospectivesTab />} />
+                  <Route path="audit" element={<AuditMetricsPage />} />
+                </Route>
                 <Route path="work/:workItemId" element={<WorkDetailPage />} />
                 <Route path="repositories" element={<RepositoriesPage />} />
                 <Route path="repositories/new" element={<RepositorySetupPage />} />

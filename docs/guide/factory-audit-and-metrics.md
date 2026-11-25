@@ -2,7 +2,7 @@
 
 The audit ledger records what the factory actually did. The metrics page counts those records in a time window. Both are observations. They never approve a plan, raise a limit, retry work, release a workspace or replay an action.
 
-Open **Audit** in the main navigation (`/audit`). The safe metrics load without an operator token. The event list needs the operator token for this browser tab.
+Open **Insights** in the main navigation, then the **Audit log** tab (`/insights/audit`). The old address `/audit` still works: it opens the same tab and keeps its query and hash. The safe metrics load without an operator token. The event list needs the operator token for this browser tab.
 
 ## What the ledger records
 
@@ -67,6 +67,10 @@ The watcher reads later results. Each poll reads at most 20 attempts that are un
 The watcher also records the facts of each merged pull request, once per watched repository scope: lines added and deleted, changed files, commits, and who merged it (`pull_request_facts`). The merge marks them as due in its own transaction, and each poll reads at most 20 due pull requests. A failed read writes nothing and is tried again on a later poll. A value that GitHub did not report is unknown, never zero. `merge_path` is `automatic` only for a merge that Synth City's own automatic merge confirmed; otherwise it is `unknown`. Merges recorded before this version have no facts.
 
 The watcher completes a work item only through one guarded write. The write requires the same attempt and status that the watcher read, and no pending approval request, live revision or requested retry. If any of these changed, the item stays unchanged and no result is recorded.
+
+## Waits on a decision
+
+Each plan approval request and each continuation request to the Leader records a wait: a start event (`decision_wait_started`) with who asked and who must answer, and an end event (`decision_wait_ended`) when the request leaves pending. The end records the outcome (approved, rejected, superseded, expired or cancelled) and who answered, which stays empty when nobody is known to have answered. Both events are keyed by the request id. A request that is never answered stays open with its age. When its work item is deleted first, the wait is unknown, not open. Requests made before this version have no wait.
 
 ## Review acceptance declarations
 

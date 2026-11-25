@@ -1,6 +1,6 @@
 import { API_BASE_URL } from '@/lib/constants'
 import { getOperatorToken } from '@/features/agent-teams/operatorAuth'
-import { ApiHttpError } from '@/lib/api'
+import { ApiHttpError, notifyApiWrite } from '@/lib/api'
 import { clearSessionStorageValue, migrateBrowserStorage, PRODUCT_STORAGE_KEYS } from '@/lib/browserStorageMigration'
 
 const KEY_STORAGE_KEY = PRODUCT_STORAGE_KEYS.actorKey
@@ -115,5 +115,6 @@ export async function actorFetch<T>(path: string, init?: RequestInit): Promise<T
       typeof detail?.detail === 'string' ? detail.detail : `HTTP ${response.status}`
     throw new Error(response.status === 429 ? `Sending too fast — ${message}` : message)
   }
+  notifyApiWrite(init?.method)
   return response.json() as Promise<T>
 }
