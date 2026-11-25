@@ -1,0 +1,110 @@
+#!/opt/albiex-synth-city-product/venv/bin/python -I
+"""Run one allowlisted workspace trust request under the factory agent account."""
+from __future__ import annotations
+
+import importlib
+import json
+import os
+import pwd
+import sys
+from pathlib import Path
+from types import ModuleType
+from typing import BinaryIO
+
+INSTALL_ROOT = Path("/opt/albiex-synth-city-product")
+WORK_ROOT = Path("/home/deckproductctl/work")
+PROC = Path("/proc")
+MAX_REQUEST_BYTES = 16384
+
+
+class ConfigBusy(Exception):
+    """A Claude Code session may still be using its config."""
+
+
+def agent_home() -> Path:
+    account = pwd.getpwnam("deckproduct")
+    if not account.pw_uid or account.pw_uid != os.getuid() or account.pw_uid != os.geteuid():
+        raise ValueError("Refusing to run as another user")
+    return Path(account.pw_dir)
+
+
+def load_writer() -> ModuleType:
+    # The operator installs the reviewed writer and interpreter under the
+    # root-owned install root. Neither the cwd nor the request selects code.
+    sys.path.insert(0, str(INSTALL_ROOT / "libexec"))
+    return importlib.import_module("team_workspace_trust")
+
+
+def no_duplicate_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    fields = dict(pairs)
+    if len(fields) != len(pairs):
+        raise ValueError("Duplicate request field")
+    return fields
+
+
+def read_request(stdin: BinaryIO) -> tuple[str, str]:
+    data = stdin.read(MAX_REQUEST_BYTES + 1)
+    if len(data) > MAX_REQUEST_BYTES:
+        raise ValueError("Request too large")
+    request = json.loads(data, object_pairs_hook=no_duplicate_fields)
+    if (not isinstance(request, dict) or request.keys() != {"operation", "provider", "folder"}
+            or request["operation"] != "folder_trust"
+            or request["provider"] not in ("codex-cli", "claude-code")
+            or not isinstance(request["folder"], str)):
+        raise ValueError("Unsupported request")
+    return request["provider"], request["folder"]
+
+
+def ensure_claude_idle() -> None:
+    uid = str(os.getuid()).encode()
+    try:
+        for process in PROC.iterdir():
+            if not process.name.isascii() or not process.name.isdecimal():
+                continue
+            try:
+                with (process / "status").open("rb") as stream:
+                    fields = dict(line.split(b":", 1) for line in stream.read(4096).splitlines() if b":" in line)
+                uids = fields[b"Uid"].split()
+                if uid not in uids[:2] or fields[b"State"].lstrip().startswith(b"Z"):
+                    continue
+                if fields[b"Name"].strip() == b"claude":
+                    raise ConfigBusy
+                with (process / "cmdline").open("rb") as stream:
+                    argv = stream.read(4096).split(b"\0", 2)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if (argv[0].rsplit(b"/", 1)[-1] == b"claude"
+                    or (len(argv) >= 2 and argv[0].rsplit(b"/", 1)[-1] == b"node"
+                        and (argv[1].rsplit(b"/", 1)[-1] == b"claude"
+                             or argv[1].endswith(b"/@anthropic-ai/claude-code/cli.js")))):
+                raise ConfigBusy
+    except (OSError, KeyError) as exc:
+        raise ConfigBusy from exc
+
+
+def main(argv: list[str], stdin: BinaryIO) -> int:
+    try:
+        if argv:
+            raise ValueError("This command takes no arguments")
+        provider, folder = read_request(stdin)
+        home = agent_home()
+        guard = ensure_claude_idle if provider == "claude-code" else None
+        if guard is not None:
+            guard()
+        writer = load_writer()
+        changed = writer.prepare_workspace_trust(
+            provider, folder, user=writer.NativeUser(home, os.getuid(), {}),
+            work_root=WORK_ROOT, before_write=guard,
+        )
+    except ConfigBusy:
+        print(json.dumps({"ok": False, "error": "agent_config_busy"}))
+        return 75
+    except (OSError, ValueError, KeyError, ImportError, RecursionError):
+        print(json.dumps({"ok": False, "error": "agent_config_refused"}))
+        return 1
+    print(json.dumps({"ok": True, "changed": changed}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:], sys.stdin.buffer))
