@@ -75,6 +75,7 @@ class RawCheckObservation:
     checks: list[dict] = field(default_factory=list)
     workflows: dict[int, _Run] = field(default_factory=dict)
     jobs: dict[int, tuple[int, object]] = field(default_factory=dict)
+    complete: bool = False
 
 
 _raw_observation: ContextVar[RawCheckObservation | None] = ContextVar("raw_check_observation", default=None)
@@ -326,6 +327,8 @@ class _Reader:
         final_checks = await self.pages(checks_path, "check_runs", {"filter": "all"})
         _require(checks == final_checks, "observation_changed")
         _require(latest_checks == await self.pages(checks_path, "check_runs", {"filter": "latest"}), "observation_changed")
+        if raw is not None:
+            raw.complete = True
         return effective
 
 

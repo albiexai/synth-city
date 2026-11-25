@@ -1,5 +1,6 @@
 """Retrospective check history from the real PR verification reader."""
 from datetime import datetime
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -10,7 +11,9 @@ from app.services.github_check_observation import GithubCheckObservationError
 from app.services.github_client import GithubClient
 from app.services.github_verification_service import github_verification_service
 from tests.agent_teams.test_github_check_observation import API, SHA, check, job, observe, run
-from tests.agent_teams.test_github_verification_service import _item, _reported_client, _scope
+from tests.agent_teams.test_github_verification_service import (
+    _diagnostic_revision, _item, _owner, _reported_client, _scope,
+)
 
 CREATED = "2026-11-25T12:00:00Z"
 STARTED = "2026-11-25T12:01:00Z"
@@ -117,16 +120,56 @@ async def test_external_required_check_is_classified_per_repository(db, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_inconclusive_merge_observation_keeps_the_raw_completed_check(db, monkeypatch):
-    api = API([check()], [run()], jobs={10: []})
+@pytest.mark.parametrize("foreign_head", [False, True])
+async def test_partial_read_defers_actions_until_metadata_can_be_recorded(db, monkeypatch, foreign_head):
+    rows = [check(), check(200, app=23)]
+    if foreign_head:
+        rows.append({**check(300, app=23), "head_sha": "b" * 40})
+    api = API(rows, [{**run(), "name": "Feature", "path": WORKFLOW}], jobs={10: []})
     async with httpx.AsyncClient(transport=httpx.MockTransport(api), base_url="https://api.github.com") as http:
         scope, item, client = await tracked_client(db, monkeypatch, http)
-        with pytest.raises(GithubCheckObservationError, match="incomplete_current_jobs"):
+        reason = "check_head_mismatch" if foreign_head else "incomplete_current_jobs"
+        with pytest.raises(GithubCheckObservationError, match=reason):
             await github_verification_service._verify_item(db, scope, item, client)
-    await db.rollback()
-    assert set(await history(db)) == {100}
-    await db.refresh(item)
-    assert item.dispatch_status == "verifying"
+        await db.rollback()
+        assert set(await history(db)) == {200}
+        await db.refresh(scope)
+        await db.refresh(item)
+        api.checks = rows[:2]
+        api.jobs = {10: [{**job(), "created_at": CREATED}]}
+        await github_verification_service._verify_item(db, scope, item, client)
+    completed = await history(db)
+    assert set(completed) == {100, 200}
+    row = completed[100]
+    assert datetime.fromisoformat(row["job_created_at"]) == datetime(2026, 11, 25, 12)
+    assert (row["run_attempt"], row["workflow_name"], row["workflow_path"]) == (1, "Feature", WORKFLOW)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["diagnostic", "human_review", "merge_wait", "stall_fallback"])
+async def test_existing_poll_paths_record_history(db, monkeypatch, stage):
+    api = API([check(200, app=23)])
+    verification = github_verification_service
+    async with httpx.AsyncClient(transport=httpx.MockTransport(api), base_url="https://api.github.com") as http:
+        scope, item, client = await tracked_client(db, monkeypatch, http, required=("CI", "external"))
+        monkeypatch.setattr(client, "get_combined_status_for_ref", AsyncMock(return_value={"state": "success"}))
+        if stage == "diagnostic":
+            slot, member = await _owner(db, scope)
+            item.dispatch_status, item.attempt_phase = "dispatched", "diagnostic"
+            item.dispatch_nonce, item.owner_slot_id, item.active_scope_revision = "diagnostic", slot.id, 1
+            revision, _ = await _diagnostic_revision(db, scope, item, slot, member)
+            await verification._observe_diagnostic_checks(db, scope, item, revision, client)
+        elif stage == "human_review":
+            item.last_verified_sha = SHA
+            await verification._process_review_item(db, scope, item, client)
+        elif stage == "merge_wait":
+            assert not await verification._wait_for_merge_checks(db, scope, item, client, SHA)
+        else:
+            item.merge_wait_head_sha = SHA
+            item.status_note = "Auto-merge blocked: GitHub checks stalled for 60 minutes on head."
+            pull = await client.get_pull("owner", "repo", 5)
+            assert await verification._cleared_fallback_note(db, scope, item, client, pull)
+    assert set(await history(db)) == {200}
 
 
 @pytest.mark.asyncio

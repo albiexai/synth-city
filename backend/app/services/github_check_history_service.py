@@ -65,9 +65,10 @@ def _completed_rows(
         app_id = _identifier(app.get("id")) if isinstance(app, dict) else None
         app_slug = _string(app.get("slug")) if isinstance(app, dict) else None
         name = _string(check.get("name"))
-        attempt, created, workflow_name, path = None, None, None, None
+        attempt, job_created_at, workflow_name, path = None, None, None, None
         if app_id == ACTIONS_APP_ID and app_slug == "github-actions":
             attempt, created = observation.jobs.get(check_id, (None, None))
+            job_created_at = _timestamp(created)
             suite = check.get("check_suite")
             workflow = observation.workflows.get(_identifier(suite.get("id")) or 0) if isinstance(suite, dict) else None
             if workflow is not None:
@@ -75,6 +76,9 @@ def _completed_rows(
                 path = _string(workflow.path)
                 if path is not None:
                     path = re.split(r"(?<=\.yml)@|(?<=\.yaml)@", path, maxsplit=1)[0]
+            # Let the next existing poll fill missing metadata before the append-only write.
+            if not observation.complete and None in (attempt, job_created_at, workflow_name, path):
+                continue
         rows.append({
             **context,
             "check_run_id": check_id,
@@ -85,7 +89,7 @@ def _completed_rows(
             "conclusion": _string(check.get("conclusion")),
             "started_at": _timestamp(check.get("started_at")),
             "completed_at": _timestamp(check.get("completed_at")),
-            "job_created_at": _timestamp(created),
+            "job_created_at": job_created_at,
             "run_attempt": _identifier(attempt),
             "workflow_name": workflow_name,
             "workflow_path": path,
