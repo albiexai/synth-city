@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import func, literal, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import FactoryAuditEvent, FactoryContextKey
@@ -660,8 +660,12 @@ class DuePullFacts:
     team_context_key: str | None
 
 
+_PULL_FACTS_PREFIX = "pull_facts:"
+
+
 def _pull_facts_operation(artifact: str) -> str:
-    return f"pull_facts:{artifact}"
+    """One identity per pull request: GitHub owner and repository names are case-insensitive."""
+    return _PULL_FACTS_PREFIX + artifact.lower()
 
 
 def _count(value: Any) -> int | None:
@@ -728,27 +732,39 @@ async def record_merged_delivery(
         attempt=attempt, launch_attempt=launch, snapshot=snapshot, source=source)
 
 
-async def due_pull_facts(db: AsyncSession, scope_id: int) -> list[DuePullFacts]:
-    """#1238: the merged pull requests of this scope lifetime whose facts are not recorded, oldest delivery first."""
+async def due_pull_facts(
+    db: AsyncSession, scope_id: int, *, repository: str, after: int, limit: int,
+) -> list[DuePullFacts]:
+    """#1238: at most ``limit`` merged pull requests of this scope lifetime and repository without recorded facts.
+
+    Each pull request is represented by its first delivery event. The order is a rotation: events after ``after``
+    first, then the older ones. GitHub names are case-insensitive, so one pull request is one identity whatever its
+    spelling. The selection is made in the database; the recorded history is never loaded.
+    """
     scope_key = await current_context_key(db, "scope", scope_id)
     if scope_key is None:
         return []
-    recorded = set((await db.scalars(select(FactoryAuditEvent.operation_id).where(
-        FactoryAuditEvent.event_kind == PULL_FACTS_KIND, FactoryAuditEvent.scope_context_key == scope_key))).all())
-    rows = (await db.execute(
-        select(FactoryAuditEvent.id, FactoryAuditEvent.team_context_key, FactoryAuditEvent.context_snapshot)
+    artifact = func.lower(FactoryAuditEvent.context_snapshot["artifact"].as_string())
+    prefix = f"{repository.lower()}/pull/"
+    recorded = select(FactoryAuditEvent.operation_id).where(
+        FactoryAuditEvent.event_kind == PULL_FACTS_KIND, FactoryAuditEvent.scope_context_key == scope_key,
+        FactoryAuditEvent.operation_id.is_not(None))
+    first = (
+        select(func.min(FactoryAuditEvent.id).label("event_id"))
         .where(FactoryAuditEvent.event_kind == "delivery_evidence", FactoryAuditEvent.scope_context_key == scope_key,
                FactoryAuditEvent.delivery_outcome == "delivered",
-               FactoryAuditEvent.context_snapshot["pull_facts"].as_string() == PULL_FACTS_DUE)
-        .order_by(FactoryAuditEvent.id))).all()
-    due: dict[str, DuePullFacts] = {}
-    for row in rows:
-        artifact = row.context_snapshot.get("artifact")
-        if artifact and _pull_facts_operation(artifact) not in recorded:
-            due.setdefault(artifact, DuePullFacts(
-                event_id=row.id, artifact=artifact, attempt=row.context_snapshot.get("attempt"),
-                scope_context_key=scope_key, team_context_key=row.team_context_key))
-    return list(due.values())
+               FactoryAuditEvent.context_snapshot["pull_facts"].as_string() == PULL_FACTS_DUE,
+               func.substr(artifact, 1, len(prefix)) == prefix,
+               literal(_PULL_FACTS_PREFIX).concat(artifact).not_in(recorded))
+        .group_by(artifact)).subquery()
+    rows = (await db.execute(
+        select(FactoryAuditEvent.id, FactoryAuditEvent.team_context_key, FactoryAuditEvent.context_snapshot)
+        .where(FactoryAuditEvent.id.in_(select(first.c.event_id)))
+        .order_by(FactoryAuditEvent.id <= after, FactoryAuditEvent.id)
+        .limit(limit))).all()
+    return [DuePullFacts(
+        event_id=row.id, artifact=row.context_snapshot["artifact"], attempt=row.context_snapshot.get("attempt"),
+        scope_context_key=scope_key, team_context_key=row.team_context_key) for row in rows]
 
 
 async def record_pull_request_facts(
@@ -770,14 +786,14 @@ async def record_pull_request_facts(
         FactoryAuditEvent.event_kind == "delivery_evidence", FactoryAuditEvent.delivery_outcome == "delivered",
         FactoryAuditEvent.scope_context_key == due.scope_context_key,
         FactoryAuditEvent.source == AUTOMATIC_MERGE_SOURCE,
-        FactoryAuditEvent.context_snapshot["artifact"].as_string() == due.artifact).limit(1))).first()
+        func.lower(FactoryAuditEvent.context_snapshot["artifact"].as_string()) == due.artifact.lower(),
+    ).limit(1))).first()
     merger = pull.get("merged_by")
     merger = merger if isinstance(merger, dict) else {}
-    login = _text(merger.get("login"))
     values = {
         "additions": _count(pull.get("additions")), "deletions": _count(pull.get("deletions")),
         "changed_files": _count(pull.get("changed_files")), "commit_count": _count(pull.get("commits")),
-        "merged_by": login, "merged_by_type": _text(merger.get("type")) if login else None,
+        "merged_by": _text(merger.get("login")), "merged_by_type": _text(merger.get("type")),
         "merge_path": "automatic" if automatic is not None else "unknown",
     }
     unknown = [name for name in values if values[name] is None]

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from app.models.database import AgentTeamPreset, GithubWorkItem, TeamGithubScope
 from app.services import factory_audit_service as audit
@@ -167,7 +167,7 @@ async def test_the_ledger_refuses_a_second_event_for_one_pull(store):
     await _start(store)
     await _merge(store, 208, 76)
     async with store() as db:
-        (due,) = await audit.due_pull_facts(db, 5)
+        (due,) = await audit.due_pull_facts(db, 5, repository=REPO, after=0, limit=20)
         first = await audit.record_pull_request_facts(db, scope_id=5, due=due, pull=_pull(76))
         again = await audit.record_pull_request_facts(db, scope_id=5, due=due, pull=_pull(76, additions=999))
         assert again.id == first.id
@@ -194,6 +194,78 @@ async def test_each_watched_repository_records_its_own_pull(store):
         (5, f"{REPO}/pull/77", 120, "shared-account"),
         (6, "other-owner/other-repo/pull/77", 9, "someone")]
     assert client.reads == [(REPO, 77)] and other.reads == [("other-owner/other-repo", 77)]
+
+
+def _upper(number, **values):
+    return _pull(number, repo="Matrix-Owner/MATRIX-Repo", **values)
+
+
+async def test_a_case_only_difference_in_the_repository_name_is_the_same_repository(store):
+    await _start(store)
+    await _merge(store, 241, 107)
+    await _poll(store, _Client({107: _upper(107)}))
+    assert len(await _facts(store)) == 1
+    async with store() as db:  # the scope's name is corrected to GitHub's spelling
+        await db.execute(text(
+            "UPDATE team_github_scopes SET repo_owner = 'Matrix-Owner', repo_name = 'MATRIX-Repo' WHERE id = 5"))
+        await db.commit()
+    await _merge(store, 242, 107)  # the same pull, observed again under the other spelling
+    await _merge(store, 243, 108, source=AUTOMATIC)
+    client = _Client({108: _pull(108)})
+    await _poll(store, client)
+    assert [number for _, number in client.reads] == [108]
+    assert [(f["snapshot"]["artifact"].lower(), f["after"]["merge_path"]) for f in await _facts(store)] == [
+        (f"{REPO}/pull/107", "unknown"), (f"{REPO}/pull/108", "automatic")]
+
+
+async def test_work_due_under_the_old_spelling_is_still_read(store):
+    await _start(store)
+    await _merge(store, 244, 109)
+    async with store() as db:
+        await db.execute(text("UPDATE team_github_scopes SET repo_name = 'MATRIX-Repo' WHERE id = 5"))
+        await db.commit()
+    await _poll(store, _Client())
+    assert len(await _facts(store)) == 1
+
+
+async def test_a_repository_spelled_with_capitals_is_read_and_recorded_once(store):
+    await _start(store)
+    async with store() as db:
+        await db.execute(text(
+            "UPDATE team_github_scopes SET repo_owner = 'Matrix-Owner', repo_name = 'MATRIX-Repo' WHERE id = 5"))
+        await db.commit()
+    await _merge(store, 247, 112)
+    client = _Client()
+    await _poll(store, client)
+    await _poll(store, client)
+    assert len(client.reads) == 1 and len(await _facts(store)) == 1
+
+
+async def test_a_case_only_rename_during_the_read_still_records(store):
+    await _start(store)
+    await _merge(store, 248, 113)
+
+    class Respells(_Client):
+        async def get_pull(self, owner, repo, number, *, token=None):
+            async with store() as other:
+                await other.execute(text("UPDATE team_github_scopes SET repo_name = 'MATRIX-Repo' WHERE id = 5"))
+                await other.commit()
+            return await super().get_pull(owner, repo, number, token=token)
+
+    await _poll(store, Respells())
+    assert len(await _facts(store)) == 1
+
+
+async def test_the_automatic_evidence_is_found_under_either_spelling(store):
+    await _start(store)
+    await _merge(store, 245, 110)
+    async with store() as db:
+        await db.execute(text("UPDATE team_github_scopes SET repo_name = 'MATRIX-Repo' WHERE id = 5"))
+        await db.commit()
+    await _merge(store, 245, 110, source=AUTOMATIC, seed=False)
+    await _poll(store, _Client())
+    (fact,) = await _facts(store)
+    assert fact["after"]["merge_path"] == "automatic"
 
 
 # 5
@@ -226,7 +298,22 @@ async def test_an_absent_merger_is_null(store, merged_by):
     await _poll(store, _Client({79: pull}))
     (fact,) = await _facts(store)
     assert fact["after"]["merged_by"] is None and fact["after"]["merged_by_type"] is None
-    assert "merged_by" in fact["sanitized_reason"]
+    assert fact["sanitized_reason"].endswith("merged_by, merged_by_type")
+
+
+@pytest.mark.parametrize(("merged_by", "login", "kind", "missing"), [
+    ({"type": "Bot"}, None, "Bot", "merged_by"),
+    ({"login": "", "type": "Bot"}, None, "Bot", "merged_by"),
+    ({"login": "someone"}, "someone", None, "merged_by_type"),
+    ({"login": "someone", "type": 7}, "someone", None, "merged_by_type"),
+])
+async def test_the_merger_and_its_type_are_kept_independently(store, merged_by, login, kind, missing):
+    await _start(store)
+    await _merge(store, 246, 111)
+    await _poll(store, _Client({111: _pull(111, merged_by=merged_by)}))
+    (fact,) = await _facts(store)
+    assert (fact["after"]["merged_by"], fact["after"]["merged_by_type"]) == (login, kind)
+    assert fact["sanitized_reason"].endswith(f"GitHub did not report {missing}")
 
 
 # 6
@@ -385,6 +472,47 @@ async def test_failing_pulls_do_not_starve_the_others(store, monkeypatch):
     assert [f["snapshot"]["artifact"] for f in await _facts(store)] == [f"{REPO}/pull/93"]
 
 
+async def test_outstanding_pulls_are_selected_in_sql_around_a_long_completed_history(store):
+    await _start(store)
+    before, history, behind, ahead = [300], range(301, 331), [331, 332], [333, 334, 335]
+    for number in [*before, *history, *behind, *ahead]:
+        await _merge(store, number, number)
+        if number in (310, 333):  # a second delivery of one pull is one outstanding pull
+            await _merge(store, number, number, source="test.second", seed=False)
+    async with store() as db:
+        for due in await audit.due_pull_facts(db, 5, repository=REPO, after=0, limit=100):
+            number = int(due.artifact.rsplit("/", 1)[1])
+            if number in history:
+                await audit.record_pull_request_facts(db, scope_id=5, due=due, pull=_pull(number))
+        await db.commit()
+
+    statements = []
+
+    def watch(conn, cursor, statement, parameters, context, executemany):
+        if "pull_facts" in str(parameters):
+            statements.append(statement)
+
+    async def selected(after, limit):
+        async with store() as db:
+            engine = db.get_bind()
+            event.listen(engine, "before_cursor_execute", watch)
+            try:
+                found = await audit.due_pull_facts(db, 5, repository=REPO, after=after, limit=limit)
+            finally:
+                event.remove(engine, "before_cursor_execute", watch)
+        return [int(due.artifact.rsplit("/", 1)[1]) for due in found], [due.event_id for due in found]
+
+    numbers, ids = await selected(0, 100)
+    assert numbers == [300, 331, 332, 333, 334, 335]
+    cursor = ids[numbers.index(332)]
+    # The rotation continues after the cursor and wraps to the older work, and the limit holds.
+    assert (await selected(cursor, 100))[0] == [333, 334, 335, 300, 331, 332]
+    assert (await selected(cursor, 4))[0] == [333, 334, 335, 300]
+    assert (await selected(cursor, 2))[0] == [333, 334]
+    # One statement decides everything: no completed history is read into memory first.
+    assert len(statements) == 4 and all(" LIMIT " in statement for statement in statements)
+
+
 # 10
 @pytest.mark.parametrize("pull", [
     _pull(999),
@@ -392,6 +520,14 @@ async def test_failing_pulls_do_not_starve_the_others(store, monkeypatch):
     _pull(94, merged_at=None),
     _pull(94, state="open", merged_at=None),
     _pull(94, base=None),
+    _pull(94, merged=False),
+    _pull(94, merged=None),
+    _pull(94, merged=1),
+    {key: value for key, value in _pull(94).items() if key != "merged"},
+    _pull(94, merged_at=""),
+    _pull(94, merged_at="not a time"),
+    _pull(94, merged_at=5),
+    _pull(94, state="open"),
     "text",
 ])
 async def test_a_mismatched_answer_records_nothing(store, pull):

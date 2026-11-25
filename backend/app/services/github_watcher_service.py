@@ -621,16 +621,16 @@ class GithubWatcherService:
 
         scope_id, owner, name = scope.id, scope.repo_owner, scope.repo_name
         repository = f"{owner}/{name}"
-        numbered = []
-        for due in await _audit.due_pull_facts(db, scope_id):
+        # Only the repository the scope watches now can be read for a pull request.
+        batch = await _audit.due_pull_facts(
+            db, scope_id, repository=repository, after=self._pull_facts_after.get(scope_id, 0),
+            limit=_PULL_FACTS_BATCH)
+        for due in batch:
             match = _ARTIFACT_PR.match(due.artifact)
-            # Only the repository the scope watches now can be read for this pull request.
-            if match is not None and match.group(1) == repository:
-                numbered.append((due, int(match.group(2))))
-        after = self._pull_facts_after.get(scope_id, 0)
-        ordered = ([entry for entry in numbered if entry[0].event_id > after]
-                   + [entry for entry in numbered if entry[0].event_id <= after])
-        for due, number in ordered[:_PULL_FACTS_BATCH]:
+            if match is None:
+                self._pull_facts_after[scope_id] = due.event_id
+                continue
+            number = int(match.group(2))
             await db.commit()  # no transaction stays open during the external read
             try:
                 pull = await client.get_pull(owner, name, number)
@@ -657,13 +657,17 @@ class GithubWatcherService:
             return False
         base = pull.get("base")
         base_repo = base.get("repo") if isinstance(base, dict) else None
-        if not isinstance(base_repo, dict) or base_repo.get("full_name") != repository:
+        full_name = base_repo.get("full_name") if isinstance(base_repo, dict) else None
+        # GitHub names are case-insensitive; the answer carries GitHub's own spelling.
+        if not isinstance(full_name, str) or full_name.lower() != repository.lower():
             return False
-        if GithubVerificationService._classify_pull(pull) != "merged":
+        # The single-pull endpoint states the merge itself. A contradictory answer is not evidence.
+        if (GithubVerificationService._classify_pull(pull) != "merged" or pull.get("merged") is not True
+                or _audit._parse_time(pull.get("merged_at")) is None):
             return False
         row = (await db.execute(select(TeamGithubScope.repo_owner, TeamGithubScope.repo_name).where(
             TeamGithubScope.id == scope_id))).first()
-        return (row is not None and f"{row.repo_owner}/{row.repo_name}" == repository
+        return (row is not None and f"{row.repo_owner}/{row.repo_name}".lower() == repository.lower()
                 and await _audit.current_context_key(db, "scope", scope_id) == scope_context_key)
 
     async def _original_context_holds(
