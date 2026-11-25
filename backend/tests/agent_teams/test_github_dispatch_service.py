@@ -22,6 +22,7 @@ from app.models.database import (
     AgentTeamPreset,
     AgentTeamSlot,
     AgentPaneBinding,
+    FactoryAuditEvent,
     GithubApprovalRequest,
     GithubAttemptScopeRevision,
     GithubWorkItem,
@@ -35,6 +36,7 @@ from app.models.database import (
     TeamGithubScope,
 )
 from app.models.schemas import MailMessageCreate
+from app.services import decision_wait_service as decision_waits
 from app.services.agent_mail_service import agent_mail_service
 from app.services.github_dispatch_service import (
     AttemptState,
@@ -3665,6 +3667,7 @@ async def test_handoff_supersedes_pending_continuation_authority(db, monkeypatch
     db.add(approval)
     await db.flush()
     revision.approval_request_id = approval.id
+    await decision_waits.record_wait_started(db, approval, source="test")
     await db.commit()
 
     await github_dispatch_service.accept_handoff(
@@ -3674,6 +3677,10 @@ async def test_handoff_supersedes_pending_continuation_authority(db, monkeypatch
         accepting_pane_pid=202,
         accepting_pane_proc_start="2002",
     )
+    # #1239: the superseded request's decision wait ends with it, unattributed.
+    assert [(row.after_values["wait_outcome"], row.after_values["answered_by_member_id"]) for row in (
+        await db.scalars(select(FactoryAuditEvent).where(FactoryAuditEvent.event_kind == decision_waits.ENDED))
+    ).all()] == [("superseded", None)]
 
     await db.refresh(item)
     await db.refresh(workspace)

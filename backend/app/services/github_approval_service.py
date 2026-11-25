@@ -32,6 +32,7 @@ from app.models.database import (
 )
 from app.models.schemas import MailMessageCreate
 from app.services import companion_paths, request_preflight
+from app.services import decision_wait_service as decision_waits
 from app.services import factory_audit_service as audit
 from app.services.agent_mail_service import agent_mail_service
 from app.services.continuation_phase_guidance import PHASE_GUIDANCE
@@ -1263,6 +1264,8 @@ class GithubApprovalService:
                 request_kind="continuation",
                 decision="requested",
             )
+            await decision_waits.record_wait_started(
+                db, approval, source="github_approval_service.create_continuation_request")
             if checkpoint_stage is not None:
                 # C09: the decision hold is a persisted transition by the
                 # requesting owner, not an operator action.
@@ -1629,6 +1632,9 @@ class GithubApprovalService:
         if request.status == "pending" and revision.status == "proposed":
             request.status = "expired"
             revision.status = "expired"
+            await decision_waits.record_wait_ended(
+                db, [request.id], outcome="expired", ended_at=revision.expires_at,
+                source="github_approval_service.expire_continuation_if_needed")
             root = None
             if request.request_message_id is not None:
                 root = await db.get(MailMessage, request.request_message_id)
@@ -1851,6 +1857,10 @@ class GithubApprovalService:
         revision: GithubAttemptScopeRevision,
     ) -> None:
         now = datetime.utcnow()
+        if request.status == "pending":
+            await decision_waits.record_wait_ended(
+                db, [request.id], outcome="superseded", ended_at=now,
+                source="github_approval_service.supersede_stale_continuation")
         if request.status in {"pending", "approved", "rejected"}:
             request.status = "superseded"
             request.superseded_at = now
@@ -2149,6 +2159,9 @@ class GithubApprovalService:
             return False
         await db.refresh(item)
         await db.refresh(request)
+        await decision_waits.record_wait_ended(
+            db, [request.id], outcome="superseded", ended_at=request.superseded_at,
+            source="github_approval_service.supersede_initial_for_timeout")
         if request.request_message_id is not None:
             await db.execute(update(MailMessage).where(
                 MailMessage.id == request.request_message_id,
@@ -2319,6 +2332,9 @@ class GithubApprovalService:
         if pending is not None:
             pending.status = "superseded"
             pending.superseded_at = datetime.utcnow()
+            await decision_waits.record_wait_ended(
+                db, [pending.id], outcome="superseded", ended_at=pending.superseded_at,
+                source="github_approval_service.create_initial_request")
             if pending.request_message_id is not None:
                 root = await db.get(MailMessage, pending.request_message_id)
                 if root is not None and root.request_status == "pending":
@@ -2378,6 +2394,8 @@ class GithubApprovalService:
         request = GithubApprovalRequest(work_item_id=work_item_id, **identity)
         db.add(request)
         try:
+            await decision_waits.record_wait_started(
+                db, request, source="github_approval_service.create_initial_request")
             if commit:
                 await db.commit()
                 await db.refresh(request)
@@ -2579,6 +2597,11 @@ class GithubApprovalService:
                     request_kind="initial_plan",
                     decision=decision,
                 )
+            if result.rowcount == 1:
+                await db.refresh(request)
+                await decision_waits.record_wait_ended(
+                    db, [request_id], outcome=decision, answered_by_member_id=authenticated_leader_member_id,
+                    ended_at=request.decided_at, source="github_approval_service.decide")
             if escalated_rejection and result.rowcount == 1:
                 # Keep retry blocked until the decision and its linked Mail answer are both durable.
                 await db.refresh(request)
@@ -2835,6 +2858,9 @@ class GithubApprovalService:
             request_kind="continuation",
             decision=decision,
         )
+        await decision_waits.record_wait_ended(
+            db, [hold_request_id], outcome=decision, answered_by_member_id=authenticated_leader_member_id,
+            ended_at=now, source="github_approval_service.decide_continuation")
         if entering_ack_hold:
             # C09: the ack hold is a persisted transition by the deciding
             # Leader, not an operator action.
@@ -3709,6 +3735,8 @@ class GithubApprovalService:
             if request.status == "superseded":
                 return request, False
             raise GithubApprovalError("request_not_pending")
+        await decision_waits.record_wait_ended(
+            db, [request.id], outcome="cancelled", ended_at=now, source="github_approval_service.cancel")
         if revision is not None:
             revision.status = "superseded"
         if request.request_message_id is not None:

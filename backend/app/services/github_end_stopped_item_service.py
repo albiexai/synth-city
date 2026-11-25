@@ -12,6 +12,7 @@ from app.models.database import (
     GithubApprovalRequest, GithubAttemptScopeRevision, GithubMaintenanceEvent,
     GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace,
 )
+from app.services import decision_wait_service as decision_waits
 from app.services import factory_audit_service as audit
 from app.services.github_approval_service import GithubApprovalError, github_approval_service
 from app.services.github_client import GithubClientResponseError, github_client
@@ -82,6 +83,17 @@ async def _assert_not_paused(db, item_id):
         raise ValueError("operator_hold")
 
 
+async def end_pending_requests(db, item_id: int, *, now: datetime) -> None:
+    """Supersede the item's pending requests; #1239: their decision waits end with them."""
+    pending = (await db.scalars(select(GithubApprovalRequest.id).where(
+        GithubApprovalRequest.work_item_id == item_id, GithubApprovalRequest.status == "pending"))).all()
+    await db.execute(update(GithubApprovalRequest).where(
+        GithubApprovalRequest.work_item_id == item_id, GithubApprovalRequest.status == "pending")
+        .values(status="superseded", superseded_at=now))
+    await decision_waits.record_wait_ended(
+        db, pending, outcome="superseded", ended_at=now, source="github_end_stopped_item_service.end_stopped_item")
+
+
 async def end_stopped_item(db, item, scope, request, *, actor, before_commit=None):
     """Record the disposition and clear the same inspected acquisition in one transaction."""
     item_id, scope_id = item.id, item.scope_id
@@ -147,9 +159,7 @@ async def end_stopped_item(db, item, scope, request, *, actor, before_commit=Non
         if workspace is not None and await github_workspace_service.delegated_release_blocker(scope, workspace, item):
             raise ValueError("workspace_not_clean")
 
-        await db.execute(update(GithubApprovalRequest).where(
-            GithubApprovalRequest.work_item_id == item_id, GithubApprovalRequest.status == "pending")
-            .values(status="superseded", superseded_at=now))
+        await end_pending_requests(db, item_id, now=now)
         await db.execute(update(GithubAttemptScopeRevision).where(
             GithubAttemptScopeRevision.work_item_id == item_id,
             GithubAttemptScopeRevision.status.not_in(TERMINAL_REVISIONS))

@@ -68,6 +68,10 @@ The watcher also records the facts of each merged pull request, once per watched
 
 The watcher completes a work item only through one guarded write. The write requires the same attempt and status that the watcher read, and no pending approval request, live revision or requested retry. If any of these changed, the item stays unchanged and no result is recorded.
 
+## Waits on a decision
+
+Each plan approval request and each continuation request to the Leader records a wait: a start event (`decision_wait_started`) with who asked and who must answer, and an end event (`decision_wait_ended`) when the request leaves pending. The end records the outcome (approved, rejected, superseded, expired or cancelled) and who answered, which stays empty when nobody is known to have answered. Both events are keyed by the request id. A request that is never answered stays open with its age. When its work item is deleted first, the wait is unknown, not open. Requests made before this version have no wait.
+
 ## Review acceptance declarations
 
 An operator can record a review acceptance from a trusted source with `POST /api/v1/factory/review-acceptances`. The declaration names:
