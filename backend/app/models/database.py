@@ -558,6 +558,27 @@ class GithubCheckRunHistoryCoverage(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
+class GithubRateLimitWindow(Base):
+    """An exhausted installation-level rate-limit window as first observed."""
+
+    __tablename__ = "github_rate_limit_windows"
+
+    source: Mapped[str] = mapped_column(String, primary_key=True)
+    reset_at: Mapped[datetime] = mapped_column(DateTime, primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    __table_args__ = (Index("ix_github_rate_limit_windows_reset", "reset_at"),)
+
+
+class GithubRateLimitHistoryCoverage(Base):
+    """The first installation time of the rate-limit recorder."""
+
+    __tablename__ = "github_rate_limit_history_coverage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 class GithubMaintenanceEvent(Base):
     """An operator reports a maintenance outcome without granting execution authority."""
 

@@ -15,6 +15,8 @@ from app.config import settings
 from app.database import AsyncSessionLocal, init_db
 from app.services.agent_bridge.attachments import agent_bridge_attachment_service
 from app.services.github_dispatch_scheduler import github_dispatch_scheduler
+from app.services.github_rate_limit_history import GithubRateLimitHistory
+from app.services.github_rate_limit_service import github_rate_limit_service
 from app.services.operations_health_service import operations_health_service
 from app.services.test_instance_campaign_service import test_instance_campaign_poller
 
@@ -36,26 +38,32 @@ async def lifespan(app: FastAPI):
             await agent_bridge_attachment_service.cleanup_expired(db)
     except Exception:
         logger.exception("Failed to clean up expired Agent Bridge attachments")
-    if settings.test_instance:
-        # A test instance runs no autonomous dispatch and must not signal
-        # tmux clients that belong to other servers on the host.
-        logger.warning("Test instance: dispatch scheduler and relay cleanup are off")
-        await test_instance_campaign_poller.start()
-    else:
-        try:
-            await github_dispatch_scheduler.start()
-        except Exception:
-            logger.exception("Failed to start autonomous GitHub dispatch scheduler")
-        # Clean up any orphaned relay processes from previous runs
-        from app.services.cc_bridge.pty_relay import cleanup_orphaned_relays
-        cleanup_orphaned_relays()
-    yield
-    # Shutdown: Cleanup
-    from app.services.cc_bridge.pty_relay import close_all_relays
-    if settings.test_instance:
-        await test_instance_campaign_poller.shutdown()
-    await github_dispatch_scheduler.shutdown()
-    await close_all_relays()
+    history = GithubRateLimitHistory(AsyncSessionLocal)
+    previous_observer = github_rate_limit_service.window_observer
+    github_rate_limit_service.window_observer = history.observe
+    try:
+        if settings.test_instance:
+            # A test instance runs no autonomous dispatch and must not signal
+            # tmux clients that belong to other servers on the host.
+            logger.warning("Test instance: dispatch scheduler and relay cleanup are off")
+            await test_instance_campaign_poller.start()
+        else:
+            try:
+                await github_dispatch_scheduler.start()
+            except Exception:
+                logger.exception("Failed to start autonomous GitHub dispatch scheduler")
+            # Clean up any orphaned relay processes from previous runs
+            from app.services.cc_bridge.pty_relay import cleanup_orphaned_relays
+            cleanup_orphaned_relays()
+        yield
+        from app.services.cc_bridge.pty_relay import close_all_relays
+        if settings.test_instance:
+            await test_instance_campaign_poller.shutdown()
+        await github_dispatch_scheduler.shutdown()
+        await close_all_relays()
+    finally:
+        github_rate_limit_service.window_observer = previous_observer
+        await history.drain()
 
 
 # Create FastAPI application
