@@ -2501,24 +2501,32 @@ async def get_team_activity(preset_id: int, response: Response, db: AsyncSession
     return await observe_team(db, preset_id)
 
 
+async def _check_preset_mail_write(
+    preset_id: int,
+    request: AgentTeamPresetUpdate,
+    x_synth_city_operator_token: str | None = Header(default=None),
+    db: AsyncSession = Depends(get_db),
+    write_context: dict | None = Depends(operator_write_context),
+) -> AgentTeamPresetUpdate:
+    director_change = request.autonomy_enabled is True or bool(
+        request.model_fields_set.intersection(("backlog_milestone", "planned_decisions")),
+    )
+    if director_change and write_context is not None:
+        await enforce_director_access_path(
+            db, write_context, operator_token=x_synth_city_operator_token,
+            source="director_action.update_preset", preset_id=preset_id,
+        )
+    return request
+
+
 @router.patch("/presets/{preset_id}", response_model=AgentTeamPresetResponse)
 async def update_preset(
     preset_id: int,
-    request: AgentTeamPresetUpdate,
-    _operator: str | None = Header(default=None, alias="X-Synth-City-Operator-Token"),
+    request: AgentTeamPresetUpdate = Depends(_check_preset_mail_write),
+    _operator: None = Depends(require_operator),
     db: AsyncSession = Depends(get_db),
     write_context: dict | None = Depends(operator_write_context),
 ):
-    # HTTP calls get server-derived context. Existing in-process calls use the dependency default.
-    if isinstance(write_context, dict):
-        director_change = request.autonomy_enabled is True or bool(
-            request.model_fields_set.intersection(("backlog_milestone", "planned_decisions")),
-        )
-        if director_change:
-            await enforce_director_access_path(
-                db, write_context, operator_token=_operator, source="director_action.update_preset", preset_id=preset_id,
-            )
-        await require_operator(_operator)
     session_invalid = isinstance(write_context, dict) and write_context["session_invalid"]
     try:
         response = await agent_team_service.update_preset(

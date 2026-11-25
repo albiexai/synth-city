@@ -251,7 +251,7 @@ async def enforce_director_access_path(
 
 def require_director_action(confirm: str | None = None):
     """Require operator authority, a direct access path and optional typed confirmation."""
-    async def dependency(
+    async def refuse_mail(
         request: Request,
         x_synth_city_operator_token: str | None = Header(default=None),
         context: dict = Depends(operator_write_context),
@@ -261,7 +261,12 @@ def require_director_action(confirm: str | None = None):
             db, context, operator_token=x_synth_city_operator_token,
             source=f"director_action.{request.scope['route'].name}",
         )
-        await require_operator(x_synth_city_operator_token)
+
+    async def dependency(
+        request: Request,
+        _mail: None = Depends(refuse_mail),
+        _operator: None = Depends(require_operator),
+    ) -> None:
         if confirm is None:
             return
         try:

@@ -325,6 +325,37 @@ async def test_mixed_preset_patch_refuses_director_fields_before_any_change(clie
 
 
 @pytest.mark.asyncio
+async def test_preset_patch_requires_operator_when_attribution_is_unavailable(client, db, preset, monkeypatch):
+    from app.api.v1.deps import operator_write_context
+
+    async def unavailable_context():
+        return None
+
+    monkeypatch.setitem(app.dependency_overrides, operator_write_context, unavailable_context)
+    response = await _campaign(client, preset, **{"X-Synth-City-Operator-Token": ""})
+    assert response.status_code == 401
+    assert response.json()["detail"] == "operator_token_required"
+    await db.refresh(preset)
+    assert preset.backlog_milestone is None
+
+
+@pytest.mark.asyncio
+async def test_oversized_preset_id_still_gets_an_audited_mail_refusal(client, db, tmp_path):
+    session = await _session(db, tmp_path)
+    response = await client.patch(
+        f"{PATH}/{2**63}", json={"backlog_milestone": "v4.4"},
+        headers={"X-Synth-City-Session-Token": SESSION_TOKEN, "X-Synth-City-Operator-Token": ""},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == MAIL_REFUSAL
+    event = (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.sanitized_reason == MAIL_REFUSAL,
+    ))).one()
+    assert event.team_preset_id is None
+    assert (event.via, event.actor_kind, event.actor_session_id) == ("mail_tool", "member", session.id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operator_key", ["", OPERATOR_KEY])
 @pytest.mark.parametrize("method,path,body", [
     ("POST", "/presets", {"name": "Director fixture"}),
