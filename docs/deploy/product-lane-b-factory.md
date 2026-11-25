@@ -30,6 +30,20 @@ Root state/manifest: `/opt/claude-deck-product/state/`. Shared dependency ledger
 
 The scripts and unit files beside this document are the installed operational source, not an unattended installer. Never check in `.env`, auth files, capability tokens, or private logs. Controller upgrades are a separate operation.
 
+## Restricted workspace trust helper
+
+[#1262](https://github.com/albiexai/synth-city/issues/1262) adds the dedicated factory's first `agent-config` helper. It accepts one JSON request on standard input with `operation` set to `folder_trust`, `provider` set to `codex-cli` or `claude-code`, and `folder` set to a directory under the factory work root. The controller runs the helper as `deckproduct`. The helper takes zero command-line arguments and writes one JSON result.
+
+The checkpoint owner installs `scripts/product-factory/agent-config` as `/opt/albiex-synth-city-product/libexec/agent-config` and installs the same release's `backend/app/services/team_workspace_trust.py` beside it as `team_workspace_trust.py`. The install directories, helper, writer, and Python environment (including `tomlkit`) must be root-owned and writable only by root. The helper uses the agent's passwd home. It keeps a private `.synth-city.bak` beside an existing config when trust changes.
+
+`productctl print-agent-config-sudoers` prints the exact command-scoped sudoers entry for the reference factory.
+
+```sudoers
+deckproductctl ALL=(deckproduct) NOPASSWD: /opt/albiex-synth-city-product/libexec/agent-config ""
+```
+
+The trailing empty argument list limits this command to invocations without arguments ([sudoers manual](https://github.com/sudo-project/sudo/blob/main/docs/sudoers.man.in)). Live installation and validation of the sudoers entry belong to the Supervisor at the deployment checkpoint with the Director's approval. The helper returns status 75 with `agent_config_busy` while it detects a live Claude Code process for the agent user or cannot determine whether the file is in use. Launch integration and retry behavior are tracked in [#1295](https://github.com/albiexai/synth-city/issues/1295) and [#1296](https://github.com/albiexai/synth-city/issues/1296).
+
 ## GitHub credential handling
 
 `productctl configure-ambient-github --confirm` runs as root and copies the operator's own `gh` login token into two places: the controller `backend/.env` (`GITHUB_TOKEN`, read by the controller service), and `gh`'s `hosts.yml` for `deckproduct` and `deckproductctl`, so that `gh` and `git` authenticate for them.
