@@ -15,6 +15,8 @@ from app.config import settings
 from app.database import AsyncSessionLocal, init_db
 from app.services.agent_bridge.attachments import agent_bridge_attachment_service
 from app.services.github_dispatch_scheduler import github_dispatch_scheduler
+from app.services.github_rate_limit_history import GithubRateLimitHistory
+from app.services.github_rate_limit_service import github_rate_limit_service
 from app.services.operations_health_service import operations_health_service
 from app.services.test_instance_campaign_service import test_instance_campaign_poller
 
@@ -25,37 +27,44 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     warn_legacy_environment()
-    # Startup: Initialize database
-    await init_db()
-    # Provider recovery needs the migrated database and retargeted backup index.
-    # It must finish its attempt before cleanup or autonomous services start.
-    from app.services.provider_upgrade import upgrade_providers
-    await upgrade_providers()
+    history = GithubRateLimitHistory(AsyncSessionLocal)
+    with history.install_on_startup():
+        await init_db()
+    previous_observer = github_rate_limit_service.window_observer
     try:
-        async with AsyncSessionLocal() as db:
-            await agent_bridge_attachment_service.cleanup_expired(db)
-    except Exception:
-        logger.exception("Failed to clean up expired Agent Bridge attachments")
-    if settings.test_instance:
-        # A test instance runs no autonomous dispatch and must not signal
-        # tmux clients that belong to other servers on the host.
-        logger.warning("Test instance: dispatch scheduler and relay cleanup are off")
-        await test_instance_campaign_poller.start()
-    else:
+        # Provider recovery needs the migrated database and retargeted backup index.
+        # It must finish before cleanup or autonomous services start.
+        from app.services.provider_upgrade import upgrade_providers
+        await upgrade_providers()
         try:
-            await github_dispatch_scheduler.start()
+            async with AsyncSessionLocal() as db:
+                await agent_bridge_attachment_service.cleanup_expired(db)
         except Exception:
-            logger.exception("Failed to start autonomous GitHub dispatch scheduler")
-        # Clean up any orphaned relay processes from previous runs
-        from app.services.cc_bridge.pty_relay import cleanup_orphaned_relays
-        cleanup_orphaned_relays()
-    yield
-    # Shutdown: Cleanup
-    from app.services.cc_bridge.pty_relay import close_all_relays
-    if settings.test_instance:
-        await test_instance_campaign_poller.shutdown()
-    await github_dispatch_scheduler.shutdown()
-    await close_all_relays()
+            logger.exception("Failed to clean up expired Agent Bridge attachments")
+        if history.marker_id is not None:
+            github_rate_limit_service.window_observer = history.observe
+        if settings.test_instance:
+            # A test instance runs no autonomous dispatch and must not signal
+            # tmux clients that belong to other servers on the host.
+            logger.warning("Test instance: dispatch scheduler and relay cleanup are off")
+            await test_instance_campaign_poller.start()
+        else:
+            try:
+                await github_dispatch_scheduler.start()
+            except Exception:
+                logger.exception("Failed to start autonomous GitHub dispatch scheduler")
+            # Clean up any orphaned relay processes from previous runs
+            from app.services.cc_bridge.pty_relay import cleanup_orphaned_relays
+            cleanup_orphaned_relays()
+        yield
+        from app.services.cc_bridge.pty_relay import close_all_relays
+        if settings.test_instance:
+            await test_instance_campaign_poller.shutdown()
+        await github_dispatch_scheduler.shutdown()
+        await close_all_relays()
+    finally:
+        github_rate_limit_service.window_observer = previous_observer
+        await history.close()
 
 
 # Create FastAPI application

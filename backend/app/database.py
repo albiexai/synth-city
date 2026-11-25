@@ -1232,12 +1232,14 @@ async def init_db() -> None:
     # Register the derived observation table for CLI and HTTP startup alike.
     from app.models import database, github_work_progress  # noqa: F401
     from app.services.github_check_history_service import install_check_history_coverage
+    from app.services.github_rate_limit_history import install_rate_limit_history_coverage
     from app.upgrade_references import reference_startup, complete_reference_upgrade
 
     with reference_startup(settings.database_url, test_instance=settings.test_instance) as phase:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
             await install_check_history_coverage(conn)
+            await install_rate_limit_history_coverage(conn)
         if settings.database_url.startswith("sqlite"):
             async with engine.connect() as conn:
                 await _run_sqlite_compat_migrations(conn)

@@ -1,8 +1,10 @@
 """Observe GitHub REST quota headers and pause requests sharing a credential."""
 from __future__ import annotations
 
+import logging
 from collections import OrderedDict
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from hashlib import sha256
@@ -11,6 +13,8 @@ import httpx
 
 from app.config import settings
 from app.services.work_item_states import DONE_STATUSES
+
+logger = logging.getLogger(__name__)
 
 GITHUB_RATE_LIMITED = "github_rate_limited"
 _FALLBACK = timedelta(minutes=1)
@@ -57,6 +61,7 @@ class _Observation:
     reset_at: datetime | None
     retry_at: datetime | None
     observed_at: datetime
+    history_resets: dict[str, tuple[datetime, datetime]] = field(default_factory=dict)
 
 
 class GithubRateLimited(httpx.HTTPStatusError):
@@ -69,7 +74,8 @@ class GithubRateLimited(httpx.HTTPStatusError):
 
 
 class GithubRateLimitService:
-    def __init__(self, now=None):
+    def __init__(self, now=None, *, window_observer: Callable[[str, datetime, datetime, datetime], None] | None = None):
+        self.window_observer = window_observer
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._observations: OrderedDict[bytes, _Observation] = OrderedDict()
 
@@ -114,6 +120,26 @@ class GithubRateLimitService:
 
         key = self._key(request.headers.get("authorization"))
         previous = self._observations.get(key)
+        history_resets = dict(previous.history_resets) if previous else {}
+        if self.window_observer is not None and retry_at is not None:
+            source = "core" if exhausted else "secondary"
+            future_reset = reset_at if exhausted and reset_at is not None and reset_at > now else None
+            history_reset = future_reset or retry_at
+            prior = history_resets.get(source)
+            prior_reset = prior[1] if prior else None
+            active = prior_reset is not None and prior_reset > now
+            new_deadline = prior_reset is not None and history_reset > prior_reset
+            # Keep equal deadlines once. A later secondary deadline adds only its extension.
+            if not active or (new_deadline and (source == "secondary" or future_reset is not None)):
+                history_start, window_reset = now, history_reset
+                if source == "secondary" and prior is not None and active:
+                    window_reset, history_start = prior
+                try:
+                    self.window_observer(source, history_start, history_reset, window_reset)
+                except Exception as exc:
+                    logger.warning("github_rate_limit_history_enqueue_failed error_type=%s", type(exc).__name__)
+                else:
+                    history_resets[source] = (window_reset, history_reset)
         observed_at = now
         if previous and previous.retry_at and previous.retry_at > now:
             # A response from a request already in flight cannot shorten an observed pause.
@@ -126,7 +152,7 @@ class GithubRateLimitService:
                 reset_at = previous.reset_at
                 if remaining is None or (previous.remaining is not None and previous.remaining <= remaining):
                     remaining, observed_at = previous.remaining, previous.observed_at
-        self._observations[key] = _Observation(remaining, reset_at, retry_at, observed_at)
+        self._observations[key] = _Observation(remaining, reset_at, retry_at, observed_at, history_resets)
         self._observations.move_to_end(key)
         overflow = len(self._observations) - _MAX_CREDENTIALS
         if overflow > 0:

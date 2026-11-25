@@ -558,6 +558,39 @@ class GithubCheckRunHistoryCoverage(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
+class GithubRateLimitWindow(Base):
+    """An exhausted installation-level rate-limit window as first observed."""
+
+    __tablename__ = "github_rate_limit_windows"
+
+    source: Mapped[str] = mapped_column(String, primary_key=True)
+    # Extensions keep the first deadline as their logical window identity.
+    window_reset_at: Mapped[datetime] = mapped_column(DateTime, primary_key=True)
+    reset_at: Mapped[datetime] = mapped_column(DateTime, primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    __table_args__ = (Index("ix_github_rate_limit_windows_reset", "reset_at"),)
+
+
+class GithubRateLimitHistoryCoverage(Base):
+    """The first installation time of the rate-limit recorder."""
+
+    __tablename__ = "github_rate_limit_history_coverage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class GithubRateLimitHistoryGap(Base):
+    """An unknown interval, or an open guard for a running recorder."""
+
+    __tablename__ = "github_rate_limit_history_gaps"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
 class GithubMaintenanceEvent(Base):
     """An operator reports a maintenance outcome without granting execution authority."""
 
