@@ -191,7 +191,7 @@ export const manifest = [
   },
   {
     "name": "synth_city_create_team",
-    "description": "Create an Agent Team preset.\n\n    parent_issue_url is an HTTPS GitHub issue URL.\n\n    Valid providers: claude-code, codex-cli, copilot-cli, opencode-cli.\n    Common slot fields: display_name, provider, repo_path, role, charter,\n    ui_color, launch_mode, launch_options. ui_color values: blue, purple,\n    green, amber, red, cyan, slate. Provider launch modes/options:\n    - claude-code: modes plain/worktree/resume; launch_options\n      skip_permissions, platform, aws_region, aws_profile, bedrock_model,\n      prompt, session_id, project_folder, worktree_name.\n    - codex-cli: modes plain/resume/fork; launch_options model, profile,\n      profile_v2, sandbox, approval_policy, search, no_alt_screen,\n      dangerously_bypass_approvals_and_sandbox, use_last, session_id,\n      platform, aws_region, aws_profile, bedrock_model, reasoning_effort,\n      prompt. reasoning_effort: low/medium/high/xhigh.\n    - copilot-cli: modes plain/resume; launch_options model, agent,\n      context_tier, reasoning_effort, plan, remote, allow_all, no_ask_user,\n      skip_permissions, dangerously_bypass_approvals_and_sandbox, use_last,\n      session_id, prompt. reasoning_effort: none/low/medium/high/xhigh/max;\n      context_tier: default/long_context. Bedrock launch options are not\n      supported for copilot-cli.\n    - opencode-cli (OpenCode 2): modes plain/resume; launch_options model\n      (provider/model with an optional #variant), agent (default agent),\n      skip_permissions (--auto), session_id (ses\u2026), platform, aws_region,\n      aws_profile, prompt. A first launch saves an exact ses\u2026 session id;\n      --continue (use_last) and reasoning_effort are not supported. On\n      Bedrock the model must be amazon-bedrock/\u2026.\n    Use synth_city_plan_team_launch before launch.\n    ",
+    "description": "Team creation is a Director action. Create teams from the UI or operator API.\n\n    parent_issue_url is an HTTPS GitHub issue URL.\n\n    Valid providers: claude-code, codex-cli, copilot-cli, opencode-cli.\n    Common slot fields: display_name, provider, repo_path, role, charter,\n    ui_color, launch_mode, launch_options. ui_color values: blue, purple,\n    green, amber, red, cyan, slate. Provider launch modes/options:\n    - claude-code: modes plain/worktree/resume; launch_options\n      skip_permissions, platform, aws_region, aws_profile, bedrock_model,\n      prompt, session_id, project_folder, worktree_name.\n    - codex-cli: modes plain/resume/fork; launch_options model, profile,\n      profile_v2, sandbox, approval_policy, search, no_alt_screen,\n      dangerously_bypass_approvals_and_sandbox, use_last, session_id,\n      platform, aws_region, aws_profile, bedrock_model, reasoning_effort,\n      prompt. reasoning_effort: low/medium/high/xhigh.\n    - copilot-cli: modes plain/resume; launch_options model, agent,\n      context_tier, reasoning_effort, plan, remote, allow_all, no_ask_user,\n      skip_permissions, dangerously_bypass_approvals_and_sandbox, use_last,\n      session_id, prompt. reasoning_effort: none/low/medium/high/xhigh/max;\n      context_tier: default/long_context. Bedrock launch options are not\n      supported for copilot-cli.\n    - opencode-cli (OpenCode 2): modes plain/resume; launch_options model\n      (provider/model with an optional #variant), agent (default agent),\n      skip_permissions (--auto), session_id (ses\u2026), platform, aws_region,\n      aws_profile, prompt. A first launch saves an exact ses\u2026 session id;\n      --continue (use_last) and reasoning_effort are not supported. On\n      Bedrock the model must be amazon-bedrock/\u2026.\n    Eligible Mail sessions can use synth_city_plan_team_launch to prepare a plan.\n    ",
     "inputSchema": {
       "properties": {
         "name": {
@@ -454,7 +454,7 @@ export const manifest = [
   },
   {
     "name": "synth_city_launch_team",
-    "description": "Launch an Agent Team preset.\n\n    Call synth_city_plan_team_launch first and pass its plan_hash as\n    confirm_plan_hash. Forced respawn and force_without_plan require an\n    operator and are not available through this agent tool. Launch behavior\n    uses the per-provider launch_options accepted by synth_city_create_team;\n    validation errors include machine-readable\n    block_code values when available.\n    ",
+    "description": "Team launch is a Director action. Launch from the UI or operator API.\n\n    Eligible Mail sessions can call synth_city_plan_team_launch to prepare a\n    plan for the Director to review. The server refuses an Agent Mail launch.\n    ",
     "inputSchema": {
       "properties": {
         "preset_id": {
@@ -788,7 +788,7 @@ export const manifest = [
   },
   {
     "name": "synth_city_plan_team_launch",
-    "description": "Plan an Agent Team launch and return the plan_hash required by\n    synth_city_launch_team. Agent sessions cannot include disabled slots or force\n    replacement of a running session; those options require an operator.",
+    "description": "Prepare an Agent Team launch plan and return its plan_hash.\n\n    An eligible Mail session can plan. A Director reviews the plan and launches\n    from the UI or operator API. Disabled slots and forced respawn require an operator.\n    ",
     "inputSchema": {
       "properties": {
         "preset_id": {
@@ -1944,7 +1944,7 @@ export const manifest = [
   },
   {
     "name": "synth_city_update_team_campaign",
-    "description": "Replace campaign metadata. Use null to clear either field.\n\n    backlog_milestone is an exact GitHub milestone title.\n    Each planned decision has text and state: later, now, or done.\n    The caller supplies the Director key for this call.\n    The tool never loads, stores, logs, returns, or publishes the key.\n    A session key grants no authority for this write.\n    ",
+    "description": "Campaign metadata must be updated from the UI.\n\n    This tool sends the request as Agent Mail for an audited refusal. The legacy\n    Director key argument is ignored.\n    ",
     "inputSchema": {
       "properties": {
         "preset_id": {

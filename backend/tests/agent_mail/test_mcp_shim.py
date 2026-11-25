@@ -875,49 +875,27 @@ def test_synth_city_create_team_posts_to_team_api(monkeypatch):
     assert requests[0][2]["json"]["parent_issue_url"].endswith("/issues/506")
 
 
-def test_campaign_setter_sends_director_key_only_as_header(monkeypatch):
+def test_campaign_setter_sends_only_mail_auth_and_returns_a_sanitized_refusal(monkeypatch):
     import mcp_shim.agent_mail_server as shim
+
     requests = []
-    def request(method, path, **kwargs):
-        requests.append((method, path, kwargs))
-        if kwargs.get("headers", {}).get("X-Synth-City-Operator-Token") != "synthetic-director-key":
-            return {"ok": False, "error": {"code": "operator_token_invalid"}}
-        return {"ok": True, "data": {"id": 12, "backlog_milestone": "Campaign",
-                                     "launch_options": {"secret": "private-launch"}}}
-    monkeypatch.setattr(shim, "_team_request", request)
-    planned = [{"text": "Decide promotion.", "state": "later"}]
-    missing = shim.synth_city_update_team_campaign(12, "Campaign", planned)
-    assert missing["ok"] is False and not requests
-    wrong = shim.synth_city_update_team_campaign(12, "Campaign", planned, director_key="wrong-key")
-    assert wrong["ok"] is False
-    result = shim.synth_city_update_team_campaign(12, "Campaign", planned, director_key="synthetic-director-key")
-    assert result["ok"] is True
-    assert "synthetic-director-key" not in repr(result)
-    assert "private-launch" not in repr(result)
-    assert requests[-1] == ("PATCH", "/presets/12", {
-        "headers": {"X-Synth-City-Operator-Token": "synthetic-director-key"},
-        "json": {"backlog_milestone": "Campaign", "planned_decisions": planned}})
+    def request(method, url, **kwargs):
+        requests.append((method, url, kwargs))
+        return shim.httpx.Response(403, request=shim.httpx.Request(method, url), json={"detail": {
+            "code": "director_action_not_via_mail", "message": "private-request-details",
+        }})
 
-
-def test_campaign_setter_preserves_unknown_write_outcome_without_private_errors(monkeypatch):
-    import mcp_shim.agent_mail_server as shim
-    monkeypatch.setattr(shim, "_team_request", lambda *args, **kwargs: {
-        "ok": False, "error": {"code": "synth_city_unreachable", "message": "synthetic-director-key"},
-        "outcome": "unknown", "suggestion": "private-request-details"})
-    result = shim.synth_city_update_team_campaign(12, None, None, director_key="synthetic-director-key")
-    assert result["ok"] is False and result["outcome"] == "unknown"
-    assert result["suggestion"] == "Do not repeat this mutation blindly; reconcile its outcome first."
-    assert "synthetic-director-key" not in repr(result) and "private-request-details" not in repr(result)
-
-
-def test_campaign_setter_keeps_session_key_out_of_director_header(monkeypatch):
-    import mcp_shim.agent_mail_server as shim
-    requests = []
+    monkeypatch.setattr(shim.httpx, "request", request)
     monkeypatch.setitem(shim._state, "capability_token", "synthetic-session-key")
-    monkeypatch.setattr(shim, "_team_request", lambda *args, **kwargs: requests.append(kwargs))
-    result = shim.synth_city_update_team_campaign(12, None, None)
-    assert result["ok"] is False
-    assert not requests
+    planned = [{"text": "Decide promotion.", "state": "later"}]
+    result = shim.synth_city_update_team_campaign(12, "Campaign", planned, director_key="synthetic-director-key")
+    assert result["ok"] is False and result["error"]["code"] == "director_action_not_via_mail"
+    assert result["error"]["status_code"] == 403 and "UI" in result["error"]["message"]
+    assert "private-request-details" not in repr(result) and "synthetic-director-key" not in repr(result)
+    (method, url, kwargs), = requests
+    assert method == "PATCH" and url.endswith("/agent-teams/presets/12")
+    assert kwargs["headers"] == {"X-Synth-City-Session-Token": "synthetic-session-key"}
+    assert kwargs["json"] == {"backlog_milestone": "Campaign", "planned_decisions": planned}
 
 
 def test_team_summary_and_parent_link_tools_use_narrow_team_routes(monkeypatch):

@@ -12,6 +12,7 @@ Naive confirmation values keep their existing UTC meaning. Stale instants still 
 "Operator token" means the `X-Synth-City-Operator-Token` header. "Mail session" means an authenticated `X-Synth-City-Session-Token`.
 
 - A route marked **Operator token** accepts only the operator token. A session token never opens it. Without a configured backend operator token the route returns 503 `operator_token_unconfigured`; a missing or wrong header returns 401 `operator_token_required` or `operator_token_invalid`.
+- A **Director action** requires the operator token through the UI or operator API. A current Mail session receives 403 `director_action_not_via_mail`, even without an operator header. The API audits the refusal with `via = mail_tool`. Routes with typed confirmation require the exact action or setting name in `confirm`.
 - A route that accepts both principals authenticates a non-empty session header first, also when both headers are sent. With no session header, or an empty one, it requires the operator token.
 - A Mail session qualifies only when the backend enforces Agent Mail capability tokens (`mail_capability_tokens_required=true`), the session comes from MCP, and its mailbox is connected.
 
@@ -19,15 +20,17 @@ Naive confirmation values keep their existing UTC meaning. Stale instants still 
 | --- | --- |
 | GET `/api/v1/agent-teams/presets/{preset_id}/summary` | None |
 | GET `/api/v1/agent-teams/presets`, GET `/api/v1/agent-teams/presets/{preset_id}`, GET `/api/v1/agent-teams/presets/{preset_id}/activity`, GET `/api/v1/agent-teams/presets/{preset_id}/github-scopes` | None |
-| POST `/api/v1/agent-teams/presets`, `/api/v1/agent-teams/presets/from-agent-mail`, `/api/v1/agent-teams/presets/from-agent-bridge`, `/api/v1/agent-teams/presets/{preset_id}/duplicate` | Operator token |
-| PATCH and DELETE `/api/v1/agent-teams/presets/{preset_id}` | Operator token |
-| PUT `/api/v1/agent-teams/presets/{preset_id}/leader` | Operator token |
-| POST `/api/v1/agent-teams/presets/{preset_id}/slots`, PATCH and DELETE `/api/v1/agent-teams/slots/{slot_id}`, POST `/api/v1/agent-teams/presets/{preset_id}/slots/reorder` | Operator token |
-| POST `/api/v1/agent-teams/presets/{preset_id}/github-scopes` | Operator token |
-| POST `/api/v1/agent-teams/presets/{preset_id}/plan-launch`, POST `/api/v1/agent-teams/presets/{preset_id}/launch` | Operator token, or a qualifying Mail session |
+| POST `/api/v1/agent-teams/presets`, `/api/v1/agent-teams/presets/from-agent-mail`, `/api/v1/agent-teams/presets/from-agent-bridge`, `/api/v1/agent-teams/presets/{preset_id}/duplicate` | Director action |
+| PATCH `/api/v1/agent-teams/presets/{preset_id}` | Director action for campaign metadata and enabling autonomy. Operator token for other writes. |
+| DELETE `/api/v1/agent-teams/presets/{preset_id}`, PUT `/api/v1/agent-teams/presets/{preset_id}/leader`, PUT `/api/v1/agent-teams/presets/{preset_id}/supervisor` | Director action |
+| POST `/api/v1/agent-teams/presets/{preset_id}/slots`, PATCH and DELETE `/api/v1/agent-teams/slots/{slot_id}`, POST `/api/v1/agent-teams/presets/{preset_id}/slots/reorder` | Director action |
+| POST `/api/v1/agent-teams/presets/{preset_id}/github-scopes`, PATCH `/api/v1/agent-teams/github-scopes/{scope_id}` and its `/continuation-policy` and `/delivery-policy` routes | Director action |
+| PATCH `/api/v1/agent-teams/github-work-items/{item_id}/delivery-policy` | Director action |
+| POST `/api/v1/agent-teams/presets/{preset_id}/plan-launch` | Operator token, or a qualifying Mail session |
+| POST `/api/v1/agent-teams/presets/{preset_id}/launch` | Director action |
 | POST `/api/v1/agent-teams/github-work-items/{work_item_id}/retry` | Operator token, or the qualifying Mail session of the team's current enabled Leader slot |
 
-A Mail session that plans or launches cannot use prompt or path overrides, include disabled slots, force a respawn, adopt unbound sessions or skip plan confirmation. Those requests return 403 `operator_launch_override_required`. For plan and launch, a session that does not qualify returns 403 `authenticated_mcp_session_required`. For retry, a session that does not qualify or is not the current Leader returns 403 `current_leader_required`.
+A Mail session can prepare a launch plan without overrides. Requests with prompt or path overrides, disabled slots, forced respawn, adoption of unbound sessions, or skipped confirmation return 403 `operator_launch_override_required`. For planning, a session that does not qualify returns 403 `authenticated_mcp_session_required`. For retry, a session that does not qualify or is not the current Leader returns 403 `current_leader_required`.
 
 ## Presets
 
@@ -389,7 +392,7 @@ POST /api/v1/agent-teams/presets/{preset_id}/launch
 }
 ```
 
-Use `confirm_plan_hash` after reviewing a plan. Only the operator token can pass `skip_plan_confirmation: true` for an intentional one-step launch; a Mail session receives 403 `operator_launch_override_required`. Stale plans return `409` `plan_conflict` with the updated plan.
+Use `confirm_plan_hash` after reviewing a plan. A Director can pass `skip_plan_confirmation: true` for an intentional one-step launch. A current Mail session receives 403 `director_action_not_via_mail` on this route. Stale plans return 409 `plan_conflict` with the updated plan.
 
 After launch, agents register through Agent Mail and receive team-slot role and charter context.
 

@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.deps import require_operator
+from app.api.v1.deps import require_director_action, require_operator
 from app.database import get_db
 from app.models.database import GithubDeliveryPolicyEvent, GithubWorkItem, TeamGithubScope
 from app.models.schemas import GithubAttemptDeliveryPolicyUpdate, TeamGithubDeliveryPolicyUpdate
@@ -11,10 +11,10 @@ from app.services.factory_delivery_policy import (
     adopt_attempt_policy, effective_policy, scope_policy, update_scope_policy,
 )
 
-router = APIRouter(dependencies=[Depends(require_operator)])
+router = APIRouter()
 
 
-@router.patch("/github-scopes/{scope_id}/delivery-policy")
+@router.patch("/github-scopes/{scope_id}/delivery-policy", dependencies=[Depends(require_director_action())])
 async def set_scope_policy(scope_id: int, request: TeamGithubDeliveryPolicyUpdate,
                            db: AsyncSession = Depends(get_db)):
     scope = await db.get(TeamGithubScope, scope_id)
@@ -27,7 +27,7 @@ async def set_scope_policy(scope_id: int, request: TeamGithubDeliveryPolicyUpdat
             "policy": scope_policy(scope)}
 
 
-@router.patch("/github-work-items/{item_id}/delivery-policy")
+@router.patch("/github-work-items/{item_id}/delivery-policy", dependencies=[Depends(require_director_action())])
 async def set_attempt_policy(item_id: int, request: GithubAttemptDeliveryPolicyUpdate,
                              db: AsyncSession = Depends(get_db)):
     item = await db.get(GithubWorkItem, item_id)
@@ -49,7 +49,7 @@ async def set_attempt_policy(item_id: int, request: GithubAttemptDeliveryPolicyU
             "revision": item.delivery_policy_revision, "policy": effective_policy(item, scope)}
 
 
-@router.get("/github-scopes/{scope_id}/delivery-policy/history")
+@router.get("/github-scopes/{scope_id}/delivery-policy/history", dependencies=[Depends(require_operator)])
 async def scope_policy_history(scope_id: int, db: AsyncSession = Depends(get_db)):
     if await db.get(TeamGithubScope, scope_id) is None:
         raise HTTPException(404, "GitHub scope not found")

@@ -9,7 +9,7 @@ from typing import NamedTuple
 
 import httpx
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from app.models.api_model import format_utc_time
 from sqlalchemy import and_, exists, func, or_, select, update
@@ -18,9 +18,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.api.v1.deps import (
+    enforce_director_access_path,
     mail_session,
     require_mail_session_or_operator,
     operator_write_context,
+    require_director_action,
     require_operator,
     require_session_slot,
     resolve_request_pane_detailed,
@@ -367,7 +369,7 @@ async def read_supervisor(preset_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.put("/presets/{preset_id}/supervisor", response_model=SupervisorObservation,
-            dependencies=[Depends(require_operator)])
+            dependencies=[Depends(require_director_action())])
 async def update_supervisor(preset_id: int, request: SupervisorBindingRequest,
                             db: AsyncSession = Depends(get_db)):
     from app.services.agent_team_supervisor_service import bind_supervisor
@@ -2420,7 +2422,7 @@ async def list_presets(db: AsyncSession = Depends(get_db)):
 @router.post("/presets", response_model=AgentTeamPresetResponse)
 async def create_preset(
     request: AgentTeamPresetCreate,
-    _operator: None = Depends(require_operator),
+    _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -2432,7 +2434,7 @@ async def create_preset(
 @router.post("/presets/from-agent-mail", response_model=AgentTeamPresetResponse)
 async def create_preset_from_agent_mail(
     request: AgentTeamCreateFromMailRequest,
-    _operator: None = Depends(require_operator),
+    _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -2444,7 +2446,7 @@ async def create_preset_from_agent_mail(
 @router.post("/presets/from-agent-bridge", response_model=AgentTeamPresetResponse)
 async def create_preset_from_agent_bridge(
     request: AgentTeamCreateFromBridgeRequest,
-    _operator: None = Depends(require_operator),
+    _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -2499,15 +2501,32 @@ async def get_team_activity(preset_id: int, response: Response, db: AsyncSession
     return await observe_team(db, preset_id)
 
 
+async def _check_preset_mail_write(
+    preset_id: int,
+    request: AgentTeamPresetUpdate,
+    x_synth_city_operator_token: str | None = Header(default=None),
+    db: AsyncSession = Depends(get_db),
+    write_context: dict | None = Depends(operator_write_context),
+) -> AgentTeamPresetUpdate:
+    director_change = request.autonomy_enabled is True or bool(
+        request.model_fields_set.intersection(("backlog_milestone", "planned_decisions")),
+    )
+    if director_change and write_context is not None:
+        await enforce_director_access_path(
+            db, write_context, operator_token=x_synth_city_operator_token,
+            source="director_action.update_preset", preset_id=preset_id,
+        )
+    return request
+
+
 @router.patch("/presets/{preset_id}", response_model=AgentTeamPresetResponse)
 async def update_preset(
     preset_id: int,
-    request: AgentTeamPresetUpdate,
+    request: AgentTeamPresetUpdate = Depends(_check_preset_mail_write),
     _operator: None = Depends(require_operator),
     db: AsyncSession = Depends(get_db),
     write_context: dict | None = Depends(operator_write_context),
 ):
-    # A direct call (no request) leaves write_context as the dependency marker, not a dict: no attribution then.
     session_invalid = isinstance(write_context, dict) and write_context["session_invalid"]
     try:
         response = await agent_team_service.update_preset(
@@ -2547,7 +2566,7 @@ async def update_preset(
 async def set_preset_leader(
     preset_id: int,
     request: AgentTeamLeaderUpdateRequest,
-    _operator: None = Depends(require_operator),
+    _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -2579,7 +2598,7 @@ async def set_preset_leader(
 @router.delete("/presets/{preset_id}", status_code=204)
 async def delete_preset(
     preset_id: int,
-    _operator: None = Depends(require_operator),
+    _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -2624,7 +2643,7 @@ async def list_github_scopes(preset_id: int, db: AsyncSession = Depends(get_db))
 async def create_github_scope(
     preset_id: int,
     request: TeamGithubScopeCreate,
-    _operator: None = Depends(require_operator),
+    _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -2658,7 +2677,7 @@ async def create_github_scope(
 async def update_github_scope(
     scope_id: int,
     request: TeamGithubScopeUpdate,
-    _operator: None = Depends(require_operator),
+    _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
 ):
     observed = await db.get(TeamGithubScope, scope_id)
@@ -2774,7 +2793,7 @@ async def update_github_scope(
 async def update_github_scope_continuation_policy(
     scope_id: int,
     request: TeamGithubContinuationPolicyUpdate,
-    _operator: None = Depends(require_operator),
+    _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
 ):
     scope = await db.get(TeamGithubScope, scope_id)
@@ -3300,7 +3319,7 @@ async def abandon_github_work_item(
 async def duplicate_preset(
     preset_id: int,
     request: AgentTeamPresetUpdate,
-    _operator: None = Depends(require_operator),
+    _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -3313,7 +3332,7 @@ async def duplicate_preset(
 async def add_slot(
     preset_id: int,
     request: AgentTeamSlotCreate,
-    _operator: None = Depends(require_operator),
+    _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -3326,7 +3345,7 @@ async def add_slot(
 async def update_slot(
     slot_id: int,
     request: AgentTeamSlotUpdate,
-    _operator: None = Depends(require_operator),
+    _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -3338,7 +3357,7 @@ async def update_slot(
 @router.delete("/slots/{slot_id}", response_model=AgentTeamPresetResponse)
 async def delete_slot(
     slot_id: int,
-    _operator: None = Depends(require_operator),
+    _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -3351,7 +3370,7 @@ async def delete_slot(
 async def reorder_slots(
     preset_id: int,
     request: AgentTeamSlotReorderRequest,
-    _operator: None = Depends(require_operator),
+    _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -3849,10 +3868,9 @@ async def plan_launch_compat(
 async def launch_preset(
     preset_id: int,
     request: AgentTeamLaunchRequest,
-    principal: MailAgentSession | None = Depends(require_mail_session_or_operator),
+    _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
 ):
-    _require_safe_agent_launch(request, principal)
     try:
         return await agent_team_service.launch(db, preset_id, request)
     except PlanConflictError as exc:
