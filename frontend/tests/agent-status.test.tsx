@@ -109,6 +109,68 @@ describe('AgentStatusBadges', () => {
   })
 })
 
+describe('Mail tools out of date (#1022a)', () => {
+  const TEXT = 'Mail tools out of date: restart to load'
+  const REASON = 'tool catalog stale: restart in resume mode'
+  const stale = (overrides: Partial<AgentStatus> = {}) => idleStatus({ tool_catalog_state: 'stale', tool_catalog_reason: REASON, ...overrides })
+
+  afterEach(() => vi.useRealTimers())
+
+  it('shows the text for a stale status when the member view asks for it, with the backend reason as the tooltip', () => {
+    render(<AgentStatusBadges status={stale()} showToolCatalog />)
+    expect(screen.getByText(TEXT)).toBeInTheDocument()
+    expect(screen.getByText(TEXT)).toHaveAttribute('title', REASON)
+  })
+
+  it.each([
+    ['current', idleStatus({ tool_catalog_state: 'current' })],
+    ['unknown', idleStatus({ tool_catalog_state: 'unknown' })],
+    ['absent (an older backend sends no field)', idleStatus()],
+  ])('shows nothing when the state is %s', (_name, status) => {
+    render(<AgentStatusBadges status={status} showToolCatalog />)
+    expect(screen.queryByText(TEXT)).not.toBeInTheDocument()
+  })
+
+  it('shows nothing without a status', () => {
+    render(<AgentStatusBadges status={null} showToolCatalog />)
+    expect(screen.queryByText(TEXT)).not.toBeInTheDocument()
+  })
+
+  it('shows nothing when the status has expired, even if its state is stale', () => {
+    render(<AgentStatusBadges status={stale({ valid_until: new Date(Date.now() - 1000).toISOString() })} showToolCatalog />)
+    expect(screen.queryByText(TEXT)).not.toBeInTheDocument()
+  })
+
+  it('hides the text when the status expires on screen', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-10-12T12:00:00Z'))
+    render(<AgentStatusBadges status={stale({ valid_until: '2026-10-12T12:00:10Z' })} showToolCatalog />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    expect(screen.getByText(TEXT)).toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(11_000) })
+    expect(screen.queryByText(TEXT)).not.toBeInTheDocument()
+  })
+
+  it('clears when the same member becomes current', () => {
+    const { rerender } = render(<AgentStatusBadges status={stale()} showToolCatalog />)
+    expect(screen.getByText(TEXT)).toBeInTheDocument()
+    rerender(<AgentStatusBadges status={idleStatus({ tool_catalog_state: 'current' })} showToolCatalog />)
+    expect(screen.queryByText(TEXT)).not.toBeInTheDocument()
+  })
+
+  it('takes its own line in a wrapping row only while the notice shows, so it cannot squeeze the name beside it', () => {
+    const { rerender } = render(<AgentStatusBadges status={stale()} showToolCatalog />)
+    expect(screen.getByTestId('agent-status')).toHaveClass('basis-full')
+    rerender(<AgentStatusBadges status={idleStatus({ tool_catalog_state: 'current' })} showToolCatalog />)
+    expect(screen.getByTestId('agent-status')).not.toHaveClass('basis-full')
+  })
+
+  it('never shows it unless the view asks for it (the Agent Mail roster and the Live sessions cards)', () => {
+    render(<AgentStatusBadges status={stale()} />)
+    expect(screen.queryByText(TEXT)).not.toBeInTheDocument()
+  })
+})
+
 describe('one agent on three pages', () => {
   const member = {
     id: 5, identity_key: 'slot:5', repo_id: 'repo', repo_path: '/tmp/repo', repo_name: 'repo',
@@ -180,6 +242,52 @@ describe('one agent on three pages', () => {
       // The activity read starts once the team list has loaded (#544), so the badge clock catches up a tick later.
       await within(card).findByText('Idle for 3 h')
       expectSameState(card)
+    })
+
+    describe('Mail tools out of date (#1022a)', () => {
+      const TEXT = 'Mail tools out of date: restart to load'
+      function serve(overrides: Partial<AgentStatus>, validForMs = 60_000) {
+        vi.mocked(fetchAgentTeamActivity).mockImplementation(async (presetId: number) => {
+          const status = idleStatus({ valid_until: new Date(Date.now() + validForMs).toISOString(), ...overrides })
+          return {
+            preset_id: presetId, checked_at: status.checked_at, valid_until: status.valid_until,
+            slots: [{ slot_id: 5, state: 'idle', reason: 'native_turn_completed', observed_at: status.idle_since, agent_status: status }],
+          }
+        })
+      }
+      async function openCard() {
+        render(
+          <MemoryRouter initialEntries={['/teams/1?tab=roster']}>
+            <Routes><Route path="/teams/:teamId" element={<AgentTeamsPage />} /></Routes>
+          </MemoryRouter>,
+        )
+        const name = await screen.findByText(AGENT, { selector: 'span' })
+        return name.closest('li') as HTMLElement
+      }
+
+      it('shows the text on the roster row of a stale member', async () => {
+        serve({ tool_catalog_state: 'stale', tool_catalog_reason: 'tool catalog stale: restart in resume mode' })
+        const card = await openCard()
+        expect(await within(card).findByText(TEXT)).toBeInTheDocument()
+      })
+
+      it.each([
+        ['current', { tool_catalog_state: 'current' as const }],
+        ['unknown', { tool_catalog_state: 'unknown' as const }],
+        ['absent', {}],
+      ])('shows nothing on the roster row when the state is %s', async (_name, overrides) => {
+        serve(overrides)
+        const card = await openCard()
+        await within(card).findByText('Can be woken')
+        expect(within(card).queryByText(TEXT)).not.toBeInTheDocument()
+      })
+
+      it('shows nothing when the activity read has expired, even if the state is stale', async () => {
+        serve({ tool_catalog_state: 'stale' }, -1000)
+        const card = await openCard()
+        await within(card).findByText('Activity unknown')
+        expect(within(card).queryByText(TEXT)).not.toBeInTheDocument()
+      })
     })
   })
 })
