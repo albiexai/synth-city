@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -10,10 +10,10 @@ import {
 } from "./charterTemplates";
 
 // #1309: one charter field with Start from a template. Part A (#1113) owns the templates and the resolver.
-const CHARTER_DOCS_URL = "https://github.com/albiexai/synth-city/blob/master/docs/features/charter-templates.md";
+// The page is on the release branch. It is not on master until the release merges there.
+const CHARTER_DOCS_URL = "https://github.com/albiexai/synth-city/blob/release/v4.4/docs/features/charter-templates.md";
 
 interface CharterFieldProps {
-  id: string;
   role: CharterRole;
   values: CharterTemplateValues;
   value: string;
@@ -21,7 +21,8 @@ interface CharterFieldProps {
 }
 
 /** A field never replaces text: an empty field is filled, and a field with text asks before it appends. */
-export function CharterField({ id, role, values, value, onChange }: CharterFieldProps) {
+export function CharterField({ role, values, value, onChange }: CharterFieldProps) {
+  const id = useId();
   const [asking, setAsking] = useState(false);
   const unresolved = findUnresolved(value);
   const template = () => resolveCharterTemplate(role, values).text;

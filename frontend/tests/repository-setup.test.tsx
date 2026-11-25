@@ -2118,6 +2118,60 @@ describe("guided repository setup", () => {
       expect(slots[slots.length - 1].charter).toMatch(/^# Reviewer charter/);
     });
 
+    it("keeps the verifier charter on the verifier when a worker is later named Verifier", async () => {
+      mockChecks();
+      mockCreate();
+      await toRouting();
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      fireEvent.change(screen.getByLabelText("Merge policy"), { target: { value: "auto" } });
+      edit("Verifier", "Reviewer text.");
+      for (let i = 0; i < 2; i += 1) fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      fireEvent.change(screen.getByLabelText("Worker slots, one name per line"), { target: { value: "Worker A\nVerifier" } });
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      expect(charterBox("Verifier").value).toBe("");
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      expect(charterBox("Verifier 2").value).toBe("Reviewer text.");
+      fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+      fireEvent.click(screen.getByLabelText(/Save configuration only/));
+      fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+      await screen.findByRole("heading", { name: "Saved configuration" });
+      const pairs = mocks.createAgentTeamPreset.mock.calls[0][0].slots
+        .map((slot: { display_name: string; role: string; charter?: string }) => [slot.display_name, slot.role, slot.charter ?? null]);
+      expect(pairs).toEqual([
+        ["Leader", "Leader", null], ["Worker A", "Worker", null], ["Verifier", "Worker", null], ["Verifier 2", "verifier", "Reviewer text."],
+      ]);
+    });
+
+    it("keeps the Leader charter when the Leader slot is renamed, and never gives it to a worker of the same name", async () => {
+      mockChecks();
+      mockCreate();
+      await toRouting({ workers: "Worker A" });
+      edit("Leader", "Leader text.");
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      fireEvent.change(screen.getByLabelText("Explicit Leader slot"), { target: { value: "Worker A" } });
+      fireEvent.change(screen.getByLabelText("Worker slots, one name per line"), { target: { value: "Chief" } });
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      expect(charterBox("Worker A").value).toBe("Leader text.");
+      expect(charterBox("Chief").value).toBe("");
+      reviewAndSave();
+      fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+      await screen.findByRole("heading", { name: "Saved configuration" });
+      const pairs = mocks.createAgentTeamPreset.mock.calls[0][0].slots
+        .map((slot: { display_name: string; charter?: string }) => [slot.display_name, slot.charter ?? null]);
+      expect(pairs).toEqual([["Worker A", "Leader text."], ["Chief", null]]);
+    });
+
+    it("gives worker names that differ only by a space or a hyphen separate Charter fields", async () => {
+      mockChecks();
+      await toRouting({ workers: "Data Team\nData-Team" });
+      const first = charterBox("Data Team");
+      const second = charterBox("Data-Team");
+      expect(first.id).not.toBe(second.id);
+      edit("Data-Team", "Second only.");
+      expect(first.value).toBe("");
+      expect(second.value).toBe("Second only.");
+    });
+
     it("shows no charter field for an existing team and sends none", async () => {
       mockChecks();
       mocks.fetchAgentTeamPresets.mockResolvedValue({ presets: [teamFixture(false)] });

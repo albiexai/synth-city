@@ -24,6 +24,10 @@ import { AUTO_MERGE_OWNER_REQUIREMENT, AUTO_MERGE_VERIFIER_REQUIREMENT, autoMerg
 
 // A slot key maps to its route and, since #1309, its charter text. The Leader and verifier keys hold only a charter.
 type SlotRoute = { areaLabels: string; expertise: string; charter?: string };
+// Leader and verifier charters sit under keys that no worker name can equal: names are single trimmed lines,
+// so they never hold a newline. A worker named "Verifier" cannot take the verifier's text.
+const LEADER_KEY = "\nleader";
+const VERIFIER_KEY = "\nverifier";
 type Check = { status: "ready" | "blocked" | "unknown"; code: string; remedy: string };
 type Preflight = { status: "ready" | "blocked" | "unknown"; observed_at: string; checked_at?: string; checks: Record<string, Check>; configuration_presence?: Record<string, boolean>; host_guidance?: string[] };
 type Draft = {
@@ -159,7 +163,7 @@ function draftTeamSlots(draft: Draft, routing: Record<string, SlotRoute>): Agent
   const base = { provider: draft.provider, repo_path: draft.path.trim(), enabled: true };
   const workers = draft.workerNames.split("\n").map((name) => name.trim()).filter(Boolean);
   const slots: AgentTeamSlotInput[] = [
-    { ...base, display_name: draft.leaderName.trim(), role: "Leader", area_labels: [], expertise: null, ...charterOf(routing, draft.leaderName.trim()) },
+    { ...base, display_name: draft.leaderName.trim(), role: "Leader", area_labels: [], expertise: null, ...charterOf(routing, LEADER_KEY) },
     ...workers.map((name) => {
       const route = routing[name];
       return {
@@ -173,7 +177,7 @@ function draftTeamSlots(draft: Draft, routing: Record<string, SlotRoute>): Agent
     const taken = new Set(slots.map((slot) => slot.display_name.toLowerCase()));
     let name = "Verifier";
     for (let suffix = 2; taken.has(name.toLowerCase()); suffix += 1) name = `Verifier ${suffix}`;
-    slots.push({ ...base, display_name: name, role: VERIFIER_ROLE, area_labels: [], expertise: null, ...charterOf(routing, name) });
+    slots.push({ ...base, display_name: name, role: VERIFIER_ROLE, area_labels: [], expertise: null, ...charterOf(routing, VERIFIER_KEY) });
   }
   return slots;
 }
@@ -279,10 +283,11 @@ export function RepositorySetupPage() {
     dispatchLabel: currentPreflight?.checks.dispatch_label?.status === "ready" ? draft.dispatch : undefined,
     areaLabels: workerName ? parseAreaLabels(slotRouting[workerName]?.areaLabels ?? "") : undefined,
   });
-  const charterField = (name: string, role: CharterRole) => <CharterField
-    id={`charter-${name.replace(/\s+/g, "-")}`} role={role} values={charterValues(role === "builder" ? name : undefined)}
-    value={slotRouting[name]?.charter ?? ""}
-    onChange={(charter) => { setConfirmSave(false); setSlotRouting((current) => ({ ...current, [name]: { areaLabels: current[name]?.areaLabels ?? "", expertise: current[name]?.expertise ?? "", charter } })); }} />;
+  // The key is a worker name, LEADER_KEY or VERIFIER_KEY.
+  const charterField = (key: string, role: CharterRole) => <CharterField
+    role={role} values={charterValues(role === "builder" ? key : undefined)}
+    value={slotRouting[key]?.charter ?? ""}
+    onChange={(charter) => { setConfirmSave(false); setSlotRouting((current) => ({ ...current, [key]: { areaLabels: current[key]?.areaLabels ?? "", expertise: current[key]?.expertise ?? "", charter } })); }} />;
   const currentSaveIntent = useRef(saveIntentKey);
   currentSaveIntent.current = saveIntentKey;
   const liveLaunchSlots = useRef<number[]>([]);
@@ -982,7 +987,7 @@ export function RepositorySetupPage() {
     {step === 1 && <div className={panelClass}><label className={labelClass}>Team setup<select className={inputClass} value={draft.teamMode} onChange={(e) => update({ teamMode: e.target.value as Draft["teamMode"] })}><option value="new">Create an inactive team</option><option value="existing">Use an existing team</option></select></label>
       {draft.teamMode === "existing" ? <label className={labelClass}>Team<select className={inputClass} value={draft.teamId} onChange={(e) => update({ teamId: Number(e.target.value) || "" })}><option value="">Select a team</option>{presets.map((item) => <option key={item.id} value={item.id}>{item.name} ({item.autonomy_enabled ? "active" : "paused"})</option>)}</select></label> : <><label className={labelClass}>Team name<input className={inputClass} value={draft.teamName} onChange={(e) => update({ teamName: e.target.value })} /></label><label className={labelClass}>Explicit Leader slot<input className={inputClass} value={draft.leaderName} onChange={(e) => update({ leaderName: e.target.value })} /></label><label className={labelClass}>Worker slots, one name per line<textarea className={inputClass} value={draft.workerNames} onChange={(e) => update({ workerNames: e.target.value })} /></label><label className={labelClass}>Worker and Leader provider<select className={inputClass} value={draft.provider} onChange={(e) => update({ provider: e.target.value })}>{["claude-code", "codex-cli", "copilot-cli", "opencode-cli", "pi-cli", "muse-cli", "antigravity-cli"].map((item) => <option key={item}>{item}</option>)}</select></label></>}
       <p className="text-sm">New teams remain inactive. Existing roster, Leader, policy, and activation stay unchanged.</p><Button disabled={draft.teamMode === "existing" && !draft.teamId} onClick={() => setStep(2)}>Continue</Button></div>}
-    {step === 2 && <div className={panelClass}><p>Repository dispatch and design labels apply to the scope. Worker routes are separate for each slot. The Leader has no worker route.</p>{draft.teamMode === "new" ? <><fieldset className="space-y-2 rounded border p-3"><legend className="font-medium">{draft.leaderName.trim() || "Leader"}</legend>{charterField(draft.leaderName.trim(), "leader")}</fieldset>{draft.workerNames.split("\n").map((rawName) => rawName.trim()).filter(Boolean).map((name) => <fieldset key={name} className="space-y-2 rounded border p-3"><legend className="font-medium">{name}</legend><label className={labelClass}>Area labels, comma separated<input className={inputClass} value={slotRouting[name]?.areaLabels ?? ""} onChange={(e) => { setConfirmSave(false); setSlotRouting((current) => ({ ...current, [name]: { ...current[name], areaLabels: e.target.value, expertise: current[name]?.expertise ?? "" } })); }} /></label><label className={labelClass}>Expertise<input className={inputClass} value={slotRouting[name]?.expertise ?? ""} onChange={(e) => { setConfirmSave(false); setSlotRouting((current) => ({ ...current, [name]: { ...current[name], areaLabels: current[name]?.areaLabels ?? "", expertise: e.target.value } })); }} /></label>{charterField(name, "builder")}</fieldset>)}</> : <p>Existing team routing stays unchanged.</p>}<p>Potential enabled overlaps: {matchingOverlap.map((item) => `team ${item.preset_id}/scope ${item.id}`).join(", ") || "none found in loaded data"}.</p><div className="flex flex-wrap gap-2"><Button onClick={() => setStep(3)}>Continue</Button><Button variant="outline" onClick={() => setStep(4)}>Skip optional steps</Button></div></div>}
+    {step === 2 && <div className={panelClass}><p>Repository dispatch and design labels apply to the scope. Worker routes are separate for each slot. The Leader has no worker route.</p>{draft.teamMode === "new" ? <><fieldset className="space-y-2 rounded border p-3"><legend className="font-medium">{draft.leaderName.trim() || "Leader"}</legend>{charterField(LEADER_KEY, "leader")}</fieldset>{draft.workerNames.split("\n").map((rawName) => rawName.trim()).filter(Boolean).map((name) => <fieldset key={name} className="space-y-2 rounded border p-3"><legend className="font-medium">{name}</legend><label className={labelClass}>Area labels, comma separated<input className={inputClass} value={slotRouting[name]?.areaLabels ?? ""} onChange={(e) => { setConfirmSave(false); setSlotRouting((current) => ({ ...current, [name]: { ...current[name], areaLabels: e.target.value, expertise: current[name]?.expertise ?? "" } })); }} /></label><label className={labelClass}>Expertise<input className={inputClass} value={slotRouting[name]?.expertise ?? ""} onChange={(e) => { setConfirmSave(false); setSlotRouting((current) => ({ ...current, [name]: { ...current[name], areaLabels: current[name]?.areaLabels ?? "", expertise: e.target.value } })); }} /></label>{charterField(name, "builder")}</fieldset>)}</> : <p>Existing team routing stays unchanged.</p>}<p>Potential enabled overlaps: {matchingOverlap.map((item) => `team ${item.preset_id}/scope ${item.id}`).join(", ") || "none found in loaded data"}.</p><div className="flex flex-wrap gap-2"><Button onClick={() => setStep(3)}>Continue</Button><Button variant="outline" onClick={() => setStep(4)}>Skip optional steps</Button></div></div>}
     {step === 3 && <div className={panelClass}>
       <h3 className="font-semibold">Policy</h3>
       <label className={labelClass}>Merge policy
@@ -993,7 +998,7 @@ export function RepositorySetupPage() {
       </label>
       <p>{AUTO_MERGE_VERIFIER_REQUIREMENT} The verifier reviews the exact PR commit. Required checks must pass before merging.</p>
       {draft.mergePolicy === "auto" && <p>{AUTO_MERGE_OWNER_REQUIREMENT}</p>}
-      {draft.mergePolicy === "auto" && draft.teamMode === "new" && <fieldset className="space-y-2 rounded border p-3"><legend className="font-medium">{draftTeamSlots(draft, slotRouting).find((slot) => slot.role === VERIFIER_ROLE)?.display_name}</legend>{charterField(draftTeamSlots(draft, slotRouting).find((slot) => slot.role === VERIFIER_ROLE)?.display_name ?? "", "reviewer")}</fieldset>}
+      {draft.mergePolicy === "auto" && draft.teamMode === "new" && <fieldset className="space-y-2 rounded border p-3"><legend className="font-medium">{draftTeamSlots(draft, slotRouting).find((slot) => slot.role === VERIFIER_ROLE)?.display_name}</legend>{charterField(VERIFIER_KEY, "reviewer")}</fieldset>}
       <p>New scopes allow one active work item and one verification retry. Setup saves the scope disabled.</p>
       <Button onClick={() => setStep(4)}>Review setup</Button>
     </div>}

@@ -20,7 +20,7 @@ const FULL: CharterTemplateValues = {
 
 function Harness({ initial = "", role = "builder", values = FULL }: { initial?: string; role?: CharterRole; values?: CharterTemplateValues }) {
   const [value, setValue] = useState(initial);
-  return <CharterField id="charter-test" role={role} values={values} value={value} onChange={setValue} />;
+  return <CharterField role={role} values={values} value={value} onChange={setValue} />;
 }
 
 const box = () => screen.getByLabelText("Charter") as HTMLTextAreaElement;
@@ -94,10 +94,22 @@ describe("CharterField", () => {
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 
+  it("gives each field instance its own id, so a label focuses its own textarea", () => {
+    render(<><Harness /><Harness /></>);
+    const boxes = screen.getAllByLabelText("Charter") as HTMLTextAreaElement[];
+    expect(boxes).toHaveLength(2);
+    expect(boxes[0].id).not.toBe(boxes[1].id);
+    for (const label of document.querySelectorAll("label")) {
+      expect(document.getElementById(label.htmlFor)?.tagName).toBe("TEXTAREA");
+    }
+  });
+
   it("links to the charter templates docs page", () => {
     render(<Harness />);
     const link = screen.getByRole("link", { name: /charter templates/i });
-    expect(link).toHaveAttribute("href", expect.stringContaining("docs/features/charter-templates.md"));
+    // The page is published on the release branch. A link to master returns 404 until the release is merged there.
+    expect(link).toHaveAttribute("href", "https://github.com/albiexai/synth-city/blob/release/v4.4/docs/features/charter-templates.md");
+    expect(link.getAttribute("href")).not.toContain("/master/");
     expect(link).toHaveAttribute("target", "_blank");
   });
 });
