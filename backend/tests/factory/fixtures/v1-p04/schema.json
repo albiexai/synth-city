@@ -762,7 +762,8 @@
                 "hold_unavailable",
                 "team_idle",
                 "unanswered_request",
-                "unanswered_request_incomplete"
+                "unanswered_request_incomplete",
+                "milestone_routing_conflict"
               ],
               "title": "Code",
               "type": "string"
