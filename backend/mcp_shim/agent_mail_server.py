@@ -1082,7 +1082,7 @@ def synth_city_create_team(
     slots: Optional[list[dict[str, Any]]] = None,
     parent_issue_url: Optional[str] = None,
 ) -> dict:
-    """Create an Agent Team preset.
+    """Team creation is a Director action. Create teams from the UI or operator API.
 
     parent_issue_url is an HTTPS GitHub issue URL.
 
@@ -1110,7 +1110,7 @@ def synth_city_create_team(
       aws_profile, prompt. A first launch saves an exact ses… session id;
       --continue (use_last) and reasoning_effort are not supported. On
       Bedrock the model must be amazon-bedrock/….
-    Use synth_city_plan_team_launch before launch.
+    Eligible Mail sessions can use synth_city_plan_team_launch to prepare a plan.
     """
     payload = {
         "name": name,
@@ -1144,15 +1144,18 @@ def synth_city_update_team_campaign(
     planned_decisions: Optional[list[dict[str, Any]]],
     director_key: Optional[str] = None,
 ) -> dict:
-    """Campaign metadata must be updated from the UI. This tool returns a refusal.
+    """Campaign metadata must be updated from the UI.
 
-    The legacy argument shape remains available to existing callers.
+    This tool sends the request as Agent Mail for an audited refusal. The legacy
+    Director key argument is ignored.
     """
-    return {"ok": False, "error": {
-        "code": "director_action_not_via_mail",
-        "status_code": 403,
-        "message": "Use the UI to update campaign metadata.",
-    }}
+    result = _team_request("PATCH", f"/presets/{preset_id}",
+                           json={"backlog_milestone": backlog_milestone, "planned_decisions": planned_decisions})
+    error = result.get("error")
+    message = "Use the UI to update campaign metadata."
+    if isinstance(error, dict) and error.get("code") == "director_action_not_via_mail":
+        return {"ok": False, "error": {"code": "director_action_not_via_mail", "status_code": 403, "message": message}}
+    return {"ok": False, "error": {"code": "campaign_update_failed", "message": message}}
 
 
 @mcp.tool()
@@ -1177,9 +1180,11 @@ def synth_city_plan_team_launch(
     slot_ids: Optional[list[int]] = None,
     include_disabled: bool = False,
 ) -> dict:
-    """Plan an Agent Team launch and return the plan_hash required by
-    synth_city_launch_team. Agent sessions cannot include disabled slots or force
-    replacement of a running session; those options require an operator."""
+    """Prepare an Agent Team launch plan and return its plan_hash.
+
+    An eligible Mail session can plan. A Director reviews the plan and launches
+    from the UI or operator API. Disabled slots and forced respawn require an operator.
+    """
     if not reuse_existing or include_disabled:
         return {
             "ok": False,
@@ -1207,14 +1212,10 @@ def synth_city_launch_team(
     slot_ids: Optional[list[int]] = None,
     force_without_plan: bool = False,
 ) -> dict:
-    """Launch an Agent Team preset.
+    """Team launch is a Director action. Launch from the UI or operator API.
 
-    Call synth_city_plan_team_launch first and pass its plan_hash as
-    confirm_plan_hash. Forced respawn and force_without_plan require an
-    operator and are not available through this agent tool. Launch behavior
-    uses the per-provider launch_options accepted by synth_city_create_team;
-    validation errors include machine-readable
-    block_code values when available.
+    Eligible Mail sessions can call synth_city_plan_team_launch to prepare a
+    plan for the Director to review. The server refuses an Agent Mail launch.
     """
     if not reuse_existing or force_without_plan:
         return {

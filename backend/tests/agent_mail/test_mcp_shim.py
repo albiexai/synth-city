@@ -875,29 +875,27 @@ def test_synth_city_create_team_posts_to_team_api(monkeypatch):
     assert requests[0][2]["json"]["parent_issue_url"].endswith("/issues/506")
 
 
-def test_campaign_setter_returns_ui_refusal_without_forwarding_credentials(monkeypatch):
+def test_campaign_setter_sends_only_mail_auth_and_returns_a_sanitized_refusal(monkeypatch):
     import mcp_shim.agent_mail_server as shim
 
     requests = []
-    monkeypatch.setattr(shim, "_team_request", lambda *args, **kwargs: requests.append((args, kwargs)))
-    planned = [{"text": "Decide promotion.", "state": "later"}]
-    for session in (None, "synthetic-session-key"):
-        monkeypatch.setitem(shim._state, "capability_token", session)
-        result = shim.synth_city_update_team_campaign(12, "Campaign", planned, director_key="synthetic-director-key")
-        assert result["ok"] is False and result["error"]["code"] == "director_action_not_via_mail"
-        assert result["error"]["status_code"] == 403 and "UI" in result["error"]["message"]
-        assert "synthetic-director-key" not in repr(result)
-    assert not requests
+    def request(method, url, **kwargs):
+        requests.append((method, url, kwargs))
+        return shim.httpx.Response(403, request=shim.httpx.Request(method, url), json={"detail": {
+            "code": "director_action_not_via_mail", "message": "private-request-details",
+        }})
 
-
-def test_campaign_setter_keeps_session_key_out_of_director_header(monkeypatch):
-    import mcp_shim.agent_mail_server as shim
-    requests = []
+    monkeypatch.setattr(shim.httpx, "request", request)
     monkeypatch.setitem(shim._state, "capability_token", "synthetic-session-key")
-    monkeypatch.setattr(shim, "_team_request", lambda *args, **kwargs: requests.append(kwargs))
-    result = shim.synth_city_update_team_campaign(12, None, None)
-    assert result["ok"] is False
-    assert not requests
+    planned = [{"text": "Decide promotion.", "state": "later"}]
+    result = shim.synth_city_update_team_campaign(12, "Campaign", planned, director_key="synthetic-director-key")
+    assert result["ok"] is False and result["error"]["code"] == "director_action_not_via_mail"
+    assert result["error"]["status_code"] == 403 and "UI" in result["error"]["message"]
+    assert "private-request-details" not in repr(result) and "synthetic-director-key" not in repr(result)
+    (method, url, kwargs), = requests
+    assert method == "PATCH" and url.endswith("/agent-teams/presets/12")
+    assert kwargs["headers"] == {"X-Synth-City-Session-Token": "synthetic-session-key"}
+    assert kwargs["json"] == {"backlog_milestone": "Campaign", "planned_decisions": planned}
 
 
 def test_team_summary_and_parent_link_tools_use_narrow_team_routes(monkeypatch):

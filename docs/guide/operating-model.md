@@ -12,7 +12,7 @@ This page calls the human role the **Director**. Agent Mail already uses that na
 
 Director actions require the operator token through the UI or operator API. These actions include creating, launching, or deleting teams, editing rosters and models, changing scope and delivery policies, enabling autonomy, binding a Supervisor, and editing campaign metadata. Launch planning remains available to eligible Mail sessions. When an action requires typed confirmation, include its exact name in the `confirm` field.
 
-The server refuses Director actions with a current Agent Mail session with `403 director_action_not_via_mail`. The audit event records `via = mail_tool` and the current session. `ui` and `api` describe the request path and provide no identity proof. Dedicated mode separates the controller and agents by OS user. In a shared-user installation, a process that can access the operator token can authenticate a direct API request, so this check cannot enforce role separation on its own.
+The server returns `403 director_action_not_via_mail` when a Director action carries a current Agent Mail session, including when the operator token is absent. The audit event records `via = mail_tool` and the current session. It identifies the session member unless the operator credential is verified. `ui` and `api` describe the request path and provide no identity proof. Dedicated mode separates the controller and agents by OS user. In a shared-user installation, a process that can access the operator token can authenticate a direct API request, so this check cannot enforce role separation on its own.
 
 ## Kinds of actor
 

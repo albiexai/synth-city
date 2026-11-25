@@ -9,7 +9,7 @@ from typing import NamedTuple
 
 import httpx
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from app.models.api_model import format_utc_time
 from sqlalchemy import and_, exists, func, or_, select, update
@@ -2505,18 +2505,20 @@ async def get_team_activity(preset_id: int, response: Response, db: AsyncSession
 async def update_preset(
     preset_id: int,
     request: AgentTeamPresetUpdate,
-    _operator: None = Depends(require_operator),
+    _operator: str | None = Header(default=None, alias="X-Synth-City-Operator-Token"),
     db: AsyncSession = Depends(get_db),
     write_context: dict | None = Depends(operator_write_context),
 ):
-    director_change = request.autonomy_enabled is True or bool(
-        request.model_fields_set.intersection(("backlog_milestone", "planned_decisions")),
-    )
-    if director_change and isinstance(write_context, dict):
-        await enforce_director_access_path(
-            db, write_context, source="director_action.update_preset", preset_id=preset_id,
+    # HTTP calls get server-derived context. Existing in-process calls use the dependency default.
+    if isinstance(write_context, dict):
+        director_change = request.autonomy_enabled is True or bool(
+            request.model_fields_set.intersection(("backlog_milestone", "planned_decisions")),
         )
-    # A direct call (no request) leaves write_context as the dependency marker, not a dict: no attribution then.
+        if director_change:
+            await enforce_director_access_path(
+                db, write_context, operator_token=_operator, source="director_action.update_preset", preset_id=preset_id,
+            )
+        await require_operator(_operator)
     session_invalid = isinstance(write_context, dict) and write_context["session_invalid"]
     try:
         response = await agent_team_service.update_preset(

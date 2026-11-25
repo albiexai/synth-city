@@ -208,6 +208,20 @@ async def _call(client, method, url, body, headers):
     return await client.post(url, json=body, headers=headers)
 
 
+def _assert_agent_refusal(label, response):
+    director_routes = {
+        "preset-update", "preset-delete", "scope-create", "scope-update",
+        "slot-add", "slot-update", "slot-delete", "slot-reorder", "leader-update",
+        "create-family-ordinary", "create-family-mail-import", "create-family-bridge-import", "create-family-duplicate",
+    }
+    if label in director_routes:
+        assert response.status_code == 403, label
+        assert response.json()["detail"]["code"] == "director_action_not_via_mail", label
+    else:
+        assert response.status_code == 401, label
+        assert response.json()["detail"] == "operator_token_required", label
+
+
 @pytest.mark.asyncio
 async def test_operator_arming_routes_refuse_anonymous_and_agent_but_accept_operator(
     client_and_db, tmp_path, operator_token_configured
@@ -220,7 +234,7 @@ async def test_operator_arming_routes_refuse_anonymous_and_agent_but_accept_oper
         agent = await _call(client, method, url, body, {"X-Synth-City-Session-Token": session_token})
         operator = await _call(client, method, url, body, {"X-Synth-City-Operator-Token": OPERATOR_TOKEN})
         assert anonymous.status_code == 401, label
-        assert agent.status_code == 401, label
+        _assert_agent_refusal(label, agent)
         assert operator.status_code not in (401, 503), label
         if label == "scope-update":
             assert operator.status_code == 200
@@ -382,7 +396,11 @@ async def test_team_launch_requires_director_and_agents_can_plan_without_overrid
     assert plan.json()["spawn_count"] == 0
     launch_payload = {"confirm_plan_hash": plan.json()["plan_hash"]}
     session_only = await client.post(f"{base}/launch", json=launch_payload, headers=session_headers)
-    assert session_only.status_code == 401 and session_only.json()["detail"] == "operator_token_required"
+    assert session_only.status_code == 403
+    assert session_only.json()["detail"]["code"] == "director_action_not_via_mail"
+    invalid_session = await client.post(f"{base}/launch", json=launch_payload,
+                                        headers={"X-Synth-City-Session-Token": "invalid-session"})
+    assert invalid_session.status_code == 401 and invalid_session.json()["detail"] == "operator_token_required"
     refused = await client.post(f"{base}/launch", json=launch_payload, headers=session_headers | operator_headers)
     assert refused.status_code == 403 and refused.json()["detail"]["code"] == "director_action_not_via_mail"
     launched = await client.post(f"{base}/launch", json=launch_payload, headers=operator_headers)
@@ -608,8 +626,7 @@ async def test_an_agent_session_token_does_not_admit_an_operator_route(
 
     for label, method, url, body in _routes(scope_id, workspace_id, item_id):
         response = await _call(client, method, url, body, headers)
-        assert response.status_code == 401, label
-        assert response.json()["detail"] == "operator_token_required", label
+        _assert_agent_refusal(label, response)
 
 
 @pytest.mark.asyncio

@@ -150,17 +150,22 @@ async def test_a_campaign_change_records_the_label_from_the_origin(client, db, p
 
 
 @pytest.mark.asyncio
-async def test_campaign_update_through_mail_is_refused_and_audited(client, db, preset, tmp_path):
+@pytest.mark.parametrize("operator_key", ["", "wrong-key", OPERATOR_KEY])
+async def test_campaign_update_through_mail_is_refused_and_audited(client, db, preset, tmp_path, operator_key):
     session = await _session(db, tmp_path)
     await _campaign(client, preset, "v4.2", Origin=UI_ORIGIN)
-    response = await _campaign(client, preset, "v4.3", **{"X-Synth-City-Session-Token": SESSION_TOKEN})
+    response = await _campaign(client, preset, "v4.3", **{
+        "X-Synth-City-Session-Token": SESSION_TOKEN, "X-Synth-City-Operator-Token": operator_key,
+    })
     assert response.status_code == 403 and response.json()["detail"]["code"] == MAIL_REFUSAL
     assert "UI" in response.json()["detail"]["message"]
     await db.refresh(preset)
     assert preset.backlog_milestone == "v4.2"
     ui, tool = await _events(db, preset)
     assert (ui.via, ui.actor_session_id) == ("ui", None)
-    assert (tool.via, tool.actor_session_id, tool.actor_member_id, tool.actor_kind) == ("mail_tool", session.id, None, "operator")
+    assert (tool.via, tool.actor_session_id) == ("mail_tool", session.id)
+    expected_actor = ("operator", None) if operator_key == OPERATOR_KEY else ("member", session.member_id)
+    assert (tool.actor_kind, tool.actor_member_id) == expected_actor
     assert tool.action_outcome == "rejected" and tool.sanitized_reason == MAIL_REFUSAL
 
 
@@ -277,8 +282,7 @@ async def test_the_route_function_still_works_when_called_directly_without_a_con
 
 
 @pytest.mark.asyncio
-async def test_the_operator_key_is_still_required_whatever_the_session_says(client, db, preset, tmp_path):
-    await _session(db, tmp_path)
+async def test_an_invalid_session_does_not_remove_the_operator_requirement(client, db, preset):
     response = await client.patch(f"{PATH}/{preset.id}", json={"backlog_milestone": "v4.2"},
                                   headers={"X-Synth-City-Operator-Token": "wrong", "X-Synth-City-Session-Token": SESSION_TOKEN})
     assert response.status_code == 401 and response.json()["detail"] == "operator_token_invalid"
@@ -321,6 +325,7 @@ async def test_mixed_preset_patch_refuses_director_fields_before_any_change(clie
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operator_key", ["", OPERATOR_KEY])
 @pytest.mark.parametrize("method,path,body", [
     ("POST", "/presets", {"name": "Director fixture"}),
     ("POST", "/presets/from-agent-mail", {"name": "Mail import fixture", "member_ids": [999]}),
@@ -343,15 +348,17 @@ async def test_mixed_preset_patch_refuses_director_fields_before_any_change(clie
         "expected_scope_revision": 0, "target_policy_revision": 1, "reason": "Fixture"}),
     ("PUT", "/presets/999/supervisor", {"actor_id": None}),
 ])
-async def test_director_routes_reject_a_current_mail_session(client, db, tmp_path, method, path, body):
+async def test_director_routes_reject_a_current_mail_session(client, db, tmp_path, method, path, body, operator_key):
     session = await _session(db, tmp_path)
     path = "/api/v1/agent-teams" + path
     refused = await client.request(method, path, json=body,
-                                   headers={"X-Synth-City-Session-Token": SESSION_TOKEN})
+                                   headers={"X-Synth-City-Session-Token": SESSION_TOKEN,
+                                            "X-Synth-City-Operator-Token": operator_key})
     assert refused.status_code == 403 and refused.json()["detail"]["code"] == MAIL_REFUSAL
     audit_event = (await db.scalars(select(FactoryAuditEvent).where(
         FactoryAuditEvent.sanitized_reason == MAIL_REFUSAL))).one()
     assert (audit_event.via, audit_event.actor_session_id, audit_event.action_outcome) == ("mail_tool", session.id, "rejected")
+    assert audit_event.actor_kind == ("operator" if operator_key else "member")
     # The synthetic target can be absent. A request without Mail reaches the route's normal result.
     direct = await client.request(method, path, json=body)
     assert direct.status_code in {200, 204, 400, 404}
