@@ -176,15 +176,21 @@ async def test_later_secondary_deadline_adds_only_its_extension(history_database
     writer = GithubRateLimitHistory(sessions)
     now = NOW
     service = GithubRateLimitService(now=lambda: now, window_observer=writer.observe)
-    for offset, delay in [(0, "60"), (1, "300"), (2, "299")]:
+    for offset, delay in [(0, "60"), (1, "300"), (2, "299"), (3, "10")]:
         now = NOW + timedelta(seconds=offset)
         with pytest.raises(GithubRateLimited):
             await service._after_response(response(429, {"retry-after": delay}))
     await writer.drain()
     sample = await campaign_rate_limit_time(db, NOW, NOW + 10 * MINUTE)
     assert (sample.seconds, sample.sample_count) == (301, 1)
-    starts = (await db.scalars(text("SELECT started_at FROM github_rate_limit_windows ORDER BY started_at"))).all()
-    assert [datetime.fromisoformat(value).replace(tzinfo=timezone.utc) for value in starts] == [NOW, NOW + MINUTE]
+    rows = (await db.execute(text(
+        "SELECT started_at, reset_at, window_reset_at FROM github_rate_limit_windows ORDER BY started_at"
+    ))).all()
+    assert [tuple(datetime.fromisoformat(value).replace(tzinfo=timezone.utc) for value in row)
+            for row in rows] == [
+        (NOW, NOW + MINUTE, NOW + MINUTE),
+        (NOW + MINUTE, NOW + timedelta(seconds=301), NOW + MINUTE),
+    ]
 
 
 @pytest.mark.asyncio
@@ -354,3 +360,89 @@ async def test_unclean_restart_preserves_time_before_the_last_checkpoint(history
         assert tail.seconds is None
     finally:
         await replacement.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_pending_window_survives_checkpoint_as_unknown_after_restart(history_database, monkeypatch):
+    db, sessions = history_database
+    from app.services import github_rate_limit_history as history
+
+    now = NOW.replace(tzinfo=None)
+    monkeypatch.setattr(history, "_now", lambda: now)
+    monkeypatch.setattr(history, "_CHECKPOINT_INTERVAL", 0.02)
+    writer = history.GithubRateLimitHistory(sessions)
+    passed_checkpoint = asyncio.Event()
+    sleep = asyncio.sleep
+    ticks = 0
+    failing = True
+
+    async def track_checkpoint(delay):
+        nonlocal ticks
+        if asyncio.current_task() is writer._checkpoint_task:
+            ticks += 1
+            if ticks == 2:
+                passed_checkpoint.set()
+        await sleep(delay)
+
+    def fail_window_write(_conn, _cursor, sql, _params, _context, _executemany):
+        if failing and sql.startswith("INSERT INTO github_rate_limit_windows "):
+            raise OperationalError(None, None, RuntimeError("fixture unavailable"))
+
+    monkeypatch.setattr(history.asyncio, "sleep", track_checkpoint)
+    event.listen(db.bind.sync_engine, "before_cursor_execute", fail_window_write)
+    with writer.install_on_startup():
+        await database.init_db()
+    window_start, window_end = NOW + MINUTE, NOW + 2 * MINUTE
+    now += 3 * MINUTE
+    writer.observe("secondary", window_start, window_end)
+    try:
+        await asyncio.wait_for(passed_checkpoint.wait(), timeout=2)
+    finally:
+        writer._checkpoint_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await writer._checkpoint_task
+        await writer.drain()
+    assert (await db.scalars(text("SELECT source FROM github_rate_limit_windows"))).all() == []
+
+    # Model a restart without the previous recorder's in-memory pending window.
+    failing = False
+    now += MINUTE
+    replacement = history.GithubRateLimitHistory(sessions)
+    with replacement.install_on_startup():
+        await database.init_db()
+    try:
+        sample = await history.campaign_rate_limit_time(db, window_start, window_end)
+        assert (sample.seconds, sample.sample_count) == (None, 0)
+    finally:
+        await replacement.close()
+
+
+@pytest.mark.asyncio
+async def test_campaign_read_becomes_unknown_when_a_window_arrives_mid_read(history_database, monkeypatch):
+    db, sessions = history_database
+    from app.services.github_rate_limit_history import GithubRateLimitHistory, campaign_rate_limit_time
+
+    writer = GithubRateLimitHistory(sessions)
+    with writer.install_on_startup():
+        await database.init_db()
+    execute = db.execute
+    appeared = False
+
+    async def read_then_observe(statement, *args, **kwargs):
+        nonlocal appeared
+        result = await execute(statement, *args, **kwargs)
+        if not appeared and "github_rate_limit_windows" in str(statement):
+            appeared = True
+            writer.observe("secondary", NOW, NOW + MINUTE)
+            await writer.drain()
+        return result
+
+    monkeypatch.setattr(db, "execute", read_then_observe)
+    try:
+        changed = await campaign_rate_limit_time(db, NOW, NOW + MINUTE)
+        current = await campaign_rate_limit_time(db, NOW, NOW + MINUTE)
+        assert appeared
+        assert (changed.seconds, changed.sample_count) == (None, 0)
+        assert (current.seconds, current.sample_count) == (60, 1)
+    finally:
+        await writer.close()
