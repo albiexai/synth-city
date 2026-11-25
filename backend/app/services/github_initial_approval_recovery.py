@@ -12,6 +12,7 @@ from app.models.database import (
     GithubWorkspace,
     MailMessage,
 )
+from app.services import decision_wait_service as decision_waits
 from app.services import factory_audit_service as audit
 from app.services.github_approval_service import (
     GithubApprovalError,
@@ -155,6 +156,9 @@ async def cancel_stranded_initial_approval(
     )
     if cancelled.rowcount != 1:
         raise GithubApprovalError("initial_approval_cancel_conflict")
+    await decision_waits.record_wait_ended(
+        db, [request_id], outcome="cancelled", ended_at=now,
+        source="github_initial_approval_recovery.cancel_stranded_initial_approval")
     for root in roots:
         root.request_status = "superseded"
     if actor is not None:
