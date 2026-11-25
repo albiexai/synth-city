@@ -1240,3 +1240,8 @@ async def init_db() -> None:
             async with engine.connect() as conn:
                 await _run_sqlite_compat_migrations(conn)
         complete_reference_upgrade(phase.database, phase.records, home=phase.home, ops=phase.ops)
+        if settings.database_url.startswith("sqlite"):
+            from app.services.github_terminal_revision_service import supersede_stale_revisions_at_upgrade
+
+            async with AsyncSession(engine) as db, db.begin():
+                await supersede_stale_revisions_at_upgrade(db)

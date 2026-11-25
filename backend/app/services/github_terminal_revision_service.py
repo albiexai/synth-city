@@ -4,6 +4,7 @@ import hashlib
 import json
 
 from sqlalchemy import String, cast, exists, inspect, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.api_model import format_utc_time
 from app.models.database import (
@@ -101,6 +102,32 @@ async def complete_current_revision(db, item, *, source, terminal_status):
         raise TerminalRevisionContextChanged("terminal_revision_context_changed")
     await audit.record_revision_outcome(db, item_id=item.id, revision_id=revision.id, status=outcome, source=source)
     await db.refresh(revision)
+
+
+async def supersede_stale_revisions_at_upgrade(db: AsyncSession) -> None:
+    """Repair legacy revisions and record outcomes in the same startup transaction."""
+    reason = "item_terminal_at_upgrade"
+    # The automatic repair covers the item outcomes specified for this upgrade.
+    terminal_item_ids = select(GithubWorkItem.id).where(
+        GithubWorkItem.dispatch_status.in_(("merged", "completed", "cancelled")),
+    )
+    # Claim only still-eligible rows in the write itself. A second startup
+    # sees the committed terminal revisions and writes no duplicate outcomes.
+    repaired = await db.execute(
+        update(GithubAttemptScopeRevision)
+        .where(
+            GithubAttemptScopeRevision.work_item_id.in_(terminal_item_ids),
+            GithubAttemptScopeRevision.status.in_(("active", "submitted", "escalated")),
+        )
+        .values(status="superseded", cancelled_at=datetime.utcnow(), cancellation_reason=reason)
+        .returning(GithubAttemptScopeRevision.id, GithubAttemptScopeRevision.work_item_id)
+    )
+    actor = audit.derive_actor(actor_kind="system")
+    for revision_id, item_id in repaired.tuples():
+        await audit.record_revision_outcome(
+            db, item_id=item_id, revision_id=revision_id, status="superseded",
+            source="database.init_db", actor=actor, sanitized_reason=reason,
+        )
 
 
 async def terminal_revision_report(db, preset_id):
