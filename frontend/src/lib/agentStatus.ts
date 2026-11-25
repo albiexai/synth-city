@@ -10,6 +10,9 @@ export interface AgentStatusView {
   session: { state: SessionFact; label: string }
   activity: { state: ActivityFact; label: string; title: string }
   wake: { state: WakeFact; label: string; reason: string | null }
+  /** True only for a stale state in a status that is still current. Every other case is false. */
+  toolCatalogStale: boolean
+  toolCatalogReason: string | null
 }
 
 const WAKE_REASONS: Record<string, string> = {
@@ -77,6 +80,8 @@ export function agentStatusView(status: AgentStatus | null | undefined, now: num
         title: status ? 'This status has expired. Synth City is reading it again.' : 'Synth City has no status for this agent.',
       },
       wake: { state: 'unknown', label: 'Wake unknown', reason: null },
+      toolCatalogStale: false,
+      toolCatalogReason: null,
     }
   }
 
@@ -101,5 +106,7 @@ export function agentStatusView(status: AgentStatus | null | undefined, now: num
       label: status.wake_state === 'can_wake' ? 'Can be woken' : status.wake_state === 'cannot_wake' ? 'Cannot be woken' : 'Wake unknown',
       reason: status.wake_state === 'cannot_wake' ? wakeReasonText(status.wake_reason) : null,
     },
+    toolCatalogStale: status.tool_catalog_state === 'stale',
+    toolCatalogReason: status.tool_catalog_reason ?? null,
   }
 }

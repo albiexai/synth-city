@@ -9,6 +9,8 @@ interface AgentStatusBadgesProps {
   status?: AgentStatus | null
   /** Leave out the line that explains a refused wake. The reason stays in the tooltip. */
   compact?: boolean
+  /** Show "Mail tools out of date" for a stale member. Only a view of one whole member turns it on (#1022a). */
+  showToolCatalog?: boolean
   /** Fixed clock for tests. */
   now?: number
   className?: string
@@ -30,12 +32,16 @@ function useStatusClock(status: AgentStatus | null | undefined, fixedNow?: numbe
 }
 
 /** The one display of an agent's status: session, activity and wake. */
-export function AgentStatusBadges({ status, compact, now, className }: AgentStatusBadgesProps) {
+export function AgentStatusBadges({ status, compact, showToolCatalog, now, className }: AgentStatusBadgesProps) {
   const clock = useStatusClock(status, now)
   const view = agentStatusView(status, clock)
   const expired = Boolean(status) && !isAgentStatusCurrent(status, clock)
   return (
-    <div className={cn('flex flex-wrap items-center gap-1.5', className)} data-testid="agent-status">
+    <div
+      // With the notice the group is wide. It takes its own line in a wrapping row, so it cannot squeeze the name beside it.
+      className={cn('flex flex-wrap items-center gap-1.5', showToolCatalog && view.toolCatalogStale && 'basis-full', className)}
+      data-testid="agent-status"
+    >
       {/* The spaces keep copied text and text queries readable: "Online Idle for 3 h". */}
       {' '}
       <Badge
@@ -72,6 +78,16 @@ export function AgentStatusBadges({ status, compact, now, className }: AgentStat
       >
         {view.wake.label}
       </Badge>
+      {' '}
+      {showToolCatalog && view.toolCatalogStale && (
+        <Badge
+          variant="outline"
+          title={view.toolCatalogReason ?? 'This member started with an older Mail tool list. Restart it in resume mode to load the new one.'}
+          className="whitespace-normal border-amber-300 text-amber-700 dark:text-amber-300"
+        >
+          Mail tools out of date: restart to load
+        </Badge>
+      )}
       {' '}
       {view.wake.reason && !compact && <span className="w-full text-xs text-muted-foreground">{view.wake.reason}</span>}
     </div>

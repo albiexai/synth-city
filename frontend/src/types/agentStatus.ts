@@ -8,4 +8,7 @@ export interface AgentStatus {
   idle_since: string | null
   checked_at: string
   valid_until: string
+  /** Whether the member's Mail tool list is the deployed one (#960). An older backend omits both fields. */
+  tool_catalog_state?: 'current' | 'stale' | 'unknown'
+  tool_catalog_reason?: string | null
 }

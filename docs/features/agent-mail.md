@@ -160,8 +160,13 @@ The state is a display fact only. It grants no authority and changes no wake, de
 member keeps working with the tools it has. **The restart fallback:** restart the member in resume mode. It then loads
 the new list and keeps its conversation.
 
-This is the first part of #960. Telling a running client with a `tools/list_changed` notification, and the badge in the
-roster, are separate follow-ups, so for now the member keeps its old list until it is restarted.
+The **Teams** roster shows this fact. A member in the **stale** state shows "Mail tools out of date: restart to load"
+beside its other status badges. The text hides when the member is current, when the state is unknown, and when the
+status has expired. The Agent Mail roster and the Live sessions cards do not show it: a session card is one session, and
+the state is judged over all of a member's sessions.
+
+A member keeps its old list until it is restarted. Telling a running client with a `tools/list_changed` notification is a
+separate issue (#1321, planned for v4.5), because no part of the Mail server changes its tool list while it runs.
 
 ## Install Details
 
