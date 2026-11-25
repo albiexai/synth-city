@@ -9,8 +9,8 @@ Someone who is not the author of Synth City (the first one is Pablo, on Ubuntu, 
 
 **Success, measured at the 4.5 release:**
 1. **Quick start:** on a clean Ubuntu 24.04 machine, `install.sh` then `start.sh` gives a working Synth City with Claude Code and Codex verified, in under 15 minutes of the user's time, and `synth-city doctor` reports no failed required check.
-2. **Dedicated:** on a clean Ubuntu 24.04 machine (and on WSL 2), `synth-city install --dedicated --execute`, the two guided harness logins and the docs give a factory whose doctor reports no failed required check, and a three-member team (Leader, builder, verifier) takes one issue from ready label to merge. **Pablo does this on his own computer** before the release.
-3. **The reference factory adopts it:** the Synth City factory gets a layout file describing its current names, its doctor passes, and it is upgraded to 4.5.0 with `synth-city upgrade` (not the private script). How far its folders and units are converted is decided in section 9.
+2. **Dedicated:** on a clean Ubuntu LTS machine (and on WSL 2), the documented download-and-verify step, `synth-city install --dedicated --execute`, the two guided harness logins and the docs give a factory whose doctor reports no failed required check, and a three-member team (Leader, builder, verifier) takes one issue from ready label to **automatic merge**. **The acceptance run is a dedicated factory for Pablo on a remote Ubuntu server** (section 9.1), on a release candidate in the last third of the campaign.
+3. **The reference factory adopts it and is converted on release day** (Director, 2026-11-24): it gets a layout file describing its current names, its doctor passes, and the 4.5.0 upgrade converts it to the standard layout (section 5.1), with `synth-city upgrade`, not the private script.
 4. **Upgrade and rollback** work on a disposable dedicated install in CI: **4.5.0-rc.1 → 4.5.0-rc.2 → rollback → rc.2**, and **adoption** works from a 4.4.0 git-checkout install (adopt, then upgrade to the 4.5 candidate). *(Author's call: the `releases/` + `current` structure and the archive exist only from 4.5, so a 4.4.0 → 4.5.0 archive upgrade can't be tested; adoption covers the 4.4 starting point.)*
 
 **Non-goals (4.6 or later):** team kits beyond three roster presets; the Quick start → Dedicated migration; one agent user per team (the layout allows it, nothing uses it); a `.deb` package; a public reverse proxy; macOS and native Windows dedicated installs.
@@ -116,7 +116,19 @@ Steps:
 
 **Rollback**: `synth-city rollback` switches `current` back and restores the backup taken by that upgrade. It refuses when the database has changed since the upgrade (new work items or Mail), says so, and stops.
 
-**Adoption:** `synth-city install --adopt` writes a `layout.toml` describing an existing installation (for the reference factory: `deckproductctl`, `deckproduct`, `deckproduct-work`, `/opt/claude-deck-product`, its current units and drop-ins, `controller/backend/.env` as the settings file), checks it with the doctor, and changes nothing else. What an adopted installation's first upgrade converts is decided in section 9.
+**Adoption:** `synth-city install --adopt` writes a `layout.toml` describing an existing installation (for the reference factory: `deckproductctl`, `deckproduct`, `deckproduct-work`, `/opt/claude-deck-product`, its current units and drop-ins, `controller/backend/.env` as the settings file), checks it with the doctor, and changes nothing else. An adopted installation's **first upgrade converts it** (Director, 2026-11-24):
+
+### 5.1 Converting an adopted installation (release day, the reference factory)
+
+`synth-city upgrade --convert <version>` does, after the normal preflight and backup:
+1. unpack the release into `releases/<version>` and create its environment (the old `controller` checkout, `venv-3.1` and the `*-candidate` folders are **kept untouched** until the conversion is confirmed);
+2. move the settings to the layout's settings file (`/etc/synth-city/env`, mode 600, controller-owned) and the database to the state folder, keeping copies in place;
+3. regenerate the units and remove the old drop-ins, keeping copies of every replaced unit file; write the `sudoers` rules through `visudo -c`;
+4. restart; run the doctor; launch nothing.
+
+Its rollback restores the old units, drop-ins, settings path and database location exactly, from the copies, and switches back to the old controller checkout. The copies are removed only by an explicit `synth-city upgrade --finish-conversion` after the Director confirms the factory works.
+
+**Because this changes a live security boundary on release day**, the release checklist requires: (a) a **rehearsal** of `--convert` and its rollback in CI on a disposable install that reproduces the reference factory's hand-built layout (names, drop-in, settings inside `controller/backend`); (b) a **dry run** (`--convert` without `--execute`) on the live factory the day before, with its plan reviewed; (c) the conversion run with **nothing dispatched**, at a time the Director chooses.
 
 ## 6. W4 Quick start
 
@@ -160,6 +172,8 @@ Sizes follow the 4.4 sweet spot (150–400 changed lines per item). L = likely t
 | U1b | `synth-city rollback`, with the database-changed refusal | W3 | U1 | M |
 | U1c | Re-apply managed harness configuration after an upgrade (through `agent-config`) | W3 | U1, I4 | S |
 | U2 | `install --adopt` for an existing installation (units, drop-ins, settings in place) | W3 | H1, H5 | M |
+| U4 | `upgrade --convert` / `--finish-conversion`, with its exact rollback | W3 | U1b, U2 | L |
+| U5 | CI: rehearse `--convert` and its rollback on a replica of the reference factory's layout | W3 | U4 | M |
 | U3 | CI: rc.1 → rc.2 → rollback → rc.2 on a disposable install; adopt a 4.4.0 git-checkout install, then upgrade | W3 | U1b, U2, I7 | M |
 | Q1 | `start.sh` (release build) | W4 | — | S |
 | Q2 | `install.sh`: checks, harness offer, verified login, layout, doctor | W4 | H1, H5 | M |
@@ -168,18 +182,25 @@ Sizes follow the 4.4 sweet spot (150–400 changed lines per item). L = likely t
 | D2 | Operating the factory (docs page) | Docs | — | M |
 | D3 | Remote access and upgrade guides | Docs | U1b | S |
 
-**28 items.** Order: H1 and I1 and Q1 first (no dependencies); then the engine and the installer core in parallel; upgrades after the archive; docs last but D2 any time.
+**30 items.** Order: H1 and I1 and Q1 first (no dependencies); then the engine and the installer core in parallel; upgrades after the archive; docs last but D2 any time.
 
 **4.4 items this slice builds on:** #1262 (minimal `agent-config`), #1113 (charter templates), #1280 (settings in force, optional), #948 (workspace provisioning). *(Author's call:)* 4.5 starts after 4.4.0 is released. An item that didn't ship in 4.4 moves into 4.5 as its own item, ordered before the items that depend on it; #1280 is simply absorbed by H8.
 
-## 9. Open points for the Director
+## 9. Decisions and open points
 
-1. **The reference factory on release day.** Adoption writes a layout file and changes nothing. The question is what its first `synth-city upgrade` converts. Its controller is a git checkout with about 25 `*-candidate` folders beside it; the unit runs `venv-3.1` through a drop-in; `.env` is inside `controller/backend`; the units were written by hand.
-   - **(a) Keep its layout for good:** adopted names, units, drop-ins and settings path stay; the upgrade only unpacks into `releases/` and repoints the drop-in. Lowest risk on release day.
-   - **(b) Convert at the first upgrade:** regenerate its units and move its settings to `/etc/synth-city/env` on release day. It ends up like a fresh install, but it changes the live security boundary during the release.
-   - **(c) Keep at release, convert later** in a quiet window after 4.5.0, with its own backup and rollback. *(Recommended.)*
-2. **Pablo as the acceptance test (success 2).** Confirm, and the details: **when** (a release candidate in the last third of the campaign), **which repository** (one of his own, with a CI workflow on its base branch; or a small fixture repository we prepare), **which GitHub account** (his own for the test, or a machine user, which section 4.5 recommends), and **which merge policy** (`human`, the presets' default, so he merges the one PR himself; or `auto`, which also proves the verifier path).
-3. **Where the installer starts.** Recommended: the docs give two commands, download and verify the archive, then run `scripts/synth-city install` from it. No `curl … | sudo bash`.
+**Decided (Director, 2026-11-24):** the reference factory is **converted on release day** (section 5.1); the acceptance test uses **automatic merge**; a dedicated install starts with **download, verify, run** (no `curl | sudo bash`).
+
+### 9.1 Pablo's factory on a remote server (the acceptance run)
+
+The Director will install a dedicated factory for Pablo on a remote Ubuntu server, and that install is the 4.5 acceptance run: a real server (not WSL), reached remotely, installed from the docs. What a remote server implies, for this run and for anyone:
+- **Remote access:** `tailscale serve` or an SSH tunnel (decision J). Synth City must **not** be published through any reverse proxy already running on the server.
+- **A server shared with other services** is a poor host: the agents run with permission prompts off, so they would share a machine with those services. Dedicated mode's separate users reduce that risk but don't remove it. **Recommendation: a server for the factory alone.**
+- **Memory:** the backend pauses dispatch below `GITHUB_MIN_AVAILABLE_MEMORY_MB` (3000 MB available, by default), and each Claude Code or Codex member, and each test run, uses memory. Without swap, running out lets the kernel's out-of-memory killer choose a victim, which may be another service. Size the server for the roster (about 8 GB for a three-member team, 16 GB for the larger presets) rather than lowering the threshold.
+- **Harness logins and subscriptions** belong to the server's agent user; whose subscriptions it uses decides whose quota the test spends.
+
+The doctor gains two checks from this: **available memory against the dispatch threshold** (a blocker for autonomy when it is below), and **free disk** (a warning below 20 GB, a blocker below 5 GB; defaults in the layout file).
+
+**Still open (the Director answers later, before the release candidate):** which server; who runs the install (Pablo himself from the docs is the stronger test); whose Claude and Codex subscriptions the agent user uses; which repository and GitHub account (a small fixture repository with CI and a machine user is recommended).
 
 ## 10. Left to the builder
 
