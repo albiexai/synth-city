@@ -64,6 +64,8 @@ A closed-without-merge result is a combination of current conditions. It has no 
 
 The watcher reads later results. Each poll reads at most 20 attempts that are unknown or closed without delivery, in turn, with no age limit. When a pull request of such an attempt merged later, the watcher records the delivery on the original attempt, with the attempt's original type and resource lifetime. When the work item was deleted, replaced or moved during the read, nothing is recorded. The watcher never changes a work item for a later result. The metrics read itself never fetches GitHub.
 
+The watcher also records the facts of each merged pull request, once per watched repository scope: lines added and deleted, changed files, commits, and who merged it (`pull_request_facts`). The merge marks them as due in its own transaction, and each poll reads at most 20 due pull requests. A failed read writes nothing and is tried again on a later poll. A value that GitHub did not report is unknown, never zero. `merge_path` is `automatic` only for a merge that Synth City's own automatic merge confirmed; otherwise it is `unknown`. Merges recorded before this version have no facts.
+
 The watcher completes a work item only through one guarded write. The write requires the same attempt and status that the watcher read, and no pending approval request, live revision or requested retry. If any of these changed, the item stays unchanged and no result is recorded.
 
 ## Review acceptance declarations
