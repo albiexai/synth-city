@@ -1,4 +1,4 @@
-"""#945 slice 1: an audited settings change records how it was made, not only that the operator made it.
+"""Operator write attribution and the Director-action boundary.
 
 The operator key stays the authority for the write. ``via`` is attribution: ``mail_tool`` is a fact the server derives from a
 validated Mail session; ``ui`` and ``api`` are labels from the browser's Origin header and are not proof of who called. A bad
@@ -13,6 +13,7 @@ from datetime import datetime
 import httpx
 import pytest
 import pytest_asyncio
+from fastapi import Depends, FastAPI
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -28,6 +29,7 @@ OPERATOR_KEY = "audit-via-test-operator-key"
 SESSION_TOKEN = "audit-via-test-session-token"
 UI_ORIGIN = "http://localhost:5173"
 PATH = "/api/v1/agent-teams/presets"
+MAIL_REFUSAL = "director_action_not_via_mail"
 
 
 @pytest_asyncio.fixture
@@ -148,13 +150,18 @@ async def test_a_campaign_change_records_the_label_from_the_origin(client, db, p
 
 
 @pytest.mark.asyncio
-async def test_the_same_change_through_a_ui_and_through_a_mail_session_records_different_paths(client, db, preset, tmp_path):
+async def test_campaign_update_through_mail_is_refused_and_audited(client, db, preset, tmp_path):
     session = await _session(db, tmp_path)
     await _campaign(client, preset, "v4.2", Origin=UI_ORIGIN)
-    await _campaign(client, preset, "v4.3", **{"X-Synth-City-Session-Token": SESSION_TOKEN})
+    response = await _campaign(client, preset, "v4.3", **{"X-Synth-City-Session-Token": SESSION_TOKEN})
+    assert response.status_code == 403 and response.json()["detail"]["code"] == MAIL_REFUSAL
+    assert "UI" in response.json()["detail"]["message"]
+    await db.refresh(preset)
+    assert preset.backlog_milestone == "v4.2"
     ui, tool = await _events(db, preset)
     assert (ui.via, ui.actor_session_id) == ("ui", None)
     assert (tool.via, tool.actor_session_id, tool.actor_member_id, tool.actor_kind) == ("mail_tool", session.id, None, "operator")
+    assert tool.action_outcome == "rejected" and tool.sanitized_reason == MAIL_REFUSAL
 
 
 @pytest.mark.asyncio
@@ -163,7 +170,8 @@ async def test_a_valid_session_wins_over_the_origin_and_caller_claims_are_never_
     response = await client.patch(
         f"{PATH}/{preset.id}", json={"backlog_milestone": "v4.2", "actor_session_id": 999, "via": "ui"},
         headers={"X-Synth-City-Session-Token": SESSION_TOKEN, "Origin": UI_ORIGIN, "X-Synth-City-Session-Id": "999"})
-    assert response.status_code == 200
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == MAIL_REFUSAL
     (event,) = await _events(db, preset)
     assert (event.via, event.actor_session_id) == ("mail_tool", session.id)
 
@@ -196,7 +204,7 @@ async def test_a_role_bearing_session_is_attributed_only_while_its_pane_is_alive
     monkeypatch.setattr(deps.peer_process, "pane_is_alive", lambda pid, start: pane_alive)
     session = await _session(db, tmp_path, team_slot_id=999, bound_pane_pid=424242, bound_pane_proc_start="fake-start")
     response = await _campaign(client, preset, **{"X-Synth-City-Session-Token": SESSION_TOKEN})
-    assert response.status_code == 200
+    assert response.status_code == (403 if expected == "mail_tool" else 200)
     (event,) = await _events(db, preset)
     assert event.via == expected
     assert event.actor_session_id == (session.id if expected == "mail_tool" else None)
@@ -216,7 +224,8 @@ async def test_a_role_bearing_session_without_a_recorded_pane_is_unattributed(cl
 async def test_a_valid_session_is_attributed_under_either_setting(client, db, preset, tmp_path, monkeypatch, strict):
     monkeypatch.setattr(settings, "mail_capability_tokens_required", strict)
     session = await _session(db, tmp_path)
-    await _campaign(client, preset, **{"X-Synth-City-Session-Token": SESSION_TOKEN})
+    response = await _campaign(client, preset, **{"X-Synth-City-Session-Token": SESSION_TOKEN})
+    assert response.status_code == 403
     (event,) = await _events(db, preset)
     assert (event.via, event.actor_session_id) == ("mail_tool", session.id)
 
@@ -240,11 +249,13 @@ async def _refusals(db, preset):
 @pytest.mark.parametrize("token,flagged", [("bad-token", True), (SESSION_TOKEN, False)])
 async def test_the_refusal_observation_keeps_the_bounded_invalid_session_flag(
         client, db, preset, tmp_path, token, flagged):
-    """Review 5930749403, P3: the refused autonomy change records how it arrived; the policy refusal is unchanged."""
+    """A valid Mail session is stopped before business rules; invalid attribution stays advisory."""
     session = await _session(db, tmp_path)
     response = await client.patch(f"{PATH}/{preset.id}", json={"autonomy_enabled": True},
                                   headers={"X-Synth-City-Session-Token": token, "Origin": UI_ORIGIN})
-    assert response.status_code == 400 and "leader_assignment_required" in response.text
+    assert response.status_code == (400 if flagged else 403)
+    reason = "leader_assignment_required" if flagged else MAIL_REFUSAL
+    assert reason in response.text
     await db.refresh(preset)
     assert preset.autonomy_enabled is not True
     (event,) = await _refusals(db, preset)
@@ -286,11 +297,89 @@ async def test_a_campaign_change_records_one_event_only_when_a_field_changes(cli
 
 
 @pytest.mark.asyncio
-async def test_the_autonomy_event_also_records_the_path(client, db, preset):
-    response = await client.patch(f"{PATH}/{preset.id}", json={"autonomy_enabled": False}, headers={"Origin": UI_ORIGIN})
+async def test_turning_off_autonomy_and_updating_parent_link_stay_available(client, db, preset, tmp_path):
+    await _session(db, tmp_path)
+    link = "https://github.com/fixture/repo/issues/42"
+    response = await client.patch(f"{PATH}/{preset.id}", json={"autonomy_enabled": False, "parent_issue_url": link},
+                                  headers={"X-Synth-City-Session-Token": SESSION_TOKEN})
     assert response.status_code == 200
+    assert response.json()["parent_issue_url"] == link
     (event,) = await _events(db, preset)
-    assert event.after_values == {"autonomy_enabled": False} and event.via == "ui"
+    assert event.after_values == {"autonomy_enabled": False} and event.via == "mail_tool"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [{"backlog_milestone": None}, {"planned_decisions": None},
+                                      {"autonomy_enabled": True, "name": "Must not be saved"}])
+async def test_mixed_preset_patch_refuses_director_fields_before_any_change(client, db, preset, tmp_path, payload):
+    await _session(db, tmp_path)
+    response = await client.patch(f"{PATH}/{preset.id}", json=payload,
+                                  headers={"X-Synth-City-Session-Token": SESSION_TOKEN})
+    assert response.status_code == 403 and response.json()["detail"]["code"] == MAIL_REFUSAL
+    await db.refresh(preset)
+    assert preset.name == "Audit via" and not preset.autonomy_enabled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method,path,body", [
+    ("POST", "/presets", {"name": "Director fixture"}),
+    ("POST", "/presets/from-agent-mail", {"name": "Mail import fixture", "member_ids": [999]}),
+    ("POST", "/presets/from-agent-bridge", {"name": "Bridge import fixture"}),
+    ("POST", "/presets/999/duplicate", {"name": "Copy fixture"}),
+    ("DELETE", "/presets/999", None),
+    ("PUT", "/presets/999/leader", {"leader_slot_id": 1, "reason": "Fixture",
+                                    "expected_updated_at": "2026-01-01T00:00:00Z"}),
+    ("POST", "/presets/999/slots", {"display_name": "Fixture", "provider": "codex-cli", "repo_path": "/fixture"}),
+    ("PATCH", "/slots/999", {"launch_options": {"model": "fixture-model"}}),
+    ("DELETE", "/slots/999", None),
+    ("POST", "/presets/999/slots/reorder", {"slot_ids": [1]}),
+    ("POST", "/presets/999/github-scopes", {"repo_owner": "fixture", "repo_name": "repo", "repo_path": "/fixture"}),
+    ("PATCH", "/github-scopes/999", {"max_auto_merges_per_day": 2, "merge_policy": "auto"}),
+    ("PATCH", "/github-scopes/999/continuation-policy", {"continuation_enabled": True,
+        "max_continuation_revisions": 1, "max_continuation_failed_heads": 1, "max_failed_heads_per_revision": 1,
+        "max_scope_paths": 1, "max_scope_commands": 1}),
+    ("PATCH", "/github-scopes/999/delivery-policy", {"expected_revision": 1, "policy": {}, "reason": "Fixture"}),
+    ("PATCH", "/github-work-items/999/delivery-policy", {"expected_dispatch_nonce": "fixture",
+        "expected_scope_revision": 0, "target_policy_revision": 1, "reason": "Fixture"}),
+    ("PUT", "/presets/999/supervisor", {"actor_id": None}),
+])
+async def test_director_routes_reject_a_current_mail_session(client, db, tmp_path, method, path, body):
+    session = await _session(db, tmp_path)
+    path = "/api/v1/agent-teams" + path
+    refused = await client.request(method, path, json=body,
+                                   headers={"X-Synth-City-Session-Token": SESSION_TOKEN})
+    assert refused.status_code == 403 and refused.json()["detail"]["code"] == MAIL_REFUSAL
+    audit_event = (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.sanitized_reason == MAIL_REFUSAL))).one()
+    assert (audit_event.via, audit_event.actor_session_id, audit_event.action_outcome) == ("mail_tool", session.id, "rejected")
+    # The synthetic target can be absent. A request without Mail reaches the route's normal result.
+    direct = await client.request(method, path, json=body)
+    assert direct.status_code in {200, 204, 400, 404}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body,expected", [({}, 400), ({"confirm": "wrong"}, 400),
+                                           ({"confirm": 42}, 400), ({"confirm": "fixture-setting"}, 200)])
+async def test_typed_director_confirmation_uses_the_top_level_action_name(db, monkeypatch, body, expected):
+    from app.api.v1.deps import require_director_action
+
+    monkeypatch.setattr(settings, "operator_token", OPERATOR_KEY)
+    fixture = FastAPI()
+
+    async def fixture_db():
+        yield db
+
+    fixture.dependency_overrides[get_db] = fixture_db
+
+    @fixture.post("/confirmation", dependencies=[Depends(require_director_action(confirm="fixture-setting"))])
+    async def confirmation(payload: dict):
+        return {"confirmed": payload["confirm"]}
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=fixture), base_url="http://fixture") as client:
+        response = await client.post("/confirmation", json=body, headers={"X-Synth-City-Operator-Token": OPERATOR_KEY})
+    assert response.status_code == expected
+    assert response.json() == ({"confirmed": "fixture-setting"} if expected == 200 else
+                               {"detail": {"code": "director_confirmation_required", "confirm": "fixture-setting"}})
 
 
 @pytest.mark.asyncio

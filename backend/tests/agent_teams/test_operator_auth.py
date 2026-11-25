@@ -357,7 +357,7 @@ async def test_retry_requires_current_bound_leader_or_operator(
 
 
 @pytest.mark.asyncio
-async def test_team_launch_requires_authority_and_agents_cannot_override(
+async def test_team_launch_requires_director_and_agents_can_plan_without_overrides(
     client_and_db, operator_token_configured, monkeypatch
 ):
     client, maker = client_and_db
@@ -380,11 +380,12 @@ async def test_team_launch_requires_authority_and_agents_cannot_override(
     plan = await client.post(f"{base}/plan-launch", json={}, headers=session_headers)
     assert plan.status_code == 200
     assert plan.json()["spawn_count"] == 0
-    launched = await client.post(
-        f"{base}/launch",
-        json={"confirm_plan_hash": plan.json()["plan_hash"]},
-        headers=session_headers,
-    )
+    launch_payload = {"confirm_plan_hash": plan.json()["plan_hash"]}
+    session_only = await client.post(f"{base}/launch", json=launch_payload, headers=session_headers)
+    assert session_only.status_code == 401 and session_only.json()["detail"] == "operator_token_required"
+    refused = await client.post(f"{base}/launch", json=launch_payload, headers=session_headers | operator_headers)
+    assert refused.status_code == 403 and refused.json()["detail"]["code"] == "director_action_not_via_mail"
+    launched = await client.post(f"{base}/launch", json=launch_payload, headers=operator_headers)
     assert launched.status_code == 200
 
     for payload in (
@@ -395,7 +396,7 @@ async def test_team_launch_requires_authority_and_agents_cannot_override(
         {"adopt_unbound_sessions": True},
         {"skip_plan_confirmation": True},
     ):
-        for path in ("plan-launch", "launch/plan", "launch"):
+        for path in ("plan-launch", "launch/plan"):
             refused = await client.post(f"{base}/{path}", json=payload, headers=session_headers)
             assert refused.status_code == 403, (path, payload)
             assert refused.json()["detail"]["block_code"] == "operator_launch_override_required"

@@ -1,6 +1,7 @@
 """Shared route dependencies for capability-token enforcement."""
 
 import hmac
+from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 
 from fastapi import Depends, Header, HTTPException, Request
@@ -9,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
-from app.models.database import MailAgentSession
+from app.models.database import AgentTeamPreset, MailAgentSession
 from app.services.agent_mail_service import agent_mail_service
 from app.utils import peer_process
 from app.utils.path_utils import resolve_scope_user, set_scope_home, _scope_home
@@ -214,6 +215,51 @@ async def operator_write_context(
     else:
         via = "ui" if origin and origin in settings.cors_origins else "api"
     return {"via": via, "session_id": session.id if session is not None else None, "session_invalid": invalid}
+
+
+async def enforce_director_access_path(
+    db: AsyncSession, context: dict, *, source: str, preset_id: int | None = None,
+) -> None:
+    """Enforce the access path after operator authentication."""
+    if context["via"] != "mail_tool":
+        return
+    from app.services import factory_audit_service as audit
+
+    code = "director_action_not_via_mail"
+    preset = await db.get(AgentTeamPreset, preset_id) if preset_id is not None else None
+    await audit.record_observation(
+        db, event_kind="policy_change", source=source, occurred_at=datetime.now(timezone.utc),
+        actor=audit.derive_actor(actor_kind="operator", via="mail_tool", session_id=context["session_id"]),
+        team_preset_id=preset.id if preset is not None else None,
+        action_outcome="rejected", sanitized_reason=code,
+    )
+    raise HTTPException(status_code=403, detail={
+        "code": code,
+        "message": "Use the UI or operator API for this Director action.",
+    })
+
+
+def require_director_action(confirm: str | None = None):
+    """Require operator authority, a direct access path and optional typed confirmation."""
+    async def dependency(
+        request: Request,
+        _operator: None = Depends(require_operator),
+        context: dict = Depends(operator_write_context),
+        db: AsyncSession = Depends(get_db),
+    ) -> None:
+        await enforce_director_access_path(db, context, source=f"director_action.{request.scope['route'].name}")
+        if confirm is None:
+            return
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict) or payload.get("confirm") != confirm:
+            raise HTTPException(status_code=400, detail={
+                "code": "director_confirmation_required", "confirm": confirm,
+            })
+
+    return dependency
 
 
 async def require_operator_for_writes(

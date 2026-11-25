@@ -8,6 +8,12 @@ Select a figure to open it at full size. Parts marked **Not implemented** descri
 This page calls the human role the **Director**. Agent Mail already uses that name. The UI calls the Director's token the **Director key**. The API and code still say *operator* for the same role: the operator token, and `require_operator` on the factory routes. A supervisor uses it only under delegation.
 :::
 
+## Director actions
+
+Director actions require the operator token through the UI or operator API. These actions include creating, launching, or deleting teams, editing rosters and models, changing scope and delivery policies, enabling autonomy, binding a Supervisor, and editing campaign metadata. Launch planning remains available to eligible Mail sessions. When an action requires typed confirmation, include its exact name in the `confirm` field.
+
+The server refuses Director actions with a current Agent Mail session with `403 director_action_not_via_mail`. The audit event records `via = mail_tool` and the current session. `ui` and `api` describe the request path and provide no identity proof. Dedicated mode separates the controller and agents by OS user. In a shared-user installation, a process that can access the operator token can authenticate a direct API request, so this check cannot enforce role separation on its own.
+
 ## Kinds of actor
 
 Each actor is one of three kinds.
