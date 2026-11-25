@@ -11,6 +11,7 @@ No credential, credential hash or agent token is ever stored.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -47,6 +48,8 @@ SAFE_VALUE_FIELDS = {
     "target_milestone", "superseding_pr_number", "merge_commit_sha",
     # #945: a campaign change stores the milestone title and only the number of planned decisions.
     "backlog_milestone", "planned_decisions_count",
+    # #1238: the facts of a merged pull request, as GitHub reports them, and how it is known to have merged.
+    "additions", "deletions", "changed_files", "commit_count", "merged_by", "merged_by_type", "merge_path",
 }
 
 # C10: typed, named fields for event-time snapshots. Values are primitive
@@ -70,6 +73,8 @@ SAFE_SNAPSHOT_FIELDS = {
     "item_created_at", "slot_created_at",
     # R-final: the stable lifetime of a revision result.
     "revision_created_at",
+    # #1238: marks a delivery fact whose pull request facts are still to be read.
+    "pull_facts",
 }
 
 # C10/C03: the typed fields of a human review evidence record.
@@ -637,6 +642,36 @@ def _parse_time(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc).replace(tzinfo=None) if parsed.tzinfo else parsed
 
 
+# #1238: the event kind of a merged pull request's facts, the mark of a delivery fact that waits for them, and the
+# delivery source that confirms Synth City's own automatic merge.
+PULL_FACTS_KIND = "pull_request_facts"
+PULL_FACTS_DUE = "due"
+AUTOMATIC_MERGE_SOURCE = "github_verification_service._process_review_item.auto_merge"
+
+
+@dataclass(frozen=True)
+class DuePullFacts:
+    """#1238: one merged pull request whose facts are not recorded yet."""
+
+    event_id: int
+    artifact: str
+    attempt: str | None
+    scope_context_key: str
+    team_context_key: str | None
+
+
+def _pull_facts_operation(artifact: str) -> str:
+    return f"pull_facts:{artifact}"
+
+
+def _count(value: Any) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def _text(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
 async def record_merged_delivery(
     db: AsyncSession, item: Any, pull: dict | None, *, source: str,
     attempt_identity: tuple[str, int | None, str] | None = None,
@@ -676,6 +711,9 @@ async def record_merged_delivery(
     original = original_context or {}
     issue_type = original.get("issue_type") or item.issue_type
     snapshot["issue_type"] = issue_type
+    if artifact is not None:
+        # #1238: durable with the merge. The watcher reads the pull request's facts after it and records them once.
+        snapshot["pull_facts"] = PULL_FACTS_DUE
     return await record_delivery_fact(
         db, item_id=item.id, revision_id=revision_id, scope_id=item.scope_id,
         team_context_key=original.get("team_context_key"),
@@ -688,6 +726,72 @@ async def record_merged_delivery(
         artifact=artifact,
         actor=derive_actor(actor_kind="scheduler", scheduler="github_dispatch_scheduler"),
         attempt=attempt, launch_attempt=launch, snapshot=snapshot, source=source)
+
+
+async def due_pull_facts(db: AsyncSession, scope_id: int) -> list[DuePullFacts]:
+    """#1238: the merged pull requests of this scope lifetime whose facts are not recorded, oldest delivery first."""
+    scope_key = await current_context_key(db, "scope", scope_id)
+    if scope_key is None:
+        return []
+    recorded = set((await db.scalars(select(FactoryAuditEvent.operation_id).where(
+        FactoryAuditEvent.event_kind == PULL_FACTS_KIND, FactoryAuditEvent.scope_context_key == scope_key))).all())
+    rows = (await db.execute(
+        select(FactoryAuditEvent.id, FactoryAuditEvent.team_context_key, FactoryAuditEvent.context_snapshot)
+        .where(FactoryAuditEvent.event_kind == "delivery_evidence", FactoryAuditEvent.scope_context_key == scope_key,
+               FactoryAuditEvent.delivery_outcome == "delivered",
+               FactoryAuditEvent.context_snapshot["pull_facts"].as_string() == PULL_FACTS_DUE)
+        .order_by(FactoryAuditEvent.id))).all()
+    due: dict[str, DuePullFacts] = {}
+    for row in rows:
+        artifact = row.context_snapshot.get("artifact")
+        if artifact and _pull_facts_operation(artifact) not in recorded:
+            due.setdefault(artifact, DuePullFacts(
+                event_id=row.id, artifact=artifact, attempt=row.context_snapshot.get("attempt"),
+                scope_context_key=scope_key, team_context_key=row.team_context_key))
+    return list(due.values())
+
+
+async def record_pull_request_facts(
+    db: AsyncSession, *, scope_id: int, due: DuePullFacts, pull: dict[str, Any],
+) -> FactoryAuditEvent:
+    """#1238: the facts of one merged pull request, once per scope lifetime and pull request.
+
+    The pull request is immutable after its merge, so an existing record is returned as it is. A value GitHub did not
+    report is null, never zero. ``merge_path`` is ``automatic`` only for a merge that Synth City's own automatic merge
+    confirmed; nothing is inferred from ``merged_by`` or from a missing record.
+    """
+    operation_id = _pull_facts_operation(due.artifact)
+    existing = (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == PULL_FACTS_KIND, FactoryAuditEvent.operation_id == operation_id,
+        FactoryAuditEvent.scope_context_key == due.scope_context_key).limit(1))).first()
+    if existing is not None:
+        return existing
+    automatic = (await db.scalars(select(FactoryAuditEvent.id).where(
+        FactoryAuditEvent.event_kind == "delivery_evidence", FactoryAuditEvent.delivery_outcome == "delivered",
+        FactoryAuditEvent.scope_context_key == due.scope_context_key,
+        FactoryAuditEvent.source == AUTOMATIC_MERGE_SOURCE,
+        FactoryAuditEvent.context_snapshot["artifact"].as_string() == due.artifact).limit(1))).first()
+    merger = pull.get("merged_by")
+    merger = merger if isinstance(merger, dict) else {}
+    login = _text(merger.get("login"))
+    values = {
+        "additions": _count(pull.get("additions")), "deletions": _count(pull.get("deletions")),
+        "changed_files": _count(pull.get("changed_files")), "commit_count": _count(pull.get("commits")),
+        "merged_by": login, "merged_by_type": _text(merger.get("type")) if login else None,
+        "merge_path": "automatic" if automatic is not None else "unknown",
+    }
+    unknown = [name for name in values if values[name] is None]
+    return await record_event(
+        db, event_kind=PULL_FACTS_KIND, source="github_watcher_service._record_due_pull_facts",
+        occurred_at=datetime.utcnow(), fact_source="github_pull_request_merged",
+        fact_time=_parse_time(pull.get("merged_at")),
+        actor=derive_actor(actor_kind="scheduler", scheduler="github_watcher"),
+        scope_id=scope_id, scope_context_key=due.scope_context_key, team_context_key=due.team_context_key,
+        context_snapshot={"artifact": due.artifact, "attempt": due.attempt,
+                          "fact_source": "github_pull_request_merged"},
+        after_values=values, action_outcome="applied", operation_id=operation_id, correlation_id=operation_id,
+        sanitized_reason="pull request facts"
+        + (f": GitHub did not report {', '.join(unknown)}" if unknown else ""))
 
 
 async def record_revision_outcome(

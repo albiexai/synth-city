@@ -18,6 +18,7 @@ from app.services.github_client import GithubClient, github_client
 from app.services.github_dispatch_service import github_dispatch_service
 from app.services.github_dispatch_priority import priority_from_labels
 from app.services.agent_team_campaign_service import agent_team_campaign_service
+from app.services.github_rate_limit_service import GithubRateLimited
 from app.services.operations_health_service import operations_health_service
 from app.services.session_recovery import recover_session
 
@@ -43,6 +44,8 @@ _TERMINAL_REVISION_STATUSES = (
 
 # A34: at most this many unresolved attempts are read per poll.
 _PROVISIONAL_BATCH = 20
+# #1238: at most this many merged pull requests are read for their facts per poll.
+_PULL_FACTS_BATCH = 20
 _ARTIFACT_PR = re.compile(r"^(.+)/pull/(\d+)$")
 _ATTEMPT_KEY = re.compile(r"^item:(\d+):launch:(\d+|None):revision:(\d+|None)$")
 
@@ -168,6 +171,10 @@ async def observe_notification_uncertainty(
 
 
 class GithubWatcherService:
+    def __init__(self) -> None:
+        # #1238: per scope, the delivery event after which the next batch of due pull request facts starts.
+        self._pull_facts_after: dict[int, int] = {}
+
     async def poll_scope(
         self, db: AsyncSession, scope: TeamGithubScope, client: GithubClient | None = None
     ) -> None:
@@ -203,6 +210,14 @@ class GithubWatcherService:
             await recover_session(db, caught_error, discard=True)
             logger.info("Later-result reconciliation unavailable for scope %s", scope.id,
                         exc_info=True)
+            await db.refresh(scope)
+
+        try:
+            await self._record_due_pull_facts(db, scope, client)
+        except Exception as caught_error:
+            # #1238: the facts stay due; the poll never waits for them.
+            await recover_session(db, caught_error, discard=True)
+            logger.info("Pull request facts unavailable for scope %s", scope_id, exc_info=True)
             await db.refresh(scope)
 
         # This cached read changes no dispatch, retry, eligibility or merge decision.
@@ -593,6 +608,63 @@ class GithubWatcherService:
                     await recover_session(db, caught_error)
                     pass
         return len(batch)
+
+    async def _record_due_pull_facts(
+        self, db: AsyncSession, scope: TeamGithubScope, client: GithubClient
+    ) -> None:
+        """#1238: read and record the facts of merged pull requests that are due, a bounded batch in rotation.
+
+        The merge itself is already recorded. A failed or mismatched read writes nothing: the pull request stays due
+        and a later poll reads it again. The rotation is per process; the due list is durable.
+        """
+        from app.services import factory_audit_service as _audit
+
+        scope_id, owner, name = scope.id, scope.repo_owner, scope.repo_name
+        repository = f"{owner}/{name}"
+        numbered = []
+        for due in await _audit.due_pull_facts(db, scope_id):
+            match = _ARTIFACT_PR.match(due.artifact)
+            # Only the repository the scope watches now can be read for this pull request.
+            if match is not None and match.group(1) == repository:
+                numbered.append((due, int(match.group(2))))
+        after = self._pull_facts_after.get(scope_id, 0)
+        ordered = ([entry for entry in numbered if entry[0].event_id > after]
+                   + [entry for entry in numbered if entry[0].event_id <= after])
+        for due, number in ordered[:_PULL_FACTS_BATCH]:
+            await db.commit()  # no transaction stays open during the external read
+            try:
+                pull = await client.get_pull(owner, name, number)
+                if await self._pull_is_merged_here(db, pull, number, scope_id, due.scope_context_key, repository):
+                    await _audit.record_pull_request_facts(db, scope_id=scope_id, due=due, pull=pull)
+                    await db.commit()
+            except GithubRateLimited:
+                logger.info("Pull request facts wait for the GitHub quota of scope %s", scope_id)
+                break
+            except Exception as caught_error:
+                await recover_session(db, caught_error, discard=True)
+                logger.info("Pull request facts unavailable for %s", due.artifact, exc_info=True)
+            self._pull_facts_after[scope_id] = due.event_id
+
+    @staticmethod
+    async def _pull_is_merged_here(
+        db: AsyncSession, pull: object, number: int, scope_id: int, scope_context_key: str, repository: str
+    ) -> bool:
+        """#1238: the answer is this merged pull request, and the scope still watches its repository."""
+        from app.services import factory_audit_service as _audit
+        from app.services.github_verification_service import GithubVerificationService
+
+        if not isinstance(pull, dict) or pull.get("number") != number:
+            return False
+        base = pull.get("base")
+        base_repo = base.get("repo") if isinstance(base, dict) else None
+        if not isinstance(base_repo, dict) or base_repo.get("full_name") != repository:
+            return False
+        if GithubVerificationService._classify_pull(pull) != "merged":
+            return False
+        row = (await db.execute(select(TeamGithubScope.repo_owner, TeamGithubScope.repo_name).where(
+            TeamGithubScope.id == scope_id))).first()
+        return (row is not None and f"{row.repo_owner}/{row.repo_name}" == repository
+                and await _audit.current_context_key(db, "scope", scope_id) == scope_context_key)
 
     async def _original_context_holds(
         self, db: AsyncSession, item: GithubWorkItem, state: dict, captured_scope: tuple
