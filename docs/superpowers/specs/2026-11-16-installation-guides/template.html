@@ -1,0 +1,38 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+:root{--ink:#1f2328;--mute:#59636e;--line:#d1d9e0;--bg:#fff;--code:#f6f8fa;--pri:#2f9e5b}
+*{box-sizing:border-box}body{margin:0;background:#f6f8fa;color:var(--ink);font:15px/1.6 -apple-system,"Segoe UI",Roboto,Ubuntu,sans-serif}
+nav{position:sticky;top:0;background:#111827;color:#fff;padding:10px 20px;z-index:5;display:flex;gap:16px;align-items:center}
+nav a{color:#cfe8d9;text-decoration:none;font-size:14px}nav a.on{color:#fff;font-weight:600;border-bottom:2px solid var(--pri)}
+main{max-width:1060px;margin:20px auto;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:28px 40px}
+h1{font-size:28px;border-bottom:1px solid var(--line);padding-bottom:8px}h2{font-size:22px;border-bottom:1px solid var(--line);padding-bottom:6px;margin-top:36px}
+table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px;display:block;overflow-x:auto}
+th,td{border:1px solid var(--line);padding:6px 12px;text-align:left;vertical-align:top}th{background:var(--code)}tr:nth-child(2n) td{background:#fafbfc}
+code{background:var(--code);padding:2px 5px;border-radius:5px;font-size:85%}pre{background:var(--code);padding:14px;border-radius:8px;overflow-x:auto}pre code{background:none;padding:0}
+blockquote{margin:12px 0;padding:4px 16px;border-left:4px solid var(--line);color:var(--mute)}
+.alert{border-left:4px solid;border-radius:6px;padding:8px 16px;margin:14px 0;color:var(--ink)}.alert .t{font-weight:600;margin-bottom:2px}
+.NOTE{border-color:#0969da;background:#ddf4ff55}.NOTE .t{color:#0969da}.TIP{border-color:#1a7f37;background:#dafbe155}.TIP .t{color:#1a7f37}
+.IMPORTANT{border-color:#8250df;background:#fbefff77}.IMPORTANT .t{color:#8250df}.WARNING{border-color:#9a6700;background:#fff8c577}.WARNING .t{color:#9a6700}
+details{border:1px solid var(--line);border-radius:8px;padding:6px 14px;margin:10px 0;background:#fcfcfd}summary{cursor:pointer;font-weight:500}
+.mermaid{text-align:center;margin:16px 0;padding:10px;border:1px solid var(--line);border-radius:8px;background:#fff;overflow-x:auto}
+.merr{color:#c9363e;font-size:13px;text-align:left;white-space:pre-wrap}
+hr{border:0;border-top:1px solid var(--line);margin:28px 0}
+</style></head><body>
+__NAV__
+<main id="doc"></main>
+<script>
+const MD = __MD__;
+const T = {NOTE:"ℹ️ Note",TIP:"💡 Tip",IMPORTANT:"❗ Important",WARNING:"⚠️ Warning",CAUTION:"🛑 Caution"};
+const doc = document.getElementById("doc");
+doc.innerHTML = marked.parse(MD, {gfm:true});
+doc.querySelectorAll("blockquote").forEach(b=>{const p=b.querySelector("p");if(!p)return;const m=p.innerHTML.match(/^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*(<br>)?/);if(!m)return;
+ p.innerHTML=p.innerHTML.slice(m[0].length);const d=document.createElement("div");d.className="alert "+m[1];d.innerHTML='<div class="t">'+T[m[1]]+'</div>'+b.innerHTML;b.replaceWith(d);});
+doc.querySelectorAll("pre code.language-mermaid").forEach(c=>{const d=document.createElement("div");d.className="mermaid";d.textContent=c.textContent;c.parentElement.replaceWith(d);});
+mermaid.initialize({startOnLoad:false,theme:"default",securityLevel:"loose",flowchart:{htmlLabels:true}});
+(async()=>{let ok=0,bad=0;for(const [i,el] of [...document.querySelectorAll(".mermaid")].entries()){const src=el.textContent;
+ try{const {svg}=await mermaid.render("m"+i,src);el.innerHTML=svg;ok++}catch(e){el.innerHTML='<div class="merr">Diagram '+(i+1)+' failed to render:\n'+String(e.message||e)+'</div>';bad++}}
+ document.getElementById("mstat").textContent="Diagrams: "+ok+" rendered"+(bad?", "+bad+" FAILED":"");})();
+</script></body></html>
