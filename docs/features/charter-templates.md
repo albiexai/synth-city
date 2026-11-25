@@ -1,5 +1,7 @@
 # Charter templates
 
+::: v-pre
+
 A charter is the text that tells one team member how to work. Albiex Synth City ships a charter template for each of three roles: Leader, builder and reviewer. The templates are Markdown files in `frontend/src/features/factory/charter-templates/`. A Director can edit any charter that a template produces.
 
 Each template holds the same eight rules. Each rule has a one-line reason, so a reader knows why the rule exists. Guided setup offers the templates in a later change (#1309).
@@ -8,15 +10,15 @@ Each template holds the same eight rules. Each rule has a one-line reason, so a 
 
 ### Plan size limit
 
-A plan must fit in the limit. The limit is `{{plan_size_limit}}` active minutes. If the work is bigger, the Leader asks for numbered split issues.
+A plan must fit in the limit. The limit is `{{plan_size_limit}}` active minutes. The Leader decides each plan. If the work is bigger, the Leader asks for numbered split issues. A reviewer flags oversized work to the Leader and does not reject a plan.
 
 Why: a plan that is too big hides scope and cannot be reviewed in one pass.
 
 ### Light review tier
 
-A PR that changes only docs, UI or tests gets a focused review without mutation probes. The repository has no other definition of this tier. The wording comes from the verifier charter (Director, 2026-11-16).
+A PR that changes only docs, UI or tests gets a focused review without mutation probes. A PR with the `security` label always gets a full review, whatever files it changes. The repository has no other definition of this tier. The wording comes from the verifier charter (Director, 2026-11-16).
 
-Why: a cheap review for low-risk changes keeps the reviewers free for risky ones.
+Why: a cheap review for low-risk changes keeps the reviewers free for risky ones, and a security change is never low-risk.
 
 ### Focused local tests
 
@@ -38,9 +40,9 @@ Why: the label shows the hold to people, and the exact-head acceptance is the ch
 
 ### Escalation order
 
-A member asks the Leader first, then the Supervisor, then the Director.
+A member takes assignments and plans to the Leader, incidents and gate problems to the Supervisor, and release decisions to the Director. A question about the roster, models or budget also goes to the Director.
 
-Why: each level has less time to spare, so most questions end at the first one.
+Why: each person decides one kind of question, so a question reaches the right person at once.
 
 ### Process safety
 
@@ -72,3 +74,5 @@ Until the per-scope plan-size limit exists (#1114a), the default of 60 minutes i
 ## Edit and append
 
 Every charter stays editable. A template never replaces a charter that has text. It adds the template below the existing text.
+
+:::

@@ -66,14 +66,38 @@ describe("charter templates: the rules and their reasons", () => {
     }
   });
 
-  it("orders the escalation Leader, Supervisor, Director", () => {
+  it("keeps a full review for a PR with the security label, whatever files it changes", () => {
+    for (const role of CHARTER_ROLES) {
+      const tier = CHARTER_TEMPLATES[role].match(/^- \*\*Light review tier:\*\* .+$/m)?.[0] ?? "";
+      expect(tier).toMatch(/`security` label.*full review.*(whatever|regardless)/i);
+    }
+  });
+
+  it("routes each kind of question to one role: plans and assignments, incidents and gates, releases", () => {
     for (const role of CHARTER_ROLES) {
       const rule = CHARTER_TEMPLATES[role].match(/^- \*\*Escalation order:\*\* .+$/m)?.[0] ?? "";
       const [leader, supervisor, director] = ["Leader", "Supervisor", "Director"].map((name) => rule.indexOf(name));
       expect(leader).toBeGreaterThanOrEqual(0);
       expect(supervisor).toBeGreaterThan(leader);
       expect(director).toBeGreaterThan(supervisor);
+      expect(rule).toMatch(/assignments? and plans? to the Leader/);
+      expect(rule).toMatch(/incidents.* gate.* to the Supervisor/);
+      expect(rule).toMatch(/release.* to the Director/);
+      expect(rule).not.toMatch(/first/i);
     }
+  });
+
+  it("gives plan decisions to the Leader: the reviewer flags oversized work and never rejects a plan", () => {
+    const reviewerRule = CHARTER_TEMPLATES.reviewer.match(/^- \*\*Plan size limit:\*\* .+$/m)?.[0] ?? "";
+    expect(reviewerRule).toMatch(/Flag .*\{\{plan_size_limit\}\}.* to the Leader/);
+    expect(reviewerRule).toMatch(/Leader decides/);
+    expect(reviewerRule).not.toMatch(/reject/i);
+    expect(CHARTER_TEMPLATES.leader.match(/^- \*\*Plan size limit:\*\* .+$/m)?.[0]).toMatch(/Reject a plan over/);
+  });
+
+  it("sends the reviewer's blockers by kind, not all through the Leader", () => {
+    expect(CHARTER_TEMPLATES.reviewer).toMatch(/plan and assignment questions to the Leader/);
+    expect(CHARTER_TEMPLATES.reviewer).toMatch(/incidents and gate problems to the Supervisor \(\{\{supervisor_address\}\}\)/);
   });
 
   it("forbids pattern kills and interactive question tools by name", () => {
@@ -210,9 +234,27 @@ describe("appendTemplate", () => {
     expect(joined.indexOf("TEMPLATE")).toBeGreaterThan(joined.indexOf("My own charter."));
   });
 
-  it("returns the template alone when the existing text is empty or blank", () => {
+  it.each([
+    ["trailing spaces", "Line one.  "],
+    ["a Markdown hard break", "Line one.  \nLine two.  \n"],
+    ["trailing blank lines", "Line one.\n\n\n"],
+    ["only whitespace", "  \n\t"],
+    ["a final newline", "Line one.\n"],
+  ])("keeps the existing text byte for byte as the prefix with %s", (_name, existing) => {
+    const joined = appendTemplate(existing, "TEMPLATE");
+    expect(joined.startsWith(existing)).toBe(true);
+    expect(joined.endsWith("TEMPLATE")).toBe(true);
+    expect(joined.slice(existing.length)).toMatch(/^\n*TEMPLATE$/);
+  });
+
+  it("separates the template from existing text by a blank line", () => {
+    expect(appendTemplate("Line one.", "TEMPLATE")).toBe("Line one.\n\nTEMPLATE");
+    expect(appendTemplate("Line one.\n", "TEMPLATE")).toBe("Line one.\n\nTEMPLATE");
+    expect(appendTemplate("Line one.\n\n", "TEMPLATE")).toBe("Line one.\n\nTEMPLATE");
+  });
+
+  it("returns the template alone only when the existing text is empty", () => {
     expect(appendTemplate("", "TEMPLATE")).toBe("TEMPLATE");
-    expect(appendTemplate("  \n", "TEMPLATE")).toBe("TEMPLATE");
   });
 });
 
@@ -234,6 +276,23 @@ describe("charter templates: documentation", () => {
   it("names the source of the light review tier and the team-practice wording of the hold", () => {
     expect(docs).toMatch(/Director, 2026-11-16/);
     expect(docs).toMatch(/team practice/i);
+  });
+
+  it("renders the double braces verbatim: every placeholder is inside a v-pre container", () => {
+    // VitePress evaluates {{ }} as Vue, even inside inline code. Text outside v-pre would render as an empty cell.
+    const open = docs.indexOf("::: v-pre");
+    expect(open).toBeGreaterThanOrEqual(0);
+    expect(docs.indexOf("{{")).toBeGreaterThan(open);
+    expect(docs.trimEnd().endsWith(":::")).toBe(true);
+    expect(docs.slice(0, open)).not.toContain("{{");
+  });
+
+  it("documents the security-label exception and the routing of each kind of question", () => {
+    expect(docs).toMatch(/`security` label[^\n]*full review/i);
+    expect(docs).toMatch(/assignments and plans to the Leader/);
+    expect(docs).toMatch(/incidents and gate problems to the Supervisor/);
+    expect(docs).toMatch(/release[^\n]* to the Director/);
+    expect(docs).toMatch(/reviewer flags/i);
   });
 
   it("is in the Features navigation", () => {

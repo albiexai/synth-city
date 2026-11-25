@@ -46,9 +46,11 @@ export function resolveCharterTemplate(
   return { text, unresolved: findUnresolved(text) }
 }
 
-/** Adds the template below the existing text. It never replaces what is there. */
+/** Adds the template below the existing text. The existing text stays byte for byte as the prefix. */
 export function appendTemplate(existing: string, template: string): string {
-  return existing.trim() ? `${existing.replace(/\s+$/, '')}\n\n${template}` : template
+  if (existing === '') return template
+  const gap = existing.endsWith('\n\n') ? '' : existing.endsWith('\n') ? '\n' : '\n\n'
+  return `${existing}${gap}${template}`
 }
 
 /** The documented default, clamped to the scope's max_item_effort_minutes when that is a lower positive integer. */
