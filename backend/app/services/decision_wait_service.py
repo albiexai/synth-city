@@ -47,8 +47,11 @@ async def record_wait_ended(
 ) -> None:
     """End each started wait among ``request_ids``. A wait never ends twice; one never started gets no end."""
     for request_id in sorted(set(request_ids)):
-        started = await _event(db, STARTED, request_id)
-        if started is None or await _event(db, ENDED, request_id, item_key=started.item_context_key) is not None:
+        # The current request's own item lifetime: an id reused after its item was deleted is another wait.
+        item_id = await db.scalar(select(GithubApprovalRequest.work_item_id).where(GithubApprovalRequest.id == request_id))
+        item_key = await audit.current_context_key(db, "item", item_id) if item_id is not None else None
+        started = await _event(db, STARTED, request_id, item_key=item_key)
+        if started is None or await _event(db, ENDED, request_id, item_key=item_key) is not None:
             continue
         operation_id = wait_operation(ENDED, request_id)
         await audit.record_event(
@@ -64,12 +67,10 @@ async def record_wait_ended(
             operation_id=operation_id, correlation_id=operation_id)
 
 
-async def _event(db: AsyncSession, kind: str, request_id: int, *, item_key: str | None = None):
-    conditions = [FactoryAuditEvent.event_kind == kind, FactoryAuditEvent.operation_id == wait_operation(kind, request_id)]
-    if item_key is not None:
-        conditions.append(FactoryAuditEvent.item_context_key == item_key)
-    return (await db.scalars(select(FactoryAuditEvent).where(*conditions)
-                             .order_by(FactoryAuditEvent.id.desc()).limit(1))).first()
+async def _event(db: AsyncSession, kind: str, request_id: int, *, item_key: str | None):
+    return (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == kind, FactoryAuditEvent.operation_id == wait_operation(kind, request_id),
+        FactoryAuditEvent.item_context_key == item_key).limit(1))).first()
 
 
 @dataclass(frozen=True)

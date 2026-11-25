@@ -9,10 +9,12 @@ from sqlalchemy import select, text
 from app.api.v1 import agent_mail
 from app.config import settings
 from app.models.database import (
-    FactoryAuditEvent, GithubApprovalRequest, GithubAttemptScopeRevision, GithubWorkItem, MailAgentSession,
+    FactoryAuditEvent, GithubApprovalRequest, GithubAttemptScopeRevision, GithubWorkItem, GithubWorkspace,
+    MailAgentSession,
 )
 from app.models.schemas import MailApprovalRequestCreate
 from app.services import decision_wait_service as waits
+from app.services import factory_audit_service as audit
 from app.services import factory_metrics_service as metrics
 from app.services.github_approval_service import github_approval_service
 from app.utils import peer_process
@@ -206,6 +208,41 @@ async def test_an_ended_wait_is_not_listed(db, monkeypatch):
     await github_approval_service.decide(db, item, authenticated_leader_member_id=members[0].id,
                                          decision="approved", reason="ok", request_id=request.id)
     assert await waits.unended_decision_waits(db, now=datetime.utcnow()) == []
+
+
+async def test_a_request_reusing_a_deleted_items_id_does_not_end_the_old_wait(db):
+    """V1 on 0329759d: a scope amendment (no start in part 1) reusing the id must not close the old wait."""
+    item, members, request = await _initial(db)
+    await db.execute(text("DELETE FROM github_approval_requests"))
+    await db.execute(text("DELETE FROM github_work_items WHERE id = :id"), {"id": item.id})
+    await db.commit()
+    other = GithubWorkItem(scope_id=item.scope_id, issue_number=93, issue_title="other", issue_url="u",
+                           github_updated_at=datetime.utcnow(), dispatch_status="dispatched",
+                           owner_slot_id=item.owner_slot_id, routing_method="label", dispatch_nonce="a" * 16,
+                           dispatch_head_ref="deck/other", approval_round_count=1)
+    workspace = GithubWorkspace(scope_id=item.scope_id, path="/tmp/other", leased_item_id=None)
+    db.add_all([other, workspace])
+    await db.flush()
+    revision = GithubAttemptScopeRevision(
+        work_item_id=other.id, dispatch_nonce=other.dispatch_nonce, revision=1, owner_slot_id=other.owner_slot_id,
+        owner_member_id=members[1].id, origin_kind="scope_amendment", phase="implementation",
+        execution_target="workspace", summary="amend", allowed_paths=["a.py"], allowed_actions=["edit_tests"],
+        allowed_commands=[], prohibited_actions=[], tool_fallbacks={}, baseline_head_sha="b" * 40,
+        baseline_tree_sha="c" * 40, originating_escalation_reason="", expected_workspace_id=workspace.id,
+        expected_lease_token_hash="h", max_failed_heads=1, expires_at=datetime.utcnow() - timedelta(seconds=1))
+    db.add(revision)
+    await db.flush()
+    amendment = GithubApprovalRequest(
+        id=request.id, work_item_id=other.id, request_kind="continuation", dispatch_nonce=other.dispatch_nonce,
+        approval_round=2, owner_member_id=members[1].id, leader_member_id=members[0].id,
+        scope_revision_id=revision.id, request_fingerprint="amendment")
+    db.add(amendment)
+    await audit.context_key_for(db, "item", other.id)  # the amendment's own request fact gives the item a lifetime key
+    await db.commit()
+    assert await github_approval_service.expire_continuation_if_needed(db, amendment, revision) == "expired_pending"
+    assert await _events(db, waits.ENDED) == []
+    (wait,) = await waits.unended_decision_waits(db, now=datetime.utcnow())
+    assert (wait.request_id, wait.state, wait.reason) == (request.id, "unknown", "work item deleted")
 
 
 async def test_a_wait_ends_once_whatever_ends_it_later(db):
