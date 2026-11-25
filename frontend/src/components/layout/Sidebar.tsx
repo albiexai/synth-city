@@ -3,7 +3,7 @@ import { LayoutDashboard, ClipboardList, FolderGit2, UsersRound, MonitorPlay, Se
 import { cn } from '@/lib/utils'
 import { useSidebar } from '@/contexts/SidebarContext'
 const entries = [
-  ['Overview', '/', LayoutDashboard], ['Work', '/work', ClipboardList], ['Repositories', '/repositories', FolderGit2], ['Teams', '/teams', UsersRound], ['Live sessions', '/agent-bridge', MonitorPlay], ['Harnesses', '/harnesses', Settings], ['Agent Mail', '/agent-mail', Mail], ['Audit', '/audit', ScrollText],
+  ['Overview', '/', LayoutDashboard], ['Work', '/work', ClipboardList], ['Repositories', '/repositories', FolderGit2], ['Teams', '/teams', UsersRound], ['Live sessions', '/agent-bridge', MonitorPlay], ['Harnesses', '/harnesses', Settings], ['Agent Mail', '/agent-mail', Mail], ['Insights', '/insights', ScrollText],
 ] as const
 export function Sidebar() {
   const { collapsed, setCollapsed } = useSidebar()

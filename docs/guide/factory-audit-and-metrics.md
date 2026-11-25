@@ -2,7 +2,7 @@
 
 The audit ledger records what the factory actually did. The metrics page counts those records in a time window. Both are observations. They never approve a plan, raise a limit, retry work, release a workspace or replay an action.
 
-Open **Audit** in the main navigation (`/audit`). The safe metrics load without an operator token. The event list needs the operator token for this browser tab.
+Open **Insights** in the main navigation, then the **Audit log** tab (`/insights/audit`). The old address `/audit` still works: it opens the same tab and keeps its query and hash. The safe metrics load without an operator token. The event list needs the operator token for this browser tab.
 
 ## What the ledger records
 

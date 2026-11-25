@@ -10,7 +10,7 @@ const KEY_STORAGE = 'albiex-synth-city.agent-teams.operator-token'
 const EVENT_COUNT = /\b\d+\s+(audit\s+)?events?\b/i
 
 async function openAudit(page: Page): Promise<void> {
-  await page.goto('/audit')
+  await page.goto('/insights/audit')
   await expect(page.getByRole('heading', { name: /Audit/ }).first()).toBeVisible()
 }
 
