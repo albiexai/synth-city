@@ -8,16 +8,26 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "ci" / "e2e_shard_identities.py"
 COMMAND = ["--no-install", "playwright", "test", "--list", "--grep", "@active", "--reporter=json"]
 
 
-def report(*entries: tuple[str, tuple[str, ...], str, tuple[str, ...]]) -> dict:
+def report(
+    *entries: tuple[str, tuple[str, ...], str, tuple[str, ...]], executions: tuple[str, ...] | None = None,
+) -> dict:
     suites = []
     for file, groups, title, projects in entries:
         spec = {"file": file, "title": title, "tests": [{"projectId": project} for project in projects]}
+        if executions is not None:
+            for project in spec["tests"]:
+                project.update({
+                    "expectedStatus": "passed",
+                    "status": "expected",
+                    "results": [{"status": outcome, "retry": retry} for retry, outcome in enumerate(executions)],
+                })
         suite = {"specs": [spec]}
         for group in reversed(groups):
             suite = {"specs": [], "suites": [{"title": group, **suite}]}
@@ -59,14 +69,14 @@ if response is not None:
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
     output = tmp_path / "manifest.json"
 
-    def run(full, first, second):
+    def run(full, first, second, *, artifacts=None):
         (tmp_path / "reports.json").write_text(
             json.dumps({"full": full, "1/2": first, "2/2": second}), encoding="utf-8",
         )
-        return subprocess.run(
-            [sys.executable, str(SCRIPT), "--shards", "2", "--output", str(output)],
-            cwd=tmp_path, capture_output=True, text=True, check=False,
-        )
+        command = [sys.executable, str(SCRIPT), "--shards", "2", "--output", str(output)]
+        if artifacts is not None:
+            command += ["--artifacts", str(artifacts)]
+        return subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, check=False)
 
     return run, output, tmp_path / "calls"
 
@@ -122,3 +132,114 @@ def test_cli_rejects_unproved_partitions(collect, full, first, second, messages)
     assert result.returncode != 0
     assert all(message in result.stderr for message in messages), result.stderr
     assert output.read_text(encoding="utf-8") == "previous manifest\n"
+
+
+def artifact(root: Path, shard: int, attempt: int, result) -> None:
+    folder = root / f"e2e-journeys-{shard}-attempt-{attempt}"
+    folder.mkdir(parents=True)
+    if result is not None:
+        payload = result if isinstance(result, str) else json.dumps(result)
+        (folder / "results.json").write_text(payload, encoding="utf-8")
+
+
+def test_runtime_proof_selects_latest_attempt_per_shard(collect, tmp_path):
+    run, output, _ = collect
+    artifacts = tmp_path / "artifacts"
+    artifact(artifacts, 1, 9, report(A, executions=("failed",)))
+    artifact(artifacts, 1, 10, report(A, executions=("passed",)))
+    artifact(artifacts, 2, 1, report(B, executions=("passed",)))
+    result = run(report(A, B), report(A), report(B), artifacts=artifacts)
+    assert result.returncode == 0, result.stderr
+    assert "2 active journeys" in result.stdout
+    assert output.is_file()
+
+
+@pytest.mark.parametrize(
+    ("last_report", "message"),
+    [
+        (report(), "missing"),
+        (report(A, B, executions=("passed",)), "duplicate"),
+        (report(C, executions=("passed",)), "unexpected"),
+        (report(B, executions=("skipped",)), "one passing execution"),
+        (report(B, executions=("failed", "passed")), "one passing execution"),
+        (report(B, executions=()), "one passing execution"),
+        (report(B, executions=("failed",)), "one passing execution"),
+        ({"suites": [], "errors": [{}]}, "reported errors"),
+        ("{broken JSON", "invalid Playwright report"),
+        (None, "could not read the Playwright report"),
+    ],
+)
+def test_runtime_proof_rejects_latest_invalid_shard(collect, tmp_path, last_report, message):
+    run, output, _ = collect
+    artifacts = tmp_path / "artifacts"
+    artifact(artifacts, 1, 1, report(A, executions=("passed",)))
+    artifact(artifacts, 2, 1, report(B, executions=("passed",)))
+    artifact(artifacts, 2, 2, last_report)
+    output.write_text("previous manifest\n", encoding="utf-8")
+    result = run(report(A, B), report(A), report(B), artifacts=artifacts)
+    assert result.returncode != 0
+    assert message in result.stderr, result.stderr
+    assert output.read_text(encoding="utf-8") == "previous manifest\n"
+
+
+def test_runtime_proof_rejects_incomplete_artifacts_and_misplaced_journeys(collect, tmp_path):
+    run, _, _ = collect
+    artifacts = tmp_path / "artifacts"
+    artifact(artifacts, 1, 1, report(B, executions=("passed",)))
+    missing = run(report(A, B), report(A), report(B), artifacts=artifacts)
+    assert missing.returncode != 0
+    assert "missing artifact for shard 2" in missing.stderr
+    artifact(artifacts, 2, 1, report(A, executions=("passed",)))
+    misplaced = run(report(A, B), report(A), report(B), artifacts=artifacts)
+    assert misplaced.returncode != 0
+    assert "does not match the planned shard" in misplaced.stderr
+
+
+def test_workflow_uses_the_same_shard_count_and_attempt_artifacts():
+    jobs = yaml.safe_load((ROOT / ".github/workflows/e2e.yml").read_text(encoding="utf-8"))["jobs"]
+    shards = jobs["e2e-shards"]
+    gate = jobs["e2e"]
+    assert shards["strategy"] == {"fail-fast": False, "matrix": {"shard": [1, 2, 3, 4]}}
+    assert shards["if"] == "needs.e2e-scope.outputs.run_suites == 'true'"
+    run = next(step["run"] for step in shards["steps"] if step.get("name") == "Run the active journeys for this shard")
+    assert "--shard=${{ matrix.shard }}/${{ strategy.job-total }}" in run
+    upload = next(step for step in shards["steps"] if step.get("name") == "Upload the journey report")
+    assert upload["with"]["name"] == "e2e-journeys-${{ matrix.shard }}-attempt-${{ github.run_attempt }}"
+    assert upload["with"]["if-no-files-found"] == "error"
+    download = next(step for step in gate["steps"] if step.get("uses", "").startswith("actions/download-artifact@"))
+    assert download["with"]["pattern"] == "e2e-journeys-*-attempt-*"
+    assert download["with"]["merge-multiple"] is False
+    proof = gate["steps"][-1]
+    for step in gate["steps"][1:]:
+        assert step["if"] == "needs.e2e-scope.outputs.run_suites == 'true'"
+    assert "--shards 4" in proof["run"] and '--artifacts "$RUNNER_TEMP/e2e-journey-artifacts"' in proof["run"]
+
+
+@pytest.mark.parametrize(("scope_result", "run_suites", "shard_result", "success"), [
+    ("success", "true", "success", True),
+    ("success", "true", "failure", False),
+    ("success", "true", "cancelled", False),
+    ("success", "true", "skipped", False),
+    ("success", "false", "skipped", True),
+    ("success", "false", "failure", False),
+    ("failure", "false", "skipped", False),
+    ("success", "", "skipped", False),
+])
+def test_required_workflow_gate_rejects_failed_shards(scope_result, run_suites, shard_result, success):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/e2e.yml").read_text(encoding="utf-8"))
+    gate = workflow["jobs"]["e2e"]
+    assert gate["name"] == "e2e"
+    assert gate["needs"] == ["e2e-scope", "e2e-shards"]
+    assert gate["if"] == "always()"
+    step = gate["steps"][0]
+    assert step["env"] == {
+        "SCOPE_RESULT": "${{ needs.e2e-scope.result }}",
+        "RUN_SUITES": "${{ needs.e2e-scope.outputs.run_suites }}",
+        "SHARDS_RESULT": "${{ needs.e2e-shards.result }}",
+    }
+    result = subprocess.run(
+        ["bash", "-e", "-c", step["run"]],
+        env={**os.environ, "SCOPE_RESULT": scope_result, "RUN_SUITES": run_suites, "SHARDS_RESULT": shard_result},
+        capture_output=True, text=True, check=False,
+    )
+    assert (result.returncode == 0) is success, result.stderr
