@@ -197,6 +197,15 @@ class AgentTeamSummaryService:
         team, scope_rows, items, total, approvals = initial
         scopes = [SimpleNamespace(**row._mapping) for row in scope_rows[:32]]
         attention, visible_actions, actors, observations = [], [], set(), []
+        if team.backlog_milestone:
+            from app.services.github_watcher_service import milestone_routes
+
+            for scope in scopes:
+                if scope_id is not None and scope.id != scope_id:
+                    continue
+                routes = await milestone_routes(db, scope)
+                if list(routes.values()).count(team.backlog_milestone) > 1:
+                    attention.append(TeamSummaryAttention(code="milestone_routing_conflict", scope_id=scope.id))
         coverage = []
         dispatch_nonces = {}
         waiting_input, native_fence, native_known = None, {}, False

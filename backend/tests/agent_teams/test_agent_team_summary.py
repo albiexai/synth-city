@@ -697,6 +697,24 @@ async def test_real_existing_attention_rules_are_collected(db, monkeypatch, stat
 
 
 @pytest.mark.asyncio
+async def test_repository_milestone_conflict_appears_on_both_teams(db, monkeypatch):
+    team, scope, _ = await seed(db, ())
+    team.backlog_milestone = "V1"
+    other = AgentTeamPreset(name="Other", backlog_milestone="V1")
+    db.add(other)
+    await db.flush()
+    peer = TeamGithubScope(preset_id=other.id, repo_owner="EXAMPLE", repo_name=scope.repo_name,
+                           repo_path=scope.repo_path)
+    db.add(peer)
+    await db.commit()
+    summary, _ = service(monkeypatch)
+    for preset_id, repo_scope_id in ((team.id, scope.id), (other.id, peer.id)):
+        result = await summary.summary(db, preset_id)
+        assert any(signal.code == "milestone_routing_conflict" and signal.scope_id == repo_scope_id
+                   for signal in result.attention)
+
+
+@pytest.mark.asyncio
 async def test_deleted_team_during_read_returns_none(db, monkeypatch):
     from sqlalchemy import delete
     team, _, items = await seed(db)
