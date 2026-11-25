@@ -8,6 +8,7 @@ import runpy
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import tomlkit
@@ -46,7 +47,8 @@ def helper(tmp_path, monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("provider", ["codex-cli", "claude-code"])
-def test_only_folder_trust_changes_and_one_private_backup_is_kept(helper, provider):
+@pytest.mark.parametrize("existing_backup", [False, True])
+def test_only_folder_trust_changes_and_one_private_backup_is_kept(helper, provider, existing_backup):
     run, workspace, home, _ = helper
     if provider == "codex-cli":
         config = home / ".codex" / "config.toml"
@@ -58,6 +60,10 @@ def test_only_folder_trust_changes_and_one_private_backup_is_kept(helper, provid
         original = json.dumps({"fixture": True, "projects": {"/unrelated": {"allowedTools": ["Read"]}}})
         config.write_text(original, encoding="utf-8")
     config.chmod(0o640)
+    backup = config.with_name(config.name + ".synth-city.bak")
+    if existing_backup:
+        backup.write_text("previous backup", encoding="utf-8")
+        backup.chmod(0o644)
 
     assert run(provider) == (0, {"ok": True, "changed": True})
     data = config.read_text(encoding="utf-8")
@@ -73,25 +79,49 @@ def test_only_folder_trust_changes_and_one_private_backup_is_kept(helper, provid
             "projects": {"/unrelated": {"allowedTools": ["Read"]}, str(workspace): {"hasTrustDialogAccepted": True}},
         }
     assert config.stat().st_mode & 0o777 == 0o640
-    backup = config.with_name(config.name + ".synth-city.bak")
     assert backup.read_text(encoding="utf-8") == original
     assert backup.stat().st_mode & 0o777 == 0o600
     assert run(provider) == (0, {"ok": True, "changed": False})
     assert backup.read_text(encoding="utf-8") == original
 
 
-@pytest.mark.parametrize("payload", [
-    b'{"operation":"other","provider":"codex-cli","folder":"/fixture"}',
-    b'{"operation":"folder_trust","provider":"antigravity-cli","folder":"/fixture"}',
-    b'{"operation":"folder_trust","provider":"codex-cli","folder":false}',
-    b'{"operation":"folder_trust","provider":"codex-cli","folder":"/fixture","extra":"/unexpected"}',
-    b'{"operation":"folder_trust","operation":"folder_trust","provider":"codex-cli","folder":"/fixture"}',
-    b'{} {}',
-    b' ' * 25000,
-])
-def test_rejects_requests_outside_the_typed_allowlist(helper, payload):
-    run, _, home, _ = helper
+@pytest.mark.parametrize("case", ["operation", "provider", "folder", "extra", "duplicate", "trailing", "oversized"])
+def test_rejects_requests_outside_the_typed_allowlist(helper, case):
+    run, workspace, home, _ = helper
+    valid = {"operation": "folder_trust", "provider": "codex-cli", "folder": str(workspace)}
+    encoded = json.dumps(valid).encode()
+    helper_module = runpy.run_path(str(SCRIPT))
+    payload = {
+        "operation": json.dumps({**valid, "operation": "other"}).encode(),
+        "provider": json.dumps({**valid, "provider": "antigravity-cli"}).encode(),
+        "folder": json.dumps({**valid, "folder": False}).encode(),
+        "extra": json.dumps({**valid, "extra": "unexpected"}).encode(),
+        "duplicate": b'{"operation": "folder_trust", ' + encoded[1:],
+        "trailing": encoded + b" {}",
+        "oversized": encoded.ljust(helper_module["MAX_REQUEST_BYTES"] + 1, b" "),
+    }[case]
+
+    # Assert the parser rejects the request before any writer-side checks can
+    # mask a missing allowlist guard.
+    with pytest.raises(ValueError):
+        helper_module["read_request"](io.BytesIO(payload))
     assert run(payload=payload) == (1, {"ok": False, "error": "agent_config_refused"})
+    assert list(home.iterdir()) == []
+
+
+def test_refuses_a_home_owned_by_another_user(helper, monkeypatch):
+    run, _, home, _ = helper
+    binding = home.stat()
+    fstat = os.fstat
+
+    def stat_with_wrong_home_owner(fd):
+        info = fstat(fd)
+        if (info.st_dev, info.st_ino) == (binding.st_dev, binding.st_ino):
+            return SimpleNamespace(st_uid=os.getuid() + 1)
+        return info
+
+    monkeypatch.setattr(trust.os, "fstat", stat_with_wrong_home_owner)
+    assert run() == (1, {"ok": False, "error": "agent_config_refused"})
     assert list(home.iterdir()) == []
 
 
@@ -149,7 +179,7 @@ def test_a_live_claude_session_defers_only_claude_trust(helper, name, argv):
 
 
 @pytest.mark.parametrize("outside", [False, True])
-def test_claude_trust_applies_to_validated_primary_checkout(helper, outside):
+def test_claude_trust_applies_to_validated_primary_checkout(helper, outside, monkeypatch):
     run, workspace, home, _ = helper
     primary_root = home.parent if outside else workspace.parent
     primary = primary_root / "primary"
@@ -157,6 +187,19 @@ def test_claude_trust_applies_to_validated_primary_checkout(helper, outside):
     subprocess.run(["git", "-C", str(primary), "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
                     "commit", "-q", "--allow-empty", "-m", "fixture"], check=True)
     subprocess.run(["git", "-C", str(primary), "worktree", "add", "-q", "--detach", str(workspace)], check=True)
+    subprocess.run(["git", "-C", str(primary), "config", "core.fsmonitor", "true"], check=True)
+    run_git = subprocess.run
+
+    def isolated_git(argv, **kwargs):
+        assert argv[0] == "/usr/bin/git"
+        config_overrides = [value for flag, value in zip(argv, argv[1:]) if flag == "-c"]
+        assert config_overrides == [f"safe.directory={workspace}", "core.fsmonitor=false"]
+        assert kwargs["env"] == {
+            "PATH": "/usr/bin:/bin", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+        }
+        return run_git(argv, **kwargs)
+
+    monkeypatch.setattr(trust.subprocess, "run", isolated_git)
     if outside:
         assert run("claude-code") == (1, {"ok": False, "error": "agent_config_refused"})
         assert list(home.iterdir()) == []
