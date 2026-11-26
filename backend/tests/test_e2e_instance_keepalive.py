@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "e2e-instance.sh"
 WORKFLOW = ROOT / ".github" / "workflows" / "e2e.yml"
+DIAGNOSTICS = ROOT / ".github" / "workflows" / "e2e-diagnostics.yml"
 READS = ROOT / "frontend" / "src" / "features" / "factory" / "reads.ts"
 
 
@@ -56,15 +57,16 @@ def test_a_backend_log_is_written_to_the_named_file_at_info_level():
 
 def test_the_workflow_sets_and_uploads_the_backend_log():
     text = WORKFLOW.read_text(encoding="utf-8")
-    # Three jobs run the instance and each keeps its log when it fails.
-    assert text.count("E2E_BACKEND_LOG: ${{ github.workspace }}/frontend/e2e-logs/backend.log") == 3
-    assert text.count("frontend/e2e-logs/") >= 3
-    assert "frontend/e2e-logs/backend.log" in text
+    diagnostics = DIAGNOSTICS.read_text(encoding="utf-8")
+    log = "E2E_BACKEND_LOG: ${{ github.workspace }}/frontend/e2e-logs/backend.log"
+    assert log in text and log in diagnostics
+    assert "frontend/e2e-logs/" in text
+    assert diagnostics.count("frontend/e2e-logs/") >= 3
 
 
 def test_the_flicker_loop_repeats_the_route_fetch_journey_twenty_times():
-    text = WORKFLOW.read_text(encoding="utf-8")
-    assert "e2e-flicker-loop:" in text
+    text = DIAGNOSTICS.read_text(encoding="utf-8")
+    assert "inputs.lane == 'flicker-loop'" in text
     assert '--grep "Overview re-watches" --repeat-each=20' in text
     # Twenty plain passes: a flaky or skipped result does not count.
     assert "s.expected !== 20 || s.unexpected || s.flaky || s.skipped" in text
