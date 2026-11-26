@@ -108,7 +108,7 @@ async def test_team_timer_columns_are_additive_and_repeat_safely():
             expected = {
                 "agent_team_presets": ("leader_ack_timeout_seconds", "leader_ack_max_wait_seconds",
                     "mail_request_unanswered_seconds", "github_team_idle_timeout_seconds",
-                    "github_publish_summaries_enabled"),
+                    "github_publish_summaries_enabled", "github_owner_idle_timeout_seconds", "github_nudge_grace_seconds"),
                 "github_approval_requests": ("leader_ack_reminded_at", "leader_activity_extended_at"),
             }
             for table, names in expected.items():
@@ -126,15 +126,18 @@ async def test_team_timer_columns_are_additive_and_repeat_safely():
                 assert set(names) <= await _sqlite_columns(conn, table)
             row = (await conn.execute(text("SELECT description, leader_ack_timeout_seconds, "
                 "leader_ack_max_wait_seconds, mail_request_unanswered_seconds, github_team_idle_timeout_seconds, "
-                "github_publish_summaries_enabled FROM agent_team_presets"))).one()
-            assert tuple(row) == ("Keep this row.", None, None, None, None, None)
+                "github_publish_summaries_enabled, github_owner_idle_timeout_seconds, "
+                "github_nudge_grace_seconds FROM agent_team_presets"))).one()
+            assert tuple(row) == ("Keep this row.", None, None, None, None, None, None, None)
             await conn.execute(text("UPDATE agent_team_presets SET leader_ack_timeout_seconds=600, "
                 "leader_ack_max_wait_seconds=3600, mail_request_unanswered_seconds=60, "
-                "github_team_idle_timeout_seconds=30, github_publish_summaries_enabled=0"))
+                "github_team_idle_timeout_seconds=30, github_publish_summaries_enabled=0, "
+                "github_owner_idle_timeout_seconds=600, github_nudge_grace_seconds=120"))
             await _run_sqlite_compat_migrations(conn)
             assert (await conn.execute(text("SELECT leader_ack_timeout_seconds, "
                 "leader_ack_max_wait_seconds, mail_request_unanswered_seconds, github_team_idle_timeout_seconds, "
-                "github_publish_summaries_enabled FROM agent_team_presets"))).one() == (600, 3600, 60, 30, 0)
+                "github_publish_summaries_enabled, github_owner_idle_timeout_seconds, "
+                "github_nudge_grace_seconds FROM agent_team_presets"))).one() == (600, 3600, 60, 30, 0, 600, 120)
     finally:
         await engine.dispose()
 

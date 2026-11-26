@@ -100,8 +100,10 @@ export function EditTeamPanel({
 }
 
 const timers = [
-  ['mail_request_unanswered_seconds', 'Unanswered Mail timeout', 60],
-  ['github_team_idle_timeout_seconds', 'Team idle timeout', 30],
+  ['mail_request_unanswered_seconds', 'Unanswered Mail timeout', 60, 86400],
+  ['github_team_idle_timeout_seconds', 'Team idle timeout', 30, 86400],
+  ['github_owner_idle_timeout_seconds', 'Owner idle timeout', 60, 86400],
+  ['github_nudge_grace_seconds', 'Nudge grace', 30, 3600],
 ] as const
 const summarySetting = 'github_publish_summaries_enabled'
 const labels: Record<string, string> = {
@@ -151,10 +153,10 @@ export function TeamWorkSettingsEditor({ load, save }: {
       ) : (
         <form className="space-y-3" onSubmit={(event) => { event.preventDefault(); void run(() => save(draft)) }}>
           <fieldset disabled={busy} className="grid gap-3 sm:grid-cols-2">
-            {timers.map(([key, label, minimum]) => (
+            {timers.map(([key, label, minimum, maximum]) => (
               <div key={key} className="grid gap-1">
                 <Label htmlFor={key}>{label} (seconds)</Label>
-                <Input id={key} type="number" min={minimum} max={86400}
+                <Input id={key} type="number" min={minimum} max={maximum}
                   placeholder={String(data.defaults[key])}
                   value={(draft[key] === undefined ? data.overrides[key] : draft[key]) ?? ''}
                   onChange={(event) => setDraft({ ...draft, [key]: event.target.value === '' ? null : event.target.valueAsNumber })} />

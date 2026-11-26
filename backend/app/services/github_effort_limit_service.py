@@ -397,7 +397,7 @@ class GithubEffortLimitService:
 
         ``code`` is ``None`` when the attempt is acknowledged, no observation pause is waiting or paused, and the
         leased workspace shows owner contact within the owner idle window (the window the idle monitor uses: the
-        delivery policy's, else the setting). ``contact`` is the contact time read, for the guarded update to repeat.
+        attempt delivery policy's, then the team's, then the installation's). ``contact`` is the contact time read.
         """
         if item.ack_received_at is None:
             return "effort_extension_not_acknowledged", None
@@ -405,10 +405,12 @@ class GithubEffortLimitService:
             return "effort_extension_paused", None
         contact = await db.scalar(select(GithubWorkspace.lease_last_owner_contact_at).where(
             GithubWorkspace.leased_item_id == item.id))
-        from app.services.factory_delivery_policy import effective_policy
+        from app.models.database import AgentTeamPreset
+        from app.services.factory_delivery_policy import effective_policy, owner_contact_windows
 
-        window = timedelta(seconds=effective_policy(item, scope).owner_idle_seconds
-                           or settings.github_owner_idle_timeout_seconds)
+        preset = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
+        idle, _ = owner_contact_windows(preset, effective_policy(item, scope))
+        window = timedelta(seconds=idle)
         if contact is None or now - contact > window:
             return "effort_extension_no_recent_activity", contact
         return None, contact

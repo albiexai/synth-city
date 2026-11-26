@@ -17,12 +17,13 @@ async def test_work_settings_http_protection_validation_and_history(client, db, 
     await db.commit()
     path, other = [f"/api/v1/agent-teams/presets/{team.id}" for team in teams]
     patch = {"mail_request_unanswered_seconds": 90, "github_team_idle_timeout_seconds": 60,
-             "github_publish_summaries_enabled": False}
+             "github_publish_summaries_enabled": False, "github_owner_idle_timeout_seconds": 600,
+             "github_nudge_grace_seconds": 120}
     headers = OPERATOR_HEADERS
 
     assert (await client.get(f"{path}/work-settings")).status_code == 401
     assert (await client.patch(path, json=patch)).status_code == 401
-    for name, value in zip(patch, (59, "60", 0)):
+    for name, value in zip(patch, (59, "60", 0, 59, 3601)):
         assert (await client.patch(path, headers=headers, json={name: value})).status_code == 422
     assert (await client.patch(path, headers=headers, json=patch)).status_code == 200
     assert (await client.patch(path, headers=headers, json={"name": "Renamed", **patch})).status_code == 200
@@ -30,6 +31,7 @@ async def test_work_settings_http_protection_validation_and_history(client, db, 
     cleared = {name: None for name in patch}
     assert (await client.patch(path, headers=headers, json=cleared)).status_code == 200
     monkeypatch.setattr(settings, "github_publish_summaries_enabled", True)
+    monkeypatch.setattr(settings, "github_nudge_grace_seconds", 4000)
 
     response = await client.get(f"{path}/work-settings", headers=headers, params={"limit": 1})
     current = response.json()
@@ -48,7 +50,7 @@ async def test_work_settings_http_protection_validation_and_history(client, db, 
 
 
 @pytest.mark.asyncio
-async def test_duplicate_preset_preserves_all_three_work_overrides(db):
+async def test_duplicate_preset_preserves_work_overrides(db):
     original = AgentTeamPreset(name="Original team")
     db.add(original)
     await db.commit()
@@ -56,6 +58,8 @@ async def test_duplicate_preset_preserves_all_three_work_overrides(db):
         mail_request_unanswered_seconds=120,
         github_team_idle_timeout_seconds=90,
         github_publish_summaries_enabled=False,
+        github_owner_idle_timeout_seconds=600,
+        github_nudge_grace_seconds=120,
     )
     await agent_team_service.update_preset(db, original.id, work_settings=overrides)
 
@@ -72,6 +76,10 @@ async def test_duplicate_preset_preserves_all_three_work_overrides(db):
     ("github_team_idle_timeout_seconds", "30", "int_type"),
     ("github_publish_summaries_enabled", "false", "bool_type"),
     ("github_publish_summaries_enabled", 0, "bool_type"),
+    ("github_owner_idle_timeout_seconds", True, "int_type"),
+    ("github_owner_idle_timeout_seconds", "60", "int_type"),
+    ("github_nudge_grace_seconds", True, "int_type"),
+    ("github_nudge_grace_seconds", "30", "int_type"),
 ])
 def test_work_overrides_reject_coerced_types(field, value, error_type):
     with pytest.raises(ValidationError) as invalid:
@@ -82,6 +90,8 @@ def test_work_overrides_reject_coerced_types(field, value, error_type):
 @pytest.mark.parametrize(("field", "minimum"), [
     ("mail_request_unanswered_seconds", 60),
     ("github_team_idle_timeout_seconds", 30),
+    ("github_owner_idle_timeout_seconds", 60),
+    ("github_nudge_grace_seconds", 30),
 ])
 def test_work_timeout_accepts_its_minimum_and_refuses_one_second_less(field, minimum):
     assert getattr(AgentTeamPresetUpdate(**{field: minimum}), field) == minimum
@@ -89,11 +99,16 @@ def test_work_timeout_accepts_its_minimum_and_refuses_one_second_less(field, min
         AgentTeamPresetUpdate(**{field: minimum - 1})
 
 
-@pytest.mark.parametrize("field", ["mail_request_unanswered_seconds", "github_team_idle_timeout_seconds"])
-def test_work_timeout_accepts_86400_and_refuses_one_second_more(field):
-    assert getattr(AgentTeamPresetUpdate(**{field: 86400}), field) == 86400
+@pytest.mark.parametrize(("field", "maximum"), [
+    ("mail_request_unanswered_seconds", 86400),
+    ("github_team_idle_timeout_seconds", 86400),
+    ("github_owner_idle_timeout_seconds", 86400),
+    ("github_nudge_grace_seconds", 3600),
+])
+def test_work_timeout_accepts_its_maximum_and_refuses_one_second_more(field, maximum):
+    assert getattr(AgentTeamPresetUpdate(**{field: maximum}), field) == maximum
     with pytest.raises(ValidationError, match="less than or equal to"):
-        AgentTeamPresetUpdate(**{field: 86401})
+        AgentTeamPresetUpdate(**{field: maximum + 1})
 
 
 @pytest.mark.asyncio

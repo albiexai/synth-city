@@ -6,7 +6,8 @@ from copy import deepcopy
 from sqlalchemy import JSON, exists, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.database import GithubDeliveryPolicyEvent, GithubWorkItem, TeamGithubScope
+from app.config import settings
+from app.models.database import AgentTeamPreset, GithubDeliveryPolicyEvent, GithubWorkItem, TeamGithubScope
 from app.models.schemas import FactoryDeliveryPolicy
 
 
@@ -19,6 +20,18 @@ def effective_policy(item: GithubWorkItem, scope: TeamGithubScope) -> FactoryDel
     value = item.delivery_policy if item.delivery_policy is not None else (
         {} if item.dispatch_nonce else scope.delivery_policy or {})
     return FactoryDeliveryPolicy.model_validate(value)
+
+
+def owner_contact_windows(
+    preset: AgentTeamPreset | None, policy: FactoryDeliveryPolicy | None = None,
+) -> tuple[int, int]:
+    """Return idle and grace seconds from the attempt, team or live installation defaults."""
+    team_idle = preset.github_owner_idle_timeout_seconds if preset is not None else None
+    team_grace = preset.github_nudge_grace_seconds if preset is not None else None
+    return (
+        (policy.owner_idle_seconds if policy else None) or team_idle or settings.github_owner_idle_timeout_seconds,
+        (policy.owner_nudge_grace_seconds if policy else None) or team_grace or settings.github_nudge_grace_seconds,
+    )
 
 
 def policy_context(item: GithubWorkItem) -> tuple:

@@ -14,6 +14,7 @@ from sqlalchemy import String, and_, cast, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.services.factory_delivery_policy import owner_contact_windows
 from app.models.database import (
     AgentPaneBinding,
     AgentTeamPreset,
@@ -3035,8 +3036,10 @@ class GithubDispatchService:
                 if anchor is None:
                     await self._nudge_owner_for_brief(db, item)
                     continue
+                preset = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
+                _, brief_grace = owner_contact_windows(preset)
                 if datetime.utcnow() - anchor <= timedelta(
-                    seconds=settings.github_nudge_grace_seconds
+                    seconds=brief_grace
                 ):
                     continue
                 if (
@@ -3053,19 +3056,19 @@ class GithubDispatchService:
                     continue
             from app.services.factory_delivery_policy import effective_policy
             from app.services.native_owner_contact import contact_context, refresh_contact_context, renew_native_owner_contact
-            policy = effective_policy(item, scope)
             workspace = await github_workspace_service.get_leased_workspace(db, item.id)
             expected_contact = contact_context(item, workspace)
             await renew_native_owner_contact(db, scope, item, workspace)
             if not await refresh_contact_context(db, item, workspace, None, expected_contact):
                 continue
-            policy = effective_policy(item, scope)
+            preset = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
+            idle_seconds, grace_seconds = owner_contact_windows(preset, effective_policy(item, scope))
             idle_anchor = max(value for value in (
                 item.updated_at or item.created_at,
                 workspace.lease_last_owner_contact_at if workspace is not None else None,
             ) if value is not None)
             idle_overdue = datetime.utcnow() - idle_anchor > timedelta(
-                seconds=policy.owner_idle_seconds or settings.github_owner_idle_timeout_seconds
+                seconds=idle_seconds
             )
             from app.services.owner_observation_pause import initial_recovery_grace
             idle_overdue = idle_overdue or await initial_recovery_grace(db, item, idle_anchor)
@@ -3074,7 +3077,7 @@ class GithubDispatchService:
             if item.last_nudge_at is None or item.last_nudge_at < idle_anchor:
                 await self._nudge_owner_for_progress(db, item)
             elif datetime.utcnow() - item.last_nudge_at > timedelta(
-                seconds=policy.owner_nudge_grace_seconds or settings.github_nudge_grace_seconds
+                seconds=grace_seconds
             ):
                 from app.services.owner_observation_pause import handle_observation_gap
                 if await handle_observation_gap(db, scope, item):
@@ -3157,12 +3160,6 @@ class GithubDispatchService:
                 )
             )
         ).scalars().all()
-        now = datetime.utcnow()
-        idle_timeout = timedelta(
-            seconds=settings.github_owner_idle_timeout_seconds
-        )
-        nudge_grace = timedelta(seconds=settings.github_nudge_grace_seconds)
-
         for item in items:
             revision = (
                 await db.execute(
@@ -3207,16 +3204,12 @@ class GithubDispatchService:
             workspace = await github_workspace_service.get_leased_workspace(db, item.id)
             from app.services.factory_delivery_policy import effective_policy
             from app.services.native_owner_contact import contact_context, refresh_contact_context, renew_native_owner_contact
-            policy = effective_policy(item, scope)
-            idle_timeout = timedelta(seconds=policy.owner_idle_seconds or settings.github_owner_idle_timeout_seconds)
-            nudge_grace = timedelta(seconds=policy.owner_nudge_grace_seconds or settings.github_nudge_grace_seconds)
             expected_contact = contact_context(item, workspace, revision)
             await renew_native_owner_contact(db, scope, item, workspace, revision)
             if not await refresh_contact_context(db, item, workspace, revision, expected_contact):
                 continue
-            policy = effective_policy(item, scope)
-            idle_timeout = timedelta(seconds=policy.owner_idle_seconds or settings.github_owner_idle_timeout_seconds)
-            nudge_grace = timedelta(seconds=policy.owner_nudge_grace_seconds or settings.github_nudge_grace_seconds)
+            preset = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
+            idle_seconds, grace_seconds = owner_contact_windows(preset, effective_policy(item, scope))
             now = datetime.utcnow()
             anchors = [
                 value
@@ -3239,7 +3232,7 @@ class GithubDispatchService:
                 continue
             anchor = max(anchors)
             elapsed = now - anchor
-            if elapsed <= idle_timeout:
+            if elapsed <= timedelta(seconds=idle_seconds):
                 continue
             if (
                 item.continuation_nudged_at is None
@@ -3275,7 +3268,7 @@ class GithubDispatchService:
                     action="nudge_owner",
                 )
                 continue
-            if now - item.continuation_nudged_at <= nudge_grace:
+            if now - item.continuation_nudged_at <= timedelta(seconds=grace_seconds):
                 continue
             from app.services.owner_observation_pause import handle_observation_gap
             if await handle_observation_gap(db, scope, item):
@@ -3836,7 +3829,11 @@ class GithubDispatchService:
             count = workspace.lease_release_reminder_count
             if count < 0 or count >= LEASE_RELEASE_REMINDER_CAP or not self.release_reminder_needed(scope, item):
                 continue
-            delay = max(settings.github_nudge_grace_seconds * (1, 1, 4, 15)[count],
+            preset = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
+            if preset is None:
+                continue
+            _, grace = owner_contact_windows(preset)
+            delay = max(grace * (1, 1, 4, 15)[count],
                         (0, 240, 900, 3600)[count])
             if (workspace.lease_release_reminded_at is not None
                 and now - workspace.lease_release_reminded_at < timedelta(seconds=delay)):
@@ -3878,7 +3875,9 @@ class GithubDispatchService:
                     TeamGithubScope.continuation_enabled == scope.continuation_enabled,
                     exists(select(AgentTeamPreset.id).where(
                         AgentTeamPreset.id == TeamGithubScope.preset_id,
+                        AgentTeamPreset.id == preset.id,
                         AgentTeamPreset.autonomy_enabled == autonomy,
+                        AgentTeamPreset.github_nudge_grace_seconds == preset.github_nudge_grace_seconds,
                     )),
                 )),
             ]
@@ -4058,7 +4057,7 @@ class GithubDispatchService:
         if elapsed < initial:
             return
         preset_fields = ("leader_slot_id", "supervisor_actor_id", "autonomy_enabled",
-                         "leader_ack_timeout_seconds", "leader_ack_max_wait_seconds")
+                         "leader_ack_timeout_seconds", "leader_ack_max_wait_seconds", "github_nudge_grace_seconds")
         expected_preset = tuple(getattr(preset, field) for field in preset_fields)
         expected_scope = (scope.enabled, scope.preset_id)
         expected_leader = (leader.enabled, leader.provider, dict(leader.launch_options or {}))
@@ -4120,9 +4119,10 @@ class GithubDispatchService:
         reminded = request.leader_ack_reminded_at
         if reminded is None and item.last_nudge_at is not None and item.last_nudge_at >= request.created_at:
             reminded = item.last_nudge_at  # A pre-upgrade reminder already spent its grace.
+        _, grace = owner_contact_windows(preset)
         if elapsed >= maximum or (reminded is not None and not active
                 and request.leader_activity_extended_at is None
-                and now - reminded > timedelta(seconds=settings.github_nudge_grace_seconds)):
+                and now - reminded > timedelta(seconds=grace)):
             await self.escalate(db, item, "leader_ack_timeout", initial_request=request)
             return
         conditions = (

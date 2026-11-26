@@ -342,6 +342,8 @@ export interface TeamWorkSettings {
   mail_request_unanswered_seconds: number | null
   github_team_idle_timeout_seconds: number | null
   github_publish_summaries_enabled: boolean | null
+  github_owner_idle_timeout_seconds: number | null
+  github_nudge_grace_seconds: number | null
 }
 
 export interface AgentTeamPresetUpdate extends Partial<TeamWorkSettings> {
