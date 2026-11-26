@@ -26,7 +26,7 @@ def _report(workflow, pages):
     return result.stdout
 
 
-def test_diagnostic_lanes_are_opt_in_and_codeql_still_scans_pushes():
+def test_diagnostic_lanes_are_opt_in_and_codeql_still_scans_pull_requests():
     assert set(_workflow("e2e.yml")["jobs"]) == {"e2e-scope", "e2e-shards", "e2e"}
     diagnostics = _workflow("e2e-diagnostics.yml")
     assert set(diagnostics["on"]) == {"workflow_dispatch"}
@@ -39,7 +39,7 @@ def test_diagnostic_lanes_are_opt_in_and_codeql_still_scans_pushes():
     assert {"e2e-pending-results", "e2e-flicker-loop-result", "e2e-flicker-loop-failure"} == {
         step["with"]["name"] for step in job["steps"] if "upload-artifact" in step.get("uses", "")
     }
-    assert set(_workflow("codeql.yml")["on"]) == {"push", "schedule"}
+    assert set(_workflow("codeql.yml")["on"]) == {"pull_request", "push", "schedule"}
 
 
 def test_report_waits_for_completed_runs_and_reads_the_exact_attempt():
@@ -83,3 +83,11 @@ def test_report_marks_unusable_timestamps_unknown(created_at, started_at):
 
 def test_report_marks_a_required_job_missing_from_this_attempt_unknown():
     assert "| Full backend regression tests | Unknown |" in _report("Backend regression tests", [])
+
+
+def test_report_marks_duplicate_required_job_names_unknown():
+    report = _report("E2E", [{"jobs": [
+        {"name": "e2e", "created_at": "2026-11-26T13:49:03Z", "started_at": "2026-11-26T13:49:05Z"},
+        {"name": "e2e", "created_at": "2026-11-26T13:49:03Z", "started_at": "2026-11-26T13:49:09Z"},
+    ]}])
+    assert "| e2e | Unknown |" in report
