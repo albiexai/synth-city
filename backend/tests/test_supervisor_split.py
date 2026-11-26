@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -12,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "superv
 import split  # noqa: E402
 
 TOKEN = "gh-secret-5d2f90ab"
-READS = {("issue", "view"), ("issue", "list")}
+READS = {("issue", "view")}  # and gh api, which is a GET here
 PLAN = {"repo": "o/r", "original": 900, "milestone": "v4.4", "parts": [
     {"title": "Part one", "body": "First part.", "lane": "v44-ui", "priority": 21},
     {"title": "Part two", "body": "Second part.", "lane": "v44-infra", "priority": 22}],
@@ -24,22 +25,23 @@ class FakeGh:
 
     def __init__(self, labels=("synth-city-v44-ready", "v44-ui"), state="OPEN", milestone="v4.4", fill=0, fail_at=None):
         self.view = {"number": 900, "state": state, "labels": [{"name": n} for n in labels],
-                     "milestone": {"title": milestone} if milestone else None, "comments": []}
+                     "milestone": {"title": milestone} if milestone else None, "comments": [],
+                     "createdAt": "2026-11-01T00:00:00Z"}
         self.created, self.calls, self.fill, self.fail_at = [], [], fill, fail_at
-        self.bad_list, self.lag = None, False
+        self.bad_list, self.bad_page = None, 1
 
     def __call__(self, args):
         self.calls.append(tuple(args))
         verb = tuple(args[:2])
         if verb == ("issue", "view"):
             return 0, json.dumps(self.view)
-        if verb == ("issue", "list"):
-            if self.bad_list is not None:
+        if args[0] == "api":  # the REST issue list: 100 rows a page, GET only, no search index
+            page = int(re.search(r"&page=(\d+)", args[1]).group(1))
+            if self.bad_list is not None and page == self.bad_page:
                 return 0, json.dumps(self.bad_list)
-            rows = [{"number": c["number"], "title": c["title"], "body": c["body"]} for c in self.created]
-            if "--search" in args:  # the search finds the marker text; a lagging index does not find a new part yet
-                return 0, json.dumps([{"number": n, "title": "x", "body": ""} for n in range(2000, 2000 + self.fill)] + ([] if self.lag else rows))
-            return 0, json.dumps(rows)
+            rows = [{"number": n, "title": "x", "body": None} for n in range(2000, 2000 + self.fill)]
+            rows += [{"number": c["number"], "title": c["title"], "body": c["body"]} for c in self.created]
+            return 0, json.dumps(rows[(page - 1) * 100:page * 100])
         if verb == ("issue", "create"):
             if self.fail_at == len(self.created) + 1:
                 return 1, f"boom: bad credentials {TOKEN}\nsecond line"
@@ -57,7 +59,7 @@ class FakeGh:
         return 1, "unknown command"
 
     def writes(self):
-        return [c for c in self.calls if tuple(c[:2]) not in READS]
+        return [c for c in self.calls if tuple(c[:2]) not in READS and c[0] != "api"]
 
 
 def go(tmp_path, fake, *extra, plan=PLAN, env=None):
@@ -89,8 +91,9 @@ def test_execute_files_each_part_once_removes_the_label_and_comments_the_list(tm
     assert "created #1001" in out
 
 
-def test_a_second_run_files_nothing_new_and_writes_nothing(tmp_path):
-    fake = FakeGh()
+@pytest.mark.parametrize("fill", [0, 250])  # 250 unrelated issues: the parts sit on the last of three pages
+def test_a_second_run_files_nothing_new_and_writes_nothing(tmp_path, fill):
+    fake = FakeGh(fill=fill)
     go(tmp_path, fake, "--execute")
     before = len(fake.writes())
     code, out, _ = go(tmp_path, fake, "--execute")
@@ -108,11 +111,19 @@ def test_a_failed_create_stops_the_run_and_a_rerun_files_only_the_missing_part(t
     assert code == 0 and [c["number"] for c in fake.created] == [1001, 1002] and len(fake.view["comments"]) == 1
 
 
-def test_a_full_issue_list_page_refuses_execute_because_a_duplicate_cannot_be_ruled_out(tmp_path):
-    fake = FakeGh(fill=200)
+def test_an_incomplete_scan_refuses_execute_because_a_duplicate_cannot_be_ruled_out(tmp_path):
+    fake = FakeGh(fill=3000)  # more issues than 30 pages of 100
     code, out, err = go(tmp_path, fake, "--execute")
     assert code == 2 and fake.writes() == [] and "cannot prove" in out + err
-    assert go(tmp_path, FakeGh(fill=200))[0] == 1  # the dry run warns and reports attention
+    assert go(tmp_path, FakeGh(fill=3000))[0] == 1  # the dry run warns and reports attention
+
+
+def test_the_scan_is_the_rest_list_since_the_original_was_created_and_never_a_search(tmp_path):
+    fake = FakeGh(fill=150)
+    go(tmp_path, fake)
+    scans = [c[1] for c in fake.calls if c[0] == "api"]
+    assert len(scans) == 2 and all("since=2026-11-01T00:00:00Z" in s and "state=all" in s for s in scans)
+    assert not any("--search" in c for c in fake.calls)
 
 
 @pytest.mark.parametrize("change", [
@@ -121,6 +132,8 @@ def test_a_full_issue_list_page_refuses_execute_because_a_duplicate_cannot_be_ru
     {"parts": [{**PLAN["parts"][0], "title": ""}]}, {"parts": [{**PLAN["parts"][0], "lane": "bad lane"}]},
     {"parts": [{**PLAN["parts"][0], "priority": "21"}]}, {"parts": [{**PLAN["parts"][0], "priority": 0}]},
     {"parts": [{k: v for k, v in PLAN["parts"][0].items() if k != "body"}]}, {"parts": ["x"]},
+    {"end_stopped": {"preset": None}}, {"end_stopped": {"item": None}}, {"end_stopped": {"revision": None}},
+    {"end_stopped": {"preset": 0}}, {"end_stopped": {"generation": "short"}}, {"end_stopped": "x"},
 ])
 def test_an_invalid_plan_is_refused_before_any_command_runs(tmp_path, change):
     fake = FakeGh()
@@ -143,7 +156,7 @@ def test_a_closed_original_or_a_missing_milestone_is_refused_with_no_write(tmp_p
     assert go(tmp_path, fake, "--execute", plan=plan)[0] == 2 and fake.writes() == []
 
 
-@pytest.mark.parametrize("damage", [{"labels": "none"}, {"state": None}, {"comments": {}}, {"number": "x"}])
+@pytest.mark.parametrize("damage", [{"labels": "none"}, {"state": None}, {"comments": {}}, {"number": "x"}, {"createdAt": None}])
 def test_a_gh_answer_without_the_fields_the_helper_reads_is_an_error_with_no_write(tmp_path, damage):
     fake = FakeGh()
     fake.view.update(damage)
@@ -157,14 +170,20 @@ def test_the_original_milestone_is_used_when_the_plan_has_none(tmp_path):
     assert {c["milestone"] for c in fake.created} == {"v4.5"}
 
 
-def test_no_token_value_reaches_the_output_even_from_gh_text_or_a_title(tmp_path):
-    plan = {**PLAN, "parts": [{**PLAN["parts"][0], "title": f"Part {TOKEN}"}, PLAN["parts"][1]]}
-    out_all = ""
-    for args in (("--execute",), ()):
-        fake = FakeGh(fail_at=2)
-        code, out, err = go(tmp_path, fake, *args, plan=plan, env={"GH_TOKEN": TOKEN, "GITHUB_TOKEN": TOKEN})
-        out_all += out + err
-    assert TOKEN not in out_all and "boom" in out_all
+@pytest.mark.parametrize("field", ["title", "body"])
+def test_a_plan_with_a_known_token_is_refused_before_any_command_and_the_value_is_not_echoed(tmp_path, field):
+    # V1: terminal redaction does not protect what is written to GitHub, so the plan itself must be free of the value.
+    plan = {**PLAN, "parts": [{**PLAN["parts"][0], field: f"Part {TOKEN}"}, PLAN["parts"][1]]}
+    fake = FakeGh()
+    code, out, err = go(tmp_path, fake, "--execute", plan=plan, env={"GH_TOKEN": TOKEN})
+    assert code == 2 and fake.calls == [] and TOKEN not in out + err and "known token" in out + err
+
+
+def test_no_token_value_is_written_or_printed_when_gh_fails_with_it_in_its_text(tmp_path):
+    fake = FakeGh(fail_at=2)
+    code, out, err = go(tmp_path, fake, "--execute", env={"GH_TOKEN": TOKEN, "GITHUB_TOKEN": TOKEN})
+    assert code == 2 and "boom" in out + err and TOKEN not in out + err
+    assert TOKEN not in json.dumps(fake.calls) and TOKEN not in json.dumps(fake.created)
 
 
 def test_control_characters_in_a_title_never_reach_the_terminal(tmp_path):
@@ -178,38 +197,37 @@ def test_the_end_stopped_command_has_the_ids_and_no_token_value(tmp_path):
     assert "/presets/9/work-items/349/end-stopped" in out and '"outcome":"superseded"' in out
     assert "$SYNTH_CITY_OPERATOR_TOKEN" in out and "<SUPERSEDING_PR_NUMBER>" in out and "a" * 64 in out and TOKEN not in out
     _, bare, _ = go(tmp_path, FakeGh(), plan={k: v for k, v in PLAN.items() if k != "end_stopped"})
-    assert "<PRESET_ID>" in bare and "<ITEM_ID>" in bare and "<EXPECTED_DISPATCH_GENERATION>" in bare
+    assert "<PRESET_ID>" in bare and "<ITEM_ID>" in bare and "<EXPECTED_DISPATCH_GENERATION>" in bare and "<EXPECTED_SCOPE_REVISION>" in bare
+
+
+def test_a_known_null_generation_stays_null_and_an_unknown_one_is_a_placeholder(tmp_path):
+    null = {**PLAN, "end_stopped": {"preset": 9, "item": 349, "generation": None, "revision": 0}}
+    unknown = {**PLAN, "end_stopped": {"preset": 9, "item": 349, "revision": 0}}
+    assert '"expected_dispatch_generation":null' in go(tmp_path, FakeGh(), plan=null)[1]
+    assert '"expected_dispatch_generation":"<EXPECTED_DISPATCH_GENERATION>"' in go(tmp_path, FakeGh(), plan=unknown)[1]
 
 
 def test_the_helper_never_closes_or_ends_the_original(tmp_path):
     fake = FakeGh()
     go(tmp_path, fake, "--execute")
-    assert {c[:2] for c in fake.calls} <= READS | {("issue", "create"), ("issue", "edit"), ("issue", "comment")}
+    assert {c[:2] for c in fake.calls if c[0] != "api"} <= READS | {("issue", "create"), ("issue", "edit"), ("issue", "comment")}
     assert all("--remove-label" in c for c in fake.calls if c[:2] == ("issue", "edit"))
     assert not any("close" in c for c in fake.calls)
 
 
 def test_the_last_step_removes_a_token_and_a_control_character_that_no_earlier_step_saw(tmp_path):
-    # The lane and the milestone are printed as they are: only the last redaction and the printable step reach them.
-    plan = {**PLAN, "milestone": "v4\x1b[31m\x07.4", "parts": [{**PLAN["parts"][0], "lane": TOKEN}, PLAN["parts"][1]]}
-    _, out, err = go(tmp_path, FakeGh(), plan=plan, env={"GH_TOKEN": TOKEN})
+    # A milestone title that gh gives is printed as it is, so only the last redaction and the printable step reach it.
+    fake = FakeGh(milestone=f"v4\x1b[31m\x07{TOKEN}")
+    _, out, err = go(tmp_path, fake, plan={k: v for k, v in PLAN.items() if k != "milestone"}, env={"GH_TOKEN": TOKEN})
     assert TOKEN not in out + err and "would create" in out
     assert all(c == "\n" or c.isprintable() for c in out + err)
 
 
-@pytest.mark.parametrize("answer", [{"x": 1}, [{"number": 5, "title": "x"}], [{"number": "5", "title": "x", "body": ""}], ["x"]])
-def test_an_issue_list_answer_without_the_fields_the_helper_reads_is_an_error_with_no_write(tmp_path, answer):
-    fake = FakeGh()
-    fake.bad_list = answer
+@pytest.mark.parametrize("page,answer", [
+    (1, {"x": 1}), (1, [{"number": "5", "body": ""}]), (1, [{"number": 5, "body": 7}]), (1, ["x"]), (2, "x"), (2, [{"number": 0}]),
+])
+def test_an_issue_list_page_without_the_fields_the_helper_reads_is_an_error_with_no_write(tmp_path, page, answer):
+    fake = FakeGh(fill=150)  # two pages: the second one is read too
+    fake.bad_list, fake.bad_page = answer, page
     code, out, err = go(tmp_path, fake, "--execute")
-    assert code == 2 and fake.writes() == [] and "no valid" in out + err
-
-
-def test_the_search_is_for_the_marker_text_and_a_part_the_index_has_not_seen_yet_is_found_in_the_newest_issues(tmp_path):
-    fake = FakeGh()
-    go(tmp_path, fake, "--execute")
-    fake.lag = True
-    code, out, _ = go(tmp_path, fake, "--execute")
-    assert code == 0 and len(fake.created) == 2 and "already filed as #1001" in out
-    searches = [c[c.index("--search") + 1] for c in fake.calls if c[:2] == ("issue", "list") and "--search" in c]
-    assert searches and all("Split from #900" in s for s in searches)
+    assert code == 2 and fake.writes() == [] and "no valid" in out + err and "Traceback" not in out + err

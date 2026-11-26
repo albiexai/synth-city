@@ -19,7 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _common as common  # noqa: E402
 
 READY_LABEL = "synth-city-v44-ready"
-LIST_LIMIT = 200
+PAGE_SIZE = 100
+MAX_PAGES = 30
 MAX_PLAN = 65536
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 LANE = re.compile(r"^[A-Za-z0-9:_.-]{1,50}$")
@@ -60,9 +61,11 @@ def load_plan(path):
              and len(part["body"]) <= 20000 and isinstance(part.get("lane"), str) and LANE.match(part["lane"])
              and is_int(part.get("priority"), 1, 999), "part (title, body, lane, priority)")
     stop = plan.get("end_stopped") or {}
-    need(isinstance(stop, dict) and all(stop.get(k) is None or is_int(stop[k], 1) for k in ("preset", "item"))
-         and (stop.get("revision") is None or is_int(stop["revision"]))
-         and (stop.get("generation") is None or re.fullmatch(r"[0-9a-f]{64}", str(stop["generation"]))), "end_stopped ids")
+    # A present id must be a real number: null is refused. Only the generation may be null (a known null generation).
+    need(isinstance(stop, dict) and all(k not in stop or is_int(stop[k], 1) for k in ("preset", "item"))
+         and ("revision" not in stop or is_int(stop["revision"]))
+         and ("generation" not in stop or stop["generation"] is None or re.fullmatch(r"[0-9a-f]{64}", str(stop["generation"]))),
+         "end_stopped ids")
     return plan
 
 
@@ -89,6 +92,19 @@ def ask_json(runner, args, redact):
         raise PlanError("the gh answer is not JSON") from None
 
 
+def scan(runner, redact, repo, since):
+    """Every issue and pull request updated since the original was created, page by page. Complete is False after MAX_PAGES."""
+    rows = []
+    for page in range(1, MAX_PAGES + 1):
+        chunk = ask_json(runner, ["api", f"repos/{repo}/issues?state=all&since={since}&per_page={PAGE_SIZE}&page={page}"], redact)
+        need(isinstance(chunk, list) and all(isinstance(x, dict) and is_int(x.get("number"), 1) and (x.get("body") is None or isinstance(x["body"], str))
+                                             for x in chunk), "answer for the issue list")
+        rows += chunk
+        if len(chunk) < PAGE_SIZE:
+            return rows, True
+    return rows, False
+
+
 def parser():
     ap = argparse.ArgumentParser(description="Split an issue into parts. Dry run by default.")
     ap.add_argument("--plan", required=True, help="JSON plan file: repo, original, milestone, parts, end_stopped")
@@ -106,7 +122,10 @@ def run(argv, env=None, stdout=None, stderr=None, runner=gh):
     redact = common.Redactor(env.get("GH_TOKEN"), env.get("GITHUB_TOKEN"), env.get(common.OPERATOR_ENV))
     out = lambda text, to=stdout: print(common.printable(redact(text)), file=to)  # noqa: E731
     try:
-        return split(load_plan(args.plan), args, runner, redact, out)
+        plan = load_plan(args.plan)
+        if any(s and s in json.dumps(plan) for s in (env.get("GH_TOKEN"), env.get("GITHUB_TOKEN"), env.get(common.OPERATOR_ENV))):
+            raise PlanError("the plan contains a known token value; it is refused before any command and not shown")
+        return split(plan, args, runner, redact, out)
     except PlanError as error:
         out(f"error: {error}", stderr)
         return 2
@@ -114,29 +133,24 @@ def run(argv, env=None, stdout=None, stderr=None, runner=gh):
 
 def split(plan, args, runner, redact, out):
     repo, n, parts, execute = plan["repo"], plan["original"], plan["parts"], args.execute
-    view = ask_json(runner, ["issue", "view", str(n), "-R", repo, "--json", "number,state,labels,milestone,comments"], redact)
+    view = ask_json(runner, ["issue", "view", str(n), "-R", repo, "--json", "number,state,labels,milestone,comments,createdAt"], redact)
     need(isinstance(view, dict) and view.get("number") == n and isinstance(view.get("state"), str)
          and isinstance(view.get("labels"), list) and all(isinstance(x, dict) and isinstance(x.get("name"), str) for x in view["labels"])
          and isinstance(view.get("comments"), list) and all(isinstance(x, dict) and isinstance(x.get("body"), str) for x in view["comments"])
          and (view.get("milestone") is None or (isinstance(view["milestone"], dict) and isinstance(view["milestone"].get("title"), str)))
-         and "milestone" in view, "answer for the original issue")
+         and "milestone" in view and isinstance(view.get("createdAt"), str) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", view["createdAt"]),
+         "answer for the original issue")
     need(view["state"] == "OPEN", "original issue: it is not open")
     milestone = plan.get("milestone") or (view["milestone"] or {}).get("title")
     need(milestone, "milestone: set one in the plan or on the original")
-    # The search finds earlier parts of any age. The newest issues cover a part that the search index has not seen yet.
-    listing = ["issue", "list", "-R", repo, "--state", "all", "--limit", str(LIST_LIMIT), "--json", "number,title,body"]
-    found = ask_json(runner, listing + ["--search", f'"Split from #{n}" in:body'], redact)
-    rows = found + ask_json(runner, listing, redact) if isinstance(found, list) else None
-    need(isinstance(rows, list) and all(isinstance(x, dict) and is_int(x.get("number"), 1) and isinstance(x.get("body"), str) for x in rows),
-         "answer for the issue list")
-    full = len(found) >= LIST_LIMIT
-    if full and execute:
-        raise PlanError(f"cannot prove that no part is filed twice: the search page is full ({LIST_LIMIT})")
+    rows, complete = scan(runner, redact, repo, view["createdAt"])
+    if not complete and execute:
+        raise PlanError(f"cannot prove that no part is filed twice: the scan stopped after {MAX_PAGES} pages")
     marker = lambda k: f"<!-- split-from:#{n} part:{k} -->"  # noqa: E731
-    numbers = {k: row["number"] for k, _ in enumerate(parts, 1) for row in rows if marker(k) in row["body"]}
+    numbers = {k: row["number"] for k, _ in enumerate(parts, 1) for row in rows if marker(k) in (row.get("body") or "")}
     out(f"split #{n} into {len(parts)} parts in {repo}" + ("" if execute else " (dry run: nothing changes; use --execute to write)"))
-    if full:
-        out(f"warning: the search page is full ({LIST_LIMIT}), so an earlier part may be missing from this check")
+    if not complete:
+        out(f"warning: the scan stopped after {MAX_PAGES} pages, so an earlier part may be missing from this check")
     for k, part in enumerate(parts, 1):
         title = common.clean(redact(part["title"]), 80)
         if k in numbers:
@@ -169,7 +183,7 @@ def split(plan, args, runner, redact, out):
             ask(runner, ["issue", "comment", str(n), "-R", repo, "--body", f"Split into:\n{lines}\n{note}"], redact)
         out(f"{'commented' if execute else 'would comment'} the list of parts on #{n}")
     stop = plan.get("end_stopped") or {}
-    data = {"operation_id": f"split-{n}", "expected_dispatch_generation": stop.get("generation") or "<EXPECTED_DISPATCH_GENERATION>",
+    data = {"operation_id": f"split-{n}", "expected_dispatch_generation": stop["generation"] if "generation" in stop else "<EXPECTED_DISPATCH_GENERATION>",
             "expected_scope_revision": stop.get("revision", "<EXPECTED_SCOPE_REVISION>"), "outcome": "superseded",
             "superseding_pr_number": "<SUPERSEDING_PR_NUMBER>", "reason": f"Superseded by the split of #{n}"}
     out("The helper does not end the original item. After a part's pull request has merged, run this yourself.")
@@ -177,7 +191,7 @@ def split(plan, args, runner, redact, out):
     out(f"curl -sS -X POST \"$SYNTH_CITY_URL/api/v1/agent-teams/presets/{stop.get('preset', '<PRESET_ID>')}/work-items/"
         f"{stop.get('item', '<ITEM_ID>')}/end-stopped\" -H \"x-synth-city-operator-token: ${common.OPERATOR_ENV}\" "
         f"-H \"content-type: application/json\" -d '{json.dumps(data, separators=(',', ':'))}'")
-    return 1 if full else 0
+    return 0 if complete else 1
 
 
 if __name__ == "__main__":
