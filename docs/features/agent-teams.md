@@ -461,6 +461,8 @@ A team admits the issues that have its backlog milestone. When an issue gets a d
 
 A deferral shows only while it is the newest item of its issue in the repository. An issue that another team admits, or that was merged, does not show as deferred. A cleared wait does not show.
 
+A row keeps the repository it was recorded for. A deferral takes it from the GitHub issue URL that its work item stored, and a deferral whose URL does not name its issue is not shown. A wait stores no repository, so changing the repository of a scope deletes the waits of that scope. The next poll records the waits of the new repository. A poll that began before such a change writes nothing for that scope.
+
 The Teams page shows the rows of the selected team. The Work page follows the team and repository filters of its URL. The view is read-only. It shows at most 100 rows of each kind and says when a list is cut. It shows nothing when both lists are empty.
 
 API: `GET /api/v1/factory/milestone-states` with the optional filters `team_id` and `scope_id`. It needs no operator key. Waits and deferrals come from the watcher; this view only reads them.
