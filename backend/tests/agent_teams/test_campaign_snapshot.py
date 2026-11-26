@@ -421,3 +421,54 @@ async def test_a_recorded_non_delivery_is_not_merged(db, world):
     await db.commit()
     by_name = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False))
     assert (by_name["merged"].value, by_name["closed_without_delivery"].value) == (1, 1)
+
+
+# V1 review 6080664549 (findings 1, 2 and 4; finding 3 is #1395)
+async def test_a_recompute_reads_membership_after_the_cutoff_as_unknown(db, world):
+    """GitHub's membership today says nothing about an earlier cutoff: the normal recompute entry point is unknown."""
+    campaign = await _campaign(db, world)
+    first = await snapshots.freeze(db, campaign, _client(), actor=SYSTEM, as_of=CUTOFF)
+    assert _measures(first)["issues_in_scope"].value == 3
+    later = _client()
+    later.labelled["a2"].append(_issue("a2", 6))  # an issue added after the finish
+    for observed_at in (None, CUTOFF + timedelta(days=1)):  # the real read time, by default or supplied
+        again = await snapshots.recompute(db, campaign, later, actor=OPERATOR, as_of=CUTOFF, observed_at=observed_at)
+        in_scope = _measures(again)["issues_in_scope"]
+        assert in_scope.value is None and "membership_read_after_cutoff" in in_scope.unknown_reasons
+
+
+async def test_an_overlapping_refresh_never_replaces_a_newer_cutoffs_entry(db, world, monkeypatch):
+    campaign = await _campaign(db, world)
+    older, newer = T0 + timedelta(days=2), T0 + timedelta(days=4)
+    await snapshots.build_snapshot(db, campaign, _client(), as_of=older)
+    real, interleaved = snapshots._rate_limited, []
+
+    async def rate_limited_while_the_newer_read_lands(db_, coverage, started, as_of):
+        sample = await real(db_, coverage, started, as_of)
+        if not interleaved and as_of == older:
+            interleaved.append(as_of)
+            await snapshots.build_snapshot(db, campaign, _client(), as_of=newer)  # populates the newer entry
+            return sample.model_copy(update={"value": None, "unknown_reasons": ["changed"]})  # forces a replace
+        return sample
+
+    monkeypatch.setattr(snapshots, "_rate_limited", rate_limited_while_the_newer_read_lands)
+    refreshed = await snapshots.build_snapshot(db, campaign, _client(), as_of=older)
+    assert interleaved and refreshed.as_of == older  # the caller gets its own refreshed result
+    assert snapshots._cache[campaign.id][2].as_of == newer  # the newer read's entry stays
+    monkeypatch.setattr(snapshots, "_rate_limited", real)
+    assert (await snapshots.build_snapshot(db, campaign, _client(), as_of=newer)).as_of == newer
+
+
+async def test_a_retired_team_without_repositories_does_not_keep_a_cached_zero(db, world):
+    from app.models.database import AgentTeamPreset
+
+    team = AgentTeamPreset(name="No repositories")
+    db.add(team)
+    await db.commit()
+    campaign = await campaigns.start(db, team.id, "label:v4.4", started_at=T0, actor=OPERATOR)
+    first = await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF)
+    assert _measures(first)["issues_in_scope"].value == 0
+    await db.execute(text("DELETE FROM agent_team_presets WHERE id = :id"), {"id": team.id})
+    await db.commit()
+    second = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF))["issues_in_scope"]
+    assert second.value is None and "team_retired" in second.unknown_reasons

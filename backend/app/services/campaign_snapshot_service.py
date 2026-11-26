@@ -27,6 +27,7 @@ from app.models.database import (
 from app.models.schemas import FactoryMetricSample
 from app.services import campaign_record_service as campaigns
 from app.services import campaign_upgrade_service as upgrade
+from app.services import factory_audit_service as audit
 from app.services.factory_metrics_service import _coverage, _naive_utc
 from app.services.github_rate_limit_history import campaign_rate_limit_time
 
@@ -86,8 +87,10 @@ async def _fingerprint(db, campaign: Campaign) -> tuple:
                                     .join(FactoryContextKey, _lifetime(campaign.team_context_key))
                                     .order_by(GithubWorkItem.id))).all())
     markers = tuple((entry.measure, entry.started_at) for entry in await upgrade.recorded_coverage(db, campaign))
+    # Retiring the team ends the cache even with no repositories or work items (V1 review 6080664549).
+    live = await audit.current_context_key(db, "team", campaign.preset_id) == campaign.team_context_key
     return (campaign.id, campaign.team_context_key, campaign.selector, campaign.status, campaign.started_at,
-            campaign.finished_at, events, scopes, items, markers)
+            campaign.finished_at, live, events, scopes, items, markers)
 
 
 async def build_snapshot(db, campaign: Campaign, client, *, as_of: datetime, observed_at: datetime | None = None,
@@ -104,22 +107,25 @@ async def build_snapshot(db, campaign: Campaign, client, *, as_of: datetime, obs
         hit = _cache.get(campaign.id)
         if hit is not None and hit[0] > _clock() and hit[1] == key:
             # The recorder's pending windows are not records: its coverage is read again on every hit.
-            return await _refresh_rate_limited(db, campaign, hit[2])
+            return await _refresh_rate_limited(db, campaign, hit)
     snapshot = await _build(db, campaign, client, as_of, observed)
     if cached:
         _cache[campaign.id] = (_clock() + CACHE_SECONDS, key, snapshot)
     return snapshot
 
 
-async def _refresh_rate_limited(db, campaign: Campaign, snapshot: Snapshot) -> Snapshot:
+async def _refresh_rate_limited(db, campaign: Campaign, hit: tuple) -> Snapshot:
+    """The caller's cached snapshot with its rate-limit sample read again. The cache entry is replaced only while it
+    is still the one this caller read (V1 review 6080664549): a newer cutoff's entry that landed meanwhile stays."""
+    snapshot = hit[2]
     coverage = await upgrade.recorded_coverage(db, campaign)
     fresh = await _rate_limited(db, coverage, snapshot.started_at, snapshot.as_of)
     metrics = sorted([m for m in snapshot.metrics if m.name != fresh.name] + [fresh], key=lambda m: m.name)
     if metrics == snapshot.metrics:
         return snapshot
     refreshed = snapshot.model_copy(update={"metrics": metrics})
-    expires, key, _old = _cache[campaign.id]
-    _cache[campaign.id] = (expires, key, refreshed)
+    if _cache.get(campaign.id) is hit:
+        _cache[campaign.id] = (hit[0], hit[1], refreshed)
     return refreshed
 
 
@@ -242,7 +248,8 @@ async def freeze(db, campaign: Campaign, client, *, actor: dict, as_of: datetime
 _RECOMPUTE_ATTEMPTS = 5
 
 
-async def recompute(db, campaign: Campaign, client, *, actor: dict, as_of: datetime | None = None) -> Snapshot:
+async def recompute(db, campaign: Campaign, client, *, actor: dict, as_of: datetime | None = None,
+                    observed_at: datetime | None = None) -> Snapshot:
     """Only the Director recomputes a frozen snapshot (design §9); it adds the next version beside the old ones.
 
     Two concurrent recomputes each keep their version: a collision on the version takes the next one, reading
@@ -253,8 +260,10 @@ async def recompute(db, campaign: Campaign, client, *, actor: dict, as_of: datet
     campaign_id = campaign.id
     if await latest(db, campaign_id) is None:
         raise campaigns.CampaignError("campaign_snapshot_not_frozen")
-    end = as_of or campaign.finished_at or datetime.now(UTC).replace(tzinfo=None)
-    snapshot = await build_snapshot(db, campaign, client, as_of=end, cached=False)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    end = as_of or campaign.finished_at or now
+    # GitHub is read now (V1 review 6080664549): today's membership is never attributed to an earlier cutoff.
+    snapshot = await build_snapshot(db, campaign, client, as_of=end, observed_at=observed_at or now, cached=False)
     payload = snapshot.model_dump(mode="json")
     for _attempt in range(_RECOMPUTE_ATTEMPTS):
         version = (await db.scalar(select(func.max(CampaignSnapshot.version)).where(
