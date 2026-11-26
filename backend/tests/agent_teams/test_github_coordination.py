@@ -461,6 +461,9 @@ async def test_unrelated_history_does_not_expand_guard_or_invalidate_assessment(
     await service.assess(db, team.scope_id, team.leader, report(row), team.client)
     db.add_all([GithubWorkItem(scope_id=team.scope_id, issue_number=n, issue_title="Historical",
         issue_url="u", github_updated_at=datetime.utcnow(), dispatch_status="merged") for n in range(100, 1300)])
+    db.add_all([GithubWorkItem(scope_id=team.scope_id, issue_number=7, issue_title="Previously deferred",
+        issue_url="u", github_updated_at=datetime.utcnow(), dispatch_status="cancelled", milestone_replaced=True)
+        for _ in range(65)])
     await db.commit()
     assert (await service.summary(db, team.scope_id))["assessment_current"]
     await service.reconcile(db, team.scope_id, team.client)

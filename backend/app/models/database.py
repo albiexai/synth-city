@@ -383,6 +383,8 @@ class GithubWorkItem(Base):
     github_updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     issue_type: Mapped[str] = mapped_column(String, default="code", nullable=False)
     dispatch_status: Mapped[str] = mapped_column(String, default="pending", nullable=False)
+    # A milestone return gets a new item while its predecessor remains addressable.
+    milestone_replaced: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
     pending_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     dispatch_priority: Mapped[int | None] = mapped_column(Integer, nullable=True)
     launch_id: Mapped[int | None] = mapped_column(
@@ -459,7 +461,8 @@ class GithubWorkItem(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (
-        UniqueConstraint("scope_id", "issue_number", name="uix_scope_issue"),
+        Index("uix_scope_issue_current", "scope_id", "issue_number", unique=True,
+              sqlite_where=text("milestone_replaced = 0"), postgresql_where=text("milestone_replaced = false")),
     )
 
 

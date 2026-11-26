@@ -2010,7 +2010,10 @@ async def test_dispatch_keeps_pid_pair_null_when_proc_start_is_unreadable(db, mo
 
 
 @pytest.mark.asyncio
-async def test_dispatch_pending_passes_issue_specific_owner_brief(db, monkeypatch):
+@pytest.mark.parametrize("with_predecessor", [False, True])
+async def test_dispatch_pending_passes_issue_specific_owner_brief(db, monkeypatch, with_predecessor):
+    from app.services.github_watcher_service import defer_milestone_exit
+
     _isolate_agent_mail_nudges(monkeypatch)
     nudge_prompts = []
 
@@ -2023,6 +2026,22 @@ async def test_dispatch_pending_passes_issue_specific_owner_brief(db, monkeypatc
     architect = next(slot for slot in slots if slot.display_name == "Architect")
     backend = next(slot for slot in slots if slot.display_name == "Backend SME")
     leader_member = await _create_registered_slot_member(db, architect)
+    if with_predecessor:
+        previous_preset = AgentTeamPreset(name="Former team", backlog_milestone="V1")
+        db.add(previous_preset)
+        await db.flush()
+        previous_scope = TeamGithubScope(preset_id=previous_preset.id, repo_owner=scope.repo_owner,
+                                         repo_name=scope.repo_name, repo_path=scope.repo_path)
+        db.add(previous_scope)
+        await db.flush()
+        previous = GithubWorkItem(
+            scope_id=previous_scope.id, issue_number=833, issue_title="Add agent docs",
+            issue_url="https://github.com/o/r/issues/833", github_updated_at=datetime.utcnow(),
+            dispatch_status="pending", dispatch_head_ref="previous/issue-833",
+        )
+        db.add(previous)
+        await db.commit()
+        await defer_milestone_exit(db, previous_scope, previous, "V2")
     item = GithubWorkItem(
         scope_id=scope.id,
         issue_number=833,
@@ -2079,6 +2098,9 @@ async def test_dispatch_pending_passes_issue_specific_owner_brief(db, monkeypatc
     assert "Workspace: /tmp/r-ws-1" in prompt
     assert "leased exclusively" in prompt
     assert "Do NOT create, move or remove git worktrees" in prompt
+    if with_predecessor:
+        assert f"Previous milestone work item {previous.id}" in prompt
+        assert "previous/issue-833" in prompt
 
     member = (
         await db.execute(select(MailTeamMember).where(MailTeamMember.team_slot_id == backend.id))
@@ -2092,6 +2114,9 @@ async def test_dispatch_pending_passes_issue_specific_owner_brief(db, monkeypatc
     assert "Issue: #833 — Add agent docs" in message.body_markdown
     assert "Acceptance criteria and verification steps." in message.body_markdown
     assert f"Agent Mail member_id={leader_member.id}" in message.body_markdown
+    if with_predecessor:
+        assert f"Previous milestone work item {previous.id}" in message.body_markdown
+        assert "previous/issue-833" in message.body_markdown
     assert f"work_item_id={item.id}" in message.body_markdown
     assert f"slot_id={architect.id}" not in message.body_markdown
     assert "wait for the explicit decision before starting implementation" in message.body_markdown

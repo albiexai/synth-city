@@ -2,10 +2,12 @@
 
 import hashlib
 import json
+import re
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 import app.models.database  # noqa: F401
 from app.database import (
@@ -15,6 +17,56 @@ from app.database import (
     _sqlite_columns,
     _sqlite_rebuild_agent_team_slots,
 )
+from app.models.database import AgentTeamPreset, TeamGithubScope
+
+
+@pytest.mark.asyncio
+async def test_work_item_admission_migration_preserves_history_and_current_uniqueness():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("PRAGMA foreign_keys=ON"))
+            await conn.run_sync(Base.metadata.create_all)
+            await conn.commit()
+            async with AsyncSession(bind=conn, expire_on_commit=False) as session:
+                preset = AgentTeamPreset(name="Existing route")
+                session.add(preset)
+                await session.flush()
+                scope = TeamGithubScope(preset_id=preset.id, repo_owner="o", repo_name="r", repo_path="/tmp/r")
+                session.add(scope)
+                await session.commit()
+            ddl = await conn.scalar(text("SELECT sql FROM sqlite_master WHERE name='github_work_items'"))
+            if "milestone_replaced" in ddl:
+                ddl = re.sub(r"\n\s*milestone_replaced [^\n]*,", "", ddl)
+                ddl = ddl[:ddl.rfind(")")] + ", CONSTRAINT uix_scope_issue UNIQUE (scope_id, issue_number))"
+            await conn.execute(text("DROP TABLE github_work_items"))
+            await conn.execute(text(ddl))
+            await conn.execute(text("CREATE INDEX historical_branch_lookup ON github_work_items (dispatch_head_ref)"))
+            insert = text(
+                "INSERT INTO github_work_items (id, scope_id, issue_number, issue_title, issue_url, github_updated_at, "
+                "dispatch_status, dispatch_head_ref, issue_type, retry_count, approval_round_count, active_scope_revision, "
+                "attempt_phase, diagnostic_retry_count, created_at, updated_at) VALUES "
+                "(:id, :scope, 5, 'Existing', 'url', CURRENT_TIMESTAMP, :status, 'old/issue-5', 'code', "
+                "0, 0, 0, 'implementation', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+            await conn.execute(insert, {"id": 1, "scope": scope.id, "status": "cancelled"})
+            await conn.execute(text("INSERT INTO github_maintenance_events "
+                "(operation_id, work_item_id, outcome, request_sha256, created_at) "
+                "VALUES ('old-deferral', 1, 'deferred', 'test', CURRENT_TIMESTAMP)"))
+            await conn.commit()
+            await _run_sqlite_compat_migrations(conn)
+            await conn.execute(text("UPDATE github_work_items SET milestone_replaced=1 WHERE id=1"))
+            await conn.execute(insert, {"id": 2, "scope": scope.id, "status": "pending"})
+            await _run_sqlite_compat_migrations(conn)
+            assert (await conn.execute(text("SELECT id, dispatch_status, milestone_replaced "
+                "FROM github_work_items ORDER BY id"))).all() == [(1, "cancelled", 1), (2, "pending", 0)]
+            assert await conn.scalar(text("SELECT work_item_id FROM github_maintenance_events")) == 1
+            assert await conn.scalar(text("SELECT name FROM sqlite_master WHERE name='historical_branch_lookup'"))
+            assert await conn.scalar(text("PRAGMA foreign_keys")) == 1
+            assert (await conn.execute(text("PRAGMA foreign_key_check"))).all() == []
+            with pytest.raises(IntegrityError):
+                await conn.execute(insert, {"id": 3, "scope": scope.id, "status": "pending"})
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
