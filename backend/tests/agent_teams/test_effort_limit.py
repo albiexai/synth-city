@@ -228,7 +228,11 @@ async def test_an_approved_plan_without_an_estimate_uses_the_ceiling_at_decision
         assert applied
         root = await db.get(MailMessage, decided.request_message_id)
         assert root.payload["plan_metadata"].get("estimate_active_minutes") is None
-        assert (item.effort_estimate_minutes, item.effort_limit_minutes) == (None, 15)
+        assert item.effort_limit_minutes == 15
+
+    async with fx.maker() as db:
+        item = await _item(fx, db)
+        assert item.effort_estimate_minutes is None
         assert service.effort_view(item, await db.get(TeamGithubScope, fx.scope_id, populate_existing=True)) == {
             "estimate_minutes": None, "limit_minutes": 15, "extension_minutes": 0,
             "effective_limit_minutes": 15, "ceiling_minutes": 15, "extension_cap_minutes": 0,
@@ -272,6 +276,34 @@ async def test_initial_decision_preserves_explicit_estimates_rejections_and_lega
         assert (item.effort_estimate_minutes, item.effort_limit_minutes) == expected
     if legacy:
         assert await _code(_extend(fx, 1)) == "effort_limit_not_set"
+
+
+@pytest.mark.asyncio
+async def test_a_lost_approval_update_does_not_default_a_legacy_limit(fx, monkeypatch):
+    resolve = github_approval_service.resolve_for_decision
+
+    async def resolve_before_legacy_approval(db, item, **kwargs):
+        pending = await resolve(db, item, **kwargs)
+        assert pending.status == "pending"
+        # A concurrent decision from the old path commits after the replay reads the request.
+        async with fx.maker() as other:
+            await other.execute(update(GithubApprovalRequest).where(GithubApprovalRequest.id == pending.id)
+                                .values(status="approved", reason="decision", decided_at=T0))
+            await other.commit()
+        return pending
+
+    monkeypatch.setattr(github_approval_service, "resolve_for_decision", resolve_before_legacy_approval)
+    async with fx.maker() as db:
+        approval = await _linked_initial_plan(fx, db, {})
+        item = await _item(fx, db)
+        decided, applied = await github_approval_service.decide(
+            db, item, authenticated_leader_member_id=fx.leader, request_id=approval.id,
+            decision="approved", reason="decision",
+        )
+        assert not applied and decided.status == "approved"
+
+    async with fx.maker() as db:
+        assert (await _item(fx, db)).effort_limit_minutes is None
 
 
 @pytest.mark.asyncio
