@@ -72,6 +72,8 @@ The watcher completes a work item only through one guarded write. The write requ
 
 Each plan approval request and each continuation request to the Leader records a wait: a start event (`decision_wait_started`) with who asked and who must answer, and an end event (`decision_wait_ended`) when the request leaves pending. The end records the outcome (approved, rejected, superseded, expired or cancelled) and who answered, which stays empty when nobody is known to have answered. Both events are keyed by the request id. A request that is never answered stays open with its age. When its work item is deleted first, the wait is unknown, not open. Requests made before this version have no wait.
 
+Two more kinds of wait are recorded the same way. A Mail context request or handoff waits on its recipient from the moment it is sent (`mail_wait_started`) until it is answered or acknowledged (`mail_wait_ended`), keyed by the message id. The Mail side of a plan approval, continuation or scope amendment is not a second wait, because its decision wait already counts it. When a member's pane shows a question, trust prompt or sign-in prompt, an input wait starts (`input_wait_started`) on the bound Supervisor, or on the Leader when there is none. It ends when the prompt clears or turns into a provider refusal (`input_wait_ended`). A provider refusal is not a wait for input.
+
 ## Review acceptance declarations
 
 An operator can record a review acceptance from a trusted source with `POST /api/v1/factory/review-acceptances`. The declaration names:

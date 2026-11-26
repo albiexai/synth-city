@@ -13,11 +13,16 @@ from typing import Iterable
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.database import FactoryAuditEvent, FactoryContextKey, GithubApprovalRequest
+from app.models.database import FactoryAuditEvent, FactoryContextKey, GithubApprovalRequest, MailMessage, MailTeamMember
 from app.services import factory_audit_service as audit
 
 STARTED = "decision_wait_started"
 ENDED = "decision_wait_ended"
+# #1240: a Mail request to a member, keyed by its message id, and an input wait on a pane, keyed by its episode.
+MAIL_STARTED, MAIL_ENDED = "mail_wait_started", "mail_wait_ended"
+INPUT_STARTED, INPUT_ENDED = "input_wait_started", "input_wait_ended"
+# The Mail root of a structured request carries this delivery key; its decision wait already counts it.
+STRUCTURED_REQUEST_KEY = "github-approval:"
 
 
 def wait_operation(kind: str, request_id: int) -> str:
@@ -73,6 +78,92 @@ async def _event(db: AsyncSession, kind: str, request_id: int, *, item_key: str 
         FactoryAuditEvent.item_context_key == item_key).limit(1))).first()
 
 
+async def _once(db: AsyncSession, operation_id: str) -> bool:
+    return (await db.scalar(select(FactoryAuditEvent.id).where(FactoryAuditEvent.operation_id == operation_id)
+                            .limit(1))) is not None
+
+
+async def record_mail_wait_started(db: AsyncSession, message: MailMessage, *, source: str) -> None:
+    """A pending Mail request waits on its recipient, unless it is the Mail side of a structured request."""
+    if message.request_status != "pending" or (message.delivery_key or "").startswith(STRUCTURED_REQUEST_KEY):
+        return
+    await db.flush()
+    operation_id = f"{MAIL_STARTED}:message:{message.id}"
+    team = await db.scalar(select(MailTeamMember.team_preset_id).where(MailTeamMember.id == message.recipient_member_id))
+    await audit.record_event(
+        db, event_kind=MAIL_STARTED, source=source, occurred_at=datetime.utcnow(), fact_source="mail_messages",
+        fact_time=message.created_at, team_preset_id=team,
+        actor=audit.derive_actor(actor_kind="member", member_id=message.sender_member_id)
+        if message.sender_member_id is not None else audit.derive_actor(actor_kind="system"),
+        after_values={"wait_message_id": message.id, "request_kind": message.kind,
+                      "owner_member_id": message.sender_member_id, "owner_actor_id": message.sender_actor_id,
+                      "awaited_member_id": message.recipient_member_id},
+        action_outcome="applied", sanitized_reason=f"{message.kind} waits on its recipient",
+        operation_id=operation_id, correlation_id=operation_id)
+
+
+async def record_mail_wait_ended(
+    db: AsyncSession, message_id: int, *, outcome: str, source: str, answered_by_member_id: int | None = None,
+) -> None:
+    """End a started Mail wait once. Who answered stays unattributed unless known."""
+    started = (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.operation_id == f"{MAIL_STARTED}:message:{message_id}").limit(1))).first()
+    operation_id = f"{MAIL_ENDED}:message:{message_id}"
+    if started is None or await _once(db, operation_id):
+        return
+    await audit.record_event(
+        db, event_kind=MAIL_ENDED, source=source, occurred_at=datetime.utcnow(), fact_source="mail_messages",
+        fact_time=datetime.utcnow(), team_preset_id=started.team_preset_id, team_context_key=started.team_context_key,
+        actor=audit.derive_actor(actor_kind="member", member_id=answered_by_member_id)
+        if answered_by_member_id is not None else audit.derive_actor(actor_kind="system"),
+        after_values={"wait_message_id": message_id, "wait_outcome": outcome,
+                      "answered_by_member_id": answered_by_member_id},
+        action_outcome="applied", sanitized_reason=f"mail wait ended: {outcome}",
+        operation_id=operation_id, correlation_id=operation_id)
+
+
+def _episode(kind: str, binding_id: int, started_at: datetime) -> str:
+    return f"{kind}:binding:{binding_id}:{audit._naive(started_at).isoformat()}"
+
+
+async def record_input_wait_started(
+    db: AsyncSession, *, preset_id: int, slot_id: int, binding_id: int, started_at: datetime, reason: str,
+    owner_member_id: int | None, awaited_member_id: int | None, awaited_actor_id: int | None, source: str,
+) -> None:
+    """A member waits for input on its pane; the Supervisor, else the Leader, is who the notice asks."""
+    operation_id = _episode(INPUT_STARTED, binding_id, started_at)
+    await audit.record_event(
+        db, event_kind=INPUT_STARTED, source=source, occurred_at=datetime.utcnow(), fact_source="agent_pane_bindings",
+        fact_time=audit._naive(started_at), team_preset_id=preset_id, team_slot_id=slot_id,
+        actor=audit.derive_actor(actor_kind="scheduler", scheduler="agent_activity_service"),
+        after_values={"wait_binding_id": binding_id, "request_kind": reason, "owner_member_id": owner_member_id,
+                      "awaited_member_id": awaited_member_id, "awaited_actor_id": awaited_actor_id},
+        action_outcome="applied", sanitized_reason=f"input wait: {reason}", operation_id=operation_id,
+        correlation_id=operation_id)
+
+
+async def record_input_wait_ended(
+    db: AsyncSession, *, binding_id: int, started_at: datetime | None, outcome: str, ended_at: datetime, source: str,
+) -> None:
+    """End a started input-wait episode once; nobody is known to have answered it."""
+    if started_at is None:
+        return
+    started = (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.operation_id == _episode(INPUT_STARTED, binding_id, started_at)).limit(1))).first()
+    operation_id = _episode(INPUT_ENDED, binding_id, started_at)
+    if started is None or await _once(db, operation_id):
+        return
+    await audit.record_event(
+        db, event_kind=INPUT_ENDED, source=source, occurred_at=datetime.utcnow(), fact_source="agent_pane_bindings",
+        # The observation time, not the insertion time.
+        fact_time=audit._naive(ended_at), team_preset_id=started.team_preset_id, team_slot_id=started.team_slot_id,
+        team_context_key=started.team_context_key,
+        actor=audit.derive_actor(actor_kind="scheduler", scheduler="agent_activity_service"),
+        after_values={"wait_binding_id": binding_id, "wait_outcome": outcome, "answered_by_member_id": None},
+        action_outcome="applied", sanitized_reason=f"input wait ended: {outcome}", operation_id=operation_id,
+        correlation_id=operation_id)
+
+
 @dataclass(frozen=True)
 class DecisionWait:
     request_id: int
@@ -83,6 +174,8 @@ class DecisionWait:
     age_seconds: float | None
     state: str  # "open", or "unknown" when the work item was deleted before the request ended
     reason: str | None = None
+    wait_kind: str = "decision"  # "decision", "mail" (keyed by message id) or "input" (keyed by pane binding id)
+    awaited_actor_id: int | None = None
 
 
 async def unended_decision_waits(
@@ -109,4 +202,20 @@ async def unended_decision_waits(
             owner_member_id=values.get("owner_member_id"), awaited_member_id=values.get("awaited_member_id"),
             started_at=began, age_seconds=None if deleted else (now - began).total_seconds(),
             state="unknown" if deleted else "open", reason="work item deleted" if deleted else None))
+    for kind, (start_kind, end_kind) in {"mail": (MAIL_STARTED, MAIL_ENDED), "input": (INPUT_STARTED, INPUT_ENDED)}.items():
+        query = select(FactoryAuditEvent).where(FactoryAuditEvent.event_kind == start_kind)
+        if team_context_key is not None:
+            query = query.where(FactoryAuditEvent.team_context_key == team_context_key)
+        ended_ids = set((await db.scalars(select(FactoryAuditEvent.operation_id).where(
+            FactoryAuditEvent.event_kind == end_kind))).all())
+        for start in (await db.scalars(query.order_by(FactoryAuditEvent.id))).all():
+            if start.operation_id.replace(start_kind, end_kind, 1) in ended_ids:
+                continue
+            values, began = start.after_values or {}, start.fact_time or start.occurred_at
+            waits.append(DecisionWait(
+                request_id=values.get("wait_message_id") or values.get("wait_binding_id"),
+                request_kind=values.get("request_kind"), owner_member_id=values.get("owner_member_id"),
+                awaited_member_id=values.get("awaited_member_id"), started_at=began,
+                age_seconds=(now - began).total_seconds(), state="open", wait_kind=kind,
+                awaited_actor_id=values.get("awaited_actor_id")))
     return waits
