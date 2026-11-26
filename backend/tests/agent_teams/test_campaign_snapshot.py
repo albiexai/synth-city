@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 from app.database import Base
 from app.models.database import (
@@ -23,6 +23,7 @@ from app.services import campaign_record_service as campaigns
 from app.services import campaign_snapshot_service as snapshots
 from app.services import factory_audit_service as audit
 from app.services.factory_metrics_service import build_metrics_window
+from app.services.github_rate_limit_history import _active_writers
 from tests.agent_teams.test_campaign_record import (  # noqa: F401  (fixtures)
     FakeGithub,
     _issue,
@@ -51,12 +52,22 @@ def fresh_cache():
     snapshots.clear_cache()
 
 
+async def _deliver(db, item_id, at):
+    """The merge fact the delivery recorder writes, at ``at``."""
+    item = await db.get(GithubWorkItem, item_id)
+    item.dispatch_status = "merged"
+    await audit.record_delivery_fact(
+        db, item_id=item_id, delivery_outcome="delivered", completion_kind="merged_code",
+        fact_source="github_pull_request_merged", fact_time=at, artifact=f"pr:{item_id}",
+        attempt=f"item:{item_id}:launch:None:revision:None", snapshot={"artifact_version": "b" * 40})
+    await db.commit()
+
+
 async def _campaign(db, world, *, recording=T0 - timedelta(days=1)):
     if recording is not None:
         db.add(GithubRateLimitHistoryCoverage(id=1, started_at=recording))
-    item = await db.get(GithubWorkItem, world.items[("a1", 2)])
-    item.dispatch_status = "merged"  # a1#2 was delivered; a2#3 was closed without delivery
-    await db.commit()
+        await db.commit()
+    await _deliver(db, world.items[("a1", 2)], T0 + timedelta(days=1))  # a2#3 was closed without delivery
     return await campaigns.start(db, world.team, "label:v4.4", started_at=T0, actor=OPERATOR)
 
 
@@ -137,6 +148,7 @@ async def test_a_new_record_invalidates_the_cache(db, world, record):
         item.dispatch_status = "merged"
         item.updated_at = datetime.now(UTC).replace(tzinfo=None)
         await db.commit()
+        await _deliver(db, item.id, T0 + timedelta(days=2))
     else:
         await campaigns.adjust_start(db, world.team, started_at=T0 - timedelta(days=1), expected_started_at=T0,
                                      actor=OPERATOR)
@@ -247,8 +259,165 @@ async def test_another_teams_delivery_of_the_same_issue_is_not_merged_here(db, w
     scope = TeamGithubScope(preset_id=world.other, repo_owner="o", repo_name="a2", repo_path="/private/b-a2")
     db.add(scope)
     await db.flush()
-    db.add(GithubWorkItem(scope_id=scope.id, issue_number=3, issue_title="Issue 3", issue_url="https://x/a2/3",
-                          github_updated_at=T0, dispatch_status="merged"))
+    other = GithubWorkItem(scope_id=scope.id, issue_number=3, issue_title="Issue 3", issue_url="https://x/a2/3",
+                           github_updated_at=T0, dispatch_status="pending")
+    db.add(other)
+    await db.commit()
+    await _deliver(db, other.id, T0 + timedelta(days=1))
+    by_name = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False))
+    assert (by_name["merged"].value, by_name["closed_without_delivery"].value) == (1, 1)
+
+
+# V1 review 6079984028
+CUTOFF = T0 + timedelta(days=5)
+
+
+@pytest.mark.parametrize("hours,deferred,in_scope", [(-1, 1, 2), (1, 0, None)], ids=["before", "after"])
+async def test_a_departure_counts_only_up_to_the_cutoff(db, world, hours, deferred, in_scope):
+    campaign = await _campaign(db, world)
+    await _stopped(db, world.items[("a1", 1)], "deferred", CUTOFF + timedelta(hours=hours), target_milestone="v4.5")
+    by_name = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=CUTOFF, cached=False))
+    assert by_name["deferred"].value == deferred
+    assert by_name["issues_in_scope"].value == in_scope  # membership after a later departure is indeterminate
+    if in_scope is None:
+        assert "departure_after_cutoff" in by_name["issues_in_scope"].unknown_reasons
+
+
+@pytest.mark.parametrize("hours,merged", [(-1, 2), (1, None)], ids=["before", "after"])
+async def test_a_delivery_counts_only_up_to_the_cutoff(db, world, hours, merged):
+    campaign = await _campaign(db, world)
+    await _deliver(db, world.items[("a2", 3)], CUTOFF + timedelta(hours=hours))
+    by_name = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=CUTOFF, cached=False))
+    assert by_name["merged"].value == merged
+    if merged is None:
+        assert "delivery_after_cutoff" in by_name["merged"].unknown_reasons
+    else:
+        assert by_name["closed_without_delivery"].value == 0
+
+
+async def test_a_membership_read_after_the_cutoff_is_unknown(db, world):
+    campaign = await _campaign(db, world)
+    snapshot = await snapshots.build_snapshot(db, campaign, _client(), as_of=CUTOFF,
+                                              observed_at=CUTOFF + timedelta(minutes=1), cached=False)
+    for name in ("issues_in_scope", "merged", "closed_without_delivery"):
+        sample = _measures(snapshot)[name]
+        assert sample.value is None and "membership_read_after_cutoff" in sample.unknown_reasons
+    assert _measures(snapshot)["deferred"].value == 0  # recorded facts stay known
+
+
+async def test_a_newly_watched_repository_misses_the_cache(db, world):
+    from app.models.database import TeamGithubScope
+
+    campaign = await _campaign(db, world)
+    first = await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF)
+    db.add(TeamGithubScope(preset_id=world.team, repo_owner="o", repo_name="a3", repo_path="/private/a3"))
+    await db.commit()
+    client = _client()
+    client.labelled["a3"] = [_issue("a3", 4)]
+    second = await snapshots.build_snapshot(db, campaign, client, as_of=AS_OF)
+    assert (_measures(first)["issues_in_scope"].value, _measures(second)["issues_in_scope"].value) == (3, 4)
+
+
+async def test_a_status_change_at_an_unchanged_timestamp_misses_the_cache(db, world):
+    campaign = await _campaign(db, world)
+    first = await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF)
+    latest = await db.scalar(select(func.max(GithubWorkItem.updated_at)))
+    await db.execute(text("UPDATE github_work_items SET dispatch_status = 'cancelled', updated_at = :at"
+                          " WHERE id = :id"), {"at": latest, "id": world.items[("a1", 1)]})
+    await db.commit()
+    second = await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF)
+    assert second is not first
+
+
+async def test_a_cache_hit_reports_rate_limit_coverage_that_became_incomplete(db, world, monkeypatch):
+    from app.services.github_rate_limit_history import GithubRateLimitHistory
+
+    campaign = await _campaign(db, world)
+    first = await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF)
+    assert (_measures(first)["rate_limited_seconds"].value, _measures(first)["rate_limited_seconds"].coverage) == (
+        0.0, "full")
+    writer = GithubRateLimitHistory(None)
+    monkeypatch.setattr(writer, "_ensure_task", lambda: None)  # the window stays awaiting persistence
+    writer.observe("core", T0 + timedelta(days=1), T0 + timedelta(days=1, hours=1))
+    _active_writers[db.bind] = writer
+    try:
+        second = await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF)
+    finally:
+        _active_writers.pop(db.bind, None)
+    rate = _measures(second)["rate_limited_seconds"]
+    assert rate.value is None and rate.coverage == "partial"
+
+
+async def test_a_repeated_finish_returns_the_first_frozen_version(db, world):
+    campaign = await _campaign(db, world)
+    first = await snapshots.freeze(db, campaign, _client(), actor=SYSTEM, as_of=AS_OF)
+    await _stopped(db, world.items[("a1", 1)], "deferred", T0 + timedelta(days=1), target_milestone="v4.5")
+    again = await snapshots.freeze(db, campaign, _client(), actor=SYSTEM, as_of=AS_OF + timedelta(minutes=5))
+    assert again == first
+    assert [row.version for row in await _versions(db, campaign.id)] == [1]
+
+
+async def _second_session(tmp_path):
+    from sqlalchemy import event as sa_event
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'campaigns.db'}")
+
+    def pragmas(connection, _record):
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=5000")
+
+    sa_event.listen(engine.sync_engine, "connect", pragmas)
+    return engine, async_sessionmaker(engine, expire_on_commit=False)
+
+
+async def test_two_simultaneous_first_finishes_both_return_version_one(db, world, tmp_path):
+    import asyncio
+
+    campaign = await _campaign(db, world)
+    engine, maker = await _second_session(tmp_path)
+
+    async def finish():
+        async with maker() as session:
+            own = await campaigns.current(session, world.team)
+            return await snapshots.freeze(session, own, _client(), actor=SYSTEM, as_of=AS_OF)
+
+    try:
+        results = await asyncio.gather(finish(), finish())
+    finally:
+        await engine.dispose()
+    assert results[0] == results[1]
+    assert [row.version for row in await _versions(db, campaign.id)] == [1]
+
+
+async def test_two_concurrent_director_recomputes_keep_every_version(db, world, tmp_path):
+    import asyncio
+
+    campaign = await _campaign(db, world)
+    await snapshots.freeze(db, campaign, _client(), actor=SYSTEM, as_of=AS_OF)
+    campaign_id = campaign.id
+    engine, maker = await _second_session(tmp_path)
+
+    async def recompute():
+        async with maker() as session:
+            own = await campaigns.current(session, world.team)
+            return await snapshots.recompute(session, own, _client(), actor=OPERATOR, as_of=AS_OF)
+
+    try:
+        await asyncio.gather(recompute(), recompute())
+    finally:
+        await engine.dispose()
+    db.expire_all()
+    assert [row.version for row in await _versions(db, campaign_id)] == [1, 2, 3]
+
+
+async def test_a_recorded_non_delivery_is_not_merged(db, world):
+    campaign = await _campaign(db, world)
+    await audit.record_delivery_fact(
+        db, item_id=world.items[("a2", 3)], delivery_outcome="closed_without_delivery", completion_kind="closed",
+        fact_source="github_issue_closed", fact_time=T0 + timedelta(days=2), artifact="issue:3",
+        attempt=f"item:{world.items[('a2', 3)]}:launch:None:revision:None")
     await db.commit()
     by_name = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False))
     assert (by_name["merged"].value, by_name["closed_without_delivery"].value) == (1, 1)
