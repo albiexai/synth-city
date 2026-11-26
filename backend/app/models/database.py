@@ -398,6 +398,7 @@ class GithubWorkItem(Base):
     handoff_target_slot_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("agent_team_slots.id", ondelete="SET NULL"), nullable=True
     )
+    handoff_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     approval_round_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     pr_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

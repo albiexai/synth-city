@@ -37,6 +37,7 @@ from app.models.database import (
 )
 from app.models.schemas import MailMessageCreate
 from app.services import decision_wait_service as decision_waits
+from app.services import github_dispatch_service as dispatch_module
 from app.services.agent_mail_service import agent_mail_service
 from app.services.github_dispatch_service import (
     AttemptState,
@@ -7585,7 +7586,7 @@ async def test_dispatch_rechecks_authority_after_workspace_preparation(db, monke
 
 
 @pytest.mark.asyncio
-async def test_handoff_cannot_reserve_another_items_owner(db, monkeypatch):
+async def test_busy_handoff_queues_without_inviting_acceptance(db, monkeypatch):
     _, slots, scope = await _team(db)
     current = GithubWorkItem(scope_id=scope.id, issue_number=9020, issue_title="Handoff", issue_url="u",
         github_updated_at=datetime.utcnow(), dispatch_status="dispatched", owner_slot_id=slots[0].id)
@@ -7594,12 +7595,227 @@ async def test_handoff_cannot_reserve_another_items_owner(db, monkeypatch):
     db.add_all([current, busy]); await db.commit()
     notice = AsyncMock()
     monkeypatch.setattr(agent_mail_service, "send_direct_message", notice)
-    with pytest.raises(ValueError, match="other work"):
-        await github_dispatch_service.initiate_handoff(db, current, scope,
-            initiating_slot_id=slots[0].id, target_slot_id=slots[1].id)
-    await db.rollback(); await db.refresh(current)
-    assert current.handoff_state is None and current.handoff_target_slot_id is None
-    assert notice.await_count == 0
+    await github_dispatch_service.initiate_handoff(db, current, scope,
+        initiating_slot_id=slots[0].id, target_slot_id=slots[1].id)
+    assert current.owner_slot_id == slots[0].id
+    assert current.handoff_state == "queued" and current.handoff_target_slot_id == slots[1].id
+    deadline = current.handoff_expires_at
+    assert deadline == current.updated_at + timedelta(minutes=30)
+    await github_dispatch_service.initiate_handoff(db, current, scope,
+        initiating_slot_id=slots[0].id, target_slot_id=slots[1].id)
+    assert current.handoff_expires_at == deadline
+    workspace = AsyncMock()
+    monkeypatch.setattr(github_workspace_service, "get_leased_workspace", workspace)
+    with pytest.raises(ValueError, match="handoff state changed"):
+        await github_dispatch_service.accept_handoff(db, current, slots[1].id,
+            accepting_pane_pid=202, accepting_pane_proc_start="2002")
+    notice.assert_not_awaited()
+    workspace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_state", ["busy", "disabled"])
+async def test_queued_handoff_waits_for_unavailable_target(db, monkeypatch, target_state):
+    _, (owner, target), scope = await _team(db)
+    now = datetime.utcnow()
+    queued = GithubWorkItem(
+        scope_id=scope.id, issue_number=9020, issue_title="Handoff", issue_url="u",
+        github_updated_at=now, dispatch_status="dispatched", owner_slot_id=owner.id,
+        handoff_state="queued", handoff_target_slot_id=target.id,
+        handoff_expires_at=now + timedelta(minutes=30),
+    )
+    db.add(queued)
+    if target_state == "busy":
+        db.add(GithubWorkItem(
+            scope_id=scope.id, issue_number=9021, issue_title="Busy", issue_url="v",
+            github_updated_at=now, dispatch_status="dispatched", owner_slot_id=target.id,
+        ))
+    else:
+        target.enabled = False
+    await db.commit()
+    notice = AsyncMock()
+    monkeypatch.setattr(agent_mail_service, "send_direct_message", notice)
+
+    await github_dispatch_service.dispatch_pending(db, scope, [owner, target])
+
+    assert queued.handoff_state == "queued"
+    assert queued.handoff_target_slot_id == target.id
+    assert queued.handoff_expires_at == now + timedelta(minutes=30)
+    notice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_oldest_queued_handoff_gets_target_across_repository_scopes(db, monkeypatch):
+    preset, (first_owner, target), first_scope = await _team(db)
+    second_scope = TeamGithubScope(preset_id=preset.id, repo_owner="o", repo_name="second", repo_path="/tmp/second")
+    second_owner = AgentTeamSlot(
+        preset_id=preset.id, position=2, display_name="Second owner", provider="codex-cli",
+        repo_id="second", repo_path="/tmp/second", repo_name="second", enabled=True,
+    )
+    db.add_all([second_scope, second_owner])
+    await db.flush()
+    now = datetime.utcnow()
+    older = GithubWorkItem(
+        scope_id=first_scope.id, issue_number=9020, issue_title="Older handoff", issue_url="u",
+        github_updated_at=now, dispatch_status="dispatched", owner_slot_id=first_owner.id,
+        handoff_state="queued", handoff_target_slot_id=target.id,
+        handoff_expires_at=now + timedelta(minutes=15),
+    )
+    newer = GithubWorkItem(
+        scope_id=second_scope.id, issue_number=9021, issue_title="Newer handoff", issue_url="v",
+        github_updated_at=now, dispatch_status="dispatched", owner_slot_id=second_owner.id,
+        handoff_state="queued", handoff_target_slot_id=target.id,
+        handoff_expires_at=now + timedelta(minutes=30),
+    )
+    db.add_all([newer, older])
+    await db.commit()
+    notice = AsyncMock()
+    monkeypatch.setattr(agent_mail_service, "send_direct_message", notice)
+    slots = [first_owner, target, second_owner]
+
+    await github_dispatch_service.dispatch_pending(db, second_scope, slots)
+    assert newer.handoff_state == older.handoff_state == "queued"
+    notice.assert_not_awaited()
+
+    await github_dispatch_service.dispatch_pending(db, first_scope, slots)
+    await github_dispatch_service.dispatch_pending(db, second_scope, slots)
+    assert older.handoff_state == "pending"
+    assert newer.handoff_state == "queued"
+    notice.assert_awaited_once()
+    assert notice.await_args.kwargs["payload"]["work_item_id"] == older.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_status", "retry_requested", "scope_enabled"),
+    [
+        pytest.param("merged", False, True, id="finished-source"),
+        pytest.param("dispatched", True, True, id="retry-requested"),
+        pytest.param("dispatched", False, False, id="disabled-scope"),
+    ],
+)
+async def test_inactive_handoff_source_releases_reservation(db, source_status, retry_requested, scope_enabled):
+    _, (owner, target), scope = await _team(db)
+    now = datetime.utcnow()
+    queued = GithubWorkItem(
+        scope_id=scope.id, issue_number=9020, issue_title="Handoff", issue_url="u",
+        github_updated_at=now, dispatch_status="dispatched", owner_slot_id=owner.id,
+        handoff_state="queued", handoff_target_slot_id=target.id,
+        handoff_expires_at=now + timedelta(minutes=30),
+    )
+    db.add(queued)
+    await db.commit()
+    assert await github_dispatch_service.slot_is_busy(db, target.id)
+
+    queued.dispatch_status = source_status
+    queued.retry_requested_at = now if retry_requested else None
+    scope.enabled = scope_enabled
+    await db.commit()
+
+    assert not await github_dispatch_service.slot_is_busy(db, target.id)
+
+
+@pytest.mark.asyncio
+async def test_expired_handoff_releases_target_before_cleanup(db, monkeypatch):
+    _, slots, scope = await _team(db)
+    target_id = slots[1].id
+    now = datetime.utcnow()
+    queued = GithubWorkItem(scope_id=scope.id, issue_number=9022, issue_title="Handoff", issue_url="u",
+        github_updated_at=now, dispatch_status="dispatched", owner_slot_id=slots[0].id,
+        handoff_state="queued", handoff_target_slot_id=target_id,
+        handoff_expires_at=now + timedelta(minutes=1))
+    db.add(queued)
+    await db.commit()
+    assert await github_dispatch_service.slot_is_busy(db, target_id)
+    queued.handoff_expires_at = now - timedelta(minutes=1)
+    await db.commit()
+    assert not await github_dispatch_service.slot_is_busy(db, target_id)
+
+    notice = AsyncMock()
+    monkeypatch.setattr(agent_mail_service, "send_direct_message", notice)
+    await github_dispatch_service.dispatch_pending(db, scope, slots)
+    assert (queued.handoff_state, queued.handoff_target_slot_id, queued.handoff_expires_at) == (None, None, None)
+    assert queued.owner_slot_id == slots[0].id
+    notice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_queued_handoff_wins_concurrent_dispatch_claim_across_scopes(tmp_path, monkeypatch):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'handoff.db'}")
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("PRAGMA journal_mode=WAL"))
+            await conn.run_sync(Base.metadata.create_all)
+        async with maker() as db:
+            preset, slots, scope = await _team(db)
+            other_scope = TeamGithubScope(preset_id=preset.id, repo_owner="o", repo_name="other",
+                repo_path="/tmp/other")
+            db.add(other_scope)
+            await db.flush()
+            target_id = slots[1].id
+            now = datetime.utcnow()
+            source = GithubWorkItem(scope_id=scope.id, issue_number=9023, issue_title="Handoff", issue_url="u",
+                github_updated_at=now, dispatch_status="dispatched", owner_slot_id=slots[0].id)
+            busy = GithubWorkItem(scope_id=other_scope.id, issue_number=9024, issue_title="Busy", issue_url="v",
+                github_updated_at=now, dispatch_status="dispatched", owner_slot_id=target_id)
+            candidate = GithubWorkItem(scope_id=other_scope.id, issue_number=9025, issue_title="New", issue_url="w",
+                github_updated_at=now)
+            db.add_all([source, busy, candidate])
+            await db.commit()
+            notice = AsyncMock()
+            monkeypatch.setattr(agent_mail_service, "send_direct_message", notice)
+            await github_dispatch_service.initiate_handoff(db, source, scope,
+                initiating_slot_id=slots[0].id, target_slot_id=target_id)
+            assert source.handoff_state == "queued"
+            notice.assert_not_awaited()
+            busy.dispatch_status = "merged"
+            await db.commit()
+            source_id, scope_id = source.id, scope.id
+            candidate_id, candidate_scope_id = candidate.id, other_scope.id
+
+        have_claim_lock, promotion_started = asyncio.Event(), asyncio.Event()
+        lock_team = dispatch_module._lock_dispatch_team
+
+        async def synchronize_claim_and_promotion(db, preset_id):
+            if db.info.get("claim"):
+                await lock_team(db, preset_id)
+                have_claim_lock.set()
+                await asyncio.wait_for(promotion_started.wait(), timeout=5)
+            else:
+                await asyncio.wait_for(have_claim_lock.wait(), timeout=5)
+                promotion_started.set()
+                await lock_team(db, preset_id)
+
+        monkeypatch.setattr(dispatch_module, "_lock_dispatch_team", synchronize_claim_and_promotion)
+
+        async def claim():
+            async with maker(info={"claim": True}) as session:
+                scope = await session.get(TeamGithubScope, candidate_scope_id)
+                candidate = await session.get(GithubWorkItem, candidate_id)
+                return await github_dispatch_service._claim_dispatch_start(
+                    session, scope, candidate, owner_slot_id=target_id, routing_method="label", require_autonomy=False,
+                )
+
+        async def promote():
+            async with maker() as session:
+                scope = await session.get(TeamGithubScope, scope_id)
+                await github_dispatch_service._advance_queued_handoffs(session, scope, require_autonomy=False)
+
+        claimed, _ = await asyncio.wait_for(asyncio.gather(claim(), promote()), timeout=10)
+        assert not claimed
+        async with maker() as db:
+            source = await db.get(GithubWorkItem, source_id)
+            candidate = await db.get(GithubWorkItem, candidate_id)
+            assert (source.handoff_state, source.handoff_target_slot_id, source.handoff_expires_at) == (
+                "pending", target_id, None,
+            )
+            assert candidate.dispatch_status == "pending"
+            assert candidate.pending_reason == "queued_slot_busy"
+        notice.assert_awaited_once()
+        assert notice.await_args.kwargs["payload"]["work_item_id"] == source_id
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
