@@ -2670,6 +2670,11 @@ async def create_github_scope(
         raise HTTPException(status_code=409, detail="GitHub scope already exists for this repo") from exc
     except ValueError as exc:
         raise _bad_request(exc) from exc
+    if scope.enabled:
+        from app.services.dispatch_workspace_provisioning import ensure_dispatch_capacity
+
+        await ensure_dispatch_capacity(db, scope.id, _reserve_scope_writer)
+        await db.refresh(scope)
     await _sync_github_jobs(db)
     return _scope_response(
         scope, await github_verification_service.auto_merges_last_24h(db, scope.id))
@@ -2783,6 +2788,7 @@ async def update_github_scope(
             # Residual workspace authority blocks effective changes. Unchanged
             # safe resumes are not affected.
             raise HTTPException(status_code=409, detail="scope_workspace_authority_in_use")
+        previously_enabled, previous_limit = scope.enabled, scope.max_concurrent_dispatched
         _apply_scope_create(scope, request)
         if scope.github_auth_mode == "app":
             if installation_id is not None:
@@ -2849,6 +2855,11 @@ async def update_github_scope(
     except Exception:
         await db.rollback()
         raise
+    if scope.enabled and (not previously_enabled or scope.max_concurrent_dispatched > previous_limit):
+        from app.services.dispatch_workspace_provisioning import ensure_dispatch_capacity
+
+        await ensure_dispatch_capacity(db, scope.id, _reserve_scope_writer)
+        await db.refresh(scope)
     await _sync_github_jobs(db)
     return _scope_response(
         scope, await github_verification_service.auto_merges_last_24h(db, scope.id))
@@ -3057,6 +3068,13 @@ async def reprobe_github_workspace(
     workspace = await db.get(GithubWorkspace, workspace_id)
     if workspace is None or workspace.scope_id != scope_id:
         raise HTTPException(status_code=404, detail="GitHub workspace not found")
+    from app.services.dispatch_workspace_provisioning import automatic_provision_is_incomplete
+
+    if automatic_provision_is_incomplete(workspace):
+        raise _conflict(
+            "Automatic workspace provisioning has not been verified",
+            block_code="workspace_provision_incomplete",
+        )
     if workspace.leased_item_id is not None:
         raise _conflict(
             "Workspace is currently leased",

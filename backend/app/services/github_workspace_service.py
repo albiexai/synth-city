@@ -1425,10 +1425,15 @@ class GithubWorkspaceService:
                     "workspace_occupied",
                 )
 
-    async def _provision_worktree(self, scope: TeamGithubScope, path: str) -> None:
-        command = [
+    async def _provision_worktree(
+        self, scope: TeamGithubScope, path: str, *, protected_source: str | None = None,
+    ) -> None:
+        options = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                   "-c", "worktree.useRelativePaths=false",
+                   "-c", "core.sharedRepository=group"] if protected_source else []
+        command = [*options,
             "-C",
-            scope.repo_path,
+            protected_source or scope.repo_path,
             "worktree",
             "add",
             "--detach",

@@ -140,6 +140,41 @@ def test_rejects_arguments_and_untrusted_paths(helper):
     assert list(home.iterdir()) == []
 
 
+@pytest.mark.parametrize("case", ["valid", "changed-inode", "non-dispatch", "different-repo"])
+def test_dispatch_git_trust_accepts_only_the_owned_exact_worktree(helper, case):
+    run, workspace, home, _ = helper
+    root = workspace.parent
+    repo = root / "repo"
+    destination = root / ("dispatch-1" if case != "non-dispatch" else "some-worktree")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+                    "commit", "-q", "--allow-empty", "-m", "fixture"], check=True)
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "--detach", str(destination)], check=True)
+    config = home / ".gitconfig"
+    original = "[user]\n\tname = existing value\n"
+    config.write_text(original, encoding="utf-8")
+    identity = destination.stat()
+    other = root / "other"
+    if case == "different-repo":
+        subprocess.run(["git", "init", "-q", str(other)], check=True)
+    payload = json.dumps({
+        "operation": "dispatch_git_trust", "folder": str(destination),
+        "repo": str(other if case == "different-repo" else repo),
+        "device": identity.st_dev, "inode": identity.st_ino + int(case == "changed-inode"),
+    }).encode()
+
+    if case != "valid":
+        assert run(payload=payload) == (1, {"ok": False, "error": "agent_config_refused"})
+        assert config.read_text(encoding="utf-8") == original
+        return
+    assert run(payload=payload) == (0, {"ok": True, "changed": True})
+    assert run(payload=payload) == (0, {"ok": True, "changed": False})
+    values = subprocess.check_output(["git", "config", "--file", str(config), "--get-all", "safe.directory"],
+                                     text=True).splitlines()
+    assert values == [str(destination)]
+    assert "existing value" in config.read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize("link_target", ["config_dir", "config_file", "backup"])
 def test_rejects_symbolic_links_in_configuration_paths(helper, link_target):
     run, _, home, _ = helper

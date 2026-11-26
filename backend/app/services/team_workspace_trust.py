@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import stat
 import subprocess
 import tempfile
@@ -192,6 +193,67 @@ def _atomic_write(
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def prepare_dispatch_git_trust(
+    folder: str, repo: str, identity: tuple[int, int], *, user: NativeUser, work_root: Path,
+) -> bool:
+    """Allowlist one verified dispatch worktree in the current user's Git config."""
+    git_env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_CONFIG_GLOBAL": "/dev/null"}
+    git = ["/usr/bin/git"]
+
+    def verify_workspace() -> None:
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != identity:
+            raise ValueError(_ERROR)
+        _workspace_under_root(directory, work_root)
+
+    def probe(path: Path) -> tuple[Path, Path, Path]:
+        result = subprocess.run([*git, "-c", f"safe.directory={path}", "-c", "core.fsmonitor=false",
+            "-C", str(path), "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--show-toplevel"],
+            env=git_env, capture_output=True, text=True, check=True, timeout=3)
+        git_dir, common_dir, top = (Path(line).resolve(strict=True) for line in result.stdout.splitlines())
+        return git_dir, common_dir, top
+
+    try:
+        directory = _workspace_under_root(Path(folder), work_root)
+        checkout = _workspace_under_root(Path(repo), work_root)
+        if (user.uid != os.geteuid() or directory.parent != checkout.parent or directory == checkout
+                or not re.fullmatch(r"dispatch-[1-9][0-9]*", directory.name)
+                or any(character in str(directory) for character in "*\r\n")):
+            raise ValueError(_ERROR)
+        verify_workspace()
+        git_dir, common_dir, top = probe(directory)
+        _, repo_common_dir, repo_top = probe(checkout)
+        if (top != directory or repo_top != checkout or common_dir != repo_common_dir
+                or git_dir.parent != common_dir / "worktrees"
+                or not all(os.access(path, os.R_OK | os.W_OK | os.X_OK)
+                           for path in (directory, git_dir, common_dir))):
+            raise ValueError(_ERROR)
+        with _WRITE_LOCK, _pinned_config(user.home / ".gitconfig", user.home, user.uid) as config:
+            before = _snapshot(config)
+            if before and before[3] != user.uid:
+                raise ValueError(_ERROR)
+            content = _read_restricted(config, before) if before else ""
+            with tempfile.TemporaryDirectory(prefix="synth-git-trust-") as temporary:
+                snapshot = Path(temporary) / "gitconfig"
+                snapshot.write_text(content, encoding="utf-8")
+                command = [*git, "config", "--file", str(snapshot)]
+                current = subprocess.run([*command, "--null", "--get-all", "safe.directory"],
+                    env=git_env, capture_output=True, text=True, timeout=3)
+                if current.returncode not in (0, 1):
+                    raise ValueError(_ERROR)
+                verify_workspace()
+                if str(directory) in current.stdout.split("\0"):
+                    return False
+                subprocess.run([*command, "--add", "safe.directory", str(directory)],
+                    env=git_env, capture_output=True, check=True, timeout=3)
+                _atomic_write(config, snapshot.read_text(encoding="utf-8"), user.uid, before,
+                              before_replace=verify_workspace)
+        return True
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise ValueError(_ERROR) from None
 
 
 def prepare_workspace_trust(

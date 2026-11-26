@@ -42,17 +42,22 @@ def no_duplicate_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return fields
 
 
-def read_request(stdin: BinaryIO) -> tuple[str, str]:
+def read_request(stdin: BinaryIO) -> dict[str, object]:
     data = stdin.read(MAX_REQUEST_BYTES + 1)
     if len(data) > MAX_REQUEST_BYTES:
         raise ValueError("Request too large")
     request = json.loads(data, object_pairs_hook=no_duplicate_fields)
-    if (not isinstance(request, dict) or request.keys() != {"operation", "provider", "folder"}
-            or request["operation"] != "folder_trust"
-            or request["provider"] not in ("codex-cli", "claude-code")
-            or not isinstance(request["folder"], str)):
+    if not isinstance(request, dict) or not isinstance(request.get("folder"), str):
         raise ValueError("Unsupported request")
-    return request["provider"], request["folder"]
+    if (request.keys() == {"operation", "provider", "folder"} and request["operation"] == "folder_trust"
+            and request["provider"] in ("codex-cli", "claude-code")):
+        return request
+    if (request.keys() == {"operation", "folder", "repo", "device", "inode"}
+            and request["operation"] == "dispatch_git_trust" and isinstance(request["repo"], str)
+            and type(request["device"]) is int and request["device"] >= 0
+            and type(request["inode"]) is int and request["inode"] > 0):
+        return request
+    raise ValueError("Unsupported request")
 
 
 def ensure_claude_idle() -> None:
@@ -86,16 +91,22 @@ def main(argv: list[str], stdin: BinaryIO) -> int:
     try:
         if argv:
             raise ValueError("This command takes no arguments")
-        provider, folder = read_request(stdin)
+        request = read_request(stdin)
         home = agent_home()
-        guard = ensure_claude_idle if provider == "claude-code" else None
-        if guard is not None:
-            guard()
+        user_uid = os.getuid()
         writer = load_writer()
-        changed = writer.prepare_workspace_trust(
-            provider, folder, user=writer.NativeUser(home, os.getuid(), {}),
-            work_root=WORK_ROOT, before_write=guard,
-        )
+        user = writer.NativeUser(home, user_uid, {})
+        if request["operation"] == "folder_trust":
+            provider = request["provider"]
+            guard = ensure_claude_idle if provider == "claude-code" else None
+            if guard is not None:
+                guard()
+            changed = writer.prepare_workspace_trust(
+                provider, request["folder"], user=user, work_root=WORK_ROOT, before_write=guard)
+        else:
+            changed = writer.prepare_dispatch_git_trust(
+                request["folder"], request["repo"], (request["device"], request["inode"]),
+                user=user, work_root=WORK_ROOT)
     except ConfigBusy:
         print(json.dumps({"ok": False, "error": "agent_config_busy"}))
         return 75
