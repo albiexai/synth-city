@@ -412,6 +412,7 @@ class GithubWatcherService:
             return
         routes = await milestone_routes(db, scope)
         milestone = routes.get(scope.preset_id)
+        admission_candidates = set()
         admitted = set()
         departures = dict((await db.execute(select(
             GithubWorkItem.issue_number, GithubWorkItem.github_updated_at,
@@ -439,6 +440,7 @@ class GithubWatcherService:
                         or _parse_gh_ts(current["updated_at"]) < departure
                         or scope.dispatch_label not in {label["name"] for label in current.get("labels", [])}):
                     continue
+            admission_candidates.add(number)
             if await self._upsert_item(db, scope, issue):
                 admitted.add(number)
         await _reconcile_milestone_waits(db, scope, routes, wait_observations, confirmed_wait_issues, admitted)
@@ -447,7 +449,7 @@ class GithubWatcherService:
         # below is never written over upserts that were thrown away.
         await db.commit()
         # #941: a labeled issue still without a work item after its commit, poll after poll, is a finding.
-        await operations_health_service.record_admissions(scope_id, admitted)
+        await operations_health_service.record_admissions(scope_id, admission_candidates)
         await self._recheck_active_items(db, scope, client, milestone=milestone)
         await self._reconcile_closed_issues(
             db,
