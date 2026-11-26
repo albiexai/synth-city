@@ -21,7 +21,8 @@ def report(
 ) -> dict:
     suites = []
     for file, groups, title, projects in entries:
-        spec = {"file": file, "title": title, "tests": [{"projectId": project} for project in projects]}
+        spec = {"id": f"{file}:{title}", "file": file, "title": title,
+                "tests": [{"projectId": project} for project in projects]}
         if executions is not None:
             for project in spec["tests"]:
                 project.update({
@@ -44,22 +45,27 @@ D = ("e2e/a.spec.ts", ("Outer › Inner",), "opens @active", ("browser-a",))
 FLAKY = ("e2e/known.spec.ts", (), "known journey @active", ("browser-a",))
 SIGNATURE = "TimeoutError: operation did not respond"
 REGISTRATION = {"test_id": FLAKY[2], "failure_signature": SIGNATURE, "issue": 1304, "expires_on": "9999-12-31"}
+STACK = "Error: fixture\n    at run (example.spec.ts:8:10)"
 
 
 def failing_report(message=SIGNATURE, *, outcome="failed", entry=FLAKY, extra_errors=False, worker=0,
-                   body_step="failed", step_message=None):
+                   body_step="failed", step_message=None, stack=STACK, step_stack=STACK):
     data = report(entry, executions=(outcome,))
     test = data["suites"][0]["specs"][0]["tests"][0]
     test["status"] = "unexpected"
-    error = {"message": message}
+    error = {"message": message, "stack": stack}
     result = test["results"][0]
     result.update(error=error, errors=[error, error] if extra_errors else [error], workerIndex=worker)
     if body_step is not None:
         step = {"title": "journey action"}
         if body_step == "failed":
-            step["error"] = {"message": message if step_message is None else step_message}
+            step["error"] = {"message": message if step_message is None else step_message, "stack": step_stack}
         result["steps"] = [step]
     return data
+
+
+def phase_record(entry=FLAKY):
+    return {"id": f"{entry[0]}:{entry[2]}", "title": entry[2], "worker": 0, "retry": 0}
 
 
 @pytest.fixture
@@ -159,7 +165,7 @@ def test_cli_rejects_unproved_partitions(collect, full, first, second, messages)
     assert output.read_text(encoding="utf-8") == "previous manifest\n"
 
 
-def artifact(root: Path, shard: int, attempt: int, result, *, exit_status="0") -> None:
+def artifact(root: Path, shard: int, attempt: int, result, *, exit_status="0", phases=()) -> None:
     folder = root / f"e2e-journeys-{shard}-attempt-{attempt}"
     folder.mkdir(parents=True)
     if result is not None:
@@ -167,6 +173,8 @@ def artifact(root: Path, shard: int, attempt: int, result, *, exit_status="0") -
         (folder / "results.json").write_text(payload, encoding="utf-8")
     if exit_status is not None:
         (folder / "playwright-exit.txt").write_text(f"{exit_status}\n", encoding="utf-8")
+    if phases is not None:
+        (folder / "journey-phases.json").write_text(json.dumps({"version": 1, "failures": list(phases)}), encoding="utf-8")
 
 
 @pytest.mark.parametrize(("result", "exit_status", "registration", "expected"), [
@@ -177,6 +185,8 @@ def artifact(root: Path, shard: int, attempt: int, result, *, exit_status="0") -
     (failing_report(body_step="passed"), "1", REGISTRATION, 1),
     (failing_report(step_message="TimeoutError: different"), "1",
      REGISTRATION | {"failure_signature": "TimeoutError: .*"}, 1),
+    (failing_report(step_stack="Error: fixture\n    at afterEach (example.spec.ts:12:5)"), "1", REGISTRATION, 1),
+    (failing_report(stack="", step_stack=""), "1", REGISTRATION, 1),
     (failing_report(outcome="timedOut", body_step="passed"), "1", REGISTRATION, 1),
     (failing_report(outcome="timedOut"), "1", REGISTRATION, 1),
     (failing_report(), "1", REGISTRATION | {"test_id": "different journey @active"}, 1),
@@ -192,7 +202,7 @@ def artifact(root: Path, shard: int, attempt: int, result, *, exit_status="0") -
 def test_registry_tolerates_only_a_proven_matching_failure(collect, tmp_path, result, exit_status, registration, expected):
     run, _, _ = collect
     artifacts = tmp_path / "artifacts"
-    artifact(artifacts, 1, 1, result, exit_status=exit_status)
+    artifact(artifacts, 1, 1, result, exit_status=exit_status, phases=[phase_record()])
     artifact(artifacts, 2, 1, report(B, executions=("passed",)))
     checked = run(report(FLAKY, B), report(FLAKY), report(B), artifacts=artifacts, registry=[registration])
     assert checked.returncode == expected, checked.stderr
@@ -200,11 +210,24 @@ def test_registry_tolerates_only_a_proven_matching_failure(collect, tmp_path, re
         assert "registered failures: 1" in checked.stdout
 
 
+@pytest.mark.parametrize("phases", [
+    None, [], [phase_record() | {"id": "different"}], [phase_record() | {"worker": 1}],
+    [phase_record() | {"retry": 1}], [phase_record(), phase_record()],
+])
+def test_matching_error_text_and_stack_require_exact_phase_evidence(collect, tmp_path, phases):
+    run, _, _ = collect
+    artifacts = tmp_path / "artifacts"
+    artifact(artifacts, 1, 1, failing_report(), exit_status="1", phases=phases)
+    artifact(artifacts, 2, 1, report(B, executions=("passed",)))
+    checked = run(report(FLAKY, B), report(FLAKY), report(B), artifacts=artifacts, registry=[REGISTRATION])
+    assert checked.returncode == 1
+
+
 def test_a_registry_title_cannot_match_two_active_journeys(collect, tmp_path):
     run, _, _ = collect
     duplicate_title = ("e2e/other.spec.ts", (), FLAKY[2], ("browser-a",))
     artifacts = tmp_path / "artifacts"
-    artifact(artifacts, 1, 1, failing_report(), exit_status="1")
+    artifact(artifacts, 1, 1, failing_report(), exit_status="1", phases=[phase_record()])
     artifact(artifacts, 2, 1, report(duplicate_title, executions=("passed",)))
     checked = run(report(FLAKY, duplicate_title), report(FLAKY), report(duplicate_title),
                   artifacts=artifacts, registry=[REGISTRATION])
@@ -274,6 +297,7 @@ def test_workflow_uses_the_same_shard_count_and_attempt_artifacts():
     run = next(step["run"] for step in shards["steps"] if step.get("name") == "Run the active journeys for this shard")
     assert "--shard=${{ matrix.shard }}/${{ strategy.job-total }}" in run
     assert "--registry ../.workflow-ci/.github/known-flakes.json" in run
+    assert 'list,html,json,$GITHUB_WORKSPACE/.workflow-ci/scripts/ci/playwright_journey_phase.cjs' in run
     tooling = next(step for step in shards["steps"] if step.get("name") == "Check out the workflow's gate tooling")
     assert tooling["with"]["ref"] == "${{ github.workflow_sha }}"
     assert tooling["with"]["persist-credentials"] is False
@@ -281,6 +305,7 @@ def test_workflow_uses_the_same_shard_count_and_attempt_artifacts():
     assert upload["with"]["name"] == "e2e-journeys-${{ matrix.shard }}-attempt-${{ github.run_attempt }}"
     assert upload["with"]["if-no-files-found"] == "error"
     assert "always()" in upload["if"] and "frontend/test-results/playwright-exit.txt" in upload["with"]["path"]
+    assert "frontend/test-results/journey-phases.json" in upload["with"]["path"]
     download = next(step for step in gate["steps"] if step.get("uses", "").startswith("actions/download-artifact@"))
     assert download["with"]["pattern"] == "e2e-journeys-*-attempt-*"
     assert download["with"]["merge-multiple"] is False
@@ -312,13 +337,21 @@ def producer_workflow(collect, tmp_path):
                if step.get("name") == "Run the active journeys for this shard")
     run = run.replace("${{ matrix.shard }}", "1").replace("${{ strategy.job-total }}", "2")
 
-    def produce(data, status):
+    def produce(data, status, *, phases=None):
         fixture = tmp_path / "producer-report.json"
         fixture.write_text(json.dumps(data), encoding="utf-8")
-        stub = 'npm() { mkdir -p test-results; cp "$TEST_PLAYWRIGHT_REPORT" test-results/results.json; return "$TEST_PLAYWRIGHT_EXIT"; }\n'
+        fixture_phases = tmp_path / "producer-phases.json"
+        if phases is None:
+            phases = [phase_record()] if status == 1 else []
+        fixture_phases.write_text(json.dumps({"version": 1, "failures": phases}), encoding="utf-8")
+        stub = (
+            'npm() { mkdir -p test-results; cp "$TEST_PLAYWRIGHT_REPORT" test-results/results.json; '
+            'cp "$TEST_PLAYWRIGHT_PHASES" test-results/journey-phases.json; return "$TEST_PLAYWRIGHT_EXIT"; }\n'
+        )
         result = subprocess.run(
             ["bash", "-e", "-c", stub + run], cwd=root,
-            env={**os.environ, "TEST_PLAYWRIGHT_REPORT": str(fixture), "TEST_PLAYWRIGHT_EXIT": str(status)},
+            env={**os.environ, "TEST_PLAYWRIGHT_REPORT": str(fixture), "TEST_PLAYWRIGHT_PHASES": str(fixture_phases),
+                 "TEST_PLAYWRIGHT_EXIT": str(status)},
             capture_output=True, text=True, check=False,
         )
         recorded = (root / "test-results/playwright-exit.txt").read_text(encoding="utf-8").strip()
@@ -342,6 +375,43 @@ def test_producer_job_stays_red_for_untolerated_failures(producer_workflow, data
     assert result.returncode == expected, result.stderr
 
 
+def test_producer_rejects_same_error_without_body_phase_evidence(producer_workflow):
+    result, recorded = producer_workflow(failing_report(), 1, phases=[])
+    assert recorded == "1"
+    assert result.returncode == 1 and "registered failure" in result.stderr
+
+
+def test_phase_reporter_records_only_confirmed_body_failures(tmp_path):
+    reporter = ROOT / "scripts/ci/playwright_journey_phase.cjs"
+    output = tmp_path / "journey-phases.json"
+    program = """
+const Reporter = require(process.argv[1])
+const reporter = new Reporter()
+const step = (category, title, options = {}) => ({category, title, duration: 2, steps: [], ...options})
+const before = step('hook', 'Before Hooks')
+const after = step('hook', 'After Hooks')
+const error = {message: 'same failure'}
+const body = step('test.step', 'read', {error})
+const records = [
+  ['body', [before, body, after]],
+  ['cleanup', [before, body, {...after, error}]],
+  ['fixture', [before, body, {...after, steps: [step('fixture', 'teardown', {error})]}]],
+  ['unfinished', [before, body, {...after, duration: -1}]],
+  ['out of order', [before, after, body]],
+  ['no boundary', [body, after]],
+]
+for (const [id, steps] of records) {
+  reporter.onTestEnd({id, title: id}, {status: 'failed', steps, retry: 0, workerIndex: 1})
+}
+reporter.onEnd()
+"""
+    subprocess.run(["node", "-e", program, str(reporter)], check=True,
+                   env={**os.environ, "E2E_JOURNEY_PHASES": str(output)}, timeout=30)
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "version": 1, "failures": [{"id": "body", "title": "body", "retry": 0, "worker": 1}],
+    }
+
+
 def test_a_registered_failure_cannot_cover_incomplete_shard_execution(producer_workflow, tmp_path):
     (tmp_path / "reports.json").write_text(json.dumps({
         "full": report(FLAKY, A, B), "1/2": report(FLAKY, A), "2/2": report(B),
@@ -360,7 +430,7 @@ def test_failed_jobs_rerun_can_replace_an_untolerated_shard(collect, producer_wo
     for attempt, (data, status, expected) in enumerate(attempts, start=1):
         producer, recorded = producer_workflow(data, status)
         assert producer.returncode == expected, producer.stderr
-        artifact(artifacts, 1, attempt, data, exit_status=recorded)
+        artifact(artifacts, 1, attempt, data, exit_status=recorded, phases=[phase_record()] if status else [])
         gate = run(report(FLAKY, B), report(FLAKY), report(B), artifacts=artifacts, registry=[REGISTRATION])
         assert gate.returncode == expected, gate.stderr
         if expected == 0:

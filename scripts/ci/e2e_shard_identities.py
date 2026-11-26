@@ -42,7 +42,7 @@ def field(value: object, key: str, kind: type[Field], *, default: Field | None =
     return item
 
 
-def suite_tests(suite: object, titles: tuple[str, ...] = ()) -> Iterator[tuple[Identity, dict]]:
+def suite_tests(suite: object, titles: tuple[str, ...] = ()) -> Iterator[tuple[Identity, dict, str]]:
     for spec in field(suite, "specs", list):
         file = field(spec, "file", str)
         title = field(spec, "title", str)
@@ -51,12 +51,12 @@ def suite_tests(suite: object, titles: tuple[str, ...] = ()) -> Iterator[tuple[I
             raise ValueError("an entry has no file or project tests")
         for test in tests:
             # The reporter can group the same spec from multiple projects into one entry.
-            yield (field(test, "projectId", str), file, *titles, title), test
+            yield (field(test, "projectId", str), file, *titles, title), test, field(spec, "id", str, default="")
     for child in field(suite, "suites", list, default=[]):
         yield from suite_tests(child, (*titles, field(child, "title", str)))
 
 
-def read_report(path: Path, label: str, *, listing: bool = False) -> list[tuple[Identity, dict]]:
+def read_report(path: Path, label: str, *, listing: bool = False) -> list[tuple[Identity, dict, str]]:
     try:
         report = json.loads(path.read_text(encoding="utf-8"))
         errors = field(report, "errors", list)
@@ -81,7 +81,7 @@ def collect(label: str, directory: Path, frontend: Path, shard: str | None = Non
     )
     if result.returncode:
         raise ValueError(f"{label}: Playwright exited with status {result.returncode}")
-    journeys = [identity for identity, _ in read_report(report_path, label, listing=True)]
+    journeys = [identity for identity, _, _ in read_report(report_path, label, listing=True)]
     if not journeys:
         raise ValueError(f"{label} collection is empty")
     return sorted(journeys)
@@ -134,6 +134,28 @@ def error_signature(error: object) -> str:
     return TERMINAL_COLOR.sub("", message).strip() if isinstance(message, str) else ""
 
 
+def read_journey_phases(report: Path, label: str) -> set[tuple[str, str, int, int]]:
+    try:
+        phases = json.loads(report.with_name("journey-phases.json").read_text(encoding="utf-8"))
+        version = field(phases, "version", int)
+        if type(version) is not int or version != 1:
+            raise ValueError("unsupported phase report version")
+        failures = set()
+        for item in field(phases, "failures", list):
+            test_id, title = field(item, "id", str), field(item, "title", str)
+            worker, retry = field(item, "worker", int), field(item, "retry", int)
+            if (set(item) != {"id", "title", "worker", "retry"} or not test_id or not title
+                    or type(worker) is not int or type(retry) is not int or min(worker, retry) < 0):
+                raise ValueError("invalid phase record")
+            key = (test_id, title, worker, retry)
+            if key in failures:
+                raise ValueError("duplicate phase record")
+            failures.add(key)
+        return failures
+    except (OSError, ValueError, RecursionError) as exc:
+        raise ValueError(f"{label}: missing or invalid journey phase evidence") from exc
+
+
 def matching_failure(result: dict, pattern: re.Pattern | None) -> bool:
     if pattern is None or result.get("status") != "failed":
         return False
@@ -148,15 +170,21 @@ def matching_failure(result: dict, pattern: re.Pattern | None) -> bool:
         return False
     # The JSON reporter only includes top-level test.step calls. A hook's steps are nested under the hook.
     step_errors = [step["error"] for step in steps if step.get("error") is not None]
-    signature = error_signature(result.get("error"))
-    return (len(step_errors) == 1 and bool(signature) and error_signature(step_errors[0]) == signature
+    if len(step_errors) != 1 or not isinstance(step_errors[0], dict):
+        return False
+    error = result.get("error")
+    signature = error_signature(error)
+    stack = error.get("stack") if isinstance(error, dict) else None
+    return (bool(signature) and error_signature(step_errors[0]) == signature
+            and isinstance(stack, str) and bool(stack.strip()) and step_errors[0].get("stack") == stack
             and pattern.fullmatch(signature) is not None)
 
 
 def verified_report(report: Path, label: str, patterns: dict[str, re.Pattern] | None) -> list[Identity]:
     identities = []
     tolerated = 0
-    for identity, test in read_report(report, label):
+    phases = read_journey_phases(report, label) if patterns is not None else set()
+    for identity, test, test_id in read_report(report, label):
         invalid = f"{label}: expected one passing execution or registered failure for {identity!r}"
         results = test.get("results")
         if (test.get("expectedStatus") != "passed" or not isinstance(results, list)
@@ -166,16 +194,20 @@ def verified_report(report: Path, label: str, patterns: dict[str, re.Pattern] | 
         retry, worker = result.get("retry"), result.get("workerIndex")
         if type(retry) is not int or retry != 0 or (patterns is not None and (type(worker) is not int or worker < 0)):
             raise ValueError(invalid)
+        phase_key = (test_id, identity[-1], worker, retry)
         if test.get("status") == "expected" and result.get("status") == "passed":
             if result.get("error") is not None or result.get("errors", []) != []:
                 raise ValueError(invalid)
-        elif (patterns is not None and test.get("status") == "unexpected"
+        elif (patterns is not None and test.get("status") == "unexpected" and phase_key in phases
               and matching_failure(result, patterns.get(identity[-1]))):
             tolerated += 1
+            phases.remove(phase_key)
         else:
             raise ValueError(invalid)
         identities.append(identity)
     if patterns is not None:
+        if phases:
+            raise ValueError(f"{label}: journey phase evidence disagrees with the recorded outcomes")
         try:
             exit_status = report.with_name("playwright-exit.txt").read_text(encoding="utf-8").strip()
         except OSError as exc:
