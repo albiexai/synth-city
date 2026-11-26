@@ -109,6 +109,17 @@ def test_rejects_requests_outside_the_typed_allowlist(helper, case):
     assert list(home.iterdir()) == []
 
 
+@pytest.mark.parametrize(("field", "value"), [("device", False), ("inode", 0), ("extra", "unexpected")])
+def test_dispatch_git_trust_parser_rejects_invalid_fields(field, value):
+    read_request = runpy.run_path(str(SCRIPT))["read_request"]
+    payload = {"operation": "dispatch_git_trust", "folder": "/fixture/dispatch-1", "repo": "/fixture/repo",
+               "device": 0, "inode": 2}
+    payload[field] = value
+
+    with pytest.raises(ValueError):
+        read_request(io.BytesIO(json.dumps(payload).encode()))
+
+
 def test_refuses_a_home_owned_by_another_user(helper, monkeypatch):
     run, _, home, _ = helper
     binding = home.stat()
@@ -137,6 +148,84 @@ def test_rejects_arguments_and_untrusted_paths(helper):
         run(argv=["--anything"]), run(folder=outside), run(folder=link), run(folder=nested / ".."),
     ]:
         assert (status, body) == (1, {"ok": False, "error": "agent_config_refused"})
+    assert list(home.iterdir()) == []
+
+
+@pytest.mark.parametrize("case", ["valid", "changed-inode", "non-dispatch", "different-repo", "changed-after-probe"])
+def test_dispatch_git_trust_accepts_only_the_owned_exact_worktree(helper, monkeypatch, case):
+    run, workspace, home, _ = helper
+    root = workspace.parent
+    repo = root / "repo"
+    destination = root / ("dispatch-1" if case != "non-dispatch" else "some-worktree")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+                    "commit", "-q", "--allow-empty", "-m", "fixture"], check=True)
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "--detach", str(destination)], check=True)
+    config = home / ".gitconfig"
+    original = "[user]\n\tname = existing value\n"
+    if case == "changed-after-probe":
+        # Exercise the idempotent path. It never reaches the pre-replace check.
+        original += f'[safe]\n\tdirectory = "{destination}"\n'
+        lstat = Path.lstat
+        read_config = trust._read_restricted
+        stale = False
+
+        def read_after_probe(*args):
+            nonlocal stale
+            content = read_config(*args)
+            stale = True
+            return content
+
+        def observed_lstat(path):
+            info = lstat(path)
+            if stale and path == destination:
+                return SimpleNamespace(st_mode=info.st_mode, st_dev=info.st_dev, st_ino=info.st_ino + 1)
+            return info
+
+        monkeypatch.setattr(trust, "_read_restricted", read_after_probe)
+        monkeypatch.setattr(Path, "lstat", observed_lstat)
+    config.write_text(original, encoding="utf-8")
+    identity = destination.stat()
+    other = root / "other"
+    if case == "different-repo":
+        subprocess.run(["git", "init", "-q", str(other)], check=True)
+    payload = json.dumps({
+        "operation": "dispatch_git_trust", "folder": str(destination),
+        "repo": str(other if case == "different-repo" else repo),
+        "device": identity.st_dev, "inode": identity.st_ino + int(case == "changed-inode"),
+    }).encode()
+
+    if case != "valid":
+        assert run(payload=payload) == (1, {"ok": False, "error": "agent_config_refused"})
+        assert config.read_text(encoding="utf-8") == original
+        return
+    assert run(payload=payload) == (0, {"ok": True, "changed": True})
+    assert run(payload=payload) == (0, {"ok": True, "changed": False})
+    values = subprocess.check_output(["git", "config", "--file", str(config), "--get-all", "safe.directory"],
+                                     text=True).splitlines()
+    assert values == [str(destination)]
+    assert "existing value" in config.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("parent_name", ["other-parent", "literal*", "literal\r", "literal\n"])
+def test_dispatch_git_trust_checks_sibling_and_literal_path_before_probing(helper, monkeypatch, parent_name):
+    run, workspace, home, _ = helper
+    parent = workspace.parent / parent_name
+    destination = parent / "dispatch-1"
+    repo_parent = workspace.parent if parent_name == "other-parent" else parent
+    repo = repo_parent / "repo"
+    destination.mkdir(parents=True)
+    repo.mkdir()
+    identity = destination.stat()
+
+    def unexpected_probe(*_args, **_kwargs):
+        pytest.fail("A non-sibling or non-literal path reached the Git trust probe")
+
+    monkeypatch.setattr(trust.subprocess, "run", unexpected_probe)
+    payload = json.dumps({"operation": "dispatch_git_trust", "folder": str(destination), "repo": str(repo),
+                          "device": identity.st_dev, "inode": identity.st_ino}).encode()
+
+    assert run(payload=payload) == (1, {"ok": False, "error": "agent_config_refused"})
     assert list(home.iterdir()) == []
 
 

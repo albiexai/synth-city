@@ -43,10 +43,18 @@ def resolve_claude_checkout(folder: str) -> str:
 def prepare_workspace_trust_via_helper(provider: str, folder: str) -> bool:
     if provider not in _PROVIDERS:
         raise AgentConfigError
-    request = json.dumps({"operation": "folder_trust", "provider": provider, "folder": folder})
+    return _run_agent_config({"operation": "folder_trust", "provider": provider, "folder": folder})
+
+
+def prepare_dispatch_git_trust_via_helper(folder: str, repo: str, identity: tuple[int, int]) -> bool:
+    return _run_agent_config({"operation": "dispatch_git_trust", "folder": folder, "repo": repo,
+                              "device": identity[0], "inode": identity[1]})
+
+
+def _run_agent_config(request: dict[str, str | int]) -> bool:
     try:
         result = subprocess.run(
-            _COMMAND, input=request, capture_output=True, encoding="utf-8", check=False,
+            _COMMAND, input=json.dumps(request), capture_output=True, encoding="utf-8", check=False,
             cwd="/", env={"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8"}, timeout=6,
         )
         lines = result.stdout.splitlines()
