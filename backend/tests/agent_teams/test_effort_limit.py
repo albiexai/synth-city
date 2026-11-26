@@ -132,14 +132,23 @@ def test_a_missing_estimate_records_no_limit(metadata):
 
 
 @pytest.mark.asyncio
-async def test_an_estimate_above_the_ceiling_stores_nothing_and_creates_no_request(fx):
+@pytest.mark.parametrize(
+    ("estimate", "code"),
+    [(500, "effort_estimate_exceeds_ceiling"), (60.5, "plan_estimate_exceeds_limit")],
+)
+async def test_an_estimate_above_the_limit_stores_nothing_and_creates_no_request(fx, estimate, code):
     async with fx.maker() as db:
         item = await _item(fx, db)
         with pytest.raises(GithubApprovalError) as caught:
             await github_approval_service.create_initial_request(
                 db, item, authenticated_owner_member_id=fx.owner, summary="plan",
-                plan_metadata={"estimate_active_minutes": 500})
-        assert caught.value.detail == "effort_estimate_exceeds_ceiling" and caught.value.status_code == 400
+                plan_metadata={"estimate_active_minutes": estimate})
+        assert caught.value.status_code == 400
+        if code == "plan_estimate_exceeds_limit":
+            assert caught.value.detail["code"] == code
+            assert "Split the issue" in caught.value.detail["message"]
+        else:
+            assert caught.value.detail == code
     async with fx.maker() as db:
         item = await _item(fx, db)
         assert item.effort_limit_minutes is None and item.effort_estimate_minutes is None
@@ -150,12 +159,35 @@ async def test_an_estimate_above_the_ceiling_stores_nothing_and_creates_no_reque
 async def test_a_valid_estimate_is_stored_with_the_request_and_a_later_plan_replaces_it(fx):
     async with fx.maker() as db:
         item = await _item(fx, db)
+        scope = await db.get(TeamGithubScope, item.scope_id)
+        scope.max_plan_estimate_minutes = 90
+        await db.commit()
         await github_approval_service.create_initial_request(
             db, item, authenticated_owner_member_id=fx.owner, summary="plan",
             plan_metadata={"estimate_active_minutes": {"low": 30, "high": 90}})
     async with fx.maker() as db:
         item = await _item(fx, db)
         assert (item.effort_estimate_minutes, item.effort_limit_minutes) == (90, 90)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["pending", "approved"])
+async def test_a_recorded_plan_replays_after_the_scope_lowers_its_limit(fx, status):
+    async with fx.maker() as db:
+        item = await _item(fx, db)
+        request = dict(authenticated_owner_member_id=fx.owner, summary="plan",
+                       plan_metadata={"estimate_active_minutes": {"low": 30, "high": 60}})
+        approval, created = await github_approval_service.create_initial_request(db, item, **request)
+        assert created
+        approval.status = status
+        scope = await db.get(TeamGithubScope, item.scope_id)
+        scope.max_plan_estimate_minutes = 45
+        await db.commit()
+
+        replay, created = await github_approval_service.create_initial_request(db, item, **request)
+        assert (replay.id, replay.status, created) == (approval.id, status, False)
+        await db.refresh(item)
+        assert item.effort_limit_minutes == 60
 
 
 @pytest.mark.asyncio
@@ -578,7 +610,7 @@ def test_the_idle_monitor_and_the_proposal_expiry_are_unchanged():
 
 
 @pytest.mark.asyncio
-async def test_an_old_database_without_the_columns_is_migrated(tmp_path):
+async def test_an_old_database_without_the_effort_and_plan_columns_is_migrated(tmp_path):
     from sqlalchemy import text
 
     from app.database import _run_sqlite_compat_migrations, _sqlite_columns
@@ -587,6 +619,7 @@ async def test_an_old_database_without_the_columns_is_migrated(tmp_path):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.execute(text("ALTER TABLE team_github_scopes DROP COLUMN max_item_effort_minutes"))
+        await conn.execute(text("ALTER TABLE team_github_scopes DROP COLUMN max_plan_estimate_minutes"))
         for column in ("effort_estimate_minutes", "effort_limit_minutes", "effort_elapsed_seconds",
                        "effort_last_tick_at", "effort_extension_minutes", "effort_extension_decided_at",
                        "effort_extension_reason"):
@@ -597,7 +630,7 @@ async def test_an_old_database_without_the_columns_is_migrated(tmp_path):
         scope_columns = await _sqlite_columns(conn, "team_github_scopes")
         item_columns = await _sqlite_columns(conn, "github_work_items")
     await engine.dispose()
-    assert "max_item_effort_minutes" in scope_columns
+    assert {"max_item_effort_minutes", "max_plan_estimate_minutes"} <= scope_columns
     assert {"effort_estimate_minutes", "effort_limit_minutes", "effort_elapsed_seconds", "effort_last_tick_at",
             "effort_extension_minutes", "effort_extension_decided_at", "effort_extension_reason"} <= set(item_columns)
 

@@ -610,6 +610,49 @@ async def test_an_initial_plan_summary_over_the_submit_limit_is_a_problem(client
     assert (await client.post(URL, headers=headers, json={**request, "summary": "x" * 12000})).json()["passed"] is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("upper", "code"), [
+    (45, None), (45.5, "plan_estimate_exceeds_limit"), (121, "effort_estimate_exceeds_ceiling"),
+])
+async def test_initial_plan_estimate_limit_matches_submission(client, db, upper, code):
+    item, _members, tokens = await _dispatch_approval_fixture(db)
+    scope = await db.get(TeamGithubScope, item.scope_id)
+    scope.max_plan_estimate_minutes = 45
+    await db.commit()
+    headers = {"X-Synth-City-Session-Token": tokens[1]}
+    payload = {
+        "work_item_id": item.id, "dispatch_nonce": item.dispatch_nonce, "summary": "Plan",
+        "plan_metadata": {"allowed_paths": ["src/a.py"], "estimate_active_minutes": {"low": 15, "high": upper}},
+    }
+    approvals = select(func.count()).select_from(GithubApprovalRequest)
+    messages = select(func.count()).select_from(MailMessage)
+    before = (await db.scalar(approvals), await db.scalar(messages))
+    check = (await client.post(URL, headers=headers, json={
+        **payload, "kind": "initial_plan", "estimate_active_minutes": 20,
+    })).json()
+    assert check["passed"] == (code is None)
+    assert (await db.scalar(approvals), await db.scalar(messages)) == before
+
+    result = await client.post("/api/v1/agent-mail/approval-requests", headers=headers, json=payload)
+    if code is None:
+        assert result.status_code == 200
+        await db.refresh(item)
+        assert item.effort_limit_minutes == 45
+    else:
+        problem, = check["problems"]
+        assert (problem["code"], problem["field"]) == (code, "plan_metadata.estimate_active_minutes")
+        assert result.status_code == 400
+        detail = result.json()["detail"]
+        if code == "plan_estimate_exceeds_limit":
+            assert detail == {"code": code, "message": problem["message"]}
+            assert "Split the issue" in detail["message"] and "45" in detail["message"]
+        else:
+            assert detail == code
+        assert (await db.scalar(approvals), await db.scalar(messages)) == before
+        await db.refresh(item)
+        assert item.effort_limit_minutes is None
+
+
 COMPANION = lambda paths, mapping=None: ["docs/guide.md"]  # noqa: E731
 
 

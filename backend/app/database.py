@@ -921,6 +921,8 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         await conn.execute(
             text("ALTER TABLE team_github_scopes ADD COLUMN max_item_effort_minutes INTEGER DEFAULT 120 NOT NULL")
         )
+    if scope_columns and "max_plan_estimate_minutes" not in scope_columns:
+        await conn.execute(text("ALTER TABLE team_github_scopes ADD COLUMN max_plan_estimate_minutes INTEGER"))
     if scope_columns and "base_ref" not in scope_columns:
         await conn.execute(
             text("ALTER TABLE team_github_scopes ADD COLUMN base_ref VARCHAR DEFAULT 'origin/HEAD' NOT NULL")

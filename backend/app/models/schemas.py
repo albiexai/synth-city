@@ -2793,6 +2793,7 @@ class GithubAttemptDeliveryPolicyUpdate(BaseModel):
 _PositiveScopeCount = Annotated[int, Field(ge=1)]
 _NonnegativeScopeCount = Annotated[int, Field(ge=0)]
 _ScopeEffortMinutes = Annotated[int, Field(ge=15, le=1440)]
+DEFAULT_PLAN_ESTIMATE_MINUTES = 60
 
 
 class TeamGithubScopeCreate(BaseModel):
@@ -2808,6 +2809,10 @@ class TeamGithubScopeCreate(BaseModel):
     max_verification_retries: _NonnegativeScopeCount = 2
     max_auto_merges_per_day: _NonnegativeScopeCount = 5
     max_item_effort_minutes: _ScopeEffortMinutes = 120
+    max_plan_estimate_minutes: _ScopeEffortMinutes = Field(
+        DEFAULT_PLAN_ESTIMATE_MINUTES,
+        description="The initial plan limit. The default is capped by the item effort ceiling.",
+    )
     base_ref: str = "origin/HEAD"
     github_auth_mode: Literal["unknown", "ambient", "app"] = "unknown"
     builds_out_of_tree: bool = False
@@ -2830,6 +2835,7 @@ class TeamGithubScopeUpdate(BaseModel):
     max_verification_retries: _NonnegativeScopeCount | None = None
     max_auto_merges_per_day: _NonnegativeScopeCount | None = None
     max_item_effort_minutes: _ScopeEffortMinutes | None = None
+    max_plan_estimate_minutes: _ScopeEffortMinutes | None = None
     base_ref: Optional[str] = None
     github_auth_mode: Optional[Literal["unknown", "ambient", "app"]] = None
     builds_out_of_tree: Optional[bool] = None
@@ -2893,6 +2899,7 @@ class TeamGithubScopeResponse(BaseModel):
     max_verification_retries: int
     max_auto_merges_per_day: int
     max_item_effort_minutes: int = 120
+    max_plan_estimate_minutes: int = DEFAULT_PLAN_ESTIMATE_MINUTES
     auto_merges_last_24h: Optional[int] = None
     base_ref: str
     builds_out_of_tree: bool

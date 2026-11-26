@@ -237,6 +237,48 @@ async def test_scope_settings_read_definitions_and_audit_history(client, db, tmp
 
 
 @pytest.mark.asyncio
+async def test_plan_estimate_setting_validates_the_ceiling_and_records_history(client, db, tmp_path):
+    preset, scope = await _scope(db, tmp_path / "plan-settings-repo")
+    path = f"/api/v1/agent-teams/github-scopes/{scope.id}"
+    definitions = (await client.get(f"{path}/settings", headers=OPERATOR_HEADERS)).json()["definitions"]
+    plan = definitions["max_plan_estimate_minutes"]
+    assert (plan["type"], plan["minimum"], plan["maximum"], plan["default"]) == ("integer", 15, 120, 60)
+    for invalid in (14, 121):
+        response = await client.patch(path, headers=OPERATOR_HEADERS, json={"max_plan_estimate_minutes": invalid})
+        assert response.status_code == 422
+
+    update = {"max_item_effort_minutes": 80, "max_plan_estimate_minutes": 75}
+    response = await client.patch(path, headers=OPERATOR_HEADERS, json=update)
+    assert response.status_code == 200
+    assert {name: response.json()[name] for name in update} == update
+    refused = await client.patch(path, headers=OPERATOR_HEADERS, json={"max_item_effort_minutes": 74})
+    assert (refused.status_code, refused.json()["detail"]) == (422, "plan_estimate_limit_exceeds_effort_ceiling")
+    await db.refresh(scope)
+    assert (scope.max_item_effort_minutes, scope.max_plan_estimate_minutes) == (80, 75)
+
+    response = await client.patch(path, headers=OPERATOR_HEADERS, json={
+        "max_item_effort_minutes": 45, "max_plan_estimate_minutes": None,
+    })
+    assert response.status_code == 200
+    assert response.json()["max_plan_estimate_minutes"] == 45
+    readback = (await client.get(f"{path}/settings", headers=OPERATOR_HEADERS)).json()
+    plan = readback["definitions"]["max_plan_estimate_minutes"]
+    assert (plan["maximum"], plan["default"]) == (45, 45)
+    assert [row["changes"]["max_plan_estimate_minutes"] for row in readback["history"]] == [
+        {"before": 75, "after": None}, {"before": None, "after": 75},
+    ]
+
+    create_url = f"/api/v1/agent-teams/presets/{preset.id}/github-scopes"
+    payload = {"repo_owner": "owner", "repo_name": "plan-create", "repo_path": scope.repo_path,
+               "max_item_effort_minutes": 45}
+    refused = await client.post(create_url, headers=OPERATOR_HEADERS, json=payload | {"max_plan_estimate_minutes": 46})
+    assert (refused.status_code, refused.json()["detail"]) == (422, "plan_estimate_limit_exceeds_effort_ceiling")
+    created = await client.post(create_url, headers=OPERATOR_HEADERS, json=payload)
+    assert created.status_code == 200
+    assert created.json()["max_plan_estimate_minutes"] == 45
+
+
+@pytest.mark.asyncio
 async def test_scope_settings_history_records_private_fields_without_values(client, db, tmp_path):
     _, scope = await _scope(db, tmp_path / "private-settings-repo")
     path = f"/api/v1/agent-teams/github-scopes/{scope.id}"
