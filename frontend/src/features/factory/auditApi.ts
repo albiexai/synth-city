@@ -90,6 +90,7 @@ export async function fetchAuditEvents(params: {
   eventKind?: string;
   occurredAfter?: string;
   occurredBefore?: string;
+  teamId?: number;
   teamContextKey?: string;
   scopeContextKey?: string;
   itemContextKey?: string;
@@ -101,6 +102,7 @@ export async function fetchAuditEvents(params: {
   if (params.eventKind) query.set("event_kind", params.eventKind);
   if (params.occurredAfter) query.set("occurred_after", params.occurredAfter);
   if (params.occurredBefore) query.set("occurred_before", params.occurredBefore);
+  if (params.teamId) query.set("team_id", String(params.teamId));
   if (params.teamContextKey) query.set("team_context_key", params.teamContextKey);
   if (params.scopeContextKey) query.set("scope_context_key", params.scopeContextKey);
   if (params.itemContextKey) query.set("item_context_key", params.itemContextKey);

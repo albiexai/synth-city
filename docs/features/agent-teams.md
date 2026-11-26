@@ -420,6 +420,15 @@ world-writable.
   agent user's `antigravity-cli` files. Otherwise the status is `native_log_unreadable`.
   The passive launch used one host user. Access across two users remains unverified.
 
+## Supervisor Binding
+
+The Supervisor line of a team page has an **Edit** button. It opens the supervisor binding editor. The editor needs the Director key.
+
+- **Bind:** Enter the id of an external actor. Select **Save**. The server checks the id. An unknown id gives "No external actor has this id." The actor list is not in the UI yet (#1291), so you type the id.
+- **Change the grace:** Enter whole seconds, 1 or more. Select **Use the default grace** to remove the override. The default grace is at least 30 minutes.
+- **Remove:** Select **Remove the supervisor** and confirm. This also clears the grace setting.
+- **History:** Each change is recorded in the audit history. The editor lists these changes, newest first, with the actor and the reason.
+
 ## External Local Agents
 
 Local external agents can use the JSON API:

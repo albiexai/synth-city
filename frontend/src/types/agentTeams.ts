@@ -174,9 +174,23 @@ export interface TeamCampaignSummary {
 }
 
 // The status that the controller derives from the clock and the stored promise (#549).
+export interface SupervisorAddress {
+  actor_id: number
+  address: string
+  display_name?: string | null
+}
+
+// PUT agent-teams/presets/{id}/supervisor. The actor id is always sent: null removes the supervisor.
+// Left out, the grace is unchanged; null returns it to the default; a number sets it.
+export interface SupervisorBindingUpdate {
+  actor_id: number | null
+  grace_seconds?: number | null
+}
+
 export interface SupervisorObservation {
   status: 'none' | 'healthy' | 'late' | 'absent'
   actor_id: number | null
+  address?: SupervisorAddress | null
   checked_at: string | null
   next_check_at: string | null
   grace_seconds: number
