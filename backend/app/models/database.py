@@ -1241,6 +1241,36 @@ class Campaign(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class CampaignUpgradeBackfill(Base):
+    """#1243: a team that had a backlog milestone or a parent issue when this version was first started.
+
+    The poll gives it one campaign (``created``), or decides it gets none (``none``, with the reason). Bound to the
+    team's lifetime key: a reused preset id never inherits the backfill.
+    """
+
+    __tablename__ = "campaign_upgrade_backfill"
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'created', 'none')", name="ck_campaign_upgrade_backfill_status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    preset_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    team_context_key: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class CampaignUpgradeCoverage(Base):
+    """#1243: when this version was first started; the backfill is enqueued only then."""
+
+    __tablename__ = "campaign_upgrade_coverage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 # R01: lifetime retirement of context keys. One active key per kind and ID;
 # deleting the resource retires it, whatever route performs the deletion.
 CONTEXT_KEY_LIFETIME_DDL = (

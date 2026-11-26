@@ -2790,6 +2790,15 @@ class FactoryDeliveryPolicy(BaseModel):
         return self
 
 
+class CampaignStartUpdate(BaseModel):
+    """#1243: the Director's new campaign start, and the start the Director saw (a compare-and-set)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    started_at: datetime
+    expected_started_at: datetime
+
+
 class TeamGithubDeliveryPolicyUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,6 +20,8 @@ from app.models.factory_schemas import (
 from app.models.schemas import PlannedCampaignDecision
 from app.services.github_dispatch_priority import dispatch_order_key, effective_priority
 from app.services.work_item_states import is_done, needs_attention
+
+logger = logging.getLogger(__name__)
 
 _PARENT = re.compile(r"https://github\.com/([^/]+)/([^/]+)/issues/([1-9][0-9]*)\Z")
 _STATE_PHRASES = {
@@ -120,6 +123,16 @@ class AgentTeamCampaignService:
         if not rows:
             return
         captured = rows[0]
+        # #1243: a team recorded at the upgrade gets its campaign once, through this poll's client. A failure stays
+        # pending for a later poll and never stops the backlog read.
+        from app.services import campaign_upgrade_service
+        from app.services.session_recovery import recover_session
+
+        try:
+            await campaign_upgrade_service.resolve_pending(db, captured.preset_id, client)
+        except Exception as caught_error:  # noqa: BLE001  (the backlog read must run whatever happens here)
+            await recover_session(db, caught_error, discard=True)
+            logger.info("Upgrade campaign unresolved for team %s", captured.preset_id)
         key, started = self._key(captured), self.clock()
         cached = self._cache.get(key)
         if cached and cached.expires_at > started:
