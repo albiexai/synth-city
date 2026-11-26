@@ -12,7 +12,7 @@ from sqlalchemy import event, select, update
 from app.api.v1 import agent_mail
 from app.config import settings
 from app.models.database import (
-    AgentTeamPreset, GithubApprovalRequest, MailAgentSession, TeamGithubScope,
+    AgentTeamPreset, GithubApprovalRequest, GithubWorkItem, MailAgentSession, TeamGithubScope,
     GithubWorkspace, MailMessage,
 )
 from app.models.schemas import MailApprovalRequestCreate, MailMessageCreate
@@ -326,6 +326,109 @@ async def test_initial_path_gate_holds_when_the_comparison_cannot_be_proved(db, 
     await github_verification_service.process_scope(db, a.scope, client=client)
     assert a.item.dispatch_status == "ready_for_review" and client.merge_calls == 0
     assert a.item.status_note.startswith("initial_paths_inconclusive:")
+    if missing == "plan":
+        assert client.pull_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["status", "round", "owner", "leader"])
+async def test_initial_path_gate_refuses_plan_with_unverifiable_authority(db, healthy_attempt, monkeypatch, mismatch):
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch)
+    approval = a.approval
+    root = await db.get(MailMessage, approval.request_message_id)
+    if mismatch == "status":
+        approval.status = "rejected"
+    elif mismatch == "round":
+        approval.approval_round += 1
+        root.payload = {**root.payload, "approval_round": approval.approval_round}
+    elif mismatch == "owner":
+        approval.owner_member_id = root.sender_member_id = a.leader.id
+    else:
+        approval.leader_member_id = root.recipient_member_id = a.owner.id
+    # The Mail still describes this persisted request. Each invalidity is in its merge authority.
+    assert github_approval_service.matches_linked_request_message(
+        approval, root, delivery_key=f"github-approval:{approval.id}:request")
+    await db.commit()
+
+    await github_verification_service.process_scope(db, a.scope, client=client)
+
+    assert client.merge_calls == 0 and a.item.dispatch_status == "ready_for_review"
+    assert a.item.status_note == "initial_paths_inconclusive: the approved first plan could not be verified."
+    assert client.pull_calls == 1
+    client.get_merge_base.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_initial_path_gate_refuses_a_different_valid_plan_on_the_final_read(db, healthy_attempt, monkeypatch):
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch)
+    root = await db.get(MailMessage, a.approval.request_message_id)
+    read_pull = client.get_pull
+
+    async def read_with_changed_plan(*args):
+        pull = await read_pull(*args)
+        if client.pull_calls == 2:
+            metadata = {"allowed_paths": ["src/base.py", "src/added.py"]}
+            root.payload = {**root.payload, "plan_metadata": metadata}
+            a.approval.request_fingerprint = github_approval_service.initial_request_fingerprint(
+                summary=root.payload["summary"], plan_metadata=metadata)
+            await db.commit()
+        return pull
+
+    client.get_pull = read_with_changed_plan
+    await github_verification_service.process_scope(db, a.scope, client=client)
+
+    assert client.merge_calls == 0 and a.item.dispatch_status == "ready_for_review"
+    assert a.item.status_note == "initial_paths_inconclusive: the approved file list changed during the comparison."
+    client.get_merge_base.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["item", "scope"])
+async def test_initial_path_gate_fences_readiness_when_context_changes_during_pr_read(
+    db, healthy_attempt, monkeypatch, changed,
+):
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch)
+    a.item.status_note = "Current readiness note"
+    await db.commit()
+    read_pull = client.get_pull
+
+    async def read_with_changed_context(*args):
+        pull = await read_pull(*args)
+        if client.pull_calls == 2:
+            change = (update(GithubWorkItem).where(GithubWorkItem.id == a.item.id).values(last_verified_sha="1" * 40)
+                      if changed == "item"
+                      else update(TeamGithubScope).where(TeamGithubScope.id == a.scope.id).values(enabled=False))
+            await db.execute(change.execution_options(synchronize_session=False))
+            await db.commit()
+            pull["draft"] = True
+        return pull
+
+    client.get_pull = read_with_changed_context
+    await github_verification_service.process_scope(db, a.scope, client=client)
+    await db.refresh(a.item)
+
+    # The late draft observation cannot rewrite readiness after the attempt or scope changed.
+    assert client.merge_calls == 0 and client.pull_calls == 2
+    assert a.item.status_note == "Current readiness note"
+
+
+@pytest.mark.asyncio
+async def test_initial_path_gate_observes_hold_after_the_final_pr_read(db, healthy_attempt, monkeypatch):
+    from app.services import github_coordination_service
+
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch)
+    monkeypatch.setattr(github_coordination_service, "hold_code",
+                        lambda: "test_hold" if client.pull_calls >= 2 else None)
+
+    await github_verification_service.process_scope(db, a.scope, client=client)
+
+    assert client.merge_calls == 0 and a.item.dispatch_status == "ready_for_review"
+    assert client.pull_calls == 2
+    client.get_merge_base.assert_awaited_once()
 
 
 async def prior_amendment(a, db, number, added, *, status="rejected", approved=False):
