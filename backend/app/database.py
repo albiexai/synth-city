@@ -867,6 +867,9 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         if preset_columns and column not in preset_columns:
             await conn.execute(text(f"ALTER TABLE agent_team_presets ADD COLUMN {column} INTEGER"))
     for column, definition in (
+        ("mail_request_unanswered_seconds", "INTEGER"),
+        ("github_team_idle_timeout_seconds", "INTEGER"),
+        ("github_publish_summaries_enabled", "BOOLEAN"),
         ("supervisor_actor_id", "INTEGER REFERENCES mail_external_actors(id) ON DELETE SET NULL"),
         ("supervisor_checked_at", "DATETIME"), ("supervisor_next_check_at", "DATETIME"),
         ("supervisor_note", "VARCHAR"), ("supervisor_grace_seconds", "INTEGER"),

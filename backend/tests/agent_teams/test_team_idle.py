@@ -42,6 +42,25 @@ async def test_idle_ignores_polling_and_clears_on_real_state_progress(db,monkeyp
 
 
 @pytest.mark.asyncio
+async def test_idle_threshold_uses_only_the_observed_teams_override(db, monkeypatch):
+    monkeypatch.setattr('app.services.github_team_idle_service.hold_code', lambda: None)
+    monkeypatch.setattr('app.services.github_team_idle_service.settings.github_team_idle_timeout_seconds', 600)
+    team, _, item = await seed(db)
+    other, _, _ = await seed(db)
+    team.github_team_idle_timeout_seconds = 60
+    await db.commit()
+    service, now = GithubTeamIdleService(), datetime.utcnow()
+    await service.observe(db, team.id, now=now)
+    await service.observe(db, other.id, now=now)
+    due = now + timedelta(seconds=90)
+    assert [entry["work_item_id"] for entry in await service.observe(db, team.id, now=due)] == [item.id]
+    assert await service.observe(db, other.id, now=due) == []
+    team.github_team_idle_timeout_seconds = None
+    await db.commit()
+    assert await service.observe(db, team.id, now=due) == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('wait',['human','external','hold','off','unknown'])
 async def test_waits_and_incomplete_observation_suppress_idle(db,monkeypatch,wait):
     monkeypatch.setattr('app.services.github_team_idle_service.hold_code',lambda:'hold' if wait=='hold' else None)

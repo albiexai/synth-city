@@ -43,7 +43,7 @@ import { fetchCCSessions } from '@/features/cc-bridge/api'
 import type { AgentSession } from '@/features/cc-bridge/types'
 import { TeamMemberPicker } from './TeamMemberPicker'
 import { TeamHeader } from './TeamHeader'
-import { EditTeamPanel } from './EditTeamPanel'
+import { EditTeamPanel, TeamWorkSettingsEditor } from './EditTeamPanel'
 import { TeamMemberRow } from './TeamMemberRow'
 import { TeamProgress } from './TeamProgress'
 import { PROVIDER_IDS, isHiddenByDefault, memberItems, sessionItems, sessionKey, sessionsToSlots, usableSessions } from './teamSources'
@@ -70,6 +70,7 @@ import {
   fetchAgentTeamPresets,
   fetchGithubWorkItems,
   fetchTeamGithubScopes,
+  fetchTeamWorkSettings,
   launchAgentTeam,
   planAgentTeamLaunch,
   reorderAgentTeamSlots,
@@ -1411,6 +1412,14 @@ export function AgentTeamsPage() {
                 onSave={savePreset}
                 onDuplicate={duplicatePreset}
                 onDelete={removePreset}
+                workSettings={<TeamWorkSettingsEditor
+                  key={selectedPreset.id}
+                  load={(beforeId) => withOperatorToken((token) => fetchTeamWorkSettings(selectedPreset.id, token, beforeId))}
+                  save={(input) => withOperatorToken(async (token) => {
+                    await updateAgentTeamPreset(selectedPreset.id, input, token)
+                    return fetchTeamWorkSettings(selectedPreset.id, token)
+                  })}
+                />}
               />
 
               <HumanActionSummary key={selectedPreset.id} presetId={selectedPreset.id} onInspectAutonomy={() => setAutonomyTab('autonomy')} />

@@ -338,7 +338,13 @@ export interface AgentTeamPresetInput {
   slots?: AgentTeamSlotInput[]
 }
 
-export interface AgentTeamPresetUpdate {
+export interface TeamWorkSettings {
+  mail_request_unanswered_seconds: number | null
+  github_team_idle_timeout_seconds: number | null
+  github_publish_summaries_enabled: boolean | null
+}
+
+export interface AgentTeamPresetUpdate extends Partial<TeamWorkSettings> {
   name?: string
   description?: string | null
   autonomy_enabled?: boolean
@@ -468,6 +474,13 @@ export interface ScopeSettingsHistoryEntry {
 export interface ScopeSettingsResponse {
   definitions: Record<string, ScopeSettingDefinition>
   required: string[]
+  history: ScopeSettingsHistoryEntry[]
+  next_before_id: number | null
+}
+
+export interface TeamWorkSettingsResponse {
+  overrides: TeamWorkSettings
+  defaults: TeamWorkSettings
   history: ScopeSettingsHistoryEntry[]
   next_before_id: number | null
 }

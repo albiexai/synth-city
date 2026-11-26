@@ -2677,7 +2677,13 @@ class AgentTeamPresetCreate(CampaignPresetFields):
     slots: List[AgentTeamSlotCreate] = Field(default_factory=list)
 
 
-class AgentTeamPresetUpdate(CampaignPresetFields):
+class TeamWorkSettings(BaseModel):
+    mail_request_unanswered_seconds: int | None = Field(default=None, strict=True, ge=60, le=86400)
+    github_team_idle_timeout_seconds: int | None = Field(default=None, strict=True, ge=30, le=86400)
+    github_publish_summaries_enabled: bool | None = Field(default=None, strict=True)
+
+
+class AgentTeamPresetUpdate(CampaignPresetFields, TeamWorkSettings):
     name: Optional[str] = None
     description: Optional[str] = None
     parent_issue_url: Optional[GithubParentIssueUrl] = None
@@ -2895,6 +2901,13 @@ class ScopeSettingsHistoryEntry(BaseModel):
 class TeamGithubScopeSettingsResponse(BaseModel):
     definitions: dict[str, dict[str, Any]]
     required: list[str]
+    history: list[ScopeSettingsHistoryEntry]
+    next_before_id: int | None = None
+
+
+class TeamWorkSettingsResponse(BaseModel):
+    overrides: TeamWorkSettings
+    defaults: TeamWorkSettings
     history: list[ScopeSettingsHistoryEntry]
     next_before_id: int | None = None
 

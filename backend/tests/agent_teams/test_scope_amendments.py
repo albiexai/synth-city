@@ -963,6 +963,66 @@ async def test_third_amendment_settlement_opens_the_normal_continuation_route(db
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("request_count,excluded", [
+    (8, None),
+    (7, None),
+    (7, "other_item"),
+    (7, "prior_attempt"),
+    (7, "continuation"),
+], ids=["cap", "below_cap", "other_item", "prior_attempt", "continuation"])
+async def test_settlement_uses_the_amendment_request_cap(
+    db, healthy_attempt, monkeypatch, request_count, excluded,
+):
+    from app.services.github_terminal_revision_service import end_submitted_revision
+
+    a = healthy_attempt
+    a.scope.max_continuation_revisions = 10
+    outcomes = ("rejected", "expired", "cancelled", "superseded")
+    for number in range(1, request_count):
+        await prior_amendment(a, db, number, [], status=outcomes[(number - 1) % len(outcomes)])
+    if excluded:
+        earlier = await prior_amendment(a, db, request_count, [], status="completed")
+        if excluded == "other_item":
+            other = await _item(db, a.scope, issue_number=99, dispatch_nonce=a.item.dispatch_nonce,
+                                ack_approver_member_id=a.leader.id, owner_slot_id=a.owner.team_slot_id)
+            earlier.work_item_id = other.id
+        elif excluded == "prior_attempt":
+            earlier.dispatch_nonce = "previous-attempt"
+        else:
+            earlier.origin_kind = "continuation"
+            earlier.approved_at = datetime.utcnow()
+        await db.commit()
+
+    await submit_amendment_for_review(db, a)
+    fact = await record_changes(db, a)
+    decision = dict(review_id=fact.id, leader_member_id=a.leader.id, dispatch_nonce=a.item.dispatch_nonce,
+                    reason="Settle after the amendment request history")
+    await end_submitted_revision(db, a.item, **decision)
+    await db.refresh(fact)
+    assert a.revision.status == "superseded" and fact.status == "consumed"
+    assert a.item.active_scope_revision == a.revision.revision and a.item.ack_received_at is None
+    assert a.item.pr_number == 5 and a.workspace.leased_item_id == a.item.id
+
+    if request_count == 8:
+        assert a.item.dispatch_status == "escalated"
+        assert a.item.escalation_reason == "amendment_budget_exhausted"
+        assert (await end_submitted_revision(db, a.item, **decision)).id == a.revision.id
+
+        monkeypatch.setattr(github_client, "get_recursive_tree", AsyncMock(return_value={}))
+        revision, _, created = await github_approval_service.create_continuation_request(
+            db, a.item, a.scope, **amendment(a))
+        assert created and revision.revision == 9 and revision.status == "proposed"
+        assert revision.originating_escalation_reason == "amendment_budget_exhausted"
+    else:
+        assert a.item.dispatch_status == "dispatched" and a.item.escalation_reason is None
+        with pytest.raises(GithubApprovalError, match="continuation_not_escalated"):
+            await github_approval_service.create_continuation_request(db, a.item, a.scope, **amendment(a))
+        revision, _, created = await github_approval_service.create_scope_amendment_request(
+            db, a.item, a.scope, **amendment(a, ["src/base.py", "src/added.py", "src/followup.py"]))
+        assert created and revision.origin_kind == "scope_amendment" and revision.status == "proposed"
+
+
+@pytest.mark.asyncio
 async def test_approved_continuation_does_not_count_towards_amendment_cap(db, submitted_continuation):
     from app.services.github_terminal_revision_service import end_submitted_revision
 

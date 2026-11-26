@@ -98,6 +98,8 @@ from app.models.schemas import (
     TeamGithubScopeResponse,
     TeamGithubScopeSettingsResponse,
     TeamGithubScopeUpdate,
+    TeamWorkSettings,
+    TeamWorkSettingsResponse,
     SupervisorBindingRequest,
     SupervisorObservation,
 )
@@ -346,7 +348,9 @@ from app.services.github_verification_service import (
     ContinuationCompletionError,
     github_verification_service,
 )
-from app.services.agent_team_service import PlanConflictError, TeamDeletionConflictError, agent_team_service
+from app.services.agent_team_service import (
+    TEAM_WORK_SETTINGS_AUDIT_SOURCE, PlanConflictError, TeamDeletionConflictError, agent_team_service,
+)
 from app.services.providers import get_providers
 from app.services.providers.base import ProviderLaunchError
 
@@ -2571,6 +2575,8 @@ async def update_preset(
             name=request.name,
             description=request.description,
             autonomy_enabled=request.autonomy_enabled,
+            work_settings=TeamWorkSettings.model_validate(
+                request.model_dump(include=set(TeamWorkSettings.model_fields), exclude_unset=True)),
             **({"parent_issue_url": request.parent_issue_url}
                if "parent_issue_url" in request.model_fields_set else {}),
             **{field: getattr(request, field) for field in ("backlog_milestone", "planned_decisions",
@@ -2594,6 +2600,45 @@ async def update_preset(
     if request.autonomy_enabled is not None:
         await _sync_github_jobs(db)
     return response
+
+
+@router.get("/presets/{preset_id}/work-settings", response_model=TeamWorkSettingsResponse)
+async def read_team_work_settings(
+    preset_id: int,
+    limit: int = Query(25, ge=1, le=100),
+    before_id: int | None = Query(None, ge=1, le=2**63 - 1),
+    _operator: None = Depends(require_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services import factory_audit_service as audit
+
+    preset = await db.get(AgentTeamPreset, preset_id)
+    if preset is None:
+        raise HTTPException(status_code=404, detail="Agent team preset not found")
+    key = await audit.current_context_key(db, "team", preset_id)
+    events = []
+    if key is not None:
+        query = select(FactoryAuditEvent).where(
+            FactoryAuditEvent.team_context_key == key,
+            FactoryAuditEvent.event_kind == "policy_change",
+            FactoryAuditEvent.source == TEAM_WORK_SETTINGS_AUDIT_SOURCE,
+            FactoryAuditEvent.action_outcome == "applied",
+        )
+        if before_id is not None:
+            query = query.where(FactoryAuditEvent.id < before_id)
+        events = (await db.scalars(query.order_by(FactoryAuditEvent.id.desc()).limit(limit + 1))).all()
+    names = TeamWorkSettings.model_fields
+    history = [
+        dict(event_id=event.id, occurred_at=event.occurred_at, actor_kind=event.actor_kind,
+             actor_reference=event.actor_reference, via=event.via, reason=event.sanitized_reason,
+             changes={name: {"before": event.before_values[name], "after": event.after_values[name]}
+                      for name in names if name in (event.before_values or {}) and name in (event.after_values or {})},
+             redacted_fields=[])
+        for event in events[:limit]
+    ]
+    return dict(overrides={name: getattr(preset, name) for name in names},
+                defaults={name: getattr(settings, name) for name in names}, history=history,
+                next_before_id=events[limit - 1].id if len(events) > limit else None)
 
 
 @router.put("/presets/{preset_id}/leader", response_model=AgentTeamPresetResponse)

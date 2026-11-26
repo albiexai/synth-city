@@ -26,6 +26,7 @@ import type {
   TeamGithubScopeInput,
   TeamGithubScopeListResponse,
   TeamGithubScopeUpdate,
+  TeamWorkSettingsResponse,
 } from '@/types/agentTeams'
 
 export function fetchAgentTeamActivity(presetId: number, signal: AbortSignal): Promise<AgentTeamActivityResponse> {
@@ -96,6 +97,14 @@ export function updateAgentTeamPreset(
     method: 'PATCH',
     headers: operatorHeaders(operatorToken),
     body: JSON.stringify(input),
+  })
+}
+
+export function fetchTeamWorkSettings(presetId: number, operatorToken: string, beforeId?: number): Promise<TeamWorkSettingsResponse> {
+  const query = beforeId == null ? '' : `?before_id=${beforeId}`
+  return apiClient<TeamWorkSettingsResponse>(`agent-teams/presets/${presetId}/work-settings${query}`, {
+    headers: operatorHeaders(operatorToken),
+    cache: 'no-store',
   })
 }
 

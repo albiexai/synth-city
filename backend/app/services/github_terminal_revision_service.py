@@ -395,7 +395,8 @@ async def withdraw_revision_review(db, item, *, review_id, reviewer_member_id, d
 async def end_submitted_revision(db, item, *, review_id, leader_member_id, dispatch_nonce, reason, actor=None):
     from app.models.database import GithubRevisionReview
     from app.services.github_approval_service import (
-        GithubApprovalError, MAX_SCOPE_AMENDMENTS, github_approval_service as approval,
+        GithubApprovalError, MAX_SCOPE_AMENDMENTS, MAX_SCOPE_AMENDMENT_REQUESTS,
+        github_approval_service as approval,
     )
     fact = await db.get(GithubRevisionReview, review_id, populate_existing=True)
     if (not fact or fact.work_item_id != item.id or fact.dispatch_nonce != dispatch_nonce
@@ -433,14 +434,15 @@ async def end_submitted_revision(db, item, *, review_id, leader_member_id, dispa
     await _claim_review_context(db, context)
     capped = False
     if revision.origin_kind == 'scope_amendment' and revision.approved_at is not None:
-        # Count the same approved amendments as the proposal cap, under the existing attempt writer.
-        count = await db.scalar(select(func.count()).select_from(GithubAttemptScopeRevision).where(
+        # Compare both proposal caps under the existing attempt writer.
+        approved_count, request_count = (await db.execute(select(
+            func.count(GithubAttemptScopeRevision.approved_at), func.count(),
+        ).select_from(GithubAttemptScopeRevision).where(
             GithubAttemptScopeRevision.work_item_id == item.id,
             GithubAttemptScopeRevision.dispatch_nonce == context['dispatch_nonce'],
             GithubAttemptScopeRevision.origin_kind == 'scope_amendment',
-            GithubAttemptScopeRevision.approved_at.is_not(None),
-        ))
-        capped = count >= MAX_SCOPE_AMENDMENTS
+        ))).one()
+        capped = approved_count >= MAX_SCOPE_AMENDMENTS or request_count >= MAX_SCOPE_AMENDMENT_REQUESTS
     consumed = await db.execute(update(GithubRevisionReview).where(*(
         _same(getattr(GithubRevisionReview, key), value) for key, value in fact_values.items()))
         .values(status='consumed', ended_at=datetime.utcnow(), settled_by_member_id=leader_member_id,
@@ -454,7 +456,7 @@ async def end_submitted_revision(db, item, *, review_id, leader_member_id, dispa
     if capped:
         stopped = stopped.values(dispatch_status='escalated', escalation_reason='amendment_budget_exhausted',
             updated_at=datetime.utcnow(),
-            status_note='The Leader settled changes required on the final approved scope amendment. '
+            status_note='The Leader settled changes required on a scope amendment after the attempt reached an amendment limit. '
                         'The owner can request a bounded continuation within the remaining budgets.')
         context.update(dispatch_status='escalated', escalation_reason='amendment_budget_exhausted')
     else:
