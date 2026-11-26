@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -26,7 +27,8 @@ def report(
                 project.update({
                     "expectedStatus": "passed",
                     "status": "expected",
-                    "results": [{"status": outcome, "retry": retry} for retry, outcome in enumerate(executions)],
+                    "results": [{"status": outcome, "retry": retry, "workerIndex": 0}
+                                for retry, outcome in enumerate(executions)],
                 })
         suite = {"specs": [spec]}
         for group in reversed(groups):
@@ -39,6 +41,18 @@ A = ("e2e/a.spec.ts", ("Outer", "Inner"), "opens @active", ("browser-a",))
 B = ("e2e/b.spec.ts", ("Outer", "Inner"), "opens @active", ("browser-a",))
 C = ("e2e/a.spec.ts", ("Outer", "Inner"), "opens @active", ("browser-b",))
 D = ("e2e/a.spec.ts", ("Outer › Inner",), "opens @active", ("browser-a",))
+FLAKY = ("e2e/known.spec.ts", (), "known journey @active", ("browser-a",))
+SIGNATURE = "TimeoutError: operation did not respond"
+REGISTRATION = {"test_id": FLAKY[2], "failure_signature": SIGNATURE, "issue": 1304, "expires_on": "9999-12-31"}
+
+
+def failing_report(message=SIGNATURE, *, outcome="failed", entry=FLAKY, extra_errors=False, worker=0):
+    data = report(entry, executions=(outcome,))
+    test = data["suites"][0]["specs"][0]["tests"][0]
+    test["status"] = "unexpected"
+    error = {"message": message}
+    test["results"][0].update(error=error, errors=[error, error] if extra_errors else [error], workerIndex=worker)
+    return data
 
 
 @pytest.fixture
@@ -69,13 +83,17 @@ if response is not None:
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
     output = tmp_path / "manifest.json"
 
-    def run(full, first, second, *, artifacts=None):
+    def run(full, first, second, *, artifacts=None, registry=None):
         (tmp_path / "reports.json").write_text(
             json.dumps({"full": full, "1/2": first, "2/2": second}), encoding="utf-8",
         )
         command = [sys.executable, str(SCRIPT), "--shards", "2", "--output", str(output)]
         if artifacts is not None:
             command += ["--artifacts", str(artifacts)]
+        if registry is not None:
+            registry_path = tmp_path / "known-flakes.json"
+            registry_path.write_text(json.dumps(registry), encoding="utf-8")
+            command += ["--registry", str(registry_path)]
         return subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, check=False)
 
     return run, output, tmp_path / "calls"
@@ -134,12 +152,51 @@ def test_cli_rejects_unproved_partitions(collect, full, first, second, messages)
     assert output.read_text(encoding="utf-8") == "previous manifest\n"
 
 
-def artifact(root: Path, shard: int, attempt: int, result) -> None:
+def artifact(root: Path, shard: int, attempt: int, result, *, exit_status="0") -> None:
     folder = root / f"e2e-journeys-{shard}-attempt-{attempt}"
     folder.mkdir(parents=True)
     if result is not None:
         payload = result if isinstance(result, str) else json.dumps(result)
         (folder / "results.json").write_text(payload, encoding="utf-8")
+    if exit_status is not None:
+        (folder / "playwright-exit.txt").write_text(f"{exit_status}\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize(("result", "exit_status", "registration", "expected"), [
+    (failing_report(), "1", REGISTRATION, 0),
+    (failing_report("\x1b[31m" + SIGNATURE + "\x1b[39m", outcome="timedOut"), "1", REGISTRATION, 0),
+    (failing_report(SIGNATURE + " (different condition)"), "1", REGISTRATION, 1),
+    (failing_report(), "1", REGISTRATION | {"test_id": "different journey @active"}, 1),
+    (failing_report(), "1", REGISTRATION | {"expires_on": "2000-01-01"}, 1),
+    (failing_report(outcome="interrupted"), "1", REGISTRATION, 1),
+    (failing_report(extra_errors=True), "1", REGISTRATION, 1),
+    (failing_report(worker=-1), "1", REGISTRATION, 1),
+    (failing_report() | {"errors": [{"message": "Run error"}]}, "1", REGISTRATION, 1),
+    (failing_report(), "0", REGISTRATION, 1),
+    (failing_report(), None, REGISTRATION, 1),
+    (report(FLAKY, executions=("passed",)), "1", REGISTRATION, 1),
+])
+def test_registry_tolerates_only_a_proven_matching_failure(collect, tmp_path, result, exit_status, registration, expected):
+    run, _, _ = collect
+    artifacts = tmp_path / "artifacts"
+    artifact(artifacts, 1, 1, result, exit_status=exit_status)
+    artifact(artifacts, 2, 1, report(B, executions=("passed",)))
+    checked = run(report(FLAKY, B), report(FLAKY), report(B), artifacts=artifacts, registry=[registration])
+    assert checked.returncode == expected, checked.stderr
+    if expected == 0:
+        assert "registered failures: 1" in checked.stdout
+
+
+def test_a_registry_title_cannot_match_two_active_journeys(collect, tmp_path):
+    run, _, _ = collect
+    duplicate_title = ("e2e/other.spec.ts", (), FLAKY[2], ("browser-a",))
+    artifacts = tmp_path / "artifacts"
+    artifact(artifacts, 1, 1, failing_report(), exit_status="1")
+    artifact(artifacts, 2, 1, report(duplicate_title, executions=("passed",)))
+    checked = run(report(FLAKY, duplicate_title), report(FLAKY), report(duplicate_title),
+                  artifacts=artifacts, registry=[REGISTRATION])
+    assert checked.returncode == 1
+    assert "expected one passing execution or registered failure" in checked.stderr
 
 
 def test_runtime_proof_selects_latest_attempt_per_shard(collect, tmp_path):
@@ -203,9 +260,14 @@ def test_workflow_uses_the_same_shard_count_and_attempt_artifacts():
     assert shards["if"] == "needs.e2e-scope.outputs.run_suites == 'true'"
     run = next(step["run"] for step in shards["steps"] if step.get("name") == "Run the active journeys for this shard")
     assert "--shard=${{ matrix.shard }}/${{ strategy.job-total }}" in run
+    assert "--registry ../.workflow-ci/.github/known-flakes.json" in run
+    tooling = next(step for step in shards["steps"] if step.get("name") == "Check out the workflow's gate tooling")
+    assert tooling["with"]["ref"] == "${{ github.workflow_sha }}"
+    assert tooling["with"]["persist-credentials"] is False
     upload = next(step for step in shards["steps"] if step.get("name") == "Upload the journey report")
     assert upload["with"]["name"] == "e2e-journeys-${{ matrix.shard }}-attempt-${{ github.run_attempt }}"
     assert upload["with"]["if-no-files-found"] == "error"
+    assert "always()" in upload["if"] and "frontend/test-results/playwright-exit.txt" in upload["with"]["path"]
     download = next(step for step in gate["steps"] if step.get("uses", "").startswith("actions/download-artifact@"))
     assert download["with"]["pattern"] == "e2e-journeys-*-attempt-*"
     assert download["with"]["merge-multiple"] is False
@@ -214,6 +276,79 @@ def test_workflow_uses_the_same_shard_count_and_attempt_artifacts():
     for step in gate["steps"][gate["steps"].index(registry) + 1:]:
         assert step["if"] == "needs.e2e-scope.outputs.run_suites == 'true'"
     assert "--shards 4" in proof["run"] and '--artifacts "$RUNNER_TEMP/e2e-journey-artifacts"' in proof["run"]
+    assert "--registry .workflow-ci/.github/known-flakes.json" in proof["run"]
+
+
+@pytest.fixture
+def producer_workflow(collect, tmp_path):
+    # Keep the actual workflow shell and checker, and supply deterministic inputs at the Playwright CLI boundary.
+    root = tmp_path / "frontend"
+    root.mkdir()
+    tools = tmp_path / ".workflow-ci" / "scripts" / "ci"
+    tools.mkdir(parents=True)
+    for file in (SCRIPT, SCRIPT.with_name("known_flakes.py")):
+        shutil.copyfile(file, tools / file.name)
+    registry = tmp_path / ".workflow-ci/.github/known-flakes.json"
+    registry.parent.mkdir()
+    registry.write_text(json.dumps([REGISTRATION]), encoding="utf-8")
+    (tmp_path / "reports.json").write_text(json.dumps({
+        "full": report(FLAKY, B), "1/2": report(FLAKY), "2/2": report(B),
+    }), encoding="utf-8")
+    jobs = yaml.safe_load((ROOT / ".github/workflows/e2e.yml").read_text(encoding="utf-8"))["jobs"]
+    run = next(step["run"] for step in jobs["e2e-shards"]["steps"]
+               if step.get("name") == "Run the active journeys for this shard")
+    run = run.replace("${{ matrix.shard }}", "1").replace("${{ strategy.job-total }}", "2")
+
+    def produce(data, status):
+        fixture = tmp_path / "producer-report.json"
+        fixture.write_text(json.dumps(data), encoding="utf-8")
+        stub = 'npm() { mkdir -p test-results; cp "$TEST_PLAYWRIGHT_REPORT" test-results/results.json; return "$TEST_PLAYWRIGHT_EXIT"; }\n'
+        result = subprocess.run(
+            ["bash", "-e", "-c", stub + run], cwd=root,
+            env={**os.environ, "TEST_PLAYWRIGHT_REPORT": str(fixture), "TEST_PLAYWRIGHT_EXIT": str(status)},
+            capture_output=True, text=True, check=False,
+        )
+        recorded = (root / "test-results/playwright-exit.txt").read_text(encoding="utf-8").strip()
+        return result, recorded
+
+    return produce
+
+
+@pytest.mark.parametrize(("data", "exit_status", "expected"), [
+    (failing_report(), 1, 0),
+    (failing_report(SIGNATURE + " (different condition)"), 1, 1),
+    (failing_report() | {"errors": [{"message": "Worker launch failed"}]}, 1, 1),
+    (failing_report(), 130, 130),
+])
+def test_producer_job_stays_red_for_untolerated_failures(producer_workflow, data, exit_status, expected):
+    result, recorded = producer_workflow(data, exit_status)
+    assert recorded == str(exit_status)
+    assert result.returncode == expected, result.stderr
+
+
+def test_a_registered_failure_cannot_cover_incomplete_shard_execution(producer_workflow, tmp_path):
+    (tmp_path / "reports.json").write_text(json.dumps({
+        "full": report(FLAKY, A, B), "1/2": report(FLAKY, A), "2/2": report(B),
+    }), encoding="utf-8")
+    result, _ = producer_workflow(failing_report(), 1)
+    assert result.returncode == 1
+    assert "missing from shards" in result.stderr
+
+
+def test_failed_jobs_rerun_can_replace_an_untolerated_shard(collect, producer_workflow, tmp_path):
+    run, _, _ = collect
+    artifacts = tmp_path / "artifacts"
+    artifact(artifacts, 2, 1, report(B, executions=("passed",)))
+    mismatch = failing_report("Different error")
+    attempts = [(mismatch, 1, 1), (mismatch, 1, 1), (report(FLAKY, executions=("passed",)), 0, 0)]
+    for attempt, (data, status, expected) in enumerate(attempts, start=1):
+        producer, recorded = producer_workflow(data, status)
+        assert producer.returncode == expected, producer.stderr
+        artifact(artifacts, 1, attempt, data, exit_status=recorded)
+        gate = run(report(FLAKY, B), report(FLAKY), report(B), artifacts=artifacts, registry=[REGISTRATION])
+        assert gate.returncode == expected, gate.stderr
+        if expected == 0:
+            assert f"e2e-journeys-1-attempt-{attempt}" in gate.stdout
 
 
 @pytest.mark.parametrize(("scope_result", "run_suites", "shard_result", "success"), [
