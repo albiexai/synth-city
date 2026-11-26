@@ -104,6 +104,21 @@ async def _team(db, preset_id):
                            .execution_options(populate_existing=True))
 
 
+def active_team_key_subquery():
+    """The active context key of the team row of the enclosing statement. It is a column of that statement, so the team and
+    its key always come from the same snapshot (#1298): a team that is replaced between two reads cannot pair its old
+    binding with the key of the replacement."""
+    return (select(FactoryContextKey.context_key).where(
+        FactoryContextKey.key_kind == "team", FactoryContextKey.numeric_id == AgentTeamPreset.id,
+        FactoryContextKey.retired_at.is_(None)).limit(1).scalar_subquery())
+
+
+async def _team_and_key(db, preset_id):
+    row = (await db.execute(select(AgentTeamPreset, active_team_key_subquery().label("team_context_key"))
+                            .where(AgentTeamPreset.id == preset_id).execution_options(populate_existing=True))).first()
+    return (None, None) if row is None else (row[0], row[1])
+
+
 async def _commit_event(db, **event):
     """Keep the supervisor mutation and its audit event in one transaction."""
     try:
@@ -117,12 +132,12 @@ async def _commit_event(db, **event):
 async def observe_supervisor(db, preset_id: int, *, now: datetime | None = None) -> dict | None:
     """Record each observed clock transition once. Do not wake or run an agent."""
     current = utc_datetime(now or datetime.now(timezone.utc))
-    team = await _team(db, preset_id)
+    team, team_key = await _team_and_key(db, preset_id)
     if team is None:
         return None
     actor = await db.get(MailExternalActor, team.supervisor_actor_id) if team.supervisor_actor_id else None
     observation = supervisor_observation(team, now=current, actor=actor, quiet=await team_needs_no_supervision(db, team),
-                                         team_context_key=await audit.current_context_key(db, "team", preset_id))
+                                         team_context_key=team_key)
     old_status, new_status = team.supervisor_observed_status, observation["status"]
     if old_status == new_status or (old_status is None and new_status == "none"):
         return observation
@@ -215,9 +230,9 @@ async def supervisor_checkin(db, actor, preset_id: int, next_check_at: datetime,
             sanitized_reason="supervisor_status_changed")
     else:
         await db.commit()
-    team = await _team(db, preset_id)
+    team, team_key = await _team_and_key(db, preset_id)
     result = supervisor_observation(team, now=current, actor=actor, quiet=await team_needs_no_supervision(db, team),
-                                    team_context_key=await audit.current_context_key(db, "team", preset_id))
+                                    team_context_key=team_key)
     from app.services.github_team_idle_service import github_team_idle_service
     from sqlalchemy.ext.asyncio import async_sessionmaker
     # The check-in is already committed. Isolate observation rollback/expiry from

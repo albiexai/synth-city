@@ -575,3 +575,35 @@ async def test_deleting_a_team_retires_its_key_and_the_recreated_team_gets_anoth
     assert second_id == first_id
     assert (await read_supervisor(supervisor_client, second_id))["team_context_key"] not in (None, old)
 
+
+@pytest.mark.asyncio
+async def test_the_three_observations_read_the_key_in_the_same_statement_as_the_team(db, supervisor_client):
+    """V1, #1356: a separate key lookup lets a replacement team's key meet the old team's supervisor."""
+    from sqlalchemy import event
+    from app.services.agent_team_supervisor_service import supervisor_checkin
+    team, actor = await keyed_team(db)
+    team_id, actor_id = team.id, actor.id
+    await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id})
+    now = datetime.now(timezone.utc)  # the real clock: the status stays healthy, so the reads write no event
+    await supervisor_checkin(db, actor, team_id, now + timedelta(hours=1), now=now)  # records the one status event
+    expected = (await read_supervisor(supervisor_client, team_id))["team_context_key"]
+    statements: list[str] = []
+    bind = db.get_bind()
+    engine = getattr(bind, "sync_engine", bind)
+
+    def capture(_conn, _cursor, statement, *_rest):
+        statements.append(" ".join(statement.split()))
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        read = await read_supervisor(supervisor_client, team_id)
+        summary = (await supervisor_client.get(f"/api/v1/agent-teams/presets/{team_id}/summary")).json()["supervisor_observation"]
+        actor = await db.get(MailExternalActor, actor_id, populate_existing=True)
+        checkin = await supervisor_checkin(db, actor, team_id, now + timedelta(hours=2), now=now + timedelta(seconds=1))
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert read["team_context_key"] == summary["team_context_key"] == checkin["team_context_key"] == expected
+    # The key is a column of the statement that reads the team. A statement that reads only the keys is a second read.
+    separate = [s for s in statements if s.upper().startswith("SELECT") and "FROM factory_context_keys" in s
+                and "FROM agent_team_presets" not in s and "agent_team_presets" not in s.split("FROM factory_context_keys")[0]]
+    assert separate == [], separate

@@ -30,9 +30,8 @@ from app.services.github_work_progress_service import github_work_progress_servi
 from app.services.agent_team_campaign_service import agent_team_campaign_service
 from app.services import required_ci_attention
 from app.services.agent_team_supervisor_service import (
-    clean_note, observe_supervisor, supervisor_observation, team_needs_no_supervision,
+    active_team_key_subquery, clean_note, observe_supervisor, supervisor_observation, team_needs_no_supervision,
 )
-from app.services.factory_audit_service import current_context_key
 from app.services.work_item_states import ATTENTION_STATUSES, FINISHED_STATUSES
 
 if TYPE_CHECKING:
@@ -143,7 +142,7 @@ class AgentTeamSummaryService:
             AgentTeamPreset.supervisor_actor_id, AgentTeamPreset.supervisor_checked_at,
             AgentTeamPreset.supervisor_next_check_at, AgentTeamPreset.supervisor_grace_seconds,
             AgentTeamPreset.supervisor_note, AgentTeamPreset.supervisor_observed_status,
-            AgentTeamPreset.supervisor_binding_version,
+            AgentTeamPreset.supervisor_binding_version, active_team_key_subquery().label("team_context_key"),
             MailExternalActor.display_name.label("supervisor_display_name"))
             .outerjoin(MailExternalActor, MailExternalActor.id == AgentTeamPreset.supervisor_actor_id)
             .where(AgentTeamPreset.id == preset_id))).one_or_none()
@@ -457,7 +456,7 @@ class AgentTeamSummaryService:
             id=final_team.supervisor_actor_id, display_name=final_team.supervisor_display_name)
             if final_team.supervisor_actor_id is not None else None,
             quiet=await team_needs_no_supervision(db, final_team),  # unfiltered, whatever the summary's filter
-            team_context_key=await current_context_key(db, "team", final_team.id))
+            team_context_key=final_team.team_context_key)
         if supervisor["next_check_at"] is not None:
             boundary = supervisor["next_check_at"]
             if supervisor["status"] == "late":
