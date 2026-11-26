@@ -576,10 +576,14 @@ def test_whole_tree_writers_stay_inside_declared_namespaces():
         and write.form == "values"
         and write.value is not None
     ]
-    assert [
+    assert sorted(
         (write.path.as_posix(), write.value)
         for write in conditional_escalation_writes
-    ] == [
+    ) == [
+        (
+            "api/v1/factory_maintenance.py",
+            "integration_update_conflict",
+        ),
         (
             "services/github_dispatch_service.py",
             "approval_rounds_exhausted",
@@ -588,14 +592,10 @@ def test_whole_tree_writers_stay_inside_declared_namespaces():
             "services/github_dispatch_service.py",
             "continuation_revision_exhausted",
         ),
-        (
-            "api/v1/factory_maintenance.py",
-            "integration_update_conflict",
-        ),
     ]
     direct_literals = [write for write in writes if write.field == "escalation_reason"
                        and write.form == "assignment" and write.value is not None]
-    assert [(write.path.as_posix(),write.value) for write in direct_literals] == [
+    assert sorted((write.path.as_posix(), write.value) for write in direct_literals) == [
         ("services/github_dispatch_service.py","continuation_revision_exhausted"),
         ("services/owner_observation_pause.py","owner_observation_unavailable")
     ]
