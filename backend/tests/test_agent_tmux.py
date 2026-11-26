@@ -50,6 +50,34 @@ def test_default_uses_live_socket_and_sanitized_environment(monkeypatch):
     assert calls == [("/usr/bin/tmux", ["tmux", "-S", LIVE_SOCKET, "list-sessions"], {"SANITIZED": "yes"})]
 
 
+@pytest.mark.parametrize(("path", "expected"), [
+    ("/opt/albiex-synth-city-product/tools/:/usr/bin", "present"),
+    ("/opt/albiex-synth-city-product/tools-extra:/private-marker", "missing"),
+    ("", "missing"),
+])
+def test_team_spawn_marks_the_client_path_it_passes_to_tmux(monkeypatch, capsys, path, expected):
+    module, calls = _load(monkeypatch)
+    environment = {"PATH": path, "LANG": "C.UTF-8"}
+    monkeypatch.setattr(module, "sanitized_env", lambda: environment)
+    args = ["new-session", "-d", "-e", "SYNTH_CITY_TEAM_SLOT_ID=7", "codex"]
+    assert module.main(args) == 0
+    assert calls == [("/usr/bin/tmux", ["tmux", "-S", LIVE_SOCKET, *args], environment)]
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err == f"agent-tmux: launch-tools={expected}\n"
+
+
+@pytest.mark.parametrize("args", [
+    ["new-session", "-d", "codex"],
+    ["list-sessions"],
+    ["-S", "/tmp/private.sock", "new-session", "-d", "-e", "SYNTH_CITY_TEAM_SLOT_ID=7", "codex"],
+    ["new-session", "-d", "-e", "SYNTH_CITY_TEAM_SLOT_ID=", "codex"],
+])
+def test_non_team_or_caller_socket_commands_keep_their_output(monkeypatch, capsys, args):
+    _, calls, code = _run(monkeypatch, args)
+    assert code == 0 and len(calls) == 1
+    assert capsys.readouterr().err == ""
+
+
 @pytest.mark.parametrize("argv", [
     ["kill-server"],
     ["-f", "/dev/null", "kill-server"],

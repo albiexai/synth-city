@@ -2220,7 +2220,12 @@ async def test_stale_team_env_does_not_reattach_after_slot_provider_change(db, t
 
 
 @pytest.mark.asyncio
-async def test_launch_writes_a_pane_binding_on_the_spawn_path(db, tmp_path, monkeypatch):
+@pytest.mark.parametrize(("tools_status", "warning"), [
+    (True, None),
+    (False, "The factory tools directory is missing from the launch PATH."),
+    (None, "The factory tools directory could not be verified in the launch PATH."),
+])
+async def test_launch_writes_a_pane_binding_on_the_spawn_path(db, tmp_path, monkeypatch, tools_status, warning):
     """Without this row every Deck-launched pane gets bind_pending forever."""
     from sqlalchemy import text
 
@@ -2247,6 +2252,7 @@ async def test_launch_writes_a_pane_binding_on_the_spawn_path(db, tmp_path, monk
             "session_name": "repo-abcd",
             "tmux_target": "repo-abcd:0.0",
             "pane_pid": 4242,
+            "tools_on_launch_path": tools_status,
         }
 
     monkeypatch.setattr("app.services.agent_team_service.spawn_session", fake_spawn)
@@ -2260,6 +2266,17 @@ async def test_launch_writes_a_pane_binding_on_the_spawn_path(db, tmp_path, monk
         AgentTeamLaunchRequest(confirm_plan_hash=plan.plan_hash),
     )
     assert result.items[0].pane_pid == 4242
+    assert result.items[0].slot_name == "Dev agent"
+    message = result.items[0].message
+    assert "Codex activity will appear after its session is identified." in message
+    if warning:
+        assert warning in message
+    else:
+        assert "launch PATH" not in message
+    stored_message = await db.scalar(text(
+        "SELECT message FROM agent_team_launch_items WHERE launch_id=:launch_id AND slot_id=:slot_id"
+    ), {"launch_id": result.launch_id, "slot_id": preset.slots[0].id})
+    assert stored_message == message
 
     rows = (
         await db.execute(

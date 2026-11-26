@@ -1170,12 +1170,19 @@ class AgentTeamService:
                                        if key not in {"session_id", "use_last"}}
                 slot.launch_mode = "plain"
             trust_changed = bool(prepared_trust or spawned.get("workspace_trust_changed"))
-            observation_message = ""
-            if slot.provider == "codex-cli" and options.mode != "resume":
-                observation_message = (
-                    ". Codex: restart needed for observation. "
-                    "Resume the saved rollout ID through Albiex Synth City after capture"
-                )
+            messages = ["Workspace trust prepared."] if trust_changed else []
+            messages.append("Session spawned. Waiting for Agent Mail registration.")
+            if slot.provider == "codex-cli":
+                if options.mode == "plain":
+                    messages.append("Codex activity will appear after its session is identified.")
+                elif options.mode == "fork":
+                    messages.append("Resume the saved Codex session to observe its activity.")
+            if "tools_on_launch_path" in spawned:
+                tools_status = spawned["tools_on_launch_path"]
+                if tools_status is False:
+                    messages.append("The factory tools directory is missing from the launch PATH.")
+                elif tools_status is None:
+                    messages.append("The factory tools directory could not be verified in the launch PATH.")
             result = AgentTeamLaunchResultItem(
                 slot_id=slot.id,
                 slot_name=slot.display_name,
@@ -1186,8 +1193,7 @@ class AgentTeamService:
                 session_name=spawned.get("session_name"),
                 tmux_target=spawned.get("tmux_target"),
                 pane_pid=spawned.get("pane_pid"),
-                message=("Workspace trust prepared. " if trust_changed else "")
-                        + "Session spawned; waiting for Agent Mail registration" + observation_message,
+                message=" ".join(messages),
                 workspace_trust_changed=trust_changed,
                 warnings=plan_item.warnings,
             )
