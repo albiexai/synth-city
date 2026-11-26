@@ -821,7 +821,7 @@ async def record_pull_request_facts(
         "merge_path": path,
     }
     unknown = [name for name in values if values[name] is None]
-    return await record_event(
+    fact = await record_event(
         db, event_kind=PULL_FACTS_KIND, source="github_watcher_service._record_due_pull_facts",
         occurred_at=datetime.utcnow(), fact_source="github_pull_request_merged",
         fact_time=_parse_time(pull.get("merged_at")),
@@ -832,6 +832,13 @@ async def record_pull_request_facts(
         after_values=values, action_outcome="applied", operation_id=operation_id, correlation_id=operation_id,
         sanitized_reason="pull request facts"
         + (f": GitHub did not report {', '.join(unknown)}" if unknown else ""))
+    if path == "unknown" and repository and number.isdigit():
+        # V1 review 6076315724: an attempt that finished after the classification read found no fact here to settle.
+        # The flushed insert holds SQLite's single write lock, so a second read sees every earlier finish, and a
+        # later finish waits for this commit and then sees the fact. SQLite only, the default and documented store.
+        await db.flush()
+        await merge_attempts.settle_observations(db, repository=repository, pr_number=int(number))
+    return fact
 
 
 async def record_merge_path_settlement(db: AsyncSession, fact: FactoryAuditEvent, path: str) -> FactoryAuditEvent:

@@ -7,6 +7,7 @@ with an uncertain one or before the recording started.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timedelta
 
@@ -455,3 +456,100 @@ async def test_a_settlement_is_written_once(store):
         await attempts.settle_observations(session, repository="Matrix-Owner/Matrix-Repo", pr_number=96)
         await session.commit()
     assert [s["after"]["merge_path"] for s in await _settlements(store)] == ["automatic"]
+
+
+# V1 review 6076315724: the attempt finishes between the observer's classification read and its fact write
+async def _observer_then_finish(store, monkeypatch, status):
+    await _install_marker(store)
+    await _seed_team(store)
+    await _coverage(store, datetime(2026, 10, 1))
+    async with store() as session:
+        first = await session.get(TeamGithubScope, 5)
+        other = AgentTeamPreset(name="Second team")
+        session.add(other)
+        await session.flush()
+        session.add(TeamGithubScope(id=7, preset_id=other.id, repo_owner=first.repo_owner, repo_name=first.repo_name,
+                                    repo_path="/tmp/second-team", base_ref="origin/main", github_auth_mode="ambient",
+                                    merge_policy="human"))
+        await session.commit()
+    await _seed_work(store, item_id=312, status="merged", pr_number=97)
+    async with store() as session:
+        attempt_id = await attempts.begin(session, scope_id=5, item_id=312, pr_number=97, head_sha="e" * 40,
+                                          repository="matrix-owner/matrix-repo")
+        await session.commit()
+    await _merge(store, 313, 97, scope_id=7)
+    real, calls = attempts.merge_path, []
+
+    async def classify_then_finish(db, **kwargs):
+        path = await real(db, **kwargs)
+        if not calls:  # the observer's classification read: team A's outcome commits on its own connection
+            calls.append(path)
+            async with store() as other_session:
+                await attempts.finish(other_session, attempt_id, status, "test")
+                await other_session.commit()
+        return path
+
+    monkeypatch.setattr(attempts, "merge_path", classify_then_finish)
+    await _poll(store, _FactsClient(), scope_id=7)
+    monkeypatch.setattr(attempts, "merge_path", real)
+    await _poll(store, _FactsClient(), scope_id=7)  # a repoll, as V1 ran it
+    assert calls == ["unknown"]  # the observer read the open attempt
+
+
+@pytest.mark.parametrize("status,path", [("merged", "automatic"), ("refused", "outside")])
+async def test_an_outcome_committed_between_classification_and_fact_write_still_settles(
+        store, monkeypatch, status, path):
+    await _observer_then_finish(store, monkeypatch, status)
+    (original,) = await _facts(store)
+    assert original["after"]["merge_path"] == "unknown"  # kept as observed
+    (settled,) = await _settlements(store)
+    assert (settled["after"], settled["correlation_id"]) == ({"merge_path": path}, original["operation_id"])
+
+
+async def test_an_uncertain_outcome_in_the_same_gap_stays_unknown(store, monkeypatch):
+    await _observer_then_finish(store, monkeypatch, "uncertain")
+    assert await _settlements(store) == []
+
+
+async def test_a_finish_waiting_on_the_observers_write_lock_settles_after_it(store, monkeypatch):
+    """The other order: team A's finish blocks on SQLite's write lock while team B's fact is written, then settles."""
+    await _install_marker(store)
+    await _seed_team(store)
+    await _coverage(store, datetime(2026, 10, 1))
+    async with store() as session:
+        first = await session.get(TeamGithubScope, 5)
+        other = AgentTeamPreset(name="Second team")
+        session.add(other)
+        await session.flush()
+        session.add(TeamGithubScope(id=7, preset_id=other.id, repo_owner=first.repo_owner, repo_name=first.repo_name,
+                                    repo_path="/tmp/second-team", base_ref="origin/main", github_auth_mode="ambient",
+                                    merge_policy="human"))
+        await session.commit()
+    await _seed_work(store, item_id=314, status="merged", pr_number=98)
+    async with store() as session:
+        attempt_id = await attempts.begin(session, scope_id=5, item_id=314, pr_number=98, head_sha="f" * 40,
+                                          repository="matrix-owner/matrix-repo")
+        await session.commit()
+    await _merge(store, 315, 98, scope_id=7)
+    real, finishing = attempts.settle_observations, []
+
+    async def finish_concurrently():
+        async with store() as other_session:
+            await attempts.finish(other_session, attempt_id, "merged", None)
+            await other_session.commit()
+
+    async def settle_while_finish_waits(db, **kwargs):
+        if not finishing:  # team B holds the write lock: its fact insert is flushed
+            finishing.append(asyncio.create_task(finish_concurrently()))
+            await asyncio.sleep(0.5)
+            assert not finishing[0].done()  # team A waits on the lock rather than failing
+        return await real(db, **kwargs)
+
+    monkeypatch.setattr(attempts, "settle_observations", settle_while_finish_waits)
+    await _poll(store, _FactsClient(), scope_id=7)
+    await finishing[0]  # no lock or snapshot failure
+    monkeypatch.setattr(attempts, "settle_observations", real)
+    (original,) = await _facts(store)
+    assert original["after"]["merge_path"] == "unknown"
+    (settled,) = await _settlements(store)
+    assert settled["after"] == {"merge_path": "automatic"}
