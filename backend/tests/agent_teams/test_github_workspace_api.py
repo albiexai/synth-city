@@ -146,10 +146,13 @@ async def test_generic_scope_patch_cannot_enable_continuation(client, db, tmp_pa
 
 @pytest.mark.asyncio
 async def test_scope_settings_read_definitions_and_audit_history(client, db, tmp_path):
+    from app.services import factory_audit_service as audit
+
     _, scope = await _scope(db, tmp_path / "settings-repo")
     _, other = await _scope(db, tmp_path / "other-settings-repo")
     scope_id, other_scope_id = scope.id, other.id
     path = f"/api/v1/agent-teams/github-scopes/{scope_id}"
+    other_path = f"/api/v1/agent-teams/github-scopes/{other_scope_id}"
     assert (await client.get(f"{path}/settings")).status_code == 401
     response = await client.get(f"{path}/settings", headers=OPERATOR_HEADERS)
     assert response.status_code == 200
@@ -194,9 +197,43 @@ async def test_scope_settings_read_definitions_and_audit_history(client, db, tmp
     assert (event.scope_id, event.source) == (scope_id, "agent_teams.update_github_scope")
     assert event.before_values["max_item_effort_minutes"] == 120
     assert event.after_values["max_item_effort_minutes"] == 45
-    other_history = await client.get(
-        f"/api/v1/agent-teams/github-scopes/{other_scope_id}/settings", headers=OPERATOR_HEADERS)
-    assert other_history.json()["history"] == []
+
+    other_update = await client.patch(
+        other_path, headers=OPERATOR_HEADERS, json={"max_item_effort_minutes": 60},
+    )
+    assert other_update.status_code == 200
+
+    before = {"max_item_effort_minutes": 45}
+    after = {"max_item_effort_minutes": 90}
+    for source, outcome in (
+        ("agent_teams.update_github_scope_continuation_policy", "applied"),
+        ("agent_teams.update_github_scope", "rejected"),
+    ):
+        ignored = await audit.record_event(
+            db,
+            event_kind="policy_change",
+            source=source,
+            occurred_at=datetime.now(timezone.utc),
+            actor=audit.derive_actor(actor_kind="operator"),
+            scope_id=scope_id,
+            before_values=before,
+            after_values=after,
+            action_outcome=outcome,
+        )
+        assert (ignored.before_values, ignored.after_values) == (before, after)
+    await db.commit()
+
+    scope_history = await client.get(f"{path}/settings", headers=OPERATOR_HEADERS)
+    assert scope_history.status_code == 200
+    assert [entry["event_id"] for entry in scope_history.json()["history"]] == [
+        latest["event_id"], first["event_id"],
+    ]
+    other_history = await client.get(f"{other_path}/settings", headers=OPERATOR_HEADERS)
+    assert other_history.status_code == 200
+    other_entry, = other_history.json()["history"]
+    assert other_entry["changes"] == {
+        "max_item_effort_minutes": {"before": 120, "after": 60},
+    }
 
 
 @pytest.mark.asyncio
