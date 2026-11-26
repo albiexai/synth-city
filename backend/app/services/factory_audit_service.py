@@ -42,6 +42,7 @@ SAFE_VALUE_FIELDS = {
     # templates are free text that can hold commands; they stay excluded.
     "max_approval_rounds", "max_concurrent_dispatched", "max_verification_retries",
     "max_auto_merges_per_day", "max_build_parallelism", "builds_out_of_tree",
+    "max_item_effort_minutes", "review_hold_label", "github_auth_mode",
     "supervisor_actor_id", "supervisor_grace_seconds", "supervisor_status",
     "origin_kind", "previous_scope_revision", "review_id", "reviewer_member_id",
     "head_sha", "verdict", "outcome",
@@ -63,7 +64,7 @@ SAFE_SNAPSHOT_FIELDS = {
     "repo_owner", "repo_name", "scope_created_at", "scope_updated_at",
     "team_created_at", "team_display_name", "slot_display_name",
     "issue_number", "pr_number", "issue_type", "artifact", "fact_source",
-    "event_time_labels",
+    "event_time_labels", "scope_changed_fields",
     # #945: the session token on an operator write was not usable, so the write is unattributed (a flag, never the token).
     "session_invalid",
     # C06/C12: stable non-secret attempt identities and the retry class.
@@ -213,6 +214,13 @@ def project_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
                     label for label in value
                     if isinstance(label, str) and label in SAFE_SNAPSHOT_FIELDS
                 ]
+            continue
+        if key == "scope_changed_fields":
+            from app.models.schemas import TeamGithubScopeCreate
+
+            fields = TeamGithubScopeCreate.model_fields
+            if isinstance(value, (list, tuple)) and len(value) <= len(fields):
+                safe[key] = sorted({name for name in value if isinstance(name, str) and name in fields})
             continue
         keep, projected = _safe_primitive(value)
         if keep:
