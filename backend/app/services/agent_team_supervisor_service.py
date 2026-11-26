@@ -231,6 +231,9 @@ async def supervisor_checkin(db, actor, preset_id: int, next_check_at: datetime,
     else:
         await db.commit()
     team, team_key = await _team_and_key(db, preset_id)
+    if team is None:
+        # The check-in is committed, and the team was deleted before the response. The caller refreshes (HTTP 409).
+        raise ValueError("supervisor_binding_changed")
     result = supervisor_observation(team, now=current, actor=actor, quiet=await team_needs_no_supervision(db, team),
                                     team_context_key=team_key)
     from app.services.github_team_idle_service import github_team_idle_service

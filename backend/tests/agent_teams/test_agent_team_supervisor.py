@@ -607,3 +607,35 @@ async def test_the_three_observations_read_the_key_in_the_same_statement_as_the_
     separate = [s for s in statements if s.upper().startswith("SELECT") and "FROM factory_context_keys" in s
                 and "FROM agent_team_presets" not in s and "agent_team_presets" not in s.split("FROM factory_context_keys")[0]]
     assert separate == [], separate
+
+
+@pytest.mark.asyncio
+async def test_a_check_in_whose_team_is_deleted_before_the_response_gets_the_defined_refusal(db, supervisor_client, monkeypatch):
+    """V1, #1356: the team can disappear after the check-in commits. The caller gets 409 and refreshes, not a 500."""
+    from fastapi import HTTPException
+    from sqlalchemy import text
+    import app.services.agent_team_supervisor_service as service
+    from app.api.v1.external_agent_mail import checkin_supervisor
+    from app.models.schemas import SupervisorCheckinRequest
+    team, actor = await keyed_team(db)
+    team_id, actor_id = team.id, actor.id
+    await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id})
+    real, calls, committed = service._team_and_key, [], {}
+
+    async def deleting_before_the_final_read(connection, preset_id):
+        calls.append(preset_id)
+        if len(calls) == 2:  # the first call is the observation at the start of the check-in; the second is the final read
+            committed["checked_at"] = (await connection.execute(text(
+                "SELECT supervisor_checked_at FROM agent_team_presets WHERE id = :id"), {"id": preset_id})).scalar_one()
+            await connection.execute(text("DELETE FROM agent_team_presets WHERE id = :id"), {"id": preset_id})
+            await connection.commit()
+        return await real(connection, preset_id)
+
+    monkeypatch.setattr(service, "_team_and_key", deleting_before_the_final_read)
+    actor = await db.get(MailExternalActor, actor_id, populate_existing=True)
+    request = SupervisorCheckinRequest(preset_id=team_id, next_check_at=datetime.now(timezone.utc) + timedelta(hours=1))
+    with pytest.raises(HTTPException) as refusal:
+        await checkin_supervisor(request, actor, db)
+    assert len(calls) == 2
+    assert committed["checked_at"] is not None, "the check-in was committed before the team was deleted"
+    assert refusal.value.status_code == 409 and refusal.value.detail == "supervisor_binding_changed"
