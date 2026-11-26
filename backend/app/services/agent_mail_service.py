@@ -47,6 +47,7 @@ from app.models.schemas import (
     MailSessionResponse,
     MailThreadResponse,
 )
+from app.services import decision_wait_service as decision_waits
 from app.services.agent_bridge.discovery import discover_agent_sessions
 from app.utils import peer_process
 from app.utils.repo_utils import derive_repo_identity
@@ -1602,6 +1603,8 @@ class AgentMailService:
         )
         db.add(message)
         await db.flush()
+        # #1240: a pending request waits on its recipient, in this message's transaction.
+        await decision_waits.record_mail_wait_started(db, message, source="agent_mail_service._send_message")
 
         if request.thread_root_id is not None:
             # Already validated before the row existed: never empty, and any explicit recipient is
@@ -1617,6 +1620,9 @@ class AgentMailService:
             root = await db.get(MailMessage, answer_target_id or request.thread_root_id)
             if root is not None and root.request_status == "pending":
                 root.request_status = "answered"
+                await decision_waits.record_mail_wait_ended(
+                    db, root.id, outcome="answered", answered_by_member_id=request.sender_member_id,
+                    source="agent_mail_service._send_message")
 
         return message, recipients
 
@@ -2679,6 +2685,9 @@ class AgentMailService:
             and message.request_status == "pending"
         ):
             message.request_status = "acknowledged"
+            await decision_waits.record_mail_wait_ended(
+                db, message.id, outcome="acknowledged", answered_by_member_id=member_id,
+                source="agent_mail_service.ack_message")
         if message is not None and message.kind == "answer" and message.thread_root_id:
             root = await db.get(MailMessage, message.thread_root_id)
             if (

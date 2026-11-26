@@ -26,6 +26,7 @@ from app.models.schemas import (
     MailThreadResponse,
     TeamListResponse,
 )
+from app.services import decision_wait_service as decision_waits
 from app.services.agent_mail_service import agent_mail_service
 
 ACTOR_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{2,80}$")
@@ -364,6 +365,11 @@ class ExternalAgentMailService:
         if root.kind not in {"context_request", "handoff"}:
             raise ValueError("Message is not a request")
         if root.request_status in {"pending", "answered"}:
+            if root.request_status == "pending":
+                # #1240: the request ends without an answer from a known member.
+                await decision_waits.record_mail_wait_ended(
+                    db, root.id, outcome="acknowledged",
+                    source="external_agent_mail_service.acknowledge_actor_request")
             root.request_status = "acknowledged"
             await db.commit()
         return await self.request_status(db, actor, root.id)
