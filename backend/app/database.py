@@ -871,6 +871,7 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         ("supervisor_checked_at", "DATETIME"), ("supervisor_next_check_at", "DATETIME"),
         ("supervisor_note", "VARCHAR"), ("supervisor_grace_seconds", "INTEGER"),
         ("supervisor_observed_status", "VARCHAR"),
+        ("supervisor_binding_version", "INTEGER DEFAULT 0 NOT NULL"),
     ):
         if preset_columns and column not in preset_columns:
             await conn.execute(text(f"ALTER TABLE agent_team_presets ADD COLUMN {column} {definition}"))
@@ -921,6 +922,8 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         await conn.execute(
             text("ALTER TABLE team_github_scopes ADD COLUMN max_item_effort_minutes INTEGER DEFAULT 120 NOT NULL")
         )
+    if scope_columns and "max_plan_estimate_minutes" not in scope_columns:
+        await conn.execute(text("ALTER TABLE team_github_scopes ADD COLUMN max_plan_estimate_minutes INTEGER"))
     if scope_columns and "base_ref" not in scope_columns:
         await conn.execute(
             text("ALTER TABLE team_github_scopes ADD COLUMN base_ref VARCHAR DEFAULT 'origin/HEAD' NOT NULL")
@@ -998,6 +1001,8 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN dispatch_priority INTEGER"))
     if work_item_columns and "status_note" not in work_item_columns:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN status_note VARCHAR"))
+    if work_item_columns and "workspace_wait_reason" not in work_item_columns:
+        await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN workspace_wait_reason VARCHAR"))
     if work_item_columns and "checks_unavailable_since" not in work_item_columns:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN checks_unavailable_since DATETIME"))
     if work_item_columns and "checks_unavailable_reason" not in work_item_columns:
@@ -1279,6 +1284,14 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         from app.models.database import _install_context_key_lifetime_ddl
 
         await conn.run_sync(lambda sync_conn: _install_context_key_lifetime_ddl(None, sync_conn))
+        # #1298: every team has an active context key, which names its lifetime. One statement, so it is atomic. A repeat
+        # finds no team without a key. Existing and retired keys are not touched.
+        if await _sqlite_columns(conn, "agent_team_presets"):
+            await conn.execute(text(
+                "INSERT INTO factory_context_keys (key_kind, numeric_id, context_key, created_at) "
+                "SELECT 'team', p.id, 'team:' || p.id || ':' || strftime('%Y%m%d%H%M%S', 'now') || printf('%06d', abs(random()) % 1000000), "
+                "CURRENT_TIMESTAMP FROM agent_team_presets p WHERE NOT EXISTS ("
+                "SELECT 1 FROM factory_context_keys k WHERE k.key_kind = 'team' AND k.numeric_id = p.id AND k.retired_at IS NULL)"))
     # C12: install the stable forward-coverage marker and import the observed
     # work state once. A later run finds the marker and changes nothing.
     audit_columns = await _sqlite_columns(conn, "factory_audit_events")

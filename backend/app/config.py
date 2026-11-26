@@ -2,6 +2,8 @@
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.services.agent_config_settings import AgentConfigSettings, load_agent_config_settings
+
 
 class Settings(BaseSettings):
     """Application settings."""
@@ -34,6 +36,10 @@ class Settings(BaseSettings):
     harness_agent_user: str | None = None
     # The dedicated factory installs the restricted helper and command-scoped sudoers rule.
     team_workspace_trust_helper_enabled: bool = False
+
+    @property
+    def agent_config(self) -> AgentConfigSettings:
+        return load_agent_config_settings()
 
     # Agent Bridge attachment settings
     bridge_attachment_dir: str = "~/.albiex-synth-city/bridge-attachments"

@@ -174,9 +174,31 @@ export interface TeamCampaignSummary {
 }
 
 // The status that the controller derives from the clock and the stored promise (#549).
+export interface SupervisorAddress {
+  actor_id: number
+  address: string
+  display_name?: string | null
+}
+
+// PUT agent-teams/presets/{id}/supervisor. The actor id is always sent: null removes the supervisor.
+// Left out, the grace is unchanged; null returns it to the default; a number sets it.
+export interface SupervisorBindingUpdate {
+  actor_id: number | null
+  grace_seconds?: number | null
+  // The binding version that the operator reviewed. The server refuses the write (409) when the binding has changed since.
+  expected_binding_version?: number
+  // The team context key that the operator reviewed. It comes with the version: a numeric team id can be reused, a key is not.
+  expected_team_context_key?: string
+}
+
 export interface SupervisorObservation {
   status: 'none' | 'healthy' | 'late' | 'absent'
   actor_id: number | null
+  address?: SupervisorAddress | null
+  // Counts the binding writes of the team. Missing on an older server.
+  binding_version?: number
+  // The active context key of the team: it names the team lifetime. Missing on an older server; null means the team has none yet.
+  team_context_key?: string | null
   checked_at: string | null
   next_check_at: string | null
   grace_seconds: number

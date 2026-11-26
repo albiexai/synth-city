@@ -292,3 +292,350 @@ async def test_supervisor_message_refuses_membership_changed_before_insert(db, m
     with pytest.raises(PermissionError, match="supervisor_address_not_bound"):
         await send_supervisor_message(db, session, SupervisorMessageRequest(actor_id=actor_id, body_markdown="Incident."))
     assert (await db.scalars(select(MailMessage))).all() == []
+
+
+# #1298: a binding version and the team context key make an edit apply only to the binding that the operator reviewed.
+DIRECTOR = {"X-Synth-City-Operator-Token": "synthetic-director-token"}
+
+
+def supervisor_path(team_id: int) -> str:
+    return f"/api/v1/agent-teams/presets/{team_id}/supervisor"
+
+
+async def put_supervisor(client, team_id: int, body: dict):
+    return await client.put(supervisor_path(team_id), headers=DIRECTOR, json=body)
+
+
+async def read_supervisor(client, team_id: int) -> dict:
+    return (await client.get(supervisor_path(team_id), headers=DIRECTOR)).json()
+
+
+async def reviewed(client, team_id: int) -> dict:
+    """What a dialog sends: the version and the lifetime of the binding that the operator saw."""
+    now = await read_supervisor(client, team_id)
+    return {"expected_binding_version": now["binding_version"], "expected_team_context_key": now["team_context_key"]}
+
+
+async def keyed_team(db):
+    """An ORM fixture team plus an active context key, as the create path gives it."""
+    from app.services.factory_audit_service import context_key_for
+    team, actor = await supervisor_team(db)
+    await context_key_for(db, "team", team.id)
+    await db.commit()
+    return team, actor
+
+
+async def make_actor(db, key: str) -> int:
+    actor = MailExternalActor(actor_key=key, display_name=key, kind="external_tool",
+                              token_hash=hashlib.sha256(key.encode()).hexdigest())
+    db.add(actor)
+    await db.commit()
+    return actor.id
+
+
+async def make_team(client, name: str) -> int:
+    return (await client.post("/api/v1/agent-teams/presets", headers=DIRECTOR, json={"name": name})).json()["id"]
+
+
+async def raw_team(db, name: str = "Raw", extra: str = "", value: str = "") -> int:
+    from sqlalchemy import text
+    result = await db.execute(text(f"INSERT INTO agent_team_presets (name, created_at, updated_at, autonomy_enabled{extra}) "
+                                   f"VALUES ('{name}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0{value})"))
+    await db.commit()
+    return result.lastrowid
+
+
+@pytest.mark.asyncio
+async def test_version_starts_at_zero_the_team_has_a_key_and_each_write_adds_one_to_the_version(db, supervisor_client):
+    team, actor = await keyed_team(db)
+    team_id, actor_id = team.id, actor.id
+    start = await read_supervisor(supervisor_client, team_id)
+    assert start["binding_version"] == 0 and start["team_context_key"]
+    first = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id})
+    assert first.status_code == 200 and first.json()["binding_version"] == 1
+    assert (await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 120})).json()["binding_version"] == 2
+    removed = await put_supervisor(supervisor_client, team_id, {"actor_id": None})
+    assert removed.json()["binding_version"] == 3 and removed.json()["team_context_key"] == start["team_context_key"]
+
+
+@pytest.mark.asyncio
+async def test_summary_reports_the_version_and_the_lifetime(db, supervisor_client):
+    team, actor = await keyed_team(db)
+    team_id, actor_id = team.id, actor.id
+    await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id})
+    summary = (await supervisor_client.get(f"/api/v1/agent-teams/presets/{team_id}/summary")).json()["supervisor_observation"]
+    assert summary["binding_version"] == 1 and summary["team_context_key"] == (await read_supervisor(supervisor_client, team_id))["team_context_key"]
+
+
+@pytest.mark.asyncio
+async def test_a_matching_pair_is_accepted_and_neither_field_keeps_the_legacy_behaviour(db, supervisor_client):
+    team, actor = await keyed_team(db)
+    team_id, actor_id = team.id, actor.id
+    accepted = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, **await reviewed(supervisor_client, team_id)})
+    assert accepted.status_code == 200 and accepted.json()["binding_version"] == 1
+    legacy = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 90})
+    assert legacy.status_code == 200 and legacy.json()["grace_seconds"] == 90
+
+
+@pytest.mark.asyncio
+async def test_a_stale_version_or_a_wrong_key_is_refused_and_changes_nothing(db, supervisor_client):
+    team, actor = await keyed_team(db)
+    team_id, actor_id = team.id, actor.id
+    old = await reviewed(supervisor_client, team_id)
+    await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 120})
+    stale = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 999, **old})
+    assert stale.status_code == 409 and stale.json()["detail"] == "supervisor_binding_changed"
+    now = await read_supervisor(supervisor_client, team_id)
+    wrong = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 999,
+        "expected_binding_version": now["binding_version"], "expected_team_context_key": now["team_context_key"] + "x"})
+    assert wrong.status_code == 409
+    after = await read_supervisor(supervisor_client, team_id)
+    assert (after["actor_id"], after["grace_seconds"], after["binding_version"]) == (actor_id, 120, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [
+    {"expected_binding_version": 0}, {"expected_team_context_key": "team:1:k"},
+    {"expected_binding_version": None, "expected_team_context_key": "team:1:k"}, {"expected_binding_version": 0, "expected_team_context_key": None},
+    {"expected_binding_version": -1, "expected_team_context_key": "team:1:k"}, {"expected_binding_version": 0, "expected_team_context_key": ""},
+    {"expected_binding_version": "x", "expected_team_context_key": "team:1:k"}, {"expected_binding_version": 0, "expected_team_context_key": 5},
+])
+async def test_the_two_expected_fields_come_together_as_a_whole_number_and_a_key(db, supervisor_client, body):
+    team, actor = await keyed_team(db)
+    team_id, actor_id = team.id, actor.id
+    response = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, **body})
+    assert response.status_code == 422
+    assert (await read_supervisor(supervisor_client, team_id))["binding_version"] == 0
+
+
+@pytest.mark.asyncio
+async def test_old_removal_cannot_remove_a_binding_of_the_same_actor_and_grace(db, supervisor_client):
+    """Remove, then bind the same actor with the same grace: the state looks the same, the version does not."""
+    team, actor = await keyed_team(db)
+    team_id, actor_id = team.id, actor.id
+    await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 60})
+    old = await reviewed(supervisor_client, team_id)
+    assert (await put_supervisor(supervisor_client, team_id, {"actor_id": None})).status_code == 200
+    rebound = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 60})
+    assert rebound.json()["actor_id"] == actor_id and rebound.json()["grace_seconds"] == 60
+    stale = await put_supervisor(supervisor_client, team_id, {"actor_id": None, **old})
+    assert stale.status_code == 409
+    now = await read_supervisor(supervisor_client, team_id)
+    assert (now["actor_id"], now["grace_seconds"], now["binding_version"]) == (actor_id, 60, 3)
+
+
+@pytest.mark.asyncio
+async def test_two_writes_with_one_reviewed_pair_let_only_the_first_win(db, supervisor_client):
+    team, actor = await keyed_team(db)
+    team_id, actor_id = team.id, actor.id
+    await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id})
+    pair = await reviewed(supervisor_client, team_id)
+    first = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 300, **pair})
+    second = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 700, **pair})
+    assert first.status_code == 200 and second.status_code == 409
+    assert (await read_supervisor(supervisor_client, team_id))["grace_seconds"] == 300
+
+
+@pytest.mark.asyncio
+async def test_a_check_in_does_not_change_the_version_or_the_lifetime(db, supervisor_client):
+    from app.services.agent_team_supervisor_service import supervisor_checkin
+    team, actor = await keyed_team(db)
+    team_id = team.id
+    now = datetime(2026, 10, 13, tzinfo=timezone.utc)
+    await put_supervisor(supervisor_client, team_id, {"actor_id": actor.id})
+    before = await reviewed(supervisor_client, team_id)
+    result = await supervisor_checkin(db, actor, team_id, now + timedelta(hours=1), now=now)
+    assert (result["binding_version"], result["team_context_key"]) == (before["expected_binding_version"], before["expected_team_context_key"])
+    assert await reviewed(supervisor_client, team_id) == before
+
+
+@pytest.mark.asyncio
+async def test_omitted_grace_is_unchanged_and_explicit_null_returns_to_the_default(db, supervisor_client):
+    team, actor = await keyed_team(db)
+    team_id, actor_id = team.id, actor.id
+    await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 120})
+    omitted = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, **await reviewed(supervisor_client, team_id)})
+    assert omitted.json()["grace_seconds"] == 120
+    reset = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": None, **await reviewed(supervisor_client, team_id)})
+    assert reset.json()["grace_seconds"] == 1800
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raced", ["supervisor_binding_version", "key_retired"])
+async def test_the_checks_and_the_write_are_one_atomic_step(db, supervisor_client, monkeypatch, raced):
+    """A change that lands between the read and the update of a request makes that update match no row."""
+    from sqlalchemy import update as sql_update
+    team, actor = await keyed_team(db)
+    team_id, actor_id = team.id, actor.id
+    await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 60})
+    pair = await reviewed(supervisor_client, team_id)
+    execute = db.execute
+    fired = False
+
+    async def racing(statement, *args, **kwargs):
+        nonlocal fired
+        if not fired and getattr(statement, "is_update", False):
+            fired = True
+            if raced == "key_retired":
+                from sqlalchemy import text
+                await execute(text("UPDATE factory_context_keys SET retired_at = CURRENT_TIMESTAMP "
+                                   "WHERE key_kind = 'team' AND numeric_id = :id AND retired_at IS NULL"), {"id": team_id})
+            else:
+                await execute(sql_update(AgentTeamPreset).where(AgentTeamPreset.id == team_id)
+                              .values(supervisor_binding_version=AgentTeamPreset.supervisor_binding_version + 1000))
+        return await execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, "execute", racing)
+    response = await put_supervisor(supervisor_client, team_id, {"actor_id": None, **pair})
+    assert fired
+    assert response.status_code == 409 and response.json()["detail"] == "supervisor_binding_changed"
+    monkeypatch.setattr(db, "execute", execute)
+    now = await read_supervisor(supervisor_client, team_id)
+    assert (now["actor_id"], now["grace_seconds"]) == (actor_id, 60)
+
+
+@pytest.mark.asyncio
+async def test_the_database_gives_a_raw_insert_version_zero_and_refuses_an_explicit_null(db, supervisor_client):
+    """The version column is NOT NULL with DEFAULT 0: a raw insert that omits it reads as 0, and a NULL cannot be stored."""
+    from sqlalchemy import text
+    from sqlalchemy.exc import IntegrityError
+    team, _actor = await supervisor_team(db)
+    team_id = team.id
+    assert (await read_supervisor(supervisor_client, await raw_team(db)))["binding_version"] == 0
+    with pytest.raises(IntegrityError):
+        await db.execute(text("UPDATE agent_team_presets SET supervisor_binding_version = NULL WHERE id = :id"), {"id": team_id})
+        await db.commit()
+    await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_a_stale_removal_from_a_deleted_team_cannot_clear_the_team_that_reuses_its_id(db, supervisor_client):
+    """V1, #1356: SQLite reuses a numeric team id, so the lifetime must tell the team lifetimes apart."""
+    actor_id = await make_actor(db, "lifetime-a")
+    first_id = await make_team(supervisor_client, "First lifetime")
+    await put_supervisor(supervisor_client, first_id, {"actor_id": actor_id, "grace_seconds": 60})
+    old = await reviewed(supervisor_client, first_id)
+    assert (await supervisor_client.delete(f"/api/v1/agent-teams/presets/{first_id}", headers=DIRECTOR)).status_code == 204
+    second_id = await make_team(supervisor_client, "Second lifetime")
+    assert second_id == first_id, "the test needs SQLite to reuse the numeric team id"
+    await put_supervisor(supervisor_client, second_id, {"actor_id": actor_id, "grace_seconds": 60})
+    now = await reviewed(supervisor_client, second_id)
+    assert now["expected_binding_version"] == old["expected_binding_version"], "same version in both lifetimes"
+    assert now["expected_team_context_key"] != old["expected_team_context_key"]
+    stale = await put_supervisor(supervisor_client, second_id, {"actor_id": None, **old})
+    assert stale.status_code == 409 and stale.json()["detail"] == "supervisor_binding_changed"
+    after = await read_supervisor(supervisor_client, second_id)
+    assert (after["actor_id"], after["grace_seconds"]) == (actor_id, 60)
+
+
+@pytest.mark.asyncio
+async def test_a_stale_bind_from_a_deleted_unbound_team_cannot_bind_the_team_that_reuses_its_id(db, supervisor_client):
+    actor_id = await make_actor(db, "lifetime-b")
+    first_id = await make_team(supervisor_client, "First")
+    old = await reviewed(supervisor_client, first_id)
+    assert (await supervisor_client.delete(f"/api/v1/agent-teams/presets/{first_id}", headers=DIRECTOR)).status_code == 204
+    second_id = await make_team(supervisor_client, "Second")
+    assert second_id == first_id
+    assert (await reviewed(supervisor_client, second_id))["expected_binding_version"] == old["expected_binding_version"]
+    stale = await put_supervisor(supervisor_client, second_id, {"actor_id": actor_id, **old})
+    assert stale.status_code == 409
+    assert (await read_supervisor(supervisor_client, second_id))["actor_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_team_without_a_key_shows_null_and_refuses_a_protected_write(db, supervisor_client):
+    team, actor = await supervisor_team(db)  # an ORM fixture: no create path, no event, so no key
+    team_id, actor_id = team.id, actor.id
+    assert (await read_supervisor(supervisor_client, team_id))["team_context_key"] is None
+    refused = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "expected_binding_version": 0,
+                                                                "expected_team_context_key": "team:1:made-up"})
+    assert refused.status_code == 409
+    assert (await read_supervisor(supervisor_client, team_id))["actor_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_create_and_duplicate_paths_give_each_team_its_own_active_key(db, supervisor_client):
+    created = await make_team(supervisor_client, "Api")
+    copy = (await supervisor_client.post(f"/api/v1/agent-teams/presets/{created}/duplicate", headers=DIRECTOR, json={"name": "Copy"})).json()["id"]
+    keys = [(await read_supervisor(supervisor_client, team_id))["team_context_key"] for team_id in (created, copy)]
+    assert all(keys) and keys[0] != keys[1]
+    assert all(key.startswith(f"team:{team_id}:") for key, team_id in zip(keys, (created, copy)))
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_team_retires_its_key_and_the_recreated_team_gets_another(db, supervisor_client):
+    from sqlalchemy import select
+    from app.models.database import FactoryContextKey
+    first_id = await make_team(supervisor_client, "First")
+    old = (await read_supervisor(supervisor_client, first_id))["team_context_key"]
+    assert (await supervisor_client.delete(f"/api/v1/agent-teams/presets/{first_id}", headers=DIRECTOR)).status_code == 204
+    retired = (await db.scalars(select(FactoryContextKey.retired_at).where(FactoryContextKey.context_key == old))).first()
+    assert retired is not None
+    second_id = await make_team(supervisor_client, "Second")
+    assert second_id == first_id
+    assert (await read_supervisor(supervisor_client, second_id))["team_context_key"] not in (None, old)
+
+
+@pytest.mark.asyncio
+async def test_the_three_observations_read_the_key_in_the_same_statement_as_the_team(db, supervisor_client):
+    """V1, #1356: a separate key lookup lets a replacement team's key meet the old team's supervisor."""
+    from sqlalchemy import event
+    from app.services.agent_team_supervisor_service import supervisor_checkin
+    team, actor = await keyed_team(db)
+    team_id, actor_id = team.id, actor.id
+    await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id})
+    now = datetime.now(timezone.utc)  # the real clock: the status stays healthy, so the reads write no event
+    await supervisor_checkin(db, actor, team_id, now + timedelta(hours=1), now=now)  # records the one status event
+    expected = (await read_supervisor(supervisor_client, team_id))["team_context_key"]
+    statements: list[str] = []
+    bind = db.get_bind()
+    engine = getattr(bind, "sync_engine", bind)
+
+    def capture(_conn, _cursor, statement, *_rest):
+        statements.append(" ".join(statement.split()))
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        read = await read_supervisor(supervisor_client, team_id)
+        summary = (await supervisor_client.get(f"/api/v1/agent-teams/presets/{team_id}/summary")).json()["supervisor_observation"]
+        actor = await db.get(MailExternalActor, actor_id, populate_existing=True)
+        checkin = await supervisor_checkin(db, actor, team_id, now + timedelta(hours=2), now=now + timedelta(seconds=1))
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert read["team_context_key"] == summary["team_context_key"] == checkin["team_context_key"] == expected
+    # The key is a column of the statement that reads the team. A statement that reads only the keys is a second read.
+    separate = [s for s in statements if s.upper().startswith("SELECT") and "FROM factory_context_keys" in s
+                and "FROM agent_team_presets" not in s and "agent_team_presets" not in s.split("FROM factory_context_keys")[0]]
+    assert separate == [], separate
+
+
+@pytest.mark.asyncio
+async def test_a_check_in_whose_team_is_deleted_before_the_response_gets_the_defined_refusal(db, supervisor_client, monkeypatch):
+    """V1, #1356: the team can disappear after the check-in commits. The caller gets 409 and refreshes, not a 500."""
+    from fastapi import HTTPException
+    from sqlalchemy import text
+    import app.services.agent_team_supervisor_service as service
+    from app.api.v1.external_agent_mail import checkin_supervisor
+    from app.models.schemas import SupervisorCheckinRequest
+    team, actor = await keyed_team(db)
+    team_id, actor_id = team.id, actor.id
+    await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id})
+    real, calls, committed = service._team_and_key, [], {}
+
+    async def deleting_before_the_final_read(connection, preset_id):
+        calls.append(preset_id)
+        if len(calls) == 2:  # the first call is the observation at the start of the check-in; the second is the final read
+            committed["checked_at"] = (await connection.execute(text(
+                "SELECT supervisor_checked_at FROM agent_team_presets WHERE id = :id"), {"id": preset_id})).scalar_one()
+            await connection.execute(text("DELETE FROM agent_team_presets WHERE id = :id"), {"id": preset_id})
+            await connection.commit()
+        return await real(connection, preset_id)
+
+    monkeypatch.setattr(service, "_team_and_key", deleting_before_the_final_read)
+    actor = await db.get(MailExternalActor, actor_id, populate_existing=True)
+    request = SupervisorCheckinRequest(preset_id=team_id, next_check_at=datetime.now(timezone.utc) + timedelta(hours=1))
+    with pytest.raises(HTTPException) as refusal:
+        await checkin_supervisor(request, actor, db)
+    assert len(calls) == 2
+    assert committed["checked_at"] is not None, "the check-in was committed before the team was deleted"
+    assert refusal.value.status_code == 409 and refusal.value.detail == "supervisor_binding_changed"

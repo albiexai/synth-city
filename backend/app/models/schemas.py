@@ -1988,6 +1988,10 @@ class SupervisorObservation(BaseModel):
     checked_at: datetime | None
     next_check_at: datetime | None
     grace_seconds: int = Field(ge=1)
+    # Counts the binding writes of the team. An older server does not send it.
+    binding_version: int = Field(default=0, ge=0)
+    # The active context key of the team: it names the team lifetime. Null means the team has none yet: a protected write is refused.
+    team_context_key: str | None = None
     note: str | None
     attention: Literal["Supervisor check-in overdue"] | None
     team_idle: list[TeamIdleItem] = Field(default_factory=list)
@@ -1998,6 +2002,20 @@ class SupervisorBindingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     actor_id: int | None = Field(..., gt=0)
     grace_seconds: int | None = Field(default=None, ge=1)
+    # Omitted: the write is not checked. Given: the write applies only to this binding version (409 otherwise).
+    expected_binding_version: int | None = Field(default=None, ge=0, strict=True)
+    # The context key of the team that the caller reviewed. It comes with the version, so an old reviewed state cannot
+    # reach a different team that reuses the numeric id.
+    expected_team_context_key: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _the_expected_pair_comes_together_as_whole_numbers(self):
+        given = [name for name in ("expected_binding_version", "expected_team_context_key") if name in self.model_fields_set]
+        if any(getattr(self, name) is None for name in given):
+            raise ValueError("expected_binding_version must be a whole number and expected_team_context_key a text")
+        if given and len(given) != 2:
+            raise ValueError("expected_binding_version and expected_team_context_key come together")
+        return self
 
 
 class SupervisorCheckinRequest(BaseModel):
@@ -2793,6 +2811,7 @@ class GithubAttemptDeliveryPolicyUpdate(BaseModel):
 _PositiveScopeCount = Annotated[int, Field(ge=1)]
 _NonnegativeScopeCount = Annotated[int, Field(ge=0)]
 _ScopeEffortMinutes = Annotated[int, Field(ge=15, le=1440)]
+DEFAULT_PLAN_ESTIMATE_MINUTES = 60
 
 
 class TeamGithubScopeCreate(BaseModel):
@@ -2808,6 +2827,10 @@ class TeamGithubScopeCreate(BaseModel):
     max_verification_retries: _NonnegativeScopeCount = 2
     max_auto_merges_per_day: _NonnegativeScopeCount = 5
     max_item_effort_minutes: _ScopeEffortMinutes = 120
+    max_plan_estimate_minutes: _ScopeEffortMinutes = Field(
+        DEFAULT_PLAN_ESTIMATE_MINUTES,
+        description="The initial plan limit. The default is capped by the item effort ceiling.",
+    )
     base_ref: str = "origin/HEAD"
     github_auth_mode: Literal["unknown", "ambient", "app"] = "unknown"
     builds_out_of_tree: bool = False
@@ -2830,6 +2853,7 @@ class TeamGithubScopeUpdate(BaseModel):
     max_verification_retries: _NonnegativeScopeCount | None = None
     max_auto_merges_per_day: _NonnegativeScopeCount | None = None
     max_item_effort_minutes: _ScopeEffortMinutes | None = None
+    max_plan_estimate_minutes: _ScopeEffortMinutes | None = None
     base_ref: Optional[str] = None
     github_auth_mode: Optional[Literal["unknown", "ambient", "app"]] = None
     builds_out_of_tree: Optional[bool] = None
@@ -2893,6 +2917,7 @@ class TeamGithubScopeResponse(BaseModel):
     max_verification_retries: int
     max_auto_merges_per_day: int
     max_item_effort_minutes: int = 120
+    max_plan_estimate_minutes: int = DEFAULT_PLAN_ESTIMATE_MINUTES
     auto_merges_last_24h: Optional[int] = None
     base_ref: str
     builds_out_of_tree: bool
@@ -2992,6 +3017,27 @@ class GithubWorkspaceListResponse(BaseModel):
     workspaces: List[GithubWorkspaceResponse] = Field(default_factory=list)
 
 
+class GithubWorkspaceReadiness(BaseModel):
+    workspace_id: int
+    path: str
+    kind: str
+    state: Literal["free", "leased", "blocked", "missing"]
+    reason: str | None = None
+    leased_issue_number: int | None = None
+
+
+class GithubWorkspaceWaitingItem(BaseModel):
+    work_item_id: int
+    issue_number: int
+    reason: str
+
+
+class GithubWorkspaceReadinessResponse(BaseModel):
+    scope_id: int
+    workspaces: list[GithubWorkspaceReadiness]
+    waiting_items: list[GithubWorkspaceWaitingItem]
+
+
 class GithubCredentialRequest(BaseModel):
     workspace_token: str
     protocol: str
@@ -3048,6 +3094,7 @@ class GithubWorkItemResponse(BaseModel):
     issue_type: str
     dispatch_status: str
     pending_reason: Optional[str] = None
+    workspace_wait_reason: str | None = None
     launch_id: Optional[int] = None
     owner_slot_id: Optional[int] = None
     routing_method: Optional[str] = None

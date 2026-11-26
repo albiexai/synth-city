@@ -44,6 +44,9 @@ _FIELDS = {
     "max_failed_heads_invalid": "max_failed_heads",
     "plan_allowed_paths_missing": "plan_metadata.allowed_paths",
     "plan_metadata_reserved_key": "plan_metadata",
+    "plan_estimate_exceeds_limit": "plan_metadata.estimate_active_minutes",
+    "effort_estimate_exceeds_ceiling": "plan_metadata.estimate_active_minutes",
+    "effort_estimate_invalid": "plan_metadata.estimate_active_minutes",
     "estimate_invalid": "estimate_active_minutes",
     "estimate_exceeds_window": "estimate_active_minutes",
     "estimate_near_window": "estimate_active_minutes",
@@ -462,6 +465,12 @@ def preflight(
         result.problems += initial_plan_problems(summary, plan_metadata)
         listed = _service().github_approval_service.initial_plan_paths(plan_metadata)
         paths_named = listed
+        from app.services.github_effort_limit_service import EffortLimitError, effort_limit_service
+
+        try:
+            effort_limit_service.initial_plan_limit(plan_metadata, scope)
+        except EffortLimitError as exc:
+            result.problems.append(problem(exc.code, exc.status_code, message=str(exc)))
     elif kind == "continuation":
         result.problems += continuation_header(phase, execution_target, summary)
         problems, normalized = continuation_body(

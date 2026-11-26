@@ -9,7 +9,7 @@ The E2E journeys drive the built Deck UI in Chromium against one isolated Deck i
 | Journey | One Playwright test in `e2e/<gate>/*.spec.ts`. |
 | Gate | A milestone check, for example `g0`. The directory name is the gate. |
 | `@active` | A journey that must pass. The required `e2e` CI job runs it. |
-| `@pending` | A journey for work that is not merged yet. The `e2e-pending` job runs it and reports progress. It does not block a merge. |
+| `@pending` | A journey under development. Run the optional `pending` lane to see its results. |
 | Instance | The backend and the built UI that `scripts/e2e-instance.sh` starts. |
 
 ## The isolated instance
@@ -105,6 +105,19 @@ E2E_REUSE_INSTANCE=1 npx playwright test e2e/g0/routes.spec.ts --headed
 Without the same `E2E_RUN_TOKEN`, the journeys refuse the running instance.
 
 After a failure, open the trace: `npx playwright show-trace test-results/<journey>/trace.zip`.
+
+### Optional hosted diagnostics
+
+Run **E2E diagnostics** in GitHub Actions on the branch you want to check. Select `pending` for the pending journeys or `flicker-loop` for 20 repetitions of the overview journey. GitHub enables manual dispatch once the workflow is present on the default branch.
+
+The **CI queue times** workflow lists queue wait per required job in its run summary. It starts after the source workflow completes and uses the job timestamps for that run attempt. GitHub activates the completion trigger once the report workflow is present on the default branch.
+
+You can also read a completed run attempt directly from the repository root. For an E2E run, set `REPOSITORY`, `RUN_ID` and `RUN_ATTEMPT` to the GitHub run's repository, ID and attempt number.
+
+```bash
+gh api --paginate --slurp "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" \
+  | python3 scripts/ci/required_job_queue_times.py E2E
+```
 
 ## Move a journey from `@pending` to `@active`
 

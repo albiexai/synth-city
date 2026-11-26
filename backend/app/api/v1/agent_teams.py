@@ -89,6 +89,7 @@ from app.models.schemas import (
     GithubWorkspaceForceReleaseRequest,
     GithubWorkspaceForceReleaseResponse,
     GithubWorkspaceListResponse,
+    GithubWorkspaceReadinessResponse,
     GithubWorkspaceResponse,
     MailMessageCreate,
     TeamGithubScopeCreate,
@@ -332,6 +333,7 @@ from app.services.github_app_auth_service import (
     GithubAppUnconfigured,
     github_app_auth_service,
 )
+from app.services.github_workspace_readiness import read_workspace_readiness
 from app.services.github_workspace_service import (
     _RELEASABLE_STATUSES,
     GithubWorkspaceCredentialRevokeError,
@@ -377,7 +379,9 @@ async def update_supervisor(preset_id: int, request: SupervisorBindingRequest,
     from app.services.agent_team_supervisor_service import bind_supervisor
     try:
         return await bind_supervisor(db, preset_id, actor_id=request.actor_id,
-            grace_seconds=request.grace_seconds, set_grace="grace_seconds" in request.model_fields_set)
+            grace_seconds=request.grace_seconds, set_grace="grace_seconds" in request.model_fields_set,
+            expected_binding_version=request.expected_binding_version,
+            expected_team_context_key=request.expected_team_context_key)
     except ValueError as exc:
         code = str(exc)
         raise HTTPException(status_code=409 if code == "supervisor_binding_changed" else 404,
@@ -512,6 +516,7 @@ def _scope_response(
         max_verification_retries=scope.max_verification_retries,
         max_auto_merges_per_day=scope.max_auto_merges_per_day,
         max_item_effort_minutes=scope.max_item_effort_minutes,
+        max_plan_estimate_minutes=effort_limit_service.plan_estimate_limit(scope),
         auto_merges_last_24h=auto_merges_last_24h,
         base_ref=scope.base_ref,
         builds_out_of_tree=scope.builds_out_of_tree,
@@ -715,7 +720,8 @@ async def _scope_identity_in_use(db: AsyncSession, scope_id: int) -> bool:
 _SCOPE_CONFIGURATION_FIELDS = (
     "preset_id", "repo_owner", "repo_name", "repo_path", "dispatch_label", "design_label",
     "merge_policy", "review_hold_label", "max_approval_rounds", "max_concurrent_dispatched", "max_verification_retries",
-    "max_auto_merges_per_day", "max_item_effort_minutes", "base_ref", "builds_out_of_tree", "build_dir_template",
+    "max_auto_merges_per_day", "max_item_effort_minutes", "max_plan_estimate_minutes", "base_ref",
+    "builds_out_of_tree", "build_dir_template",
     "build_command_hint", "max_build_parallelism", "github_auth_mode", "github_app_installation_id",
     "continuation_enabled", "max_continuation_revisions", "max_continuation_failed_heads",
     "max_failed_heads_per_revision", "max_scope_paths", "max_scope_commands", "enabled",
@@ -831,6 +837,11 @@ def _apply_scope_create(
         scope.max_auto_merges_per_day = request.max_auto_merges_per_day
     if request.max_item_effort_minutes is not None:
         scope.max_item_effort_minutes = request.max_item_effort_minutes
+    if "max_plan_estimate_minutes" in request.model_fields_set:
+        scope.max_plan_estimate_minutes = request.max_plan_estimate_minutes
+    if (scope.max_plan_estimate_minutes is not None
+            and scope.max_plan_estimate_minutes > scope.max_item_effort_minutes):
+        raise HTTPException(status_code=422, detail="plan_estimate_limit_exceeds_effort_ceiling")
     if request.base_ref is not None:
         scope.base_ref = _clean_required(request.base_ref, "Base ref")
     if request.github_auth_mode is not None:
@@ -2693,9 +2704,13 @@ async def read_github_scope_settings(
 ):
     from app.services import factory_audit_service as audit
 
-    if await db.get(TeamGithubScope, scope_id) is None:
+    scope = await db.get(TeamGithubScope, scope_id)
+    if scope is None:
         raise HTTPException(status_code=404, detail="GitHub scope not found")
     definition = TeamGithubScopeCreate.model_json_schema()
+    plan_limit = definition["properties"]["max_plan_estimate_minutes"]
+    plan_limit["maximum"] = scope.max_item_effort_minutes
+    plan_limit["default"] = min(plan_limit["default"], scope.max_item_effort_minutes)
     scope_context = await audit.current_context_key(db, "scope", scope_id)
     records = []
     if scope_context is not None:
@@ -3004,6 +3019,21 @@ async def list_github_workspaces(
     return GithubWorkspaceListResponse(
         workspaces=[_workspace_response(workspace) for workspace in workspaces]
     )
+
+
+@router.get(
+    "/github-scopes/{scope_id}/workspaces/readiness",
+    response_model=GithubWorkspaceReadinessResponse,
+)
+async def get_github_workspace_readiness(
+    scope_id: int,
+    _operator: None = Depends(require_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    scope = await db.get(TeamGithubScope, scope_id)
+    if scope is None:
+        raise HTTPException(status_code=404, detail="GitHub scope not found")
+    return await read_workspace_readiness(db, scope)
 
 
 @router.post(

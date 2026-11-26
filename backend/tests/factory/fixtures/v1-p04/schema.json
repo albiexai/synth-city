@@ -378,6 +378,12 @@
               ],
               "title": "Attention"
             },
+            "binding_version": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Binding Version",
+              "type": "integer"
+            },
             "checked_at": {
               "anyOf": [
                 {
@@ -427,6 +433,18 @@
               ],
               "title": "Status",
               "type": "string"
+            },
+            "team_context_key": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Team Context Key"
             },
             "team_idle": {
               "items": {

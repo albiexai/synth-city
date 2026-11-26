@@ -19,6 +19,8 @@ import type {
   GithubRecoveryGate,
   GithubWorkspace,
   ScopeSettingsResponse,
+  SupervisorBindingUpdate,
+  SupervisorObservation,
   TeamGithubContinuationPolicyUpdate,
   TeamGithubScope,
   TeamGithubScopeInput,
@@ -56,6 +58,18 @@ export function createAgentTeamFromMail(input: AgentTeamCreateFromMailRequest, o
 export function createAgentTeamFromBridge(input: AgentTeamCreateFromBridgeRequest, operatorToken: string): Promise<AgentTeamPreset> {
   return apiClient<AgentTeamPreset>('agent-teams/presets/from-agent-bridge', {
     method: 'POST',
+    headers: operatorHeaders(operatorToken),
+    body: JSON.stringify(input),
+  })
+}
+
+export function updateTeamSupervisor(
+  presetId: number,
+  input: SupervisorBindingUpdate,
+  operatorToken: string
+): Promise<SupervisorObservation> {
+  return apiClient<SupervisorObservation>(`agent-teams/presets/${presetId}/supervisor`, {
+    method: 'PUT',
     headers: operatorHeaders(operatorToken),
     body: JSON.stringify(input),
   })

@@ -99,7 +99,7 @@ MAX_AMENDMENT_ADDED_PATHS = 16
 
 
 class GithubApprovalError(ValueError):
-    def __init__(self, detail: str, *, status_code: int = 409):
+    def __init__(self, detail: str | dict[str, str], *, status_code: int = 409):
         self.detail = detail
         self.status_code = status_code
         super().__init__(detail)
@@ -619,22 +619,32 @@ class GithubApprovalService:
                     approved, root, delivery_key=f"github-approval:{approved.id}:request")
                     or item.ack_received_at is None and not history):
                 raise GithubApprovalError("amendment_baseline_unverifiable")
-            metadata = (root.payload or {}).get("plan_metadata") or {}
-            paths = self.initial_plan_paths(metadata)
-            # Only companions the server presented to the Leader are approved. The fingerprint, checked above,
-            # covers the metadata, and the server-rendered Mail body must show the same list. Old opaque
-            # metadata under the same key keeps the authority it always had.
+            try:
+                paths = self.linked_initial_plan_paths(root)
+            except GithubApprovalError as exc:
+                raise GithubApprovalError("amendment_baseline_unverifiable") from exc
             if paths is None:
                 raise GithubApprovalError("amendment_baseline_unverifiable")
-            companions = companion_paths.verified_companions(
-                metadata, (root.payload or {}).get("summary"), root.body_markdown)
-            paths = [*paths, *(companions or [])]
         if not isinstance(paths, list) or not paths or any(not isinstance(path, str) for path in paths):
             raise GithubApprovalError("amendment_baseline_unverifiable")
         paths = self._canonical_paths(paths)
         if any(path.endswith("/") for path in paths):
             raise GithubApprovalError("amendment_closed_file_paths_required")
         return paths
+
+    @classmethod
+    def linked_initial_plan_paths(cls, root: MailMessage) -> list[str] | None:
+        """Read the path authority of a request whose linked Mail fingerprint already matched."""
+        payload = root.payload or {}
+        metadata = payload.get("plan_metadata")
+        if not isinstance(metadata, dict) or not {"allowed_paths", "paths"}.intersection(metadata):
+            return None
+        paths = cls.initial_plan_paths(metadata)
+        if paths is None:
+            raise GithubApprovalError("allowed_paths_invalid", status_code=400)
+        # Only the server-rendered companions presented to the Leader grant authority.
+        companions = companion_paths.verified_companions(metadata, payload.get("summary"), root.body_markdown)
+        return [*paths, *(companions or [])]
 
     @staticmethod
     def base_ref_matches(github_ref, dispatch_base_ref):
@@ -2273,14 +2283,6 @@ class GithubApprovalService:
         owner, leader = await self._current_participants(db, item)
         if owner.id != authenticated_owner_member_id:
             raise GithubApprovalError("not_item_owner", status_code=403)
-        # #938: the estimate becomes the item's effort limit; an estimate over the scope ceiling is refused here,
-        # before anything is written or any request is created.
-        effort_scope = await db.get(TeamGithubScope, item.scope_id)
-        try:
-            effort_limit = effort_limit_service.limit_for_plan(plan_metadata, effort_scope)
-        except EffortLimitError as exc:
-            raise GithubApprovalError(exc.code, status_code=exc.status_code) from exc
-
         if not commit:
             # Serialize the composing API before looking up pending/terminal
             # authority, including an already-linked replay. This also starts
@@ -2313,17 +2315,8 @@ class GithubApprovalService:
             "request_fingerprint": request_fingerprint,
         }
         pending = await self.current_pending(db, item.id)
-        if pending is not None:
-            if self._same_request(pending, **identity):
-                return pending, False
-            if not self._attempt_identity_changed(
-                pending,
-                dispatch_nonce=item.dispatch_nonce,
-                approval_round=item.approval_round_count,
-                owner_member_id=owner.id,
-                leader_member_id=leader.id,
-            ):
-                raise GithubApprovalError("approval_request_already_pending")
+        if pending is not None and self._same_request(pending, **identity):
+            return pending, False
 
         terminal = await self.current_terminal_for_attempt(
             db,
@@ -2333,9 +2326,27 @@ class GithubApprovalService:
             owner_member_id=owner.id,
             leader_member_id=leader.id,
         )
+        if terminal is not None and self._same_request(terminal, **identity):
+            return terminal, False
+
+        # Exact replays return above. Apply the current settings before any new
+        # request can change approval, Mail, or effort state.
+        effort_scope = await db.get(TeamGithubScope, item.scope_id, populate_existing=True)
+        try:
+            effort_limit = effort_limit_service.initial_plan_limit(plan_metadata, effort_scope)
+        except EffortLimitError as exc:
+            detail = {"code": exc.code, "message": str(exc)} if exc.code == "plan_estimate_exceeds_limit" else exc.code
+            raise GithubApprovalError(detail, status_code=exc.status_code) from exc
+
+        if pending is not None and not self._attempt_identity_changed(
+            pending,
+            dispatch_nonce=item.dispatch_nonce,
+            approval_round=item.approval_round_count,
+            owner_member_id=owner.id,
+            leader_member_id=leader.id,
+        ):
+            raise GithubApprovalError("approval_request_already_pending")
         if terminal is not None:
-            if self._same_request(terminal, **identity):
-                return terminal, False
             raise GithubApprovalError("approval_request_already_decided")
 
         if pending is not None:

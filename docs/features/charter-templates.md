@@ -12,6 +12,8 @@ Each template holds the same eight rules. Each rule has a one-line reason, so a 
 
 A plan must fit in the limit. The limit is `{{plan_size_limit}}` active minutes. The Leader decides each plan. If the work is bigger, the Leader asks for numbered split issues. A reviewer flags oversized work to the Leader and does not reject a plan.
 
+Synth City checks the upper estimate at initial plan submission. An estimate above the repository scope's plan limit returns `plan_estimate_exceeds_limit` and suggests splitting the work into smaller issues. The limit defaults to 60 active minutes, capped by the scope's item effort ceiling.
+
 Why: a plan that is too big hides scope and cannot be reviewed in one pass.
 
 ### Light review tier
@@ -69,7 +71,7 @@ A template has six placeholders. A value is filled in only when its source state
 | `{{plan_size_limit}}` | The plan limit in active minutes | The documented default of 60 minutes, clamped to the scope's `max_item_effort_minutes` when that is lower. |
 | `{{supervisor_address}}` | Who to escalate to | The bound supervisor, as its display name and key. It has no value when no supervisor is bound. |
 
-Until the per-scope plan-size limit exists (#1114a), the default of 60 minutes is the only source for `{{plan_size_limit}}`.
+Repository operators can set `max_plan_estimate_minutes` from 15 minutes up to `max_item_effort_minutes`. A scope settings PATCH with `null` restores the inherited limit. The scope's settings history records changes. Existing charter text stays editable, and the charter template presentation has its own follow-up (#1363).
 
 ## Edit and append
 

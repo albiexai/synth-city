@@ -1,0 +1,39 @@
+name: CI queue times
+
+on:
+  workflow_run:
+    workflows: [Backend regression tests, Product CI, Factory source checks, E2E]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  report:
+    name: Report required job queue times
+    if: github.event.workflow_run.event == 'pull_request' || github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - name: Report timings for the completed run attempt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_WORKFLOW: ${{ github.event.workflow_run.name }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          pages="$RUNNER_TEMP/source-job-pages.json"
+          endpoint="repos/$REPOSITORY/actions/runs/$SOURCE_RUN_ID/attempts/$SOURCE_ATTEMPT/jobs?per_page=100"
+          if ! gh api --paginate --slurp "$endpoint" > "$pages"; then
+            printf '[]\n' > "$pages"
+          fi
+          printf '[Source run attempt](%s/%s/actions/runs/%s/attempts/%s)\n\n' \
+            "$GITHUB_SERVER_URL" "$REPOSITORY" "$SOURCE_RUN_ID" "$SOURCE_ATTEMPT" >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/ci/required_job_queue_times.py "$SOURCE_WORKFLOW" < "$pages" >> "$GITHUB_STEP_SUMMARY"

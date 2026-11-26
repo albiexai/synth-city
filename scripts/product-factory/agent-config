@@ -1,4 +1,4 @@
-#!/opt/albiex-synth-city-product/venv/bin/python -I
+#!/usr/bin/python3 -I
 """Run one allowlisted workspace trust request under the factory agent account."""
 from __future__ import annotations
 
@@ -11,8 +11,6 @@ from pathlib import Path
 from types import ModuleType
 from typing import BinaryIO
 
-INSTALL_ROOT = Path("/opt/albiex-synth-city-product")
-WORK_ROOT = Path("/home/deckproductctl/work")
 PROC = Path("/proc")
 MAX_REQUEST_BYTES = 16384
 
@@ -21,18 +19,36 @@ class ConfigBusy(Exception):
     """A Claude Code session may still be using its config."""
 
 
-def agent_home() -> Path:
-    account = pwd.getpwnam("deckproduct")
+def agent_home(agent_user: str) -> Path:
+    account = pwd.getpwnam(agent_user)
     if not account.pw_uid or account.pw_uid != os.getuid() or account.pw_uid != os.geteuid():
         raise ValueError("Refusing to run as another user")
     return Path(account.pw_dir)
 
 
-def load_writer() -> ModuleType:
+def load_install_module(name: str) -> ModuleType:
     # The operator installs the reviewed writer and interpreter under the
     # root-owned install root. Neither the cwd nor the request selects code.
-    sys.path.insert(0, str(INSTALL_ROOT / "libexec"))
-    return importlib.import_module("team_workspace_trust")
+    directory = Path(__file__).resolve().parent
+    if not (directory / f"{name}.py").is_file():
+        raise ImportError("Missing installed agent-config module")
+    sys.path.insert(0, str(directory))
+    return importlib.import_module(name)
+
+
+def load_policy():
+    return load_install_module("agent_config_settings").load_agent_config_settings()
+
+
+def load_writer() -> ModuleType:
+    return load_install_module("team_workspace_trust")
+
+
+def use_install_python(helper: Path) -> None:
+    venv = (helper.parent.parent / "venv").resolve()
+    if Path(sys.prefix).resolve() != venv:
+        python = str(venv / "bin" / "python")
+        os.execv(python, [python, "-I", str(helper)])
 
 
 def no_duplicate_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -87,12 +103,19 @@ def ensure_claude_idle() -> None:
         raise ConfigBusy from exc
 
 
-def main(argv: list[str], stdin: BinaryIO) -> int:
+def main(argv: list[str], stdin: BinaryIO, *, installed: bool = False) -> int:
     try:
         if argv:
             raise ValueError("This command takes no arguments")
+        policy = load_policy()
+        if installed:
+            helper = Path(__file__).resolve()
+            if helper != Path(policy.agent_config_helper_path).resolve():
+                raise ValueError("Installed helper does not match agent-config policy")
+            use_install_python(helper)
         request = read_request(stdin)
-        home = agent_home()
+        home = agent_home(policy.agent_config_agent_user)
+        work_root = Path(policy.agent_config_work_root)
         user_uid = os.getuid()
         writer = load_writer()
         user = writer.NativeUser(home, user_uid, {})
@@ -102,11 +125,11 @@ def main(argv: list[str], stdin: BinaryIO) -> int:
             if guard is not None:
                 guard()
             changed = writer.prepare_workspace_trust(
-                provider, request["folder"], user=user, work_root=WORK_ROOT, before_write=guard)
+                provider, request["folder"], user=user, work_root=work_root, before_write=guard)
         else:
             changed = writer.prepare_dispatch_git_trust(
                 request["folder"], request["repo"], (request["device"], request["inode"]),
-                user=user, work_root=WORK_ROOT)
+                user=user, work_root=work_root)
     except ConfigBusy:
         print(json.dumps({"ok": False, "error": "agent_config_busy"}))
         return 75
@@ -118,4 +141,4 @@ def main(argv: list[str], stdin: BinaryIO) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:], sys.stdin.buffer))
+    sys.exit(main(sys.argv[1:], sys.stdin.buffer, installed=True))

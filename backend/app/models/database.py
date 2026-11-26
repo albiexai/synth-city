@@ -172,6 +172,8 @@ class AgentTeamPreset(Base):
     supervisor_next_check_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     supervisor_note: Mapped[str | None] = mapped_column(String, nullable=True)
     supervisor_grace_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Counts the binding writes of this team. A write that carries the version it reviewed cannot change a newer binding.
+    supervisor_binding_version: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
     supervisor_observed_status: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
@@ -272,6 +274,7 @@ class TeamGithubScope(Base):
     max_verification_retries: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
     max_auto_merges_per_day: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
     max_item_effort_minutes: Mapped[int] = mapped_column(Integer, default=120, server_default="120", nullable=False)
+    max_plan_estimate_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     base_ref: Mapped[str] = mapped_column(String, default="origin/HEAD", nullable=False)
     builds_out_of_tree: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     build_dir_template: Mapped[str | None] = mapped_column(String, default="build", nullable=True)
@@ -387,6 +390,7 @@ class GithubWorkItem(Base):
     # A milestone return gets a new item while its predecessor remains addressable.
     milestone_replaced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     pending_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    workspace_wait_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     dispatch_priority: Mapped[int | None] = mapped_column(Integer, nullable=True)
     launch_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("agent_team_launches.id", ondelete="SET NULL"), nullable=True

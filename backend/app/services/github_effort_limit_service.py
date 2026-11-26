@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.database import GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace, TeamGithubScope
+from app.models.schemas import DEFAULT_PLAN_ESTIMATE_MINUTES
 from app.services import decision_wait_service as decision_waits
 from app.services.github_terminal_revision_service import TERMINAL_ITEMS
 
@@ -58,6 +59,27 @@ def _minutes_text(value) -> str:
 
 
 class GithubEffortLimitService:
+    @staticmethod
+    def plan_estimate_limit(scope) -> int:
+        configured = getattr(scope, "max_plan_estimate_minutes", None)
+        default_or_override = DEFAULT_PLAN_ESTIMATE_MINUTES if configured is None else configured
+        return min(default_or_override, scope.max_item_effort_minutes)
+
+    def initial_plan_limit(self, plan_metadata, scope) -> int | None:
+        """Validate a new plan against both the item ceiling and its plan limit."""
+        effort_limit = self.limit_for_plan(plan_metadata, scope)
+        if effort_limit is None:
+            return None
+        plan_limit = self.plan_estimate_limit(scope)
+        if effort_limit > plan_limit:
+            raise EffortLimitError(
+                "plan_estimate_exceeds_limit", status_code=400,
+                message=(f"The estimate exceeds this scope's {plan_limit}-minute plan limit "
+                         f"(max_plan_estimate_minutes). Split the issue into parts estimated "
+                         f"at {plan_limit} active minutes or less."),
+            )
+        return effort_limit
+
     def limit_for_plan(self, plan_metadata, scope) -> int | None:
         """The effort limit a plan's estimate asks for, or ``None`` when it states no estimate.
 

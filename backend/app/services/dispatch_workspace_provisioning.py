@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.database import GithubWorkspace, TeamGithubScope
-from app.services.agent_config_client import FACTORY_WORK_ROOT, prepare_dispatch_git_trust_via_helper
+from app.services.agent_config_client import prepare_dispatch_git_trust_via_helper
 from app.services.github_coordination_service import hold_code
 from app.services.github_workspace_service import GithubWorkspaceError, GithubWorkspaceService, github_workspace_service
 from app.services.team_workspace_trust import NativeUser, prepare_dispatch_git_trust
@@ -168,12 +168,14 @@ async def prepare_dispatch_workspace_trust(repo: Path, destination: Path, identi
         if not agent_name or pwd.getpwnam(agent_name).pw_uid == os.geteuid():
             # An owned checkout is already trusted on a single-user installation.
             return
-        if (agent_name != "deckproduct" or not settings.team_workspace_trust_helper_enabled
-                or not destination.is_relative_to(FACTORY_WORK_ROOT)):
-            raise ValueError("The configured agent has no fixed Git trust helper")
+        policy = settings.agent_config
+        work_root = Path(policy.agent_config_work_root)
+        if (agent_name != policy.agent_config_agent_user or not settings.team_workspace_trust_helper_enabled
+                or not destination.is_relative_to(work_root)):
+            raise ValueError("The configured agent has no Git trust helper for this workspace")
         user = NativeUser(Path(pwd.getpwuid(os.geteuid()).pw_dir), os.geteuid(), {})
         await asyncio.to_thread(prepare_dispatch_git_trust, str(destination), str(repo), identity,
-                                user=user, work_root=FACTORY_WORK_ROOT)
+                                user=user, work_root=work_root)
         await asyncio.to_thread(prepare_dispatch_git_trust_via_helper, str(destination), str(repo), identity)
     except (KeyError, OSError, ValueError) as exc:
         raise GithubWorkspaceError("Exact Git trust could not be verified for both users",
