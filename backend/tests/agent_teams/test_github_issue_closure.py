@@ -9,7 +9,8 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.database import Base
-from app.models.database import AgentTeamPreset, GithubWorkItem, TeamGithubScope
+from app.models.database import AgentTeamPreset, GithubIssueClosure, GithubWorkItem, TeamGithubScope
+from app.services.github_client import GithubClientResponseError
 from app.services.github_verification_service import github_verification_service
 
 
@@ -91,8 +92,6 @@ async def poll(sessions, scope_id, client):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("lost_response", ["comment", "close"])
 async def test_lost_response_and_next_poll_cannot_duplicate_remote_writes(job, lost_response):
-    from app.models.database import GithubIssueClosure
-
     sessions, scope_id, item_id = job
     remote = Github(lose=lost_response)
     await poll(sessions, scope_id, remote)
@@ -113,6 +112,25 @@ async def test_lost_response_and_next_poll_cannot_duplicate_remote_writes(job, l
 
 
 @pytest.mark.asyncio
+async def test_repeated_merge_record_preserves_completed_closure(job):
+    sessions, scope_id, item_id = job
+    remote = Github()
+    await poll(sessions, scope_id, remote)
+
+    async with sessions.begin() as db:
+        closure = await db.get(GithubIssueClosure, item_id)
+        assert closure.completed_at is not None
+        completed_at, next_attempt_at = closure.completed_at, closure.next_attempt_at
+        item = await db.get(GithubWorkItem, item_id)
+        await github_verification_service._mark_merged_with_fact(db, item, {"number": 5}, source="closure-test")
+        await db.flush()
+        assert (closure.completed_at, closure.next_attempt_at) == (completed_at, next_attempt_at)
+
+    await poll(sessions, scope_id, remote)
+    assert len(remote.comments) == remote.closed == 1
+
+
+@pytest.mark.asyncio
 async def test_another_poll_cannot_write_while_first_poll_owns_the_claim(job):
     sessions, scope_id, _ = job
     remote = Github()
@@ -129,7 +147,7 @@ async def test_another_poll_cannot_write_while_first_poll_owns_the_claim(job):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["item", "scope", "hold"])
+@pytest.mark.parametrize("changed", ["item", "scope", "hold", "disabled", "different_pr", "different_repository"])
 async def test_a_change_before_the_comment_blocks_writes(job, monkeypatch, changed):
     from app.services import github_issue_closure_service
 
@@ -141,14 +159,85 @@ async def test_a_change_before_the_comment_blocks_writes(job, monkeypatch, chang
                 monkeypatch.setattr(github_issue_closure_service, "hold_code", lambda: "hold")
             else:
                 async with sessions.begin() as db:
-                    if changed == "item":
-                        (await db.get(GithubWorkItem, item_id)).dispatch_status = "verifying"
+                    if changed in {"item", "different_pr"}:
+                        item = await db.get(GithubWorkItem, item_id)
+                        if changed == "item":
+                            item.dispatch_status = "verifying"
+                        else:
+                            item.pr_number = 6
                     else:
-                        (await db.get(TeamGithubScope, scope_id)).merge_policy = "human"
+                        scope = await db.get(TeamGithubScope, scope_id)
+                        if changed == "disabled":
+                            scope.enabled = False
+                        elif changed == "different_repository":
+                            scope.repo_name = "other"
+                        else:
+                            scope.merge_policy = "human"
             return []
 
     remote = StateChange()
     await poll(sessions, scope_id, remote)
+    assert remote.comments == []
+    assert remote.closed == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["replacement", "completion"])
+async def test_existing_comment_does_not_allow_closing_after_claim_changes(job, changed):
+    sessions, scope_id, item_id = job
+    changed_claim = False
+
+    class ClaimChanged(Github):
+        async def list_issue_comments(self, owner, repo, number, *, since):
+            nonlocal changed_claim
+            comments = await super().list_issue_comments(owner, repo, number, since=since)
+            now = datetime.utcnow()
+            values = {"next_attempt_at": now + timedelta(hours=1)} if changed == "replacement" else {"completed_at": now}
+            async with sessions.begin() as db:
+                await db.execute(update(GithubIssueClosure).where(GithubIssueClosure.work_item_id == item_id)
+                    .values(**values))
+            changed_claim = True
+            return comments
+
+    remote = ClaimChanged()
+    merge_sha = "a" * 40
+    note = f"Delivered in PR #5 at merge commit `{merge_sha}`.\n\n<!-- deck:issue-closure:5:{merge_sha} -->"
+    remote.comments = [{"body": note}]
+
+    await poll(sessions, scope_id, remote)
+
+    assert changed_claim
+    assert remote.comments == [{"body": note}]
+    assert remote.closed == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence", [
+    {"number": 6},
+    {"base": {"repo": {"full_name": "o/other"}}},
+    {"state": "open"},
+    {"merged": False},
+    {"merged_at": None},
+    {"merged_at": "not-a-date"},
+    {"merged_at": "2026-11-26T07:00:00"},
+    {"merge_commit_sha": "not-a-commit"},
+], ids=["different-pr", "wrong-repository", "open", "unmerged", "no-merge-time",
+    "invalid-merge-time", "no-timezone", "invalid-merge-sha"])
+async def test_invalid_github_merge_evidence_prevents_remote_writes(job, evidence):
+    from app.services.github_issue_closure_service import _deliver
+
+    sessions, scope_id, item_id = job
+
+    class InvalidMerge(Github):
+        async def get_pull(self, owner, repo, number):
+            return {**(await super().get_pull(owner, repo, number)), **evidence}
+
+    remote = InvalidMerge()
+    async with sessions() as db:
+        closure = await db.get(GithubIssueClosure, item_id)
+        with pytest.raises(GithubClientResponseError, match="GitHub merge"):
+            await _deliver(db, scope_id, item_id, closure.next_attempt_at, remote)
+        assert closure.completed_at is None
     assert remote.comments == []
     assert remote.closed == 0
 

@@ -105,12 +105,14 @@ async def _deliver(db: AsyncSession, scope_id: int, item_id: int, retry_at: date
     return True
 
 
-async def process_issue_closures(db: AsyncSession, scope_id: int, client: GithubClient) -> None:
+async def process_issue_closures(
+    db: AsyncSession, scope_id: int, client: GithubClient, *, due_before: datetime | None = None,
+) -> None:
     """Claim due jobs before writing to GitHub. A lost reply is reconciled on the next attempt."""
     if hold_code():
         return
     due = _eligible_jobs(scope_id).with_only_columns(GithubIssueClosure.work_item_id).where(
-        GithubIssueClosure.next_attempt_at <= datetime.utcnow())
+        GithubIssueClosure.next_attempt_at < (due_before or datetime.utcnow()))
     item_ids = (await db.scalars(due.order_by(
         GithubIssueClosure.next_attempt_at, GithubIssueClosure.work_item_id).limit(_POLL_LIMIT))).all()
     for item_id in item_ids:

@@ -1094,6 +1094,8 @@ class GithubVerificationService:
         recovery_only_attempt: GithubRecoveryOnlyAttempt | None = None,
     ) -> None:
         client = client or github_client
+        scope_id = scope.id
+        closure_cutoff = datetime.utcnow()
         self.skipped_item_ids = set()
         await self._repair_exhausted_diagnostic_notifications(
             db, scope, recovery_only_attempt=recovery_only_attempt
@@ -1227,23 +1229,23 @@ class GithubVerificationService:
         await self._reconcile_escalated_merges(
             db, scope, client, recovery_only_attempt=recovery_only_attempt
         )
-        if recovery_only_attempt is None and scope.merge_policy == "auto":
+        if recovery_only_attempt is None:
             from app.services.github_issue_closure_service import process_issue_closures
 
             try:
-                await process_issue_closures(db, scope.id, client)
+                await process_issue_closures(db, scope_id, client, due_before=closure_cutoff)
             except GithubRateLimited:
                 raise
             except Exception as exc:
                 await recover_session(db, exc, discard=True)
                 logger.warning("issue_closure_failed error_type=%s", type(exc).__name__)
-            if inspect(scope).expired:
-                await db.refresh(scope)
         # #940: the generated summary comment, only after every decision above has been committed. It reads no gate,
         # changes no status and never raises into the poll.
         try:
             from app.services.github_summary_publication_service import github_summary_publication_service
 
+            if inspect(scope).expired:
+                await db.refresh(scope)
             await github_summary_publication_service.publish_scope(db, scope, client)
         except Exception as exc:
             await recover_session(db, exc, discard=True)

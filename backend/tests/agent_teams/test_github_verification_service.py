@@ -20,6 +20,7 @@ from app.models.database import (
     AgentTeamSlot,
     GithubApprovalRequest,
     GithubAttemptScopeRevision,
+    GithubIssueClosure,
     GithubWorkItem,
     GithubWorkspace,
     MailMessage,
@@ -1691,6 +1692,10 @@ async def test_verification_poll_closes_only_a_committed_auto_code_delivery(
     client.close_issue = AsyncMock(side_effect=assert_committed)
 
     await github_verification_service.process_scope(db, scope, client=client)
+    client.create_issue_comment.assert_not_awaited()
+    client.close_issue.assert_not_awaited()
+    job = await db.get(GithubIssueClosure, item_id)
+    assert (job is not None) is (pull_merged and policy == "auto" and issue_type == "code")
     await github_verification_service.process_scope(db, scope, client=client)
 
     assert client.create_issue_comment.await_count == int(expects_closure)
@@ -3248,6 +3253,11 @@ async def test_auto_merge_success_sets_merged_and_budget_timestamp(db):
     assert item.dispatch_status == "merged"
     assert item.auto_merged_at is not None
     assert client.merge_calls == 1
+    client.create_issue_comment.assert_not_awaited()
+    client.close_issue.assert_not_awaited()
+
+    await github_verification_service.process_scope(db, scope, client=client)
+
     client.create_issue_comment.assert_awaited_once()
     client.close_issue.assert_awaited_once_with("o", "r", 1)
 
