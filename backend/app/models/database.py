@@ -587,6 +587,42 @@ class GithubCheckRunHistory(Base):
     __table_args__ = (Index("ix_github_check_run_history_head", "repository", "head_sha"),)
 
 
+class GithubMergeAttempt(Base):
+    """#1310: one Synth City automatic-merge attempt, committed before the merge call's fences.
+
+    ``attempted`` until its outcome is known: ``merged``, ``refused`` (the call failed, or a fence stopped it after the
+    record) or ``uncertain`` (it may have reached GitHub). An attempt left ``attempted`` (a crash) reads as uncertain.
+    Plain ids, so the history survives the work item's deletion; the scope lifetime key binds it to its scope.
+    """
+
+    __tablename__ = "github_merge_attempts"
+    __table_args__ = (
+        CheckConstraint("status IN ('attempted', 'merged', 'refused', 'uncertain')",
+                        name="ck_github_merge_attempts_status"),
+        Index("ix_github_merge_attempts_pull", "scope_context_key", "pr_number"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scope_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope_context_key: Mapped[str] = mapped_column(String, nullable=False)
+    work_item_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    pr_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    head_sha: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="attempted")
+    reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class GithubMergeAttemptCoverage(Base):
+    """#1310: when merge-attempt recording began; a PR merged before it is unknown, never "outside"."""
+
+    __tablename__ = "github_merge_attempt_coverage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 class GithubCheckRunHistoryCoverage(Base):
     """The installation's forward coverage boundary, independent of its first poll."""
 

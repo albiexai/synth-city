@@ -64,7 +64,19 @@ A closed-without-merge result is a combination of current conditions. It has no 
 
 The watcher reads later results. Each poll reads at most 20 attempts that are unknown or closed without delivery, in turn, with no age limit. When a pull request of such an attempt merged later, the watcher records the delivery on the original attempt, with the attempt's original type and resource lifetime. When the work item was deleted, replaced or moved during the read, nothing is recorded. The watcher never changes a work item for a later result. The metrics read itself never fetches GitHub.
 
-The watcher also records the facts of each merged pull request, once per watched repository scope: lines added and deleted, changed files, commits, and who merged it (`pull_request_facts`). The merge marks them as due in its own transaction, and each poll reads at most 20 due pull requests. A failed read writes nothing and is tried again on a later poll. A value that GitHub did not report is unknown, never zero. `merge_path` is `automatic` only for a merge that Synth City's own automatic merge confirmed; otherwise it is `unknown`. Merges recorded before this version have no facts.
+The watcher also records the facts of each merged pull request, once per watched repository scope: lines added and deleted, changed files, commits, and who merged it (`pull_request_facts`). The merge marks them as due in its own transaction, and each poll reads at most 20 due pull requests. A failed read writes nothing and is tried again on a later poll. A value that GitHub did not report is unknown, never zero. `merge_path` says how a pull request was merged. Merges recorded before this version have no facts.
+
+Synth City records each automatic-merge attempt (`github_merge_attempts`). The attempt is committed before the merge call's existing fences, which stay the last checks before the call. Its outcome is:
+- `merged` when GitHub confirmed the merge;
+- `refused` when GitHub can't have merged: a fence or HOLD stopped it after the record, GitHub answered 4xx, it was rate-limited, or the request was never sent;
+- `uncertain` when it may have reached GitHub: a 5xx, a timeout or lost connection after sending, or an unreadable answer. An attempt left unfinished by a crash reads the same way.
+
+GitHub can prove whether Synth City made a merge, but not whether a person did, because the factory merges with one shared account. So `merge_path` is:
+- `automatic` with a confirmed attempt;
+- `outside` (merged outside Synth City's automatic merge, by a person, GitHub's auto-merge, a bot or a script) with no attempt or only refused ones;
+- `unknown` with an uncertain or unfinished attempt, or for a pull request merged before attempt recording began.
+
+`merged_by` stays beside it as a fact, and nothing is inferred from it.
 
 The watcher completes a work item only through one guarded write. The write requires the same attempt and status that the watcher read, and no pending approval request, live revision or requested retry. If any of these changed, the item stays unchanged and no result is recorded.
 

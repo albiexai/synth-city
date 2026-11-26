@@ -788,7 +788,8 @@ async def record_pull_request_facts(
 
     The pull request is immutable after its merge, so an existing record is returned as it is. A value GitHub did not
     report is null, never zero. ``merge_path`` is ``automatic`` only for a merge that Synth City's own automatic merge
-    confirmed; nothing is inferred from ``merged_by`` or from a missing record.
+    confirmed, ``outside`` for one merged after the attempt recording began with no attempt or only refused ones, and
+    ``unknown`` otherwise (#1310); nothing is inferred from ``merged_by``.
     """
     operation_id = _pull_facts_operation(due.artifact)
     existing = (await db.scalars(select(FactoryAuditEvent).where(
@@ -804,11 +805,18 @@ async def record_pull_request_facts(
     ).limit(1))).first()
     merger = pull.get("merged_by")
     merger = merger if isinstance(merger, dict) else {}
+    # #1310: confirmed attempts, refused or no attempts after the recording began, else unknown.
+    from app.services import github_merge_attempt_service as merge_attempts
+
+    number = pull.get("number")
+    path = "automatic" if automatic is not None else await merge_attempts.merge_path(
+        db, scope_context_key=due.scope_context_key, pr_number=number if type(number) is int else None,
+        merged_at=_parse_time(pull.get("merged_at")))
     values = {
         "additions": _count(pull.get("additions")), "deletions": _count(pull.get("deletions")),
         "changed_files": _count(pull.get("changed_files")), "commit_count": _count(pull.get("commits")),
         "merged_by": _text(merger.get("login")), "merged_by_type": _text(merger.get("type")),
-        "merge_path": "automatic" if automatic is not None else "unknown",
+        "merge_path": path,
     }
     unknown = [name for name in values if values[name] is None]
     return await record_event(

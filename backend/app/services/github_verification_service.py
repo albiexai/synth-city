@@ -43,6 +43,7 @@ from app.services.github_client import (
 )
 from app.services.github_check_history_service import observe_tracked_checks
 from app.services.github_check_observation import GithubCheckObservationError
+from app.services import github_merge_attempt_service as merge_attempts
 from app.services import required_ci_attention
 from app.services.github_ci_watch_service import github_ci_watch_service
 from app.services.github_terminal_revision_service import (
@@ -3150,16 +3151,22 @@ class GithubVerificationService:
         if withdrawn is not None:
             await self._record_readiness_hold(db, item, withdrawn)
             return
+        # #1310: the attempt is durable before the fences, which stay the last checks before the call.
+        attempt_id = await merge_attempts.begin(
+            db, scope_id=scope.id, item_id=item.id, pr_number=int(item.pr_number), head_sha=current_head)
+        await db.commit()
         if fence is not None:
             # The last await before the merge call is this one statement; the HOLD read and the call follow with none.
             if not await db.scalar(select(self._superseded_fence_holds(scope, item, fence))):
                 await db.rollback()
                 await db.refresh(scope)
+                await self._refuse_attempt(db, attempt_id, "authority_changed")
                 logger.info("Authority changed before the superseded-revision merge; nothing was merged")
                 return
             from app.services.github_coordination_service import hold_code
             if hold_code():
                 await db.rollback()
+                await self._refuse_attempt(db, attempt_id, "hold")
                 return
         try:
             await client.merge_pull(
@@ -3168,9 +3175,11 @@ class GithubVerificationService:
                 int(item.pr_number),
                 expected_head_sha=current_head,
             )
-        except GithubRateLimited:
+        except GithubRateLimited as exc:
+            await self._record_attempt_failure(db, attempt_id, exc)
             raise
         except httpx.HTTPStatusError as exc:
+            await self._record_attempt_failure(db, attempt_id, exc)
             status_code = exc.response.status_code
             if status_code in _MERGE_TRANSIENT_STATUS_CODES or status_code >= 500:
                 # Checks can start after the green read and before the merge.
@@ -3189,6 +3198,10 @@ class GithubVerificationService:
                     f"Auto-merge failed with GitHub status {status_code}; requires human merge.",
                 )
             return
+        except BaseException as exc:
+            # Transport, malformed answers or a stop during the call: recorded, then handled as before.
+            await self._record_attempt_failure(db, attempt_id, exc)
+            raise
 
         # The merge response carries no merge time, so the sourced fact time
         # stays unknown (null); the record time is the observation time.
@@ -3196,8 +3209,23 @@ class GithubVerificationService:
             db, item, {"number": item.pr_number},
             source="github_verification_service._process_review_item.auto_merge")
         item.auto_merged_at = datetime.utcnow()
+        await merge_attempts.finish(db, attempt_id, merge_attempts.MERGED, None)
         await db.commit()
         await self._notify_blocker_merged(db, scope, item)
+
+    async def _refuse_attempt(self, db: AsyncSession, attempt_id: int, reason: str) -> None:
+        """#1310: a fence stopped the recorded attempt before the call."""
+        await merge_attempts.finish(db, attempt_id, merge_attempts.REFUSED, reason)
+        await db.commit()
+
+    async def _record_attempt_failure(self, db: AsyncSession, attempt_id: int, error: BaseException) -> None:
+        """#1310: what a failed merge call proves, committed at once: an error that propagates may meet a rollback,
+        and nothing else is pending since the attempt's own commit."""
+        if isinstance(error, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+            return  # a stop during the call: the attempt stays unfinished, which reads as uncertain
+        status, reason = merge_attempts.outcome(error)
+        await merge_attempts.finish(db, attempt_id, status, reason)
+        await db.commit()
 
     async def _capture_superseded_fence(
         self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, head: str | None = None,
