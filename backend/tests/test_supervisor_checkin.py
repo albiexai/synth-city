@@ -127,7 +127,8 @@ def test_a_healthy_team_gives_ok_lines_and_exit_0(serve):
      "attention health"),
     ({"summary": {"hold_code": "hold", "attention": [{"code": "owner_stalled", "issue_number": 5}],
                   "human_actions": [{"kind": "review_pr", "issue_number": 5, "state": "requested"}],
-                  "required_ci_unreadable": [{"issue_number": 5}], "coverage_complete": False}},
+                  "required_ci_unreadable": [{"issue_number": 5}], "coverage_complete": False,
+                  "supervisor_observation": None}},
      "attention summary"),
     ({"overview": {"counts": {"total": 4, "attention": 2}}}, "attention overview"),
     ({"summary": {"hold_code": None, "attention": [], "human_actions": [], "required_ci_unreadable": [],
@@ -142,7 +143,8 @@ def test_a_finding_is_reported_with_exit_1(serve, change, expected):
 def test_the_summary_line_names_the_hold_the_attention_and_the_gaps(serve):
     summary = {"hold_code": "hold", "attention": [{"code": "owner_stalled", "issue_number": 5}],
                "human_actions": [{"kind": "review_pr", "issue_number": 5, "state": "requested"}],
-               "required_ci_unreadable": [{"issue_number": 5}], "coverage_complete": False}
+               "required_ci_unreadable": [{"issue_number": 5}], "coverage_complete": False,
+                  "supervisor_observation": None}
     _, out, _ = run(serve(summary=summary))
     for part in ("hold", "owner_stalled", "review_pr", "unreadable", "coverage"):
         assert part in out
@@ -391,9 +393,17 @@ def test_every_emitted_line_is_printable_whatever_the_server_sends(serve, token_
     ("health", {}),
     ("health", {"status": "ok"}),
     ("health", {"status": "ok", "health": "ok", "reasons": []}),
+    ("health", {"status": "ok", "health": "ok", "open_findings": 0}),
+    ("health", {"status": "ok", "health": "ok", "reasons": "none", "open_findings": 0}),
     ("health", {"status": "ok", "health": "ok", "reasons": [], "open_findings": -1}),
     ("health", {"status": "ok", "health": "ok", "reasons": [], "open_findings": "3"}),
     ("summary", {}),
+    ("summary", {"hold_code": None, "attention": [], "human_actions": [], "coverage_complete": True, "supervisor_observation": None}),
+    ("summary", {"hold_code": None, "attention": [], "human_actions": [], "required_ci_unreadable": {}, "coverage_complete": True, "supervisor_observation": None}),
+    ("summary", {"hold_code": None, "attention": [], "human_actions": [], "required_ci_unreadable": [], "coverage_complete": True}),
+    ("summary", {"hold_code": None, "attention": [], "human_actions": [], "required_ci_unreadable": [], "coverage_complete": True, "supervisor_observation": 5}),
+    ("summary", {"hold_code": None, "attention": ["x"], "human_actions": [], "required_ci_unreadable": [], "coverage_complete": True, "supervisor_observation": None}),
+    ("summary", {"hold_code": None, "attention": [], "human_actions": [], "required_ci_unreadable": ["x"], "coverage_complete": True, "supervisor_observation": None}),
     ("summary", {"hold_code": None, "attention": [], "human_actions": []}),
     ("summary", {"attention": [], "human_actions": [], "coverage_complete": True}),
     ("summary", {"hold_code": 5, "attention": [], "human_actions": [], "coverage_complete": True}),
@@ -482,7 +492,7 @@ def test_a_member_state_the_script_does_not_know_is_reported(serve):
 
 def summary_with(*actions, coverage=True):
     return {"hold_code": None, "attention": [], "human_actions": list(actions), "required_ci_unreadable": [],
-            "coverage_complete": coverage}
+            "coverage_complete": coverage, "supervisor_observation": None}
 
 
 @pytest.mark.parametrize("state", ["waiting_for_prerequisites", "context_pending", "pr_unavailable",
@@ -494,7 +504,7 @@ def test_a_blocked_human_action_is_reported_with_its_issue_and_state(serve, stat
 
 
 def test_a_request_the_operator_can_act_on_is_told_apart_from_a_blocked_one(serve):
-    ready = {"kind": "review_pr", "issue_number": 5, "state": "requested"}
+    ready = {"kind": "review_pr", "issue_number": 5, "state": "requested", "assessment_current": True}
     blocked = {"kind": "merge_pr", "issue_number": 7, "state": "waiting_for_prerequisites"}
     _, out, _ = run(serve(summary=summary_with(ready, blocked)))
     assert "act now: review_pr #5" in out and "blocked: merge_pr #7 waiting_for_prerequisites" in out
@@ -547,3 +557,20 @@ def test_a_token_file_that_is_not_text_is_a_setup_error_and_exit_2(serve, tmp_pa
     fake = serve()
     code, out, err = run(fake, "--supervisor-token-file", str(binary))
     assert code == 2 and fake.seen == [] and "Traceback" not in out + err
+
+
+# --- V2's review of 889c5ab0 (#1116 part 1) ---
+
+def test_a_requested_action_is_act_now_only_when_its_assessment_is_current(serve):
+    current = {"kind": "review_pr", "issue_number": 5, "state": "requested", "assessment_current": True}
+    old = {"kind": "review_pr", "issue_number": 6, "state": "requested", "assessment_current": False}
+    unknown = {"kind": "merge_pr", "issue_number": 7, "state": "requested"}
+    _, out, _ = run(serve(summary=summary_with(current, old, unknown)))
+    assert "act now: review_pr #5" in out and "#6" not in out.split("act now:")[1].split(";")[0]
+    assert "stale: review_pr #6, merge_pr #7" in out
+
+
+def test_a_stale_request_alone_is_never_called_act_now(serve):
+    old = {"kind": "review_pr", "issue_number": 6, "state": "requested", "assessment_current": False}
+    code, out, _ = run(serve(summary=summary_with(old)))
+    assert code == 1 and "stale: review_pr #6" in out and "act now" not in out

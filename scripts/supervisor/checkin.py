@@ -36,13 +36,18 @@ def need(ok, what):
         raise common.StepError(f"the answer has no valid {what}")
 
 
+def is_list_of_objects(value):
+    return isinstance(value, list) and all(isinstance(item, dict) for item in value)
+
+
 def is_count(value):
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def health(data, args):
     need(isinstance(data, dict) and isinstance(data.get("status"), str) and isinstance(data.get("health"), str)
-         and "open_findings" in data and (data["open_findings"] is None or is_count(data["open_findings"])),
+         and "open_findings" in data and (data["open_findings"] is None or is_count(data["open_findings"]))
+         and isinstance(data.get("reasons"), list),
          "status, health and findings count")
     parts = [f"status {data.get('status')}", f"health {data.get('health')}",
              "unknown open findings" if data["open_findings"] is None else f"{data['open_findings']} open findings"]
@@ -55,23 +60,31 @@ def health(data, args):
 def summary(data, args):
     need(isinstance(data, dict) and "hold_code" in data and isinstance(data["hold_code"], (str, type(None)))
          and isinstance(data.get("coverage_complete"), bool)
-         and isinstance(data.get("attention"), list) and isinstance(data.get("human_actions"), list),
-         "hold, coverage, attention and human actions")
+         and is_list_of_objects(data.get("attention")) and is_list_of_objects(data.get("human_actions"))
+         and is_list_of_objects(data.get("required_ci_unreadable"))
+         and "supervisor_observation" in data and isinstance(data["supervisor_observation"], (dict, type(None))),
+         "hold, coverage, attention, human actions, unreadable CI and supervisor observation")
     found = []
     if data.get("hold_code"):
         found.append(f"hold {common.clean(data['hold_code'], 40)}")
     for item in data.get("attention") or []:
         found.append(f"attention {common.clean(item.get('code'), 40)}" + (f" #{item['issue_number']}" if item.get("issue_number") else ""))
-    ready, blocked = [], []
+    ready, stale, blocked = [], [], []
     for item in data["human_actions"]:
         state = item.get("state")
         if state in FINISHED_ACTIONS:
             continue
         label = f"{common.clean(item.get('kind'), 40)} #{common.clean(item.get('issue_number'), 20)}"
-        # Only a request the operator can act on now is "act now". Every other state waits on something else.
-        (ready if state == "requested" else blocked).append(label if state == "requested" else f"{label} {common.clean(state, 40)}")
+        # Only a request with a current assessment is "act now". An old or unknown assessment is "stale". Every other
+        # state waits on something else.
+        if state == "requested":
+            (ready if item.get("assessment_current") is True else stale).append(label)
+        else:
+            blocked.append(f"{label} {common.clean(state, 40)}")
     if ready:
         found.append("human action, act now: " + ", ".join(ready))
+    if stale:
+        found.append("human action, stale: " + ", ".join(stale))
     if blocked:
         found.append("human action, blocked: " + ", ".join(blocked))
     for item in data.get("required_ci_unreadable") or []:
