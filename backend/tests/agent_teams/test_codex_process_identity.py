@@ -30,6 +30,7 @@ def test_resume_refuses_a_different_executable_or_noncanonical_identity():
 @pytest.mark.parametrize(("arguments", "expected"), [
     ([], True),
     ([b"--cd", b"/tmp/repo", b"--no-alt-screen", b"Start work"], True),
+    ([b"--no-alt-screen", b"Start work", b"Extra argument"], False),
     ([b"resume", SESSION.encode()], False),
     ([b"resume", b"--last"], False),
     ([b"fork"], False),

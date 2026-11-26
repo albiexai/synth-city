@@ -543,6 +543,23 @@ def test_codex_first_launch_captures_identity_before_attributing_activity(codex_
     assert f["session_id"] not in observed.model_dump_json()
 
 
+def test_codex_first_launch_rejects_process_replaced_during_discovery(codex_first_launch, monkeypatch):
+    f = codex_first_launch
+    find_rollout = activity._new_codex_rollout
+
+    def replace_process_after_discovery(*args, **kwargs):
+        rollout = find_rollout(*args, **kwargs)
+        assert rollout is not None and rollout.session_id == f["session_id"]
+        monkeypatch.setattr(activity, "_process", lambda pid: ("S", "2000"))
+        return rollout
+
+    monkeypatch.setattr(activity, "_new_codex_rollout", replace_process_after_discovery)
+    provenance = {}
+    observed = activity._observe(2, "codex-cli", None, [f["binding"]], False, f["now"], provenance=provenance)
+    assert (observed.state, observed.reason) == ("unknown", "binding_changed")
+    assert "discovered_session_id" not in provenance
+
+
 @pytest.mark.parametrize("invalid", ["cwd", "old", "future", "uuid", "world_write", "ambiguous"])
 def test_codex_rollout_capture_refuses_invalid_evidence(codex_first_launch, invalid):
     f = codex_first_launch
