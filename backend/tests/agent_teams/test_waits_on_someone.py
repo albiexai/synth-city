@@ -166,3 +166,65 @@ async def test_a_provider_refusal_is_no_input_wait_and_ends_one(db):
     (_start, end) = await _events(db)
     assert end.after_values["wait_outcome"] == "refused"
     assert await _open(db, "input") == []
+
+
+# V1 on d2ded7ae: the episode an observation ends is the one it read
+async def _episode_appears_before(db, monkeypatch, team, slot, binding, marker):
+    """Another observer claims a question between this observation's read and its write."""
+    from sqlalchemy import update
+
+    from app.models.database import AgentPaneBinding
+    original, fired = db.execute, []
+    began = datetime(2026, 11, 26, 0, 0, 0)
+
+    async def interleaved(statement, *args, **kwargs):
+        if not fired and getattr(statement, "is_update", False) and marker in str(statement):
+            fired.append(True)
+            await original(update(AgentPaneBinding).where(AgentPaneBinding.id == binding.id).values(
+                waiting_input_reason="question", waiting_input_started_at=began))
+            await waits.record_input_wait_started(db, preset_id=team.id, slot_id=slot.id, binding_id=binding.id,
+                started_at=began, reason="question", owner_member_id=None, awaited_member_id=None,
+                awaited_actor_id=team.supervisor_actor_id, source="other observer")
+        return await original(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, "execute", interleaved)
+    return fired
+
+
+@pytest.mark.parametrize(("reason", "marker"), [("clear", "waiting_input_notice_id"),
+                                                ("provider_refusal", "waiting_input_started_at=")])
+async def test_an_observation_never_leaves_the_episode_it_replaced_open(db, monkeypatch, reason, marker):
+    team, _actor, slot, binding, _session, _leader = await wait_team(db)
+    fired = await _episode_appears_before(db, monkeypatch, team, slot, binding, marker)
+    await record_wait(db, team, slot, binding, reason)
+    monkeypatch.undo()
+    assert fired
+    await db.refresh(binding)
+    # The binding and the retrospective agree: an open question is still on the screen, or it has ended.
+    assert (binding.waiting_input_reason == "question") == bool(await _open(db, "input"))
+
+
+async def test_a_binding_removed_before_the_write_is_a_stale_observation(db):
+    from sqlalchemy import delete
+
+    from app.models.database import AgentPaneBinding
+    from app.services import agent_activity_service as activity
+    team, _actor, slot, binding, _session, _leader = await wait_team(db)
+    inputs = await activity._team_inputs(db, team.id)
+    metadata = [{"input_wait_known": True, "input_wait_binding_id": binding.id, "input_wait_reason": "question"}
+                if entry[0] == slot.id else {} for entry in inputs]
+    await db.execute(delete(AgentPaneBinding).where(AgentPaneBinding.id == binding.id))
+    await activity._record_input_waits(db, team.id, inputs, metadata, {entry[0]: entry for entry in inputs},
+                                       now=datetime.now(timezone.utc))
+    assert await _events(db) == []
+
+
+@pytest.mark.parametrize(("ending", "outcome"), [("clear", "cleared"), ("provider_refusal", "refused")])
+async def test_an_input_wait_ends_at_the_observation_time(db, ending, outcome):
+    team, _actor, slot, binding, _session, _leader = await wait_team(db)
+    began = datetime(2026, 11, 26, 1, 0, tzinfo=timezone.utc)
+    await record_wait(db, team, slot, binding, "question", now=began)
+    await record_wait(db, team, slot, binding, ending, now=began + timedelta(minutes=30))
+    start, end = await _events(db)
+    assert end.after_values["wait_outcome"] == outcome
+    assert (start.fact_time, end.fact_time) == (datetime(2026, 11, 26, 1, 0), datetime(2026, 11, 26, 1, 30))

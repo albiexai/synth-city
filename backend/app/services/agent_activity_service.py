@@ -766,16 +766,25 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
             AgentPaneBinding.preset_id == preset_id, AgentPaneBinding.pane_pid == binding.pane_pid,
             AgentPaneBinding.pane_proc_start == binding.pane_start, authenticated, active_slot, ~retired,
             or_(AgentPaneBinding.waiting_input_observed_at.is_(None), AgentPaneBinding.waiting_input_observed_at <= now)]
-        # #1240: the episode this observation may end, read before the write replaces it.
-        prior_reason, prior_start = (await db.execute(select(AgentPaneBinding.waiting_input_reason,
-            AgentPaneBinding.waiting_input_started_at).where(AgentPaneBinding.id == binding.binding_id))).one()
+        # #1240: the episode this observation may end, read before the write replaces it. A removed binding is a
+        # stale observation. The writes below compare against this episode, so a concurrent observer's newer
+        # episode is never replaced without its wait ending.
+        prior = (await db.execute(select(AgentPaneBinding.waiting_input_reason,
+            AgentPaneBinding.waiting_input_started_at).where(AgentPaneBinding.id == binding.binding_id))).one_or_none()
+        if prior is None:
+            continue
+        prior_reason, prior_start = prior
         prior_waiting = prior_reason is not None  # a refusal episode has no wait, so it has nothing to end
+        same_episode = [AgentPaneBinding.waiting_input_reason.is_(None) if prior_reason is None
+                        else AgentPaneBinding.waiting_input_reason == prior_reason,
+                        AgentPaneBinding.waiting_input_started_at.is_(None) if prior_start is None
+                        else AgentPaneBinding.waiting_input_started_at == prior_start]
         if reason == "clear":
-            result = await db.execute(update(AgentPaneBinding).where(*conditions).values(waiting_input_reason=None,
+            result = await db.execute(update(AgentPaneBinding).where(*conditions, *same_episode).values(waiting_input_reason=None,
                 waiting_input_started_at=None, waiting_input_notice_id=None, waiting_input_observed_at=now).execution_options(synchronize_session=False))
             if result.rowcount == 1 and prior_waiting:
                 await decision_waits.record_input_wait_ended(db, binding_id=binding.binding_id, started_at=prior_start,
-                    outcome="cleared", source="agent_activity_service._record_input_waits")
+                    outcome="cleared", ended_at=now, source="agent_activity_service._record_input_waits")
             changed = changed or result.rowcount == 1
             continue
         # One continuous episode keeps its first reason (a question may become a trust prompt). A refusal is not
@@ -812,7 +821,7 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
             conditions.extend([leader_current == recipient, exists(select(AgentTeamSlot.id).where(
                 AgentTeamSlot.id == leader_slot_id, AgentTeamSlot.preset_id == preset_id,
                 AgentTeamSlot.enabled.is_(True)))])
-        claim = update(AgentPaneBinding).where(*conditions, same_route,
+        claim = update(AgentPaneBinding).where(*conditions, *same_episode, same_route,
             or_(AgentPaneBinding.waiting_input_reason.is_(None), ~same_kind)).values(waiting_input_reason=reason,
             waiting_input_started_at=now, waiting_input_observed_at=now).execution_options(synchronize_session=False)
         if reason == PROVIDER_REFUSAL:
@@ -825,7 +834,8 @@ async def _record_input_waits(db, preset_id, inputs, metadata, current, *, now) 
                         continue
                     if prior_waiting:  # a refusal is not a wait for input, so the running wait ends here
                         await decision_waits.record_input_wait_ended(db, binding_id=binding.binding_id,
-                            started_at=prior_start, outcome="refused", source="agent_activity_service._record_input_waits")
+                            started_at=prior_start, outcome="refused", ended_at=now,
+                            source="agent_activity_service._record_input_waits")
                     notice_id = await send_provider_refusal_notices(db, preset_id=preset_id, slot_id=entry[0],
                         binding_id=binding.binding_id, started_at=now, supervisor_actor_id=actor_id,
                         leader_slot_id=leader_slot_id)
