@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     # The OS user whose ~/.claude the Harnesses pages show as "global". Unset: the controller's own user.
     # Set it on a two-user install (controller and agents run as different users) to the agent user.
     harness_agent_user: str | None = None
+    # The dedicated factory installs the restricted helper and command-scoped sudoers rule.
+    team_workspace_trust_helper_enabled: bool = False
 
     # Agent Bridge attachment settings
     bridge_attachment_dir: str = "~/.albiex-synth-city/bridge-attachments"

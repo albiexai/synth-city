@@ -65,6 +65,16 @@ export function TeamMemberRow({
         <span className="text-sm text-muted-foreground [overflow-wrap:anywhere]">{harness}{model ? ` · ${model}` : ''}{effort ? ` · ${effort} effort` : ''}</span>
         <span className="min-w-24 text-sm">{slot.role || 'Unassigned'}</span>
         <AgentStatusBadges status={status} compact showToolCatalog />
+        {slot.workspace_trust_status === 'pending' && (
+          <Badge variant="outline" title="The agent's configuration is busy. Launch again to retry.">
+            Folder trust pending
+          </Badge>
+        )}
+        {slot.workspace_trust_status === 'failed' && (
+          <Badge variant="outline" title="Check the agent configuration helper before launching.">
+            Folder trust failed
+          </Badge>
+        )}
         <div className="relative">
           <Button
             variant="outline"

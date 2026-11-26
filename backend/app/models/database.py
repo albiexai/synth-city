@@ -200,6 +200,7 @@ class AgentTeamSlot(Base):
     launch_options: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     area_labels: Mapped[list | None] = mapped_column(JSON, nullable=True)
     expertise: Mapped[str | None] = mapped_column(String, nullable=True)
+    workspace_trust_status: Mapped[str | None] = mapped_column(String, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
