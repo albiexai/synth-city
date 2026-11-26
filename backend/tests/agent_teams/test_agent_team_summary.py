@@ -14,7 +14,7 @@ from app.models.database import (
     MailAgentSession, MailMessage, MailTeamMember, TeamGithubScope,
 )
 from app.models.github_work_progress_schemas import GithubPublicationObservation, GithubWorkProgressResponse, GithubWorkRemainingView
-from app.models.schemas import AgentActivityObservation
+from app.models.schemas import AgentActivityObservation, NativeInputWait
 from app.services import agent_activity_service as activity
 from app.services.agent_team_campaign_service import agent_team_campaign_service
 from app.services.agent_team_summary_service import AgentTeamSummaryService
@@ -152,24 +152,33 @@ async def test_summary_reports_public_native_reason_without_private_identity(db,
     assert "private-native-debug-value" not in result.model_dump_json()
 
 
-async def bind_quiet_summary_member(db, team, monkeypatch, *, reason, age_seconds=600):
-    slot_id = await db.scalar(select(AgentTeamSlot.id).where(AgentTeamSlot.preset_id == team.id))
+async def bind_quiet_summary_member(
+    db, team, monkeypatch, *, reason, age_seconds=600, waiting=False, recent_registration=False,
+):
+    slot = await db.scalar(select(AgentTeamSlot).where(AgentTeamSlot.preset_id == team.id))
+    slot_id = slot.id
+    if recent_registration:
+        # The Pi binding takes its registration time from the authenticated Mail session.
+        slot.provider = "pi-cli"
     member = MailTeamMember(identity_key="quiet-member", repo_id="fixture", repo_path="/synthetic/project",
         repo_name="fixture", display_name="Worker", team_preset_id=team.id, team_slot_id=slot_id)
     db.add(member)
     await db.flush()
     db.add_all([
         AgentPaneBinding(pane_pid=41002, pane_proc_start="29", slot_id=slot_id, preset_id=team.id, tmux_target="%10"),
-        MailAgentSession(member_id=member.id, provider="codex-cli", source="mcp", session_key="quiet-session",
+        MailAgentSession(member_id=member.id, provider=slot.provider, source="mcp", session_key="quiet-session",
             team_slot_id=slot_id, team_preset_id=team.id, bound_pane_pid=41002, bound_pane_proc_start="29",
-            cwd="/synthetic/project", capability_token_hash="synthetic-hash", mailbox_status="connected"),
+            cwd="/synthetic/project", capability_token_hash="synthetic-hash", mailbox_status="connected",
+            pid=41003 if recent_registration else None, created_at=datetime.utcnow()),
     ])
     await db.commit()
 
     def observe(slot_id, provider, session_id, bindings, duplicate, now, *, provenance=None):
         assert len(bindings) == 1
         observed_at = now - timedelta(seconds=age_seconds) if reason == "native_event_stale" else None
-        return AgentActivityObservation(slot_id=slot_id, state="unknown", reason=reason, observed_at=observed_at)
+        wait = NativeInputWait(reason="question", observed_at=now) if waiting else None
+        return AgentActivityObservation(
+            slot_id=slot_id, state="unknown", reason=reason, observed_at=observed_at, waiting_input=wait)
 
     monkeypatch.setattr(activity, "_observe", observe)
     monkeypatch.setattr(activity, "_process_started_at",
@@ -187,6 +196,8 @@ def request_for(member_id):
     ("quiet", "native_event_stale", True),
     ("quiet", "no_native_event", True),
     ("just-launched", "no_native_event", False),
+    ("recent-registration", "no_native_event", False),
+    ("waiting-for-input", "no_native_event", False),
     ("dispatched", "no_native_event", False),
     ("filtered-dispatch", "native_event_stale", False),
     ("retained-lease", "native_event_stale", False),
@@ -199,7 +210,8 @@ async def test_only_quiet_live_slots_without_work_stop_blocking_coverage(
     statuses = {"dispatched": ("dispatched",), "filtered-dispatch": ("dispatched",), "retained-lease": ("merged",)}
     team, scope, items = await seed(db, statuses.get(scenario, ()))
     member = await bind_quiet_summary_member(
-        db, team, monkeypatch, reason=reason, age_seconds=5 if scenario == "just-launched" else 600)
+        db, team, monkeypatch, reason=reason, age_seconds=5 if scenario == "just-launched" else 600,
+        waiting=scenario == "waiting-for-input", recent_registration=scenario == "recent-registration")
     scope_filter = None
     if scenario == "retained-lease":
         db.add(GithubWorkspace(scope_id=scope.id, path="/synthetic/leased", leased_item_id=items[0].id,
@@ -221,7 +233,7 @@ async def test_only_quiet_live_slots_without_work_stop_blocking_coverage(
     public_reason = None if reason == "native_event_stale" else reason
     assert [(row.code, row.slot_id, row.activity_reason) for row in result.coverage_reason] == (
         [] if expected_complete else [("native_unknown", slot_id, public_reason)])
-    assert result.waiting_input == []
+    assert [row.reason for row in result.waiting_input] == (["question"] if scenario == "waiting-for-input" else [])
 
 
 @pytest.mark.asyncio
