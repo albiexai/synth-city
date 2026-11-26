@@ -107,6 +107,7 @@ async def test_workspace_readiness_is_operator_only_and_scope_local(client, db, 
             dispatch_status=status,
             pending_reason=pending_reason,
             workspace_wait_reason=detail,
+            milestone_replaced_at=datetime.utcnow() if number == 7 else None,
         )
         for scope_id, number, status, pending_reason, detail in (
             (scope.id, 1, "pending", "queued_no_workspace", "workspace_missing"),
@@ -115,6 +116,7 @@ async def test_workspace_readiness_is_operator_only_and_scope_local(client, db, 
             (scope.id, 4, "dispatched", None, "workspace_missing"),
             (scope.id, 5, "pending", "queued_no_workspace", "private diagnostic"),
             (other_scope.id, 6, "pending", "queued_no_workspace", "workspace_missing"),
+            (scope.id, 7, "pending", "queued_no_workspace", "workspace_missing"),
         )
     ]
     db.add_all(items)
@@ -165,7 +167,8 @@ async def test_workspace_readiness_is_operator_only_and_scope_local(client, db, 
     listing = await client.get(f"{root}/presets/{preset.id}/github-work-items")
     assert listing.status_code == 200
     assert {row["issue_number"]: row["workspace_wait_reason"] for row in listing.json()["items"]} == {
-        1: "workspace_missing", 2: "no_free_workspace", 3: None, 4: None, 5: "no_free_workspace",
+        1: "workspace_missing", 2: "no_free_workspace", 3: None, 4: None,
+        5: "no_free_workspace", 7: "workspace_missing",
     }
 
 
