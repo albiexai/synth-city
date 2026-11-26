@@ -187,8 +187,8 @@ export interface SupervisorBindingUpdate {
   grace_seconds?: number | null
   // The binding version that the operator reviewed. The server refuses the write (409) when the binding has changed since.
   expected_binding_version?: number
-  // The team lifetime that the operator reviewed. It comes with the version: a numeric team id can be reused.
-  expected_team_lifetime?: number
+  // The team context key that the operator reviewed. It comes with the version: a numeric team id can be reused, a key is not.
+  expected_team_context_key?: string
 }
 
 export interface SupervisorObservation {
@@ -197,8 +197,8 @@ export interface SupervisorObservation {
   address?: SupervisorAddress | null
   // Counts the binding writes of the team. Missing on an older server.
   binding_version?: number
-  // The number of the team lifetime. Missing on an older server; 0 means the database has not assigned one.
-  team_lifetime?: number
+  // The active context key of the team: it names the team lifetime. Missing on an older server; null means the team has none yet.
+  team_context_key?: string | null
   checked_at: string | null
   next_check_at: string | null
   grace_seconds: number

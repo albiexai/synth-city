@@ -1279,6 +1279,14 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         from app.models.database import _install_context_key_lifetime_ddl
 
         await conn.run_sync(lambda sync_conn: _install_context_key_lifetime_ddl(None, sync_conn))
+        # #1298: every team has an active context key, which names its lifetime. One statement, so it is atomic. A repeat
+        # finds no team without a key. Existing and retired keys are not touched.
+        if await _sqlite_columns(conn, "agent_team_presets"):
+            await conn.execute(text(
+                "INSERT INTO factory_context_keys (key_kind, numeric_id, context_key, created_at) "
+                "SELECT 'team', p.id, 'team:' || p.id || ':' || strftime('%Y%m%d%H%M%S', 'now') || printf('%06d', abs(random()) % 1000000), "
+                "CURRENT_TIMESTAMP FROM agent_team_presets p WHERE NOT EXISTS ("
+                "SELECT 1 FROM factory_context_keys k WHERE k.key_kind = 'team' AND k.numeric_id = p.id AND k.retired_at IS NULL)"))
     # C12: install the stable forward-coverage marker and import the observed
     # work state once. A later run finds the marker and changes nothing.
     audit_columns = await _sqlite_columns(conn, "factory_audit_events")
@@ -1289,46 +1297,6 @@ async def _run_sqlite_compat_migrations(conn) -> None:
 
         await install_forward_coverage(conn)
     await conn.commit()
-    await _upgrade_team_lifetimes(conn)
-
-
-async def _assign_team_lifetimes(conn, limit: int | None = None) -> None:
-    """Give each team that has no lifetime number a fresh one, in team id order. It writes only the new column."""
-    rows = (await conn.execute(text("SELECT id FROM agent_team_presets WHERE supervisor_lifetime = 0 ORDER BY id"))).fetchall()
-    for (team_id,) in rows[:limit]:
-        await conn.execute(text("INSERT INTO agent_team_lifetimes (created_at) VALUES (CURRENT_TIMESTAMP)"))
-        await conn.execute(text("UPDATE agent_team_presets SET supervisor_lifetime = last_insert_rowid() WHERE id = :id"),
-                           {"id": team_id})
-
-
-async def _upgrade_team_lifetimes(conn) -> None:
-    """#1298: add the team lifetime to an existing database, all or nothing.
-
-    One explicit write transaction holds every step: the table, the column, the trigger, the backfill and the unique
-    index. SQLite DDL is transactional, so a fault at any step rolls all of them back. SQLite has one writer, so no team
-    can be inserted between the steps. A repeat finds nothing to do.
-    """
-    from app.models.database import TEAM_LIFETIME_TRIGGER
-
-    if not await _sqlite_columns(conn, "agent_team_presets"):
-        return
-    await conn.commit()  # no open transaction may be left before the explicit one begins
-    await conn.exec_driver_sql("BEGIN IMMEDIATE")
-    try:
-        await conn.execute(text(
-            "CREATE TABLE IF NOT EXISTS agent_team_lifetimes ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)"))
-        if "supervisor_lifetime" not in await _sqlite_columns(conn, "agent_team_presets"):
-            await conn.execute(text("ALTER TABLE agent_team_presets ADD COLUMN supervisor_lifetime INTEGER NOT NULL DEFAULT 0"))
-        await conn.execute(text(TEAM_LIFETIME_TRIGGER))
-        await _assign_team_lifetimes(conn)
-        await conn.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uix_agent_team_presets_supervisor_lifetime "
-            "ON agent_team_presets (supervisor_lifetime) WHERE supervisor_lifetime <> 0"))
-        await conn.commit()
-    except BaseException:
-        await conn.rollback()
-        raise
 
 
 async def init_db() -> None:

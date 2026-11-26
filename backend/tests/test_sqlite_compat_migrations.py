@@ -1873,117 +1873,86 @@ async def test_supervisor_binding_version_column_migrates_existing_teams_and_rep
         await engine.dispose()
 
 
-# #1298: the team lifetime. The upgrade is one write transaction, so nothing is left half done.
-LIFETIME_TRIGGER = "trg_agent_team_presets_assign_lifetime"
-LIFETIME_INDEX = "uix_agent_team_presets_supervisor_lifetime"
+# #1298: every team has an active context key, which names its lifetime. The startup step is one statement.
+async def _team_keys(conn):
+    return [tuple(row) for row in (await conn.execute(text(
+        "SELECT numeric_id, context_key, retired_at IS NULL FROM factory_context_keys WHERE key_kind = 'team' ORDER BY id"))).all()]
 
 
-async def _before_lifetimes(conn) -> None:
-    """Turn a current schema into one from before the team lifetime existed."""
-    await conn.execute(text(f"DROP TRIGGER IF EXISTS {LIFETIME_TRIGGER}"))
-    await conn.execute(text(f"DROP INDEX IF EXISTS {LIFETIME_INDEX}"))
-    await conn.execute(text("ALTER TABLE agent_team_presets DROP COLUMN supervisor_lifetime"))
-    await conn.execute(text("DROP TABLE agent_team_lifetimes"))
+async def _insert_teams(conn, *names):
+    for name in names:
+        await conn.execute(text("INSERT INTO agent_team_presets (name, created_at, updated_at, autonomy_enabled) "
+                                f"VALUES ('{name}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0)"))
     await conn.commit()
 
 
-async def _lifetime_objects(conn) -> dict:
-    names = {row[0] for row in (await conn.execute(text("SELECT name FROM sqlite_master"))).all()}
-    columns = {row[1]: tuple(row)[1:] for row in (await conn.execute(text("PRAGMA table_info(agent_team_presets)"))).all()}
-    index_sql = (await conn.execute(text("SELECT sql FROM sqlite_master WHERE name = :name"), {"name": LIFETIME_INDEX})).scalar()
-    trigger_sql = (await conn.execute(text("SELECT sql FROM sqlite_master WHERE name = :name"), {"name": LIFETIME_TRIGGER})).scalar()
-    return {"table": "agent_team_lifetimes" in names, "trigger": LIFETIME_TRIGGER in names, "index": LIFETIME_INDEX in names,
-            "column": columns.get("supervisor_lifetime"),
-            "index_sql": " ".join((index_sql or "").lower().replace("if not exists ", "").split()),
-            "trigger_sql": " ".join((trigger_sql or "").lower().replace("if not exists ", "").split())}
-
-
 @pytest.mark.asyncio
-async def test_team_lifetimes_migrate_old_teams_once_and_repeat_safely():
+async def test_existing_teams_get_one_active_key_each_and_the_step_repeats_safely():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     try:
         async with engine.connect() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            await _before_lifetimes(conn)
-            for name in ("One", "Two", "Three"):
-                await conn.execute(text("INSERT INTO agent_team_presets (name, created_at, updated_at, autonomy_enabled) "
-                                        f"VALUES ('{name}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0)"))
+            await _insert_teams(conn, "One", "Two", "Three")
+            await conn.execute(text("INSERT INTO factory_context_keys (key_kind, numeric_id, context_key, created_at) "
+                                    "VALUES ('team', 2, 'team:2:kept', CURRENT_TIMESTAMP)"))  # team 2 already has an active key
+            await conn.execute(text("INSERT INTO factory_context_keys (key_kind, numeric_id, context_key, created_at, retired_at) "
+                                    "VALUES ('team', 3, 'team:3:old', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"))  # a retired key of team 3
             await conn.commit()
             await _run_sqlite_compat_migrations(conn)
-            objects = await _lifetime_objects(conn)
-            assert objects["table"] and objects["trigger"] and objects["index"]
-            assert objects["column"][2] == 1 and objects["column"][3] == "0"  # NOT NULL, DEFAULT 0
-            assert "create unique index" in objects["index_sql"] and "where supervisor_lifetime <> 0" in objects["index_sql"]
-            numbers = [row[0] for row in (await conn.execute(text("SELECT supervisor_lifetime FROM agent_team_presets ORDER BY id"))).all()]
-            with pytest.raises(Exception, match="UNIQUE"):
-                await conn.execute(text("UPDATE agent_team_presets SET supervisor_lifetime = :n WHERE name = 'Two'"), {"n": numbers[0]})
-            await conn.rollback()
-            first = [row[0] for row in (await conn.execute(text("SELECT supervisor_lifetime FROM agent_team_presets ORDER BY id"))).all()]
-            assert all(value >= 1 for value in first) and first == sorted(set(first))
+            keys = await _team_keys(conn)
+            active = {team_id: key for team_id, key, is_active in keys if is_active}
+            assert sorted(active) == [1, 2, 3] and len(set(active.values())) == 3
+            assert active[2] == "team:2:kept"
+            assert ("team:3:old" in [key for _, key, _ in keys]) and (3, "team:3:old", 0) in keys
+            assert active[1].startswith("team:1:") and active[3].startswith("team:3:") and active[3] != "team:3:old"
             await _run_sqlite_compat_migrations(conn)
-            again = [row[0] for row in (await conn.execute(text("SELECT supervisor_lifetime FROM agent_team_presets ORDER BY id"))).all()]
-            assert again == first
-            await conn.execute(text("INSERT INTO agent_team_presets (name, created_at, updated_at, autonomy_enabled) "
-                                    "VALUES ('New', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0)"))
-            await conn.commit()
-            newest = (await conn.execute(text("SELECT supervisor_lifetime FROM agent_team_presets WHERE name = 'New'"))).scalar_one()
-            assert newest > max(first)
+            assert await _team_keys(conn) == keys
     finally:
         await engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_a_fault_in_the_middle_of_the_lifetime_upgrade_rolls_everything_back(monkeypatch):
-    import app.database as database
+async def test_a_fault_after_the_key_step_leaves_no_key_rows_and_a_rerun_succeeds(monkeypatch):
+    import app.services.factory_audit_service as audit
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     try:
         async with engine.connect() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            await _before_lifetimes(conn)
-            for name in ("One", "Two"):
-                await conn.execute(text("INSERT INTO agent_team_presets (name, created_at, updated_at, autonomy_enabled) "
-                                        f"VALUES ('{name}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0)"))
-            await conn.commit()
-            real = database._assign_team_lifetimes
+            await _insert_teams(conn, "One", "Two")
+            real = audit.install_forward_coverage
 
             async def broken(connection):
-                await real(connection, limit=1)  # one team is already assigned when the fault comes
-                raise RuntimeError("fault in the middle of the backfill")
+                raise RuntimeError("fault after the key step")
 
-            monkeypatch.setattr(database, "_assign_team_lifetimes", broken)
+            monkeypatch.setattr(audit, "install_forward_coverage", broken)
             with pytest.raises(RuntimeError):
                 await _run_sqlite_compat_migrations(conn)
             await conn.rollback()
-            objects = await _lifetime_objects(conn)
-            assert (objects["table"], objects["trigger"], objects["index"], objects["column"]) == (False, False, False, None)
-            assert (await conn.execute(text("SELECT count(*) FROM agent_team_presets"))).scalar_one() == 2
-            monkeypatch.setattr(database, "_assign_team_lifetimes", real)
+            assert await _team_keys(conn) == []
+            monkeypatch.setattr(audit, "install_forward_coverage", real)
             await _run_sqlite_compat_migrations(conn)
-            objects = await _lifetime_objects(conn)
-            assert objects["table"] and objects["trigger"] and objects["index"] and objects["column"] is not None
-            values = [row[0] for row in (await conn.execute(text("SELECT supervisor_lifetime FROM agent_team_presets ORDER BY id"))).all()]
-            assert len(set(values)) == 2 and min(values) >= 1
+            assert sorted(team_id for team_id, _, is_active in await _team_keys(conn) if is_active) == [1, 2]
     finally:
         await engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_a_fresh_database_and_an_upgraded_database_get_the_same_lifetime_objects():
-    fresh_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    old_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+async def test_the_normal_startup_order_keeps_every_team_and_gives_each_a_key(tmp_path):
+    """The order init_db uses: create_all in one transaction, then the compat step on its own connection."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'old.db'}")
     try:
-        async with fresh_engine.connect() as fresh, old_engine.connect() as old:
-            await fresh.run_sync(Base.metadata.create_all)
-            await _run_sqlite_compat_migrations(fresh)
-            await old.run_sync(Base.metadata.create_all)
-            await _before_lifetimes(old)
-            await _run_sqlite_compat_migrations(old)
-            assert await _lifetime_objects(fresh) == await _lifetime_objects(old)
-            for conn in (fresh, old):
-                columns = [(row[1], row[2], row[3], row[4]) for row in (await conn.execute(text("PRAGMA table_info(agent_team_lifetimes)"))).all()]
-                assert [name for name, *_ in columns] == ["id", "created_at"]
-                sql = (await conn.execute(text("SELECT sql FROM sqlite_master WHERE name = 'agent_team_lifetimes'"))).scalar_one()
-                assert "AUTOINCREMENT" in sql.upper()
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            for name in ("Old one", "Old two"):
+                await conn.execute(text("INSERT INTO agent_team_presets (name, created_at, updated_at, autonomy_enabled) "
+                                        f"VALUES ('{name}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0)"))
+        async with engine.begin() as conn:  # a second startup of the same file
+            await conn.run_sync(Base.metadata.create_all)
+        async with engine.connect() as conn:
+            await _run_sqlite_compat_migrations(conn)
+        async with engine.connect() as conn:
+            names = [row[0] for row in (await conn.execute(text("SELECT name FROM agent_team_presets ORDER BY id"))).all()]
+            assert names == ["Old one", "Old two"]
+            assert sorted(team_id for team_id, _, is_active in await _team_keys(conn) if is_active) == [1, 2]
     finally:
-        await fresh_engine.dispose()
-        await old_engine.dispose()
+        await engine.dispose()

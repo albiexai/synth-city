@@ -294,7 +294,7 @@ async def test_supervisor_message_refuses_membership_changed_before_insert(db, m
     assert (await db.scalars(select(MailMessage))).all() == []
 
 
-# #1298: a binding version and a team lifetime make an edit apply only to the binding that the operator reviewed.
+# #1298: a binding version and the team context key make an edit apply only to the binding that the operator reviewed.
 DIRECTOR = {"X-Synth-City-Operator-Token": "synthetic-director-token"}
 
 
@@ -313,7 +313,16 @@ async def read_supervisor(client, team_id: int) -> dict:
 async def reviewed(client, team_id: int) -> dict:
     """What a dialog sends: the version and the lifetime of the binding that the operator saw."""
     now = await read_supervisor(client, team_id)
-    return {"expected_binding_version": now["binding_version"], "expected_team_lifetime": now["team_lifetime"]}
+    return {"expected_binding_version": now["binding_version"], "expected_team_context_key": now["team_context_key"]}
+
+
+async def keyed_team(db):
+    """An ORM fixture team plus an active context key, as the create path gives it."""
+    from app.services.factory_audit_service import context_key_for
+    team, actor = await supervisor_team(db)
+    await context_key_for(db, "team", team.id)
+    await db.commit()
+    return team, actor
 
 
 async def make_actor(db, key: str) -> int:
@@ -337,30 +346,30 @@ async def raw_team(db, name: str = "Raw", extra: str = "", value: str = "") -> i
 
 
 @pytest.mark.asyncio
-async def test_version_starts_at_zero_the_lifetime_is_assigned_and_each_write_adds_one_to_the_version(db, supervisor_client):
-    team, actor = await supervisor_team(db)
+async def test_version_starts_at_zero_the_team_has_a_key_and_each_write_adds_one_to_the_version(db, supervisor_client):
+    team, actor = await keyed_team(db)
     team_id, actor_id = team.id, actor.id
     start = await read_supervisor(supervisor_client, team_id)
-    assert start["binding_version"] == 0 and start["team_lifetime"] >= 1
+    assert start["binding_version"] == 0 and start["team_context_key"]
     first = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id})
     assert first.status_code == 200 and first.json()["binding_version"] == 1
     assert (await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 120})).json()["binding_version"] == 2
     removed = await put_supervisor(supervisor_client, team_id, {"actor_id": None})
-    assert removed.json()["binding_version"] == 3 and removed.json()["team_lifetime"] == start["team_lifetime"]
+    assert removed.json()["binding_version"] == 3 and removed.json()["team_context_key"] == start["team_context_key"]
 
 
 @pytest.mark.asyncio
 async def test_summary_reports_the_version_and_the_lifetime(db, supervisor_client):
-    team, actor = await supervisor_team(db)
+    team, actor = await keyed_team(db)
     team_id, actor_id = team.id, actor.id
     await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id})
     summary = (await supervisor_client.get(f"/api/v1/agent-teams/presets/{team_id}/summary")).json()["supervisor_observation"]
-    assert summary["binding_version"] == 1 and summary["team_lifetime"] == (await read_supervisor(supervisor_client, team_id))["team_lifetime"]
+    assert summary["binding_version"] == 1 and summary["team_context_key"] == (await read_supervisor(supervisor_client, team_id))["team_context_key"]
 
 
 @pytest.mark.asyncio
 async def test_a_matching_pair_is_accepted_and_neither_field_keeps_the_legacy_behaviour(db, supervisor_client):
-    team, actor = await supervisor_team(db)
+    team, actor = await keyed_team(db)
     team_id, actor_id = team.id, actor.id
     accepted = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, **await reviewed(supervisor_client, team_id)})
     assert accepted.status_code == 200 and accepted.json()["binding_version"] == 1
@@ -369,8 +378,8 @@ async def test_a_matching_pair_is_accepted_and_neither_field_keeps_the_legacy_be
 
 
 @pytest.mark.asyncio
-async def test_a_stale_version_or_a_wrong_lifetime_is_refused_and_changes_nothing(db, supervisor_client):
-    team, actor = await supervisor_team(db)
+async def test_a_stale_version_or_a_wrong_key_is_refused_and_changes_nothing(db, supervisor_client):
+    team, actor = await keyed_team(db)
     team_id, actor_id = team.id, actor.id
     old = await reviewed(supervisor_client, team_id)
     await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 120})
@@ -378,7 +387,7 @@ async def test_a_stale_version_or_a_wrong_lifetime_is_refused_and_changes_nothin
     assert stale.status_code == 409 and stale.json()["detail"] == "supervisor_binding_changed"
     now = await read_supervisor(supervisor_client, team_id)
     wrong = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 999,
-        "expected_binding_version": now["binding_version"], "expected_team_lifetime": now["team_lifetime"] + 1})
+        "expected_binding_version": now["binding_version"], "expected_team_context_key": now["team_context_key"] + "x"})
     assert wrong.status_code == 409
     after = await read_supervisor(supervisor_client, team_id)
     assert (after["actor_id"], after["grace_seconds"], after["binding_version"]) == (actor_id, 120, 1)
@@ -386,13 +395,13 @@ async def test_a_stale_version_or_a_wrong_lifetime_is_refused_and_changes_nothin
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("body", [
-    {"expected_binding_version": 0}, {"expected_team_lifetime": 1},
-    {"expected_binding_version": None, "expected_team_lifetime": 1}, {"expected_binding_version": 0, "expected_team_lifetime": None},
-    {"expected_binding_version": -1, "expected_team_lifetime": 1}, {"expected_binding_version": 0, "expected_team_lifetime": 0},
-    {"expected_binding_version": "x", "expected_team_lifetime": 1},
+    {"expected_binding_version": 0}, {"expected_team_context_key": "team:1:k"},
+    {"expected_binding_version": None, "expected_team_context_key": "team:1:k"}, {"expected_binding_version": 0, "expected_team_context_key": None},
+    {"expected_binding_version": -1, "expected_team_context_key": "team:1:k"}, {"expected_binding_version": 0, "expected_team_context_key": ""},
+    {"expected_binding_version": "x", "expected_team_context_key": "team:1:k"}, {"expected_binding_version": 0, "expected_team_context_key": 5},
 ])
-async def test_the_two_expected_fields_come_together_as_whole_numbers(db, supervisor_client, body):
-    team, actor = await supervisor_team(db)
+async def test_the_two_expected_fields_come_together_as_a_whole_number_and_a_key(db, supervisor_client, body):
+    team, actor = await keyed_team(db)
     team_id, actor_id = team.id, actor.id
     response = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, **body})
     assert response.status_code == 422
@@ -402,7 +411,7 @@ async def test_the_two_expected_fields_come_together_as_whole_numbers(db, superv
 @pytest.mark.asyncio
 async def test_old_removal_cannot_remove_a_binding_of_the_same_actor_and_grace(db, supervisor_client):
     """Remove, then bind the same actor with the same grace: the state looks the same, the version does not."""
-    team, actor = await supervisor_team(db)
+    team, actor = await keyed_team(db)
     team_id, actor_id = team.id, actor.id
     await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 60})
     old = await reviewed(supervisor_client, team_id)
@@ -417,7 +426,7 @@ async def test_old_removal_cannot_remove_a_binding_of_the_same_actor_and_grace(d
 
 @pytest.mark.asyncio
 async def test_two_writes_with_one_reviewed_pair_let_only_the_first_win(db, supervisor_client):
-    team, actor = await supervisor_team(db)
+    team, actor = await keyed_team(db)
     team_id, actor_id = team.id, actor.id
     await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id})
     pair = await reviewed(supervisor_client, team_id)
@@ -430,19 +439,19 @@ async def test_two_writes_with_one_reviewed_pair_let_only_the_first_win(db, supe
 @pytest.mark.asyncio
 async def test_a_check_in_does_not_change_the_version_or_the_lifetime(db, supervisor_client):
     from app.services.agent_team_supervisor_service import supervisor_checkin
-    team, actor = await supervisor_team(db)
+    team, actor = await keyed_team(db)
     team_id = team.id
     now = datetime(2026, 10, 13, tzinfo=timezone.utc)
     await put_supervisor(supervisor_client, team_id, {"actor_id": actor.id})
     before = await reviewed(supervisor_client, team_id)
     result = await supervisor_checkin(db, actor, team_id, now + timedelta(hours=1), now=now)
-    assert (result["binding_version"], result["team_lifetime"]) == (before["expected_binding_version"], before["expected_team_lifetime"])
+    assert (result["binding_version"], result["team_context_key"]) == (before["expected_binding_version"], before["expected_team_context_key"])
     assert await reviewed(supervisor_client, team_id) == before
 
 
 @pytest.mark.asyncio
 async def test_omitted_grace_is_unchanged_and_explicit_null_returns_to_the_default(db, supervisor_client):
-    team, actor = await supervisor_team(db)
+    team, actor = await keyed_team(db)
     team_id, actor_id = team.id, actor.id
     await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 120})
     omitted = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, **await reviewed(supervisor_client, team_id)})
@@ -452,11 +461,11 @@ async def test_omitted_grace_is_unchanged_and_explicit_null_returns_to_the_defau
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("raced", ["supervisor_binding_version", "supervisor_lifetime"])
+@pytest.mark.parametrize("raced", ["supervisor_binding_version", "key_retired"])
 async def test_the_checks_and_the_write_are_one_atomic_step(db, supervisor_client, monkeypatch, raced):
     """A change that lands between the read and the update of a request makes that update match no row."""
     from sqlalchemy import update as sql_update
-    team, actor = await supervisor_team(db)
+    team, actor = await keyed_team(db)
     team_id, actor_id = team.id, actor.id
     await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 60})
     pair = await reviewed(supervisor_client, team_id)
@@ -467,8 +476,13 @@ async def test_the_checks_and_the_write_are_one_atomic_step(db, supervisor_clien
         nonlocal fired
         if not fired and getattr(statement, "is_update", False):
             fired = True
-            column = getattr(AgentTeamPreset, raced)
-            await execute(sql_update(AgentTeamPreset).where(AgentTeamPreset.id == team_id).values(**{raced: column + 1000}))
+            if raced == "key_retired":
+                from sqlalchemy import text
+                await execute(text("UPDATE factory_context_keys SET retired_at = CURRENT_TIMESTAMP "
+                                   "WHERE key_kind = 'team' AND numeric_id = :id AND retired_at IS NULL"), {"id": team_id})
+            else:
+                await execute(sql_update(AgentTeamPreset).where(AgentTeamPreset.id == team_id)
+                              .values(supervisor_binding_version=AgentTeamPreset.supervisor_binding_version + 1000))
         return await execute(statement, *args, **kwargs)
 
     monkeypatch.setattr(db, "execute", racing)
@@ -507,7 +521,7 @@ async def test_a_stale_removal_from_a_deleted_team_cannot_clear_the_team_that_re
     await put_supervisor(supervisor_client, second_id, {"actor_id": actor_id, "grace_seconds": 60})
     now = await reviewed(supervisor_client, second_id)
     assert now["expected_binding_version"] == old["expected_binding_version"], "same version in both lifetimes"
-    assert now["expected_team_lifetime"] != old["expected_team_lifetime"]
+    assert now["expected_team_context_key"] != old["expected_team_context_key"]
     stale = await put_supervisor(supervisor_client, second_id, {"actor_id": None, **old})
     assert stale.status_code == 409 and stale.json()["detail"] == "supervisor_binding_changed"
     after = await read_supervisor(supervisor_client, second_id)
@@ -529,38 +543,35 @@ async def test_a_stale_bind_from_a_deleted_unbound_team_cannot_bind_the_team_tha
 
 
 @pytest.mark.asyncio
-async def test_a_stored_lifetime_of_zero_fails_closed(db, supervisor_client):
-    from sqlalchemy import text
-    team, actor = await supervisor_team(db)
+async def test_a_team_without_a_key_shows_null_and_refuses_a_protected_write(db, supervisor_client):
+    team, actor = await supervisor_team(db)  # an ORM fixture: no create path, no event, so no key
     team_id, actor_id = team.id, actor.id
-    pair = await reviewed(supervisor_client, team_id)
-    await db.execute(text("UPDATE agent_team_presets SET supervisor_lifetime = 0 WHERE id = :id"), {"id": team_id})
-    await db.commit()
-    assert (await read_supervisor(supervisor_client, team_id))["team_lifetime"] == 0
-    refused = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, **pair})
+    assert (await read_supervisor(supervisor_client, team_id))["team_context_key"] is None
+    refused = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "expected_binding_version": 0,
+                                                                "expected_team_context_key": "team:1:made-up"})
     assert refused.status_code == 409
     assert (await read_supervisor(supervisor_client, team_id))["actor_id"] is None
 
 
 @pytest.mark.asyncio
-async def test_every_new_team_gets_its_own_database_assigned_lifetime_whatever_the_input(db, supervisor_client):
-    from sqlalchemy import text
-    from sqlalchemy.exc import IntegrityError
+async def test_the_create_and_duplicate_paths_give_each_team_its_own_active_key(db, supervisor_client):
     created = await make_team(supervisor_client, "Api")
     copy = (await supervisor_client.post(f"/api/v1/agent-teams/presets/{created}/duplicate", headers=DIRECTOR, json={"name": "Copy"})).json()["id"]
-    orm_team, _ = await supervisor_team(db)
-    plain = await raw_team(db, "Raw one")
-    again = await raw_team(db, "Raw two")
-    explicit = await raw_team(db, "Raw explicit", ", supervisor_lifetime", ", 999")
-    ids = [created, copy, orm_team.id, plain, again, explicit]
-    lifetimes = [(await read_supervisor(supervisor_client, team_id))["team_lifetime"] for team_id in ids]
-    assert all(value >= 1 for value in lifetimes) and len(set(lifetimes)) == len(lifetimes)
-    assert lifetimes[-1] != 999
-    taken = lifetimes[0]
-    with pytest.raises(IntegrityError):
-        await raw_team(db, "Reuses a lifetime", ", supervisor_lifetime", f", {taken}")
-    await db.rollback()
-    with pytest.raises(IntegrityError):
-        await db.execute(text("UPDATE agent_team_presets SET supervisor_lifetime = :value WHERE id = :id"), {"value": taken, "id": copy})
-        await db.commit()
-    await db.rollback()
+    keys = [(await read_supervisor(supervisor_client, team_id))["team_context_key"] for team_id in (created, copy)]
+    assert all(keys) and keys[0] != keys[1]
+    assert all(key.startswith(f"team:{team_id}:") for key, team_id in zip(keys, (created, copy)))
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_team_retires_its_key_and_the_recreated_team_gets_another(db, supervisor_client):
+    from sqlalchemy import select
+    from app.models.database import FactoryContextKey
+    first_id = await make_team(supervisor_client, "First")
+    old = (await read_supervisor(supervisor_client, first_id))["team_context_key"]
+    assert (await supervisor_client.delete(f"/api/v1/agent-teams/presets/{first_id}", headers=DIRECTOR)).status_code == 204
+    retired = (await db.scalars(select(FactoryContextKey.retired_at).where(FactoryContextKey.context_key == old))).first()
+    assert retired is not None
+    second_id = await make_team(supervisor_client, "Second")
+    assert second_id == first_id
+    assert (await read_supervisor(supervisor_client, second_id))["team_context_key"] not in (None, old)
+

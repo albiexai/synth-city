@@ -3,10 +3,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import JSON, insert, literal, select, update
+from sqlalchemy import JSON, exists, insert, literal, select, update
 
 from app.models.api_model import utc_datetime
-from app.models.database import (AgentTeamPreset, AgentTeamSlot, MailAgentSession, MailExternalActor,
+from app.models.database import (AgentTeamPreset, AgentTeamSlot, FactoryContextKey, MailAgentSession, MailExternalActor,
                                  MailMessage, MailReceipt, MailTeamMember)
 from app.services import factory_audit_service as audit
 from app.services.factory_audit_service import sanitize_text
@@ -40,7 +40,8 @@ def supervisor_address(actor) -> dict | None:
             "display_name": clean_note(actor.display_name)}
 
 
-def supervisor_observation(team, *, now: datetime | None = None, actor=None, quiet: bool = False) -> dict:
+def supervisor_observation(team, *, now: datetime | None = None, actor=None, quiet: bool = False,
+                           team_context_key: str | None = None) -> dict:
     """Derive health from the controller clock and the stored promise.
 
     ``quiet``: the team is paused with no remaining work (#1132), so a late or absent check-in raises no attention.
@@ -70,7 +71,7 @@ def supervisor_observation(team, *, now: datetime | None = None, actor=None, qui
     return {"status": status, "actor_id": actor_id,
             "address": supervisor_address(actor), "checked_at": checked, "next_check_at": promised,
             "grace_seconds": grace, "binding_version": int(getattr(team, "supervisor_binding_version", 0) or 0),
-            "team_lifetime": int(getattr(team, "supervisor_lifetime", 0) or 0),
+            "team_context_key": team_context_key,
             "note": clean_note(team.supervisor_note) if actor_id is not None else None,
             "attention": "Supervisor check-in overdue" if status in {"late", "absent"} and not quiet else None}
 
@@ -95,7 +96,6 @@ def _current_binding(team):
             AgentTeamPreset.supervisor_next_check_at == team.supervisor_next_check_at,
             AgentTeamPreset.supervisor_grace_seconds == team.supervisor_grace_seconds,
             AgentTeamPreset.supervisor_binding_version == team.supervisor_binding_version,
-            AgentTeamPreset.supervisor_lifetime == team.supervisor_lifetime,
             AgentTeamPreset.supervisor_observed_status == team.supervisor_observed_status)
 
 
@@ -121,8 +121,8 @@ async def observe_supervisor(db, preset_id: int, *, now: datetime | None = None)
     if team is None:
         return None
     actor = await db.get(MailExternalActor, team.supervisor_actor_id) if team.supervisor_actor_id else None
-    observation = supervisor_observation(team, now=current, actor=actor,
-                                         quiet=await team_needs_no_supervision(db, team))
+    observation = supervisor_observation(team, now=current, actor=actor, quiet=await team_needs_no_supervision(db, team),
+                                         team_context_key=await audit.current_context_key(db, "team", preset_id))
     old_status, new_status = team.supervisor_observed_status, observation["status"]
     if old_status == new_status or (old_status is None and new_status == "none"):
         return observation
@@ -141,11 +141,12 @@ async def observe_supervisor(db, preset_id: int, *, now: datetime | None = None)
 async def bind_supervisor(db, preset_id: int, *, actor_id: int | None,
                           grace_seconds: int | None, set_grace: bool, now: datetime | None = None,
                           expected_binding_version: int | None = None,
-                          expected_team_lifetime: int | None = None) -> dict:
+                          expected_team_context_key: str | None = None) -> dict:
     """Register an operator-selected actor without changing team permissions.
 
-    ``expected_binding_version`` and ``expected_team_lifetime``: when given (they come together), the write applies only to
-    the binding that the caller reviewed, in the team lifetime that the caller reviewed.
+    ``expected_binding_version`` and ``expected_team_context_key``: when given (they come together), the write applies only to
+    the binding that the caller reviewed, in the team lifetime (the active context key) that the caller reviewed. The key is
+    also checked inside the UPDATE, so a delete that commits first makes the update match no row.
     The check and the write are one atomic update (``_current_binding`` holds the version), so a removal and a
     rebinding of the same actor cannot be mistaken for the reviewed binding. Omitted: the write is not checked.
     """
@@ -153,8 +154,9 @@ async def bind_supervisor(db, preset_id: int, *, actor_id: int | None,
     team = await _team(db, preset_id)
     if team is None:
         raise ValueError("supervisor_team_missing")
-    if expected_binding_version is not None and (expected_binding_version != team.supervisor_binding_version
-            or expected_team_lifetime != team.supervisor_lifetime):  # the request allows only 1 or more, so a stored 0 never matches
+    protected = expected_binding_version is not None
+    if protected and (expected_binding_version != team.supervisor_binding_version
+            or expected_team_context_key != await audit.current_context_key(db, "team", preset_id)):
         await db.rollback()
         raise ValueError("supervisor_binding_changed")
     actor = await db.get(MailExternalActor, actor_id) if actor_id is not None else None
@@ -168,7 +170,10 @@ async def bind_supervisor(db, preset_id: int, *, actor_id: int | None,
                       supervisor_observed_status="absent" if actor_id is not None else "none")
     if set_grace or actor_id is None:
         values["supervisor_grace_seconds"] = grace_seconds if actor_id is not None else None
-    result = await db.execute(update(AgentTeamPreset).where(*_current_binding(team))
+    key_still_active = (exists().where(FactoryContextKey.key_kind == "team", FactoryContextKey.numeric_id == preset_id,
+                                       FactoryContextKey.context_key == expected_team_context_key,
+                                       FactoryContextKey.retired_at.is_(None)),) if protected else ()
+    result = await db.execute(update(AgentTeamPreset).where(*_current_binding(team), *key_still_active)
         .values(**values).execution_options(synchronize_session=False))
     if result.rowcount != 1:
         await db.rollback()
@@ -211,7 +216,8 @@ async def supervisor_checkin(db, actor, preset_id: int, next_check_at: datetime,
     else:
         await db.commit()
     team = await _team(db, preset_id)
-    result = supervisor_observation(team, now=current, actor=actor, quiet=await team_needs_no_supervision(db, team))
+    result = supervisor_observation(team, now=current, actor=actor, quiet=await team_needs_no_supervision(db, team),
+                                    team_context_key=await audit.current_context_key(db, "team", preset_id))
     from app.services.github_team_idle_service import github_team_idle_service
     from sqlalchemy.ext.asyncio import async_sessionmaker
     # The check-in is already committed. Isolate observation rollback/expiry from

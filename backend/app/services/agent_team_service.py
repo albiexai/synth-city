@@ -160,6 +160,10 @@ class AgentTeamService:
         )
         db.add(preset)
         await db.flush()
+        # #1298: the team lifetime has a name from its first moment, in the transaction that inserts the team.
+        from app.services.factory_audit_service import context_key_for
+
+        await context_key_for(db, "team", preset.id)
 
         normalized_slots = [
             self._normalize_slot_create(slot, index)
@@ -544,6 +548,9 @@ class AgentTeamService:
         await self._ensure_preset_name_is_unique(db, clone.name)
         db.add(clone)
         await db.flush()
+        from app.services.factory_audit_service import context_key_for
+
+        await context_key_for(db, "team", clone.id)
         for slot in slots:
             cloned_slot = AgentTeamSlot(
                 preset_id=clone.id,

@@ -26,9 +26,9 @@ const words = (failure: unknown, fallback: string) => {
 }
 const actorWords = (value: unknown) => (value === null || value === undefined ? 'none' : `actor ${String(value)}`)
 const graceWords = (value: unknown) => (value === null || value === undefined ? 'default' : `${String(value)} seconds`)
-// A binding is named by its version (the writes of the team) and its team lifetime (a deleted team's id can be reused).
-type BindingKey = { version: number; lifetime: number }
-const sameBinding = (a: BindingKey, b: BindingKey | undefined) => b !== undefined && a.version === b.version && a.lifetime === b.lifetime
+// A binding is named by its version (the writes of the team) and the team's context key (a deleted team's id can be reused, its key cannot).
+type BindingKey = { version: number; key: string }
+const sameBinding = (a: BindingKey, b: BindingKey | undefined) => b !== undefined && a.version === b.version && a.key === b.key
 const wholeFrom = (text: string, least: number) => (text.trim() !== '' && Number.isInteger(Number(text)) && Number(text) >= least ? Number(text) : null)
 
 function changes(event: AuditEventRead) {
@@ -68,11 +68,11 @@ export function SupervisorBindingDialog({ presetId, presetName, observation, ope
   const actorText = draft.actor ?? (boundId === null ? '' : String(boundId))
   const graceText = draft.grace ?? (boundId === null ? '' : String(observation?.grace_seconds ?? ''))
   const useDefault = draft.useDefault ?? false
-  // Writes need the binding version and the team lifetime of the server. Without them a change by another client, or
+  // Writes need the binding version and the team context key of the server. Without them a change by another client, or
   // a team that reuses a deleted team's id, could not be detected.
   const version = observation?.binding_version
-  const lifetime = observation?.team_lifetime
-  const current: BindingKey | undefined = typeof version === 'number' && typeof lifetime === 'number' && lifetime >= 1 ? { version, lifetime } : undefined
+  const teamKey = observation?.team_context_key
+  const current: BindingKey | undefined = typeof version === 'number' && typeof teamKey === 'string' && teamKey !== '' ? { version, key: teamKey } : undefined
   const canWrite = current !== undefined
   const reviewed = draft.baseline ?? current // the binding that the operator saw when the edit began
   const stale = canWrite && draft.baseline !== undefined && !sameBinding(draft.baseline, current)
@@ -153,7 +153,7 @@ export function SupervisorBindingDialog({ presetId, presetName, observation, ope
       setError('Enter the actor id as a whole number, 1 or more.')
       return
     }
-    const update: SupervisorBindingUpdate = { actor_id: actorId, expected_binding_version: reviewed.version, expected_team_lifetime: reviewed.lifetime }
+    const update: SupervisorBindingUpdate = { actor_id: actorId, expected_binding_version: reviewed.version, expected_team_context_key: reviewed.key }
     if (draft.useDefault) {
       update.grace_seconds = null
     } else if (draft.grace !== undefined) {
@@ -183,7 +183,7 @@ export function SupervisorBindingDialog({ presetId, presetName, observation, ope
           {observation === null ? 'The supervisor binding could not be read.' : boundId === null ? 'No supervisor is bound.' : `Bound: ${observation.address?.display_name ?? observation.address?.address ?? 'actor'} (actor ${boundId})`}
         </p>
         {observation !== null && !canWrite && (
-          <p className="text-sm text-muted-foreground">Changes are off: this server does not report a binding version and a team lifetime, so a change by another client could not be detected. Update the server to edit the supervisor.</p>
+          <p className="text-sm text-muted-foreground">Changes are off: this server does not report a binding version and a team key, so a change by another client could not be detected. Update the server to edit the supervisor.</p>
         )}
         {stale && (
           <div role="status" className="grid gap-2 rounded-md border border-amber-500/60 p-3 text-sm">
@@ -211,7 +211,7 @@ export function SupervisorBindingDialog({ presetId, presetName, observation, ope
             <div className="grid gap-2 rounded-md border p-3 text-sm">
               <p>Remove this supervisor? Its grace setting is cleared.</p>
               <div className="flex gap-2">
-                <Button variant="destructive" size="sm" onClick={() => { if (confirmKey !== null) void send({ actor_id: null, expected_binding_version: confirmKey.version, expected_team_lifetime: confirmKey.lifetime }) }} disabled={saving}>Remove</Button>
+                <Button variant="destructive" size="sm" onClick={() => { if (confirmKey !== null) void send({ actor_id: null, expected_binding_version: confirmKey.version, expected_team_context_key: confirmKey.key }) }} disabled={saving}>Remove</Button>
                 <Button variant="outline" size="sm" onClick={() => setConfirmKey(null)} disabled={saving}>Keep the supervisor</Button>
               </div>
             </div>

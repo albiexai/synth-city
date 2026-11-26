@@ -434,18 +434,24 @@
               "title": "Status",
               "type": "string"
             },
+            "team_context_key": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Team Context Key"
+            },
             "team_idle": {
               "items": {
                 "$ref": "#/$defs/TeamIdleItem"
               },
               "title": "Team Idle",
               "type": "array"
-            },
-            "team_lifetime": {
-              "default": 0,
-              "minimum": 0,
-              "title": "Team Lifetime",
-              "type": "integer"
             },
             "unanswered_requests": {
               "anyOf": [
