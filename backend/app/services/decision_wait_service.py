@@ -209,9 +209,12 @@ async def record_effort_wait_ended(
         operation_id = started.operation_id.replace(EFFORT_STARTED, EFFORT_ENDED, 1)
         if await _once(db, operation_id, item_key=item_key):
             continue
+        # An extension found after a notice it had already satisfied gives a zero-length episode, never a reversed
+        # one (V1, #1334): the end is never before the start.
+        ended = max(audit._naive(ended_at), started.fact_time or audit._naive(ended_at))
         await audit.record_event(
             db, event_kind=EFFORT_ENDED, source=source, occurred_at=datetime.utcnow(), fact_source="mail_messages",
-            fact_time=audit._naive(ended_at), item_id=started.item_id, item_context_key=item_key,
+            fact_time=ended, item_id=started.item_id, item_context_key=item_key,
             scope_context_key=started.scope_context_key, team_context_key=started.team_context_key,
             actor=audit.derive_actor(actor_kind="member", member_id=answered_by_member_id)
             if answered_by_member_id is not None else audit.derive_actor(actor_kind="system"),

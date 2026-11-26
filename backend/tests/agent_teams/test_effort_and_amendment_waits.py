@@ -61,7 +61,8 @@ async def test_an_extension_ends_the_wait_answered_by_the_leader(fx):
     assert end.event_kind == waits.EFFORT_ENDED and end.item_context_key == start.item_context_key
     assert end.after_values == {"wait_message_id": start.after_values["wait_message_id"], "wait_outcome": "extended",
                                 "answered_by_member_id": fx.leader}
-    assert end.fact_time == T0 and end.actor_member_id == fx.leader
+    # The fixture's extension clock (T0) predates the real Mail time of the notice, so the end is clamped to it.
+    assert end.fact_time == max(T0, start.fact_time) and end.actor_member_id == fx.leader
 
 
 async def test_a_later_limit_after_an_extension_is_a_new_wait(fx):
@@ -77,11 +78,12 @@ async def test_a_later_limit_after_an_extension_is_a_new_wait(fx):
 async def test_an_ended_item_ends_its_wait_unattributed(fx, status):
     await _at_limit(fx)
     await _set(fx, dispatch_status=status)
-    await _tick(fx, T0 + timedelta(minutes=3))
-    await _tick(fx, T0 + timedelta(minutes=4))  # once
+    seen = (await _leader_notice(fx))[0].created_at + timedelta(minutes=3)  # observed after the notice: kept
+    await _tick(fx, seen)
+    await _tick(fx, seen + timedelta(minutes=1))  # once
     _start, end = await _effort_events(fx)
     assert end.after_values["wait_outcome"] == "item_ended" and end.after_values["answered_by_member_id"] is None
-    assert end.fact_time == T0 + timedelta(minutes=3)
+    assert end.fact_time == seen
 
 
 async def test_an_escalated_item_keeps_its_wait_open(fx):
@@ -112,7 +114,7 @@ async def test_an_extension_after_an_interrupted_start_records_the_whole_episode
     start, end = await _effort_events(fx)
     assert (start.after_values["wait_message_id"], start.fact_time) == (notice.id, notice.created_at)
     assert (end.after_values["wait_outcome"], end.after_values["answered_by_member_id"], end.fact_time) == (
-        "extended", fx.leader, T0)
+        "extended", fx.leader, max(T0, start.fact_time))
     async with fx.maker() as session:  # the interrupted writer finishing late adds nothing
         from app.services import github_effort_limit_service as effort
         await effort.effort_limit_service._record_effort_waits(session, fx.item_id, now=T0 + timedelta(minutes=9))
@@ -145,9 +147,13 @@ async def test_a_notice_the_extension_did_not_answer_ends_unattributed(fx, monke
     else:  # the next limit's notice finds it; it ends at the extension's time and the new wait stays open
         await _set(fx, effort_elapsed_seconds=18 * 60 - 1, effort_last_tick_at=T0 + timedelta(minutes=5))
         await _tick(fx, T0 + timedelta(minutes=5, seconds=2))
-    end = next(e for e in await _effort_events(fx) if e.event_kind == waits.EFFORT_ENDED)
+    events = await _effort_events(fx)
+    end = next(e for e in events if e.event_kind == waits.EFFORT_ENDED)
+    start = next(e for e in events if e.event_kind == waits.EFFORT_STARTED
+                 and e.after_values["wait_message_id"] == end.after_values["wait_message_id"])
     assert (end.after_values["wait_outcome"], end.after_values["answered_by_member_id"]) == ("extended", None)
-    assert (end.actor_member_id, end.fact_time) == (None, T0)
+    # V1 (25370): the extension came before this notice, so the episode is zero-length, never reversed.
+    assert (end.actor_member_id, end.fact_time) == (None, start.fact_time)
     if found_by == "reconciliation":
         later = (await _leader_notice(fx))[-1]
         async with fx.maker() as session:
