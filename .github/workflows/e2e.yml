@@ -16,11 +16,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Required check. Runs the @active journeys against one isolated instance.
-  e2e:
-    name: e2e
+  e2e-scope:
+    name: E2E change scope
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 5
+    outputs:
+      run_suites: ${{ steps.changes.outputs.run_suites }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -28,56 +29,123 @@ jobs:
           persist-credentials: false
       - name: Detect a docs-only change
         id: changes
-        working-directory: .
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/ci/docs_only.py
+
+  e2e-shards:
+    name: E2E shard ${{ matrix.shard }} of ${{ strategy.job-total }}
+    needs: e2e-scope
+    if: needs.e2e-scope.outputs.run_suites == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v7
-        if: steps.changes.outputs.run_suites != 'false'
         with:
           python-version: '3.12'
           cache: pip
           cache-dependency-path: backend/requirements.txt
       - uses: actions/setup-node@v7
-        if: steps.changes.outputs.run_suites != 'false'
         with:
           node-version: '24'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: Install the backend
-        if: steps.changes.outputs.run_suites != 'false'
         run: |
           python -m venv backend/venv
           backend/venv/bin/pip install -r backend/requirements.txt apscheduler
       - name: Install the frontend and Chromium
-        if: steps.changes.outputs.run_suites != 'false'
         working-directory: frontend
         run: |
           npm ci
           npx playwright install --with-deps chromium
       - name: Install tmux
-        if: steps.changes.outputs.run_suites != 'false'
         run: sudo apt-get install -y --no-install-recommends tmux
       - name: Type-check the journeys
-        if: steps.changes.outputs.run_suites != 'false'
+        if: matrix.shard == 1
         working-directory: frontend
         run: npm run e2e:typecheck
-      - name: Run the active journeys
-        if: steps.changes.outputs.run_suites != 'false'
+      - name: Run the active journeys for this shard
         working-directory: frontend
         env:
           E2E_BACKEND_LOG: ${{ github.workspace }}/frontend/e2e-logs/backend.log
-        run: npm run e2e
-      - name: Upload traces, screenshots and the backend log
-        if: steps.changes.outputs.run_suites != 'false' && (failure())
+        run: npm run e2e -- --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+      - name: Upload the journey report
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-results
+          name: e2e-journeys-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: frontend/test-results/results.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload traces, screenshots and the backend log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-diagnostics-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: |
             frontend/test-results/
             frontend/playwright-report/
             frontend/e2e-logs/
           retention-days: 7
+
+  # Required check. It also succeeds when the detector confirms a docs-only change.
+  e2e:
+    name: e2e
+    needs: [e2e-scope, e2e-shards]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require successful shards or a verified docs-only skip
+        env:
+          SCOPE_RESULT: ${{ needs.e2e-scope.result }}
+          RUN_SUITES: ${{ needs.e2e-scope.outputs.run_suites }}
+          SHARDS_RESULT: ${{ needs.e2e-shards.result }}
+        run: |
+          if [ "$SCOPE_RESULT" = success ]; then
+            case "$RUN_SUITES:$SHARDS_RESULT" in
+              true:success|false:skipped) exit 0 ;;
+            esac
+          fi
+          printf 'E2E gate refused scope=%s run_suites=%s shards=%s\n' "$SCOPE_RESULT" "$RUN_SUITES" "$SHARDS_RESULT" >&2
+          exit 1
+      - uses: actions/checkout@v7
+        if: needs.e2e-scope.outputs.run_suites == 'true'
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        if: needs.e2e-scope.outputs.run_suites == 'true'
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install the Playwright collector
+        if: needs.e2e-scope.outputs.run_suites == 'true'
+        working-directory: frontend
+        run: npm ci
+      - uses: actions/download-artifact@v5
+        if: needs.e2e-scope.outputs.run_suites == 'true'
+        with:
+          # A failed-jobs rerun can still use successful reports from earlier attempts of this run.
+          pattern: e2e-journeys-*-attempt-*
+          path: ${{ runner.temp }}/e2e-journey-artifacts
+          merge-multiple: false
+      - name: Prove that every active journey ran exactly once
+        if: needs.e2e-scope.outputs.run_suites == 'true'
+        run: |
+          python3 scripts/ci/e2e_shard_identities.py --shards 4 \
+            --output "$RUNNER_TEMP/e2e-manifest.json" \
+            --artifacts "$RUNNER_TEMP/e2e-journey-artifacts"
 
   # Not required. Runs the @pending journeys and reports lane progress.
   e2e-pending:

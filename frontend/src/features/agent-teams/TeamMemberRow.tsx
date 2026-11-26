@@ -64,7 +64,7 @@ export function TeamMemberRow({
         </button>
         <span className="text-sm text-muted-foreground [overflow-wrap:anywhere]">{harness}{model ? ` · ${model}` : ''}{effort ? ` · ${effort} effort` : ''}</span>
         <span className="min-w-24 text-sm">{slot.role || 'Unassigned'}</span>
-        <AgentStatusBadges status={status} compact />
+        <AgentStatusBadges status={status} compact showToolCatalog />
         <div className="relative">
           <Button
             variant="outline"
