@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AlertCircle, GitPullRequest, RotateCcw, XCircle } from 'lucide-react'
 import { formatServerTime } from '@/lib/serverTime'
+import { hasLiveQueuedHandoff, QueuedHandoffDetails } from './QueuedHandoffDetails'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -313,7 +314,13 @@ export function WorkItemActions({
                 </div>
               )}
               {actionResult && <p role="status" className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 p-3 text-sm">{actionResult}</p>}
-              {item.handoff_state && (
+              {hasLiveQueuedHandoff(item) && (
+                <section aria-label="Queued handoff" className="rounded-lg border border-sky-500/40 bg-sky-500/10 p-4">
+                  <h3 className="mb-2 text-sm font-medium">Queued handoff</h3>
+                  <QueuedHandoffDetails item={item} targetName={handoffTargetName} />
+                </section>
+              )}
+              {item.handoff_state && item.handoff_state !== 'queued' && (
                 <div className="rounded-lg border border-sky-500/40 bg-sky-500/10 p-4 text-sm">
                   <span className="font-medium">{ownerName ?? 'Current owner'}</span>
                   <span className="mx-2 text-muted-foreground">→ {readableCode(item.handoff_state)} handoff →</span>

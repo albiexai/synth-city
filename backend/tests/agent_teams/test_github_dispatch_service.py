@@ -7827,6 +7827,124 @@ async def test_queued_handoff_wins_concurrent_dispatch_claim_across_scopes(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_handoff_withdrawal_releases_the_target_in_the_dispatch_transaction(wal_dispatch_sessions, monkeypatch):
+    from app.services import github_coordination_service as coordination
+
+    maker = wal_dispatch_sessions
+    async with maker() as db:
+        preset, slots, scope = await _team(db)
+        target_id = slots[1].id
+        other = TeamGithubScope(preset_id=preset.id, repo_owner="o", repo_name="other", repo_path="/tmp/other")
+        db.add(other)
+        await db.flush()
+        now = datetime.utcnow()
+        source = GithubWorkItem(scope_id=scope.id, issue_number=9031, issue_title="Handoff", issue_url="u",
+            github_updated_at=now, dispatch_status="dispatched", owner_slot_id=slots[0].id, dispatch_nonce="attempt",
+            handoff_state="queued", handoff_target_slot_id=target_id, handoff_expires_at=now + timedelta(minutes=10))
+        candidate = GithubWorkItem(scope_id=other.id, issue_number=9032, issue_title="New", issue_url="v",
+            github_updated_at=now)
+        db.add_all([source, candidate])
+        await db.commit()
+        source_id, scope_id, candidate_id, other_id = source.id, scope.id, candidate.id, other.id
+        assert await github_dispatch_service.slot_is_busy(db, target_id)
+
+    locked, claim_started = asyncio.Event(), asyncio.Event()
+    original_lock = dispatch_module._lock_dispatch_team
+    require_leader = AsyncMock(return_value=SimpleNamespace(id=9, member_id=8))
+    monkeypatch.setattr(coordination.github_coordination_service, "require_leader", require_leader)
+
+    async def serialize(db, preset_id):
+        if db.info.get("withdraw"):
+            await original_lock(db, preset_id)
+            locked.set()
+            await asyncio.wait_for(claim_started.wait(), timeout=5)
+        else:
+            await asyncio.wait_for(locked.wait(), timeout=5)
+            claim_started.set()
+            await original_lock(db, preset_id)
+            assert await db.scalar(select(FactoryAuditEvent.id).where(
+                FactoryAuditEvent.item_id == source_id,
+                FactoryAuditEvent.sanitized_reason == "queued handoff withdrawn",
+            ))
+
+    monkeypatch.setattr(dispatch_module, "_lock_dispatch_team", serialize)
+
+    async def withdraw():
+        async with maker(info={"withdraw": True}) as db:
+            await github_dispatch_service.withdraw_queued_handoff(
+                db, await db.get(GithubWorkItem, source_id), await db.get(TeamGithubScope, scope_id),
+                leader_session=SimpleNamespace(id=9, member_id=8),
+            )
+
+    async def claim():
+        async with maker() as db:
+            return await github_dispatch_service._claim_dispatch_start(
+                db, await db.get(TeamGithubScope, other_id), await db.get(GithubWorkItem, candidate_id),
+                owner_slot_id=target_id, routing_method="label", require_autonomy=False,
+            )
+
+    _, claimed = await asyncio.wait_for(asyncio.gather(withdraw(), claim()), timeout=10)
+    assert claimed
+    require_leader.assert_awaited_once()
+    async with maker() as db:
+        source = await db.get(GithubWorkItem, source_id)
+        candidate = await db.get(GithubWorkItem, candidate_id)
+        assert source.handoff_state is None and source.handoff_target_slot_id is None
+        assert candidate.dispatch_status == "dispatched" and candidate.owner_slot_id == target_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("queue", ["expiry_moved", "expired"])
+async def test_handoff_withdrawal_refuses_changed_or_expired_queue(wal_dispatch_sessions, monkeypatch, queue):
+    from app.services import github_coordination_service as coordination
+
+    maker = wal_dispatch_sessions
+    leader = SimpleNamespace(id=9, member_id=8)
+    monkeypatch.setattr(coordination.github_coordination_service, "require_leader", AsyncMock(return_value=leader))
+    async with maker() as db:
+        _, slots, scope = await _team(db)
+        now = datetime.utcnow()
+        expires_at = now + timedelta(minutes=10 if queue == "expiry_moved" else -1)
+        target_id = slots[1].id
+        item = GithubWorkItem(scope_id=scope.id, issue_number=9033, issue_title="Handoff", issue_url="u",
+            github_updated_at=now, dispatch_status="dispatched", owner_slot_id=slots[0].id, dispatch_nonce="attempt",
+            handoff_state="queued", handoff_target_slot_id=target_id, handoff_expires_at=expires_at)
+        db.add(item)
+        await db.commit()
+        item_id = item.id
+
+        if queue == "expiry_moved":
+            current_expiry = expires_at + timedelta(minutes=2)
+            lock = dispatch_module._lock_dispatch_team
+
+            async def move_queue_before_lock(session, preset_id):
+                await session.commit()
+                async with maker() as other:
+                    await other.execute(update(GithubWorkItem).where(
+                        GithubWorkItem.id == item_id,
+                    ).values(handoff_expires_at=current_expiry))
+                    await other.commit()
+                await lock(session, preset_id)
+
+            monkeypatch.setattr(dispatch_module, "_lock_dispatch_team", move_queue_before_lock)
+            refusal = "handoff_context_changed"
+        else:
+            current_expiry = expires_at
+            refusal = "handoff_not_queued"
+
+        with pytest.raises(coordination.CoordinationError, match=refusal):
+            await github_dispatch_service.withdraw_queued_handoff(db, item, scope, leader_session=leader)
+        await db.rollback()
+
+    async with maker() as db:
+        item = await db.get(GithubWorkItem, item_id)
+        assert (item.handoff_state, item.handoff_target_slot_id, item.handoff_expires_at) == (
+            "queued", target_id, current_expiry,
+        )
+        assert await db.scalar(select(FactoryAuditEvent.id).where(FactoryAuditEvent.item_id == item_id)) is None
+
+
+@pytest.mark.asyncio
 async def test_committed_start_without_launch_cannot_be_started_again(db, monkeypatch):
     _, slots, scope = await _team(db)
     item = GithubWorkItem(scope_id=scope.id, issue_number=9030, issue_title="Interrupted start", issue_url="u",

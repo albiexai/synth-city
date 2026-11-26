@@ -2465,6 +2465,52 @@ class GithubDispatchService:
             await db.commit()
             await self._notify_handoff(db, item_id, target, notice_fields)
 
+    async def withdraw_queued_handoff(
+        self, db: AsyncSession, item: GithubWorkItem, scope: TeamGithubScope, *,
+        leader_session: MailAgentSession, dispatch_nonce: str | None = None,
+    ) -> None:
+        from app.services import factory_audit_service as audit
+        from app.services.github_coordination_service import CoordinationError, github_coordination_service, hold_code
+
+        # Share the writer with dispatch and promotion. A queue observed before it
+        # moved to another attempt, target, or state has no withdrawal authority.
+        identity = ("scope_id", "owner_slot_id", "dispatch_nonce", "handoff_state",
+                    "handoff_target_slot_id", "handoff_expires_at")
+        observed = tuple(getattr(item, field) for field in identity)
+        preset_id = scope.preset_id
+        await _lock_dispatch_team(db, preset_id)
+        await db.refresh(scope)
+        await db.refresh(item, with_for_update=True)
+        if scope.preset_id != preset_id or tuple(getattr(item, field) for field in identity) != observed:
+            raise CoordinationError("handoff_context_changed")
+        await db.get(AgentTeamPreset, preset_id, populate_existing=True)
+        leader = await github_coordination_service.require_leader(db, scope.id, leader_session)
+        if dispatch_nonce is not None and dispatch_nonce != item.dispatch_nonce:
+            raise CoordinationError("handoff_context_changed")
+        if code := hold_code():
+            raise CoordinationError(code)
+
+        now = datetime.utcnow()
+        expires_at, target_id = item.handoff_expires_at, item.handoff_target_slot_id
+        if (expires_at is None or target_id is None
+                or await db.scalar(_live_queued_handoffs(now).where(GithubWorkItem.id == item.id)) is None):
+            raise CoordinationError("handoff_not_queued")
+        operation_id = f"handoff:item:{item.id}:to:{target_id}:expires:{expires_at.isoformat()}:withdrawn"
+        item.handoff_state = item.handoff_target_slot_id = item.handoff_expires_at = None
+        item.updated_at = now
+        await audit.record_event(
+            db, event_kind="handoff_reassignment", source="github_dispatch_service.withdraw_queued_handoff",
+            occurred_at=now, actor=audit.derive_actor(actor_kind="member", member_id=leader.member_id,
+                                                      session_id=leader.id),
+            scope_id=scope.id, item_id=item.id,
+            before_values={"status": "queued"}, after_values={"status": "withdrawn"},
+            action_outcome="applied", sanitized_reason="queued handoff withdrawn",
+            operation_id=operation_id, correlation_id=operation_id,
+        )
+        if code := hold_code():
+            raise CoordinationError(code)
+        await db.commit()
+
     async def initiate_handoff(
         self,
         db: AsyncSession,

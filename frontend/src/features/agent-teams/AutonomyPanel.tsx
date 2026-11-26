@@ -28,6 +28,7 @@ import type {
   TeamGithubScope,
 } from '@/types/agentTeams'
 import { BacklogCoordination } from './BacklogCoordination'
+import { hasLiveQueuedHandoff, QueuedHandoffDetails } from './QueuedHandoffDetails'
 import { workItemAttention } from './workItemAttention'
 import { useOperatorTokenFlow } from './useOperatorTokenFlow'
 import { fetchGithubRecoveryGate, fetchGithubRecoveryGateActive } from './api'
@@ -101,6 +102,7 @@ export function AutonomyPanel({
     [workItems]
   )
   const countsLimited = workItemTotal != null && workItemTotal > workItems.length
+  const queuedHandoffs = workItems.filter(hasLiveQueuedHandoff)
   const inspectGate = async () => {
     setGateOpen(false)
     setGateLoading(true)
@@ -266,6 +268,24 @@ export function AutonomyPanel({
           </Card>
         ))}
       </div>
+
+      {queuedHandoffs.length > 0 && (
+        <section aria-label="Queued handoffs" className="min-w-0 space-y-3 rounded-lg border p-4">
+          <h3 className="font-semibold">Queued handoffs</h3>
+          <ul className="space-y-3">
+            {queuedHandoffs.map((item) => (
+              <li key={item.id} className="min-w-0 space-y-1">
+                <p className="wrap-anywhere text-sm font-medium">
+                  <Link className="underline underline-offset-4" to={`/work/${item.id}`}>#{item.issue_number}</Link>{' '}
+                  {item.issue_title}
+                </p>
+                <QueuedHandoffDetails item={item}
+                  targetName={preset.slots.find((slot) => slot.id === item.handoff_target_slot_id)?.display_name} />
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       <Card className="min-w-0">
         <CardContent className="flex flex-wrap items-center justify-between gap-3 p-4 text-sm">

@@ -16,6 +16,43 @@ const MEMBERS = ['D2 Docs lead', 'D3 Writer', 'D4 Editor', 'D5 Reviewer']
 
 test.use({ viewport: { width: 1440, height: 900 } })
 
+for (const width of [1440, 390]) {
+  test(`@active shows a queued handoff on the team and its work item at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 })
+    const now = Date.now()
+    let queued = true
+    await page.route(/\/agent-teams\/presets\/1\/github-work-items\?/, async (route) => {
+      const response = await route.fetch()
+      const body = await response.json()
+      const item = body.items.find((entry: { id: number }) => entry.id === 3)
+      if (queued) Object.assign(item, {
+        handoff_state: 'queued',
+        handoff_target_slot_id: 4,
+        handoff_queued_at: new Date(now - 10 * 60_000).toISOString(),
+        handoff_expires_at: new Date(now + 20 * 60_000).toISOString(),
+      })
+      await route.fulfill({ response, json: body })
+    })
+    await page.goto('/teams/1?tab=autonomy')
+    const queue = page.getByRole('region', { name: 'Queued handoffs' })
+    await expect(queue.getByText('F1 Frontend', { exact: true })).toBeVisible()
+    await expect(queue.getByText(/\d+ min ago/)).toBeVisible()
+    await expect(queue.getByText('Expires', { exact: true })).toBeVisible()
+    await queue.getByRole('link', { name: '#103' }).click()
+
+    const handoff = page.getByRole('region', { name: 'Queued handoff', exact: true })
+    await expect(handoff.getByText('F1 Frontend', { exact: true })).toBeVisible()
+    await expect(handoff.getByText(/\d+ min ago/)).toBeVisible()
+    await expect(handoff.getByText('Expires', { exact: true })).toBeVisible()
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width)
+
+    queued = false
+    await page.goto('/teams/1?tab=autonomy')
+    await expect(page.getByRole('link', { name: 'View in Work ›' })).toBeVisible()
+    await expect(queue).toHaveCount(0)
+  })
+}
+
 test('@active the header and all 4 members are visible without scrolling', async ({ page }) => {
   await page.goto(TEAM)
   await expect(page.locator('main').getByRole('heading', { name: 'Docs crew' }).first()).toBeInViewport()

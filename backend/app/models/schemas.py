@@ -3100,6 +3100,8 @@ class GithubWorkItemResponse(BaseModel):
     routing_method: Optional[str] = None
     handoff_state: Optional[str] = None
     handoff_target_slot_id: Optional[int] = None
+    handoff_queued_at: Optional[datetime] = None
+    handoff_expires_at: Optional[datetime] = None
     approval_round_count: int
     ack_approver_member_id: Optional[int] = None
     ack_evidence_message_id: Optional[int] = None

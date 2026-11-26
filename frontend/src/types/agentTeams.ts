@@ -594,6 +594,8 @@ export interface GithubWorkItem {
   routing_method?: string | null
   handoff_state?: string | null
   handoff_target_slot_id?: number | null
+  handoff_queued_at?: string | null
+  handoff_expires_at?: string | null
   approval_round_count: number
   dispatch_nonce?: string | null
   dispatch_generation?: string | null

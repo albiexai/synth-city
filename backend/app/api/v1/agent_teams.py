@@ -891,6 +891,7 @@ _DISPATCH_STATUS_RULES: dict[str, _StatusRule] = {
     "handoff_initiated": _OWNER,
     "revision_requested": _OWNER,
     "handoff_accepted": _StatusRule("target", "not_handoff_target"),
+    "handoff_withdrawn": _StatusRule("leader", "current_leader_required"),
     "pr_opened": _StatusRule("owner", "not_item_owner", lease_token_required=True),
     "pr_ready": _StatusRule("owner", "not_item_owner", lease_token_required=True),
     "continuation_completed": _StatusRule(
@@ -929,6 +930,9 @@ async def _authorize_dispatch_report(
     rule = _DISPATCH_STATUS_RULES.get(report.status)
     if rule is None:
         raise HTTPException(status_code=400, detail=f"unknown status {report.status}")
+
+    if rule.role == "leader":
+        return  # The withdrawal checks the authenticated Leader under the team dispatch lock.
 
     authorized = item.owner_slot_id if rule.role == "owner" else item.handoff_target_slot_id
     if authorized is None or slot_id != authorized:
@@ -1174,7 +1178,17 @@ async def report_dispatch_status(
     scope = await db.get(TeamGithubScope, item.scope_id)
     await _authorize_dispatch_report(db, item, report, session)
 
-    if item.dispatch_status in TERMINAL_ITEMS and report.status != "workspace_released":
+    if report.status == "handoff_withdrawn":
+        from app.services.github_coordination_service import CoordinationError
+
+        try:
+            await github_dispatch_service.withdraw_queued_handoff(
+                db, item, scope, leader_session=session, dispatch_nonce=report.dispatch_nonce,
+            )
+        except CoordinationError as exc:
+            await db.rollback()
+            raise HTTPException(status_code=exc.status, detail=exc.code) from exc
+    elif item.dispatch_status in TERMINAL_ITEMS and report.status != "workspace_released":
         await _observe_terminal_dispatch_report(db, item, report, session)
     elif report.status == "triaging":
         if report.note is not None:
