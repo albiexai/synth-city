@@ -285,3 +285,54 @@ async def test_changed_claude_checkout_does_not_produce_ready_evidence(db, tmp_p
     assert row.workspace_trust_target is None
     monkeypatch.setattr(settings, "team_workspace_trust_helper_enabled", False)
     assert (await agent_team_service.get_preset(db, preset.id)).slots[0].workspace_trust_status is None
+
+
+@pytest.mark.asyncio
+async def test_duplicate_codex_slot_prepares_trust_and_retries_a_distinct_dispatch(
+    db, tmp_path, integrated_helper, helper, monkeypatch,
+):
+    calls, errors = integrated_helper
+    directory = str(tmp_path)
+    original = await agent_team_service.create_preset(db, AgentTeamPresetCreate(
+        name="Original",
+        slots=[AgentTeamSlotCreate(display_name="Builder", provider="codex-cli", repo_path=directory)],
+    ))
+    errors.append(helper.AgentConfigBusy)
+    duplicate = await agent_team_service.duplicate_preset(db, original.id)
+    slot = duplicate.slots[0]
+    assert slot.id != original.slots[0].id
+    assert slot.workspace_trust_status == "pending"
+    assert calls == [("codex-cli", directory)] * 2
+    assert (await agent_team_service.get_preset(db, duplicate.id)).slots[0].workspace_trust_status == "pending"
+
+    plan = SimpleNamespace(
+        can_launch=True, plan_hash="fixture", items=[SimpleNamespace(slot_id=slot.id, action="spawn", warnings=[])],
+        reuse_count=0, adopt_count=0, spawn_count=1, skipped_count=0, blocked_count=0,
+    )
+    monkeypatch.setattr(agent_team_service, "plan_launch", AsyncMock(return_value=plan))
+    monkeypatch.setattr(agent_team_service, "_bootstrap_prompt", AsyncMock(return_value=None))
+    launches = []
+
+    def spawn(provider, options, *, workspace_trust_prepared, **kwargs):
+        launches.append((provider, options.directory, workspace_trust_prepared))
+        return {"session_name": "fixture"}
+
+    monkeypatch.setattr("app.services.agent_team_service.spawn_session", spawn)
+    request = AgentTeamLaunchRequest(skip_plan_confirmation=True, reuse_existing=False, slot_ids=[slot.id])
+    launched = await agent_team_service.launch(db, duplicate.id, request)
+    assert launched.items[0].status == "pending_registration"
+    assert (await agent_team_service.get_preset(db, duplicate.id)).slots[0].workspace_trust_status == "ready"
+
+    workspace = tmp_path / "dispatch"
+    workspace.mkdir()
+    dispatch = request.model_copy(update={"repo_path_override": str(workspace)})
+    errors.append(helper.AgentConfigBusy)
+    busy = await agent_team_service.launch(db, duplicate.id, dispatch)
+    assert busy.items[0].block_code == "agent_config_busy"
+    assert launches == [("codex-cli", directory, True)]
+
+    retry = await agent_team_service.launch(db, duplicate.id, dispatch)
+    assert retry.items[0].status == "pending_registration"
+    assert launches[-1] == ("codex-cli", str(workspace), True)
+    assert calls == [("codex-cli", directory)] * 3 + [("codex-cli", str(workspace))] * 2
+    assert (await agent_team_service.get_preset(db, duplicate.id)).slots[0].workspace_trust_status == "ready"

@@ -545,27 +545,27 @@ class AgentTeamService:
         db.add(clone)
         await db.flush()
         for slot in slots:
-            db.add(
-                AgentTeamSlot(
-                    preset_id=clone.id,
-                    position=slot.position,
-                    display_name=slot.display_name,
-                    provider=slot.provider,
-                    repo_id=slot.repo_id,
-                    repo_path=slot.repo_path,
-                    repo_name=slot.repo_name,
-                    role=slot.role,
-                    charter=slot.charter,
-                    ui_color=slot.ui_color,
-                    bootstrap_prompt=slot.bootstrap_prompt,
-                    controlled_language_enabled=slot.controlled_language_enabled,
-                    launch_mode=slot.launch_mode,
-                    launch_options=slot.launch_options or {},
-                    area_labels=slot.area_labels,
-                    expertise=slot.expertise,
-                    enabled=slot.enabled,
-                )
+            cloned_slot = AgentTeamSlot(
+                preset_id=clone.id,
+                position=slot.position,
+                display_name=slot.display_name,
+                provider=slot.provider,
+                repo_id=slot.repo_id,
+                repo_path=slot.repo_path,
+                repo_name=slot.repo_name,
+                role=slot.role,
+                charter=slot.charter,
+                ui_color=slot.ui_color,
+                bootstrap_prompt=slot.bootstrap_prompt,
+                controlled_language_enabled=slot.controlled_language_enabled,
+                launch_mode=slot.launch_mode,
+                launch_options=slot.launch_options or {},
+                area_labels=slot.area_labels,
+                expertise=slot.expertise,
+                enabled=slot.enabled,
             )
+            await self._provision_slot_workspace_trust(cloned_slot)
+            db.add(cloned_slot)
         if source.leader_slot_id is not None:
             mapped_leader_index = next(
                 (index for index, slot in enumerate(slots) if slot.id == source.leader_slot_id),

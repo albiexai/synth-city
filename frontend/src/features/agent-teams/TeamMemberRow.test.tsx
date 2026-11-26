@@ -24,11 +24,17 @@ const noop = () => undefined
 const actions = { onLaunch: noop, onEdit: noop, onSetLeader: null, onMove: noop, onDelete: noop }
 
 test('shows pending folder trust until a launch prepares it', () => {
-  const props = { isLeader: false, first: true, last: true, status: null, actions }
+  const props = { isLeader: true, first: true, last: true, status: null, actions }
   const { rerender } = render(
     <TeamMemberRow {...props} slot={{ ...slot, workspace_trust_status: 'pending' }} />,
   )
-  expect(screen.getByText('Folder trust pending')).toBeVisible()
+  const nameHeader = screen.getByRole('button', { name: 'Details for Builder' }).parentElement
+  const pending = screen.getByText('Folder trust pending')
+  expect(screen.getByText('Builder')).toBeVisible()
+  expect(pending).toBeVisible()
+  expect(nameHeader).not.toContainElement(pending)
+  rerender(<TeamMemberRow {...props} slot={{ ...slot, workspace_trust_status: 'failed' }} />)
+  expect(nameHeader).not.toContainElement(screen.getByText('Folder trust failed'))
   rerender(<TeamMemberRow {...props} slot={{ ...slot, workspace_trust_status: 'ready' }} />)
   expect(screen.queryByText('Folder trust pending')).not.toBeInTheDocument()
 })
