@@ -25,10 +25,13 @@ async def add_wait(maker, scope_id, number, title, at=MOMENT):
         await db.commit()
 
 
-async def add_item(maker, scope_id, number, status="pending", **values):
+async def add_item(maker, scope_id, number, status="pending", url=None, **values):
     async with maker() as db:
+        scope = await db.get(TeamGithubScope, scope_id)
+        # The watcher stores the GitHub html_url of the issue.
+        url = url or f"https://github.com/{scope.repo_owner}/{scope.repo_name}/issues/{number}"
         item = GithubWorkItem(scope_id=scope_id, issue_number=number, issue_title=f"Issue {number}",
-                              issue_url="u", github_updated_at=MOMENT, dispatch_status=status, **values)
+                              issue_url=url, github_updated_at=MOMENT, dispatch_status=status, **values)
         db.add(item)
         await db.commit()
         return item.id
@@ -146,3 +149,97 @@ async def test_a_deferral_without_a_recorded_milestone_shows_a_null_milestone(fa
         await db.commit()
     rows = (await get_states(factory_client))["deferred"]
     assert len(rows) == 1 and rows[0]["target_milestone"] is None
+
+
+# #1337, review 6074331482: a row keeps the repository it was recorded for, also after its scope moves.
+DIRECTOR = {"x-synth-city-operator-token": "synthetic-factory-operator"}
+
+
+async def move_scope(client, scope_id, **body):
+    response = await client.patch(f"/api/v1/agent-teams/github-scopes/{scope_id}", json=body, headers=DIRECTOR)
+    assert response.status_code == 200, response.text
+
+
+async def idle_scope(maker, team_index, repo_name, ids):
+    """A scope without items: the scope PATCH changes the repository of an idle scope only."""
+    async with maker() as db:
+        scope = TeamGithubScope(preset_id=ids.teams[team_index], repo_owner="fixture", repo_name=repo_name,
+                                repo_path="/private/idle", dispatch_label="ready")
+        db.add(scope)
+        await db.commit()
+        return scope.id
+
+
+async def test_a_moved_scope_keeps_its_deferral_on_the_old_repository_and_drops_its_waits(factory_client, factory_store):
+    scope = await idle_scope(factory_store.maker, 0, "orig", factory_store.ids)
+    await add_wait(factory_store.maker, scope, 9111, "v4.5")
+    item_id = await add_item(factory_store.maker, scope, 9112)
+    await defer(factory_store.maker, scope, item_id, "v4.6")
+    before = await get_states(factory_client)
+    assert [r["repository"]["github"] for r in before["waiting"]] == [{"owner": "fixture", "name": "orig"}]
+    assert [r["repository"]["github"] for r in before["deferred"]] == [{"owner": "fixture", "name": "orig"}]
+    await move_scope(factory_client, scope, repo_name="renamed")
+    after = await get_states(factory_client)
+    # The wait belonged to the old repository. The deferral still names it, so its link still opens its issue.
+    assert after["waiting"] == []
+    assert [(r["repository"]["github"], r["issue_number"]) for r in after["deferred"]] == [
+        ({"owner": "fixture", "name": "orig"}, 9112)]
+
+
+async def test_waits_of_other_scopes_stay_when_one_scope_moves(factory_client, factory_store):
+    first = await idle_scope(factory_store.maker, 0, "twin", factory_store.ids)
+    second = await idle_scope(factory_store.maker, 1, "twin", factory_store.ids)
+    await add_wait(factory_store.maker, first, 9113, "v4.5")
+    await add_wait(factory_store.maker, second, 9113, "v4.5")
+    await move_scope(factory_client, first, repo_name="elsewhere")
+    rows = (await get_states(factory_client))["waiting"]
+    assert [(r["repository"]["scope_id"], r["issue_number"]) for r in rows] == [(second, 9113)]
+
+
+async def test_a_case_only_change_of_the_repository_keeps_the_waits(factory_client, factory_store):
+    scope = await idle_scope(factory_store.maker, 0, "casey", factory_store.ids)
+    await add_wait(factory_store.maker, scope, 9114, "v4.5")
+    await move_scope(factory_client, scope, repo_owner="Fixture")
+    assert [r["issue_number"] for r in (await get_states(factory_client))["waiting"]] == [9114]
+
+
+async def test_an_item_of_the_new_repository_with_the_same_number_does_not_hide_the_deferral(factory_client, factory_store):
+    old = await idle_scope(factory_store.maker, 0, "orig", factory_store.ids)
+    other = await idle_scope(factory_store.maker, 1, "newer", factory_store.ids)
+    item_id = await add_item(factory_store.maker, old, 9115)
+    await defer(factory_store.maker, old, item_id, "v4.5")
+    await move_scope(factory_client, old, repo_name="newer")
+    await add_item(factory_store.maker, other, 9115)
+    rows = (await get_states(factory_client))["deferred"]
+    assert [(r["repository"]["github"]["name"], r["issue_number"]) for r in rows] == [("orig", 9115)]
+
+
+async def test_an_item_with_the_same_issue_url_hides_the_deferral_even_in_another_scope(factory_client, factory_store):
+    first, second = factory_store.ids.scopes[:2]
+    item_id = await add_item(factory_store.maker, first, 9116)
+    await defer(factory_store.maker, first, item_id, "v4.5")
+    await add_item(factory_store.maker, second, 9116, url="https://github.com/Fixture/Shared/issues/9116")
+    assert (await get_states(factory_client))["deferred"] == []
+
+
+@pytest.mark.parametrize("url", [
+    "u", "https://example.com/fixture/shared/issues/9117", "https://github.com/fixture/shared/pull/9117",
+    "https://github.com/fixture/shared/issues/9118", "https://github.com/fixture/shared/issues/9117/extra",
+])
+async def test_a_deferral_whose_stored_url_does_not_name_its_issue_is_omitted(factory_client, factory_store, url):
+    scope = factory_store.ids.scopes[0]
+    item_id = await add_item(factory_store.maker, scope, 9117, url=url)
+    await defer(factory_store.maker, scope, item_id, "v4.5")
+    assert (await get_states(factory_client))["deferred"] == []
+
+
+async def test_only_the_rows_of_the_list_are_built(factory_client, factory_store, monkeypatch):
+    monkeypatch.setattr(milestone_state_service, "ROW_LIMIT", 3)
+    for number in range(9200, 9212):
+        await add_wait(factory_store.maker, factory_store.ids.scopes[0], number, "v4.5")
+    built = []
+    original = milestone_state_service._repository
+    monkeypatch.setattr(milestone_state_service, "_repository", lambda scope: built.append(scope.id) or original(scope))
+    body = await get_states(factory_client)
+    assert len(body["waiting"]) == 3 and body["waiting_truncated"] is True
+    assert len(built) == 3

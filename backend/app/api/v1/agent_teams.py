@@ -12,7 +12,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from app.models.api_model import format_utc_time
-from sqlalchemy import String, and_, cast, exists, func, or_, select, update
+from sqlalchemy import String, and_, cast, delete, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -39,6 +39,7 @@ from app.models.database import (
     FactoryAuditEvent,
     GithubApprovalRequest,
     GithubAttemptScopeRevision,
+    GithubMilestoneWait,
     GithubWorkItem,
     GithubWorkspace,
     MailAgentSession,
@@ -2803,7 +2804,11 @@ async def update_github_scope(
             if not compatible_checkout:
                 raise HTTPException(status_code=409, detail="scope_workspace_repository_mismatch")
         previously_enabled, previous_limit = scope.enabled, scope.max_concurrent_dispatched
+        previous_repository = (scope.repo_owner.lower(), scope.repo_name.lower())
         _apply_scope_create(scope, request, normalized_repo_path=proposed_repo_path)
+        if (scope.repo_owner.lower(), scope.repo_name.lower()) != previous_repository:
+            # #1337: a wait stores no repository. After a move it would name the new repository's issues.
+            await db.execute(delete(GithubMilestoneWait).where(GithubMilestoneWait.scope_id == scope.id))
         if scope.github_auth_mode == "app":
             if installation_id is not None:
                 scope.github_app_installation_id = installation_id

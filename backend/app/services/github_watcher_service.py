@@ -401,13 +401,21 @@ class GithubWatcherService:
         self, db: AsyncSession, scope: TeamGithubScope, client: GithubClient | None = None
     ) -> None:
         client = client or github_client
+        # #1337: the repository this poll reads. A scope PATCH can change it while the remote read waits.
+        scope_id, polled_owner, polled_name = scope.id, scope.repo_owner, scope.repo_name
         labeled = await client.list_issues_with_label(
-            scope.repo_owner, scope.repo_name, scope.dispatch_label
+            polled_owner, polled_name, scope.dispatch_label
         )
-        scope_id = scope.id
         open_labeled = {issue["number"]: issue for issue in labeled}
         wait_observations, confirmed_wait_issues = await _wait_issue_observations(db, scope, client, open_labeled)
         if not await _lock_repository(db, scope):
+            await db.rollback()
+            return
+        # Under the writer lock, read the scope again. A poll of a moved or removed scope writes nothing.
+        current = (await db.execute(select(TeamGithubScope.repo_owner, TeamGithubScope.repo_name)
+                                    .where(TeamGithubScope.id == scope_id))).one_or_none()
+        if current is None or (current.repo_owner.lower(), current.repo_name.lower()) != (
+                polled_owner.lower(), polled_name.lower()):
             await db.rollback()
             return
         routes = await milestone_routes(db, scope)
