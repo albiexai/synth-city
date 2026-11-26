@@ -80,7 +80,7 @@ A request beyond the scope's effort ceiling waits on the Supervisor. Synth City'
 - `ceiling_raised`: a change to `max_item_effort_minutes` that makes the step the notice asked for fit, when it did not fit before. A change that still leaves too little room, or comes after the item or attempt ended, leaves the wait open. The reason names the asked minutes and the room before and after.
 - `work_stopped`: an end-stopped disposition.
 - `item_terminal`: the item ended first.
-- `attempt_ended`: a new attempt replaced the notice's attempt. The snapshot names the new attempt's launch, never its nonce.
+- `attempt_ended`: a retry or a new attempt replaced the notice's attempt. The snapshot names the new attempt's launch once it is known, never its nonce; until then the reason says the launch is not yet known.
 
 A split has no record of its own, so it counts as whichever of these recorded it. The end names whoever acted, for example the operator for a scope change; the answerer stays unknown, because an operator key or a Leader never proves the Supervisor's or the Director's answer. The notice is not a Mail request, so it is not counted twice.
 

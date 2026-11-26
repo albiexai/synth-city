@@ -10,7 +10,7 @@ from datetime import timedelta
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, select, text, update
 
 from app.api.v1 import agent_teams
 from app.models.database import AgentTeamLaunch, FactoryAuditEvent, GithubWorkItem, MailMessage, TeamGithubScope
@@ -314,6 +314,60 @@ async def test_a_replaced_attempt_ends_its_wait_unattributed(fx):
     # The replacement's non-secret launch identity, never a nonce or its digest.
     assert end.context_snapshot["launch_attempt"] == f"item:{fx.item_id}:launch:{replacement}"
     assert fx.nonce not in str(end.context_snapshot)
+
+
+async def _retry_reset(fx):
+    """The real retry reset (V1 review 6070048705): it clears the attempt's nonce but keeps the old launch."""
+    from app.models.database import GithubWorkspace
+    from app.services.github_dispatch_service import github_dispatch_service
+
+    async with fx.maker() as session:
+        await session.execute(update(GithubWorkspace).where(GithubWorkspace.leased_item_id == fx.item_id)
+                              .values(leased_item_id=None))
+        item = await session.get(GithubWorkItem, fx.item_id)
+        await github_dispatch_service.reset_for_retry(session, item)
+        await session.commit()
+
+
+@pytest.mark.parametrize("step", ["reset", "prepared", "launched"])
+async def test_a_retry_names_the_replacement_launch_only_once_it_is_known(fx, step):
+    old = await _launch(fx)
+    await _set(fx, launch_id=old)
+    await _refused(fx)
+    await _retry_reset(fx)
+    if step in ("prepared", "launched"):  # the new attempt's nonce comes before its launch
+        await _set(fx, dispatch_nonce="the-next-attempt")
+    new = await _launch(fx) if step == "launched" else None
+    if new is not None:
+        await _set(fx, launch_id=new)
+    await _tick(fx, T0 + timedelta(minutes=1))
+    start, end = await _events(fx)
+    assert end.after_values["wait_outcome"] == "attempt_ended"
+    assert start.context_snapshot["launch_attempt"] == f"item:{fx.item_id}:launch:{old}"
+    if new is None:
+        assert end.context_snapshot.get("launch_attempt") is None
+        assert end.sanitized_reason == (
+            "ceiling wait ended: attempt_ended; the replacement attempt's launch is not yet known")
+    else:
+        assert end.context_snapshot["launch_attempt"] == f"item:{fx.item_id}:launch:{new}"
+        assert end.sanitized_reason == "ceiling wait ended: attempt_ended"
+
+
+@pytest.mark.parametrize("notice", ["kept", "deleted", "reused"])
+async def test_a_raise_after_a_retry_reset_succeeds_and_claims_no_end(fx, monkeypatch, notice):
+    await _refused(fx)
+    await _retry_reset(fx)  # the item's nonce is now unset
+    if notice == "deleted":
+        async with fx.maker() as session:
+            await session.execute(delete(MailMessage).where(MailMessage.subject == "Effort ceiling reached"))
+            await session.commit()
+    elif notice == "reused":  # another item's row under the notice's id names no attempt of this item
+        await _replace_notice(fx, delivery_key="github-effort-ceiling:999:other-attempt:operator",
+                              payload={"requested_minutes": 15})  # a step this raise would make fit
+    await _change_scope(fx, monkeypatch, max_item_effort_minutes=120)
+    async with fx.maker() as session:
+        assert (await session.get(TeamGithubScope, fx.scope_id)).max_item_effort_minutes == 120
+    assert [e.event_kind for e in await _events(fx)] == [waits.CEILING_STARTED]
 
 
 async def test_a_mail_id_reused_by_another_item_is_another_wait(fx):

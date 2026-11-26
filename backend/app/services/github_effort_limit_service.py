@@ -295,7 +295,7 @@ class GithubEffortLimitService:
         status, nonce, wrote = item.dispatch_status, item.dispatch_nonce, False
         for start in await decision_waits.open_ceiling_waits(db, item.id):
             notice_id = (start.after_values or {}).get("wait_message_id")
-            snapshot = None
+            snapshot, detail = None, None
             if status in TERMINAL_ITEMS:
                 outcome, evidence = "item_terminal", {"dispatch_status": status}
             else:
@@ -303,12 +303,18 @@ class GithubEffortLimitService:
                 # A missing or reused Mail row is no evidence: the wait stays open.
                 if noticed is None or noticed == nonce:
                     continue
-                # The replacement by its non-secret launch identity: the ledger keeps no nonce or digest of one.
+                # The replacement by its non-secret launch identity: the ledger keeps no nonce or digest of one. A
+                # retry clears the nonce but keeps the old launch until the new one is published (V1 review
+                # 6070048705), so a launch the notice already named is no evidence of the replacement.
                 outcome, evidence = "attempt_ended", {}
-                snapshot = {"launch_attempt": audit.launch_attempt_key(item.id, item.launch_id)}
+                replacement = audit.launch_attempt_key(item.id, item.launch_id)
+                if item.launch_id is not None and replacement != (start.context_snapshot or {}).get("launch_attempt"):
+                    snapshot = {"launch_attempt": replacement}
+                else:
+                    detail = "the replacement attempt's launch is not yet known"
             await decision_waits.record_ceiling_wait_ended(
                 db, item_id=item.id, notice_ids=[notice_id], outcome=outcome, ended_at=now, evidence=evidence,
-                context_snapshot=snapshot, source="github_effort_limit_service.tick_item")
+                context_snapshot=snapshot, detail=detail, source="github_effort_limit_service.tick_item")
             wrote = True
         return wrote
 
@@ -345,9 +351,12 @@ class GithubEffortLimitService:
             after = self.ceiling_room(limit or 0, used or 0, ceiling_after)
             for start in await decision_waits.open_ceiling_waits(db, item_id):
                 notice_id = (start.after_values or {}).get("wait_message_id")
-                if await self._notice_attempt(db, notice_id, item_id) != nonce:
+                # Only a readable notice of the item's current attempt; a retry reset leaves no current nonce.
+                noticed = await self._notice_attempt(db, notice_id, item_id)
+                notice = await db.get(MailMessage, notice_id) if noticed is not None and noticed == nonce else None
+                if notice is None:
                     continue
-                requested = ((await db.get(MailMessage, notice_id)).payload or {}).get("requested_minutes")
+                requested = (notice.payload or {}).get("requested_minutes")
                 if (not isinstance(requested, int) or before is None or before >= requested
                         or (after is not None and after < requested)):
                     continue
