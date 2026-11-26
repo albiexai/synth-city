@@ -1,6 +1,7 @@
 """Team summaries collect existing observations without adding authority."""
 import asyncio
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
@@ -20,6 +21,7 @@ from app.services.agent_team_campaign_service import agent_team_campaign_service
 from app.services.agent_team_summary_service import AgentTeamSummaryService
 from app.services.github_operator_attention_service import github_operator_attention_service
 from app.services.github_operator_context_service import bind_attempt
+from tests.agent_teams.test_native_activity import _codex_long_turn
 
 
 @pytest_asyncio.fixture
@@ -129,8 +131,6 @@ async def test_empty_team_has_zero_effort_and_no_actor(db, monkeypatch):
     ("private-native-debug-value", None),
 ])
 async def test_summary_reports_public_native_reason_without_private_identity(db, monkeypatch, reason, expected):
-    from types import SimpleNamespace
-
     team, _, items = await seed(db)
     slot_id = items[0].owner_slot_id
 
@@ -150,6 +150,50 @@ async def test_summary_reports_public_native_reason_without_private_identity(db,
     assert result.remaining_work.state == "known"
     assert "private-launch-option" not in result.model_dump_json()
     assert "private-native-debug-value" not in result.model_dump_json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event,age,complete", [
+    ("token_count", 1, True),
+    ("item_completed", 181, False),
+    (None, 1, False),
+])
+async def test_work_item_gate_observes_long_codex_activity(db, monkeypatch, tmp_path, event, age, complete):
+    team, _, (candidate, active_work) = await seed(db, ("verifying", "dispatched"))
+    worker = AgentTeamSlot(preset_id=team.id, position=1, display_name="Other owner", provider="codex-cli",
+        repo_path="/synthetic/project", repo_id="fixture", repo_name="fixture")
+    db.add(worker)
+    await db.flush()
+    active_work.owner_slot_id = worker.id
+    await db.commit()
+
+    observed = datetime.now(timezone.utc)
+    rollout = {"log": tmp_path / "long.jsonl", "cwd": tmp_path, "now": observed}
+    monkeypatch.setattr(activity, "_TAIL_BYTES", 4096)
+    monkeypatch.setattr(activity, "_MAX_HISTORY_BYTES", 8192)
+    session_id = "isolated-long-turn"
+    _codex_long_turn(rollout, session_id, start_age=3600, filler_bytes=4 * 4096,
+                     progress_event=event, progress_age=age)
+    state, reason, timestamp = activity._native_state(rollout["log"], session_id, str(tmp_path),
+        observed, observed - timedelta(hours=2))
+
+    async def native(db, preset_id, **kwargs):
+        inputs = await activity._team_inputs(db, preset_id, 256)
+        kwargs["input_fence"].update({entry[0]: entry for entry in inputs})
+        return SimpleNamespace(slots=[
+            AgentActivityObservation(slot_id=candidate.owner_slot_id, state="idle", reason="native_turn_completed"),
+            AgentActivityObservation(slot_id=worker.id, state=state, reason=reason, observed_at=timestamp),
+        ], valid_until=observed + timedelta(seconds=60))
+
+    monkeypatch.setattr(activity, "observe_team", native)
+    summary, _ = service(monkeypatch)
+    global_summary = await summary.summary(db, team.id)
+    assert global_summary.coverage_complete is complete
+    gate_item = candidate if complete else active_work
+    gate = await summary.for_work_item(db, team.id, gate_item.id)
+    assert gate.coverage_complete is complete
+    assert [(row.code, row.slot_id) for row in gate.coverage_reason] == (
+        [] if complete else [("native_unknown", worker.id)])
 
 
 async def bind_quiet_summary_member(
