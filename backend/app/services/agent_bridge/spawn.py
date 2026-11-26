@@ -8,6 +8,7 @@ import subprocess
 import uuid
 from pathlib import Path
 
+from app.services.agent_config_client import AgentConfigError, uses_agent_config
 from app.services.providers import get_provider
 from app.services.providers.base import ProviderLaunchError, SpawnCommandOptions
 from app.services.providers.claude_code import ClaudeCodeProvider
@@ -69,14 +70,17 @@ def spawn_session(
     options: SpawnCommandOptions,
     *,
     extra_env: dict[str, str] | None = None,
+    workspace_trust_prepared: bool | None = None,
 ) -> dict:
-    """Spawn a new provider CLI session inside tmux."""
+    """Spawn in tmux. A supplied helper result records whether trust changed."""
     provider = get_provider(provider_id)
     if isinstance(provider, ClaudeCodeProvider):
         directory = provider.resolve_directory(options)
         options = SpawnCommandOptions(**{**options.__dict__, "directory": directory})
 
     directory = _validate_directory(options.directory)
+    if workspace_trust_prepared is not None and Path(options.directory) != Path(directory):
+        raise AgentConfigError
     options = SpawnCommandOptions(**{**options.__dict__, "directory": directory})
     name = _session_name_for(directory)
     if provider.id == "claude-code" and options.mode == "worktree" and not options.worktree_name:
@@ -126,8 +130,10 @@ def spawn_session(
     if extra_env:
         env_flags += _env_flags(extra_env)
 
-    trust_changed = False
-    if extra_env and extra_env.get("SYNTH_CITY_TEAM_SLOT_ID"):
+    trust_changed = bool(workspace_trust_prepared)
+    if extra_env and extra_env.get("SYNTH_CITY_TEAM_SLOT_ID") and workspace_trust_prepared is None:
+        if uses_agent_config(provider.id):
+            raise AgentConfigError
         trust_changed = prepare_workspace_trust(provider.id, directory)
 
     try:

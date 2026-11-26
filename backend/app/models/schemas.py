@@ -2595,6 +2595,7 @@ class AgentTeamSlotResponse(BaseModel):
     area_labels: Optional[List[str]] = None
     expertise: Optional[str] = None
     warnings: List[str] = Field(default_factory=list)
+    workspace_trust_status: str | None = None
     enabled: bool
     created_at: datetime
     updated_at: datetime

@@ -1,11 +1,13 @@
 """Agent Team presets: saved rosters, launch planning, and launch execution."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import re
 import uuid
+from contextlib import suppress
 from dataclasses import fields
 from datetime import datetime, timedelta
 from typing import Any
@@ -46,6 +48,9 @@ from app.models.schemas import (
 from app.services import agent_mail_install_service, opencode_version
 from app.services.agent_bridge.discovery import discover_agent_sessions
 from app.services.agent_bridge.spawn import spawn_session
+from app.services.agent_config_client import (
+    AgentConfigBusy, AgentConfigError, prepare_workspace_trust_via_helper, resolve_claude_checkout, uses_agent_config,
+)
 from app.services.agent_mail_service import MCP_HEARTBEAT_TTL_SECONDS, agent_mail_service
 from app.services.github_recovery_gate import configured_recovery_only_attempt
 from app.services.github_terminal_revision_service import TERMINAL_ITEMS, TERMINAL_REVISIONS
@@ -161,7 +166,9 @@ class AgentTeamService:
             for index, slot in enumerate(request.slots)
         ]
         for slot_data in normalized_slots:
-            db.add(AgentTeamSlot(preset_id=preset.id, **slot_data))
+            slot = AgentTeamSlot(preset_id=preset.id, **slot_data)
+            await self._provision_slot_workspace_trust(slot)
+            db.add(slot)
 
         await db.commit()
         await db.refresh(preset)
@@ -538,27 +545,27 @@ class AgentTeamService:
         db.add(clone)
         await db.flush()
         for slot in slots:
-            db.add(
-                AgentTeamSlot(
-                    preset_id=clone.id,
-                    position=slot.position,
-                    display_name=slot.display_name,
-                    provider=slot.provider,
-                    repo_id=slot.repo_id,
-                    repo_path=slot.repo_path,
-                    repo_name=slot.repo_name,
-                    role=slot.role,
-                    charter=slot.charter,
-                    ui_color=slot.ui_color,
-                    bootstrap_prompt=slot.bootstrap_prompt,
-                    controlled_language_enabled=slot.controlled_language_enabled,
-                    launch_mode=slot.launch_mode,
-                    launch_options=slot.launch_options or {},
-                    area_labels=slot.area_labels,
-                    expertise=slot.expertise,
-                    enabled=slot.enabled,
-                )
+            cloned_slot = AgentTeamSlot(
+                preset_id=clone.id,
+                position=slot.position,
+                display_name=slot.display_name,
+                provider=slot.provider,
+                repo_id=slot.repo_id,
+                repo_path=slot.repo_path,
+                repo_name=slot.repo_name,
+                role=slot.role,
+                charter=slot.charter,
+                ui_color=slot.ui_color,
+                bootstrap_prompt=slot.bootstrap_prompt,
+                controlled_language_enabled=slot.controlled_language_enabled,
+                launch_mode=slot.launch_mode,
+                launch_options=slot.launch_options or {},
+                area_labels=slot.area_labels,
+                expertise=slot.expertise,
+                enabled=slot.enabled,
             )
+            await self._provision_slot_workspace_trust(cloned_slot)
+            db.add(cloned_slot)
         if source.leader_slot_id is not None:
             mapped_leader_index = next(
                 (index for index, slot in enumerate(slots) if slot.id == source.leader_slot_id),
@@ -694,7 +701,9 @@ class AgentTeamService:
             request,
             await self._next_slot_position(db, preset_id) if request.position is None else request.position,
         )
-        db.add(AgentTeamSlot(preset_id=preset.id, **slot_data))
+        slot = AgentTeamSlot(preset_id=preset.id, **slot_data)
+        await self._provision_slot_workspace_trust(slot)
+        db.add(slot)
         preset.updated_at = datetime.utcnow()
         await db.commit()
         await db.refresh(preset)
@@ -754,6 +763,9 @@ class AgentTeamService:
         candidate_options = updates.get("launch_options", slot.launch_options or {})
         self._validate_slot_options(candidate_provider, candidate_mode, candidate_options)
 
+        trust_binding_changed = (
+            candidate_provider != slot.provider or updates.get("repo_path", slot.repo_path) != slot.repo_path
+        )
         identity_changed = (
             ("repo_id" in updates and updates["repo_id"] != slot.repo_id)
             or ("provider" in updates and updates["provider"] != slot.provider)
@@ -763,11 +775,74 @@ class AgentTeamService:
 
         for key, value in updates.items():
             setattr(slot, key, value)
+        if trust_binding_changed:
+            await self._provision_slot_workspace_trust(slot)
         slot.updated_at = datetime.utcnow()
         preset.updated_at = datetime.utcnow()
         await db.commit()
         await db.refresh(preset)
         return await self._preset_response(db, preset)
+
+    async def _provision_slot_workspace_trust(self, slot: AgentTeamSlot) -> None:
+        slot.workspace_trust_status = None
+        slot.workspace_trust_target = None
+        if uses_agent_config(slot.provider):
+            # The result remains on the slot so an operator can retry by launching.
+            with suppress(AgentConfigError):
+                await self._prepare_slot_workspace_trust(slot, slot.repo_path)
+
+    async def _prepare_slot_workspace_trust(
+        self, slot: AgentTeamSlot, directory: str, *, target: str | None = None,
+    ) -> bool:
+        status = "failed"
+        try:
+            if slot.provider == "claude-code" and target is None:
+                target = await asyncio.to_thread(resolve_claude_checkout, directory)
+            changed = await asyncio.to_thread(prepare_workspace_trust_via_helper, slot.provider, directory)
+            if target is not None and await asyncio.to_thread(resolve_claude_checkout, directory) != target:
+                raise AgentConfigError
+            status = "ready"
+            return changed
+        except AgentConfigBusy:
+            status = "pending"
+            raise
+        finally:
+            if directory == slot.repo_path:
+                slot.workspace_trust_status = status
+                slot.workspace_trust_target = target if status == "ready" else None
+
+    async def _prepare_launch_workspace_trust(
+        self, db: AsyncSession, slot: AgentTeamSlot, directory: str,
+    ) -> bool:
+        binding = (await db.execute(select(
+            AgentTeamSlot.provider, AgentTeamSlot.repo_path, AgentTeamSlot.workspace_trust_status,
+        ).where(AgentTeamSlot.id == slot.id, AgentTeamSlot.preset_id == slot.preset_id))).one_or_none()
+        if binding is None or (binding.provider, binding.repo_path) != (slot.provider, slot.repo_path):
+            raise PlanConflictError("The slot workspace changed. Review a new launch plan.")
+        if slot.provider != "claude-code":
+            if directory == slot.repo_path and binding.workspace_trust_status == "ready":
+                return False
+            return await self._prepare_slot_workspace_trust(slot, directory)
+
+        try:
+            target = await asyncio.to_thread(resolve_claude_checkout, directory)
+        except AgentConfigError:
+            if directory == slot.repo_path:
+                slot.workspace_trust_status = "failed"
+                slot.workspace_trust_target = None
+            raise
+        # Dedicated factory slots share one agent account and one Claude trust file.
+        ready_slot = await db.scalar(select(AgentTeamSlot.id).where(
+            AgentTeamSlot.provider == "claude-code",
+            AgentTeamSlot.workspace_trust_status == "ready",
+            AgentTeamSlot.workspace_trust_target == target,
+        ).limit(1))
+        if ready_slot is None:
+            return await self._prepare_slot_workspace_trust(slot, directory, target=target)
+        if directory == slot.repo_path:
+            slot.workspace_trust_status = "ready"
+            slot.workspace_trust_target = target
+        return False
 
     async def delete_slot(self, db: AsyncSession, slot_id: int) -> AgentTeamPresetResponse:
         slot, preset = await self._lock_slot_and_preset(db, slot_id)
@@ -1047,6 +1122,7 @@ class AgentTeamService:
             self._record_launch_item(db, launch_id, result)
             return result
 
+        prepared_trust: bool | None = None
         try:
             if prompt_override:
                 bootstrap_prompt = await self._bootstrap_prompt(
@@ -1064,6 +1140,8 @@ class AgentTeamService:
             elif slot.provider == PROVIDER_OPENCODE_CLI and options.mode != "resume":
                 # Synth City chooses the OpenCode session id so that resume is exact (#731).
                 options = SpawnCommandOptions(**{**options.__dict__, "session_id": new_opencode_session_id()})
+            if uses_agent_config(slot.provider):
+                prepared_trust = await self._prepare_launch_workspace_trust(db, slot, options.directory)
             spawned = spawn_session(
                 slot.provider,
                 options,
@@ -1075,6 +1153,7 @@ class AgentTeamService:
                     **({"SYNTH_CITY_TEAM_SLOT_ROLE": slot.role} if slot.role else {}),
                     **({"SYNTH_CITY_TEAM_SLOT_COLOR": slot.ui_color} if slot.ui_color else {}),
                 },
+                **({"workspace_trust_prepared": prepared_trust} if prepared_trust is not None else {}),
             )
             if slot.provider in {"claude-code", PROVIDER_OPENCODE_CLI} and options.session_id:
                 slot.launch_options = {**(slot.launch_options or {}), "session_id": options.session_id}
@@ -1083,7 +1162,7 @@ class AgentTeamService:
                 slot.launch_options = {key: value for key, value in (slot.launch_options or {}).items()
                                        if key not in {"session_id", "use_last"}}
                 slot.launch_mode = "plain"
-            trust_changed = bool(spawned.get("workspace_trust_changed"))
+            trust_changed = bool(prepared_trust or spawned.get("workspace_trust_changed"))
             observation_message = ""
             if slot.provider == "codex-cli" and options.mode != "resume":
                 observation_message = (
@@ -1120,10 +1199,11 @@ class AgentTeamService:
                 status="failed",
                 provider=slot.provider,
                 repo_path=repo_path_override or slot.repo_path,
+                block_code=exc.code if isinstance(exc, AgentConfigError) else None,
                 error=str(exc),
-                workspace_trust_changed=bool(getattr(exc, "workspace_trust_changed", False)),
+                workspace_trust_changed=bool(prepared_trust or getattr(exc, "workspace_trust_changed", False)),
                 message=("Workspace trust prepared. Session spawn failed."
-                         if getattr(exc, "workspace_trust_changed", False) else None),
+                         if prepared_trust or getattr(exc, "workspace_trust_changed", False) else None),
                 warnings=plan_item.warnings,
             )
         self._record_launch_item(db, launch_id, result)
@@ -1935,6 +2015,7 @@ class AgentTeamService:
             area_labels=slot.area_labels,
             expertise=slot.expertise,
             warnings=self._slot_launch_warnings(slot.provider, slot.launch_options or {}),
+            workspace_trust_status=slot.workspace_trust_status if uses_agent_config(slot.provider) else None,
             enabled=slot.enabled,
             created_at=slot.created_at,
             updated_at=slot.updated_at,

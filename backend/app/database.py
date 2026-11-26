@@ -573,6 +573,8 @@ async def _sqlite_rebuild_agent_team_slots(conn, columns: set[str]) -> None:
     language_expr = "COALESCE(controlled_language_enabled, 1)" if "controlled_language_enabled" in columns else "1"
     launch_mode_expr = "COALESCE(NULLIF(launch_mode, ''), 'plain')" if "launch_mode" in columns else "'plain'"
     launch_options_expr = "launch_options" if "launch_options" in columns else "NULL"
+    trust_status_expr = "workspace_trust_status" if "workspace_trust_status" in columns else "NULL"
+    trust_target_expr = "workspace_trust_target" if "workspace_trust_target" in columns else "NULL"
     enabled_expr = "COALESCE(enabled, 1)" if "enabled" in columns else "1"
 
     await conn.execute(text("DROP TABLE IF EXISTS agent_team_slots_new"))
@@ -594,6 +596,8 @@ async def _sqlite_rebuild_agent_team_slots(conn, columns: set[str]) -> None:
                 controlled_language_enabled BOOLEAN DEFAULT 1 NOT NULL,
                 launch_mode VARCHAR NOT NULL,
                 launch_options JSON,
+                workspace_trust_status VARCHAR,
+                workspace_trust_target VARCHAR,
                 enabled BOOLEAN NOT NULL,
                 created_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL,
@@ -620,6 +624,8 @@ async def _sqlite_rebuild_agent_team_slots(conn, columns: set[str]) -> None:
                 controlled_language_enabled,
                 launch_mode,
                 launch_options,
+                workspace_trust_status,
+                workspace_trust_target,
                 enabled,
                 created_at,
                 updated_at
@@ -639,6 +645,8 @@ async def _sqlite_rebuild_agent_team_slots(conn, columns: set[str]) -> None:
                 {language_expr},
                 {launch_mode_expr},
                 {launch_options_expr},
+                {trust_status_expr},
+                {trust_target_expr},
                 {enabled_expr},
                 created_at,
                 updated_at
@@ -786,6 +794,9 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         await conn.execute(text("ALTER TABLE agent_team_slots ADD COLUMN area_labels JSON"))
     if slot_columns and "expertise" not in slot_columns:
         await conn.execute(text("ALTER TABLE agent_team_slots ADD COLUMN expertise VARCHAR"))
+    for column in ("workspace_trust_status", "workspace_trust_target"):
+        if slot_columns and column not in slot_columns:
+            await conn.execute(text(f"ALTER TABLE agent_team_slots ADD COLUMN {column} VARCHAR"))
 
     result = await conn.execute(text("PRAGMA table_info(agent_team_presets)"))
     preset_columns = {row[1] for row in result.fetchall()}

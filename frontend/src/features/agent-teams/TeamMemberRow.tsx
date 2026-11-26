@@ -42,6 +42,8 @@ export function TeamMemberRow({
   const model = (options?.platform === 'bedrock' && options.bedrock_model) || options?.model
   const effort = options?.reasoning_effort
   const detailsId = `member-details-${slot.id}`
+  const trustPending = slot.workspace_trust_status === 'pending'
+  const trustFailed = slot.workspace_trust_status === 'failed'
   const choose = (action: () => void) => () => {
     setMenuOpen(false)
     action()
@@ -51,7 +53,7 @@ export function TeamMemberRow({
       <div className="flex flex-wrap items-center gap-3 px-3 py-2">
         <button
           type="button"
-          className="flex min-w-0 flex-1 items-center gap-2 text-left"
+          className="flex min-w-40 flex-1 items-center gap-2 text-left"
           aria-expanded={expanded}
           aria-controls={detailsId}
           aria-label={`Details for ${slot.display_name}`}
@@ -95,6 +97,18 @@ export function TeamMemberRow({
           )}
         </div>
       </div>
+      {(trustPending || trustFailed) && (
+        <div className="border-t px-3 py-1.5" role="status">
+          <Badge
+            variant="outline"
+            title={trustPending
+              ? "The agent's configuration is busy. Launch again to retry."
+              : 'Check the agent configuration helper before launching.'}
+          >
+            {trustPending ? 'Folder trust pending' : 'Folder trust failed'}
+          </Badge>
+        </div>
+      )}
       {(slot.area_labels?.length || slot.expertise) && (
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-t px-3 py-1.5 text-xs">
           <span className="uppercase text-muted-foreground">GitHub dispatch routing</span>

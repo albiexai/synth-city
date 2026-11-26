@@ -61,6 +61,7 @@ export interface AgentTeamSlot {
   area_labels?: string[] | null
   expertise?: string | null
   warnings?: string[]
+  workspace_trust_status?: 'pending' | 'ready' | 'failed' | null
   enabled: boolean
   created_at: string
   updated_at: string
