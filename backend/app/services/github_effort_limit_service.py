@@ -18,6 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.database import GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace, TeamGithubScope
+from app.services import decision_wait_service as decision_waits
+from app.services.github_terminal_revision_service import TERMINAL_ITEMS
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +147,9 @@ class GithubEffortLimitService:
         now = now or datetime.utcnow()
         item = (await db.execute(select(GithubWorkItem).where(GithubWorkItem.id == item_id)
                                  .execution_options(populate_existing=True))).scalar_one_or_none()
+        if item is not None and item.dispatch_status in TERMINAL_ITEMS:
+            await self._record_effort_waits(db, item.id, now=now)
+            await db.commit()
         if item is None or item.effort_limit_minutes is None:
             return "skipped"
         last = item.effort_last_tick_at if seen_last_tick is _UNSET else seen_last_tick
@@ -198,10 +203,10 @@ class GithubEffortLimitService:
             return "lost"
         async with _keep_loaded(db):
             await db.refresh(item)
-            await self._notify_at_limit(db, item)
+            await self._notify_at_limit(db, item, now=now)
         return "counted"
 
-    async def _notify_at_limit(self, db: AsyncSession, item: GithubWorkItem) -> None:
+    async def _notify_at_limit(self, db: AsyncSession, item: GithubWorkItem, *, now: datetime) -> None:
         limit = item.effort_limit_minutes + item.effort_extension_minutes
         if item.effort_elapsed_seconds < limit * 60:
             return
@@ -227,6 +232,54 @@ class GithubEffortLimitService:
                 payload={"kind": "github_effort_limit_reached", "work_item_id": item.id,
                          "limit_minutes": item.effort_limit_minutes, "extension_minutes": item.effort_extension_minutes},
                 delivery_key=f"github-effort:{item.id}:{item.dispatch_nonce}:{item.effort_extension_minutes}:{role}")
+        await self._record_effort_waits(db, item.id, now=now)
+        await db.commit()
+
+    async def _record_effort_waits(self, db: AsyncSession, item_id: int, *, now: datetime,
+                                   extended_by: int | None = None, extended_from: int | None = None) -> None:
+        """#1299: rebuild the attempt's effort waits from durable evidence (V1 review 6067843784).
+
+        The Mail layer commits a notice on its own, so an interruption or a concurrent extension can fall between a
+        Leader notice and its wait start. Each Leader notice therefore starts one wait whenever this runs: after the
+        notices, inside each extension and when the item ends. A higher extension total ends it: answered by the
+        Leader at the extension that raised the notice's own total, otherwise unattributed when found, which can be
+        later than the real end. The item's end ends every open one.
+        """
+        from app.models.database import MailMessage
+
+        row = (await db.execute(select(
+            GithubWorkItem.dispatch_nonce, GithubWorkItem.dispatch_status, GithubWorkItem.effort_extension_minutes,
+            GithubWorkItem.effort_extension_decided_at, GithubWorkItem.created_at,
+        ).where(GithubWorkItem.id == item_id))).one_or_none()
+        if row is None:
+            return
+        nonce, status, total, extended_at, created_at = row
+        # Every attempt's notices in this item lifetime (V1 review 6068009562): a reused item id's are older.
+        prefix = f"github-effort:{item_id}:"
+        sent = (await db.scalars(select(MailMessage).where(
+            MailMessage.delivery_key.startswith(prefix, autoescape=True),
+            MailMessage.created_at >= created_at).order_by(MailMessage.id))).all()
+        owners = {m.delivery_key.rsplit(":", 1)[0]: m.recipient_member_id
+                  for m in sent if m.delivery_key.endswith(":owner")}
+        notices = [m for m in sent if m.delivery_key.endswith(":leader")]
+        source = "github_effort_limit_service._record_effort_waits"
+        for notice in notices:  # the owner notified with it, never the current assignment; else unknown
+            await decision_waits.record_effort_wait_started(
+                db, item_id=item_id, notice_id=notice.id, noticed_at=notice.created_at,
+                owner_member_id=owners.get(notice.delivery_key.rsplit(":", 1)[0]),
+                leader_member_id=notice.recipient_member_id, source=source)
+        for notice in notices:
+            noticed_total = (notice.payload or {}).get("extension_minutes", total)
+            # Only this attempt's extensions end its notices; an earlier attempt's close on the item's end.
+            if notice.delivery_key.startswith(f"{prefix}{nonce}:") and noticed_total < total:
+                answered = noticed_total == extended_from
+                await decision_waits.record_effort_wait_ended(
+                    db, item_id=item_id, notice_ids=[notice.id], outcome="extended",
+                    ended_at=(extended_at or now) if answered or extended_from is None else now,
+                    answered_by_member_id=extended_by if answered else None, source=source)
+        if status in TERMINAL_ITEMS:
+            await decision_waits.record_effort_wait_ended(
+                db, item_id=item_id, outcome="item_ended", ended_at=now, source=source)
 
     # -- Leader extensions ----------------------------------------------------------------------------------------
 
@@ -370,6 +423,8 @@ class GithubEffortLimitService:
                 action_outcome="granted", scope_id=scope_id, item_id=work_item_id,
                 sanitized_reason=(f"Extended by {minutes} minutes to an effective limit of {limit + expected + minutes}"
                                   f" minutes. Reason: {reason[:150]} Evidence: {evidence}"))
+            await self._record_effort_waits(db, work_item_id, now=now, extended_by=leader_member_id,
+                                            extended_from=expected)
         except Exception:
             await db.rollback()
             raise
