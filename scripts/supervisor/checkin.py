@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""One Supervisor check-in. It reads existing product routes and writes nothing.
+"""One Supervisor check-in on existing product routes.
+
+The script sends GET requests only and writes no file. The product's activity and summary reads can record native
+observations and notices on the server, as they do for the web page.
 
 Each step prints `ok`, `attention` or `error` and one line of findings. One failed step does not stop the others.
+An answer without the fields a step reports on is an error, never a success.
 Exit code: 0 all ok, 1 attention, 2 a step or the setup failed. A token is never printed or written.
 """
 from __future__ import annotations
 
 import argparse
-import getpass
 import os
 import sys
 from datetime import datetime, timezone
@@ -27,7 +30,18 @@ def parse_time(value):
     return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
 
 
+def need(ok, what):
+    if not ok:
+        raise common.StepError(f"the answer has no valid {what}")
+
+
+def is_count(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def health(data, args):
+    need(isinstance(data, dict) and isinstance(data.get("status"), str) and isinstance(data.get("health"), str),
+         "status and health")
     parts = [f"status {data.get('status')}", f"health {data.get('health', 'ok')}", f"{data.get('open_findings')} open findings"]
     if data.get("reasons"):
         parts.append("reasons " + ", ".join(common.clean(r, 40) for r in data["reasons"]))
@@ -36,6 +50,9 @@ def health(data, args):
 
 
 def summary(data, args):
+    need(isinstance(data, dict) and isinstance(data.get("coverage_complete"), bool)
+         and isinstance(data.get("attention"), list) and isinstance(data.get("human_actions"), list),
+         "coverage, attention and human actions")
     found = []
     if data.get("hold_code"):
         found.append(f"hold {common.clean(data['hold_code'], 40)}")
@@ -55,13 +72,15 @@ def summary(data, args):
 
 
 def activity(data, args):
-    reference = parse_time(data.get("checked_at")) or datetime.now(timezone.utc)
+    need(isinstance(data, dict) and isinstance(data.get("slots"), list), "member list")
+    reference = parse_time(data.get("checked_at"))
+    need(reference is not None, "check time")
     found = []
     for slot in data.get("slots") or []:
         name = f"slot {slot.get('slot_id')}"
         state = slot.get("state")
-        if state in ("stopped", "unknown"):
-            found.append(f"{name} {state}")
+        if state not in ("working", "idle"):
+            found.append(f"{name} {common.clean(state, 40)}")
         elif state == "idle":
             since = parse_time(slot.get("observed_at"))
             minutes = int((reference - since).total_seconds() // 60) if since else None
@@ -76,19 +95,26 @@ def activity(data, args):
 
 
 def overview(data, args):
-    counts = data.get("counts") or {}
-    needing = counts.get("attention") or 0
-    text = f"{needing} of {counts.get('total', 0)} work items need attention"
+    counts = data.get("counts") if isinstance(data, dict) else None
+    need(isinstance(counts, dict) and is_count(counts.get("total")) and is_count(counts.get("attention")), "counts")
+    needing = counts["attention"]
+    text = f"{needing} of {counts['total']} work items need attention"
     return [("attention" if needing else "ok", text)]
 
 
 def inbox(messages, args):
-    fresh = [m for m in messages if isinstance(m.get("id"), int) and m["id"] > args.since_id]
+    need(isinstance(messages, list), "message list")
+    seen = [m for m in messages if isinstance(m, dict) and is_count(m.get("id"))]
+    fresh = [m for m in seen if m["id"] > args.since_id]
     highest = max([args.since_id, *(m["id"] for m in fresh)])
-    lines = [("attention" if fresh else "ok", f"{len(fresh)} new messages since id {args.since_id}")]
+    # The route gives the newest INBOX_LIMIT messages. A full page that stays above the saved id may hide older ones.
+    limited = len(messages) >= INBOX_LIMIT and bool(seen) and min(m["id"] for m in seen) > args.since_id
+    text = f"{len(fresh)} new messages since id {args.since_id}"
+    lines = [("attention" if fresh else "ok", text + (", the newest page only; earlier messages may be missing" if limited else ""))]
     lines += [("detail", f"  {m['id']} from {common.clean(m.get('sender_name'), 60)}: {common.clean(m.get('subject'))}")
               for m in sorted(fresh, key=lambda m: m["id"])]
-    return lines + [("detail", f"highest inbox id: {highest}")]
+    cursor = f"highest inbox id seen: {highest} (not a confirmed cursor)" if limited else f"highest inbox id: {highest}"
+    return lines + [("detail", cursor)]
 
 
 def parser():
@@ -102,7 +128,7 @@ def parser():
     return ap
 
 
-def run(argv, env=None, stdout=None, stderr=None, prompt=getpass.getpass):
+def run(argv, env=None, stdout=None, stderr=None, prompt=common.hidden_prompt):
     env, stdout, stderr = os.environ if env is None else env, stdout or sys.stdout, stderr or sys.stderr
     try:
         args = parser().parse_args(argv)
@@ -134,7 +160,7 @@ def run(argv, env=None, stdout=None, stderr=None, prompt=getpass.getpass):
         except (common.StepError, AttributeError, TypeError, ValueError, KeyError) as error:
             lines = [("error", str(error) if isinstance(error, common.StepError) else "the answer has an unexpected shape")]
         for level, text in lines:
-            print(redact(text if level == "detail" else f"{level} {name}: {text}"), file=stdout)
+            print(common.printable(redact(text if level == "detail" else f"{level} {name}: {text}")), file=stdout)
             worst = max(worst, {"attention": 1, "error": 2}.get(level, 0))
     if not supervisor:
         print("skip inbox: skipped, give --supervisor-token-file to read the supervisor inbox", file=stdout)

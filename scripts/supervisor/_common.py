@@ -1,13 +1,17 @@
 """Shared pieces of the Supervisor scripts: token handling, a bounded read-only client and safe output (#1116)."""
 from __future__ import annotations
 
+import getpass
+import http.client
 import ipaddress
 import json
 import os
 import stat
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 
 OPERATOR_ENV = "SYNTH_CITY_OPERATOR_TOKEN"
 OPERATOR_HEADER = "x-synth-city-operator-token"
@@ -42,6 +46,21 @@ def clean(text, limit=120):
     return " ".join(text.split())[:limit]
 
 
+def printable(text):
+    """A line for the terminal: every control character becomes a space. Run it last, on the whole line."""
+    return "".join(c if c.isprintable() else " " for c in text)
+
+
+def hidden_prompt(text):
+    """Hidden input only. A terminal that cannot hide the input is a setup error, never a visible fallback."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
+            return getpass.getpass(text)
+        except (getpass.GetPassWarning, EOFError):
+            raise ConfigError(f"the terminal cannot hide the input; set {OPERATOR_ENV} instead") from None
+
+
 def check_base_url(url):
     """Plain http only to this machine. A token never crosses the network unencrypted or goes with a login in the URL."""
     try:
@@ -70,7 +89,7 @@ def _is_loopback(host):
 def read_token_file(path):
     """The token inside a regular file that only its owner can access. A link is refused."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as error:
         raise ConfigError(f"cannot read the token file ({error.strerror})") from None
     with os.fdopen(fd) as stream:
@@ -101,7 +120,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Client:
-    """Read-only GET client. It follows no redirect, ignores proxy settings and bounds time and size."""
+    """Read-only GET client. It follows no redirect, ignores proxy settings and bounds time and size.
+
+    Each wait for data stops after TIMEOUT_SECONDS. The whole answer is checked against the same limit between reads,
+    so a slow answer can run over by at most one wait.
+    """
 
     def __init__(self, base_url, redact):
         self.base_url = base_url
@@ -111,17 +134,22 @@ class Client:
     def get(self, path, headers=None, params=None):
         url = self.base_url + path + ("?" + urllib.parse.urlencode(params) if params else "")
         request = urllib.request.Request(url, headers=headers or {}, method="GET")
+        started, chunks, size = time.monotonic(), [], 0
         try:
             with self._opener.open(request, timeout=TIMEOUT_SECONDS) as answer:
-                raw = answer.read(MAX_BYTES + 1)
+                while chunk := answer.read1(8192):
+                    size += len(chunk)
+                    if size > MAX_BYTES:
+                        raise StepError(f"the answer is larger than {MAX_BYTES} bytes")
+                    if time.monotonic() - started > TIMEOUT_SECONDS:
+                        raise StepError(f"the answer took longer than {TIMEOUT_SECONDS} seconds")
+                    chunks.append(chunk)
         except urllib.error.HTTPError as error:
             raise StepError(f"HTTP {error.code}") from None
-        except (urllib.error.URLError, OSError) as error:
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
             raise StepError(self._redact(f"cannot read the answer ({type(error).__name__})")) from None
-        if len(raw) > MAX_BYTES:
-            raise StepError(f"the answer is larger than {MAX_BYTES} bytes")
         try:
-            return self._scrub(json.loads(raw))
+            return self._scrub(json.loads(b"".join(chunks)))
         except ValueError:
             raise StepError("the answer is not JSON") from None
 

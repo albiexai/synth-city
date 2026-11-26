@@ -1,12 +1,16 @@
 """#1116 part 1: the Supervisor check-in script reads product routes only and never shows a token."""
 from __future__ import annotations
 
+import getpass
 import io
 import json
 import os
+import signal
 import stat
 import sys
 import threading
+import time
+import warnings
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -52,6 +56,9 @@ class Fake:
                 fake.queries[path] = query
                 fake.seen.append((path, {k.lower(): v for k, v in self.headers.items()}))
                 status, body = fake.answers.get(path, (404, {"detail": "missing"}))
+                if callable(body):
+                    body(self)
+                    return
                 if status == 302:
                     self.send_response(302)
                     self.send_header("Location", body)
@@ -327,3 +334,133 @@ def test_the_operator_token_is_prompted_only_when_asked(serve):
     assert len(asked) == 1 and OPERATOR not in asked[0]
     assert {h.get("x-synth-city-operator-token") for p, h in fake.seen if p != ROUTES["inbox"]} == {OPERATOR}
     assert OPERATOR not in out + err
+
+
+# --- V1's second security review (#1116 part 1) ---
+
+def test_a_hidden_prompt_that_cannot_hide_the_input_is_a_setup_error_before_any_read(monkeypatch):
+    read = []
+
+    def echoing(prompt, stream=None):
+        warnings.warn("Can not control echo on the terminal.", getpass.GetPassWarning)
+        read.append(1)  # the real fallback reads the visible input after the warning
+        return OPERATOR
+
+    monkeypatch.setattr(getpass, "getpass", echoing)
+    with pytest.raises(_common.ConfigError):
+        _common.hidden_prompt("Operator token: ")
+    assert read == []
+
+
+def test_end_of_input_at_the_prompt_is_a_setup_error(monkeypatch):
+    def closed(prompt, stream=None):
+        raise EOFError
+
+    monkeypatch.setattr(getpass, "getpass", closed)
+    with pytest.raises(_common.ConfigError):
+        _common.hidden_prompt("Operator token: ")
+
+
+def test_a_failed_prompt_ends_the_command_with_exit_2_and_no_request(serve):
+    def failing(_):
+        raise _common.ConfigError("the terminal cannot hide the input; use the environment variable")
+
+    fake = serve()
+    code, out, err = run(fake, "--prompt-operator-token", prompt=failing)
+    assert code == 2 and fake.seen == [] and "environment variable" in err
+
+
+def test_every_emitted_line_is_printable_whatever_the_server_sends(serve, token_file):
+    dirty = "\x1b[31m\x07a\r\nb\x00"
+    answers = dict(
+        health={"status": "ok" + dirty, "health": "degraded" + dirty, "reasons": [dirty], "open_findings": 0},
+        summary={"hold_code": dirty, "attention": [{"code": dirty, "issue_number": 5}],
+                 "human_actions": [{"kind": dirty, "issue_number": 5, "state": "requested"}],
+                 "required_ci_unreadable": [], "coverage_complete": True, "supervisor_observation": {"status": "late"}},
+        activity={"checked_at": NOW, "slots": [
+            {"slot_id": dirty, "state": "stopped"},
+            {"slot_id": 2, "state": "working", "observed_at": NOW, "waiting_input": {"reason": dirty, "observed_at": NOW}}]},
+        overview={"counts": {"total": 4, "attention": 1}},
+        inbox=[{"id": 3, "sender_name": dirty, "subject": dirty}])
+    _, out, _ = run(serve(**answers), "--supervisor-token-file", str(token_file))
+    assert all(char == "\n" or char.isprintable() for char in out)
+    assert all(line.startswith(("ok ", "attention ", "error ", "skip ", "  ", "highest ")) for line in out.splitlines())
+
+
+@pytest.mark.parametrize("name,answer", [
+    ("health", {}),
+    ("health", {"status": "ok"}),
+    ("summary", {}),
+    ("summary", {"hold_code": None, "attention": [], "human_actions": []}),
+    ("summary", {"hold_code": None, "attention": [], "human_actions": [], "coverage_complete": "yes"}),
+    ("summary", {"hold_code": None, "attention": {}, "human_actions": [], "coverage_complete": True}),
+    ("activity", {}),
+    ("activity", {"slots": []}),
+    ("activity", {"checked_at": NOW}),
+    ("overview", {}),
+    ("overview", {"counts": {"total": 3}}),
+    ("overview", {"counts": {"total": "3", "attention": "0"}}),
+    ("overview", {"counts": {"total": True, "attention": False}}),
+])
+def test_an_incomplete_answer_is_an_error_and_never_a_success(serve, name, answer):
+    code, out, _ = run(serve(**{name: answer}))
+    assert code == 2 and f"error {name}: the answer has no valid" in out
+    for other in {"health", "summary", "activity", "overview"} - {name}:
+        assert f"ok {other}" in out
+
+
+def test_an_inbox_answer_that_is_not_a_list_is_an_error(serve, token_file):
+    code, out, _ = run(serve(inbox={"detail": "x"}), "--supervisor-token-file", str(token_file))
+    assert code == 2 and "error inbox: the answer has no valid" in out
+
+
+def test_a_full_inbox_page_above_the_saved_id_is_a_limited_window(serve, token_file):
+    page = [{"id": 100 + n, "sender_name": "m", "subject": "s"} for n in range(50)]
+    code, out, _ = run(serve(inbox=page), "--supervisor-token-file", str(token_file), "--since-id", "10")
+    assert code == 1 and "earlier messages may be missing" in out
+    assert "highest inbox id seen: 149 (not a confirmed cursor)" in out and "highest inbox id: " not in out
+
+
+def test_a_full_inbox_page_that_reaches_the_saved_id_is_complete(serve, token_file):
+    page = [{"id": 10 + n, "sender_name": "m", "subject": "s"} for n in range(50)]
+    _, out, _ = run(serve(inbox=page), "--supervisor-token-file", str(token_file), "--since-id", "10")
+    assert "earlier messages may be missing" not in out and "highest inbox id: 59" in out
+
+
+def test_a_pipe_as_the_token_file_is_refused_and_never_waited_for(tmp_path):
+    pipe = tmp_path / "pipe.token"
+    os.mkfifo(pipe)
+    pipe.chmod(0o600)
+
+    def blocked(*_):
+        raise TimeoutError("opening the token file blocked")
+
+    old = signal.signal(signal.SIGALRM, blocked)
+    signal.alarm(5)
+    try:
+        with pytest.raises(_common.ConfigError, match="regular file"):
+            _common.read_token_file(pipe)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def test_a_slow_trickle_is_stopped_by_the_total_deadline(serve, monkeypatch):
+    monkeypatch.setattr(_common, "TIMEOUT_SECONDS", 0.4)
+
+    def trickle(handler):
+        handler.send_response(200)
+        handler.send_header("Content-Length", "1000")
+        handler.end_headers()
+        try:
+            for _ in range(60):  # one byte every 0.1 s: no single wait reaches the limit
+                handler.wfile.write(b" ")
+                handler.wfile.flush()
+                time.sleep(0.1)
+        except OSError:
+            pass
+
+    started = time.monotonic()
+    code, out, _ = run(serve(health=trickle))
+    assert code == 2 and "error health: the answer took longer than" in out
+    assert time.monotonic() - started < 4
