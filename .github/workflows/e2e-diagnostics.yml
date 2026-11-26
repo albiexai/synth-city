@@ -1,0 +1,107 @@
+name: E2E diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: Optional E2E lane to run
+        type: choice
+        options: [pending, flicker-loop]
+        default: pending
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  diagnostics:
+    name: e2e-${{ inputs.lane }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.lane == 'pending' && 15 || 35 }}
+    continue-on-error: ${{ inputs.lane == 'pending' }}
+    env:
+      E2E_BACKEND_LOG: ${{ github.workspace }}/frontend/e2e-logs/backend.log
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install the backend
+        run: |
+          python -m venv backend/venv
+          backend/venv/bin/pip install -r backend/requirements.txt apscheduler
+      - name: Install the frontend and Chromium
+        working-directory: frontend
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Install tmux
+        run: sudo apt-get install -y --no-install-recommends tmux
+      - name: Run the pending journeys
+        if: inputs.lane == 'pending'
+        id: pending
+        working-directory: frontend
+        run: npm run e2e:pending
+        continue-on-error: true
+      - name: Report pending lane progress
+        if: always() && (steps.pending.outcome == 'success' || steps.pending.outcome == 'failure')
+        working-directory: frontend
+        run: node e2e/support/report-progress.mjs test-results/results.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload pending traces and screenshots
+        if: inputs.lane == 'pending' && steps.pending.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-pending-results
+          path: |
+            frontend/test-results/
+            frontend/playwright-report/
+            frontend/e2e-logs/
+          retention-days: 7
+      - name: Repeat the route.fetch journey 20 times
+        if: inputs.lane == 'flicker-loop'
+        working-directory: frontend
+        run: npx playwright test e2e/g1/no-poll-flicker.spec.ts --grep "Overview re-watches" --repeat-each=20
+      - name: Require 20 plain passes
+        if: inputs.lane == 'flicker-loop'
+        working-directory: frontend
+        run: |
+          node -e '
+            const s = JSON.parse(require("fs").readFileSync("test-results/results.json", "utf8")).stats
+            const line = `expected=${s.expected} unexpected=${s.unexpected} flaky=${s.flaky} skipped=${s.skipped}`
+            console.log(line)
+            require("fs").appendFileSync(process.env.GITHUB_STEP_SUMMARY, `Flicker loop: ${line} (20 plain passes required)\n`)
+            if (s.expected !== 20 || s.unexpected || s.flaky || s.skipped) process.exit(1)
+          '
+      - name: Upload the loop result and the backend log
+        if: success() && inputs.lane == 'flicker-loop'
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-flicker-loop-result
+          path: |
+            frontend/test-results/results.json
+            frontend/e2e-logs/backend.log
+          retention-days: 7
+      - name: Upload flicker traces, screenshots and the backend log
+        if: failure() && inputs.lane == 'flicker-loop'
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-flicker-loop-failure
+          path: |
+            frontend/test-results/
+            frontend/playwright-report/
+            frontend/e2e-logs/
+          retention-days: 7
