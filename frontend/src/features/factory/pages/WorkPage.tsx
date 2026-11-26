@@ -1,3 +1,4 @@
+import { MilestoneStates } from "../components/MilestoneStates";
 import { WorkResults } from "../components/WorkResults";
 import { factoryQuery } from "../filterHelpers";
 import { FactoryFilters } from "../filters";
@@ -16,6 +17,12 @@ export function WorkPage() {
         Work across your teams. Open an item to see its history and actions.
       </p>
       <FactoryFilters work />
+      {ready && (
+        <MilestoneStates
+          teamId={Number(params.get("team_id")) || undefined}
+          scopeId={Number(params.get("scope_id")) || undefined}
+        />
+      )}
       {ready && <WorkResults key={query} query={query} />}
     </section>
   );
