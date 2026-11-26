@@ -390,7 +390,7 @@ def test_overrides_share_the_sudo_target_and_bound_helper_work_root(helper, tmp_
     ("agent_config_agent_user", "#0"), ("agent_config_helper_path", "/opt/helpers/*"),
     ("agent_config_helper_path", "/opt/helper\nALL ALL=NOPASSWD: ALL"),
     pytest.param("agent_config_helper_path", "/opt/helper with space", id="helper-space"),
-    ("agent_config_work_root", "relative/work"), ("agent_config_work_root", "/"),
+    ("agent_config_work_root", "relative/work"),
     pytest.param("agent_config_work_root", "/fixture/work*", id="work-root-wildcard"),
     pytest.param("agent_config_work_root", "/fixture/work\0", id="work-root-nul"),
     pytest.param("agent_config_work_root", "/fixture/work\r", id="work-root-cr"),
@@ -402,6 +402,24 @@ def test_agent_config_settings_reject_unsafe_sudoers_fields_and_work_roots(field
     monkeypatch.setattr(agent_config_settings, "_read_policy", lambda: json.dumps({field: value}).encode())
     with pytest.raises(ValueError):
         agent_config_settings.load_agent_config_settings()
+
+
+@pytest.mark.parametrize(("work_root", "valid"), [
+    pytest.param("/", False, id="literal-root"),
+    pytest.param("//", False, id="alternate-root"),
+    pytest.param("///", False, id="repeated-separators"),
+    pytest.param("/./", False, id="dot-root"),
+    pytest.param("//fixture/work", False, id="alternate-anchor"),
+    pytest.param("/fixture/alternate-work", True, id="named-work-root"),
+])
+def test_agent_config_work_root_requires_a_canonical_absolute_directory(monkeypatch, work_root, valid):
+    monkeypatch.setattr(agent_config_settings, "_read_policy",
+                        lambda: json.dumps({"agent_config_work_root": work_root}).encode())
+    if valid:
+        assert agent_config_settings.load_agent_config_settings().agent_config_work_root == work_root
+    else:
+        with pytest.raises(ValueError, match="Invalid agent-config path"):
+            agent_config_settings.load_agent_config_settings()
 
 
 @pytest.mark.parametrize("values", [

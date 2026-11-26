@@ -36,7 +36,7 @@ class AgentConfigSettings:
             raise ValueError("Invalid agent-config helper path")
         for value in (self.agent_config_helper_path, self.agent_config_work_root):
             path = Path(value)
-            if (not path.is_absolute() or path == Path("/") or str(path) != value
+            if (path.anchor != "/" or len(path.parts) < 2 or str(path) != value
                     or ".." in path.parts or any(char in value for char in "*\0\r\n")):
                 raise ValueError("Invalid agent-config path")
 
