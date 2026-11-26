@@ -180,3 +180,13 @@ The Director can adjust a campaign's start with `PATCH /api/v1/agent-teams/{pres
 ### Measures recorded from v4.4 on
 
 Check runs, the merge path, rate-limit windows, pull request facts and decision waits are recorded only from v4.4 on. A campaign that started before a measure's recording began reads unknown for that measure, never zero. Check runs, the merge path and rate-limit windows use their own recording markers. Pull request facts and decision waits use the first start of v4.4, so they may read unknown longer, but are never known too early. Every campaign measure reads this coverage first (`campaign_upgrade_service.recorded_coverage`), as the rate-limit measure already does with its own marker.
+
+### Campaign snapshots
+
+A campaign snapshot holds the campaign's measures from its start to an as-of time, each as a metric sample with its sample count, coverage and calculation version (`campaign-snapshot-v1`). It also lists the coverage of each measure recorded from v4.4 on. The snapshot reads no clock, so the same records and membership give the same snapshot.
+- **Measures in this version:** issues in scope, merged, closed without delivery, and deferred (from the membership and its departures), and the time spent rate-limited.
+- **Unknown, never zero:** an incomplete membership makes the membership measures unknown, with the repository and its reason. A campaign that started before the rate-limit recording, or without its marker, reads unknown for that measure.
+- **Cache:** a snapshot is cached per campaign for 30 seconds, for the Overview panel's polls. Any new or changed record a measure reads ends the cache at once, as does a change to the campaign itself.
+- **Frozen snapshots:** stored as versions in `campaign_snapshots`. A freeze stores the next version. Only the Director (the operator key) recomputes a frozen snapshot, and that also stores a new version. Earlier versions are never changed.
+
+The metrics window's samples have no calculation version.
