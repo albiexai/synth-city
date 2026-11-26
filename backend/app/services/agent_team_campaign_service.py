@@ -123,15 +123,17 @@ class AgentTeamCampaignService:
         if not rows:
             return
         captured = rows[0]
-        # #1243: a team recorded at the upgrade gets its campaign once, through this poll's client. A failure stays
-        # pending for a later poll and never stops the backlog read.
+        # #1243: a team recorded at the upgrade gets its campaign once, through this poll's client. It runs in its own
+        # session (V1 review 6078808159), so its commits and rollbacks never expire what the caller loaded. A failure
+        # stays pending for a later poll and never stops the backlog read.
+        from sqlalchemy.ext.asyncio import AsyncSession
+
         from app.services import campaign_upgrade_service
-        from app.services.session_recovery import recover_session
 
         try:
-            await campaign_upgrade_service.resolve_pending(db, captured.preset_id, client)
-        except Exception as caught_error:  # noqa: BLE001  (the backlog read must run whatever happens here)
-            await recover_session(db, caught_error, discard=True)
+            async with AsyncSession(db.bind, expire_on_commit=False) as own:
+                await campaign_upgrade_service.resolve_pending(own, captured.preset_id, client)
+        except Exception:  # noqa: BLE001  (the backlog read must run whatever happens here)
             logger.info("Upgrade campaign unresolved for team %s", captured.preset_id)
         key, started = self._key(captured), self.clock()
         cached = self._cache.get(key)

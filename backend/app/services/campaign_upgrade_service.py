@@ -79,10 +79,14 @@ async def _open_campaign(db, preset_id: int) -> Campaign | None:
     return await campaigns.current(db, preset_id)
 
 
-async def _finish(db, row_id: int, status: str, reason: str | None) -> None:
-    await db.execute(update(CampaignUpgradeBackfill).where(CampaignUpgradeBackfill.id == row_id).values(
-        status=status, reason=reason, resolved_at=_now()).execution_options(synchronize_session=False))
+async def _finish(db, row_id: int, status: str, reason: str | None) -> str | None:
+    """A terminal outcome, only while the row is pending (V1 review 6078808159): a later resolver's stale view never
+    overwrites the outcome another resolver recorded. ``None`` when the row was no longer pending."""
+    result = await db.execute(update(CampaignUpgradeBackfill).where(
+        CampaignUpgradeBackfill.id == row_id, CampaignUpgradeBackfill.status == PENDING,
+    ).values(status=status, reason=reason, resolved_at=_now()).execution_options(synchronize_session=False))
     await db.commit()
+    return status if result.rowcount == 1 else None
 
 
 async def resolve_pending(db, preset_id: int, client: Any) -> str | None:
@@ -98,8 +102,7 @@ async def resolve_pending(db, preset_id: int, client: Any) -> str | None:
         return None
     row_id, key = row.id, row.team_context_key
     if await audit.current_context_key(db, "team", preset_id) != key:
-        await _finish(db, row_id, NONE, "team_retired")
-        return NONE
+        return await _finish(db, row_id, NONE, "team_retired")
     team = await db.get(AgentTeamPreset, preset_id)
     try:
         selector = await _selector(db, team, client)
@@ -107,8 +110,7 @@ async def resolve_pending(db, preset_id: int, client: Any) -> str | None:
         await db.rollback()
         return PENDING
     if selector.startswith("none:"):
-        await _finish(db, row_id, NONE, selector.removeprefix("none:"))
-        return NONE
+        return await _finish(db, row_id, NONE, selector.removeprefix("none:"))
     probe = Campaign(team_context_key=key, preset_id=preset_id, selector=selector, status="active",
                      started_at=datetime(1970, 1, 1))
     membership = await campaigns.members(db, probe, client)
@@ -125,20 +127,22 @@ async def resolve_pending(db, preset_id: int, client: Any) -> str | None:
         return None  # another resolver took it
     if await audit.current_context_key(db, "team", preset_id) != key:
         await db.rollback()
-        await _finish(db, row_id, NONE, "team_retired")
-        return NONE
+        return await _finish(db, row_id, NONE, "team_retired")
     if await _open_campaign(db, preset_id) is not None:
         await db.rollback()
-        await _finish(db, row_id, NONE, "director_campaign")
-        return NONE
+        return await _finish(db, row_id, NONE, "director_campaign")
     try:
         await campaigns.insert(db, preset_id, key, selector, started_at=started_at or _now(),
                                actor=audit.derive_actor(actor_kind="system"), source=SOURCE)
         await db.commit()
-    except IntegrityError:  # the open-campaign index: the Director's campaign won
+    except IntegrityError:
         await db.rollback()
-        await _finish(db, row_id, NONE, "director_campaign")
-        return NONE
+        # Only a confirmed open campaign is the Director's (V1 review 6078808159); any other refusal stays pending.
+        if await _open_campaign(db, preset_id) is not None:
+            return await _finish(db, row_id, NONE, "director_campaign")
+        await db.rollback()
+        logger.info("Upgrade campaign for team %s stays pending after a storage refusal", preset_id)
+        return PENDING
     return CREATED
 
 

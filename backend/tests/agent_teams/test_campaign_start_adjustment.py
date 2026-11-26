@@ -11,6 +11,9 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 import pytest_asyncio
+from sqlalchemy import event, select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
 from app.config import settings
 from app.database import Base, get_db
 from app.main import app
@@ -27,8 +30,6 @@ from app.models.database import (
 from app.services import campaign_record_service as campaigns
 from app.services import campaign_upgrade_service as upgrade
 from app.services import factory_audit_service as audit
-from sqlalchemy import event, select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from tests.test_audit_via import SESSION_TOKEN, _session
 
 pytestmark = pytest.mark.asyncio
@@ -212,3 +213,35 @@ async def test_an_adjusted_start_after_coverage_becomes_covered(client, db, make
     async with maker() as other:
         after = await upgrade.recorded_coverage(other, await campaigns.current(other, team))
     assert all(c.covered for c in after)
+
+
+# V1 review 6078808159
+async def test_a_team_retired_during_the_adjustment_keeps_its_campaign(client, maker, team, monkeypatch):
+    """Retired and its id recreated between the lookup and the update: nothing changes."""
+    from sqlalchemy import text
+
+    real = campaigns.current
+
+    async def current_then_retire(db, preset_id):
+        found = await real(db, preset_id)
+        async with maker() as other:
+            await other.execute(text("DELETE FROM team_github_scopes WHERE preset_id = :team"), {"team": preset_id})
+            await other.execute(text("DELETE FROM agent_team_presets WHERE id = :team"), {"team": preset_id})
+            other.add(AgentTeamPreset(id=preset_id, name="Recreated"))
+            await other.commit()
+        return found
+
+    monkeypatch.setattr(campaigns, "current", current_then_retire)
+    response = await client.patch(_path(team), json=_body(T0 - timedelta(days=1)))
+    assert response.status_code == 404 and response.json()["detail"] == "campaign_not_found"
+    async with maker() as other:
+        assert (await other.scalar(select(Campaign.started_at))) == T0
+    assert await _adjusted(maker) == []
+
+
+async def test_every_valid_adjustment_has_its_own_event(client, maker, team):
+    earlier = T0 - timedelta(days=1)
+    for new, expected in ((earlier, T0), (T0, earlier), (earlier, T0)):
+        assert (await client.patch(_path(team), json=_body(new, expected))).status_code == 200
+    assert len(await _adjusted(maker)) == 3
+    assert await _start(maker, team) == earlier

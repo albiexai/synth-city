@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import httpx
-from sqlalchemy import and_, select, update
+from sqlalchemy import and_, func, select, update
 
 from app.models.database import (
     AgentTeamPreset,
@@ -135,20 +135,32 @@ async def adjust_start(db, preset_id: int, *, started_at: datetime, expected_sta
         raise CampaignError("campaign_not_found")
     if campaign.status != "active":
         raise CampaignError("campaign_not_active")
+    campaign_id, key = campaign.id, campaign.team_context_key
+    # The team's lifetime is read in the update itself (V1 review 6078808159): a team retired, or its id reused,
+    # after the lookup changes nothing.
+    lifetime = select(FactoryContextKey.context_key).where(
+        FactoryContextKey.key_kind == "team", FactoryContextKey.numeric_id == preset_id,
+        FactoryContextKey.retired_at.is_(None)).scalar_subquery()
     result = await db.execute(update(Campaign).where(
-        Campaign.id == campaign.id, Campaign.team_context_key == campaign.team_context_key,
+        Campaign.id == campaign_id, Campaign.team_context_key == key, Campaign.team_context_key == lifetime,
         Campaign.status == "active", Campaign.started_at == expected,
     ).values(started_at=new).execution_options(synchronize_session=False))
     if result.rowcount != 1:
         await db.rollback()
+        if await audit.current_context_key(db, "team", preset_id) != key:
+            raise CampaignError("campaign_not_found")
         raise CampaignError("campaign_start_changed")
+    # Each applied change is its own event, numbered under the update's write lock: a start moved back and forth
+    # keeps every change (V1 review 6078808159). The compare-and-set refuses a stale retry.
+    sequence = await db.scalar(select(func.count(FactoryAuditEvent.id)).where(
+        FactoryAuditEvent.event_kind == "campaign_start_adjusted",
+        FactoryAuditEvent.correlation_id == f"campaign:{campaign_id}")) + 1
     await audit.record_event(
         db, event_kind="campaign_start_adjusted", source="campaign_record_service.adjust_start",
         occurred_at=datetime.now(UTC), actor=actor, team_preset_id=preset_id,
-        team_context_key=campaign.team_context_key, action_outcome="applied",
+        team_context_key=key, action_outcome="applied",
         sanitized_reason=f"campaign start adjusted from {expected.isoformat()} to {new.isoformat()}",
-        operation_id=f"campaign_start_adjusted:{campaign.id}:{expected.isoformat()}:{new.isoformat()}",
-        correlation_id=f"campaign:{campaign.id}")
+        operation_id=f"campaign_start_adjusted:{campaign_id}:{sequence}", correlation_id=f"campaign:{campaign_id}")
     await db.commit()
     await db.refresh(campaign)
     return campaign

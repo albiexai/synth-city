@@ -169,13 +169,13 @@ The first start of v4.4 records each team that has a backlog milestone or a pare
 - **Selector:** `milestone:<backlog milestone>`, or the title of the parent issue's milestone when the parent is in one of the team's repositories. A parent outside them, or without a milestone, gives no campaign.
 - **Start:** the first admission (work item) of an issue that matches the selector, in the team's own repositories. With none yet, the campaign starts when it is created.
 - **When it waits:** while GitHub can't be read, or the membership is incomplete, the team waits for a later poll rather than getting a guessed start.
-- **When it yields:** if the Director started a campaign first, the Director's is kept. A deleted team, or a new team that took its id, gets none.
+- **When it yields:** if the Director started a campaign first, the Director's is kept. A deleted team, or a new team that took its id, gets none. Once a team's outcome is recorded, a slower poll can't overwrite it. Any other storage refusal leaves the team waiting for a later poll.
 
 The Director can adjust a campaign's start with `PATCH /api/v1/agent-teams/{preset_id}/campaign/start`, giving the new `started_at` and the `expected_started_at` they saw.
 - It needs the operator token, and a Mail session is refused.
-- Only an `active` campaign changes, and only when the start is still the one the Director saw; otherwise the answer is 409.
+- Only an `active` campaign of the team's current lifetime changes, and only when the start is still the one the Director saw. Otherwise the answer is 409, or 404 when the team was deleted or its id reused.
 - A start in the future is refused (422).
-- Each change records one `campaign_start_adjusted` event.
+- Each change records its own `campaign_start_adjusted` event, even when a start is moved back to an earlier value.
 
 ### Measures recorded from v4.4 on
 

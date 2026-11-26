@@ -12,6 +12,9 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import event, select, text
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
 from app.database import Base
 from app.models.database import (
     AgentTeamPreset,
@@ -30,8 +33,6 @@ from app.services import campaign_upgrade_service as upgrade
 from app.services import factory_audit_service as audit
 from app.services.github_client import GithubClientResponseError
 from app.services.github_rate_limit_history import campaign_rate_limit_time
-from sqlalchemy import event, select, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 pytestmark = pytest.mark.asyncio
 T0 = datetime(2026, 11, 1, 9, 0, 0)
@@ -286,10 +287,13 @@ async def test_a_director_campaign_the_check_misses_is_refused_by_the_database(m
     async with maker() as db:
         await campaigns.start(db, teams["M"], "label:director", started_at=T0, actor=OPERATOR)
 
-    async def misses(db, preset_id):
-        return None
+    real, checks = upgrade._open_campaign, []
 
-    monkeypatch.setattr(upgrade, "_open_campaign", misses)
+    async def misses_once(db, preset_id):
+        checks.append(preset_id)
+        return None if len(checks) == 1 else await real(db, preset_id)  # the confirmation after the refusal reads
+
+    monkeypatch.setattr(upgrade, "_open_campaign", misses_once)
     await _resolve(maker, teams["M"])
     assert (await _open(maker, teams["M"])).selector == "label:director"
     assert (await _rows(maker))[teams["M"]] == ("none", "director_campaign")
@@ -421,3 +425,77 @@ async def test_the_poll_resolves_the_backfill_through_the_campaign_refresh(maker
         scope = await db.scalar(select(TeamGithubScope).where(TeamGithubScope.preset_id == teams["M"]))
         await AgentTeamCampaignService().refresh_scope(db, scope, _client())
     assert (await _open(maker, teams["M"])).selector == "milestone:v4.4"
+
+
+# V1 review 6078808159
+async def test_a_stale_resolver_does_not_overwrite_a_created_backfill(maker, teams, monkeypatch):
+    """Resolver A reads a missing parent; resolver B creates the campaign before A records its outcome."""
+    await _upgrade(maker)
+    real, calls = upgrade._selector, []
+
+    async def missing_after_the_other_resolved(db, team, client):
+        if calls:
+            return await real(db, team, client)
+        calls.append(team.id)
+        await _resolve(maker, teams["P"])  # B, with a readable parent
+        return "none:parent_not_found"
+
+    monkeypatch.setattr(upgrade, "_selector", missing_after_the_other_resolved)
+    await _resolve(maker, teams["P"], _client(issues={}))
+    assert (await _rows(maker))[teams["P"]] == ("created", None)
+    assert (await _open(maker, teams["P"])).selector == "milestone:Sprint 9"
+
+
+async def test_an_unrelated_integrity_error_leaves_the_backfill_pending(maker, teams, monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+
+    await _upgrade(maker)
+    real = audit.record_event
+
+    async def failing_start_event(db, **kwargs):
+        if kwargs.get("event_kind") == "campaign_started":
+            raise IntegrityError("INSERT INTO factory_audit_events", {}, Exception("injected"))
+        return await real(db, **kwargs)
+
+    monkeypatch.setattr(audit, "record_event", failing_start_event)
+    await _resolve(maker, teams["M"])
+    assert await _open(maker, teams["M"]) is None
+    assert (await _rows(maker))[teams["M"]] == ("pending", None)
+    monkeypatch.setattr(audit, "record_event", real)
+    await _resolve(maker, teams["M"])  # retryable: the next poll creates it
+    assert (await _rows(maker))[teams["M"]] == ("created", None)
+
+
+@pytest.mark.parametrize("client", [_client(), _client(broken={"m1", "m2", "p1"})], ids=["created", "pending"])
+async def test_resolution_never_expires_the_callers_scopes(maker, teams, client):
+    """The test-instance poller refreshes every scope it loaded, in one session."""
+    from app.services.agent_team_campaign_service import AgentTeamCampaignService
+
+    await _upgrade(maker)
+    service = AgentTeamCampaignService()
+    async with maker() as db:
+        scopes = (await db.scalars(select(TeamGithubScope).order_by(TeamGithubScope.id))).all()
+        seen = []
+        for scope in scopes:
+            await service.refresh_scope(db, scope, client)
+            seen.append(scope.id)  # a rollback in the caller's session would expire it (MissingGreenlet)
+    assert len(seen) == len(scopes) == 4
+
+
+async def test_a_backfill_resolved_meanwhile_is_not_claimed_again(maker, teams, monkeypatch):
+    """Another resolver recorded "none" while this one read the membership: the claim fails, nothing is created."""
+    await _upgrade(maker)
+    real = campaigns.members
+
+    async def members_then_other_outcome(db, campaign, client):
+        result = await real(db, campaign, client)
+        async with maker() as other:
+            await other.execute(text("UPDATE campaign_upgrade_backfill SET status = 'none', reason = 'other'"
+                                     " WHERE preset_id = :team"), {"team": teams["M"]})
+            await other.commit()
+        return result
+
+    monkeypatch.setattr(campaigns, "members", members_then_other_outcome)
+    await _resolve(maker, teams["M"])
+    assert await _open(maker, teams["M"]) is None
+    assert (await _rows(maker))[teams["M"]] == ("none", "other")
