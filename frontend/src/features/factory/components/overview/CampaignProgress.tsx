@@ -1,4 +1,5 @@
 import { Link } from "react-router-dom";
+import { formatServerTime } from "@/lib/serverTime";
 import type { AgentTeamPreset, AgentTeamSummary, CampaignUnderWayItem } from "@/types/agentTeams";
 import { RelativeTime } from "../RelativeTime";
 import { anchor } from "../styles";
@@ -67,6 +68,12 @@ function CampaignCard({ preset, summary }: { preset: AgentTeamPreset; summary: A
         </p>
       </div>
       <CampaignBar campaign={c} />
+      {c.backlog_state === "available" && c.backlog_stale && c.backlog_observed_at && (
+        <p className="text-sm text-muted-foreground">
+          Backlog as of{" "}
+          <time dateTime={c.backlog_observed_at}>{formatServerTime(c.backlog_observed_at)}</time>
+        </p>
+      )}
       {c.backlog_state !== "available" && (
         <p role="note" className="text-sm text-muted-foreground">
           The backlog cannot be read, so Synth City shows only the work it has seen.

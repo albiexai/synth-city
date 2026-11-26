@@ -157,6 +157,8 @@ export interface CampaignDecision { text: string; state: 'later' | 'now' | 'done
 // The progress of one team's campaign (#548, #587). Counts come from the server.
 export interface TeamCampaignSummary {
   backlog_state: 'available' | 'backlog unavailable'
+  backlog_observed_at?: string | null
+  backlog_stale?: boolean
   done_count: number
   /** The part of done_count merged into a branch other than the scope's base (#1106). */
   done_on_other_branch_count?: number

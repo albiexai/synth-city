@@ -5,7 +5,7 @@ import asyncio
 import logging
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 import time
 
@@ -44,9 +44,10 @@ _DECISION_TEXT = {
 
 @dataclass(frozen=True)
 class BacklogObservation:
-    expires_at: float
+    read_at: float
     # None means unavailable. An empty tuple means a complete, empty backlog.
     issues: tuple[tuple[int, tuple[str, ...]], ...] | None
+    observed_at: datetime | None
 
 
 def _parent(url):
@@ -59,10 +60,16 @@ def _branch(value):
 
 
 class AgentTeamCampaignService:
-    def __init__(self, *, interval_seconds=None, clock=time.monotonic):
+    def __init__(self, *, interval_seconds=None, clock=time.monotonic, wall_clock=None):
         self.interval_seconds = max(1, interval_seconds or settings.github_dispatch_interval_seconds)
         self.clock = clock
+        self.wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
         self._cache: dict[tuple, BacklogObservation] = {}
+
+    def _expires_at(self, observation: BacklogObservation) -> float:
+        # A failed first read delays the next attempt for one interval.
+        intervals = 1 if observation.issues is None else 3
+        return observation.read_at + intervals * self.interval_seconds
 
     async def _scopes(self, db, preset_id=None, scope_id=None):
         query = select(TeamGithubScope.id, TeamGithubScope.preset_id, TeamGithubScope.created_at,
@@ -137,8 +144,9 @@ class AgentTeamCampaignService:
             logger.info("Upgrade campaign unresolved for team %s", captured.preset_id)
         key, started = self._key(captured), self.clock()
         cached = self._cache.get(key)
-        if cached and cached.expires_at > started:
+        if cached and cached.read_at + self.interval_seconds > started:
             return
+        observed_at = self.wall_clock()
         try:
             issues = await asyncio.wait_for(self._read_backlog(captured, client), timeout=8)
         except Exception:
@@ -147,11 +155,18 @@ class AgentTeamCampaignService:
         fresh = await self._scopes(db, scope_id=scope_id)
         if not fresh or self._key(fresh[0]) != key:
             return
-        self._cache = {k: v for k, v in self._cache.items() if v.expires_at > started}
-        if len(self._cache) >= 1024:
-            oldest = min(self._cache, key=lambda k: self._cache[k].expires_at)
+        now = self.clock()
+        latest = self._cache.get(key)
+        if latest is not None:
+            if latest.read_at > started and (latest.issues is not None or issues is None):
+                return
+            if issues is None and latest.issues is not None and self._expires_at(latest) > now:
+                return
+        self._cache = {k: v for k, v in self._cache.items() if self._expires_at(v) > now}
+        if key not in self._cache and len(self._cache) >= 1024:
+            oldest = min(self._cache, key=lambda k: self._expires_at(self._cache[k]))
             self._cache.pop(oldest)
-        self._cache[key] = BacklogObservation(started + self.interval_seconds, issues)
+        self._cache[key] = BacklogObservation(started, issues, observed_at if issues is not None else None)
 
     async def summary(self, db, preset_id, human_actions=(), scope_id=None, provider=None):
         """The campaign counts. scope_id narrows them to one repository and provider to the work that an owner of
@@ -169,8 +184,9 @@ class AgentTeamCampaignService:
         by_scope = {scope.id: scope for scope in scopes}
         now = self.clock()
         observations = {scope.id: self._cache.get(self._key(scope)) for scope in scopes}
-        available = bool(scopes) and all(observation is not None and observation.expires_at > now
+        available = bool(scopes) and all(observation is not None and self._expires_at(observation) > now
             and observation.issues is not None for observation in observations.values())
+        oldest_observation = min(observations.values(), key=lambda observation: observation.read_at) if available else None
         backlog = {}
         if available:
             for scope in scopes:
@@ -254,6 +270,8 @@ class AgentTeamCampaignService:
                 continue
             decisions.append(CampaignDecision(text=decision.text, state=decision.state))
         return TeamCampaignSummary(backlog_state="available" if available else "backlog unavailable",
+            backlog_observed_at=oldest_observation.observed_at if oldest_observation else None,
+            backlog_stale=oldest_observation is not None and oldest_observation.read_at + self.interval_seconds < now,
             done_count=len(done), done_on_other_branch_count=other_branch, latest_done=[CampaignDoneItem(title=row.issue_title,
                 merged_at=row.auto_merged_at) for row in done[:3]],
             under_way_count=len(under_way), under_way=under_way, attention_count=attention, queued_count=len(queued), queued=queued,
