@@ -392,6 +392,8 @@ def test_every_emitted_line_is_printable_whatever_the_server_sends(serve, token_
     ("health", {"status": "ok"}),
     ("summary", {}),
     ("summary", {"hold_code": None, "attention": [], "human_actions": []}),
+    ("summary", {"attention": [], "human_actions": [], "coverage_complete": True}),
+    ("summary", {"hold_code": 5, "attention": [], "human_actions": [], "coverage_complete": True}),
     ("summary", {"hold_code": None, "attention": [], "human_actions": [], "coverage_complete": "yes"}),
     ("summary", {"hold_code": None, "attention": {}, "human_actions": [], "coverage_complete": True}),
     ("activity", {}),
@@ -401,6 +403,7 @@ def test_every_emitted_line_is_printable_whatever_the_server_sends(serve, token_
     ("overview", {"counts": {"total": 3}}),
     ("overview", {"counts": {"total": "3", "attention": "0"}}),
     ("overview", {"counts": {"total": True, "attention": False}}),
+    ("overview", {"counts": {"total": -1, "attention": 0}}),
 ])
 def test_an_incomplete_answer_is_an_error_and_never_a_success(serve, name, answer):
     code, out, _ = run(serve(**{name: answer}))
@@ -464,3 +467,9 @@ def test_a_slow_trickle_is_stopped_by_the_total_deadline(serve, monkeypatch):
     code, out, _ = run(serve(health=trickle))
     assert code == 2 and "error health: the answer took longer than" in out
     assert time.monotonic() - started < 4
+
+
+def test_a_member_state_the_script_does_not_know_is_reported(serve):
+    slots = [{"slot_id": 7, "state": "paused", "reason": "r", "observed_at": NOW}]
+    code, out, _ = run(serve(activity={"checked_at": NOW, "slots": slots}))
+    assert code == 1 and "slot 7 paused" in out

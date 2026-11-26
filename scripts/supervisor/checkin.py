@@ -50,9 +50,10 @@ def health(data, args):
 
 
 def summary(data, args):
-    need(isinstance(data, dict) and isinstance(data.get("coverage_complete"), bool)
+    need(isinstance(data, dict) and "hold_code" in data and isinstance(data["hold_code"], (str, type(None)))
+         and isinstance(data.get("coverage_complete"), bool)
          and isinstance(data.get("attention"), list) and isinstance(data.get("human_actions"), list),
-         "coverage, attention and human actions")
+         "hold, coverage, attention and human actions")
     found = []
     if data.get("hold_code"):
         found.append(f"hold {common.clean(data['hold_code'], 40)}")

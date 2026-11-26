@@ -122,8 +122,9 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 class Client:
     """Read-only GET client. It follows no redirect, ignores proxy settings and bounds time and size.
 
-    Each wait for data stops after TIMEOUT_SECONDS. The whole answer is checked against the same limit between reads,
-    so a slow answer can run over by at most one wait.
+    Each wait for data stops after TIMEOUT_SECONDS. The body of the answer is also checked against the same limit in
+    total, between reads, so a slow body can run over by at most one wait. The status line and the headers are bounded
+    per wait only: the standard library accepts up to 100 header lines, so a slow server can hold them much longer.
     """
 
     def __init__(self, base_url, redact):
