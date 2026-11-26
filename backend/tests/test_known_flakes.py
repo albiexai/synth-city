@@ -81,7 +81,7 @@ def test_cli_rejects_duplicate_json_fields_and_missing_registry(tmp_path):
     ("backend-tests.yml", "backend-gate"),
     ("e2e.yml", "e2e"),
 ])
-def test_required_gate_enforces_expiry_using_its_tooling_and_candidate_data(workflow, gate_id, tmp_path):
+def test_required_gate_enforces_expiry_using_the_effective_registry(workflow, gate_id, tmp_path):
     jobs = yaml.safe_load((ROOT / ".github/workflows" / workflow).read_text(encoding="utf-8"))["jobs"]
     steps = jobs[gate_id]["steps"]
     step_index, validation = next(
@@ -89,25 +89,41 @@ def test_required_gate_enforces_expiry_using_its_tooling_and_candidate_data(work
         if step.get("name") == "Validate the known-flakes registry"
     )
     assert "if" not in validation and not validation.get("continue-on-error", False)
-    checkouts = [step for step in steps[:step_index] if step.get("uses", "").startswith("actions/checkout@")]
-    assert all("if" not in step for step in checkouts)
-    assert [step["with"]["ref"] for step in checkouts] == [
+    candidate, tooling = [step for step in steps[:step_index] if step.get("uses", "").startswith("actions/checkout@")]
+    assert [step["with"]["ref"] for step in (candidate, tooling)] == [
         "${{ github.event.pull_request.head.sha || github.sha }}", "${{ github.workflow_sha }}",
     ]
+    assert "if" not in tooling
+    assert set(tooling["with"]["sparse-checkout"].split()) == {"scripts/ci", ".github"}
+    if gate_id == "e2e":
+        assert candidate["if"] == "needs.e2e-scope.outputs.run_suites == 'true'"
 
     validator = tmp_path / ".workflow-ci/scripts/ci/known_flakes.py"
     validator.parent.mkdir(parents=True)
     shutil.copyfile(SCRIPT, validator)
-    registry = tmp_path / "candidate/.github/known-flakes.json"
+    registry = tmp_path / ".workflow-ci/.github/known-flakes.json"
     registry.parent.mkdir(parents=True)
 
-    def run(expiry):
-        registry.write_text(json.dumps([RECORD | {"expires_on": expiry}]), encoding="utf-8")
+    def run():
         return subprocess.run(
             ["bash", "-e", "-c", validation["run"]], cwd=tmp_path, text=True, capture_output=True, check=False,
         )
 
-    assert run(None).returncode == 0
-    expired = run("2000-01-01")
+    # An older head or a docs-only E2E run may have no candidate registry at all.
+    registry.write_text("[]", encoding="utf-8")
+    assert run().returncode == 0
+
+    candidate_registry = tmp_path / "candidate/.github/known-flakes.json"
+    candidate_registry.parent.mkdir(parents=True)
+    candidate_registry.write_text("[]", encoding="utf-8")
+    registry.write_text(json.dumps([RECORD | {"expires_on": "2000-01-01"}]), encoding="utf-8")
+    expired = run()
     assert expired.returncode == 1
     assert RECORD["test_id"] in expired.stderr and "issue #123" in expired.stderr
+
+    # The effective tree also contains a pull request's edits, such as renewing an entry.
+    registry.write_text(json.dumps([RECORD | {"expires_on": "9999-12-31"}]), encoding="utf-8")
+    assert run().returncode == 0
+    registry.unlink()
+    missing = run()
+    assert missing.returncode == 1 and "Could not read" in missing.stderr
