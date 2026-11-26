@@ -223,6 +223,33 @@ def test_a_token_inside_a_message_subject_is_removed_from_the_output(serve, toke
     assert OPERATOR not in out + err and SUPERVISOR not in out + err
 
 
+def test_a_token_cut_by_the_length_limit_is_not_printed_in_part(serve, token_file):
+    # V2: the text was cut to 120 (subject) and 60 (sender) characters before the redaction, so a part of the token stayed.
+    messages = [{"id": 3, "sender_name": "y" * 55 + OPERATOR, "subject": "x" * 110 + SUPERVISOR}]
+    health = {"status": "ok", "health": "ok", "reasons": ["z" * 35 + OPERATOR], "open_findings": 0}
+    _, out, err = run(serve(inbox=messages, health=health), "--supervisor-token-file", str(token_file),
+                      env={"SYNTH_CITY_OPERATOR_TOKEN": OPERATOR})
+    for token in (OPERATOR, SUPERVISOR):
+        for size in range(4, len(token) + 1):
+            assert token[:size] not in out + err and token[-size:] not in out + err
+
+
+def test_control_characters_from_another_party_never_reach_the_terminal(serve, token_file):
+    messages = [{"id": 3, "sender_name": "n\x1b]0;title\x07ame", "subject": "a\x1b[31mred\x07\r\nb\x00c"}]
+    _, out, _ = run(serve(inbox=messages), "--supervisor-token-file", str(token_file))
+    assert all(char in "\n" or char.isprintable() for char in out)
+    assert "red" in out and "ame" in out
+
+
+def test_proxy_settings_are_ignored_so_a_token_never_goes_to_a_proxy(serve, monkeypatch):
+    proxy, fake = serve(), serve()
+    for name in ("http_proxy", "HTTP_PROXY", "no_proxy", "NO_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("http_proxy", proxy.url)
+    run(fake, env={"SYNTH_CITY_OPERATOR_TOKEN": OPERATOR})
+    assert proxy.seen == [] and len(fake.seen) == 4
+
+
 def test_the_redaction_removes_both_tokens_and_ignores_empty_ones():
     redact = _common.Redactor(OPERATOR, SUPERVISOR, "", None)
     assert redact(f"a {OPERATOR} b {SUPERVISOR} c") == "a [token removed] b [token removed] c"
@@ -285,8 +312,9 @@ def test_a_redirect_is_not_followed_so_a_token_never_goes_to_another_address(ser
 
 
 def test_a_very_large_answer_is_refused(serve):
-    code, out, _ = run(serve(health=(200, b"[" + b"1," * 600000 + b"1]")))
-    assert code == 2 and "error health" in out
+    # A valid answer of the right shape, so only the size check can refuse it.
+    code, out, _ = run(serve(health=(200, b'{"status": "ok", "health": "ok", "pad": "' + b"a" * 1_100_000 + b'"}')))
+    assert code == 2 and "error health: the answer is larger than" in out
 
 
 def test_the_operator_token_is_prompted_only_when_asked(serve):

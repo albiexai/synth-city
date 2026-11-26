@@ -121,6 +121,16 @@ class Client:
         if len(raw) > MAX_BYTES:
             raise StepError(f"the answer is larger than {MAX_BYTES} bytes")
         try:
-            return json.loads(raw)
+            return self._scrub(json.loads(raw))
         except ValueError:
             raise StepError("the answer is not JSON") from None
+
+    def _scrub(self, value):
+        """Redact every text of the answer once, before any cut or reformat, so no part of a token can stay."""
+        if isinstance(value, str):
+            return self._redact(value)
+        if isinstance(value, list):
+            return [self._scrub(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self._scrub(item) for key, item in value.items()}
+        return value
