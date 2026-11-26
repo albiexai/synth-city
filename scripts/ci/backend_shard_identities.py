@@ -9,6 +9,7 @@ of an id is a uuid inside a few parameter ids; ids that contain one are compared
 
 With a known-flakes registry, the gate reconciles pytest's exit status and JUnit failure counts.
 It tolerates only a test-call failure with an exact node ID and a full signature match.
+Each producer runs the same checker on its own artifact before the aggregate checks the full partition.
 
     python scripts/ci/backend_shard_identities.py --full full.txt --artifacts DIR --shards 4 --registry known-flakes.json
 """
@@ -171,6 +172,27 @@ def _latest_artifacts(artifacts: Path, count: int) -> tuple[dict[int, Path], lis
     return {index: folder for index, (_, folder) in latest.items()}, problems
 
 
+def load_shard(folder: Path, index: int) -> tuple[dict, list[str]]:
+    files = {"collected": folder / f"backend-shard-{index}-collected.txt",
+             "executed": folder / f"backend-shard-{index}-executed.jsonl",
+             "junit": folder / f"backend-junit-{index}.xml"}
+    text, problems = {}, []
+    for kind, path in files.items():
+        if not path.is_file() or path.stat().st_size == 0:
+            problems.append(f"{path.name} is missing or empty")
+        elif kind != "junit":
+            text[kind] = path.read_text(encoding="utf-8")
+    executed, bad_rows = parse_executed(text.get("executed", ""))
+    exit_file = folder / f"backend-shard-{index}-pytest-exit.txt"
+    return {
+        "artifact": folder.name,
+        "collected": parse_collected(text.get("collected", "")),
+        "executed": executed,
+        "pytest_exit": exit_file.read_text(encoding="utf-8").strip() if exit_file.is_file() else None,
+        **_junit_counts(files["junit"]),
+    }, [f"shard {index}: {message}" for message in problems + bad_rows]
+
+
 def load_shards(artifacts: Path, count: int) -> tuple[dict[str, dict], list[str]]:
     """Read the newest artifact per shard, or a complete legacy set from one attempt."""
     selected, problems = _latest_artifacts(artifacts, count)
@@ -180,35 +202,26 @@ def load_shards(artifacts: Path, count: int) -> tuple[dict[str, dict], list[str]
         if folder is None:
             problems.append(f"missing artifact for shard {index}")
             continue
-        files = {"collected": folder / f"backend-shard-{index}-collected.txt",
-                 "executed": folder / f"backend-shard-{index}-executed.jsonl",
-                 "junit": folder / f"backend-junit-{index}.xml"}
-        text = {}
-        for kind, path in files.items():
-            if not path.is_file() or path.stat().st_size == 0:
-                problems.append(f"shard {index}: {path.name} is missing or empty")
-            elif kind != "junit":
-                text[kind] = path.read_text(encoding="utf-8")
-        executed, bad_rows = parse_executed(text.get("executed", ""))
-        problems += [f"shard {index}: {message}" for message in bad_rows]
-        exit_file = folder / f"backend-shard-{index}-pytest-exit.txt"
-        shards[f"shard {index}"] = {
-            "artifact": folder.name,
-            "collected": parse_collected(text.get("collected", "")),
-            "executed": executed,
-            "pytest_exit": exit_file.read_text(encoding="utf-8").strip() if exit_file.is_file() else None,
-            **_junit_counts(files["junit"]),
-        }
+        shard, invalid = load_shard(folder, index)
+        shards[f"shard {index}"] = shard
+        problems.extend(invalid)
     return shards, problems
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--full", type=Path, required=True, help="node ids of the full collection, one per line")
-    parser.add_argument("--artifacts", type=Path, required=True, help="directory holding one folder per shard artifact")
-    parser.add_argument("--shards", type=int, required=True)
+    parser.add_argument("--full", type=Path, help="node ids of the full collection, one per line")
+    parser.add_argument("--artifacts", type=Path, required=True, help="one shard folder or the complete artifact root")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--shard", type=int, help="the producer shard's number")
+    mode.add_argument("--shards", type=int, help="the number of shards in the full run")
     parser.add_argument("--registry", type=Path, help="the workflow tree's known-flakes registry")
     args = parser.parse_args(argv)
+    if args.shard is not None:
+        if args.shard < 1 or args.full is not None or args.registry is None:
+            parser.error("--shard requires a positive number and --registry, without --full")
+    elif args.shards < 1 or args.full is None:
+        parser.error("--shards requires a positive count and --full")
     flakes = None
     if args.registry is not None:
         from known_flakes import read_registry, validate
@@ -223,10 +236,15 @@ def main(argv: list[str] | None = None) -> int:
             print("\n".join(errors), file=sys.stderr)
             return 1
         flakes = {entry["test_id"]: re.compile(entry["failure_signature"]) for entry in registry}
-    shards, problems = load_shards(args.artifacts, args.shards)
+    if args.shard is not None:
+        shard, problems = load_shard(args.artifacts, args.shard)
+        shards = {f"shard {args.shard}": shard}
+        full = shard["collected"]
+    else:
+        shards, problems = load_shards(args.artifacts, args.shards)
+        full = parse_collected(args.full.read_text(encoding="utf-8")) if args.full.is_file() else []
     for name, shard in shards.items():
         print(f"{name}: {shard['artifact']}")
-    full = parse_collected(args.full.read_text(encoding="utf-8")) if args.full.is_file() else []
     more, summary = check(full, shards, flakes)
     problems += more
     print(f"shards {summary['shards']}; full collection {summary['full']}; collected {summary['collected']}; "

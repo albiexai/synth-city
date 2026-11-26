@@ -44,6 +44,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/ci/docs_only.py
+      - name: Check out the workflow's gate tooling
+        if: steps.changes.outputs.run_suites != 'false'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .workflow-ci
+          sparse-checkout: |
+            scripts/ci
+            .github
+          persist-credentials: false
       - uses: actions/setup-python@v7
         if: steps.changes.outputs.run_suites != 'false'
         with:
@@ -84,7 +94,7 @@ jobs:
         working-directory: backend
         # The 30 slowest tests go to the log. The JUnit file keeps the time of every test case (#866). The
         # identity plugin records every executed test once, for the partition check of the gate (#1013).
-        # The gate evaluates ordinary test failures using the identities, JUnit and pytest exit status.
+        # Use the same evidence rules as the aggregate so failed-job reruns retry an affected shard.
         run: |
           pytest_exit=0
           python -m pytest $(cat backend-shard-files.txt) -q --tb=short -p tests.ci_shard_identity --identity-out=backend-shard-${{ matrix.shard }}-executed.jsonl --durations=30 --durations-min=1.0 --junitxml=backend-junit-${{ matrix.shard }}.xml || pytest_exit=$?
@@ -92,6 +102,7 @@ jobs:
           if [ "$pytest_exit" -gt 1 ]; then
             exit "$pytest_exit"
           fi
+          python ../.workflow-ci/scripts/ci/backend_shard_identities.py --artifacts . --shard ${{ matrix.shard }} --registry ../.workflow-ci/.github/known-flakes.json
       - name: Keep the backend test timings and identities
         # Runs after a failed suite too, so a failing run still keeps what pytest wrote.
         if: always() && steps.changes.outputs.run_suites != 'false'
