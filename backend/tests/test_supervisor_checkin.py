@@ -389,35 +389,52 @@ def test_every_emitted_line_is_printable_whatever_the_server_sends(serve, token_
     assert all(line.startswith(("ok ", "attention ", "error ", "skip ", "  ", "highest ")) for line in out.splitlines())
 
 
-@pytest.mark.parametrize("name,answer", [
-    ("health", {}),
-    ("health", {"status": "ok"}),
-    ("health", {"status": "ok", "health": "ok", "reasons": []}),
-    ("health", {"status": "ok", "health": "ok", "open_findings": 0}),
-    ("health", {"status": "ok", "health": "ok", "reasons": "none", "open_findings": 0}),
-    ("health", {"status": "ok", "health": "ok", "reasons": [], "open_findings": -1}),
-    ("health", {"status": "ok", "health": "ok", "reasons": [], "open_findings": "3"}),
-    ("summary", {}),
-    ("summary", {"hold_code": None, "attention": [], "human_actions": [], "coverage_complete": True, "supervisor_observation": None}),
-    ("summary", {"hold_code": None, "attention": [], "human_actions": [], "required_ci_unreadable": {}, "coverage_complete": True, "supervisor_observation": None}),
-    ("summary", {"hold_code": None, "attention": [], "human_actions": [], "required_ci_unreadable": [], "coverage_complete": True}),
-    ("summary", {"hold_code": None, "attention": [], "human_actions": [], "required_ci_unreadable": [], "coverage_complete": True, "supervisor_observation": 5}),
-    ("summary", {"hold_code": None, "attention": ["x"], "human_actions": [], "required_ci_unreadable": [], "coverage_complete": True, "supervisor_observation": None}),
-    ("summary", {"hold_code": None, "attention": [], "human_actions": [], "required_ci_unreadable": ["x"], "coverage_complete": True, "supervisor_observation": None}),
-    ("summary", {"hold_code": None, "attention": [], "human_actions": []}),
-    ("summary", {"attention": [], "human_actions": [], "coverage_complete": True}),
-    ("summary", {"hold_code": 5, "attention": [], "human_actions": [], "coverage_complete": True}),
-    ("summary", {"hold_code": None, "attention": [], "human_actions": [], "coverage_complete": "yes"}),
-    ("summary", {"hold_code": None, "attention": {}, "human_actions": [], "coverage_complete": True}),
-    ("activity", {}),
-    ("activity", {"slots": []}),
-    ("activity", {"checked_at": NOW}),
-    ("overview", {}),
-    ("overview", {"counts": {"total": 3}}),
-    ("overview", {"counts": {"total": "3", "attention": "0"}}),
-    ("overview", {"counts": {"total": True, "attention": False}}),
-    ("overview", {"counts": {"total": -1, "attention": 0}}),
-])
+def _one_field_cases():
+    """Each case starts from one complete valid answer and changes exactly one field, so the case can only fail on it."""
+    complete = {name: healthy()[ROUTES[name]] for name in ("health", "summary", "activity", "overview")}
+    cases = []
+
+    def missing(step, key):
+        cases.append(pytest.param(step, {k: v for k, v in complete[step].items() if k != key}, id=f"{step}-without-{key}"))
+
+    def wrong(step, key, value, label):
+        cases.append(pytest.param(step, {**complete[step], key: value}, id=f"{step}-{key}-{label}"))
+
+    for key in ("status", "health", "reasons", "open_findings"):
+        missing("health", key)
+    for key, value, label in (("status", 5, "number"), ("health", 5, "number"), ("reasons", "none", "text"),
+                              ("open_findings", -1, "negative"), ("open_findings", "3", "text"),
+                              ("open_findings", True, "bool")):
+        wrong("health", key, value, label)
+    for key in ("hold_code", "attention", "human_actions", "required_ci_unreadable", "coverage_complete",
+                "supervisor_observation"):
+        missing("summary", key)
+    for key, value, label in (("hold_code", 5, "number"), ("coverage_complete", "yes", "text"),
+                              ("attention", {}, "object"), ("human_actions", {}, "object"),
+                              ("required_ci_unreadable", {}, "object"), ("supervisor_observation", 5, "number"),
+                              ("attention", ["x"], "entry-not-object"), ("human_actions", ["x"], "entry-not-object"),
+                              ("required_ci_unreadable", ["x"], "entry-not-object")):
+        wrong("summary", key, value, label)
+    for key in ("slots", "checked_at"):
+        missing("activity", key)
+    wrong("activity", "slots", {}, "object")
+    wrong("activity", "checked_at", "not a time", "text")
+    missing("overview", "counts")
+    for value, label in (({}, "empty"), ({"total": 3}, "no-attention"), ({"attention": 0}, "no-total"),
+                         ({"total": "3", "attention": "0"}, "text"), ({"total": True, "attention": False}, "bool"),
+                         ({"total": -1, "attention": 0}, "negative"), ([], "list")):
+        wrong("overview", "counts", value, label)
+    for step in complete:
+        cases.append(pytest.param(step, [], id=f"{step}-not-an-object"))
+    return cases
+
+
+def test_the_complete_answers_used_for_the_one_field_cases_are_a_success(serve):
+    code, out, _ = run(serve())
+    assert code == 0, out
+
+
+@pytest.mark.parametrize("name,answer", _one_field_cases())
 def test_an_incomplete_answer_is_an_error_and_never_a_success(serve, name, answer):
     code, out, _ = run(serve(**{name: answer}))
     assert code == 2 and f"error {name}: the answer has no valid" in out
