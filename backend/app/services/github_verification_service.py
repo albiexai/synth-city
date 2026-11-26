@@ -1094,6 +1094,8 @@ class GithubVerificationService:
         recovery_only_attempt: GithubRecoveryOnlyAttempt | None = None,
     ) -> None:
         client = client or github_client
+        scope_id = scope.id
+        closure_cutoff = datetime.utcnow()
         self.skipped_item_ids = set()
         await self._repair_exhausted_diagnostic_notifications(
             db, scope, recovery_only_attempt=recovery_only_attempt
@@ -1227,11 +1229,23 @@ class GithubVerificationService:
         await self._reconcile_escalated_merges(
             db, scope, client, recovery_only_attempt=recovery_only_attempt
         )
+        if recovery_only_attempt is None:
+            from app.services.github_issue_closure_service import process_issue_closures
+
+            try:
+                await process_issue_closures(db, scope_id, client, due_before=closure_cutoff)
+            except GithubRateLimited:
+                raise
+            except Exception as exc:
+                await recover_session(db, exc, discard=True)
+                logger.warning("issue_closure_failed error_type=%s", type(exc).__name__)
         # #940: the generated summary comment, only after every decision above has been committed. It reads no gate,
         # changes no status and never raises into the poll.
         try:
             from app.services.github_summary_publication_service import github_summary_publication_service
 
+            if inspect(scope).expired:
+                await db.refresh(scope)
             await github_summary_publication_service.publish_scope(db, scope, client)
         except Exception as exc:
             await recover_session(db, exc, discard=True)
@@ -3906,10 +3920,13 @@ class GithubVerificationService:
         # R02: the sourced merge outcome is recorded in the merge transaction,
         # bound to the attempt, revision and PR artifact.
         from app.services import factory_audit_service as _audit
+        from app.services.github_issue_closure_service import queue_issue_closure
+
         await lock_terminal_transition(db, item)
         await _audit.record_merged_delivery(db, item, pull, source=source)
         self._mark_merged(item)
         await complete_current_revision(db, item, source=source, terminal_status="merged")
+        await queue_issue_closure(db, item)
 
     async def _record_revision_outcome(
         self,

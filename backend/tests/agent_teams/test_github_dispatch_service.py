@@ -2166,6 +2166,31 @@ async def test_every_report_instruction_carries_the_lease_token(db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("auth_mode,policy,issue_type,expects_reference", [
+    ("ambient", "auto", "code", True),
+    ("ambient", "human", "code", False),
+    ("ambient", "auto", "design", False),
+    ("app", "auto", "code", False),
+])
+async def test_only_ambient_auto_code_brief_asks_for_a_closing_reference(
+    db, auth_mode, policy, issue_type, expects_reference,
+):
+    _, slots, scope = await _team(db)
+    scope.github_auth_mode = auth_mode
+    scope.merge_policy = policy
+    workspace = (await db.execute(select(GithubWorkspace).order_by(GithubWorkspace.id))).scalars().first()
+    item = GithubWorkItem(scope_id=scope.id, issue_number=94, issue_title="x", issue_url="u",
+        issue_type=issue_type, github_updated_at=datetime.utcnow(), dispatch_status="dispatched",
+        dispatch_head_ref="fixture-branch")
+    db.add(item)
+    await db.commit()
+
+    brief = github_dispatch_service._dispatch_brief(
+        item, scope, workspace, owner_slot_id=slots[1].id, preset_slots=slots)
+    assert ("`Closes #94`" in brief) is expects_reference
+
+
+@pytest.mark.asyncio
 async def test_app_brief_uses_persisted_head_and_deck_owned_pr_contract(db):
     _, slots, scope = await _team(db)
     scope.github_auth_mode = "app"
