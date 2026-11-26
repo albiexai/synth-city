@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import re
 
-from sqlalchemy import String, cast, func, literal, select
+from pydantic import ValidationError
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -20,7 +21,7 @@ from app.models import factory_schemas as wire
 from app.models.database import (
     AgentTeamPreset, FactoryAuditEvent, GithubMilestoneWait, GithubWorkItem, TeamGithubScope,
 )
-from app.services.factory_projection_service import github_identity, utc_now
+from app.services.factory_projection_service import FactoryReadError, github_identity, utc_now
 # One definition of "deferred by milestone": the watcher writes it, so this view reads the same facts.
 from app.services.github_watcher_service import _milestone_deferral_facts
 
@@ -55,6 +56,27 @@ def _recorded_repository(scope_id: int, issue_url: str, number: int) -> wire.Wor
                                display_name=f"{match.group(1)}/{match.group(2)}")
 
 
+async def _page(db: AsyncSession, query, build):
+    """The first ROW_LIMIT rows that `build` accepts, and whether one more exists.
+
+    The rows are read in ordered batches. A stored row that cannot be shown (`build` gives None) is
+    skipped and never takes the place of a row that can be shown, so a list is cut by shown rows only.
+    """
+    shown, offset = [], 0
+    while len(shown) <= ROW_LIMIT:
+        rows = (await db.execute(query.limit(ROW_LIMIT + 1).offset(offset))).all()
+        for row in rows:
+            built = build(row)
+            if built is not None:
+                shown.append(built)
+                if len(shown) > ROW_LIMIT:
+                    break
+        if len(rows) < ROW_LIMIT + 1:
+            break
+        offset += len(rows)
+    return shown[:ROW_LIMIT], len(shown) > ROW_LIMIT
+
+
 async def _waiting(db: AsyncSession, filters: wire.FactoryFilters):
     # One row for each repository and issue, even when several scopes recorded the same wait. The database
     # keeps the newest, orders and cuts, so a response builds at most one row more than it returns.
@@ -73,48 +95,54 @@ async def _waiting(db: AsyncSession, filters: wire.FactoryFilters):
         .join(TeamGithubScope, TeamGithubScope.id == GithubMilestoneWait.scope_id)
         .where(GithubMilestoneWait.milestone_title.is_not(None)), filters,
     ).subquery()
-    rows = (await db.execute(
-        select(ranked).where(ranked.c.rank == 1)
-        .order_by(ranked.c.observed_at.desc(), ranked.c.id, ranked.c.issue_number).limit(ROW_LIMIT + 1)
-    )).all()
-    waiting = [wire.WaitingIssue(repository=_repository(row), issue_number=row.issue_number,
-                                 milestone=row.milestone, observed_at=row.observed_at)
-               for row in rows[:ROW_LIMIT]]
-    return waiting, len(rows) > ROW_LIMIT
+
+    def build(row):
+        if not row.milestone.strip():
+            return None
+        try:
+            return wire.WaitingIssue(repository=_repository(row), issue_number=row.issue_number,
+                                     milestone=row.milestone, observed_at=row.observed_at)
+        except (FactoryReadError, ValidationError):
+            return None
+
+    return await _page(db, select(ranked).where(ranked.c.rank == 1)
+                       .order_by(ranked.c.observed_at.desc(), ranked.c.id, ranked.c.issue_number), build)
 
 
 async def _deferred(db: AsyncSession, filters: wire.FactoryFilters):
     later = aliased(GithubWorkItem)
-    # The deferral shows only while it is the newest item of its issue. The issue is named by its GitHub URL,
-    # which does not change when a scope changes its repository.
+    # The deferral shows only while it is the newest item of its issue. The issue is named by its number and
+    # its GitHub URL, which do not change when a scope changes its repository.
     superseded = (select(later.id).where(
+        later.issue_number == GithubWorkItem.issue_number,
         func.lower(later.issue_url) == func.lower(GithubWorkItem.issue_url), later.id > GithubWorkItem.id).exists())
     latest_event = (select(func.max(FactoryAuditEvent.id))
                     .where(FactoryAuditEvent.item_id == GithubWorkItem.id, *_milestone_deferral_facts())
                     .correlate(GithubWorkItem).scalar_subquery())
-    rows = (await db.execute(_selected_scopes(
+    query = _selected_scopes(
         select(GithubWorkItem, TeamGithubScope, AgentTeamPreset, FactoryAuditEvent)
         .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
         .join(AgentTeamPreset, AgentTeamPreset.id == TeamGithubScope.preset_id)
         .join(FactoryAuditEvent, FactoryAuditEvent.id == latest_event)
-        .where(GithubWorkItem.dispatch_status == "cancelled", ~superseded,
-               # A first cut in the database; _recorded_repository checks the URL exactly.
-               func.lower(GithubWorkItem.issue_url).like(
-                   literal("https://github.com/%/%/issues/").concat(cast(GithubWorkItem.issue_number, String))
-               )), filters,
-    ).order_by(FactoryAuditEvent.occurred_at.desc(), GithubWorkItem.id.desc()).limit(ROW_LIMIT + 1))).all()
-    deferred = []
-    for item, scope, team, event in rows[:ROW_LIMIT]:
+        .where(GithubWorkItem.dispatch_status == "cancelled", ~superseded), filters,
+    ).order_by(FactoryAuditEvent.occurred_at.desc(), GithubWorkItem.id.desc())
+
+    def build(row):
+        item, scope, team, event = row
         repository = _recorded_repository(scope.id, item.issue_url, item.issue_number)
         if repository is None:
-            continue
+            return None
         target = (event.after_values or {}).get("target_milestone")
-        deferred.append(wire.DeferredIssue(
-            repository=repository, team=wire.TeamReference(id=team.id, name=team.name),
-            work_item_id=item.id, issue_number=item.issue_number, issue_title=item.issue_title,
-            target_milestone=target if isinstance(target, str) and target else None,
-            deferred_at=event.occurred_at, previous_branch=item.dispatch_head_ref))
-    return deferred, len(rows) > ROW_LIMIT
+        try:
+            return wire.DeferredIssue(
+                repository=repository, team=wire.TeamReference(id=team.id, name=team.name),
+                work_item_id=item.id, issue_number=item.issue_number, issue_title=item.issue_title,
+                target_milestone=target if isinstance(target, str) and target else None,
+                deferred_at=event.occurred_at, previous_branch=item.dispatch_head_ref)
+        except ValidationError:
+            return None
+
+    return await _page(db, query, build)
 
 
 async def milestone_states(db: AsyncSession, filters: wire.FactoryFilters) -> wire.MilestoneStatesResponse:

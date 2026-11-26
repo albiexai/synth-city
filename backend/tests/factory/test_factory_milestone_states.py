@@ -242,4 +242,77 @@ async def test_only_the_rows_of_the_list_are_built(factory_client, factory_store
     monkeypatch.setattr(milestone_state_service, "_repository", lambda scope: built.append(scope.id) or original(scope))
     body = await get_states(factory_client)
     assert len(body["waiting"]) == 3 and body["waiting_truncated"] is True
-    assert len(built) == 3
+    # The list builds its rows and the one more that proves the cut, and no other row.
+    assert len(built) == 4
+
+
+# #1337, review 6074734411: a stored row that cannot be shown never takes the place of one that can.
+async def test_an_invalid_newer_row_does_not_hide_a_valid_older_deferral_at_the_page_limit(factory_client, factory_store, monkeypatch):
+    monkeypatch.setattr(milestone_state_service, "ROW_LIMIT", 1)
+    scope = factory_store.ids.scopes[0]
+    valid = await add_item(factory_store.maker, scope, 9301)
+    await defer(factory_store.maker, scope, valid, "v4.5")
+    bad = await add_item(factory_store.maker, scope, 9302, url="https://github.com/fixture/shared/extra/issues/9302")
+    await defer(factory_store.maker, scope, bad, "v4.5")
+    body = await get_states(factory_client)
+    assert [r["issue_number"] for r in body["deferred"]] == [9301]
+    assert body["deferred_truncated"] is False
+
+
+async def test_invalid_rows_longer_than_one_batch_do_not_hide_a_valid_deferral(factory_client, factory_store, monkeypatch):
+    monkeypatch.setattr(milestone_state_service, "ROW_LIMIT", 2)
+    scope = factory_store.ids.scopes[0]
+    valid = await add_item(factory_store.maker, scope, 9310)
+    await defer(factory_store.maker, scope, valid, "v4.5")
+    for number in range(9311, 9316):
+        bad = await add_item(factory_store.maker, scope, number, url=f"https://github.com/fixture/shared/x/issues/{number}")
+        await defer(factory_store.maker, scope, bad, "v4.5")
+    body = await get_states(factory_client)
+    assert [r["issue_number"] for r in body["deferred"]] == [9310]
+    assert body["deferred_truncated"] is False
+
+
+async def test_a_list_is_cut_only_by_rows_that_can_be_shown(factory_client, factory_store, monkeypatch):
+    monkeypatch.setattr(milestone_state_service, "ROW_LIMIT", 2)
+    scope = factory_store.ids.scopes[0]
+    for number in (9320, 9321, 9322):
+        item = await add_item(factory_store.maker, scope, number)
+        await defer(factory_store.maker, scope, item, "v4.5")
+    body = await get_states(factory_client)
+    assert len(body["deferred"]) == 2 and body["deferred_truncated"] is True
+
+
+async def test_a_later_item_with_another_number_does_not_hide_the_deferral(factory_client, factory_store):
+    first, second = factory_store.ids.scopes[:2]
+    item_id = await add_item(factory_store.maker, first, 9811)
+    await defer(factory_store.maker, first, item_id, "v4.5")
+    # The stored URL names issue 9811, but the item is issue 9812.
+    await add_item(factory_store.maker, second, 9812, url="https://github.com/fixture/shared/issues/9811")
+    assert [r["issue_number"] for r in (await get_states(factory_client))["deferred"]] == [9811]
+
+
+async def test_waiting_rows_that_cannot_be_shown_are_omitted_and_the_read_succeeds(factory_client, factory_store):
+    bad_identity = await idle_scope(factory_store.maker, 0, "bad name!", factory_store.ids)
+    good = factory_store.ids.scopes[0]
+    await add_wait(factory_store.maker, bad_identity, 9340, "v4.5")
+    await add_wait(factory_store.maker, good, 9341, "")
+    await add_wait(factory_store.maker, good, 0, "v4.5")
+    await add_wait(factory_store.maker, good, 9342, "v4.6")
+    assert [r["issue_number"] for r in (await get_states(factory_client))["waiting"]] == [9342]
+
+
+async def test_an_invalid_waiting_row_does_not_hide_a_valid_one_at_the_page_limit(factory_client, factory_store, monkeypatch):
+    monkeypatch.setattr(milestone_state_service, "ROW_LIMIT", 1)
+    bad_identity = await idle_scope(factory_store.maker, 0, "bad name!", factory_store.ids)
+    await add_wait(factory_store.maker, bad_identity, 9350, "v4.5", at=datetime(2026, 11, 26, 11, 0))
+    await add_wait(factory_store.maker, factory_store.ids.scopes[0], 9351, "v4.5")
+    body = await get_states(factory_client)
+    assert [r["issue_number"] for r in body["waiting"]] == [9351] and body["waiting_truncated"] is False
+
+
+async def test_an_older_item_of_the_same_issue_does_not_hide_the_deferral(factory_client, factory_store):
+    first, second = factory_store.ids.scopes[:2]
+    await add_item(factory_store.maker, second, 9400, status="cancelled")
+    item_id = await add_item(factory_store.maker, first, 9400)
+    await defer(factory_store.maker, first, item_id, "v4.5")
+    assert [r["issue_number"] for r in (await get_states(factory_client))["deferred"]] == [9400]
