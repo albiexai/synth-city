@@ -180,3 +180,16 @@ The Director can adjust a campaign's start with `PATCH /api/v1/agent-teams/{pres
 ### Measures recorded from v4.4 on
 
 Check runs, the merge path, rate-limit windows, pull request facts and decision waits are recorded only from v4.4 on. A campaign that started before a measure's recording began reads unknown for that measure, never zero. Check runs, the merge path and rate-limit windows use their own recording markers. Pull request facts and decision waits use the first start of v4.4, so they may read unknown longer, but are never known too early. Every campaign measure reads this coverage first (`campaign_upgrade_service.recorded_coverage`), as the rate-limit measure already does with its own marker.
+
+### Campaign snapshots
+
+A campaign snapshot holds the campaign's measures from its start to an as-of time, each as a metric sample with its sample count, coverage and calculation version (`campaign-snapshot-v1`). It also lists the coverage of each measure recorded from v4.4 on. The snapshot reads no clock, so the same records and membership give the same snapshot.
+- **Measures in this version:** issues in scope, merged, closed without delivery, and deferred (from the membership and its departures), and the time spent rate-limited.
+- **The cutoff:** only facts recorded by the as-of time count. A deferral or a delivery after it isn't counted. GitHub reports today's membership, so a membership read after the cutoff, or a member's departure or delivery after it, leaves the membership measures unknown with that reason. Merged counts recorded delivery facts, not the current status.
+- **Unknown, never zero:** an incomplete membership makes the membership measures unknown, with the repository and its reason. A campaign that started before the rate-limit recording, or without its marker, reads unknown for that measure.
+- **Cache:** a snapshot is cached per campaign for 30 seconds, for the Overview panel's polls. Any new or changed record a measure reads ends the cache at once, including a newly watched repository or a status change. A change to the campaign itself ends it too. The rate-limit coverage is read again on every cached answer, so a window still waiting to be written shows as unknown. Retiring the team ends the cache too.
+- **Frozen snapshots:** stored as versions in `campaign_snapshots`. Finishing stores version 1. A repeated or simultaneous finish returns that same version unchanged. Only the Director (the operator key) recomputes a frozen snapshot, and each recompute stores the next version, even when two run at once. Earlier versions are never changed. A recompute reads GitHub now, so for an earlier cutoff its membership measures read unknown (`membership_read_after_cutoff`).
+
+The metrics window's samples have no calculation version.
+
+Until #1395 merges, a delivery whose local work item was deleted, or an older item with only an automatic-merge time and no delivery record, may read as not delivered.

@@ -3399,6 +3399,8 @@ class FactoryMetricSample(BaseModel):
     unknown_reasons: list[str] = []
     source: str = "factory_audit_events"
     coverage: str = "full"
+    # #1244: which calculation produced the sample, so a frozen campaign snapshot says it. The window leaves it unset.
+    calculation_version: str | None = None
 
 
 class FactoryMetricsWindow(BaseModel):

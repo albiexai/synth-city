@@ -1267,6 +1267,22 @@ class CampaignUpgradeBackfill(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class CampaignSnapshot(Base):
+    """#1244: one frozen campaign snapshot version (design §9). Append-only: a freeze or the Director's recompute
+    adds the next version; no path updates or deletes one."""
+
+    __tablename__ = "campaign_snapshots"
+    __table_args__ = (UniqueConstraint("campaign_id", "version", name="uq_campaign_snapshots_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    campaign_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    calculation_version: Mapped[str] = mapped_column(String, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_by: Mapped[str] = mapped_column(String, nullable=False)  # the recorded actor kind
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class CampaignUpgradeCoverage(Base):
     """#1243: when this version was first started; the backfill is enqueued only then."""
 
