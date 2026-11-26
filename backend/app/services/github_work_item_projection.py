@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.database import GithubApprovalRequest, GithubAttemptScopeRevision, GithubWorkItem, GithubWorkspace, TeamGithubScope
 from app.models.schemas import GithubWorkItemResponse
 from app.services.github_approval_service import CONTINUABLE_ESCALATIONS
-from app.services.github_dispatch_service import github_dispatch_service
+from app.services.github_dispatch_service import HANDOFF_QUEUE_TTL, github_dispatch_service
 from app.services.github_rate_limit_service import github_rate_limit_service
 from app.services.github_workspace_readiness import work_item_workspace_wait_reason
 from app.services import required_ci_attention
@@ -61,6 +61,7 @@ def _work_item_response(
         continuation_block_code = "continuation_budget_exhausted"
     else:
         continuation_block_code = None
+    handoff_expiry = item.handoff_expires_at if item.handoff_state == "queued" else None
     return GithubWorkItemResponse(
         id=item.id,
         scope_id=item.scope_id,
@@ -81,6 +82,8 @@ def _work_item_response(
         routing_method=item.routing_method,
         handoff_state=item.handoff_state,
         handoff_target_slot_id=item.handoff_target_slot_id,
+        handoff_queued_at=handoff_expiry - HANDOFF_QUEUE_TTL if handoff_expiry else None,
+        handoff_expires_at=handoff_expiry,
         approval_round_count=item.approval_round_count,
         ack_approver_member_id=item.ack_approver_member_id,
         ack_evidence_message_id=item.ack_evidence_message_id,

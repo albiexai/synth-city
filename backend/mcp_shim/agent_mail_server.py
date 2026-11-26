@@ -1393,15 +1393,16 @@ def synth_city_report_dispatch_status(
 
     status is one of: triaging, ack_received, in_progress, pr_ready (with
     head_ref), pr_opened (with pr_number), handoff_initiated (with
-    reassign_to_slot_id), handoff_accepted, blocked, continuation_completed,
+    reassign_to_slot_id), handoff_accepted, handoff_withdrawn, blocked, continuation_completed,
     diagnostic_completed, workspace_released. Both completion statuses require
     revision, dispatch_nonce, current_head_sha, summary, evidence, and lease_token.
     diagnostic_completed is accepted only after the PR tree is restored exactly to
     the approved diagnostic baseline. Never send both head_ref and pr_number. Report
     ack_received only after the designated
     leader records an explicit approved decision with synth_city_approve_work_item;
-    prose replies are not approval. Called by the owner slot the brain dispatched
-    the issue to. Include work_item_id and lease_token from your bootstrap prompt.
+    prose replies are not approval. The current Leader uses handoff_withdrawn
+    with the work item id to withdraw a queued handoff. Other reports use the
+    authorized owner or target and the lease token when required.
     """
     identity = _ensure_registered()
     if not identity.get("ok"):

@@ -5,7 +5,7 @@ import inspect
 import os
 import subprocess
 import textwrap
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -372,6 +372,7 @@ def _statuses_the_route_accepts() -> set[str]:
         ("revision_requested", {}),
         ("handoff_initiated", {"reassign_to_slot_id": 2}),
         ("handoff_accepted", {}),
+        ("handoff_withdrawn", {}),
         ("blocked", {"note": "n"}),
         ("ack_received", {}),
         ("pr_opened", {"pr_number": 7, "lease_token": "lease"}),
@@ -1474,6 +1475,76 @@ async def test_revision_requested_is_actionable_for_every_authenticated_slot(
 
 
 @pytest.mark.asyncio
+async def test_only_current_leader_withdraws_a_queued_handoff(client_and_db, monkeypatch):
+    from app.services import github_coordination_service as coordination
+
+    ac, maker = client_and_db
+    item_id, owner_id, target_id, workspace_id, _ = await _seed_leased_item(maker, dispatch_status="dispatched")
+    expires = datetime.utcnow() + timedelta(minutes=20)
+    async with maker() as db:
+        item = await db.get(GithubWorkItem, item_id)
+        scope = await db.get(TeamGithubScope, item.scope_id)
+        preset = await db.get(AgentTeamPreset, scope.preset_id)
+        leader = AgentTeamSlot(preset_id=preset.id, position=2, display_name="Leader", provider="codex-cli",
+                               repo_id="r", repo_path="/tmp/r", repo_name="r")
+        db.add(leader)
+        await db.flush()
+        leader_id, preset_id = leader.id, preset.id
+        preset.leader_slot_id = leader_id
+        item.dispatch_nonce = "queued-attempt"
+        item.handoff_state, item.handoff_target_slot_id, item.handoff_expires_at = "queued", target_id, expires
+        await db.commit()
+    leader_token = await _token_for_slot(maker, leader_id, key="mcp:handoff-leader")
+    async with maker() as db:
+        principal = await db.scalar(select(MailAgentSession).where(MailAgentSession.session_key == "mcp:handoff-leader"))
+        member = await db.get(MailTeamMember, principal.member_id)
+        principal.team_preset_id = member.team_preset_id = preset_id
+        principal.wake_enabled, principal.mailbox_status = True, "connected"
+        leader_member_id = member.id
+        await db.commit()
+
+    request = {"work_item_id": item_id, "status": "handoff_withdrawn"}
+    refused = await ac.post("/api/v1/agent-teams/dispatch-status", json=request)
+    assert refused.status_code == 403
+    queued = (await ac.get(f"/api/v1/agent-teams/presets/{preset_id}/github-work-items")).json()["items"][0]
+    assert queued["handoff_state"] == "queued" and queued["handoff_target_slot_id"] == target_id
+    assert datetime.fromisoformat(queued["handoff_expires_at"]) == expires.replace(tzinfo=UTC)
+    assert datetime.fromisoformat(queued["handoff_queued_at"]) == expires.replace(tzinfo=UTC) - timedelta(minutes=30)
+    stale = await ac.post("/api/v1/agent-teams/dispatch-status",
+                          json={**request, "dispatch_nonce": "old-attempt"}, headers=_auth(leader_token))
+    assert stale.status_code == 409
+
+    with monkeypatch.context() as guard:
+        hold = iter([None, "operator_hold"])
+        guard.setattr(coordination, "hold_code", lambda: next(hold))
+        paused = await ac.post("/api/v1/agent-teams/dispatch-status", json=request, headers=_auth(leader_token))
+    assert paused.status_code == 409
+    assert paused.json()["detail"] == "operator_hold"
+    async with maker() as db:
+        item = await db.get(GithubWorkItem, item_id)
+        assert (item.handoff_state, item.handoff_target_slot_id, item.handoff_expires_at) == ("queued", target_id, expires)
+        assert await db.scalar(select(FactoryAuditEvent.id).where(FactoryAuditEvent.item_id == item_id,
+            FactoryAuditEvent.event_kind == "handoff_reassignment", FactoryAuditEvent.action_outcome == "applied")) is None
+
+    result = await ac.post("/api/v1/agent-teams/dispatch-status", json=request, headers=_auth(leader_token))
+    assert result.status_code == 200
+    assert result.json()["handoff_state"] is None
+    async with maker() as db:
+        item = await db.get(GithubWorkItem, item_id)
+        workspace = await db.get(GithubWorkspace, workspace_id)
+        events = (await db.scalars(select(FactoryAuditEvent).where(
+            FactoryAuditEvent.item_id == item_id, FactoryAuditEvent.event_kind == "handoff_reassignment",
+            FactoryAuditEvent.action_outcome == "applied",
+        ))).all()
+        assert (item.handoff_state, item.handoff_target_slot_id, item.handoff_expires_at) == (None, None, None)
+        assert (item.owner_slot_id, item.dispatch_nonce, workspace.leased_item_id) == (owner_id, "queued-attempt", item_id)
+        assert len(events) == 1 and events[0].actor_member_id == leader_member_id
+        assert events[0].sanitized_reason == "queued handoff withdrawn"
+    replay = await ac.post("/api/v1/agent-teams/dispatch-status", json=request, headers=_auth(leader_token))
+    assert replay.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_handoff_accepted_belongs_to_the_target(client_and_db, monkeypatch):
     ac, maker = client_and_db
     monkeypatch.setattr(github_workspace_service, "_runner", _FakeGitRunner())
@@ -1829,7 +1900,7 @@ async def test_an_invalid_token_never_falls_back_to_the_legacy_path(client_and_d
 
 def test_every_accepted_status_has_an_authorization_rule():
     accepted = _statuses_the_route_accepts()
-    assert len(accepted) == 12, f"branch count changed: {sorted(accepted)}"
+    assert len(accepted) == 13, f"branch count changed: {sorted(accepted)}"
     missing = accepted - set(agent_teams_routes._DISPATCH_STATUS_RULES)
     assert not missing, f"statuses with no authorization rule: {sorted(missing)}"
 
