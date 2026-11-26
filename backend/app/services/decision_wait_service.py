@@ -155,7 +155,8 @@ async def record_input_wait_ended(
         return
     await audit.record_event(
         db, event_kind=INPUT_ENDED, source=source, occurred_at=datetime.utcnow(), fact_source="agent_pane_bindings",
-        fact_time=audit._naive(ended_at),  # the observation, not the insertion team_preset_id=started.team_preset_id, team_slot_id=started.team_slot_id,
+        # The observation time, not the insertion time.
+        fact_time=audit._naive(ended_at), team_preset_id=started.team_preset_id, team_slot_id=started.team_slot_id,
         team_context_key=started.team_context_key,
         actor=audit.derive_actor(actor_kind="scheduler", scheduler="agent_activity_service"),
         after_values={"wait_binding_id": binding_id, "wait_outcome": outcome, "answered_by_member_id": None},

@@ -228,3 +228,6 @@ async def test_an_input_wait_ends_at_the_observation_time(db, ending, outcome):
     start, end = await _events(db)
     assert end.after_values["wait_outcome"] == outcome
     assert (start.fact_time, end.fact_time) == (datetime(2026, 11, 26, 1, 0), datetime(2026, 11, 26, 1, 30))
+    # V1 on 4a152706: the end keeps the start's team and slot.
+    assert (end.team_preset_id, end.team_slot_id, end.team_context_key) == (
+        team.id, slot.id, start.team_context_key)
