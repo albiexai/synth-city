@@ -274,6 +274,7 @@ class TeamGithubScope(Base):
     max_verification_retries: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
     max_auto_merges_per_day: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
     max_item_effort_minutes: Mapped[int] = mapped_column(Integer, default=120, server_default="120", nullable=False)
+    max_plan_estimate_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     base_ref: Mapped[str] = mapped_column(String, default="origin/HEAD", nullable=False)
     builds_out_of_tree: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     build_dir_template: Mapped[str | None] = mapped_column(String, default="build", nullable=True)
