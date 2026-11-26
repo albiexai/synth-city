@@ -3017,6 +3017,27 @@ class GithubWorkspaceListResponse(BaseModel):
     workspaces: List[GithubWorkspaceResponse] = Field(default_factory=list)
 
 
+class GithubWorkspaceReadiness(BaseModel):
+    workspace_id: int
+    path: str
+    kind: str
+    state: Literal["free", "leased", "blocked", "missing"]
+    reason: str | None = None
+    leased_issue_number: int | None = None
+
+
+class GithubWorkspaceWaitingItem(BaseModel):
+    work_item_id: int
+    issue_number: int
+    reason: str
+
+
+class GithubWorkspaceReadinessResponse(BaseModel):
+    scope_id: int
+    workspaces: list[GithubWorkspaceReadiness]
+    waiting_items: list[GithubWorkspaceWaitingItem]
+
+
 class GithubCredentialRequest(BaseModel):
     workspace_token: str
     protocol: str
@@ -3073,6 +3094,7 @@ class GithubWorkItemResponse(BaseModel):
     issue_type: str
     dispatch_status: str
     pending_reason: Optional[str] = None
+    workspace_wait_reason: str | None = None
     launch_id: Optional[int] = None
     owner_slot_id: Optional[int] = None
     routing_method: Optional[str] = None

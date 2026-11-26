@@ -94,6 +94,85 @@ async def _scope(db, repo_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_workspace_readiness_is_operator_only_and_scope_local(client, db, tmp_path):
+    preset, scope = await _scope(db, tmp_path / "repo")
+    _, other_scope = await _scope(db, tmp_path / "other")
+    items = [
+        GithubWorkItem(
+            scope_id=scope_id,
+            issue_number=number,
+            issue_title=f"Issue {number}",
+            issue_url="https://example.test/issues",
+            github_updated_at=datetime.utcnow(),
+            dispatch_status=status,
+            pending_reason=pending_reason,
+            workspace_wait_reason=detail,
+            milestone_replaced_at=datetime.utcnow() if number == 7 else None,
+        )
+        for scope_id, number, status, pending_reason, detail in (
+            (scope.id, 1, "pending", "queued_no_workspace", "workspace_missing"),
+            (scope.id, 2, "pending", "queued_no_workspace", None),
+            (scope.id, 3, "pending", "queued_slot_busy", "workspace_missing"),
+            (scope.id, 4, "dispatched", None, "workspace_missing"),
+            (scope.id, 5, "pending", "queued_no_workspace", "private diagnostic"),
+            (other_scope.id, 6, "pending", "queued_no_workspace", "workspace_missing"),
+            (scope.id, 7, "pending", "queued_no_workspace", "workspace_missing"),
+        )
+    ]
+    db.add_all(items)
+    await db.flush()
+    workspace = GithubWorkspace(
+        scope_id=scope.id, path=str(tmp_path / "leased"), leased_item_id=items[3].id,
+        leased_at=datetime.utcnow(), lease_token="private diagnostic",
+    )
+    cross_scope = GithubWorkspace(
+        scope_id=scope.id, path=str(tmp_path / "foreign-lease"), leased_item_id=items[5].id,
+    )
+    other_workspace = GithubWorkspace(scope_id=other_scope.id, path=str(tmp_path / "other-workspace"))
+    db.add_all([workspace, cross_scope, other_workspace])
+    await db.commit()
+
+    root = "/api/v1/agent-teams"
+    route = f"{root}/github-scopes/{scope.id}/workspaces/readiness"
+    assert (await client.get(route)).status_code == 401
+    assert (await client.get(
+        f"{root}/github-scopes/{other_scope.id + 1}/workspaces/readiness", headers=OPERATOR_HEADERS,
+    )).status_code == 404
+
+    def refuse_write(_conn, _cursor, sql, _parameters, _context, _many):
+        assert sql.lstrip().upper().startswith("SELECT")
+
+    event.listen(db.bind.sync_engine, "before_cursor_execute", refuse_write)
+    try:
+        result = await client.get(route, headers=OPERATOR_HEADERS)
+    finally:
+        event.remove(db.bind.sync_engine, "before_cursor_execute", refuse_write)
+    assert result.status_code == 200
+    assert "private diagnostic" not in result.text
+    assert result.json() == {
+        "scope_id": scope.id,
+        "workspaces": [
+            {
+                "workspace_id": row.id, "path": row.path, "kind": "worktree",
+                "state": "leased", "reason": None, "leased_issue_number": issue_number,
+            }
+            for row, issue_number in [(workspace, 4), (cross_scope, None)]
+        ],
+        "waiting_items": [
+            {"work_item_id": items[index].id, "issue_number": items[index].issue_number, "reason": reason}
+            for index, reason in [(0, "workspace_missing"), (1, "no_free_workspace"), (4, "no_free_workspace")]
+        ],
+    }
+
+    listing = await client.get(f"{root}/presets/{preset.id}/github-work-items")
+    assert listing.status_code == 200
+    assert {row["issue_number"]: row["workspace_wait_reason"] for row in listing.json()["items"]} == {
+        1: "workspace_missing", 2: "no_free_workspace", 3: None, 4: None,
+        5: "no_free_workspace", 7: "workspace_missing",
+    }
+
+
+@pytest.mark.asyncio
 async def test_continuation_policy_is_operator_only_and_updates_all_fields(
     client, db, tmp_path
 ):

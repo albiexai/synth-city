@@ -89,6 +89,7 @@ from app.models.schemas import (
     GithubWorkspaceForceReleaseRequest,
     GithubWorkspaceForceReleaseResponse,
     GithubWorkspaceListResponse,
+    GithubWorkspaceReadinessResponse,
     GithubWorkspaceResponse,
     MailMessageCreate,
     TeamGithubScopeCreate,
@@ -332,6 +333,7 @@ from app.services.github_app_auth_service import (
     GithubAppUnconfigured,
     github_app_auth_service,
 )
+from app.services.github_workspace_readiness import read_workspace_readiness
 from app.services.github_workspace_service import (
     _RELEASABLE_STATUSES,
     GithubWorkspaceCredentialRevokeError,
@@ -3017,6 +3019,21 @@ async def list_github_workspaces(
     return GithubWorkspaceListResponse(
         workspaces=[_workspace_response(workspace) for workspace in workspaces]
     )
+
+
+@router.get(
+    "/github-scopes/{scope_id}/workspaces/readiness",
+    response_model=GithubWorkspaceReadinessResponse,
+)
+async def get_github_workspace_readiness(
+    scope_id: int,
+    _operator: None = Depends(require_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    scope = await db.get(TeamGithubScope, scope_id)
+    if scope is None:
+        raise HTTPException(status_code=404, detail="GitHub scope not found")
+    return await read_workspace_readiness(db, scope)
 
 
 @router.post(

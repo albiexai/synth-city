@@ -15,6 +15,7 @@ from app.models.schemas import GithubWorkItemResponse
 from app.services.github_approval_service import CONTINUABLE_ESCALATIONS
 from app.services.github_dispatch_service import github_dispatch_service
 from app.services.github_rate_limit_service import github_rate_limit_service
+from app.services.github_workspace_readiness import work_item_workspace_wait_reason
 from app.services import required_ci_attention
 
 
@@ -74,6 +75,7 @@ def _work_item_response(
         issue_type=item.issue_type,
         dispatch_status=item.dispatch_status,
         pending_reason=item.pending_reason,
+        workspace_wait_reason=work_item_workspace_wait_reason(item),
         launch_id=item.launch_id,
         owner_slot_id=item.owner_slot_id,
         routing_method=item.routing_method,
