@@ -59,14 +59,29 @@ def load_plan(path):
     for part in parts:
         need(isinstance(part, dict) and is_text(part.get("title"), 256) and isinstance(part.get("body"), str)
              and len(part["body"]) <= 20000 and isinstance(part.get("lane"), str) and LANE.match(part["lane"])
-             and is_int(part.get("priority"), 1, 999), "part (title, body, lane, priority)")
+             and is_int(part.get("priority"), 1, 999)
+             and not any(m in part[f] for f in ("title", "body") for m in ("split-from:#", "split-comment:#")),
+             "part (title, body, lane, priority; marker text is not allowed)")
     stop = plan.get("end_stopped") or {}
     # A present id must be a real number: null is refused. Only the generation may be null (a known null generation).
     need(isinstance(stop, dict) and all(k not in stop or is_int(stop[k], 1) for k in ("preset", "item"))
          and ("revision" not in stop or is_int(stop["revision"]))
-         and ("generation" not in stop or stop["generation"] is None or re.fullmatch(r"[0-9a-f]{64}", str(stop["generation"]))),
+         and ("generation" not in stop or stop["generation"] is None or (isinstance(stop["generation"], str) and re.fullmatch(r"[0-9a-f]{64}", stop["generation"]))),
          "end_stopped ids")
     return plan
+
+
+def texts(value):
+    """Every decoded string of a JSON value, keys included: the text that would reach GitHub or the terminal."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from texts(key)
+            yield from texts(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from texts(item)
 
 
 def gh(args):
@@ -97,7 +112,7 @@ def scan(runner, redact, repo, since):
     rows = []
     for page in range(1, MAX_PAGES + 1):
         chunk = ask_json(runner, ["api", f"repos/{repo}/issues?state=all&since={since}&per_page={PAGE_SIZE}&page={page}"], redact)
-        need(isinstance(chunk, list) and all(isinstance(x, dict) and is_int(x.get("number"), 1) and (x.get("body") is None or isinstance(x["body"], str))
+        need(isinstance(chunk, list) and all(isinstance(x, dict) and is_int(x.get("number"), 1) and "body" in x and (x["body"] is None or isinstance(x["body"], str))
                                              for x in chunk), "answer for the issue list")
         rows += chunk
         if len(chunk) < PAGE_SIZE:
@@ -123,7 +138,7 @@ def run(argv, env=None, stdout=None, stderr=None, runner=gh):
     out = lambda text, to=stdout: print(common.printable(redact(text)), file=to)  # noqa: E731
     try:
         plan = load_plan(args.plan)
-        if any(s and s in json.dumps(plan) for s in (env.get("GH_TOKEN"), env.get("GITHUB_TOKEN"), env.get(common.OPERATOR_ENV))):
+        if any(redact(text) != text for text in texts(plan)):
             raise PlanError("the plan contains a known token value; it is refused before any command and not shown")
         return split(plan, args, runner, redact, out)
     except PlanError as error:
@@ -143,11 +158,18 @@ def split(plan, args, runner, redact, out):
     need(view["state"] == "OPEN", "original issue: it is not open")
     milestone = plan.get("milestone") or (view["milestone"] or {}).get("title")
     need(milestone, "milestone: set one in the plan or on the original")
+    if redact(milestone) != milestone:
+        raise PlanError("the milestone contains a known token value; it is refused before any write and not shown")
     rows, complete = scan(runner, redact, repo, view["createdAt"])
     if not complete and execute:
         raise PlanError(f"cannot prove that no part is filed twice: the scan stopped after {MAX_PAGES} pages")
     marker = lambda k: f"<!-- split-from:#{n} part:{k} -->"  # noqa: E731
-    numbers = {k: row["number"] for k, _ in enumerate(parts, 1) for row in rows if marker(k) in (row.get("body") or "")}
+    numbers = {}
+    for k in range(1, len(parts) + 1):  # a pull request or the original issue never counts as a filed part
+        hits = sorted({r["number"] for r in rows if "pull_request" not in r and r["number"] != n and marker(k) in (r["body"] or "")})
+        if len(hits) > 1:
+            raise PlanError(f"conflict: part {k} is matched by more than one issue ({', '.join(f'#{h}' for h in hits)})")
+        numbers.update({k: hits[0]} if hits else {})
     out(f"split #{n} into {len(parts)} parts in {repo}" + ("" if execute else " (dry run: nothing changes; use --execute to write)"))
     if not complete:
         out(f"warning: the scan stopped after {MAX_PAGES} pages, so an earlier part may be missing from this check")

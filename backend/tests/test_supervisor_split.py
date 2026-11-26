@@ -28,7 +28,7 @@ class FakeGh:
                      "milestone": {"title": milestone} if milestone else None, "comments": [],
                      "createdAt": "2026-11-01T00:00:00Z"}
         self.created, self.calls, self.fill, self.fail_at = [], [], fill, fail_at
-        self.bad_list, self.bad_page = None, 1
+        self.bad_list, self.bad_page, self.extra = None, 1, []
 
     def __call__(self, args):
         self.calls.append(tuple(args))
@@ -40,7 +40,7 @@ class FakeGh:
             if self.bad_list is not None and page == self.bad_page:
                 return 0, json.dumps(self.bad_list)
             rows = [{"number": n, "title": "x", "body": None} for n in range(2000, 2000 + self.fill)]
-            rows += [{"number": c["number"], "title": c["title"], "body": c["body"]} for c in self.created]
+            rows += [{"number": c["number"], "title": c["title"], "body": c["body"]} for c in self.created] + self.extra
             return 0, json.dumps(rows[(page - 1) * 100:page * 100])
         if verb == ("issue", "create"):
             if self.fail_at == len(self.created) + 1:
@@ -134,6 +134,9 @@ def test_the_scan_is_the_rest_list_since_the_original_was_created_and_never_a_se
     {"parts": [{k: v for k, v in PLAN["parts"][0].items() if k != "body"}]}, {"parts": ["x"]},
     {"end_stopped": {"preset": None}}, {"end_stopped": {"item": None}}, {"end_stopped": {"revision": None}},
     {"end_stopped": {"preset": 0}}, {"end_stopped": {"generation": "short"}}, {"end_stopped": "x"},
+    {"end_stopped": {"generation": 10**63}}, {"end_stopped": {"generation": 5}},
+    {"parts": [{**PLAN["parts"][0], "body": "x <!-- split-from:#900 part:2 -->"}]},
+    {"parts": [{**PLAN["parts"][0], "title": "split-comment:#900"}]},
 ])
 def test_an_invalid_plan_is_refused_before_any_command_runs(tmp_path, change):
     fake = FakeGh()
@@ -215,19 +218,51 @@ def test_the_helper_never_closes_or_ends_the_original(tmp_path):
     assert not any("close" in c for c in fake.calls)
 
 
-def test_the_last_step_removes_a_token_and_a_control_character_that_no_earlier_step_saw(tmp_path):
-    # A milestone title that gh gives is printed as it is, so only the last redaction and the printable step reach it.
-    fake = FakeGh(milestone=f"v4\x1b[31m\x07{TOKEN}")
-    _, out, err = go(tmp_path, fake, plan={k: v for k, v in PLAN.items() if k != "milestone"}, env={"GH_TOKEN": TOKEN})
-    assert TOKEN not in out + err and "would create" in out
-    assert all(c == "\n" or c.isprintable() for c in out + err)
+def test_the_last_step_makes_a_control_character_in_a_gh_milestone_printable(tmp_path):
+    # A milestone title that gh gives is printed as it is, so only the printable step reaches it.
+    fake = FakeGh(milestone="v4\x1b[31m\x07.4")
+    _, out, err = go(tmp_path, fake, plan={k: v for k, v in PLAN.items() if k != "milestone"})
+    assert "would create" in out and all(c == "\n" or c.isprintable() for c in out + err)
 
 
 @pytest.mark.parametrize("page,answer", [
-    (1, {"x": 1}), (1, [{"number": "5", "body": ""}]), (1, [{"number": 5, "body": 7}]), (1, ["x"]), (2, "x"), (2, [{"number": 0}]),
+    (1, {"x": 1}), (1, [{"number": 5, "title": "no body key"}]), (1, [{"number": "5", "body": ""}]), (1, [{"number": 5, "body": 7}]), (1, ["x"]), (2, "x"), (2, [{"number": 0}]),
 ])
 def test_an_issue_list_page_without_the_fields_the_helper_reads_is_an_error_with_no_write(tmp_path, page, answer):
     fake = FakeGh(fill=150)  # two pages: the second one is read too
     fake.bad_list, fake.bad_page = answer, page
     code, out, err = go(tmp_path, fake, "--execute")
     assert code == 2 and fake.writes() == [] and "no valid" in out + err and "Traceback" not in out + err
+
+
+def marked(n, part, number, **row):
+    return {"number": number, "title": "x", "body": f"<!-- split-from:#{n} part:{part} -->", **row}
+
+
+def test_a_pull_request_or_the_original_issue_never_counts_as_a_filed_part(tmp_path):
+    fake = FakeGh()
+    fake.extra = [marked(900, 1, 3000, pull_request={}), marked(900, 2, 900)]
+    code, out, _ = go(tmp_path, fake, "--execute")
+    assert code == 0 and [c["number"] for c in fake.created] == [1001, 1002] and "already filed" not in out
+    assert "#3000" not in fake.view["comments"][0]["body"]
+
+
+def test_two_issues_with_one_marker_are_a_conflict_refused_before_any_write(tmp_path):
+    fake = FakeGh()
+    fake.extra = [marked(900, 1, 3001), marked(900, 1, 3002)]
+    code, out, err = go(tmp_path, fake, "--execute")
+    assert code == 2 and fake.writes() == [] and "conflict" in out + err and "#3001" in out + err
+
+
+def test_the_known_token_check_reads_the_text_that_goes_to_github_not_the_json_encoding(tmp_path):
+    secret = 'gh"s\u00e9cret-5d2f'  # JSON writes the quote and the accent differently, so a search of the encoded text misses it
+    plan = {**PLAN, "parts": [{**PLAN["parts"][0], "body": f"Body {secret} end"}, PLAN["parts"][1]]}
+    fake = FakeGh()
+    code, out, err = go(tmp_path, fake, "--execute", plan=plan, env={"GH_TOKEN": secret})
+    assert code == 2 and fake.calls == [] and secret not in out + err and "known token" in out + err
+
+
+def test_a_known_token_in_the_milestone_that_gh_gives_is_refused_before_any_write(tmp_path):
+    fake = FakeGh(milestone=f"v4.{TOKEN}")
+    code, out, err = go(tmp_path, fake, "--execute", plan={k: v for k, v in PLAN.items() if k != "milestone"}, env={"GH_TOKEN": TOKEN})
+    assert code == 2 and fake.writes() == [] and TOKEN not in out + err and "known token" in out + err
