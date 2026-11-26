@@ -243,3 +243,113 @@ def test_required_workflow_gate_rejects_failed_shards(scope_result, run_suites, 
         capture_output=True, text=True, check=False,
     )
     assert (result.returncode == 0) is success, result.stderr
+
+
+def test_workflow_gate_uses_its_checker_on_an_older_candidate_branch(collect, tmp_path, monkeypatch):
+    _, _, calls = collect
+    fixture = tmp_path / "fixture-repo"
+    fixture.mkdir()
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(fixture), *args], text=True, capture_output=True, check=True,
+        ).stdout
+
+    git("init", "-b", "workflow")
+    git("config", "user.name", "Workflow fixture")
+    git("config", "user.email", "fixture@example.invalid")
+    checker = fixture / "scripts/ci/e2e_shard_identities.py"
+    checker.parent.mkdir(parents=True)
+    checker.write_text(
+        "import argparse\np=argparse.ArgumentParser()\np.add_argument('--shards')\n"
+        "p.add_argument('--output')\np.parse_args()\n",
+        encoding="utf-8",
+    )
+    (fixture / "frontend").mkdir()
+    (fixture / "frontend/journeys.txt").write_text("before branch\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-m", "Legacy checker")
+    git("switch", "-c", "candidate")
+    (fixture / "frontend/journeys.txt").write_text("candidate journeys\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-m", "Older candidate journeys")
+    git("switch", "workflow")
+    checker.write_text(SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    (fixture / "frontend/workflow-only.txt").write_text("workflow-only journey\n", encoding="utf-8")
+    yml = fixture / ".github/workflows/e2e.yml"
+    yml.parent.mkdir(parents=True)
+    yml.write_text((ROOT / ".github/workflows/e2e.yml").read_text(encoding="utf-8"), encoding="utf-8")
+    git("add", ".")
+    git("commit", "-m", "Workflow and checker update")
+    git("merge", "--no-ff", "--no-edit", "candidate")
+
+    jobs = yaml.safe_load(git("show", "workflow:.github/workflows/e2e.yml"))["jobs"]
+    gate = jobs["e2e"]
+    checkouts = [step["with"] for step in gate["steps"] if step.get("uses", "").startswith("actions/checkout@")]
+    assert [x["ref"] for x in checkouts] == [
+        "${{ github.event.pull_request.head.sha || github.sha }}", "${{ github.workflow_sha }}",
+    ]
+    candidate, tooling = (tmp_path / x["path"] for x in checkouts)
+    git("clone", "--branch", "candidate", str(fixture), str(candidate))
+    git("clone", "--branch", "workflow", "--no-checkout", str(fixture), str(tooling))
+    git("-C", str(tooling), "sparse-checkout", "set", *checkouts[1]["sparse-checkout"].splitlines())
+    git("-C", str(tooling), "checkout", "workflow")
+    assert (candidate / "frontend/journeys.txt").read_text(encoding="utf-8") == "candidate journeys\n"
+    assert not (candidate / "frontend/workflow-only.txt").exists()
+    assert git("show", "workflow:frontend/workflow-only.txt") == "workflow-only journey\n"
+    assert not (tooling / "frontend").exists()
+    old = subprocess.run(
+        [sys.executable, str(candidate / checker.relative_to(fixture)), "--artifacts", "reports"],
+        text=True, capture_output=True, check=False,
+    )
+    assert old.returncode != 0 and "unrecognized arguments: --artifacts" in old.stderr
+
+    expected = {"full": report(A, B, C, D)}
+    runner_temp = tmp_path / "runner-temp"
+    for shard, entry in enumerate((A, B, C, D), start=1):
+        expected[f"{shard}/4"] = report(entry)
+        artifact(runner_temp / "e2e-journey-artifacts", shard, 1, report(entry, executions=("passed",)))
+    (tmp_path / "reports.json").write_text(json.dumps(expected), encoding="utf-8")
+    monkeypatch.setenv("RUNNER_TEMP", str(runner_temp))
+    result = subprocess.run(
+        ["bash", "-eu", "-c", gate["steps"][-1]["run"]], cwd=tmp_path,
+        text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Proved the execution of 4 active journeys" in result.stdout
+    assert (runner_temp / "e2e-manifest.json").is_file()
+    assert {json.loads(line)[0] for line in calls.read_text(encoding="utf-8").splitlines()} == {
+        str(candidate / "frontend"),
+    }
+
+
+def test_required_gates_keep_their_names_and_source_contract():
+    def job(workflow, key):
+        return yaml.safe_load((ROOT / ".github/workflows" / workflow).read_text(encoding="utf-8"))["jobs"][key]
+
+    def refs(gate):
+        return [s["with"]["ref"] for s in gate["steps"] if s.get("uses", "").startswith("actions/checkout@")]
+
+    workflow_sha = "${{ github.workflow_sha }}"
+    backend = job("backend-tests.yml", "backend-gate")
+    assert backend["name"] == "Full backend regression tests"
+    assert refs(backend) == ["${{ github.event.pull_request.head.sha || github.sha }}", workflow_sha]
+    backend_commands = {s.get("name"): s for s in backend["steps"]}
+    assert backend_commands["Detect a docs-only change"]["run"] == "python3 .workflow-ci/scripts/ci/docs_only.py"
+    assert backend_commands["Collect the full backend suite"]["working-directory"] == "candidate/backend"
+    assert ".workflow-ci/scripts/ci/backend_shard_identities.py" in backend_commands[
+        "Prove that the shards ran every test exactly once"
+    ]["run"]
+
+    python = job("factory-checks.yml", "python")
+    assert python["name"] == "Changed Python undefined names"
+    assert refs(python) == ["${{ github.event.pull_request.head.sha }}", workflow_sha]
+    python_check = next(step for step in python["steps"] if step.get("name") == "Check changed Python files")
+    assert python_check["run"] == 'python ../.workflow-ci/scripts/factory-static-check.py --base "$ACCEPTED_BASE"'
+    assert python_check["working-directory"] == "candidate"
+    assert job("factory-checks.yml", "old_names")["name"] == "Rename old-name guard"
+
+    product = job("product-ci.yml", "gate")
+    assert product["name"] == "Product CI gate"
+    assert refs(product) == []
+    assert refs(job("e2e.yml", "e2e-scope")) == [workflow_sha]

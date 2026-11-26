@@ -4,6 +4,8 @@
     python scripts/ci/e2e_shard_identities.py --shards 4 --output journeys.json
     python scripts/ci/e2e_shard_identities.py --shards 4 --output journeys.json --artifacts shard-artifacts
 
+With a separate checker checkout, --frontend selects the candidate's Playwright directory.
+
 Version 1 stores sorted identities as [project id, relative file, ...suite titles,
 test title]. The full list and each shard's list use the same identity format.
 """
@@ -66,12 +68,12 @@ def read_report(path: Path, label: str, *, listing: bool = False) -> list[tuple[
     return tests
 
 
-def collect(label: str, directory: Path, shard: str | None = None) -> list[Identity]:
+def collect(label: str, directory: Path, frontend: Path, shard: str | None = None) -> list[Identity]:
     report_path = directory / "collection.json"
     report_path.unlink(missing_ok=True)
     command = [*LIST_COMMAND, f"--shard={shard}"] if shard else LIST_COMMAND
     result = subprocess.run(
-        command, cwd=FRONTEND, env={**os.environ, "PLAYWRIGHT_JSON_OUTPUT_FILE": str(report_path)},
+        command, cwd=frontend, env={**os.environ, "PLAYWRIGHT_JSON_OUTPUT_FILE": str(report_path)},
         stdout=subprocess.DEVNULL, check=False, timeout=120,
     )
     if result.returncode:
@@ -155,17 +157,19 @@ def main() -> int:
     parser.add_argument("--shards", type=int, required=True, help="number of planned Playwright shards")
     parser.add_argument("--output", type=Path, required=True, help="manifest path (parent directory must exist)")
     parser.add_argument("--artifacts", type=Path, help="prove execution from the latest report per shard")
+    parser.add_argument("--frontend", type=Path, default=FRONTEND, help="candidate Playwright frontend directory")
     args = parser.parse_args()
     if args.shards < 1:
         parser.error("--shards must be positive")
 
     try:
+        frontend = args.frontend.resolve()
         with tempfile.TemporaryDirectory(prefix="e2e-journeys-") as directory:
-            journeys = collect("full", Path(directory))
+            journeys = collect("full", Path(directory), frontend)
             shards = {}
             for index in range(1, args.shards + 1):
                 shard = f"{index}/{args.shards}"
-                shards[shard] = collect(f"shard {shard}", Path(directory), shard)
+                shards[shard] = collect(f"shard {shard}", Path(directory), frontend, shard)
         prove_partition(journeys, shards)
         if args.artifacts is not None:
             verify_executions(args.artifacts, journeys, shards)
