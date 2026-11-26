@@ -8,7 +8,7 @@ import logging
 import secrets
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 from sqlalchemy import String, and_, cast, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -2811,6 +2811,16 @@ class GithubDispatchService:
         from app.services.github_effort_limit_service import effort_limit_service
 
         await effort_limit_service.tick_scope(db, scope)
+        # #1338: close the operator waits (holds, pauses) that ended without a release, for every item of the scope.
+        from app.services import decision_wait_service as decision_waits
+
+        try:
+            if await decision_waits.reconcile_operator_waits(db, scope_id=scope.id, now=datetime.now(UTC)):
+                await db.commit()
+        except Exception as exc:  # noqa: BLE001  (advisory accounting must never break the monitor)
+            # Drop the pass's writes and reload what the monitor still holds; a bare rollback would expire them.
+            await recover_session(db, exc, discard=True)
+            logger.warning("operator_wait_reconcile_failed scope_id=%s error_type=%s", scope.id, type(exc).__name__)
         enabled = sorted(
             [slot for slot in preset_slots if slot.enabled],
             key=lambda slot: slot.position,

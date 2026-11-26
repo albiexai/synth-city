@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from weakref import WeakValueDictionary
 
@@ -1289,6 +1289,10 @@ class GithubApprovalService:
                     before_stage=None,
                     after_stage=checkpoint_stage,
                 )
+                # #1338: the owner now waits for the operator.
+                await decision_waits.record_hold_wait_started(
+                    db, request_id=approval.id, item_id=item.id, stage=checkpoint_stage,
+                    source="github_approval_service.create_continuation_request")
             await db.commit()
             await db.refresh(revision)
             await db.refresh(approval)
@@ -2884,6 +2888,10 @@ class GithubApprovalService:
                 before_stage="decision_open",
                 after_stage="ack_hold",
             )
+            # #1338: the owner now waits for the operator again.
+            await decision_waits.record_hold_wait_started(
+                db, request_id=hold_request_id, item_id=work_item_id, stage="ack_hold",
+                source="github_approval_service.decide_continuation")
         await db.commit()
         await db.refresh(request)
         await db.refresh(revision)
@@ -3049,6 +3057,11 @@ class GithubApprovalService:
         if result.rowcount != 1:
             await db.rollback()
             raise GithubApprovalError("recovery_checkpoint_context_changed")
+        # #1338: the release ends the owner's wait; ``actor`` is exactly the caller's, none stays unknown.
+        await decision_waits.record_hold_wait_ended(
+            db, request_id=approval.id, item_id=item.id, stage=expected_hold, outcome="released",
+            ended_at=datetime.now(UTC), actor=actor,
+            source="github_approval_service.release_recovery_checkpoint")
         if actor is not None:
             await _record_checkpoint_fact(
                 db,

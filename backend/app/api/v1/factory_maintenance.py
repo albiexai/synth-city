@@ -155,7 +155,8 @@ async def resume_observation(preset_id: int, item_id: int, request: ObservationR
     response.headers["Cache-Control"] = "no-store"
     item, scope = await context(db, preset_id, item_id)
     try:
-        return await resume_observation_pause(db, item, scope, request.pause_id, request.reason)
+        return await resume_observation_pause(db, item, scope, request.pause_id, request.reason,
+                                              actor=derive_actor(actor_kind="operator"))
     except ValueError as error:
         await db.rollback()
         raise HTTPException(status_code=409, detail=str(error)) from None

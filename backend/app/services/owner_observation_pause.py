@@ -16,6 +16,7 @@ from app.models.database import (
     MailPaneLifecycle, MailTeamMember, TeamGithubScope,
 )
 from app.services import agent_activity_service as activity
+from app.services import decision_wait_service as decision_waits
 from app.services.factory_delivery_policy import effective_policy
 from app.services.github_approval_service import github_approval_service
 from app.services.agent_mail_service import MCP_HEARTBEAT_TTL_SECONDS
@@ -271,6 +272,9 @@ async def handle_observation_gap(db, scope, item):
             item.escalation_reason = REASON
             item.status_note = "Native observation is unavailable. The approved owner is preserved. Inspect the recorded observation pause before resuming."
             item.updated_at = now
+            # #1338: the owner now waits for the operator to resume this pause.
+            await decision_waits.record_pause_wait_started(
+                db, record, item_id=item.id, source="owner_observation_pause.handle_observation_gap")
         await db.commit()
         if record.status == "paused" and record.notice_status == "pending":
             from app.services.github_dispatch_service import github_dispatch_service
@@ -300,8 +304,11 @@ async def handle_observation_gap(db, scope, item):
         return inspected
 
 
-async def resume_observation_pause(db, item, scope, pause_id, reason):
-    """An operator resumes only the unchanged recorded pause. No new approval is created."""
+async def resume_observation_pause(db, item, scope, pause_id, reason, actor=None):
+    """An operator resumes only the unchanged recorded pause. No new approval is created.
+
+    #1338: ``actor`` is the authenticated caller's, recorded on the wait's end; none stays unknown.
+    """
     record = await db.get(GithubOwnerObservationPause, pause_id, populate_existing=True)
     if record is None or record.work_item_id != item.id:
         raise ValueError("observation_pause_not_found")
@@ -335,6 +342,9 @@ async def resume_observation_pause(db, item, scope, pause_id, reason):
     item.updated_at = now
     record.resume_context_key = _digest([item.id, item.dispatch_nonce, item.owner_slot_id,
                                         item.active_scope_revision, item.last_nudge_at])
+    await decision_waits.record_pause_wait_ended(
+        db, pause_id=record.id, item_id=item.id, outcome="resumed", ended_at=now, actor=actor,
+        source="owner_observation_pause.resume_observation_pause")
     await db.commit()
     return {"pause_id": record.id, "status": "resumed", "resumed_at": now.isoformat()}
 
