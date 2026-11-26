@@ -504,12 +504,14 @@ async def test_scope_or_trust_changed_before_publication_keeps_workspace_disable
 
 
 @pytest.mark.asyncio
-async def test_split_user_trust_uses_the_configured_accounts_and_the_same_identity(tmp_path, monkeypatch):
+@pytest.mark.parametrize("matches_policy", [True, False], ids=["configured-agent", "different-agent"])
+async def test_split_user_trust_uses_the_configured_accounts_and_the_same_identity(tmp_path, monkeypatch, matches_policy):
     from app.services import dispatch_workspace_provisioning as provisioning
     from app.services.agent_config_settings import AgentConfigSettings
 
     current = os.geteuid()
-    monkeypatch.setattr(provisioning.settings, "harness_agent_user", "fixture-agent")
+    harness_user = "fixture-agent" if matches_policy else "different-agent"
+    monkeypatch.setattr(provisioning.settings, "harness_agent_user", harness_user)
     monkeypatch.setattr(provisioning.settings, "team_workspace_trust_helper_enabled", True)
     monkeypatch.setattr(provisioning.pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=current + 1))
     monkeypatch.setattr(provisioning.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path / "controller")))
@@ -522,6 +524,12 @@ async def test_split_user_trust_uses_the_configured_accounts_and_the_same_identi
         lambda *args: calls.append(("agent", args, None)))
 
     repo, destination = tmp_path / "scope" / "repo", tmp_path / "scope" / "dispatch-1"
+    if not matches_policy:
+        with pytest.raises(GithubWorkspaceError) as refused:
+            await provisioning.prepare_dispatch_workspace_trust(repo, destination, (12, 34))
+        assert refused.value.block_code == "workspace_git_trust_unavailable"
+        assert calls == []
+        return
     await provisioning.prepare_dispatch_workspace_trust(repo, destination, (12, 34))
 
     expected = (str(destination), str(repo), (12, 34))

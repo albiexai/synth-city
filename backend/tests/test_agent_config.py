@@ -389,11 +389,28 @@ def test_overrides_share_the_sudo_target_and_bound_helper_work_root(helper, tmp_
     ("agent_config_agent_user", "root"), ("agent_config_controller_user", "ALL"),
     ("agent_config_agent_user", "#0"), ("agent_config_helper_path", "/opt/helpers/*"),
     ("agent_config_helper_path", "/opt/helper\nALL ALL=NOPASSWD: ALL"),
+    pytest.param("agent_config_helper_path", "/opt/helper with space", id="helper-space"),
     ("agent_config_work_root", "relative/work"), ("agent_config_work_root", "/"),
+    pytest.param("agent_config_work_root", "/fixture/work*", id="work-root-wildcard"),
+    pytest.param("agent_config_work_root", "/fixture/work\0", id="work-root-nul"),
+    pytest.param("agent_config_work_root", "/fixture/work\r", id="work-root-cr"),
+    pytest.param("agent_config_work_root", "/fixture/work\n", id="work-root-lf"),
+    pytest.param("agent_config_work_root", "/fixture/work/", id="noncanonical-work-root"),
+    pytest.param("agent_config_work_root", "/fixture/work/../other", id="parent-traversal"),
 ])
 def test_agent_config_settings_reject_unsafe_sudoers_fields_and_work_roots(field, value, monkeypatch):
     monkeypatch.setattr(agent_config_settings, "_read_policy", lambda: json.dumps({field: value}).encode())
     with pytest.raises(ValueError):
+        agent_config_settings.load_agent_config_settings()
+
+
+@pytest.mark.parametrize("values", [
+    pytest.param({"unexpected": "fixture"}, id="unknown-key"),
+    pytest.param({"agent_config_work_root": 21}, id="non-text-value"),
+])
+def test_agent_config_policy_rejects_invalid_schema_before_building_settings(monkeypatch, values):
+    monkeypatch.setattr(agent_config_settings, "_read_policy", lambda: json.dumps(values).encode())
+    with pytest.raises(ValueError, match="Invalid agent-config policy"):
         agent_config_settings.load_agent_config_settings()
 
 
@@ -403,10 +420,11 @@ def test_agent_config_policy_rejects_an_agent_alias_for_uid_zero(monkeypatch):
         agent_config_settings.AgentConfigSettings(agent_config_agent_user="fixture-agent")
 
 
-@pytest.mark.parametrize("fault", ["owner", "policy_write", "parent_write", "symlink"])
-def test_policy_requires_a_root_controlled_regular_file(tmp_path, monkeypatch, fault):
+@pytest.mark.parametrize("fault", ["owner", "policy_write", "parent_write", "symlink", "nonregular", "oversize"])
+def test_policy_requires_a_root_controlled_bounded_regular_file(tmp_path, monkeypatch, fault):
     path = tmp_path / "policy.json"
-    path.write_text("{}", encoding="utf-8")
+    padding = " " * agent_config_settings._MAX_POLICY_BYTES if fault == "oversize" else ""
+    path.write_text("{}" + padding, encoding="utf-8")
     observed_path = path
     if fault == "symlink":
         observed_path = tmp_path / "policy-link.json"
@@ -419,6 +437,8 @@ def test_policy_requires_a_root_controlled_regular_file(tmp_path, monkeypatch, f
         info = fstat(fd)
         mode = info.st_mode & ~0o022
         if stat.S_ISREG(info.st_mode):
+            if fault == "nonregular":
+                mode = stat.S_IFIFO | stat.S_IMODE(mode)
             return SimpleNamespace(st_uid=int(fault == "owner"), st_mode=mode | (0o020 if fault == "policy_write" else 0))
         if fault == "parent_write" and (info.st_dev, info.st_ino) == (parent.st_dev, parent.st_ino):
             mode |= 0o020
@@ -471,3 +491,20 @@ def test_installed_helper_refuses_a_policy_for_another_executable(tmp_path, monk
     output = capsys.readouterr()
     assert json.loads(output.out) == {"ok": False, "error": "agent_config_refused"}
     assert output.err == ""
+
+
+def test_installed_main_uses_isolated_python_before_reading_the_request(monkeypatch, capsys):
+    main = runpy.run_path(str(SCRIPT))["main"]
+    helper = SCRIPT.resolve()
+    policy = agent_config_settings.AgentConfigSettings(agent_config_helper_path=str(helper))
+    monkeypatch.setitem(main.__globals__, "load_policy", lambda: policy)
+    called = []
+
+    def read_request(_stdin):
+        assert called == [helper]
+        raise ValueError("Synthetic invalid request")
+
+    monkeypatch.setitem(main.__globals__, "use_install_python", called.append)
+    monkeypatch.setitem(main.__globals__, "read_request", read_request)
+    assert main([], io.BytesIO(b""), installed=True) == 1
+    assert json.loads(capsys.readouterr().out) == {"ok": False, "error": "agent_config_refused"}
