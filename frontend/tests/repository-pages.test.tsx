@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RepositoriesPage } from "../src/features/factory/pages/RepositoriesPage";
 import { RepositoryPage } from "../src/features/factory/pages/RepositoryPage";
 import { resetFactoryReads } from "../src/features/factory/reads";
-import { clearOperatorToken } from "../src/features/agent-teams/operatorAuth";
+import { clearOperatorToken, setOperatorToken } from "../src/features/agent-teams/operatorAuth";
 import { fixtureFetch, jsonResponse, renderRoute, settle } from "./helpers/factory";
 import repositories from "./fixtures/factory/v1-p04/repositories.json";
 import repository from "./fixtures/factory/v1-p04/repository.json";
@@ -31,6 +31,20 @@ const scope = {
   created_at: "2026-09-29T12:00:00Z", updated_at: "2026-09-29T12:00:00Z",
 };
 const counts = { active: 2, attention: 0, finished: 3, queued: 0, review: 0, total: 5, unknown: 0 };
+const readinessPath = "agent-teams/github-scopes/1/workspaces/readiness";
+const readiness = {
+  scope_id: 1,
+  workspaces: [
+    { workspace_id: 1, path: "/fixture/free", state: "free", reason: null, leased_issue_number: null },
+    { workspace_id: 2, path: "/fixture/leased", state: "leased", reason: null, leased_issue_number: 42 },
+    { workspace_id: 3, path: "/fixture/blocked", state: "blocked", reason: "repository_identity_mismatch", leased_issue_number: null },
+    { workspace_id: 4, path: "/fixture/missing", state: "missing", reason: "workspace_missing", leased_issue_number: null },
+  ],
+  waiting_items: [
+    { work_item_id: 85, issue_number: 56, reason: "no_free_workspace" },
+    { work_item_id: 86, issue_number: 57, reason: "workspace_provision_incomplete" },
+  ],
+};
 
 function serve(overrides: Record<string, () => Response> = {}) {
   return fixtureFetch((path) => {
@@ -108,6 +122,47 @@ function renderRepository(path = "/repositories/1") {
 }
 
 describe("Repository page", () => {
+  it("focuses the card and uses the Director key to read each state and waiting reason", async () => {
+    const { fetch } = serve({ [readinessPath]: () => jsonResponse(readiness) });
+    const user = userEvent.setup();
+    renderRepository("/repositories/1#workspaces");
+    const card = await screen.findByRole("region", { name: "Workspaces" });
+    expect(card).toHaveFocus();
+    expect(fetch.mock.calls.some(([url]) => String(url).includes(readinessPath))).toBe(false);
+    await user.click(within(card).getByRole("button", { name: "Load workspace status" }));
+    const dialog = await screen.findByRole("dialog", { name: "Director key" });
+    await user.type(within(dialog).getByLabelText(/^Director key/), "fixture-director-key");
+    await user.click(within(dialog).getByRole("button", { name: "Use key" }));
+    const list = await within(card).findByRole("list", { name: "Dispatch workspaces" });
+    for (const label of ["Free", "Leased to #42", "Blocked", "Missing", "repository_identity_mismatch"]) {
+      expect(within(list).getByText(label)).toBeInTheDocument();
+    }
+    expect(within(card).getByRole("link", { name: "#56" })).toHaveAttribute("href", "/work/85");
+    expect(within(card).getByText("No workspace is free.")).toBeInTheDocument();
+    expect(within(card).getByText("Workspace provisioning is incomplete.")).toBeInTheDocument();
+    const request = fetch.mock.calls.find(([url]) => String(url).includes(readinessPath))?.[1];
+    expect(request?.method ?? "GET").toBe("GET");
+    expect(new Headers(request?.headers).get("X-Synth-City-Operator-Token")).toBe("fixture-director-key");
+  });
+
+  it("reports a failed read in the card and displays empty status after a retry", async () => {
+    setOperatorToken("fixture-director-key");
+    let attempt = 0;
+    serve({
+      [readinessPath]: () => ++attempt === 1 ? jsonResponse({ detail: "down" }, 500)
+        : jsonResponse({ scope_id: 1, workspaces: [], waiting_items: [] }),
+    });
+    const user = userEvent.setup();
+    renderRepository();
+    const card = await screen.findByRole("region", { name: "Workspaces" });
+    await user.click(within(card).getByRole("button", { name: "Load workspace status" }));
+    expect(await within(card).findByRole("alert")).toHaveTextContent("Workspace status could not be loaded.");
+    await user.click(within(card).getByRole("button", { name: "Load workspace status" }));
+    expect(await within(card).findByText("No workspaces are configured.")).toBeInTheDocument();
+    expect(within(card).getByText("No items are waiting for a workspace.")).toBeInTheDocument();
+    expect(within(card).queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("is titled by the repository, with no scope number, and links to Work", async () => {
     serve();
     renderRepository();

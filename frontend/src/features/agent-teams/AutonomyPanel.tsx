@@ -261,7 +261,10 @@ export function AutonomyPanel({
                     {!scope.enabled ? 'Off' : preset.autonomy_enabled ? 'On' : 'Off · team autonomy off'}
                   </Badge>
                 </div>
-                <Link className="font-medium underline underline-offset-4" to={`/repositories/${scope.id}`} aria-label={`Manage ${scope.repo_owner}/${scope.repo_name}`}>Manage ›</Link>
+                <div className="flex flex-wrap gap-x-3 gap-y-1">
+                  <Link className="font-medium underline underline-offset-4" to={`/repositories/${scope.id}`} aria-label={`Manage ${scope.repo_owner}/${scope.repo_name}`}>Manage ›</Link>
+                  <Link className="font-medium underline underline-offset-4" to={`/repositories/${scope.id}#workspaces`} aria-label={`Workspaces for ${scope.repo_owner}/${scope.repo_name}`}>Workspaces ›</Link>
+                </div>
               </div>
               <BacklogCoordination scopeId={scope.id} withOperatorToken={withOperatorToken} />
             </CardContent>

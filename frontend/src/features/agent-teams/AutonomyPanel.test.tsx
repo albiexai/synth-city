@@ -123,3 +123,13 @@ describe('AutonomyPanel item count', () => {
     expect(screen.queryByText('0 items · 0 active')).not.toBeNull()
   })
 })
+
+describe('AutonomyPanel workspace navigation', () => {
+  it('links to the repository workspace section for each watched scope', () => {
+    renderPanel({ scopes: [scope, { ...scope, id: 7, repo_name: 'other' }] })
+    expect(screen.getByRole('link', { name: 'Workspaces for example/project' }))
+      .toHaveAttribute('href', '/repositories/2#workspaces')
+    expect(screen.getByRole('link', { name: 'Workspaces for example/other' }))
+      .toHaveAttribute('href', '/repositories/7#workspaces')
+  })
+})
