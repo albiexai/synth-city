@@ -38,6 +38,50 @@ test('@active a repository page shows no Work table copy and no scope number in 
   await expect(page.locator('main a[href^="/work?"]').first()).toBeVisible()
 })
 
+test('@active Teams links to scoped workspace states and wait reasons at desktop and 390 px', async ({ page }) => {
+  const longPath = '/fixture/' + 'long-worktree-path-'.repeat(12)
+  await page.route('**/api/v1/agent-teams/github-scopes/1/workspaces/readiness', async route => {
+    expect(route.request().method()).toBe('GET')
+    expect(route.request().headers()['x-synth-city-operator-token']).toBe('fixture-director-key')
+    await route.fulfill({
+      json: {
+        scope_id: 1,
+        workspaces: [
+          { workspace_id: 1, path: longPath, state: 'free', reason: null, leased_issue_number: null },
+          { workspace_id: 2, path: '/fixture/leased', state: 'leased', reason: null, leased_issue_number: 42 },
+          { workspace_id: 3, path: '/fixture/blocked', state: 'blocked', reason: 'repository_identity_mismatch', leased_issue_number: null },
+          { workspace_id: 4, path: '/fixture/missing', state: 'missing', reason: 'workspace_missing', leased_issue_number: null },
+        ],
+        waiting_items: [{ work_item_id: 85, issue_number: 56, reason: 'no_free_workspace' }],
+      },
+    })
+  })
+
+  await page.setViewportSize({ width: 1280, height: 900 })
+  await page.goto('/teams/1?tab=autonomy')
+  await page.getByRole('link', { name: 'Workspaces for example-org/sample-app' }).click()
+  await expect(page).toHaveURL(/\/repositories\/1#workspaces$/)
+  const card = page.getByRole('region', { name: 'Workspaces' })
+  await expect(card).toBeFocused()
+  await card.getByRole('button', { name: 'Load workspace status' }).click()
+  const dialog = page.getByRole('dialog', { name: 'Director key' })
+  await dialog.getByLabel(/^Director key/).fill('fixture-director-key')
+  await dialog.getByRole('button', { name: 'Use key' }).click()
+
+  for (const width of [1280, 390]) {
+    await page.setViewportSize({ width, height: 900 })
+    for (const label of ['Free', 'Leased to #42', 'Blocked', 'Missing', 'repository_identity_mismatch', 'No workspace is free.']) {
+      await expect(card.getByText(label, { exact: true })).toBeVisible()
+    }
+    await expect(card.getByRole('link', { name: '#56' })).toHaveAttribute('href', '/work/85')
+    const fits = await card.evaluate(element =>
+      element.scrollWidth <= element.clientWidth &&
+      document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+    )
+    expect(fits, `Workspace status fits at ${width} px`).toBe(true)
+  }
+})
+
 for (const theme of ['light', 'dark'] as Theme[]) {
   test(`@active Repositories meets AA contrast and is keyboard reachable in the ${theme} theme`, async ({ page }) => {
     await useTheme(page, theme)

@@ -3,6 +3,7 @@ import { RepositorySettings } from "@/features/agent-teams/RepositorySettings";
 import type { RepositoryDetailResponse, WorkListResponse } from "@/types/factory";
 import { RelativeTime } from "../components/RelativeTime";
 import { ReadStatus } from "../components/ReadStatus";
+import { RepositoryWorkspaces } from "../components/RepositoryWorkspaces";
 import { anchor } from "../components/styles";
 import { repositoryState } from "../filterHelpers";
 import { useObservation } from "../reads";
@@ -70,6 +71,7 @@ export function RepositoryPage() {
               </Link>
             </p>
           </div>
+          <RepositoryWorkspaces key={repository.scope_id} scopeId={repository.scope_id} />
           {scope.scope ? (
             <RepositorySettings
               scope={scope.scope}
