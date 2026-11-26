@@ -937,7 +937,8 @@ async def test_three_incoherent_attempts_fail_closed(db, monkeypatch):
 async def test_a_failed_early_projection_capture_is_untrusted_and_never_replaced(db, monkeypatch, failure):
     team, people = await bound_fixture(db, monkeypatch, pid=19506)
     service = MailRequestStallService()
-    service.deadline_seconds = 0.5
+    if failure == "timeout":
+        service.deadline_seconds = 0.5
     original, calls = service._coherent_snapshot, []
 
     async def failing(*args):

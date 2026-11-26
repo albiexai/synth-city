@@ -6,6 +6,7 @@ export const ATTENTION_TEXT: Record<TeamSummaryAttention['code'], string> = {
   recovery_decision: 'Recovery decision needed',
   human_review: 'Human review needed',
   owner_stalled: 'Owner stalled',
+  milestone_routing_conflict: 'Multiple teams claim the same milestone for this repository',
   team_idle: 'Team idle',
   observation_pause: 'Observation paused',
   hold: 'Team on HOLD',

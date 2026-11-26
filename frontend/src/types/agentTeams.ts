@@ -83,7 +83,7 @@ export interface AgentTeamPreset {
 export type TeamSummaryAttentionCode =
   | 'attempt_stopped' | 'recovery_decision' | 'human_review' | 'owner_stalled'
   | 'observation_pause' | 'hold' | 'recovery_only' | 'hold_unavailable' | 'team_idle'
-  | 'unanswered_request' | 'unanswered_request_incomplete'
+  | 'unanswered_request' | 'unanswered_request_incomplete' | 'milestone_routing_conflict'
 
 // Why the unanswered-request view is not complete (#752). A fixed word, never free text.
 export type UnansweredRequestReason =

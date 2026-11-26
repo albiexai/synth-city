@@ -82,7 +82,7 @@ async def test_an_exception_in_one_completion_is_logged_with_the_item_id_and_iso
 async def test_the_poll_time_is_never_advanced_over_discarded_upserts(db, monkeypatch):
     scope = await _make_scope(db)
 
-    async def recheck_that_rolls_back(db_, scope_, client_):
+    async def recheck_that_rolls_back(db_, scope_, client_, *, milestone=None):
         await db_.rollback()
         await db_.refresh(scope_)  # as every rollback path in the watcher does
 

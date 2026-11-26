@@ -4,14 +4,17 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime
+from hashlib import sha256
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import (
+    AgentTeamPreset,
     AgentTeamSlot,
     GithubAttemptScopeRevision,
     GithubWorkItem,
+    MailMessage,
     TeamGithubScope,
 )
 from app.services.github_client import GithubClient, github_client
@@ -21,6 +24,7 @@ from app.services.agent_team_campaign_service import agent_team_campaign_service
 from app.services.github_rate_limit_service import GithubRateLimited
 from app.services.operations_health_service import operations_health_service
 from app.services.session_recovery import recover_session
+from app.services.work_item_states import FINISHED_STATUSES
 
 _ACTIVE_STATUSES = ("dispatched", "verifying", "awaiting_human_review")
 _RECOVERABLE_STATUSES = ("failed", "escalated")
@@ -170,6 +174,91 @@ async def observe_notification_uncertainty(
             pass
 
 
+def _repository_scope(scope):
+    return (func.lower(TeamGithubScope.repo_owner) == scope.repo_owner.lower(),
+            func.lower(TeamGithubScope.repo_name) == scope.repo_name.lower())
+
+
+async def _lock_repository(db, scope):
+    # Lock the same scope row for every poll of this repository before checking ownership.
+    first_scope = select(func.min(TeamGithubScope.id)).where(*_repository_scope(scope)).scalar_subquery()
+    result = await db.execute(update(TeamGithubScope).where(TeamGithubScope.id == first_scope)
+                              .values(updated_at=TeamGithubScope.updated_at).execution_options(synchronize_session=False))
+    return result.rowcount == 1
+
+
+async def milestone_routes(db, scope):
+    return dict((await db.execute(select(AgentTeamPreset.id, AgentTeamPreset.backlog_milestone)
+                                 .join(TeamGithubScope, TeamGithubScope.preset_id == AgentTeamPreset.id)
+                                 .where(*_repository_scope(scope)))).all())
+
+
+def milestone_title(issue):
+    milestone = issue.get("milestone")
+    title = milestone.get("title") if isinstance(milestone, dict) else None
+    return title if isinstance(title, str) else None
+
+
+async def _owned_elsewhere(db, scope, number):
+    return await db.scalar(select(GithubWorkItem.id).join(TeamGithubScope).where(
+        *_repository_scope(scope), GithubWorkItem.issue_number == number, GithubWorkItem.scope_id != scope.id,
+        (GithubWorkItem.dispatch_status.not_in(FINISHED_STATUSES) | (GithubWorkItem.dispatch_status == "merged")),
+    ).limit(1)) is not None
+
+
+async def defer_milestone_exit(db, scope, item, title):
+    from mcp_shim.work_remaining_protocol import public_generation
+
+    from app.services import factory_audit_service as audit
+    from app.services.github_end_stopped_item_service import EndStoppedItemRequest, end_stopped_item
+
+    key = sha256(f"{item.id}:{item.created_at.isoformat()}:{title!r}".encode()).hexdigest()
+    generation = public_generation(item.id, item.dispatch_nonce) if item.dispatch_nonce else None
+    request = EndStoppedItemRequest(operation_id=f"milestone-{key}", expected_dispatch_generation=generation,
+        expected_scope_revision=item.active_scope_revision, outcome="deferred",
+        reason="The issue left this team's backlog milestone.", target_milestone=(title or "no milestone")[:120])
+    try:
+        await end_stopped_item(db, item, scope, request, allow_unstarted=True,
+            actor=audit.derive_actor(actor_kind="scheduler", scheduler=_WATCHER_SCHEDULER))
+    except ValueError as exc:
+        if item.dispatch_status != "pending" or str(exc) != "item_not_stopped":
+            raise
+        await _notify_milestone_exit(db, scope, item, title)
+
+
+async def _notify_milestone_exit(db, scope, item, title):
+    from app.models.schemas import MailMessageCreate
+    from app.services.agent_mail_service import agent_mail_service
+    from app.services.factory_audit_service import sanitize_text
+    from app.services.github_workspace_service import github_workspace_service
+
+    item_id = item.id
+    await _lock_repository(db, scope)
+    item = await db.get(GithubWorkItem, item_id, populate_existing=True)
+    leased_pending = (item is not None and item.dispatch_status == "pending"
+                      and await github_workspace_service.get_leased_workspace(db, item_id) is not None)
+    if item is None or (item.dispatch_status not in _ACTIVE_STATUSES and not leased_pending):
+        await db.commit()
+        return
+    subject = "Issue milestone changed"
+    target = sanitize_text(title or "no milestone")
+    body = f"Issue #{item.issue_number} moved to {target}. Finish or end the current attempt."
+    key = sha256(f"{item.id}:{item.created_at.isoformat()}:{title!r}".encode()).hexdigest()
+    members = {member.id for member in await agent_mail_service._dispatch_participants(db, item) if member}
+    for member_id in members:
+        await agent_mail_service.send_message(db, MailMessageCreate(kind="message", recipient_member_id=member_id,
+            subject=subject, body_markdown=body), commit=False, auto_nudge=False,
+            delivery_key=f"milestone:{key}:member:{member_id}")
+    preset = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
+    if preset is not None and preset.supervisor_actor_id is not None:
+        delivery = f"milestone:{key}:supervisor:{preset.supervisor_actor_id}"
+        if await db.scalar(select(MailMessage.id).where(MailMessage.delivery_key == delivery)) is None:
+            db.add(MailMessage(kind="message", audience_type="team_preset", audience_id=str(preset.id),
+                subject=subject, body_markdown=body, delivery_key=delivery,
+                payload={"notice": "issue_milestone_changed", "supervisor_actor_id": preset.supervisor_actor_id}))
+    await db.commit()
+
+
 class GithubWatcherService:
     def __init__(self) -> None:
         # #1238: per scope, the delivery event after which the next batch of due pull request facts starts.
@@ -183,20 +272,36 @@ class GithubWatcherService:
             scope.repo_owner, scope.repo_name, scope.dispatch_label
         )
         scope_id = scope.id
-        for issue in labeled:
+        if not await _lock_repository(db, scope):
+            await db.rollback()
+            return
+        routes = await milestone_routes(db, scope)
+        milestone = routes.get(scope.preset_id)
+        admitted = set()
+        open_labeled = {issue["number"]: issue for issue in labeled}
+        for number, issue in open_labeled.items():
+            title = milestone_title(issue)
+            matches = {team_id for team_id, configured in routes.items() if configured and configured == title}
+            if (matches != {scope.preset_id} if milestone else bool(matches)):
+                continue
+            if await _owned_elsewhere(db, scope, number):
+                continue
             await self._upsert_item(db, scope, issue)
+            admitted.add(number)
         # The admitted items are durable before any per-item completion runs: a later
         # rollback can then only discard that completion's own work, and the poll time
         # below is never written over upserts that were thrown away.
         await db.commit()
         # #941: a labeled issue still without a work item after its commit, poll after poll, is a finding.
-        await operations_health_service.record_admissions(scope_id, {issue["number"] for issue in labeled})
-        await self._recheck_active_items(db, scope, client)
+        await operations_health_service.record_admissions(scope_id, admitted)
+        await self._recheck_active_items(db, scope, client, milestone=milestone)
         await self._reconcile_closed_issues(
             db,
             scope,
             client,
-            open_labeled_numbers=frozenset(issue["number"] for issue in labeled),
+            open_labeled_numbers=frozenset(open_labeled),
+            milestone=milestone,
+            open_labeled=open_labeled,
         )
         await github_dispatch_service.promote_deferred_retries(db, scope)
         scope.last_polled_at = datetime.utcnow()
@@ -274,7 +379,7 @@ class GithubWatcherService:
         existing.updated_at = datetime.utcnow()
 
     async def _recheck_active_items(
-        self, db: AsyncSession, scope: TeamGithubScope, client: GithubClient
+        self, db: AsyncSession, scope: TeamGithubScope, client: GithubClient, *, milestone=None
     ) -> None:
         active = (
             await db.execute(
@@ -297,7 +402,7 @@ class GithubWatcherService:
         for item_id, issue_number in pending:
             await self._isolated(db, scope, item_id,
                                  lambda item_id=item_id, issue_number=issue_number:
-                                 self._recheck_one(db, scope, current, item_id, issue_number))
+                                 self._recheck_one(db, scope, current, item_id, issue_number, milestone))
 
     async def _isolated(self, db: AsyncSession, scope: TeamGithubScope, item_id: int, work) -> None:
         """Run one item's work so its failure never aborts the poll or discards another item's work."""
@@ -310,7 +415,7 @@ class GithubWatcherService:
             await db.refresh(scope)
 
     async def _recheck_one(self, db: AsyncSession, scope: TeamGithubScope, current: dict,
-                           item_id: int, issue_number: int) -> None:
+                           item_id: int, issue_number: int, milestone=None) -> None:
         item = await db.get(GithubWorkItem, item_id, populate_existing=True)
         if item is None or item.dispatch_status not in _ACTIVE_STATUSES:
             return
@@ -323,6 +428,9 @@ class GithubWatcherService:
                 fact_source="github_watcher_service._recheck_active_items", issue=issue,
                 guard_continuation=True)
             return
+        if issue is not None and milestone and milestone_title(issue) != milestone:
+            await _notify_milestone_exit(db, scope, item, milestone_title(issue))
+            return
         still_labeled = issue is not None and any(
             label["name"] == scope.dispatch_label for label in issue.get("labels", [])
         )
@@ -334,6 +442,13 @@ class GithubWatcherService:
                 "The dispatch label was removed from the issue.",
             )
 
+    async def _defer_current(self, db, scope, item_id, issue):
+        item = await db.get(GithubWorkItem, item_id, populate_existing=True)
+        observed = issue.get("updated_at")
+        if item is not None and item.dispatch_status in ("pending", *_RECOVERABLE_STATUSES) and (
+                observed is None or _parse_gh_ts(observed) >= item.github_updated_at):
+            await defer_milestone_exit(db, scope, item, milestone_title(issue))
+
     async def _reconcile_closed_issues(
         self,
         db: AsyncSession,
@@ -341,13 +456,16 @@ class GithubWatcherService:
         client: GithubClient,
         *,
         open_labeled_numbers: frozenset[int] = frozenset(),
+        milestone=None,
+        open_labeled=None,
     ) -> None:
         stalled = (
             await db.execute(
                 select(GithubWorkItem).where(
                     GithubWorkItem.scope_id == scope.id,
                     GithubWorkItem.dispatch_status.in_(
-                        _CLOSED_ISSUE_RECONCILABLE_STATUSES
+                        (*_CLOSED_ISSUE_RECONCILABLE_STATUSES, "pending")
+                        if milestone else _CLOSED_ISSUE_RECONCILABLE_STATUSES
                     ),
                 )
             )
@@ -357,22 +475,24 @@ class GithubWatcherService:
         stalled = [
             item
             for item in stalled
-            if item.issue_number not in open_labeled_numbers
+            if milestone or item.issue_number not in open_labeled_numbers
         ]
         if not stalled:
             return
         # Scalars are captured before any await. A failed notification below
         # rolls the session back and expires every loaded row, so later loop
         # entries must never read attributes from the original objects.
-        pending = [(item.id, item.issue_number, item.pr_number, item.escalation_reason)
-                   for item in stalled]
-        current = await client.get_issues_by_number(
-            scope.repo_owner,
-            scope.repo_name,
-            [issue_number for _item_id, issue_number, _pr_number, _reason in pending],
-        )
-        for item_id, issue_number, pr_number, _escalation_reason in pending:
+        pending = [(item.id, item.issue_number, item.pr_number) for item in stalled]
+        missing = [number for _, number, _ in pending if number not in open_labeled_numbers]
+        current = dict(open_labeled or {})
+        if missing:
+            current.update(await client.get_issues_by_number(scope.repo_owner, scope.repo_name, missing))
+        for item_id, issue_number, pr_number in pending:
             issue = current.get(issue_number)
+            if issue is not None and issue.get("state") != "closed" and milestone and milestone_title(issue) != milestone:
+                await self._isolated(db, scope, item_id,
+                    lambda: self._defer_current(db, scope, item_id, issue))
+                continue
             if issue is None or issue.get("state") != "closed":
                 continue
             proof = None

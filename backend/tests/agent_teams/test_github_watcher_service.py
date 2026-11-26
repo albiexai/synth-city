@@ -1,4 +1,5 @@
 """GitHub client + watcher service tests."""
+import asyncio
 import json
 from datetime import datetime
 
@@ -13,9 +14,11 @@ from app.database import Base
 from app.models.database import (
     AgentTeamPreset,
     AgentTeamSlot,
+    FactoryAuditEvent,
     GithubApprovalRequest,
     GithubWorkItem,
     GithubWorkspace,
+    MailExternalActor,
     MailMessage,
     MailTeamMember,
     TeamGithubScope,
@@ -186,8 +189,8 @@ async def test_github_client_pr_check_and_merge_requests():
 
 
 @pytest_asyncio.fixture
-async def db():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+async def db(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'watcher.db'}")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     maker = async_sessionmaker(engine, expire_on_commit=False)
@@ -221,7 +224,8 @@ class _FakeClient:
 
 
 async def _make_scope(db, **kw):
-    preset = AgentTeamPreset(name=kw.pop("preset_name", "T"), description="", created_by="t")
+    preset = AgentTeamPreset(name=kw.pop("preset_name", "T"), description="", created_by="t",
+                             backlog_milestone=kw.pop("milestone", None))
     db.add(preset)
     await db.flush()
     leader_slot = AgentTeamSlot(
@@ -256,6 +260,117 @@ def _issue(number, labels, updated="2026-07-04T00:00:00Z"):
         "state": "open",
         "labels": [{"name": name} for name in labels],
     }
+
+
+def _milestone_issue(scope, title):
+    return dict(_issue(1, [scope.dispatch_label]), milestone={"title": title} if title else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("prepared", [False, True])
+async def test_milestone_move_waits_for_original_owner_in_either_poll_order(db, reverse, prepared):
+    old = await _make_scope(db, preset_name="Old", milestone="V1")
+    new = await _make_scope(db, preset_name="New", milestone="V2")
+    fallback = await _make_scope(db, preset_name="Fallback")
+    issue = _milestone_issue(old, "V1")
+    await github_watcher_service.poll_scope(db, fallback, _FakeClient(labeled=[issue]))
+    assert await db.scalar(select(GithubWorkItem)) is None
+    await github_watcher_service.poll_scope(db, old, _FakeClient(labeled=[issue]))
+    original = await db.scalar(select(GithubWorkItem))
+    assert original.scope_id == old.id
+    if prepared:
+        original.dispatch_nonce = "prepared"
+        original.dispatch_base_ref = "release/v1"
+        original.dispatch_head_ref = "work/issue-1"
+        original.dispatched_at = original.github_updated_at
+        original.pending_reason = "queued_no_workspace"
+        await db.commit()
+
+    moved = _milestone_issue(old, "V2")
+    for scope in ([new, old] if reverse else [old, new]):
+        await github_watcher_service.poll_scope(db, scope, _FakeClient(labeled=[moved]))
+    assert original.dispatch_status == "cancelled"
+    event = await db.scalar(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == "stopped_work_item_ended"))
+    assert event.after_values["outcome"] == "deferred"
+    await github_watcher_service.poll_scope(db, new, _FakeClient(labeled=[moved]))
+    assert (await db.scalars(select(GithubWorkItem.scope_id).order_by(GithubWorkItem.id))).all() == [
+        old.id, new.id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("title", [None, "v1", "V1"])
+async def test_no_exact_milestone_or_conflicting_teams(db, title):
+    scopes = [await _make_scope(db, milestone="V1")]
+    if title == "V1":
+        scopes.append(await _make_scope(db, preset_name="Other", milestone="V1"))
+    for scope in scopes:
+        await github_watcher_service.poll_scope(db, scope, _FakeClient(labeled=[_milestone_issue(scope, title)]))
+    assert await db.scalar(select(GithubWorkItem)) is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_label_only_polls_admit_at_most_one_owner(db):
+    scopes = [await _make_scope(db, preset_name=name) for name in ("One", "Two")]
+    maker = async_sessionmaker(db.bind, expire_on_commit=False)
+
+    async def poll(scope_id):
+        async with maker() as session:
+            scope = await session.get(TeamGithubScope, scope_id)
+            await github_watcher_service.poll_scope(session, scope, _FakeClient(labeled=[_milestone_issue(scope, None)]))
+
+    await asyncio.gather(*(poll(scope.id) for scope in scopes))
+    assert len((await db.scalars(select(GithubWorkItem))).all()) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["escalated", "failed", "pending", "dispatched", "verifying", "awaiting_human_review"])
+async def test_milestone_exit_defers_or_notifies_once(db, status, caplog):
+    from app.services.agent_team_supervisor_service import supervisor_inbox
+
+    scope = await _make_scope(db, milestone="V1")
+    preset = await db.get(AgentTeamPreset, scope.preset_id)
+    actor = MailExternalActor(actor_key="supervisor", display_name="Supervisor", token_hash="test")
+    owner = AgentTeamSlot(preset_id=preset.id, position=1, display_name="Owner", role="Builder",
+                          provider="codex-cli", repo_id="r", repo_path="/tmp/r", repo_name="r")
+    db.add_all([actor, owner])
+    await db.flush()
+    preset.supervisor_actor_id = actor.id
+    db.add(MailTeamMember(identity_key=f"slot:{owner.id}", repo_id="r", repo_path="/tmp/r", repo_name="r",
+                          display_name="Owner", participant_kind="team_slot", team_preset_id=preset.id,
+                          team_slot_id=owner.id))
+    item = GithubWorkItem(scope_id=scope.id, issue_number=1, issue_title="Issue", issue_url="u",
+                          github_updated_at=datetime(2026, 7, 1), dispatch_status=status, owner_slot_id=owner.id)
+    db.add(item)
+    if status == "pending":
+        item.dispatch_nonce = "prepared"
+        await db.flush()
+        workspace = GithubWorkspace(scope_id=scope.id, path="/tmp/r-held", leased_item_id=item.id)
+        db.add(workspace)
+    await db.commit()
+    destination = await _make_scope(db, preset_name="Destination", milestone="V2")
+    moved = dict(_milestone_issue(scope, "V2"), labels=[])
+    client = _FakeClient(by_number={1: moved})
+    for _ in range(2):
+        await github_watcher_service.poll_scope(db, scope, client)
+    assert "Completion failed" not in caplog.text
+    if status == "pending":
+        await db.refresh(workspace)
+        assert workspace.leased_item_id == item.id
+    if status in {"escalated", "failed"}:
+        assert item.dispatch_status == "cancelled"
+        assert await db.scalar(select(FactoryAuditEvent.id).where(
+            FactoryAuditEvent.event_kind == "stopped_work_item_ended"))
+    else:
+        await github_watcher_service.poll_scope(db, destination, _FakeClient(labeled=[_milestone_issue(destination, "V2")]))
+        assert (await db.scalars(select(GithubWorkItem.id))).all() == [item.id]
+        assert item.dispatch_status == status
+        recipients = (await db.scalars(select(MailMessage.recipient_member_id).where(
+            MailMessage.subject == "Issue milestone changed",
+            MailMessage.recipient_member_id.is_not(None)))).all()
+        assert len(recipients) == len(set(recipients)) == 2
+        assert len(await supervisor_inbox(db, actor)) == 1
 
 
 @pytest.mark.asyncio

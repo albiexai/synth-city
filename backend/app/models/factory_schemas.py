@@ -285,7 +285,7 @@ class FactoryErrorResponse(FactoryModel):
 class TeamSummaryAttention(FactoryModel):
     code: Literal["attempt_stopped", "recovery_decision", "human_review", "owner_stalled",
                   "observation_pause", "hold", "recovery_only", "hold_unavailable", "team_idle",
-                  "unanswered_request", "unanswered_request_incomplete"]
+                  "unanswered_request", "unanswered_request_incomplete", "milestone_routing_conflict"]
     work_item_id: PositiveId | None = None
     scope_id: PositiveId | None = None
     issue_number: PositiveId | None = None

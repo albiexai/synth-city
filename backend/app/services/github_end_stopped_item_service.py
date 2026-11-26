@@ -94,7 +94,7 @@ async def end_pending_requests(db, item_id: int, *, now: datetime) -> None:
         db, pending, outcome="superseded", ended_at=now, source="github_end_stopped_item_service.end_stopped_item")
 
 
-async def end_stopped_item(db, item, scope, request, *, actor, before_commit=None):
+async def end_stopped_item(db, item, scope, request, *, actor, before_commit=None, allow_unstarted=False):
     """Record the disposition and clear the same inspected acquisition in one transaction."""
     item_id, scope_id = item.id, item.scope_id
     operation_id = f"end_stopped_item:{request.operation_id}"
@@ -116,18 +116,24 @@ async def end_stopped_item(db, item, scope, request, *, actor, before_commit=Non
     generation = public_generation(item_id, item.dispatch_nonce) if item.dispatch_nonce else None
     if generation != request.expected_dispatch_generation or item.active_scope_revision != request.expected_scope_revision:
         raise ValueError("end_stopped_item_context_changed")
-    if item.dispatch_status not in ATTENTION_STATUSES:
+    # A reservation can leave preparation fields on a pending item without launching an agent.
+    unstarted = (allow_unstarted and request.outcome == "deferred" and item.dispatch_status == "pending"
+                 and not any((item.launch_id, item.pr_number, item.active_scope_revision,
+                              item.handoff_state, item.handoff_target_slot_id)))
+    if item.dispatch_status not in ATTENTION_STATUSES and not unstarted:
         raise ValueError("item_not_stopped")
 
     identity_fields = (
         "scope_id", "dispatch_nonce", "dispatch_status", "escalation_reason", "launch_id", "owner_slot_id",
         "handoff_state", "handoff_target_slot_id", "approval_round_count", "active_scope_revision",
-        "pr_number", "dispatch_base_ref", "retry_requested_at",
+        "pr_number", "dispatch_base_ref", "retry_requested_at", "dispatch_head_ref", "dispatched_at",
     )
     original_status = item.dispatch_status
     conditions = [GithubWorkItem.id == item_id, *(
         getattr(GithubWorkItem, field) == getattr(item, field) for field in identity_fields)]
     workspace = await github_workspace_service.get_leased_workspace(db, item_id)
+    if unstarted and workspace is not None:
+        raise ValueError("item_not_stopped")
     evidence = ({"target_milestone": request.target_milestone} if request.outcome == "deferred"
                 else await _delivery_evidence(scope, item, request.superseding_pr_number))
     reason = audit.sanitize_reason(request.reason)

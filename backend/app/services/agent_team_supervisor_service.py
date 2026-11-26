@@ -340,12 +340,21 @@ def _is_provider_refusal_notice(root) -> bool:
         and optional_positive(payload["work_item_id"]) and optional_positive(payload["issue_number"]))
 
 
+def _is_issue_milestone_notice(root) -> bool:
+    payload = root.payload
+    return (root.sender_type == "system" and root.sender_member_id is None and root.sender_actor_id is None
+            and root.recipient_member_id is None and root.subject == "Issue milestone changed"
+            and isinstance(payload, dict) and set(payload) == {"notice", "supervisor_actor_id"}
+            and payload["notice"] == "issue_milestone_changed"
+            and type(payload["supervisor_actor_id"]) is int and payload["supervisor_actor_id"] > 0)
+
+
 def is_supervisor_message(root) -> bool:
     return (root.kind == "message" and root.audience_type == "team_preset"
             and (root.sender_member_id is not None or _is_native_wait_notice(root)
                  or _is_leader_ack_wait_notice(root) or _is_auto_merge_not_fired_notice(root)
                  or _is_effort_ceiling_notice(root) or _is_operations_finding_notice(root) or _is_wake_followup_notice(root)
-                 or _is_provider_refusal_notice(root))
+                 or _is_provider_refusal_notice(root) or _is_issue_milestone_notice(root))
             and root.thread_root_id is None
             and isinstance(root.payload, dict) and "supervisor_actor_id" in root.payload)
 

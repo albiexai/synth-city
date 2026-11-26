@@ -579,6 +579,30 @@ async def test_scheduler_escalates_pending_item_after_dispatch_label_is_removed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prepared", [False, True])
+async def test_scheduler_blocks_launch_after_fresh_milestone_move(db, prepared):
+    scope = await _scope(db, autonomy=True, enabled=True)
+    preset = await db.get(AgentTeamPreset, scope.preset_id)
+    preset.backlog_milestone = "V1"
+    item = GithubWorkItem(scope_id=scope.id, issue_number=2, issue_title="Moved issue", issue_url="u",
+                          github_updated_at=datetime.utcnow(), dispatch_status="pending",
+                          dispatch_nonce="0123456789abcdef" if prepared else None)
+    db.add(item)
+    await db.commit()
+    service = GithubDispatchScheduler(scheduler=_FakeScheduler(), watcher=_FakeWatcher(),
+                                      dispatch=_RoutingDispatch(), verification=_FakeVerification())
+
+    await service.run_repo_once(db, "o", "r", client=_RetryFlowClient({
+        "number": 2, "state": "open", "milestone": {"title": "V2"},
+        "labels": [{"name": scope.dispatch_label}],
+    }))
+
+    await db.refresh(item)
+    assert item.dispatch_status == "cancelled"
+    assert item.launch_id is None
+
+
+@pytest.mark.asyncio
 async def test_scheduler_checks_held_leases_with_no_enabled_slots(db):
     scope = await _scope(db, autonomy=True, enabled=True)
     slot = (

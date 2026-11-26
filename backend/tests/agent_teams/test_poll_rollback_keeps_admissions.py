@@ -54,7 +54,7 @@ async def maker(tmp_path, monkeypatch):
     await engine.dispose()
 
 
-async def _add_scope(maker, *, repo="r"):
+async def _add_scope(maker, *, repo="r", dispatch_label="claude-deck-ready"):
     async with maker() as db:
         preset = AgentTeamPreset(name=f"team-{datetime.utcnow().timestamp()}", autonomy_enabled=True)
         db.add(preset)
@@ -62,7 +62,7 @@ async def _add_scope(maker, *, repo="r"):
         slot = AgentTeamSlot(preset_id=preset.id, position=0, display_name="Owner", provider="codex-cli",
                              repo_id=repo, repo_path=f"/tmp/{repo}", repo_name=repo, role="Leader")
         scope = TeamGithubScope(preset_id=preset.id, repo_owner="o", repo_name=repo, repo_path=f"/tmp/{repo}",
-                                dispatch_label="claude-deck-ready", design_label="claude-deck-design",
+                                dispatch_label=dispatch_label, design_label="claude-deck-design",
                                 base_ref="origin/master", enabled=True)
         db.add_all([slot, scope])
         await db.flush()
@@ -71,9 +71,9 @@ async def _add_scope(maker, *, repo="r"):
         return scope.id
 
 
-def _issue(number):
+def _issue(number, dispatch_label="claude-deck-ready"):
     return {"number": number, "title": f"Issue {number}", "html_url": f"https://github.com/o/r/issues/{number}",
-            "updated_at": "2026-11-17T10:00:00Z", "labels": [{"name": "claude-deck-ready"}], "state": "open"}
+            "updated_at": "2026-11-17T10:00:00Z", "labels": [{"name": dispatch_label}], "state": "open"}
 
 
 class _Client:
@@ -83,13 +83,13 @@ class _Client:
         self.issues = [_issue(number) for number in numbers]
         self.list_error = None
 
-    def label(self, number):
-        self.issues.append(_issue(number))
+    def label(self, number, dispatch_label="claude-deck-ready"):
+        self.issues.append(_issue(number, dispatch_label))
 
     async def list_issues_with_label(self, owner, repo, label):
         if self.list_error is not None:
             raise self.list_error
-        return list(self.issues)
+        return [issue for issue in self.issues if {"name": label} in issue["labels"]]
 
     def __getattr__(self, name):
         async def nothing(*args, **kwargs):
@@ -222,10 +222,10 @@ async def test_a_rollback_inside_the_watcher_after_the_admission_commit_keeps_ad
     original = github_watcher_service._recheck_active_items
     broken = {"once": True}
 
-    async def recheck(db, scope, client):
+    async def recheck(db, scope, client, *, milestone=None):
         if broken.pop("once", False):
             raise LOCKED
-        return await original(db, scope, client)
+        return await original(db, scope, client, milestone=milestone)
 
     monkeypatch.setattr(github_watcher_service, "_recheck_active_items", recheck)
     await _tick(scheduler)
@@ -301,8 +301,12 @@ async def test_a_newly_labelled_issue_is_admitted_next_to_the_kept_ones(maker, m
 async def test_a_failure_in_one_scope_keeps_its_admissions_and_the_next_tick_reaches_the_other_scope(
         maker, monkeypatch):
     first = await _add_scope(maker)
-    second = await _add_scope(maker)
-    scheduler, stages = _build(_Client(1, 2), monkeypatch)
+    second_label = "other-team-ready"
+    second = await _add_scope(maker, dispatch_label=second_label)
+    client = _Client(1, 2)
+    client.label(3, second_label)
+    client.label(4, second_label)
+    scheduler, stages = _build(client, monkeypatch)
     stages.fail[("monitor_dispatched", first)] = LOCKED
     await _tick(scheduler)
     kept = await _items(maker)
@@ -311,7 +315,8 @@ async def test_a_failure_in_one_scope_keeps_its_admissions_and_the_next_tick_rea
     await _tick(scheduler)
     after = await _items(maker)
     assert [row for row in after if row[0] == first] == kept
-    assert [(scope, number) for scope, number, _id, _status in after if scope == second] == [(second, 1), (second, 2)]
+    assert _stage_names(stages, second) == list(STAGES)
+    assert [(scope, number) for scope, number, _id, _status in after if scope == second] == [(second, 3), (second, 4)]
 
 
 # ---- negative controls: the assertions above can fail. Behaviour is patched in this process only. ----------------

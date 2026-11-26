@@ -1252,10 +1252,26 @@ class GithubDispatchService:
 
         # #1081: owner slots a higher-ranked item found busy in this poll. A slot that frees during the walk goes to
         # the top-ranked waiting item on the next poll, not to whichever item is checked next.
+        from app.services.github_watcher_service import defer_milestone_exit, milestone_routes, milestone_title
+
+        milestone = preset.backlog_milestone if preset else None
+        milestone_conflict = milestone and list((await milestone_routes(db, scope)).values()).count(milestone) > 1
         busy_slots: set[int] = set()
         for item in pending:
             pending_identity = _item_identity(item)
             issue_labels = issue_labels_by_number.get(item.issue_number, [])
+            if milestone_conflict or (milestone and not issue_details_are_authoritative):
+                continue
+            details = issue_details_by_number.get(item.issue_number)
+            if milestone and details is not None and milestone_title(details) != milestone:
+                try:
+                    await defer_milestone_exit(db, scope, item, milestone_title(details))
+                except ValueError as exc:
+                    if str(exc) != "item_not_stopped":
+                        await db.rollback()
+                        for loaded in (scope, preset, *preset_slots, *pending):
+                            await db.refresh(loaded)
+                continue
             if issue_details_are_authoritative and (
                 item.issue_number not in issue_details_by_number
                 or scope.dispatch_label not in issue_labels
