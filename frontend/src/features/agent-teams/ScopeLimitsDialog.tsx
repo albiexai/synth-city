@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -29,33 +29,55 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
   const [range, setRange] = useState<ScopeSettingDefinition | null>(null)
   const [history, setHistory] = useState<ScopeSettingsHistoryEntry[]>([])
   const [next, setNext] = useState<number | null>(null)
-  const [label, setLabel] = useState('')
-  const [clear, setClear] = useState(false)
-  const [minutes, setMinutes] = useState('')
-  const [reason, setReason] = useState('')
+  const [historyState, setHistoryState] = useState<'loading' | 'ready' | 'failed'>('loading')
+  // A field the user has not touched is undefined and follows the server, so a background refresh never erases a draft.
+  const [draft, setDraft] = useState<{ label?: string; clear?: boolean; minutes?: string; reason: string }>({ reason: '' })
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
+  const generation = useRef(0) // a newer first load, or closing the dialog, makes older answers obsolete
+  const pending = useRef(new Set<number>()) // one request for each cursor at a time
+  const label = draft.label ?? scope.review_hold_label ?? ''
+  const clear = draft.clear ?? scope.review_hold_label == null
+  const minutes = draft.minutes ?? String(scope.max_item_effort_minutes ?? '')
+  const reason = draft.reason
 
   const load = useCallback(async (beforeId?: number) => {
+    const key = beforeId ?? 0
+    if (beforeId === undefined) {
+      generation.current += 1
+      pending.current.clear()
+    } else if (pending.current.has(key)) {
+      return
+    }
+    const mine = generation.current
+    pending.current.add(key)
     try {
       const page = await withOperatorToken((token) => fetchScopeSettings(scope.id, token, beforeId))
+      if (mine !== generation.current) return
       setRange(page.definitions.max_item_effort_minutes ?? null)
-      setHistory((current) => (beforeId === undefined ? page.history : [...current, ...page.history]))
+      setHistory((current) => (beforeId === undefined ? page.history : [...current, ...page.history.filter((item) => !current.some((seen) => seen.event_id === item.event_id))]))
       setNext(page.next_before_id)
+      setHistoryState('ready')
       setError(null)
     } catch (failure) {
+      if (mine !== generation.current) return
+      if (beforeId === undefined) setHistoryState('failed')
       setError(`Could not read the settings and history: ${failure instanceof Error ? failure.message : 'unknown error'}`)
+    } finally {
+      pending.current.delete(key)
     }
   }, [scope.id, withOperatorToken])
 
   useEffect(() => {
-    if (!open) return
+    if (!open) {
+      generation.current += 1
+      return
+    }
     queueMicrotask(() => {
-      setLabel(scope.review_hold_label ?? ''); setClear(scope.review_hold_label == null)
-      setMinutes(String(scope.max_item_effort_minutes ?? '')); setReason(''); setRange(null); setHistory([])
+      setDraft({ reason: '' }); setRange(null); setHistory([]); setHistoryState('loading')
       void load()
     })
-  }, [open, load, scope.review_hold_label, scope.max_item_effort_minutes])
+  }, [open, load])
 
   const min = range?.minimum, max = range?.maximum
   const submit = async () => {
@@ -81,6 +103,7 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
     try {
       await withOperatorToken((token) => updateTeamGithubScope(scope.id, update, token))
       await refresh()
+      setDraft({ reason: '' })
       await load()
       toast.success('Review hold and effort limit saved')
     } catch (failure) {
@@ -101,26 +124,27 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
         <div className="grid gap-4">
           <div className="grid gap-2">
             <Label htmlFor="limits-label">Review hold label</Label>
-            <Input id="limits-label" value={label} disabled={clear} onChange={(event) => setLabel(event.target.value)} />
+            <Input id="limits-label" value={label} disabled={clear} onChange={(event) => setDraft((current) => ({ ...current, label: event.target.value }))} />
             <div className="flex items-center gap-2 text-sm">
-              <Checkbox id="limits-clear" checked={clear} onCheckedChange={(next) => setClear(next === true)} />
+              <Checkbox id="limits-clear" checked={clear} onCheckedChange={(checked) => setDraft((current) => ({ ...current, clear: checked === true }))} />
               <Label htmlFor="limits-clear" className="font-normal">No hold label (clear it)</Label>
             </div>
           </div>
           <div className="grid gap-2">
             <Label htmlFor="limits-minutes">Effort ceiling (minutes)</Label>
-            <Input id="limits-minutes" inputMode="numeric" value={minutes} onChange={(event) => setMinutes(event.target.value)} />
+            <Input id="limits-minutes" inputMode="numeric" value={minutes} onChange={(event) => setDraft((current) => ({ ...current, minutes: event.target.value }))} />
             {range && <p className="text-xs text-muted-foreground">Whole minutes, {min} to {max} minutes{range.default !== undefined && `, default ${String(range.default)}`}.</p>}
           </div>
           <div className="grid gap-2">
             <Label htmlFor="limits-reason">Reason (optional)</Label>
-            <Input id="limits-reason" maxLength={1000} value={reason} onChange={(event) => setReason(event.target.value)} />
+            <Input id="limits-reason" maxLength={1000} value={reason} onChange={(event) => setDraft((current) => ({ ...current, reason: event.target.value }))} />
           </div>
           <Button onClick={() => void submit()} disabled={saving || !range}>Save</Button>
         </div>
         <section aria-label="History" className="space-y-2">
           <h4 className="text-sm font-semibold">History</h4>
-          {history.length === 0 && <p className="text-sm text-muted-foreground">No changes recorded yet.</p>}
+          {historyState === 'ready' && history.length === 0 && <p className="text-sm text-muted-foreground">No changes recorded yet.</p>}
+          {historyState === 'failed' && <p className="text-sm text-muted-foreground">The history is not available.</p>}
           <ul className="space-y-2 text-sm">
             {history.map((item) => (
               <li key={item.event_id} className="rounded-md border p-2">

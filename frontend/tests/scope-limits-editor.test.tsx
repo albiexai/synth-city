@@ -1,5 +1,5 @@
 import { MemoryRouter } from 'react-router-dom'
-import { render as renderUi, screen, waitFor, within } from '@testing-library/react'
+import { act, render as renderUi, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { RepositorySettings } from '../src/features/agent-teams/RepositorySettings'
@@ -38,11 +38,14 @@ const page = (history: ReturnType<typeof entry>[], next: number | null = null) =
 
 async function openEditor(overrides: Partial<TeamGithubScope> = {}, refresh = vi.fn().mockResolvedValue(undefined)) {
   const user = userEvent.setup()
-  render(<RepositorySettings scope={{ ...scope, ...overrides }} autonomyEnabled={false} refresh={refresh} onRemoved={vi.fn()} />)
+  const view = render(<RepositorySettings scope={{ ...scope, ...overrides }} autonomyEnabled={false} refresh={refresh} onRemoved={vi.fn()} />)
   await user.click(screen.getByRole('button', { name: 'Edit review hold and effort limit for example/project' }))
   await screen.findByText(/20 to 600 minutes/)
-  return { user, refresh }
+  return { user, refresh, view }
 }
+const deferred = <T,>() => { let resolve!: (value: T) => void; const promise = new Promise<T>((r) => { resolve = r }); return { promise, resolve } }
+const withScope = (over: Partial<TeamGithubScope>) => <RepositorySettings scope={{ ...scope, ...over }} autonomyEnabled={false} refresh={vi.fn()} onRemoved={vi.fn()} />
+const flush = () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
 const effort = () => screen.getByLabelText('Effort ceiling (minutes)')
 const save = () => screen.getByRole('button', { name: 'Save' })
 
@@ -136,9 +139,10 @@ describe('the review hold and effort limit editors', () => {
       entry(9, { max_item_effort_minutes: { before: 120, after: 90 } }, { reason: 'Shorter items' }),
       entry(7, { max_item_effort_minutes: { before: 60, after: 120 } }),
     ]))
-    await user.clear(effort()); await user.type(effort(), '90'); await user.click(save())
+    await user.clear(effort()); await user.type(effort(), '90'); await user.type(screen.getByLabelText('Reason (optional)'), 'Shorter items'); await user.click(save())
     expect(await screen.findByText('Effort ceiling: 120 → 90')).toBeInTheDocument()
     expect(refresh).toHaveBeenCalled()
+    expect(screen.getByLabelText('Reason (optional)')).toHaveValue('')
     expect(fetchScopeSettings).toHaveBeenCalledTimes(2)
   })
 
@@ -168,5 +172,59 @@ describe('the review hold and effort limit editors', () => {
     await user.click(screen.getByRole('button', { name: 'Edit review hold and effort limit for example/project' }))
     expect(await screen.findByText(/settings unavailable/)).toBeInTheDocument()
     expect(save()).toBeDisabled()
+    expect(screen.queryByText('No changes recorded yet.')).not.toBeInTheDocument()
+    expect(screen.getByText('The history is not available.')).toBeInTheDocument()
+  })
+
+  it('keeps an unsaved ceiling and reason when the settings refresh in the background, and lets untouched fields follow the server', async () => {
+    const { user, view } = await openEditor()
+    await user.clear(effort()); await user.type(effort(), '222'); await user.type(screen.getByLabelText('Reason (optional)'), 'Audit')
+    view.rerender(withScope({ review_hold_label: 'other-label', max_item_effort_minutes: 120 }))
+    await flush()
+    expect(effort()).toHaveValue('222')
+    expect(screen.getByLabelText('Reason (optional)')).toHaveValue('Audit')
+    expect(screen.getByLabelText('Review hold label')).toHaveValue('other-label')
+    await user.clear(effort()); await user.type(effort(), '90'); await user.click(save())
+    await waitFor(() => expect(updateTeamGithubScope).toHaveBeenCalledWith(2, { max_item_effort_minutes: 90, reason: 'Audit' }, 'director-key'))
+  })
+
+  it('keeps an edited label over a background change of the same field', async () => {
+    const { user, view } = await openEditor()
+    await user.clear(screen.getByLabelText('Review hold label')); await user.type(screen.getByLabelText('Review hold label'), 'mine')
+    view.rerender(withScope({ review_hold_label: 'theirs' }))
+    await flush()
+    expect(screen.getByLabelText('Review hold label')).toHaveValue('mine')
+  })
+
+  it('loads one history page for each cursor, even after a double click, and shows each event once', async () => {
+    vi.mocked(fetchScopeSettings).mockResolvedValueOnce(page([entry(7, { max_item_effort_minutes: { before: 60, after: 120 } })], 7))
+    const { user } = await openEditor()
+    const slow = deferred<ReturnType<typeof page>>()
+    vi.mocked(fetchScopeSettings).mockReturnValueOnce(slow.promise)
+    await user.dblClick(screen.getByRole('button', { name: 'Load more history' }))
+    expect(fetchScopeSettings).toHaveBeenCalledTimes(2)
+    slow.resolve(page([entry(7, { max_item_effort_minutes: { before: 60, after: 120 } }), entry(3, { max_item_effort_minutes: { before: 30, after: 60 } })]))
+    expect(await screen.findByText('Effort ceiling: 30 → 60')).toBeInTheDocument()
+    expect(screen.getAllByText('Effort ceiling: 60 → 120')).toHaveLength(1)
+  })
+
+  it('discards a history page that arrives after a newer load', async () => {
+    vi.mocked(fetchScopeSettings).mockResolvedValueOnce(page([entry(7, { max_item_effort_minutes: { before: 60, after: 120 } })], 7))
+    const { user } = await openEditor()
+    const old = deferred<ReturnType<typeof page>>()
+    vi.mocked(fetchScopeSettings).mockReturnValueOnce(old.promise)
+    await user.click(screen.getByRole('button', { name: 'Load more history' }))
+    vi.mocked(fetchScopeSettings).mockResolvedValue(page([entry(9, { max_item_effort_minutes: { before: 120, after: 90 } })]))
+    await user.clear(effort()); await user.type(effort(), '90'); await user.click(save())
+    expect(await screen.findByText('Effort ceiling: 120 → 90')).toBeInTheDocument()
+    old.resolve(page([entry(3, { max_item_effort_minutes: { before: 30, after: 60 } })]))
+    await flush()
+    expect(screen.queryByText('Effort ceiling: 30 → 60')).not.toBeInTheDocument()
+  })
+
+  it('says "No changes recorded yet." only after a successful read that found no entries', async () => {
+    vi.mocked(fetchScopeSettings).mockResolvedValue(page([]))
+    await openEditor()
+    expect(screen.getByText('No changes recorded yet.')).toBeInTheDocument()
   })
 })
