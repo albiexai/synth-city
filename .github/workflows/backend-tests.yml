@@ -169,7 +169,7 @@ jobs:
         with:
           # Untouched shards can come from earlier attempts of this same run.
           pattern: backend-test-timings-*-attempt-*
-          path: ${{ runner.temp }}/backend-shard-artifacts
+          path: shard-artifacts
           merge-multiple: false
       - name: Collect the full backend suite
         if: steps.changes.outputs.run_suites != 'false'
@@ -179,7 +179,7 @@ jobs:
           grep '::' backend-full-collect.txt > backend-full-collected.txt
       - name: Prove that the shards ran every test exactly once
         if: steps.changes.outputs.run_suites != 'false'
-        run: python .workflow-ci/scripts/ci/backend_shard_identities.py --full candidate/backend/backend-full-collected.txt --artifacts "$RUNNER_TEMP/backend-shard-artifacts" --shards ${{ env.BACKEND_SHARDS }}
+        run: python .workflow-ci/scripts/ci/backend_shard_identities.py --full candidate/backend/backend-full-collected.txt --artifacts shard-artifacts --shards ${{ env.BACKEND_SHARDS }}
       - name: Check the active factory fixtures
         if: steps.changes.outputs.run_suites != 'false'
         working-directory: candidate
