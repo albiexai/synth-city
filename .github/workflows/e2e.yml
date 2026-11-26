@@ -49,6 +49,15 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Check out the workflow's gate tooling
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .workflow-ci
+          sparse-checkout: |
+            scripts/ci
+            .github
+          persist-credentials: false
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
@@ -78,13 +87,30 @@ jobs:
         working-directory: frontend
         env:
           E2E_BACKEND_LOG: ${{ github.workspace }}/frontend/e2e-logs/backend.log
-        run: npm run e2e -- --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+          E2E_JOURNEY_PHASES: ${{ github.workspace }}/frontend/test-results/journey-phases.json
+          PLAYWRIGHT_HTML_OPEN: never
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ github.workspace }}/frontend/test-results/results.json
+        run: |
+          playwright_exit=0
+          npm run e2e -- --shard=${{ matrix.shard }}/${{ strategy.job-total }} \
+            --reporter="list,html,json,$GITHUB_WORKSPACE/.workflow-ci/scripts/ci/playwright_journey_phase.cjs" || playwright_exit=$?
+          mkdir -p test-results
+          printf '%s\n' "$playwright_exit" > test-results/playwright-exit.txt
+          if [ "$playwright_exit" -gt 1 ]; then
+            exit "$playwright_exit"
+          fi
+          python3 ../.workflow-ci/scripts/ci/e2e_shard_identities.py --frontend . \
+            --shards ${{ strategy.job-total }} --shard ${{ matrix.shard }} --report test-results/results.json \
+            --registry ../.workflow-ci/.github/known-flakes.json
       - name: Upload the journey report
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: e2e-journeys-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
-          path: frontend/test-results/results.json
+          path: |
+            frontend/test-results/results.json
+            frontend/test-results/playwright-exit.txt
+            frontend/test-results/journey-phases.json
           if-no-files-found: error
           retention-days: 14
       - name: Upload traces, screenshots and the backend log
@@ -158,4 +184,5 @@ jobs:
         run: |
           python3 .workflow-ci/scripts/ci/e2e_shard_identities.py --shards 4 --frontend candidate/frontend \
             --output "$RUNNER_TEMP/e2e-manifest.json" \
-            --artifacts "$RUNNER_TEMP/e2e-journey-artifacts"
+            --artifacts "$RUNNER_TEMP/e2e-journey-artifacts" \
+            --registry .workflow-ci/.github/known-flakes.json
