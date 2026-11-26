@@ -36,6 +36,7 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
   const [saving, setSaving] = useState(false)
   const generation = useRef(0) // a newer first load, or closing the dialog, makes older answers obsolete
   const pending = useRef(new Set<number>()) // one request for each cursor at a time
+  const session = useRef(0) // each open and each close starts a new session; a save from an older session changes nothing
   const label = draft.label ?? scope.review_hold_label ?? ''
   const clear = draft.clear ?? scope.review_hold_label == null
   const minutes = draft.minutes ?? String(scope.max_item_effort_minutes ?? '')
@@ -69,12 +70,16 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
   }, [scope.id, withOperatorToken])
 
   useEffect(() => {
+    session.current += 1
+  }, [open])
+
+  useEffect(() => {
     if (!open) {
       generation.current += 1
       return
     }
     queueMicrotask(() => {
-      setDraft({ reason: '' }); setRange(null); setHistory([]); setHistoryState('loading')
+      setDraft({ reason: '' }); setRange(null); setHistory([]); setNext(null); setSaving(false); setHistoryState('loading')
       void load()
     })
   }, [open, load])
@@ -99,17 +104,19 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
       return
     }
     if (reason.trim()) update.reason = reason.trim()
+    const mine = session.current
     setSaving(true)
     try {
       await withOperatorToken((token) => updateTeamGithubScope(scope.id, update, token))
       await refresh()
+      if (mine !== session.current) return
       setDraft({ reason: '' })
       await load()
       toast.success('Review hold and effort limit saved')
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : 'Failed to save the limits')
+      if (mine === session.current) setError(failure instanceof Error ? failure.message : 'Failed to save the limits')
     } finally {
-      setSaving(false)
+      if (mine === session.current) setSaving(false)
     }
   }
 
@@ -124,20 +131,20 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
         <div className="grid gap-4">
           <div className="grid gap-2">
             <Label htmlFor="limits-label">Review hold label</Label>
-            <Input id="limits-label" value={label} disabled={clear} onChange={(event) => setDraft((current) => ({ ...current, label: event.target.value }))} />
+            <Input id="limits-label" value={label} disabled={clear || saving} onChange={(event) => setDraft((current) => ({ ...current, label: event.target.value, clear: false }))} />
             <div className="flex items-center gap-2 text-sm">
-              <Checkbox id="limits-clear" checked={clear} onCheckedChange={(checked) => setDraft((current) => ({ ...current, clear: checked === true }))} />
+              <Checkbox id="limits-clear" checked={clear} disabled={saving} onCheckedChange={(checked) => setDraft((current) => ({ ...current, clear: checked === true }))} />
               <Label htmlFor="limits-clear" className="font-normal">No hold label (clear it)</Label>
             </div>
           </div>
           <div className="grid gap-2">
             <Label htmlFor="limits-minutes">Effort ceiling (minutes)</Label>
-            <Input id="limits-minutes" inputMode="numeric" value={minutes} onChange={(event) => setDraft((current) => ({ ...current, minutes: event.target.value }))} />
+            <Input id="limits-minutes" inputMode="numeric" value={minutes} disabled={saving} onChange={(event) => setDraft((current) => ({ ...current, minutes: event.target.value }))} />
             {range && <p className="text-xs text-muted-foreground">Whole minutes, {min} to {max} minutes{range.default !== undefined && `, default ${String(range.default)}`}.</p>}
           </div>
           <div className="grid gap-2">
             <Label htmlFor="limits-reason">Reason (optional)</Label>
-            <Input id="limits-reason" maxLength={1000} value={reason} onChange={(event) => setDraft((current) => ({ ...current, reason: event.target.value }))} />
+            <Input id="limits-reason" maxLength={1000} value={reason} disabled={saving} onChange={(event) => setDraft((current) => ({ ...current, reason: event.target.value }))} />
           </div>
           <Button onClick={() => void submit()} disabled={saving || !range}>Save</Button>
         </div>
@@ -155,7 +162,7 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
               </li>
             ))}
           </ul>
-          {next !== null && <Button variant="outline" size="sm" onClick={() => void load(next)}>Load more history</Button>}
+          {historyState === 'ready' && next !== null && <Button variant="outline" size="sm" onClick={() => void load(next)}>Load more history</Button>}
         </section>
         {tokenDialog}
       </DialogContent>

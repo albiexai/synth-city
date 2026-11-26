@@ -43,7 +43,7 @@ async function openEditor(overrides: Partial<TeamGithubScope> = {}, refresh = vi
   await screen.findByText(/20 to 600 minutes/)
   return { user, refresh, view }
 }
-const deferred = <T,>() => { let resolve!: (value: T) => void; const promise = new Promise<T>((r) => { resolve = r }); return { promise, resolve } }
+const deferred = <T,>() => { let resolve!: (value: T) => void; let reject!: (error: Error) => void; const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej }); return { promise, resolve, reject } }
 const withScope = (over: Partial<TeamGithubScope>) => <RepositorySettings scope={{ ...scope, ...over }} autonomyEnabled={false} refresh={vi.fn()} onRemoved={vi.fn()} />
 const flush = () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
 const effort = () => screen.getByLabelText('Effort ceiling (minutes)')
@@ -227,4 +227,87 @@ describe('the review hold and effort limit editors', () => {
     await openEditor()
     expect(screen.getByText('No changes recorded yet.')).toBeInTheDocument()
   })
+
+  it('keeps a typed replacement label when another client clears the stored label, and saves it', async () => {
+    const { user, view } = await openEditor()
+    await user.clear(screen.getByLabelText('Review hold label')); await user.type(screen.getByLabelText('Review hold label'), 'mine')
+    view.rerender(withScope({ review_hold_label: null }))
+    await flush()
+    expect(screen.getByLabelText('Review hold label')).toBeEnabled()
+    expect(screen.getByLabelText('Review hold label')).toHaveValue('mine')
+    expect(screen.getByRole('checkbox', { name: 'No hold label (clear it)' })).not.toBeChecked()
+    await user.click(save())
+    await waitFor(() => expect(updateTeamGithubScope).toHaveBeenCalledWith(2, { review_hold_label: 'mine' }, 'director-key'))
+  })
+
+  it('locks the fields while a save is pending, and unlocks them when it ends', async () => {
+    const slow = deferred<object>()
+    vi.mocked(updateTeamGithubScope).mockReturnValueOnce(slow.promise as never)
+    const { user } = await openEditor()
+    await user.clear(effort()); await user.type(effort(), '90'); await user.click(save())
+    await waitFor(() => expect(updateTeamGithubScope).toHaveBeenCalledTimes(1))
+    for (const field of [effort(), screen.getByLabelText('Review hold label'), screen.getByLabelText('Reason (optional)'), screen.getByRole('checkbox', { name: 'No hold label (clear it)' })]) expect(field).toBeDisabled()
+    slow.resolve({})
+    await waitFor(() => expect(effort()).toBeEnabled())
+  })
+
+  it('does not let a save that ends after the dialog was reopened touch the new draft or the history', async () => {
+    const slow = deferred<object>()
+    vi.mocked(updateTeamGithubScope).mockReturnValueOnce(slow.promise as never)
+    const { user } = await openEditor()
+    await user.clear(effort()); await user.type(effort(), '90'); await user.click(save())
+    await waitFor(() => expect(updateTeamGithubScope).toHaveBeenCalledTimes(1))
+    await user.keyboard('{Escape}')
+    await user.click(screen.getByRole('button', { name: 'Edit review hold and effort limit for example/project' }))
+    await screen.findByText(/20 to 600 minutes/)
+    await user.type(screen.getByLabelText('Reason (optional)'), 'second draft')
+    slow.resolve({})
+    await flush()
+    expect(screen.getByLabelText('Reason (optional)')).toHaveValue('second draft')
+    expect(fetchScopeSettings).toHaveBeenCalledTimes(2)
+  })
+
+  it('forgets the old history cursor on reopen, and offers more history only after that read succeeded', async () => {
+    vi.mocked(fetchScopeSettings).mockResolvedValueOnce(page([entry(7, { max_item_effort_minutes: { before: 60, after: 120 } })], 7))
+    const { user } = await openEditor()
+    expect(screen.getByRole('button', { name: 'Load more history' })).toBeInTheDocument()
+    await user.keyboard('{Escape}')
+    vi.mocked(fetchScopeSettings).mockRejectedValueOnce(new Error('history unavailable'))
+    await user.click(screen.getByRole('button', { name: 'Edit review hold and effort limit for example/project' }))
+    expect(await screen.findByText(/history unavailable/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Load more history' })).not.toBeInTheDocument()
+  })
+
+  it('does not show the error of a save from an older session in the new one', async () => {
+    const old = deferred<object>()
+    vi.mocked(updateTeamGithubScope).mockReturnValueOnce(old.promise as never)
+    const { user } = await openEditor()
+    await user.clear(effort()); await user.type(effort(), '90'); await user.click(save())
+    await waitFor(() => expect(updateTeamGithubScope).toHaveBeenCalledTimes(1))
+    await user.keyboard('{Escape}')
+    await user.click(screen.getByRole('button', { name: 'Edit review hold and effort limit for example/project' }))
+    await screen.findByText(/20 to 600 minutes/)
+    await act(async () => { old.reject(new Error('old save failed')) })
+    await flush()
+    expect(screen.queryByText(/old save failed/)).not.toBeInTheDocument()
+  })
+
+  it('keeps the new session locked while its own save runs, when an older save ends first', async () => {
+    const old = deferred<object>(), current = deferred<object>()
+    vi.mocked(updateTeamGithubScope).mockReturnValueOnce(old.promise as never).mockReturnValueOnce(current.promise as never)
+    const { user } = await openEditor()
+    await user.clear(effort()); await user.type(effort(), '90'); await user.click(save())
+    await waitFor(() => expect(updateTeamGithubScope).toHaveBeenCalledTimes(1))
+    await user.keyboard('{Escape}')
+    await user.click(screen.getByRole('button', { name: 'Edit review hold and effort limit for example/project' }))
+    await screen.findByText(/20 to 600 minutes/)
+    await user.clear(effort()); await user.type(effort(), '95'); await user.click(save())
+    await waitFor(() => expect(updateTeamGithubScope).toHaveBeenCalledTimes(2))
+    old.resolve({})
+    await flush()
+    expect(effort()).toBeDisabled()
+    current.resolve({})
+    await waitFor(() => expect(effort()).toBeEnabled())
+  })
 })
+
