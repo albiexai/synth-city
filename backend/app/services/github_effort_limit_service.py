@@ -147,9 +147,12 @@ class GithubEffortLimitService:
         now = now or datetime.utcnow()
         item = (await db.execute(select(GithubWorkItem).where(GithubWorkItem.id == item_id)
                                  .execution_options(populate_existing=True))).scalar_one_or_none()
-        if item is not None and item.dispatch_status in TERMINAL_ITEMS:
-            await self._record_effort_waits(db, item.id, now=now)
-            await db.commit()
+        if item is not None:
+            ended = await self._end_ceiling_waits(db, item, now=now)
+            if item.dispatch_status in TERMINAL_ITEMS:
+                await self._record_effort_waits(db, item.id, now=now)
+            if ended or item.dispatch_status in TERMINAL_ITEMS:
+                await db.commit()
         if item is None or item.effort_limit_minutes is None:
             return "skipped"
         last = item.effort_last_tick_at if seen_last_tick is _UNSET else seen_last_tick
@@ -281,6 +284,90 @@ class GithubEffortLimitService:
             await decision_waits.record_effort_wait_ended(
                 db, item_id=item_id, outcome="item_ended", ended_at=now, source=source)
 
+    async def _end_ceiling_waits(self, db: AsyncSession, item: GithubWorkItem, *, now: datetime) -> bool:
+        """#1300: close a Supervisor ceiling wait the item's end or a new attempt resolved, unattributed.
+
+        The notice belongs to one attempt (its delivery key names the nonce); a new attempt asks anew. Whether
+        anything was written.
+        """
+        from app.services import factory_audit_service as audit
+
+        status, nonce, wrote = item.dispatch_status, item.dispatch_nonce, False
+        for start in await decision_waits.open_ceiling_waits(db, item.id):
+            notice_id = (start.after_values or {}).get("wait_message_id")
+            snapshot, detail = None, None
+            if status in TERMINAL_ITEMS:
+                outcome, evidence = "item_terminal", {"dispatch_status": status}
+            else:
+                noticed = await self._notice_attempt(db, notice_id, item.id)
+                # A missing or reused Mail row is no evidence: the wait stays open.
+                if noticed is None or noticed == nonce:
+                    continue
+                # The replacement by its non-secret launch identity: the ledger keeps no nonce or digest of one. A
+                # retry clears the nonce but keeps the old launch until the new one is published (V1 review
+                # 6070048705), so a launch the notice already named is no evidence of the replacement.
+                outcome, evidence = "attempt_ended", {}
+                replacement = audit.launch_attempt_key(item.id, item.launch_id)
+                if item.launch_id is not None and replacement != (start.context_snapshot or {}).get("launch_attempt"):
+                    snapshot = {"launch_attempt": replacement}
+                else:
+                    detail = "the replacement attempt's launch is not yet known"
+            await decision_waits.record_ceiling_wait_ended(
+                db, item_id=item.id, notice_ids=[notice_id], outcome=outcome, ended_at=now, evidence=evidence,
+                context_snapshot=snapshot, detail=detail, source="github_effort_limit_service.tick_item")
+            wrote = True
+        return wrote
+
+    @staticmethod
+    async def _notice_attempt(db: AsyncSession, notice_id, item_id: int) -> str | None:
+        """The attempt nonce a ceiling notice's delivery key names, or ``None`` for a missing or reused Mail row."""
+        from app.models.database import MailMessage
+
+        key = await db.scalar(select(MailMessage.delivery_key).where(MailMessage.id == notice_id))
+        parts = (key or "").split(":")
+        if len(parts) != 4 or parts[:2] != ["github-effort-ceiling", str(item_id)] or parts[3] != "operator":
+            return None
+        return parts[2]
+
+    async def end_resolved_ceiling_waits(self, db: AsyncSession, *, scope_id: int, ceiling_before, ceiling_after,
+                                         actor: dict, correlation_id: str, now: datetime) -> None:
+        """#1300: a ceiling change ends a Supervisor ceiling wait only when the change itself makes the asked step fit.
+
+        The room is the one ``extend`` computes, on the item's current limit and extensions: too small before the
+        change and enough after it. An item that already ended, or a notice of a replaced attempt, is left for the
+        tick, which records that end instead (V1 review 6069720545). Called in the scope change's own transaction.
+        """
+        from app.models.database import FactoryAuditEvent, MailMessage
+
+        items = (await db.execute(select(
+            GithubWorkItem.id, GithubWorkItem.effort_limit_minutes, GithubWorkItem.effort_extension_minutes,
+            GithubWorkItem.dispatch_status, GithubWorkItem.dispatch_nonce,
+        ).where(GithubWorkItem.scope_id == scope_id, GithubWorkItem.id.in_(select(FactoryAuditEvent.item_id).where(
+            FactoryAuditEvent.event_kind == decision_waits.CEILING_STARTED))))).all()
+        for item_id, limit, used, status, nonce in items:
+            if status in TERMINAL_ITEMS:
+                continue
+            before = self.ceiling_room(limit or 0, used or 0, ceiling_before)
+            after = self.ceiling_room(limit or 0, used or 0, ceiling_after)
+            for start in await decision_waits.open_ceiling_waits(db, item_id):
+                notice_id = (start.after_values or {}).get("wait_message_id")
+                # Only a readable notice of the item's current attempt; a retry reset leaves no current nonce.
+                noticed = await self._notice_attempt(db, notice_id, item_id)
+                notice = await db.get(MailMessage, notice_id) if noticed is not None and noticed == nonce else None
+                if notice is None:
+                    continue
+                requested = (notice.payload or {}).get("requested_minutes")
+                if (not isinstance(requested, int) or before is None or before >= requested
+                        or (after is not None and after < requested)):
+                    continue
+                room = "no ceiling" if after is None else f"{after} minutes of room"
+                await decision_waits.record_ceiling_wait_ended(
+                    db, item_id=item_id, notice_ids=[notice_id], outcome="ceiling_raised", ended_at=now,
+                    actor=actor, source="agent_teams.update_github_scope", correlation_id=correlation_id,
+                    before_values={"max_item_effort_minutes": ceiling_before},
+                    evidence={"max_item_effort_minutes": ceiling_after},
+                    detail=f"the asked {requested} minutes now fit: {room}, {before} before")
+
     # -- Leader extensions ----------------------------------------------------------------------------------------
 
     async def _read_activity(self, db: AsyncSession, item: GithubWorkItem, scope, now: datetime):
@@ -359,7 +446,7 @@ class GithubEffortLimitService:
             raise EffortLimitError("extension_exceeds_cap", status_code=400)
         # Read everything needed before any rollback: a rollback expires the loaded row.
         limit, used, scope_id = item.effort_limit_minutes, item.effort_extension_minutes, item.scope_id
-        status, issue_number = item.dispatch_status, item.issue_number
+        status = item.dispatch_status
         # Read as it is now: the session may hold an older copy of the scope row (V1 review 5925693104).
         scope = (await db.execute(select(TeamGithubScope).where(TeamGithubScope.id == item.scope_id)
                                   .execution_options(populate_existing=True))).scalar_one_or_none()
@@ -380,9 +467,8 @@ class GithubEffortLimitService:
                 # Beyond the ceiling the Supervisor decides (#1102): tell them once for this attempt.
                 try:
                     await self._add_ceiling_notice(
-                        db, preset_id=preset_id, work_item_id=work_item_id, dispatch_nonce=dispatch_nonce,
-                        issue_number=issue_number, limit=limit, used=used, ceiling=ceiling, requested=minutes,
-                        room=room)
+                        db, preset_id=preset_id, scope_id=scope_id, work_item_id=work_item_id,
+                        dispatch_nonce=dispatch_nonce, requested=minutes, leader_member_id=leader_member_id)
                     await db.commit()
                 except Exception:  # the unique delivery key also refuses a concurrent second notice
                     await db.rollback()
@@ -432,23 +518,39 @@ class GithubEffortLimitService:
         await db.refresh(item)
         return self._result(item)
 
-    async def _add_ceiling_notice(self, db: AsyncSession, *, preset_id: int, work_item_id: int, dispatch_nonce: str,
-                                  issue_number: int, limit: int, used: int, ceiling: int, requested: int,
-                                  room: int) -> None:
+    async def _add_ceiling_notice(self, db: AsyncSession, *, preset_id: int, scope_id: int, work_item_id: int,
+                                  dispatch_nonce: str, requested: int, leader_member_id: int) -> None:
         """Add (never commit) the Supervisor's notice for a request beyond the ceiling: one per item and attempt.
+
+        #1300: its wait on the Supervisor starts with it, so the two commit together. The refusal released the
+        writer, so a scope change may have landed since (V1 review 6069720545): take the writer again, read the item
+        and the ceiling anew, and write nothing when the asked step fits or the attempt changed.
 
         Built like the auto-merge notice (#939): a system row to the team with no member receipts, which only the
         bound Supervisor's inbox shows through its exact payload shape. No team Supervisor means no row.
         """
         from app.models.database import AgentTeamPreset, MailMessage
 
+        await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == work_item_id)
+                         .values(updated_at=GithubWorkItem.updated_at).execution_options(synchronize_session=False))
+        row = (await db.execute(select(
+            GithubWorkItem.dispatch_nonce, GithubWorkItem.dispatch_status, GithubWorkItem.effort_limit_minutes,
+            GithubWorkItem.effort_extension_minutes, GithubWorkItem.issue_number, GithubWorkItem.launch_id,
+        ).where(GithubWorkItem.id == work_item_id))).one_or_none()
+        ceiling = await db.scalar(select(TeamGithubScope.max_item_effort_minutes).where(TeamGithubScope.id == scope_id))
+        if row is None or row[0] != dispatch_nonce or row[1] not in _EXTENDABLE_STATUSES or row[2] is None:
+            return
+        _nonce, _status, limit, used, issue_number, launch_id = row
+        room = self.ceiling_room(limit, used, ceiling)
+        if room is None or requested <= room:
+            return
         supervisor = await db.scalar(select(AgentTeamPreset.supervisor_actor_id).where(AgentTeamPreset.id == preset_id))
         if supervisor is None:
             return
         key = f"github-effort-ceiling:{work_item_id}:{dispatch_nonce}:operator"
         if await db.scalar(select(MailMessage.id).where(MailMessage.delivery_key == key)) is not None:
             return
-        db.add(MailMessage(
+        notice = MailMessage(
             kind="message", sender_type="system", audience_type="team_preset", audience_id=str(preset_id),
             subject="Effort ceiling reached",
             body_markdown=(
@@ -460,7 +562,11 @@ class GithubEffortLimitService:
                      "limit_minutes": limit, "extension_minutes": used, "ceiling_minutes": ceiling,
                      "requested_minutes": requested, "supervisor_actor_id": supervisor},
             delivery_key=key,
-        ))
+        )
+        db.add(notice)
+        await decision_waits.record_ceiling_wait_started(
+            db, notice, item_id=work_item_id, leader_member_id=leader_member_id, launch_id=launch_id,
+            source="github_effort_limit_service.extend")
 
     @staticmethod
     def _total_changed(recorded: int) -> EffortLimitError:

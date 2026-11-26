@@ -76,6 +76,14 @@ Two more kinds of wait are recorded the same way. A Mail context request or hand
 
 A scope-amendment request is a decision wait like a plan approval, keyed by its request id. An effort-limit episode is one too: it starts when Synth City sends the Leader the effort-limit notice (`effort_wait_started`, keyed by that notice's message id) and ends when the Leader extends the limit, or when the item ends (`effort_wait_ended`). The waits are rebuilt from the durable notices whenever a notice is sent, an extension is granted or the item ends, so an interruption between the notice and its start loses nothing. An extension ends the notice it answers, attributed to the Leader; a notice it did not see ends unattributed when found, and never before it started. The rebuild covers every attempt of the item, but only the current attempt's extensions end its notices. A rebuilt start names the owner notified with that notice, or no owner. An owner's Mail request to the Leader during that time is still its own Mail wait, so wait counts may include both; time is counted once per instant by the retrospective measures.
 
+A request beyond the scope's effort ceiling waits on the Supervisor. Synth City's ceiling notice starts it (`ceiling_wait_started`, keyed by that notice's message id), in the notice's own transaction. That transaction checks the item and the ceiling again, so no notice is sent for a step that already fits. Only evidence that the notice was resolved ends it (`ceiling_wait_ended`), and never before it started:
+- `ceiling_raised`: a change to `max_item_effort_minutes` that makes the step the notice asked for fit, when it did not fit before. A change that still leaves too little room, or comes after the item or attempt ended, leaves the wait open. The reason names the asked minutes and the room before and after.
+- `work_stopped`: an end-stopped disposition.
+- `item_terminal`: the item ended first.
+- `attempt_ended`: a retry or a new attempt replaced the notice's attempt. The snapshot names the new attempt's launch once it is known, never its nonce; until then the reason says the launch is not yet known.
+
+A split has no record of its own, so it counts as whichever of these recorded it. The end names whoever acted, for example the operator for a scope change; the answerer stays unknown, because an operator key or a Leader never proves the Supervisor's or the Director's answer. The notice is not a Mail request, so it is not counted twice.
+
 ## Review acceptance declarations
 
 An operator can record a review acceptance from a trusted source with `POST /api/v1/factory/review-acceptances`. The declaration names:

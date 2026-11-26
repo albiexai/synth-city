@@ -2798,12 +2798,14 @@ async def update_github_scope(
         from app.services import factory_audit_service as _audit
         _policy_before = dict(zip(_SCOPE_CONFIGURATION_FIELDS, observed_configuration))
         _policy_after = dict(zip(_SCOPE_CONFIGURATION_FIELDS, _scope_configuration(scope)))
+        _policy_actor, _policy_at = _write_actor(write_context), datetime.now(timezone.utc)
+        _policy_correlation = f"policy:scope:{scope.id}:{scope.updated_at.isoformat()}"
         await _audit.record_event(
             db,
             event_kind="policy_change",
             source="agent_teams.update_github_scope",
-            occurred_at=datetime.now(timezone.utc),
-            actor=_write_actor(write_context),
+            occurred_at=_policy_at,
+            actor=_policy_actor,
             scope_id=scope.id,
             context_snapshot={
                 **_policy_event_snapshot(scope, request),
@@ -2816,8 +2818,14 @@ async def update_github_scope(
             after_values=_policy_after,
             sanitized_reason=(request.reason or "").strip() or "scope configuration update",
             action_outcome="applied",
-            correlation_id=f"policy:scope:{scope.id}:{scope.updated_at.isoformat()}",
+            correlation_id=_policy_correlation,
         )
+        if _policy_before.get("max_item_effort_minutes") != scope.max_item_effort_minutes:
+            # #1300: a Supervisor ceiling wait ends here only when its asked step now fits.
+            await effort_limit_service.end_resolved_ceiling_waits(
+                db, scope_id=scope.id, ceiling_before=_policy_before.get("max_item_effort_minutes"),
+                ceiling_after=scope.max_item_effort_minutes, actor=_policy_actor,
+                correlation_id=_policy_correlation, now=_policy_at)
         await db.commit()
         await db.refresh(scope)
     except HTTPException as exc:
