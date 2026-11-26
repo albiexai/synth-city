@@ -525,8 +525,10 @@ class AgentTeamSummaryService:
                    if row.work_item_id is None and row.scope_id is not None and row.issue_number is not None}
         bindings = {}
         if unbound:
-            rows = await db.execute(tracked_items.where(tuple_(GithubWorkItem.scope_id, GithubWorkItem.issue_number)
-                                                       .in_(unbound)))
+            rows = await db.execute(tracked_items.where(
+                GithubWorkItem.milestone_replaced_at.is_(None),
+                tuple_(GithubWorkItem.scope_id, GithubWorkItem.issue_number).in_(unbound),
+            ))
             bindings = {(row.scope_id, row.issue_number): row.id for row in rows}
 
         def relevant(row):

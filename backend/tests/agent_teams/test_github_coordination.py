@@ -795,6 +795,54 @@ async def test_standing_pr_and_future_gate_are_reported_without_dispatch_or_quot
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("replaced", [False, True])
+async def test_leader_pr_action_retirement_uses_current_admission(db, team, replaced):
+    from app.services.github_operator_attention_service import github_operator_attention_service as attention
+
+    db.add(GithubWorkItem(
+        scope_id=team.scope_id, issue_number=8, issue_title="Cancelled", issue_url="u",
+        github_updated_at=datetime.utcnow(), dispatch_status="cancelled",
+        milestone_replaced_at=datetime.utcnow() if replaced else None,
+    ))
+    if replaced:
+        db.add(GithubWorkItem(
+            scope_id=team.scope_id, issue_number=8, issue_title="Returned", issue_url="u",
+            github_updated_at=datetime.utcnow(), dispatch_status="dispatched", pr_number=38,
+        ))
+    await db.commit()
+    await service.assess(db, team.scope_id, team.leader, await human_report(db, team), team.client)
+    actions = (await attention.summary(db, team.preset.id, team.client))["actions"]
+    assert any(a["source"] == "leader" and a["pull_request_number"] == 38
+               and a["state"] == "requested" for a in actions) is replaced
+
+
+@pytest.mark.asyncio
+async def test_final_gate_binds_unbound_action_to_current_admission(db, team, monkeypatch):
+    from app.models.factory_schemas import AgentTeamSummaryResponse, TeamSummaryHumanAction
+    from app.services.agent_team_summary_service import AgentTeamSummaryService
+
+    historical = GithubWorkItem(
+        scope_id=team.scope_id, issue_number=team.item.issue_number, issue_title="Previous", issue_url="u",
+        github_updated_at=datetime.utcnow(), dispatch_status="cancelled",
+        milestone_replaced_at=datetime.utcnow(), created_at=team.item.created_at - timedelta(days=1),
+    )
+    db.add(historical)
+    await db.commit()
+    action = TeamSummaryHumanAction(
+        scope_id=team.scope_id, issue_number=team.item.issue_number, kind="merge_pr",
+        state="requested", source="leader", assessment_current=True, pull_request_number=25,
+    )
+    observed = AgentTeamSummaryResponse.model_construct(
+        coverage_complete=True, hold_code=None, valid_until=datetime.utcnow() + timedelta(minutes=1),
+        attention=[], human_actions=[action],
+    )
+    summaries = AgentTeamSummaryService()
+    monkeypatch.setattr(summaries, "summary", AsyncMock(return_value=observed))
+    assert (await summaries.for_work_item(db, team.preset.id, team.item.id)).human_actions == [action]
+    assert (await summaries.for_work_item(db, team.preset.id, historical.id)).human_actions == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["head", "closed", "repo", "missing", "draft", "prerequisite"])
 async def test_human_pr_report_refuses_changed_identity_or_unassigned_evidence(db, team, change):
     receipt = await human_report(db, team)

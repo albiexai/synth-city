@@ -272,6 +272,7 @@ class GithubOperatorAttentionService:
         if reported_issues:
             keys = (GithubWorkItem.scope_id, GithubWorkItem.issue_number)
             ended = set((await db.execute(select(*keys).where(GithubWorkItem.dispatch_status == "cancelled",
+                GithubWorkItem.milestone_replaced_at.is_(None),
                 tuple_(*keys).in_(reported_issues)))).all())
             actions = [action for action in actions if (action["scope_id"], action["issue_number"]) not in ended]
         snapshot = await self.dispatch_snapshot(db, scopes[:32])
