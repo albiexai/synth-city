@@ -7894,6 +7894,57 @@ async def test_handoff_withdrawal_releases_the_target_in_the_dispatch_transactio
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("queue", ["expiry_moved", "expired"])
+async def test_handoff_withdrawal_refuses_changed_or_expired_queue(wal_dispatch_sessions, monkeypatch, queue):
+    from app.services import github_coordination_service as coordination
+
+    maker = wal_dispatch_sessions
+    leader = SimpleNamespace(id=9, member_id=8)
+    monkeypatch.setattr(coordination.github_coordination_service, "require_leader", AsyncMock(return_value=leader))
+    async with maker() as db:
+        _, slots, scope = await _team(db)
+        now = datetime.utcnow()
+        expires_at = now + timedelta(minutes=10 if queue == "expiry_moved" else -1)
+        target_id = slots[1].id
+        item = GithubWorkItem(scope_id=scope.id, issue_number=9033, issue_title="Handoff", issue_url="u",
+            github_updated_at=now, dispatch_status="dispatched", owner_slot_id=slots[0].id, dispatch_nonce="attempt",
+            handoff_state="queued", handoff_target_slot_id=target_id, handoff_expires_at=expires_at)
+        db.add(item)
+        await db.commit()
+        item_id = item.id
+
+        if queue == "expiry_moved":
+            current_expiry = expires_at + timedelta(minutes=2)
+            lock = dispatch_module._lock_dispatch_team
+
+            async def move_queue_before_lock(session, preset_id):
+                await session.commit()
+                async with maker() as other:
+                    await other.execute(update(GithubWorkItem).where(
+                        GithubWorkItem.id == item_id,
+                    ).values(handoff_expires_at=current_expiry))
+                    await other.commit()
+                await lock(session, preset_id)
+
+            monkeypatch.setattr(dispatch_module, "_lock_dispatch_team", move_queue_before_lock)
+            refusal = "handoff_context_changed"
+        else:
+            current_expiry = expires_at
+            refusal = "handoff_not_queued"
+
+        with pytest.raises(coordination.CoordinationError, match=refusal):
+            await github_dispatch_service.withdraw_queued_handoff(db, item, scope, leader_session=leader)
+        await db.rollback()
+
+    async with maker() as db:
+        item = await db.get(GithubWorkItem, item_id)
+        assert (item.handoff_state, item.handoff_target_slot_id, item.handoff_expires_at) == (
+            "queued", target_id, current_expiry,
+        )
+        assert await db.scalar(select(FactoryAuditEvent.id).where(FactoryAuditEvent.item_id == item_id)) is None
+
+
+@pytest.mark.asyncio
 async def test_committed_start_without_launch_cannot_be_started_again(db, monkeypatch):
     _, slots, scope = await _team(db)
     item = GithubWorkItem(scope_id=scope.id, issue_number=9030, issue_title="Interrupted start", issue_url="u",
