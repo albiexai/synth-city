@@ -2,24 +2,26 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from types import SimpleNamespace
-from typing import get_args
+from typing import TYPE_CHECKING, get_args
 
-from sqlalchemy import func, select, tuple_
+from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.exc import OperationalError
 from mcp_shim.work_remaining_protocol import MAX_AGE
 
 from app.models.database import (
     AgentTeamPreset, AgentTeamSlot, GithubApprovalRequest, GithubOwnerObservationPause,
-    GithubWorkItem, GithubWorkspace, MailExternalActor, TeamGithubScope,
+    GithubWorkItem, GithubWorkspace, MailExternalActor, MailMessage, MailTeamMember, TeamGithubScope,
 )
 from app.models.factory_schemas import (
     AgentTeamSummaryResponse, TeamRemainingWork, TeamSummaryAttention, TeamSummaryHumanAction,
     TeamRequiredCIUnreadable, TeamSummaryActivityReason, TeamSummaryCoverageReason, TeamWaitingInput,
 )
-from app.models.schemas import UnansweredRequestView
+from app.models.schemas import MAIL_REQUEST_KINDS, AgentActivityObservation, UnansweredRequestView
 from app.services.github_coordination_service import hold_code
 from app.services.github_dispatch_service import ESCALATION_REASONS
 from app.services.github_operator_attention_service import github_operator_attention_service
@@ -27,8 +29,13 @@ from app.services.github_operator_context_service import bind_attempt
 from app.services.github_work_progress_service import github_work_progress_service
 from app.services.agent_team_campaign_service import agent_team_campaign_service
 from app.services import required_ci_attention
-from app.services.agent_team_supervisor_service import observe_supervisor, supervisor_observation, team_needs_no_supervision
+from app.services.agent_team_supervisor_service import (
+    clean_note, observe_supervisor, supervisor_observation, team_needs_no_supervision,
+)
 from app.services.work_item_states import ATTENTION_STATUSES, FINISHED_STATUSES
+
+if TYPE_CHECKING:
+    from app.services.agent_activity_service import ActivityBinding
 
 _ACTORS = ("owner", "leader", "operator", "controller", "reviewer")
 _KINDS = {"review_pr", "merge_pr", "inspect_attempt", "inspect_checkpoint", "milestone_acceptance",
@@ -39,10 +46,40 @@ _LEGACY_OBSERVATION_PAUSE_REASON = "owner_observation_pause"
 _INSPECTION_REASONS = ESCALATION_REASONS | {_LEGACY_OBSERVATION_PAUSE_REASON}
 _ACTIVITY_REASONS = frozenset(get_args(TeamSummaryActivityReason))
 _SUMMARY_VALIDITY_SECONDS = 30
+logger = logging.getLogger(__name__)
 
 
 def _utc(value):
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def _quiet_live_member(entry: AgentActivityObservation, bindings: Sequence[ActivityBinding], now: datetime) -> bool:
+    # These reasons come from an observer that checked the live process on the authenticated binding.
+    if not bindings or entry.waiting_input is not None:
+        return False
+    if entry.reason == "native_event_stale":
+        return True
+    if entry.reason != "no_native_event":
+        return False
+
+    from app.services.agent_activity_service import _WORK_FRESHNESS_SECONDS, _process_started_at
+
+    cutoff = now - timedelta(seconds=_WORK_FRESHNESS_SECONDS)
+    observed_at = entry.observed_at
+    return (observed_at is None or _utc(observed_at) < cutoff) and all(
+        _process_started_at(binding.pane_start) < cutoff
+        and (binding.registered_at is None or _utc(binding.registered_at) < cutoff)
+        for binding in bindings
+    )
+
+
+def _log_observation_error(preset_id: int, source: str, error: Exception) -> None:
+    # SQLAlchemy's full exception contains statements and parameters.
+    detail = error.orig if isinstance(error, OperationalError) else error
+    message = clean_note(str(detail))
+    if not message:
+        message = "observation deadline exceeded" if isinstance(error, TimeoutError) else "no diagnostic message"
+    logger.warning("Team %s summary observation at %s: %s: %s", preset_id, source, type(error).__name__, message)
 
 
 class _FilterMatch:
@@ -142,7 +179,18 @@ class AgentTeamSummaryService:
             .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
             .where(TeamGithubScope.preset_id == preset_id, GithubApprovalRequest.status == "pending")
             .order_by(GithubApprovalRequest.id).limit(65))).all())
-        return team, scopes, items, count, approvals
+        # A repository or harness filter cannot prove that an excluded slot has no work.
+        owners_with_work = select(GithubWorkItem.owner_slot_id).join(TeamGithubScope,
+            TeamGithubScope.id == GithubWorkItem.scope_id).outerjoin(
+            GithubWorkspace, GithubWorkspace.leased_item_id == GithubWorkItem.id).where(
+            TeamGithubScope.preset_id == preset_id, GithubWorkItem.owner_slot_id.is_not(None),
+            or_(GithubWorkItem.dispatch_status.not_in(FINISHED_STATUSES), GithubWorkspace.id.is_not(None)))
+        pending_recipients = select(MailTeamMember.team_slot_id).join(
+            MailMessage, MailMessage.recipient_member_id == MailTeamMember.id).where(
+            MailTeamMember.team_preset_id == preset_id, MailTeamMember.team_slot_id.is_not(None),
+            MailMessage.kind.in_(MAIL_REQUEST_KINDS), MailMessage.request_status == "pending")
+        occupied_slots = frozenset((await db.execute(owners_with_work.union(pending_recipients))).scalars())
+        return team, scopes, items, count, approvals, occupied_slots
 
     async def _pauses(self, db, preset_id):
         return tuple((await db.execute(select(GithubOwnerObservationPause.id,
@@ -194,7 +242,7 @@ class AgentTeamSummaryService:
         initial = await self._snapshot(db, preset_id, scope_id, provider)
         if initial is None:
             return None
-        team, scope_rows, items, total, approvals = initial
+        team, scope_rows, items, total, approvals, occupied_slots = initial
         scopes = [SimpleNamespace(**row._mapping) for row in scope_rows[:32]]
         attention, visible_actions, actors, observations = [], [], set(), []
         if team.backlog_milestone:
@@ -256,6 +304,11 @@ class AgentTeamSummaryService:
                 reason = getattr(entry, "reason", None)
                 # An unlaunched slot with no leased work has no active owner to observe.
                 if entry.state != "unknown" or (reason == "no_current_binding" and entry.slot_id not in leased_owner_slots):
+                    continue
+                native_input = native_fence.get(entry.slot_id)
+                if entry.slot_id not in occupied_slots and native_input is not None and _quiet_live_member(
+                    entry, native_input[3], started,
+                ):
                     continue
                 coverage.append(TeamSummaryCoverageReason(code="native_unknown", slot_id=entry.slot_id,
                     activity_reason=reason if reason in _ACTIVITY_REASONS else None))
@@ -331,6 +384,7 @@ class AgentTeamSummaryService:
                 waiting_input = None
                 coverage.append(TeamSummaryCoverageReason(code="fence_changed", source="native"))
         except (TimeoutError, OSError, ValueError, OperationalError) as error:
+            _log_observation_error(preset_id, source, error)
             waiting_input = None
             coverage.append(TeamSummaryCoverageReason(
                 code="observation_timeout" if isinstance(error, TimeoutError) else "observation_failed",
@@ -454,6 +508,7 @@ class AgentTeamSummaryService:
                 published_native = {entry[0]: entry for entry in await bounded(lambda: _team_inputs(db, preset_id, 256))}
                 native_changed = published_native != native_fence
         except (TimeoutError, OSError, ValueError, OperationalError) as error:
+            _log_observation_error(preset_id, "publication/native" if rechecking_native else "publication", error)
             publication_error = error
             if db.in_transaction():
                 await db.rollback()

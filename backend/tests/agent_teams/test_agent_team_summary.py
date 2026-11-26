@@ -4,11 +4,19 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.database import Base
-from app.models.database import AgentTeamPreset, AgentTeamSlot, GithubOwnerObservationPause, GithubWorkItem, TeamGithubScope
+from app.models.database import (
+    AgentPaneBinding, AgentTeamPreset, AgentTeamSlot, GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace,
+    MailAgentSession, MailMessage, MailTeamMember, TeamGithubScope,
+)
 from app.models.github_work_progress_schemas import GithubPublicationObservation, GithubWorkProgressResponse, GithubWorkRemainingView
+from app.models.schemas import AgentActivityObservation, NativeInputWait
+from app.services import agent_activity_service as activity
+from app.services.agent_team_campaign_service import agent_team_campaign_service
 from app.services.agent_team_summary_service import AgentTeamSummaryService
 from app.services.github_operator_attention_service import github_operator_attention_service
 from app.services.github_operator_context_service import bind_attempt
@@ -142,6 +150,153 @@ async def test_summary_reports_public_native_reason_without_private_identity(db,
     assert result.remaining_work.state == "known"
     assert "private-launch-option" not in result.model_dump_json()
     assert "private-native-debug-value" not in result.model_dump_json()
+
+
+async def bind_quiet_summary_member(
+    db, team, monkeypatch, *, reason, age_seconds=600, waiting=False, recent_registration=False,
+):
+    slot = await db.scalar(select(AgentTeamSlot).where(AgentTeamSlot.preset_id == team.id))
+    slot_id = slot.id
+    if recent_registration:
+        # The Pi binding takes its registration time from the authenticated Mail session.
+        slot.provider = "pi-cli"
+    member = MailTeamMember(identity_key="quiet-member", repo_id="fixture", repo_path="/synthetic/project",
+        repo_name="fixture", display_name="Worker", team_preset_id=team.id, team_slot_id=slot_id)
+    db.add(member)
+    await db.flush()
+    db.add_all([
+        AgentPaneBinding(pane_pid=41002, pane_proc_start="29", slot_id=slot_id, preset_id=team.id, tmux_target="%10"),
+        MailAgentSession(member_id=member.id, provider=slot.provider, source="mcp", session_key="quiet-session",
+            team_slot_id=slot_id, team_preset_id=team.id, bound_pane_pid=41002, bound_pane_proc_start="29",
+            cwd="/synthetic/project", capability_token_hash="synthetic-hash", mailbox_status="connected",
+            pid=41003 if recent_registration else None, created_at=datetime.utcnow()),
+    ])
+    await db.commit()
+
+    def observe(slot_id, provider, session_id, bindings, duplicate, now, *, provenance=None):
+        assert len(bindings) == 1
+        observed_at = now - timedelta(seconds=age_seconds) if reason == "native_event_stale" else None
+        wait = NativeInputWait(reason="question", observed_at=now) if waiting else None
+        return AgentActivityObservation(
+            slot_id=slot_id, state="unknown", reason=reason, observed_at=observed_at, waiting_input=wait)
+
+    monkeypatch.setattr(activity, "_observe", observe)
+    monkeypatch.setattr(activity, "_process_started_at",
+        lambda start: datetime.now(timezone.utc) - timedelta(seconds=age_seconds))
+    return member
+
+
+def request_for(member_id):
+    return MailMessage(kind="context_request", request_status="pending", recipient_member_id=member_id,
+        audience_type="member", audience_id=str(member_id), body_markdown="Fixture request")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario,reason,expected_complete", [
+    ("quiet", "native_event_stale", True),
+    ("quiet", "no_native_event", True),
+    ("just-launched", "no_native_event", False),
+    ("recent-registration", "no_native_event", False),
+    ("waiting-for-input", "no_native_event", False),
+    ("dispatched", "no_native_event", False),
+    ("filtered-dispatch", "native_event_stale", False),
+    ("retained-lease", "native_event_stale", False),
+    ("pending-request", "native_event_stale", False),
+    ("unreadable", "observation_unavailable", False),
+])
+async def test_only_quiet_live_slots_without_work_stop_blocking_coverage(
+    db, monkeypatch, scenario, reason, expected_complete,
+):
+    statuses = {"dispatched": ("dispatched",), "filtered-dispatch": ("dispatched",), "retained-lease": ("merged",)}
+    team, scope, items = await seed(db, statuses.get(scenario, ()))
+    member = await bind_quiet_summary_member(
+        db, team, monkeypatch, reason=reason, age_seconds=5 if scenario == "just-launched" else 600,
+        waiting=scenario == "waiting-for-input", recent_registration=scenario == "recent-registration")
+    scope_filter = None
+    if scenario == "retained-lease":
+        db.add(GithubWorkspace(scope_id=scope.id, path="/synthetic/leased", leased_item_id=items[0].id,
+            lease_token="fixture-retained-lease"))
+    if scenario == "pending-request":
+        db.add(request_for(member.id))
+    if scenario == "filtered-dispatch":
+        other_scope = TeamGithubScope(preset_id=team.id, repo_owner="example", repo_name="other",
+            repo_path="/synthetic/other")
+        db.add(other_scope)
+        await db.flush()
+        scope_filter = other_scope.id
+    await db.commit()
+
+    slot_id = member.team_slot_id
+    summary, _ = service(monkeypatch)
+    result = await summary.summary(db, team.id, scope_id=scope_filter)
+    assert result.coverage_complete is expected_complete
+    public_reason = None if reason == "native_event_stale" else reason
+    assert [(row.code, row.slot_id, row.activity_reason) for row in result.coverage_reason] == (
+        [] if expected_complete else [("native_unknown", slot_id, public_reason)])
+    assert [row.reason for row in result.waiting_input] == (["question"] if scenario == "waiting-for-input" else [])
+
+
+@pytest.mark.asyncio
+async def test_request_arriving_during_the_summary_invalidates_quiet_coverage(db, monkeypatch):
+    team, _, _ = await seed(db, ())
+    member = await bind_quiet_summary_member(db, team, monkeypatch, reason="native_event_stale")
+    member_id = member.id
+
+    class NewRequestCampaign:
+        async def summary(self, db, preset_id, actions, **kwargs):
+            result = await agent_team_campaign_service.summary(db, preset_id, actions, **kwargs)
+            db.add(request_for(member_id))
+            await db.commit()
+            return result
+
+    summary, _ = service(monkeypatch, campaign=NewRequestCampaign())
+    result = await summary.summary(db, team.id)
+    assert not result.coverage_complete
+    assert [row.code for row in result.coverage_reason] == ["source_changed"]
+    assert result.waiting_input is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase,error_type,coverage_code", [
+    ("native", OSError, "observation_failed"),
+    ("native", TimeoutError, "observation_timeout"),
+    ("publication", OperationalError, "observation_failed"),
+])
+async def test_summary_logs_sanitized_observation_failure(db, monkeypatch, caplog, phase, error_type, coverage_code):
+    team, _, _ = await seed(db, ())
+    team_id = team.id
+    summary, _ = service(monkeypatch)
+    diagnostic = "forced observation failure\npassword=fixture-private-password"
+
+    if phase == "native":
+        async def fail(*args, **kwargs):
+            raise error_type(diagnostic)
+
+        monkeypatch.setattr(activity, "observe_team", fail)
+    else:
+        original = summary._snapshot
+        snapshots = 0
+
+        async def fail_at_publication(*args, **kwargs):
+            nonlocal snapshots
+            snapshots += 1
+            if snapshots == 3:
+                raise OperationalError("fixture-private-statement", ("fixture-private-parameter",), OSError(diagnostic))
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(summary, "_snapshot", fail_at_publication)
+
+    with caplog.at_level("WARNING", logger="app.services.agent_team_summary_service"):
+        result = await summary.summary(db, team_id)
+    assert not result.coverage_complete
+    assert coverage_code in {reason.code for reason in result.coverage_reason}
+    records = [record for record in caplog.records if record.name == "app.services.agent_team_summary_service"]
+    (record,) = records
+    message = record.getMessage()
+    assert phase in message and error_type.__name__ in message
+    assert "forced observation failure password=[redacted]" in message
+    assert "fixture-private" not in message
+    assert "\n" not in message and record.exc_info is None
 
 
 @pytest.mark.asyncio
