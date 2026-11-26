@@ -171,6 +171,7 @@ ESCALATION_REASONS = frozenset(
         "integration_update_conflict",
         "retry_count_exhausted",
         "continuation_revision_exhausted",
+        "amendment_budget_exhausted",
         "continuation_budget_exhausted",
         "continuation_invalid_state",
         "continuation_pr_identity_invalid",

@@ -299,9 +299,15 @@ The current Leader settles an active negative fact through `synth_city_end_submi
 or `POST /github-work-items/{id}/submitted-revision/end`, supplying `review_id`, `dispatch_nonce`
 and `reason`. The server rechecks reviewer assignment, source head, current sessions, owner,
 Leader, policy, lease and pause/HOLD fences after external reads. It supersedes the submitted
-revision and clears owner acknowledgement without escalating or splitting the issue. Source work
-is stopped until a fresh bounded amendment, approval and owner activation. This action does not
-approve the source or satisfy independent acceptance, CI, human review or merge policy.
+revision and clears owner acknowledgement. In the usual case, resuming source work requires
+a fresh bounded amendment, Leader approval and owner activation.
+
+If the submitted revision is a scope amendment and the current attempt has used all three
+approved amendments, settlement escalates the item with `amendment_budget_exhausted`. The item,
+PR and workspace lease stay bound to the attempt. The owner can use `synth_city_request_continuation`
+within the existing continuation budgets. The Leader must approve the proposal, and the owner
+must acknowledge the delivered revision before editing. Settlement alone grants no source,
+independent acceptance, CI, human review or merge authority.
 
 An independent `accepted` fact for the exact submitted head is settled by the current Leader, who must
 differ from the owner, through `synth_city_settle_accepted_revision` or
