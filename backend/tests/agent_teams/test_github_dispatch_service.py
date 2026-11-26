@@ -6983,9 +6983,15 @@ async def test_monitor_leaves_item_when_leader_not_registered_yet(db):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_pending_queues_when_no_workspace_is_available(db):
+@pytest.mark.parametrize("missing_workspace", [False, True])
+async def test_dispatch_pending_queues_when_no_workspace_is_available(db, tmp_path, missing_workspace):
     preset, slots, scope = await _team(db)
     await db.execute(delete(GithubWorkspace).where(GithubWorkspace.scope_id == scope.id))
+    if missing_workspace:
+        db.add(GithubWorkspace(
+            scope_id=scope.id, path=str(tmp_path / "missing"), enabled=False,
+            provision_error="Previous checkout reset failed",
+        ))
     item = GithubWorkItem(
         scope_id=scope.id,
         issue_number=950,
@@ -7010,6 +7016,8 @@ async def test_dispatch_pending_queues_when_no_workspace_is_available(db):
 
     assert item.dispatch_status == "pending"
     assert item.pending_reason == "queued_no_workspace"
+    await db.refresh(item)
+    assert item.workspace_wait_reason == ("workspace_missing" if missing_workspace else "no_free_workspace")
     assert item.owner_slot_id == slots[1].id
     assert item.routing_method == "label"
 

@@ -390,6 +390,7 @@ class GithubWorkItem(Base):
     # A milestone return gets a new item while its predecessor remains addressable.
     milestone_replaced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     pending_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    workspace_wait_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     dispatch_priority: Mapped[int | None] = mapped_column(Integer, nullable=True)
     launch_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("agent_team_launches.id", ondelete="SET NULL"), nullable=True

@@ -1397,6 +1397,8 @@ class GithubDispatchService:
             start_identity = _item_identity(item)
             workspace = await github_workspace_service.acquire(db, scope, item)
             if workspace is None:
+                from app.services.github_workspace_readiness import explain_workspace_wait
+
                 skipped_primary = await github_workspace_service.skipped_primary_count(
                     db, scope.id
                 )
@@ -1408,7 +1410,7 @@ class GithubDispatchService:
                 )
                 await self._update_current_item(
                     db, item, start_identity, dispatch_status="pending", pending_reason="queued_no_workspace",
-                    status_note=status_note,
+                    status_note=status_note, workspace_wait_reason=await explain_workspace_wait(db, scope),
                 )
                 await db.commit()
                 continue
