@@ -185,12 +185,16 @@ export interface SupervisorAddress {
 export interface SupervisorBindingUpdate {
   actor_id: number | null
   grace_seconds?: number | null
+  // The binding version that the operator reviewed. The server refuses the write (409) when the binding has changed since.
+  expected_binding_version?: number
 }
 
 export interface SupervisorObservation {
   status: 'none' | 'healthy' | 'late' | 'absent'
   actor_id: number | null
   address?: SupervisorAddress | null
+  // Counts the binding writes of the team. Missing on an older server.
+  binding_version?: number
   checked_at: string | null
   next_check_at: string | null
   grace_seconds: number

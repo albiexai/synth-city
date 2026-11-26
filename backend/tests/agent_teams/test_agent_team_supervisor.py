@@ -292,3 +292,172 @@ async def test_supervisor_message_refuses_membership_changed_before_insert(db, m
     with pytest.raises(PermissionError, match="supervisor_address_not_bound"):
         await send_supervisor_message(db, session, SupervisorMessageRequest(actor_id=actor_id, body_markdown="Incident."))
     assert (await db.scalars(select(MailMessage))).all() == []
+
+
+# #1298: a durable binding version makes an edit apply only to the binding that the operator reviewed.
+DIRECTOR = {"X-Synth-City-Operator-Token": "synthetic-director-token"}
+
+
+def supervisor_path(team_id: int) -> str:
+    return f"/api/v1/agent-teams/presets/{team_id}/supervisor"
+
+
+async def put_supervisor(client, team_id: int, body: dict):
+    return await client.put(supervisor_path(team_id), headers=DIRECTOR, json=body)
+
+
+async def read_supervisor(client, team_id: int) -> dict:
+    return (await client.get(supervisor_path(team_id), headers=DIRECTOR)).json()
+
+
+@pytest.mark.asyncio
+async def test_binding_version_starts_at_zero_and_each_write_adds_one(db, supervisor_client):
+    team, actor = await supervisor_team(db)
+    team_id, actor_id = team.id, actor.id
+    assert (await read_supervisor(supervisor_client, team_id))["binding_version"] == 0
+    first = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id})
+    assert first.status_code == 200 and first.json()["binding_version"] == 1
+    second = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 120})
+    assert second.json()["binding_version"] == 2
+    removed = await put_supervisor(supervisor_client, team_id, {"actor_id": None})
+    assert removed.json()["binding_version"] == 3
+
+
+@pytest.mark.asyncio
+async def test_summary_reports_the_binding_version(db, supervisor_client):
+    team, actor = await supervisor_team(db)
+    team_id, actor_id = team.id, actor.id
+    await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id})
+    summary = await supervisor_client.get(f"/api/v1/agent-teams/presets/{team_id}/summary")
+    assert summary.status_code == 200
+    assert summary.json()["supervisor_observation"]["binding_version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_matching_expected_version_is_accepted(db, supervisor_client):
+    team, actor = await supervisor_team(db)
+    team_id, actor_id = team.id, actor.id
+    response = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "expected_binding_version": 0})
+    assert response.status_code == 200 and response.json()["binding_version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_expected_version_is_refused_and_changes_nothing(db, supervisor_client):
+    team, actor = await supervisor_team(db)
+    team_id, actor_id = team.id, actor.id
+    await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 120})
+    response = await put_supervisor(supervisor_client, team_id,
+                                    {"actor_id": actor_id, "grace_seconds": 999, "expected_binding_version": 0})
+    assert response.status_code == 409 and response.json()["detail"] == "supervisor_binding_changed"
+    now = await read_supervisor(supervisor_client, team_id)
+    assert (now["actor_id"], now["grace_seconds"], now["binding_version"]) == (actor_id, 120, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [None, -1, "x"])
+async def test_expected_version_must_be_a_whole_number_of_zero_or_more(db, supervisor_client, value):
+    team, actor = await supervisor_team(db)
+    team_id, actor_id = team.id, actor.id
+    response = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "expected_binding_version": value})
+    assert response.status_code == 422
+    assert (await read_supervisor(supervisor_client, team_id))["binding_version"] == 0
+
+
+@pytest.mark.asyncio
+async def test_old_removal_cannot_remove_a_binding_of_the_same_actor_and_grace(db, supervisor_client):
+    """Remove, then bind the same actor with the same grace: the state looks the same, the version does not."""
+    team, actor = await supervisor_team(db)
+    team_id, actor_id = team.id, actor.id
+    bound = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 60})
+    reviewed = bound.json()["binding_version"]
+    assert (await put_supervisor(supervisor_client, team_id, {"actor_id": None})).status_code == 200
+    rebound = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 60})
+    assert rebound.json()["actor_id"] == actor_id and rebound.json()["grace_seconds"] == 60
+    stale = await put_supervisor(supervisor_client, team_id, {"actor_id": None, "expected_binding_version": reviewed})
+    assert stale.status_code == 409
+    now = await read_supervisor(supervisor_client, team_id)
+    assert (now["actor_id"], now["grace_seconds"]) == (actor_id, 60)
+    assert now["binding_version"] == rebound.json()["binding_version"] == 3
+
+
+@pytest.mark.asyncio
+async def test_two_writes_with_one_version_let_only_the_first_win(db, supervisor_client):
+    team, actor = await supervisor_team(db)
+    team_id, actor_id = team.id, actor.id
+    version = (await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id})).json()["binding_version"]
+    first = await put_supervisor(supervisor_client, team_id,
+                                 {"actor_id": actor_id, "grace_seconds": 300, "expected_binding_version": version})
+    second = await put_supervisor(supervisor_client, team_id,
+                                  {"actor_id": actor_id, "grace_seconds": 700, "expected_binding_version": version})
+    assert first.status_code == 200 and second.status_code == 409
+    assert (await read_supervisor(supervisor_client, team_id))["grace_seconds"] == 300
+
+
+@pytest.mark.asyncio
+async def test_a_check_in_does_not_change_the_binding_version(db, supervisor_client):
+    from app.services.agent_team_supervisor_service import supervisor_checkin
+    team, actor = await supervisor_team(db)
+    team_id = team.id
+    now = datetime(2026, 10, 13, tzinfo=timezone.utc)
+    await put_supervisor(supervisor_client, team_id, {"actor_id": actor.id})
+    before = (await read_supervisor(supervisor_client, team_id))["binding_version"]
+    result = await supervisor_checkin(db, actor, team_id, now + timedelta(hours=1), now=now)
+    assert result["binding_version"] == before == 1
+    assert (await read_supervisor(supervisor_client, team_id))["binding_version"] == before
+
+
+@pytest.mark.asyncio
+async def test_omitted_grace_is_unchanged_and_explicit_null_returns_to_the_default(db, supervisor_client):
+    team, actor = await supervisor_team(db)
+    team_id, actor_id = team.id, actor.id
+    await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 120})
+    omitted = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "expected_binding_version": 1})
+    assert omitted.json()["grace_seconds"] == 120
+    reset = await put_supervisor(supervisor_client, team_id,
+                                 {"actor_id": actor_id, "grace_seconds": None, "expected_binding_version": 2})
+    assert reset.json()["grace_seconds"] == 1800
+
+
+@pytest.mark.asyncio
+async def test_the_version_check_and_the_write_are_one_atomic_step(db, supervisor_client, monkeypatch):
+    """A binding write that lands between the read and the update of a request must make that update match no row."""
+    from sqlalchemy import update as sql_update
+    team, actor = await supervisor_team(db)
+    team_id, actor_id = team.id, actor.id
+    version = (await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "grace_seconds": 60})).json()["binding_version"]
+    execute = db.execute
+    raced = False
+
+    async def racing(statement, *args, **kwargs):
+        nonlocal raced
+        if not raced and getattr(statement, "is_update", False):
+            raced = True
+            # Another client removed and rebound the same actor with the same grace: only the version differs.
+            await execute(sql_update(AgentTeamPreset).where(AgentTeamPreset.id == team_id)
+                          .values(supervisor_binding_version=AgentTeamPreset.supervisor_binding_version + 2))
+        return await execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, "execute", racing)
+    response = await put_supervisor(supervisor_client, team_id, {"actor_id": None, "expected_binding_version": version})
+    assert raced
+    assert response.status_code == 409 and response.json()["detail"] == "supervisor_binding_changed"
+    monkeypatch.setattr(db, "execute", execute)
+    now = await read_supervisor(supervisor_client, team_id)
+    assert (now["actor_id"], now["grace_seconds"]) == (actor_id, 60)
+
+
+@pytest.mark.asyncio
+async def test_a_row_without_a_version_counts_as_version_zero_and_can_be_written(db, supervisor_client):
+    """A raw insert that omits the column gets 0 from the database. An explicit NULL is also read as 0."""
+    from sqlalchemy import text
+    team, actor = await supervisor_team(db)
+    team_id, actor_id = team.id, actor.id
+    await db.execute(text("UPDATE agent_team_presets SET supervisor_binding_version = NULL WHERE id = :id"), {"id": team_id})
+    await db.commit()
+    assert (await read_supervisor(supervisor_client, team_id))["binding_version"] == 0
+    response = await put_supervisor(supervisor_client, team_id, {"actor_id": actor_id, "expected_binding_version": 0})
+    assert response.status_code == 200 and response.json()["binding_version"] == 1
+    inserted = await db.execute(text("INSERT INTO agent_team_presets (name, created_at, updated_at, autonomy_enabled) "
+                                     "VALUES ('Raw', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0)"))
+    await db.commit()
+    assert (await read_supervisor(supervisor_client, inserted.lastrowid))["binding_version"] == 0

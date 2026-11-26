@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import JSON, insert, literal, select, update
+from sqlalchemy import JSON, func, insert, literal, select, update
 
 from app.models.api_model import utc_datetime
 from app.models.database import (AgentTeamPreset, AgentTeamSlot, MailAgentSession, MailExternalActor,
@@ -69,7 +69,8 @@ def supervisor_observation(team, *, now: datetime | None = None, actor=None, qui
         status = "absent"
     return {"status": status, "actor_id": actor_id,
             "address": supervisor_address(actor), "checked_at": checked, "next_check_at": promised,
-            "grace_seconds": grace, "note": clean_note(team.supervisor_note) if actor_id is not None else None,
+            "grace_seconds": grace, "binding_version": int(getattr(team, "supervisor_binding_version", 0) or 0),
+            "note": clean_note(team.supervisor_note) if actor_id is not None else None,
             "attention": "Supervisor check-in overdue" if status in {"late", "absent"} and not quiet else None}
 
 
@@ -92,6 +93,7 @@ def _current_binding(team):
             AgentTeamPreset.supervisor_checked_at == team.supervisor_checked_at,
             AgentTeamPreset.supervisor_next_check_at == team.supervisor_next_check_at,
             AgentTeamPreset.supervisor_grace_seconds == team.supervisor_grace_seconds,
+            func.coalesce(AgentTeamPreset.supervisor_binding_version, 0) == int(team.supervisor_binding_version or 0),
             AgentTeamPreset.supervisor_observed_status == team.supervisor_observed_status)
 
 
@@ -135,17 +137,27 @@ async def observe_supervisor(db, preset_id: int, *, now: datetime | None = None)
 
 
 async def bind_supervisor(db, preset_id: int, *, actor_id: int | None,
-                          grace_seconds: int | None, set_grace: bool, now: datetime | None = None) -> dict:
-    """Register an operator-selected actor without changing team permissions."""
+                          grace_seconds: int | None, set_grace: bool, now: datetime | None = None,
+                          expected_binding_version: int | None = None) -> dict:
+    """Register an operator-selected actor without changing team permissions.
+
+    ``expected_binding_version``: when given, the write applies only to the binding that the caller reviewed.
+    The check and the write are one atomic update (``_current_binding`` holds the version), so a removal and a
+    rebinding of the same actor cannot be mistaken for the reviewed binding. Omitted: the write is not checked.
+    """
     current = utc_datetime(now or datetime.now(timezone.utc))
     team = await _team(db, preset_id)
     if team is None:
         raise ValueError("supervisor_team_missing")
+    if expected_binding_version is not None and expected_binding_version != int(team.supervisor_binding_version or 0):
+        await db.rollback()
+        raise ValueError("supervisor_binding_changed")
     actor = await db.get(MailExternalActor, actor_id) if actor_id is not None else None
     if actor_id is not None and actor is None:
         raise ValueError("supervisor_actor_missing")
     old_actor, old_grace = team.supervisor_actor_id, team.supervisor_grace_seconds
-    values = {"supervisor_actor_id": actor_id, "updated_at": current.replace(tzinfo=None)}
+    values = {"supervisor_actor_id": actor_id, "updated_at": current.replace(tzinfo=None),
+              "supervisor_binding_version": func.coalesce(AgentTeamPreset.supervisor_binding_version, 0) + 1}
     if actor_id != old_actor:
         values.update(supervisor_checked_at=None, supervisor_next_check_at=None, supervisor_note=None,
                       supervisor_observed_status="absent" if actor_id is not None else "none")

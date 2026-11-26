@@ -171,6 +171,9 @@ class AgentTeamPreset(Base):
     supervisor_next_check_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     supervisor_note: Mapped[str | None] = mapped_column(String, nullable=True)
     supervisor_grace_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Counts the binding writes of this team. A write that carries the version it reviewed cannot change a newer binding.
+    # The database default is 0, so a raw insert that omits the column (the e2e seed does) gets 0; a NULL also counts as 0.
+    supervisor_binding_version: Mapped[int | None] = mapped_column(Integer, default=0, server_default="0", nullable=True)
     supervisor_observed_status: Mapped[str | None] = mapped_column(String, nullable=True)
 
 

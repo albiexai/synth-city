@@ -871,6 +871,7 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         ("supervisor_checked_at", "DATETIME"), ("supervisor_next_check_at", "DATETIME"),
         ("supervisor_note", "VARCHAR"), ("supervisor_grace_seconds", "INTEGER"),
         ("supervisor_observed_status", "VARCHAR"),
+        ("supervisor_binding_version", "INTEGER DEFAULT 0"),
     ):
         if preset_columns and column not in preset_columns:
             await conn.execute(text(f"ALTER TABLE agent_team_presets ADD COLUMN {column} {definition}"))

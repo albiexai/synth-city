@@ -1988,6 +1988,8 @@ class SupervisorObservation(BaseModel):
     checked_at: datetime | None
     next_check_at: datetime | None
     grace_seconds: int = Field(ge=1)
+    # Counts the binding writes of the team. An older server does not send it.
+    binding_version: int = Field(default=0, ge=0)
     note: str | None
     attention: Literal["Supervisor check-in overdue"] | None
     team_idle: list[TeamIdleItem] = Field(default_factory=list)
@@ -1998,6 +2000,14 @@ class SupervisorBindingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     actor_id: int | None = Field(..., gt=0)
     grace_seconds: int | None = Field(default=None, ge=1)
+    # Omitted: the write is not checked. Given: the write applies only to this binding version (409 otherwise).
+    expected_binding_version: int | None = Field(default=None, ge=0, strict=True)
+
+    @model_validator(mode="after")
+    def _expected_version_is_a_number_when_given(self):
+        if "expected_binding_version" in self.model_fields_set and self.expected_binding_version is None:
+            raise ValueError("expected_binding_version must be a whole number of 0 or more")
+        return self
 
 
 class SupervisorCheckinRequest(BaseModel):

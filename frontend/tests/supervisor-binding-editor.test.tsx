@@ -22,7 +22,7 @@ vi.mock('../src/features/factory/auditApi', async (importOriginal) => ({
   fetchAuditEvents: vi.fn(),
 }))
 
-const none: SupervisorObservation = { status: 'none', actor_id: null, address: null, checked_at: null, next_check_at: null, grace_seconds: 1800, note: null, attention: null }
+const none: SupervisorObservation = { status: 'none', actor_id: null, address: null, checked_at: null, next_check_at: null, grace_seconds: 1800, binding_version: 4, note: null, attention: null }
 const bound: SupervisorObservation = { ...none, status: 'healthy', actor_id: 7, address: { actor_id: 7, address: 'night@example', display_name: 'Night supervisor' }, grace_seconds: 1800 }
 const event = (id: number, before: Record<string, unknown>, after: Record<string, unknown>, extra = {}) => ({
   id, occurred_at: '2026-11-26T08:00:00Z', recorded_at: '2026-11-26T08:00:00Z', event_kind: 'policy_change',
@@ -34,7 +34,7 @@ const auditPage = (items: ReturnType<typeof event>[], total = items.length, page
 const deferred = <T,>() => { let resolve!: (value: T) => void; let reject!: (error: Error) => void; const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej }); return { promise, resolve, reject } }
 const flush = () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
 
-function Harness({ observation, refresh }: { observation: SupervisorObservation; refresh: () => Promise<void> }) {
+function Harness({ observation, refresh }: { observation: SupervisorObservation | null; refresh: () => Promise<void> }) {
   const [open, setOpen] = useState(false)
   return (
     <>
@@ -43,7 +43,7 @@ function Harness({ observation, refresh }: { observation: SupervisorObservation;
     </>
   )
 }
-async function openEditor(observation = bound, refresh = vi.fn().mockResolvedValue(undefined)) {
+async function openEditor(observation: SupervisorObservation | null = bound, refresh = vi.fn().mockResolvedValue(undefined)) {
   const user = userEvent.setup()
   const view = renderUi(<Harness observation={observation} refresh={refresh} />, { wrapper: MemoryRouter })
   await user.click(screen.getByRole('button', { name: 'Edit supervisor binding for Alpha' }))
@@ -78,7 +78,7 @@ describe('the supervisor binding editor', () => {
   it('binds an actor by its id and sends only the actor id', async () => {
     const { user, refresh } = await openEditor(none)
     await retype(user, actor(), '12'); await user.click(save())
-    await waitFor(() => expect(updateTeamSupervisor).toHaveBeenCalledWith(1, { actor_id: 12 }, 'director-key'))
+    await waitFor(() => expect(updateTeamSupervisor).toHaveBeenCalledWith(1, { actor_id: 12, expected_binding_version: 4 }, 'director-key'))
     expect(refresh).toHaveBeenCalled()
   })
 
@@ -92,7 +92,7 @@ describe('the supervisor binding editor', () => {
   it('changes only the grace: the current actor id and the new grace are sent', async () => {
     const { user } = await openEditor()
     await retype(user, grace(), '900'); await user.click(save())
-    await waitFor(() => expect(updateTeamSupervisor).toHaveBeenCalledWith(1, { actor_id: 7, grace_seconds: 900 }, 'director-key'))
+    await waitFor(() => expect(updateTeamSupervisor).toHaveBeenCalledWith(1, { actor_id: 7, grace_seconds: 900, expected_binding_version: 4 }, 'director-key'))
   })
 
   it.each(['0', '1.5', 'abc', ''])('refuses the grace "%s" with no request', async (text) => {
@@ -105,13 +105,13 @@ describe('the supervisor binding editor', () => {
   it('returns the grace to the default with an explicit null', async () => {
     const { user } = await openEditor()
     await user.click(useDefault()); await user.click(save())
-    await waitFor(() => expect(updateTeamSupervisor).toHaveBeenCalledWith(1, { actor_id: 7, grace_seconds: null }, 'director-key'))
+    await waitFor(() => expect(updateTeamSupervisor).toHaveBeenCalledWith(1, { actor_id: 7, grace_seconds: null, expected_binding_version: 4 }, 'director-key'))
   })
 
   it('changes only the actor: the grace is not sent', async () => {
     const { user } = await openEditor()
     await retype(user, actor(), '9'); await user.click(save())
-    await waitFor(() => expect(updateTeamSupervisor).toHaveBeenCalledWith(1, { actor_id: 9 }, 'director-key'))
+    await waitFor(() => expect(updateTeamSupervisor).toHaveBeenCalledWith(1, { actor_id: 9, expected_binding_version: 4 }, 'director-key'))
   })
 
   it('says "No value changed." when the same grace is typed again', async () => {
@@ -136,7 +136,7 @@ describe('the supervisor binding editor', () => {
     expect(updateTeamSupervisor).not.toHaveBeenCalled()
     await user.click(screen.getByRole('button', { name: 'Remove the supervisor' }))
     await user.click(screen.getByRole('button', { name: 'Remove' }))
-    await waitFor(() => expect(updateTeamSupervisor).toHaveBeenCalledWith(1, { actor_id: null }, 'director-key'))
+    await waitFor(() => expect(updateTeamSupervisor).toHaveBeenCalledWith(1, { actor_id: null, expected_binding_version: 4 }, 'director-key'))
   })
 
   it('shows a server refusal as words, not as a code', async () => {
@@ -312,6 +312,93 @@ describe('the supervisor binding editor', () => {
     expect(await screen.findByText('Grace: default → 900 seconds')).toBeInTheDocument()
     slow.resolve(auditPage([event(3, { supervisor_actor_id: null, supervisor_grace_seconds: null }, { supervisor_actor_id: 3, supervisor_grace_seconds: null })], 150, 2)); await flush()
     expect(screen.queryByText('Supervisor: none → actor 3')).not.toBeInTheDocument()
+  })
+
+  it('fails closed: with no binding version from the server, every write is off and none is sent', async () => {
+    const { user } = await openEditor({ ...bound, binding_version: undefined })
+    expect(screen.getByText(/Changes are off: this server does not report a binding version/)).toBeInTheDocument()
+    expect(save()).toBeDisabled(); expect(useDefault()).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Remove the supervisor' })).toBeDisabled()
+    await user.click(save())
+    expect(updateTeamSupervisor).not.toHaveBeenCalled()
+    expect(screen.getByText(/Night supervisor/)).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: 'History' })).toBeInTheDocument()
+  })
+
+  it('fails closed when the binding could not be read, and still shows the history', async () => {
+    await openEditor(null)
+    expect(screen.getByText('The supervisor binding could not be read.')).toBeInTheDocument()
+    expect(save()).toBeDisabled(); expect(useDefault()).toBeDisabled()
+    expect(updateTeamSupervisor).not.toHaveBeenCalled()
+    expect(await screen.findByText('Supervisor: none → actor 12')).toBeInTheDocument()
+  })
+
+  it('marks a draft stale when the binding version changes during the edit, and resets it on request', async () => {
+    const { user, view, refresh } = await openEditor()
+    await retype(user, grace(), '900')
+    view.rerender(<Harness observation={{ ...none, binding_version: 5 }} refresh={refresh} />)
+    await flush()
+    expect(screen.getByText('The binding changed while you edited. Review the current binding.')).toBeInTheDocument()
+    expect(save()).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: 'Review the current binding' }))
+    expect(screen.queryByText('The binding changed while you edited. Review the current binding.')).not.toBeInTheDocument()
+    expect(screen.getByText('No supervisor is bound.')).toBeInTheDocument()
+    expect(actor()).toHaveValue(''); expect(save()).toBeEnabled()
+    await retype(user, actor(), '12'); await user.click(save())
+    await waitFor(() => expect(updateTeamSupervisor).toHaveBeenCalledWith(1, { actor_id: 12, expected_binding_version: 5 }, 'director-key'))
+  })
+
+  it('keeps a stale draft stale when the operator keeps typing', async () => {
+    const { user, view, refresh } = await openEditor()
+    await retype(user, grace(), '900')
+    view.rerender(<Harness observation={{ ...bound, binding_version: 5 }} refresh={refresh} />)
+    await flush()
+    await user.type(grace(), '5')
+    expect(screen.getByText('The binding changed while you edited. Review the current binding.')).toBeInTheDocument()
+    expect(save()).toBeDisabled()
+  })
+
+  it('follows a changed version without a draft, and sends the new version', async () => {
+    const { user, view, refresh } = await openEditor()
+    view.rerender(<Harness observation={{ ...bound, grace_seconds: 600, binding_version: 6 }} refresh={refresh} />)
+    await flush()
+    expect(screen.queryByText(/changed while you edited/)).not.toBeInTheDocument()
+    await retype(user, grace(), '300'); await user.click(save())
+    await waitFor(() => expect(updateTeamSupervisor).toHaveBeenCalledWith(1, { actor_id: 7, grace_seconds: 300, expected_binding_version: 6 }, 'director-key'))
+  })
+
+  it('does not let a removal confirmation survive a changed binding', async () => {
+    const { user, view, refresh } = await openEditor()
+    await user.click(screen.getByRole('button', { name: 'Remove the supervisor' }))
+    expect(screen.getByRole('button', { name: 'Remove' })).toBeInTheDocument()
+    view.rerender(<Harness observation={{ ...bound, actor_id: 12, address: { actor_id: 12, address: 'new@example', display_name: 'New supervisor' }, binding_version: 5 }} refresh={refresh} />)
+    await flush()
+    expect(screen.queryByRole('button', { name: 'Remove' })).not.toBeInTheDocument()
+    expect(screen.getByText('The binding changed, so the removal was not confirmed.')).toBeInTheDocument()
+    expect(updateTeamSupervisor).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Remove the supervisor' }))
+    await user.click(screen.getByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(updateTeamSupervisor).toHaveBeenCalledWith(1, { actor_id: null, expected_binding_version: 5 }, 'director-key'))
+  })
+
+  it('on a conflict from the server, refreshes the binding and drops the draft', async () => {
+    vi.mocked(updateTeamSupervisor).mockRejectedValueOnce(new Error('supervisor_binding_changed'))
+    const { user, refresh } = await openEditor()
+    await retype(user, grace(), '900'); await user.click(save())
+    expect(await screen.findByText('The binding changed while you edited. Review the current binding, then save again.')).toBeInTheDocument()
+    await waitFor(() => expect(refresh).toHaveBeenCalled())
+    expect(grace()).toHaveValue('1800')
+  })
+
+  it('does not call a history empty while older pages are not read', async () => {
+    vi.mocked(fetchAuditEvents).mockResolvedValueOnce(auditPage([], 150, 1))
+    const { user } = await openEditor()
+    expect(screen.queryByText('No changes recorded yet.')).not.toBeInTheDocument()
+    expect(screen.getByText('No supervisor binding change in the events loaded so far. Load older history to look further.')).toBeInTheDocument()
+    vi.mocked(fetchAuditEvents).mockResolvedValueOnce(auditPage([bind12], 150, 2))
+    await user.click(screen.getByRole('button', { name: 'Load older history' }))
+    expect(await screen.findByText('Supervisor: none → actor 12')).toBeInTheDocument()
+    expect(screen.queryByText(/events loaded so far/)).not.toBeInTheDocument()
   })
 })
 

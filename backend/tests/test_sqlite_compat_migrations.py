@@ -1846,3 +1846,26 @@ async def test_dispatch_priority_migration_is_additive_and_repeats_safely():
             assert await conn.scalar(text("SELECT dispatch_priority FROM github_work_items WHERE id=1")) == 3
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_binding_version_column_migrates_existing_teams_and_repeats_safely():
+    """#1298: an older table gets the version column, existing teams start at 0, and a repeat changes nothing."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.connect() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            await conn.execute(text("ALTER TABLE agent_team_presets DROP COLUMN supervisor_binding_version"))
+            await conn.execute(text("INSERT INTO agent_team_presets (name, description, created_at, updated_at, autonomy_enabled) "
+                                    "VALUES ('Existing', 'Keep this team.', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0)"))
+            for _ in range(2):
+                await _run_sqlite_compat_migrations(conn)
+                columns = {row[1] for row in (await conn.execute(text("PRAGMA table_info(agent_team_presets)"))).all()}
+                assert "supervisor_binding_version" in columns
+                row = (await conn.execute(text("SELECT description, supervisor_binding_version FROM agent_team_presets"))).one()
+                assert tuple(row) == ("Keep this team.", 0)
+            await conn.execute(text("UPDATE agent_team_presets SET supervisor_binding_version = 4"))
+            await _run_sqlite_compat_migrations(conn)
+            assert (await conn.execute(text("SELECT supervisor_binding_version FROM agent_team_presets"))).scalar_one() == 4
+    finally:
+        await engine.dispose()

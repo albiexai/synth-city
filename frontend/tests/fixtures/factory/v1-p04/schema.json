@@ -378,6 +378,12 @@
               ],
               "title": "Attention"
             },
+            "binding_version": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Binding Version",
+              "type": "integer"
+            },
             "checked_at": {
               "anyOf": [
                 {
