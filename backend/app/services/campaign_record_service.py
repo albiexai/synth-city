@@ -3,8 +3,8 @@
 A campaign belongs to one team lifetime and selects issues with ``label:<name>`` or ``milestone:<title>`` in every
 repository the team watches: a label by name, a milestone by title, since GitHub milestones are per repository.
 Membership is read live from GitHub; #1219's deferrals and supersessions since the start take an issue out of it, with
-their reason. A repository that can't be read leaves the membership incomplete, never empty. Finishing (#1261) and
-creation on upgrade (#1243) live elsewhere.
+their reason. A repository that can't be read leaves the membership incomplete, never empty. The Director can adjust
+the start (#1243). Finishing (#1261) and creation on upgrade (#1243, ``campaign_upgrade_service``) live elsewhere.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import httpx
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select, update
 
 from app.models.database import (
     AgentTeamPreset,
@@ -98,15 +98,69 @@ async def start(db, preset_id: int, selector: str, *, started_at: datetime, acto
     if await current(db, preset_id) is not None:
         raise CampaignError("campaign_already_active")
     key = await audit.current_context_key(db, "team", preset_id) or await audit.context_key_for(db, "team", preset_id)
+    campaign = await insert(db, preset_id, key, selector, started_at=started_at, actor=actor,
+                            source="campaign_record_service.start")
+    await db.commit()
+    await db.refresh(campaign)
+    return campaign
+
+
+async def insert(db, preset_id: int, key: str, selector: str, *, started_at: datetime, actor: dict,
+                 source: str) -> Campaign:
+    """Add (never commit) an active campaign and its start event; the open-campaign index refuses a second one."""
     campaign = Campaign(team_context_key=key, preset_id=preset_id, selector=selector, status="active",
                         started_at=audit._naive(started_at))
     db.add(campaign)
     await db.flush()
     await audit.record_event(
-        db, event_kind="campaign_started", source="campaign_record_service.start", occurred_at=datetime.now(UTC),
+        db, event_kind="campaign_started", source=source, occurred_at=datetime.now(UTC),
         actor=actor, team_preset_id=preset_id, team_context_key=key, after_values={"status": "active"},
         action_outcome="applied", sanitized_reason=f"campaign started: {selector}",
         operation_id=f"campaign_started:{campaign.id}", correlation_id=f"campaign:{campaign.id}")
+    return campaign
+
+
+async def adjust_start(db, preset_id: int, *, started_at: datetime, expected_started_at: datetime,
+                       actor: dict) -> Campaign:
+    """The Director's change of the start of the team's active campaign (design §2), with one audit event.
+
+    A compare-and-set on the start the Director saw, the current team lifetime and the ``active`` status: a stale
+    view, a concurrent change or a campaign that began finishing changes nothing.
+    """
+    new, expected = audit._naive(started_at), audit._naive(expected_started_at)
+    if new > datetime.now(UTC).replace(tzinfo=None):
+        raise CampaignError("campaign_start_in_future")
+    campaign = await current(db, preset_id)
+    if campaign is None:
+        raise CampaignError("campaign_not_found")
+    if campaign.status != "active":
+        raise CampaignError("campaign_not_active")
+    campaign_id, key = campaign.id, campaign.team_context_key
+    # The team's lifetime is read in the update itself (V1 review 6078808159): a team retired, or its id reused,
+    # after the lookup changes nothing.
+    lifetime = select(FactoryContextKey.context_key).where(
+        FactoryContextKey.key_kind == "team", FactoryContextKey.numeric_id == preset_id,
+        FactoryContextKey.retired_at.is_(None)).scalar_subquery()
+    result = await db.execute(update(Campaign).where(
+        Campaign.id == campaign_id, Campaign.team_context_key == key, Campaign.team_context_key == lifetime,
+        Campaign.status == "active", Campaign.started_at == expected,
+    ).values(started_at=new).execution_options(synchronize_session=False))
+    if result.rowcount != 1:
+        await db.rollback()
+        if await audit.current_context_key(db, "team", preset_id) != key:
+            raise CampaignError("campaign_not_found")
+        raise CampaignError("campaign_start_changed")
+    # Each applied change is its own event, numbered under the update's write lock: a start moved back and forth
+    # keeps every change (V1 review 6078808159). The compare-and-set refuses a stale retry.
+    sequence = await db.scalar(select(func.count(FactoryAuditEvent.id)).where(
+        FactoryAuditEvent.event_kind == "campaign_start_adjusted",
+        FactoryAuditEvent.correlation_id == f"campaign:{campaign_id}")) + 1
+    await audit.record_event(
+        db, event_kind="campaign_start_adjusted", source="campaign_record_service.adjust_start",
+        occurred_at=datetime.now(UTC), actor=actor, team_preset_id=preset_id,
+        team_context_key=key, action_outcome="applied",
+        sanitized_reason=f"campaign start adjusted from {expected.isoformat()} to {new.isoformat()}",
+        operation_id=f"campaign_start_adjusted:{campaign_id}:{sequence}", correlation_id=f"campaign:{campaign_id}")
     await db.commit()
     await db.refresh(campaign)
     return campaign

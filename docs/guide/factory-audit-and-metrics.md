@@ -162,3 +162,21 @@ Membership is read from GitHub when it is needed, in all issue states:
 - An issue deferred or superseded through the end-stopped action after the campaign started leaves the membership, even if it still matches. It is listed among the departures with its destination (the target milestone or the superseding pull request) and its reason. Departures come from the recorded event itself (the team lifetime, repository and issue it named), so deleting the local work item, or reusing its id, changes nothing.
 - A repository that GitHub could not read, or where the milestone title doesn't name exactly one milestone, marks the membership incomplete, with the reason. It is never counted as zero members.
 - Once the campaign's team is deleted, its repositories are no longer read, even if a new team takes the same id. The membership is incomplete (`team_retired`). A campaign can only be started for an existing team.
+
+### Campaigns created on upgrade
+
+The first start of v4.4 records each team that has a backlog milestone or a parent issue, the settings the team's campaign progress already reads. Later starts record none. So a team configured afterwards, or one with neither setting, gets no campaign until the Director starts one. Each recorded team then gets one `active` campaign at a later poll:
+- **Selector:** `milestone:<backlog milestone>`, or the title of the parent issue's milestone when the parent is in one of the team's repositories. A parent outside them, or without a milestone, gives no campaign.
+- **Start:** the first admission (work item) of an issue that matches the selector, in the team's own repositories. With none yet, the campaign starts when it is created.
+- **When it waits:** while GitHub can't be read, or the membership is incomplete, the team waits for a later poll rather than getting a guessed start.
+- **When it yields:** if the Director started a campaign first, the Director's is kept. A deleted team, or a new team that took its id, gets none. Once a team's outcome is recorded, a slower poll can't overwrite it. Any other storage refusal leaves the team waiting for a later poll.
+
+The Director can adjust a campaign's start with `PATCH /api/v1/agent-teams/{preset_id}/campaign/start`, giving the new `started_at` and the `expected_started_at` they saw.
+- It needs the operator token, and a Mail session is refused.
+- Only an `active` campaign of the team's current lifetime changes, and only when the start is still the one the Director saw. Otherwise the answer is 409, or 404 when the team was deleted or its id reused.
+- A start in the future is refused (422).
+- Each change records its own `campaign_start_adjusted` event, even when a start is moved back to an earlier value.
+
+### Measures recorded from v4.4 on
+
+Check runs, the merge path, rate-limit windows, pull request facts and decision waits are recorded only from v4.4 on. A campaign that started before a measure's recording began reads unknown for that measure, never zero. Check runs, the merge path and rate-limit windows use their own recording markers. Pull request facts and decision waits use the first start of v4.4, so they may read unknown longer, but are never known too early. Every campaign measure reads this coverage first (`campaign_upgrade_service.recorded_coverage`), as the rate-limit measure already does with its own marker.

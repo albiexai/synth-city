@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,6 +20,8 @@ from app.models.factory_schemas import (
 from app.models.schemas import PlannedCampaignDecision
 from app.services.github_dispatch_priority import dispatch_order_key, effective_priority
 from app.services.work_item_states import is_done, needs_attention
+
+logger = logging.getLogger(__name__)
 
 _PARENT = re.compile(r"https://github\.com/([^/]+)/([^/]+)/issues/([1-9][0-9]*)\Z")
 _STATE_PHRASES = {
@@ -120,6 +123,18 @@ class AgentTeamCampaignService:
         if not rows:
             return
         captured = rows[0]
+        # #1243: a team recorded at the upgrade gets its campaign once, through this poll's client. It runs in its own
+        # session (V1 review 6078808159), so its commits and rollbacks never expire what the caller loaded. A failure
+        # stays pending for a later poll and never stops the backlog read.
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        from app.services import campaign_upgrade_service
+
+        try:
+            async with AsyncSession(db.bind, expire_on_commit=False) as own:
+                await campaign_upgrade_service.resolve_pending(own, captured.preset_id, client)
+        except Exception:  # noqa: BLE001  (the backlog read must run whatever happens here)
+            logger.info("Upgrade campaign unresolved for team %s", captured.preset_id)
         key, started = self._key(captured), self.clock()
         cached = self._cache.get(key)
         if cached and cached.expires_at > started:

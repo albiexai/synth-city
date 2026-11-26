@@ -1312,6 +1312,7 @@ async def init_db() -> None:
     """Initialize database tables."""
     # Register the derived observation table for CLI and HTTP startup alike.
     from app.models import database, github_work_progress  # noqa: F401
+    from app.services.campaign_upgrade_service import install as install_campaign_upgrade
     from app.services.github_check_history_service import install_check_history_coverage
     from app.services.github_merge_attempt_service import install_merge_attempt_coverage
     from app.services.github_rate_limit_history import install_rate_limit_history_coverage
@@ -1332,3 +1333,6 @@ async def init_db() -> None:
 
             async with AsyncSession(engine) as db, db.begin():
                 await supersede_stale_revisions_at_upgrade(db)
+        # #1243: once, at the first start of this version, the teams that get a campaign on upgrade.
+        async with AsyncSession(engine, expire_on_commit=False) as db:
+            await install_campaign_upgrade(db)
