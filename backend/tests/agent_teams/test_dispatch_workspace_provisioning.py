@@ -377,6 +377,31 @@ async def test_scope_growth_checks_existing_worktrees_against_the_proposed_check
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["pending", "main_checkout", "moved_worktree", "proposed_subdirectory"])
+async def test_checkout_match_requires_verified_worktrees_at_their_roots(monkeypatch, fault):
+    from app.services import dispatch_workspace_provisioning as provisioning
+
+    proposed = "/fixture/alternate"
+    worktree = "/fixture/dispatch-1"
+    common = "/fixture/original/.git"
+    identities = {
+        proposed: (f"{common}/worktrees/alternate", common,
+                   "/fixture" if fault == "proposed_subdirectory" else proposed),
+        worktree: (common if fault == "main_checkout" else f"{common}/worktrees/dispatch-1", common,
+                   "/fixture/moved" if fault == "moved_worktree" else worktree),
+    }
+
+    async def probe(path):
+        return identities[path]
+
+    monkeypatch.setattr(provisioning.github_workspace_service, "_probe_identity", probe)
+    timestamp = datetime.utcnow()
+    binding = provisioning.DispatchWorktreeBinding(1, worktree, timestamp, timestamp, pending=fault == "pending")
+
+    assert not await provisioning.dispatch_worktrees_match_checkout((binding,), proposed)
+
+
+@pytest.mark.asyncio
 async def test_concurrent_pool_reservations_keep_unverified_checkout_disabled(scope_database, monkeypatch):
     from app.services import dispatch_workspace_provisioning as provisioning
 
