@@ -811,6 +811,8 @@ class GithubApprovalService:
             actor=proposal.get("actor") or audit.derive_actor(actor_kind="member", member_id=owner.id),
             scope_id=scope.id, item_id=item.id, request_id=request.id, revision_id=revision.id,
             request_kind="scope_amendment", decision="requested")
+        await decision_waits.record_wait_started(
+            db, request, request_kind="scope_amendment", source="github_approval_service.create_scope_amendment_request")
         final_context = dict(context)
         final_context.update(approval_round_count=request.approval_round, ack_received_at=None)
         await self.claim_healthy_scope_context(db, final_context)
@@ -954,6 +956,9 @@ class GithubApprovalService:
             actor=actor or audit.derive_actor(actor_kind="member", member_id=leader_id),
             scope_id=scope.id, item_id=item.id, request_id=request.id, revision_id=revision.id,
             request_kind="scope_amendment", decision=decision)
+        await decision_waits.record_wait_ended(
+            db, [request.id], outcome=decision, answered_by_member_id=leader_id, ended_at=now,
+            source="github_approval_service.decide_scope_amendment")
         await self.claim_healthy_scope_context(db, context)
         if revision.expires_at is not None and revision.expires_at <= datetime.utcnow():
             await db.rollback()

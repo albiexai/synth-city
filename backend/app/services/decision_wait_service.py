@@ -21,6 +21,8 @@ ENDED = "decision_wait_ended"
 # #1240: a Mail request to a member, keyed by its message id, and an input wait on a pane, keyed by its episode.
 MAIL_STARTED, MAIL_ENDED = "mail_wait_started", "mail_wait_ended"
 INPUT_STARTED, INPUT_ENDED = "input_wait_started", "input_wait_ended"
+# #1299: an effort-limit episode, keyed by the Mail message id of the limit notice to the Leader.
+EFFORT_STARTED, EFFORT_ENDED = "effort_wait_started", "effort_wait_ended"
 # The Mail root of a structured request carries this delivery key; its decision wait already counts it.
 STRUCTURED_REQUEST_KEY = "github-approval:"
 
@@ -30,8 +32,11 @@ def wait_operation(kind: str, request_id: int) -> str:
     return f"{kind}:request:{request_id}"
 
 
-async def record_wait_started(db: AsyncSession, request: GithubApprovalRequest, *, source: str) -> None:
-    """Who asked, who must answer, and when it was asked."""
+async def record_wait_started(
+    db: AsyncSession, request: GithubApprovalRequest, *, source: str, request_kind: str | None = None,
+) -> None:
+    """Who asked, who must answer, and when it was asked. A scope amendment names its own kind (#1299)."""
+    request_kind = request_kind or request.request_kind
     await db.flush()
     operation_id = wait_operation(STARTED, request.id)
     await audit.record_event(
@@ -39,10 +44,10 @@ async def record_wait_started(db: AsyncSession, request: GithubApprovalRequest, 
         fact_source="github_approval_requests", fact_time=request.created_at,
         actor=audit.derive_actor(actor_kind="member", member_id=request.owner_member_id),
         item_id=request.work_item_id, request_id=request.id,
-        after_values={"wait_request_id": request.id, "request_kind": request.request_kind,
+        after_values={"wait_request_id": request.id, "request_kind": request_kind,
                       "owner_member_id": request.owner_member_id,
                       "awaited_member_id": request.leader_member_id, "awaited_role": "leader"},
-        action_outcome="applied", sanitized_reason=f"{request.request_kind} waits on the leader",
+        action_outcome="applied", sanitized_reason=f"{request_kind} waits on the leader",
         operation_id=operation_id, correlation_id=operation_id)
 
 
@@ -164,6 +169,49 @@ async def record_input_wait_ended(
         correlation_id=operation_id)
 
 
+async def record_effort_wait_started(
+    db: AsyncSession, *, item_id: int, notice_id: int, noticed_at: datetime, owner_member_id: int | None,
+    leader_member_id: int, source: str,
+) -> None:
+    """#1299: the effort-limit notice to the Leader starts a wait on the Leader's extension decision."""
+    operation_id = f"{EFFORT_STARTED}:message:{notice_id}"  # a repeat replays identically and adds nothing
+    await audit.record_event(
+        db, event_kind=EFFORT_STARTED, source=source, occurred_at=datetime.utcnow(), fact_source="mail_messages",
+        fact_time=audit._naive(noticed_at), item_id=item_id,
+        actor=audit.derive_actor(actor_kind="scheduler", scheduler="github_effort_limit_service"),
+        after_values={"wait_message_id": notice_id, "request_kind": "effort_extension",
+                      "owner_member_id": owner_member_id, "awaited_member_id": leader_member_id,
+                      "awaited_role": "leader"},
+        action_outcome="applied", sanitized_reason="effort extension waits on the leader",
+        operation_id=operation_id, correlation_id=operation_id)
+
+
+async def record_effort_wait_ended(
+    db: AsyncSession, *, item_id: int, outcome: str, ended_at: datetime, source: str,
+    answered_by_member_id: int | None = None,
+) -> None:
+    """End the item's open effort wait in its current lifetime: by an extension, or when the item ends."""
+    item_key = await audit.current_context_key(db, "item", item_id)
+    if item_key is None:
+        return
+    starts = (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == EFFORT_STARTED, FactoryAuditEvent.item_context_key == item_key))).all()
+    for started in starts:
+        operation_id = started.operation_id.replace(EFFORT_STARTED, EFFORT_ENDED, 1)
+        if await _once(db, operation_id):
+            continue
+        await audit.record_event(
+            db, event_kind=EFFORT_ENDED, source=source, occurred_at=datetime.utcnow(), fact_source="mail_messages",
+            fact_time=audit._naive(ended_at), item_id=started.item_id, item_context_key=item_key,
+            scope_context_key=started.scope_context_key, team_context_key=started.team_context_key,
+            actor=audit.derive_actor(actor_kind="member", member_id=answered_by_member_id)
+            if answered_by_member_id is not None else audit.derive_actor(actor_kind="system"),
+            after_values={"wait_message_id": started.after_values.get("wait_message_id"), "wait_outcome": outcome,
+                          "answered_by_member_id": answered_by_member_id},
+            action_outcome="applied", sanitized_reason=f"effort wait ended: {outcome}",
+            operation_id=operation_id, correlation_id=operation_id)
+
+
 @dataclass(frozen=True)
 class DecisionWait:
     request_id: int
@@ -202,7 +250,8 @@ async def unended_decision_waits(
             owner_member_id=values.get("owner_member_id"), awaited_member_id=values.get("awaited_member_id"),
             started_at=began, age_seconds=None if deleted else (now - began).total_seconds(),
             state="unknown" if deleted else "open", reason="work item deleted" if deleted else None))
-    for kind, (start_kind, end_kind) in {"mail": (MAIL_STARTED, MAIL_ENDED), "input": (INPUT_STARTED, INPUT_ENDED)}.items():
+    for kind, (start_kind, end_kind) in {"mail": (MAIL_STARTED, MAIL_ENDED), "input": (INPUT_STARTED, INPUT_ENDED),
+                                         "effort": (EFFORT_STARTED, EFFORT_ENDED)}.items():
         query = select(FactoryAuditEvent).where(FactoryAuditEvent.event_kind == start_kind)
         if team_context_key is not None:
             query = query.where(FactoryAuditEvent.team_context_key == team_context_key)
@@ -212,10 +261,13 @@ async def unended_decision_waits(
             if start.operation_id.replace(start_kind, end_kind, 1) in ended_ids:
                 continue
             values, began = start.after_values or {}, start.fact_time or start.occurred_at
+            # An item-bound wait (effort) whose work item was deleted is unknown, as for decision waits.
+            deleted = start.item_context_key is not None and start.item_context_key in retired
             waits.append(DecisionWait(
                 request_id=values.get("wait_message_id") or values.get("wait_binding_id"),
                 request_kind=values.get("request_kind"), owner_member_id=values.get("owner_member_id"),
                 awaited_member_id=values.get("awaited_member_id"), started_at=began,
-                age_seconds=(now - began).total_seconds(), state="open", wait_kind=kind,
-                awaited_actor_id=values.get("awaited_actor_id")))
+                age_seconds=None if deleted else (now - began).total_seconds(),
+                state="unknown" if deleted else "open", reason="work item deleted" if deleted else None,
+                wait_kind=kind, awaited_actor_id=values.get("awaited_actor_id")))
     return waits

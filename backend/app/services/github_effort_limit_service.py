@@ -18,6 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.database import GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace, TeamGithubScope
+from app.services import decision_wait_service as decision_waits
+from app.services.github_terminal_revision_service import TERMINAL_ITEMS
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +147,11 @@ class GithubEffortLimitService:
         now = now or datetime.utcnow()
         item = (await db.execute(select(GithubWorkItem).where(GithubWorkItem.id == item_id)
                                  .execution_options(populate_existing=True))).scalar_one_or_none()
+        if item is not None and item.dispatch_status in TERMINAL_ITEMS:
+            # #1299: an item that ended closes its open effort wait, unattributed, at this observation.
+            await decision_waits.record_effort_wait_ended(
+                db, item_id=item.id, outcome="item_ended", ended_at=now, source="github_effort_limit_service.tick_item")
+            await db.commit()
         if item is None or item.effort_limit_minutes is None:
             return "skipped"
         last = item.effort_last_tick_at if seen_last_tick is _UNSET else seen_last_tick
@@ -221,12 +228,20 @@ class GithubEffortLimitService:
         for role, member in (("leader", leader), ("owner", owner)):
             if member is None:
                 continue
-            await agent_mail_service.send_direct_message(
+            notice = await agent_mail_service.send_direct_message(
                 db, recipient_member_id=member.id, subject=f"Effort limit reached: issue #{item.issue_number}",
                 body_markdown=body,
                 payload={"kind": "github_effort_limit_reached", "work_item_id": item.id,
                          "limit_minutes": item.effort_limit_minutes, "extension_minutes": item.effort_extension_minutes},
                 delivery_key=f"github-effort:{item.id}:{item.dispatch_nonce}:{item.effort_extension_minutes}:{role}")
+            if role == "leader":
+                # #1299: the notice to the Leader starts the wait on the extension decision. The notice is sent once
+                # per limit episode; a start missed by a crash is recorded on the next tick.
+                await decision_waits.record_effort_wait_started(
+                    db, item_id=item.id, notice_id=notice.id, noticed_at=notice.created_at,
+                    owner_member_id=owner.id if owner is not None else None, leader_member_id=member.id,
+                    source="github_effort_limit_service._notify_at_limit")
+                await db.commit()
 
     # -- Leader extensions ----------------------------------------------------------------------------------------
 
@@ -370,6 +385,9 @@ class GithubEffortLimitService:
                 action_outcome="granted", scope_id=scope_id, item_id=work_item_id,
                 sanitized_reason=(f"Extended by {minutes} minutes to an effective limit of {limit + expected + minutes}"
                                   f" minutes. Reason: {reason[:150]} Evidence: {evidence}"))
+            await decision_waits.record_effort_wait_ended(
+                db, item_id=work_item_id, outcome="extended", answered_by_member_id=leader_member_id, ended_at=now,
+                source="github_effort_limit_service.extend")
         except Exception:
             await db.rollback()
             raise

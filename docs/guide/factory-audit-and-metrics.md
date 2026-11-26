@@ -74,6 +74,8 @@ Each plan approval request and each continuation request to the Leader records a
 
 Two more kinds of wait are recorded the same way. A Mail context request or handoff waits on its recipient from the moment it is sent (`mail_wait_started`) until it is answered or acknowledged (`mail_wait_ended`), keyed by the message id. The Mail side of a plan approval, continuation or scope amendment is not a second wait, because its decision wait already counts it. When a member's pane shows a question, trust prompt or sign-in prompt, an input wait starts (`input_wait_started`) on the bound Supervisor, or on the Leader when there is none. It ends when the prompt clears or turns into a provider refusal (`input_wait_ended`). A provider refusal is not a wait for input.
 
+A scope-amendment request is a decision wait like a plan approval, keyed by its request id. An effort-limit episode is one too: it starts when Synth City sends the Leader the effort-limit notice (`effort_wait_started`, keyed by that notice's message id) and ends when the Leader extends the limit, or when the item ends (`effort_wait_ended`). An owner's Mail request to the Leader during that time is still its own Mail wait, so wait counts may include both; time is counted once per instant by the retrospective measures.
+
 ## Review acceptance declarations
 
 An operator can record a review acceptance from a trusted source with `POST /api/v1/factory/review-acceptances`. The declaration names:
