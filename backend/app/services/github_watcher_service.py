@@ -6,6 +6,7 @@ import re
 from datetime import datetime
 from hashlib import sha256
 
+import httpx
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,12 +15,13 @@ from app.models.database import (
     AgentTeamSlot,
     FactoryAuditEvent,
     GithubAttemptScopeRevision,
+    GithubMilestoneWait,
     GithubWorkItem,
     GithubWorkspace,
     MailMessage,
     TeamGithubScope,
 )
-from app.services.github_client import GithubClient, github_client
+from app.services.github_client import GithubClient, GithubClientResponseError, github_client
 from app.services.github_dispatch_service import github_dispatch_service
 from app.services.github_dispatch_priority import priority_from_labels
 from app.services.agent_team_campaign_service import agent_team_campaign_service
@@ -201,6 +203,101 @@ def milestone_title(issue):
     return title if isinstance(title, str) else None
 
 
+async def _wait_issue_observations(db, scope, client, labeled):
+    tracked = (await db.execute(select(
+        GithubMilestoneWait.issue_number,
+        GithubMilestoneWait.milestone_title,
+        GithubMilestoneWait.github_updated_at,
+    ).where(
+        GithubMilestoneWait.scope_id == scope.id,
+        GithubMilestoneWait.milestone_title.is_not(None) | GithubMilestoneWait.issue_number.in_(labeled),
+    ))).all()
+    # The label feed is bounded. Confirm absent waits and conflicting snapshots
+    # from the same GitHub second before changing the durable observation.
+    recheck = []
+    for wait in tracked:
+        issue = labeled.get(wait.issue_number)
+        if issue is None or (
+            milestone_title(issue) != wait.milestone_title
+            and _parse_gh_ts(issue["updated_at"]) == wait.github_updated_at
+        ):
+            recheck.append(wait.issue_number)
+    if not recheck:
+        return labeled, {}
+    await db.commit()
+    try:
+        confirmed = await client.get_issues_by_number(scope.repo_owner, scope.repo_name, sorted(recheck))
+    except GithubRateLimited:
+        raise
+    except (httpx.HTTPError, GithubClientResponseError):
+        logger.info("Milestone wait confirmation unavailable for scope %s", scope.id)
+        confirmed = {}
+    observations = {number: issue for number, issue in labeled.items() if number not in recheck}
+    return observations | confirmed, confirmed
+
+
+async def _reconcile_milestone_waits(db, scope, routes, observed, confirmed, admitted):
+    if not observed:
+        return
+    repository_scopes = {row.id: row for row in (await db.execute(
+        select(TeamGithubScope.id, TeamGithubScope.preset_id, TeamGithubScope.dispatch_label)
+        .where(*_repository_scope(scope))
+    )).all()}
+    ready_labels = {row.dispatch_label for row in repository_scopes.values()}
+    routed_titles = {title for title in routes.values() if title}
+
+    waits = {}
+    for record in (await db.scalars(select(GithubMilestoneWait).where(
+        GithubMilestoneWait.scope_id.in_(repository_scopes),
+        GithubMilestoneWait.issue_number.in_(observed),
+    ).execution_options(populate_existing=True))).all():
+        waits.setdefault(record.issue_number, {})[record.scope_id] = record
+
+    prior_admissions = {}
+    for row in (await db.execute(
+        select(GithubWorkItem.issue_number, GithubWorkItem.scope_id, GithubWorkItem.dispatch_status,
+               GithubWorkItem.github_updated_at)
+        .where(GithubWorkItem.scope_id.in_(repository_scopes), GithubWorkItem.issue_number.in_(observed))
+        .order_by(GithubWorkItem.created_at.desc(), GithubWorkItem.id.desc())
+    )).all():
+        prior_admissions.setdefault(row.issue_number, row)
+
+    for number, issue in observed.items():
+        updated_at = _parse_gh_ts(issue["updated_at"])
+        records = waits.get(number, {})
+        previous = prior_admissions.get(number)
+        if (any(record.github_updated_at > updated_at for record in records.values())
+                or previous is not None and previous.github_updated_at > updated_at):
+            continue
+        labels = {label["name"] for label in issue.get("labels", [])}
+        title = milestone_title(issue)
+        waiting_scopes = set()
+        source = repository_scopes[previous.scope_id] if previous is not None else None
+        fallback_admitted = (source is not None and not routes.get(source.preset_id)
+                             and source.dispatch_label in labels and previous.dispatch_status not in TERMINAL_ITEMS)
+        if (number not in admitted and not fallback_admitted
+                and issue.get("state") == "open" and title and labels & ready_labels
+                and (previous is None or previous.dispatch_status != "merged")):
+            if title not in routed_titles:
+                waiting_scopes = {previous.scope_id} if previous is not None else set(repository_scopes)
+            else:
+                # A newly configured route does not clear a wait until actual admission.
+                waiting_scopes = {scope_id for scope_id, record in records.items()
+                                  if record.milestone_title == title}
+        for scope_id in records.keys() | waiting_scopes:
+            record = records.get(scope_id)
+            waiting_title = title if scope_id in waiting_scopes else None
+            if (record is not None and record.github_updated_at == updated_at
+                    and number not in confirmed and number not in admitted):
+                continue
+            if record is None:
+                db.add(GithubMilestoneWait(scope_id=scope_id, issue_number=number,
+                                          milestone_title=waiting_title, github_updated_at=updated_at))
+            else:
+                record.milestone_title = waiting_title
+                record.github_updated_at = updated_at
+
+
 async def _admission_blocked(db, scope, number):
     return await db.scalar(select(GithubWorkItem.id).join(TeamGithubScope).where(
         *_repository_scope(scope), GithubWorkItem.issue_number == number,
@@ -308,13 +405,14 @@ class GithubWatcherService:
             scope.repo_owner, scope.repo_name, scope.dispatch_label
         )
         scope_id = scope.id
+        open_labeled = {issue["number"]: issue for issue in labeled}
+        wait_observations, confirmed_wait_issues = await _wait_issue_observations(db, scope, client, open_labeled)
         if not await _lock_repository(db, scope):
             await db.rollback()
             return
         routes = await milestone_routes(db, scope)
         milestone = routes.get(scope.preset_id)
         admitted = set()
-        open_labeled = {issue["number"]: issue for issue in labeled}
         departures = dict((await db.execute(select(
             GithubWorkItem.issue_number, GithubWorkItem.github_updated_at,
         ).join(FactoryAuditEvent, FactoryAuditEvent.item_id == GithubWorkItem.id).where(
@@ -341,8 +439,9 @@ class GithubWatcherService:
                         or _parse_gh_ts(current["updated_at"]) < departure
                         or scope.dispatch_label not in {label["name"] for label in current.get("labels", [])}):
                     continue
-            await self._upsert_item(db, scope, issue)
-            admitted.add(number)
+            if await self._upsert_item(db, scope, issue):
+                admitted.add(number)
+        await _reconcile_milestone_waits(db, scope, routes, wait_observations, confirmed_wait_issues, admitted)
         # The admitted items are durable before any per-item completion runs: a later
         # rollback can then only discard that completion's own work, and the poll time
         # below is never written over upserts that were thrown away.
@@ -389,14 +488,14 @@ class GithubWatcherService:
             logger.info("Campaign backlog unavailable for scope %s", scope_id)
             await db.refresh(scope)
 
-    async def _upsert_item(self, db: AsyncSession, scope: TeamGithubScope, issue: dict) -> None:
+    async def _upsert_item(self, db: AsyncSession, scope: TeamGithubScope, issue: dict) -> bool:
         label_names = {label["name"] for label in issue.get("labels", [])}
         issue_type = "design" if scope.design_label in label_names else "code"
         github_updated_at = _parse_gh_ts(issue["updated_at"])
         deferrals = _milestone_deferrals(scope, issue["number"])
         predecessor = await db.scalar(deferrals)
         if predecessor is not None and github_updated_at < predecessor.github_updated_at:
-            return
+            return False
         existing = (
             await db.execute(
                 select(GithubWorkItem).where(
@@ -412,7 +511,7 @@ class GithubWatcherService:
                     or await db.scalar(deferrals.where(GithubWorkItem.id == existing.id)) is None
                     or await db.scalar(select(GithubWorkspace.id).where(
                         GithubWorkspace.leased_item_id == existing.id)) is not None):
-                return
+                return False
             existing.milestone_replaced_at = datetime.utcnow()
             await db.flush()
             existing = None
@@ -430,7 +529,7 @@ class GithubWatcherService:
                     dispatch_priority=priority_from_labels(label_names),
                 )
             )
-            return
+            return True
 
         if (
             existing.dispatch_status in _RECOVERABLE_STATUSES
@@ -447,6 +546,7 @@ class GithubWatcherService:
         existing.github_updated_at = github_updated_at
         existing.issue_title = issue["title"]
         existing.updated_at = datetime.utcnow()
+        return True
 
     async def _recheck_active_items(
         self, db: AsyncSession, scope: TeamGithubScope, client: GithubClient, *, milestone=None
