@@ -210,7 +210,8 @@ def test_workflow_uses_the_same_shard_count_and_attempt_artifacts():
     assert download["with"]["pattern"] == "e2e-journeys-*-attempt-*"
     assert download["with"]["merge-multiple"] is False
     proof = gate["steps"][-1]
-    for step in gate["steps"][1:]:
+    registry = next(step for step in gate["steps"] if step.get("name") == "Validate the known-flakes registry")
+    for step in gate["steps"][gate["steps"].index(registry) + 1:]:
         assert step["if"] == "needs.e2e-scope.outputs.run_suites == 'true'"
     assert "--shards 4" in proof["run"] and '--artifacts "$RUNNER_TEMP/e2e-journey-artifacts"' in proof["run"]
 
@@ -279,6 +280,9 @@ def test_workflow_gate_uses_its_checker_on_an_older_candidate_branch(collect, tm
     yml = fixture / ".github/workflows/e2e.yml"
     yml.parent.mkdir(parents=True)
     yml.write_text((ROOT / ".github/workflows/e2e.yml").read_text(encoding="utf-8"), encoding="utf-8")
+    validator = fixture / "scripts/ci/known_flakes.py"
+    validator.write_text((ROOT / "scripts/ci/known_flakes.py").read_text(encoding="utf-8"), encoding="utf-8")
+    (fixture / ".github/known-flakes.json").write_text("[]", encoding="utf-8")
     git("add", ".")
     git("commit", "-m", "Workflow and checker update")
     git("merge", "--no-ff", "--no-edit", "candidate")
@@ -298,6 +302,16 @@ def test_workflow_gate_uses_its_checker_on_an_older_candidate_branch(collect, tm
     assert not (candidate / "frontend/workflow-only.txt").exists()
     assert git("show", "workflow:frontend/workflow-only.txt") == "workflow-only journey\n"
     assert not (tooling / "frontend").exists()
+    assert not (candidate / ".github/known-flakes.json").exists()
+    validation = next(step for step in gate["steps"] if step.get("name") == "Validate the known-flakes registry")
+
+    def check_registry():
+        return subprocess.run(
+            ["bash", "-eu", "-c", validation["run"]], cwd=tmp_path, text=True, capture_output=True, check=False,
+        )
+
+    registry_check = check_registry()
+    assert registry_check.returncode == 0, registry_check.stderr
     old = subprocess.run(
         [sys.executable, str(candidate / checker.relative_to(fixture)), "--artifacts", "reports"],
         text=True, capture_output=True, check=False,
@@ -321,6 +335,21 @@ def test_workflow_gate_uses_its_checker_on_an_older_candidate_branch(collect, tm
     assert {json.loads(line)[0] for line in calls.read_text(encoding="utf-8").splitlines()} == {
         str(candidate / "frontend"),
     }
+
+    git("switch", "-c", "registry-edit")
+    registry = fixture / ".github/known-flakes.json"
+    registry.write_text(json.dumps([{
+        "test_id": "an active journey", "failure_signature": "TimeoutError",
+        "issue": 123, "expires_on": "2000-01-01",
+    }]), encoding="utf-8")
+    git("add", str(registry))
+    git("commit", "-m", "Candidate edits the registry")
+    git("switch", "workflow")
+    git("merge", "--no-ff", "--no-edit", "registry-edit")
+    git("-C", str(tooling), "pull", "--ff-only", "origin", "workflow")
+    edited_registry = check_registry()
+    assert edited_registry.returncode == 1
+    assert "an active journey" in edited_registry.stderr and "issue #123" in edited_registry.stderr
 
 
 def test_required_gates_keep_their_names_and_source_contract():

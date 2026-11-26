@@ -127,12 +127,15 @@ jobs:
           persist-credentials: false
       - name: Check out the workflow's gate tooling
         uses: actions/checkout@v7
-        if: needs.e2e-scope.outputs.run_suites == 'true'
         with:
           ref: ${{ github.workflow_sha }}
           path: .workflow-ci
-          sparse-checkout: scripts/ci
+          sparse-checkout: |
+            scripts/ci
+            .github
           persist-credentials: false
+      - name: Validate the known-flakes registry
+        run: python3 .workflow-ci/scripts/ci/known_flakes.py .workflow-ci/.github/known-flakes.json
       - uses: actions/setup-node@v7
         if: needs.e2e-scope.outputs.run_suites == 'true'
         with:
