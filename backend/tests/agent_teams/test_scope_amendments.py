@@ -765,8 +765,15 @@ async def test_diagnostic_restoration_uses_tree_even_when_restore_commit_differs
 
 
 @pytest_asyncio.fixture
-async def submitted_attempt(db, healthy_attempt):
+async def submitted_attempt(db, healthy_attempt, request):
     a = healthy_attempt
+    for number in range(1, getattr(request, "param", 1)):
+        await prior_amendment(a, db, number, [], status="completed", approved=True)
+    await submit_amendment_for_review(db, a)
+    return a
+
+
+async def submit_amendment_for_review(db, a):
     revision, approval, _ = await github_approval_service.create_scope_amendment_request(
         db, a.item, a.scope, **amendment(a))
     await github_approval_service.ensure_continuation_request_message(db, a.item, approval, revision)
@@ -784,7 +791,6 @@ async def submitted_attempt(db, healthy_attempt):
     a.item.pr_number = 5
     a.item.dispatch_status = "verifying"
     await bind_submitted_review(db, a, revision)
-    return a
 
 
 async def bind_submitted_review(db, a, revision):
@@ -792,16 +798,18 @@ async def bind_submitted_review(db, a, revision):
     from app.services.factory_delivery_policy import effective_policy
     from app.services.github_ci_watch_service import _digest
 
-    slot = AgentTeamSlot(preset_id=a.preset.id, position=2, display_name="Reviewer", provider="codex-cli",
-        repo_id="approval", repo_path=str(a.repo), repo_name="approval", launch_mode="plain",
-        launch_options={}, enabled=True)
-    db.add(slot)
-    await db.flush()
-    reviewer = MailTeamMember(identity_key=f"reviewer:{slot.id}", repo_id="approval", repo_path=str(a.repo),
-        repo_name="approval", display_name="Reviewer", participant_kind="team_slot",
-        team_preset_id=a.preset.id, team_slot_id=slot.id)
-    db.add(reviewer)
-    await db.flush()
+    reviewer = getattr(a, "reviewer", None)
+    if reviewer is None:
+        slot = AgentTeamSlot(preset_id=a.preset.id, position=2, display_name="Reviewer", provider="codex-cli",
+            repo_id="approval", repo_path=str(a.repo), repo_name="approval", launch_mode="plain",
+            launch_options={}, enabled=True)
+        db.add(slot)
+        await db.flush()
+        reviewer = MailTeamMember(identity_key=f"reviewer:{slot.id}", repo_id="approval", repo_path=str(a.repo),
+            repo_name="approval", display_name="Reviewer", participant_kind="team_slot",
+            team_preset_id=a.preset.id, team_slot_id=slot.id)
+        db.add(reviewer)
+        await db.flush()
     watch = GithubRequiredCheckWatch(work_item_id=a.item.id, dispatch_nonce=a.item.dispatch_nonce,
         scope_revision=revision.revision, pr_number=5, head_sha=a.head, owner_slot_id=a.owner.team_slot_id,
         reviewer_member_id=reviewer.id, policy_digest=_digest(effective_policy(a.item, a.scope)),
@@ -812,8 +820,10 @@ async def bind_submitted_review(db, a, revision):
 
 
 @pytest_asyncio.fixture
-async def submitted_continuation(db, healthy_attempt, monkeypatch):
+async def submitted_continuation(db, healthy_attempt, monkeypatch, request):
     a = healthy_attempt
+    for number in range(1, getattr(request, "param", 0) + 1):
+        await prior_amendment(a, db, number, [], status="completed", approved=True)
     monkeypatch.setattr(github_client, "get_recursive_tree", AsyncMock(return_value={}))
     a.item.pr_number = 5
     await github_dispatch_service.escalate_without_notification(db, a.item, "plan_blocked")
@@ -871,6 +881,8 @@ async def test_current_independent_changes_required_needs_leader_settlement_and_
     with pytest.raises(GithubApprovalError):
         await end_submitted_revision(db, a.item, review_id=review.id, leader_member_id=a.leader.id,
             dispatch_nonce=a.item.dispatch_nonce, reason='A different settlement is not a replay')
+    with pytest.raises(GithubApprovalError, match="continuation_not_escalated"):
+        await github_approval_service.create_continuation_request(db, a.item, a.scope, **amendment(a))
     next_revision, next_request, _ = await github_approval_service.create_scope_amendment_request(
         db, a.item, a.scope, **amendment(a, ["src/base.py", "src/added.py", "src/followup.py"]))
     assert next_revision.status == "proposed" and next_revision.previous_scope_revision == a.revision.revision
@@ -888,6 +900,167 @@ async def test_current_independent_changes_required_needs_leader_settlement_and_
             authenticated_owner_member_id=a.owner.id, authenticated_owner_slot_id=a.owner.team_slot_id,
             dispatch_nonce=a.item.dispatch_nonce, lease_token=a.workspace.lease_token)
     assert a.item.active_scope_revision == next_revision.revision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("submitted_attempt", [3], indirect=True)
+async def test_third_amendment_settlement_opens_the_normal_continuation_route(db, submitted_attempt, monkeypatch):
+    from app.services.github_terminal_revision_service import end_submitted_revision
+
+    a = submitted_attempt
+    assert a.revision.revision == 3 and a.revision.status == "submitted"
+    a.item.retry_count = 2
+    a.item.effort_limit_minutes = 55
+    a.item.effort_elapsed_seconds = 1200
+    a.revision.failed_head_count = 1
+    await db.commit()
+    before = (a.item.dispatch_nonce, a.item.pr_number, a.item.approval_round_count,
+              a.item.retry_count, a.item.effort_limit_minutes, a.item.effort_elapsed_seconds,
+              a.revision.failed_head_count, a.workspace.lease_token)
+    fact = await record_changes(db, a)
+    decision = dict(review_id=fact.id, leader_member_id=a.leader.id, dispatch_nonce=a.item.dispatch_nonce,
+                    reason="Settle the capped amendment")
+    await end_submitted_revision(db, a.item, **decision)
+    await db.refresh(a.revision)
+    await db.refresh(fact)
+    assert a.item.dispatch_status == "escalated"
+    assert a.item.escalation_reason == "amendment_budget_exhausted"
+    assert a.item.active_scope_revision == 3 and a.item.ack_received_at is None
+    assert a.revision.status == "superseded" and fact.status == "consumed"
+    assert before == (a.item.dispatch_nonce, a.item.pr_number, a.item.approval_round_count,
+                      a.item.retry_count, a.item.effort_limit_minutes, a.item.effort_elapsed_seconds,
+                      a.revision.failed_head_count, a.workspace.lease_token)
+    settled_at = a.revision.completed_at
+    replay = await end_submitted_revision(db, a.item, **decision)
+    assert replay.id == a.revision.id and replay.completed_at == settled_at
+    with pytest.raises(GithubApprovalError, match="current_leader_and_review_required"):
+        await end_submitted_revision(db, a.item, **{**decision, "reason": "A different disposition"})
+
+    monkeypatch.setattr(github_client, "get_recursive_tree", AsyncMock(return_value={}))
+    a.scope.max_continuation_revisions = 3
+    await db.commit()
+    with pytest.raises(GithubApprovalError, match="continuation_budget_exhausted"):
+        await github_approval_service.create_continuation_request(db, a.item, a.scope, **amendment(a))
+    a.scope.max_continuation_revisions = 6
+    await db.commit()
+    revision, request, created = await github_approval_service.create_continuation_request(
+        db, a.item, a.scope, **amendment(a))
+    assert created and revision.revision == 4 and revision.status == "proposed"
+    assert revision.originating_escalation_reason == "amendment_budget_exhausted"
+    await github_approval_service.ensure_continuation_request_message(db, a.item, request, revision)
+    await github_approval_service.decide_continuation(db, a.item,
+        authenticated_leader_member_id=a.leader.id, decision="approved", reason="Normal bounded recovery",
+        request_id=request.id)
+    await github_approval_service.ensure_continuation_decision_message(db, a.item, request, revision)
+    await github_approval_service.deliver_approved_continuation(db, a.item, request, revision)
+    assert a.item.ack_received_at is None
+    assert await github_dispatch_service.activate_continuation_revision(
+        db, a.item, a.scope, revision, authenticated_owner_member_id=a.owner.id,
+        authenticated_owner_slot_id=a.owner.team_slot_id, dispatch_nonce=a.item.dispatch_nonce,
+        lease_token=a.workspace.lease_token)
+    assert a.item.active_scope_revision == revision.revision and a.item.dispatch_status == "dispatched"
+    assert a.item.effort_limit_minutes == 55 and a.item.effort_elapsed_seconds == 1200
+
+
+@pytest.mark.asyncio
+async def test_approved_continuation_does_not_count_towards_amendment_cap(db, submitted_continuation):
+    from app.services.github_terminal_revision_service import end_submitted_revision
+
+    a = submitted_continuation
+    assert a.revision.origin_kind == "continuation" and a.revision.approved_at is not None
+    for reason in ("Settle the approved continuation", "Settle the first amendment"):
+        fact = await record_changes(db, a)
+        await end_submitted_revision(db, a.item, review_id=fact.id, leader_member_id=a.leader.id,
+            dispatch_nonce=a.item.dispatch_nonce, reason=reason)
+        await submit_amendment_for_review(db, a)
+
+    assert a.revision.revision == 3 and a.revision.origin_kind == "scope_amendment"
+    fact = await record_changes(db, a)
+    await end_submitted_revision(db, a.item, review_id=fact.id, leader_member_id=a.leader.id,
+        dispatch_nonce=a.item.dispatch_nonce, reason="Settle the second approved amendment")
+    assert a.item.dispatch_status == "dispatched" and a.item.escalation_reason is None
+
+
+@pytest.mark.asyncio
+async def test_capped_item_rejects_replay_of_an_older_consumed_review(db, submitted_attempt):
+    from app.services.github_terminal_revision_service import end_submitted_revision
+
+    a = submitted_attempt
+    old_fact = await record_changes(db, a)
+    old_decision = dict(review_id=old_fact.id, leader_member_id=a.leader.id,
+        dispatch_nonce=a.item.dispatch_nonce, reason="Settle the first amendment")
+    await end_submitted_revision(db, a.item, **old_decision)
+    await db.refresh(old_fact)
+    assert old_fact.status == "consumed"
+
+    for reason in ("Settle the second amendment", "Settle the capped amendment"):
+        await submit_amendment_for_review(db, a)
+        fact = await record_changes(db, a)
+        await end_submitted_revision(db, a.item, review_id=fact.id, leader_member_id=a.leader.id,
+            dispatch_nonce=a.item.dispatch_nonce, reason=reason)
+
+    assert a.item.active_scope_revision == 3 and a.item.dispatch_status == "escalated"
+    assert a.item.escalation_reason == "amendment_budget_exhausted"
+    with pytest.raises(GithubApprovalError, match="current_leader_and_review_required"):
+        await end_submitted_revision(db, a.item, **old_decision)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ignored", ["rejected", "prior_attempt"])
+async def test_settlement_counts_only_approved_amendments_of_this_attempt(db, submitted_attempt, ignored):
+    from app.services.github_terminal_revision_service import end_submitted_revision
+
+    a = submitted_attempt
+    for number in (2, 3):
+        if ignored == "rejected":
+            await prior_amendment(a, db, number, [])
+        else:
+            earlier = await prior_amendment(a, db, number, [], status="completed", approved=True)
+            earlier.dispatch_nonce = "previous-attempt"
+            await db.commit()
+    fact = await record_changes(db, a)
+    await end_submitted_revision(db, a.item, review_id=fact.id, leader_member_id=a.leader.id,
+        dispatch_nonce=a.item.dispatch_nonce, reason="Settle an amendment below its cap")
+    assert a.item.dispatch_status == "dispatched" and a.item.escalation_reason is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("submitted_continuation", [3], indirect=True)
+async def test_settling_a_continuation_does_not_use_the_amendment_cap_route(db, submitted_continuation):
+    from app.services.github_terminal_revision_service import end_submitted_revision
+
+    a = submitted_continuation
+    fact = await record_changes(db, a)
+    await end_submitted_revision(db, a.item, review_id=fact.id, leader_member_id=a.leader.id,
+        dispatch_nonce=a.item.dispatch_nonce, reason="Settle a non-amendment submission")
+    assert a.revision.origin_kind == "continuation"
+    assert a.item.dispatch_status == "dispatched" and a.item.escalation_reason is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("submitted_attempt", [3], indirect=True)
+async def test_cap_escalation_rolls_back_if_hold_arrives_during_settlement(db, submitted_attempt, monkeypatch):
+    from app.services import github_coordination_service as coordination
+    from app.services import github_terminal_revision_service as terminal
+
+    a = submitted_attempt
+    fact = await record_changes(db, a)
+    original_audit = terminal._review_audit
+
+    async def audit_then_hold(*args, **kwargs):
+        await original_audit(*args, **kwargs)
+        monkeypatch.setattr(coordination, "hold_code", lambda: "factory_hold")
+
+    monkeypatch.setattr(terminal, "_review_audit", audit_then_hold)
+    with pytest.raises(GithubApprovalError, match="stale_revision_review"):
+        await terminal.end_submitted_revision(db, a.item, review_id=fact.id, leader_member_id=a.leader.id,
+            dispatch_nonce=a.item.dispatch_nonce, reason="Settle with a concurrent hold")
+    await db.refresh(a.item)
+    await db.refresh(a.revision)
+    await db.refresh(fact)
+    assert a.item.dispatch_status == "verifying" and a.item.escalation_reason is None
+    assert a.item.ack_received_at is not None
+    assert a.revision.status == "submitted" and fact.status == "active"
 
 
 @pytest.mark.asyncio

@@ -55,6 +55,7 @@ CONTINUABLE_ESCALATIONS = frozenset(
         "leader_offline",
         "leader_ack_timeout",
         "continuation_revision_exhausted",
+        "amendment_budget_exhausted",
     }
 )
 _CONTINUATION_ACTIONS = frozenset(

@@ -3,7 +3,7 @@ from datetime import datetime
 import hashlib
 import json
 
-from sqlalchemy import String, cast, exists, inspect, select, update
+from sqlalchemy import String, cast, exists, func, inspect, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.api_model import format_utc_time
@@ -394,14 +394,17 @@ async def withdraw_revision_review(db, item, *, review_id, reviewer_member_id, d
 
 async def end_submitted_revision(db, item, *, review_id, leader_member_id, dispatch_nonce, reason, actor=None):
     from app.models.database import GithubRevisionReview
-    from app.services.github_approval_service import GithubApprovalError, github_approval_service as approval
+    from app.services.github_approval_service import (
+        GithubApprovalError, MAX_SCOPE_AMENDMENTS, github_approval_service as approval,
+    )
     fact = await db.get(GithubRevisionReview, review_id, populate_existing=True)
     if (not fact or fact.work_item_id != item.id or fact.dispatch_nonce != dispatch_nonce
             or fact.verdict != 'changes_required' or not reason.strip()):
         raise GithubApprovalError('current_negative_review_required')
     if fact.status == 'consumed':
         scope = await db.get(TeamGithubScope, item.scope_id)
-        context, _, leader, _ = await approval.healthy_scope_context(db, item, scope)
+        capped = item.dispatch_status == 'escalated' and item.escalation_reason == 'amendment_budget_exhausted'
+        context, _, leader, _ = await approval.healthy_scope_context(db, item, scope, allow_recovery=capped)
         await approval.bind_actor_session(db, context, actor)
         revision = await db.get(GithubAttemptScopeRevision, fact.revision_id, populate_existing=True)
         if (leader.id != leader_member_id or fact.settled_by_member_id != leader.id
@@ -409,6 +412,11 @@ async def end_submitted_revision(db, item, *, review_id, leader_member_id, dispa
                 or fact.expected_lease_token_hash != approval.lease_token_hash(context['lease_token'])
                 or not revision or revision.status != 'superseded' or not revision.completed_at):
             raise GithubApprovalError('current_leader_and_review_required', status_code=403)
+        if context['dispatch_status'] == 'escalated':
+            if (item.escalation_reason != 'amendment_budget_exhausted'
+                    or revision.origin_kind != 'scope_amendment' or revision.revision != context['active_scope_revision']):
+                raise GithubApprovalError('current_leader_and_review_required', status_code=403)
+            context['escalation_reason'] = 'amendment_budget_exhausted'
         await approval.claim_healthy_scope_context(db, context)
         return revision
     if fact.status != 'active':
@@ -423,6 +431,16 @@ async def end_submitted_revision(db, item, *, review_id, leader_member_id, dispa
     scope = await db.get(TeamGithubScope, item.scope_id)
     await _read_review_head(scope, context, fact.head_sha)
     await _claim_review_context(db, context)
+    capped = False
+    if revision.origin_kind == 'scope_amendment' and revision.approved_at is not None:
+        # Count the same approved amendments as the proposal cap, under the existing attempt writer.
+        count = await db.scalar(select(func.count()).select_from(GithubAttemptScopeRevision).where(
+            GithubAttemptScopeRevision.work_item_id == item.id,
+            GithubAttemptScopeRevision.dispatch_nonce == context['dispatch_nonce'],
+            GithubAttemptScopeRevision.origin_kind == 'scope_amendment',
+            GithubAttemptScopeRevision.approved_at.is_not(None),
+        ))
+        capped = count >= MAX_SCOPE_AMENDMENTS
     consumed = await db.execute(update(GithubRevisionReview).where(*(
         _same(getattr(GithubRevisionReview, key), value) for key, value in fact_values.items()))
         .values(status='consumed', ended_at=datetime.utcnow(), settled_by_member_id=leader_member_id,
@@ -432,12 +450,20 @@ async def end_submitted_revision(db, item, *, review_id, leader_member_id, dispa
         raise GithubApprovalError('stale_revision_review')
     await db.execute(update(GithubAttemptScopeRevision).where(GithubAttemptScopeRevision.id == revision.id)
         .values(status='superseded', completed_at=datetime.utcnow()).execution_options(synchronize_session=False))
-    await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == item.id).values(
-        dispatch_status='dispatched', escalation_reason=None, ack_received_at=None,
-        status_note='Submitted revision ended after current independent CHANGES REQUIRED and Leader settlement. '
-                    'Source work is stopped. A fresh bounded amendment, approval and owner acknowledgement are required.')
-        .execution_options(synchronize_session=False))
-    context['dispatch_status'], context['ack_received_at'] = 'dispatched', None
+    stopped = update(GithubWorkItem).where(GithubWorkItem.id == item.id).values(ack_received_at=None)
+    if capped:
+        stopped = stopped.values(dispatch_status='escalated', escalation_reason='amendment_budget_exhausted',
+            updated_at=datetime.utcnow(),
+            status_note='The Leader settled changes required on the final approved scope amendment. '
+                        'The owner can request a bounded continuation within the remaining budgets.')
+        context.update(dispatch_status='escalated', escalation_reason='amendment_budget_exhausted')
+    else:
+        stopped = stopped.values(dispatch_status='dispatched', escalation_reason=None,
+            status_note='Submitted revision ended after current independent CHANGES REQUIRED and Leader settlement. '
+                        'Source work is stopped. A fresh bounded amendment, approval and owner acknowledgement are required.')
+        context['dispatch_status'] = 'dispatched'
+    await db.execute(stopped.execution_options(synchronize_session=False))
+    context['ack_received_at'] = None
     context['review_revision']['status'] = 'superseded'
     # The completion timestamp is part of the exact revision fence.
     await db.refresh(revision)

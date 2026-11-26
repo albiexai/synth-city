@@ -116,6 +116,7 @@ const escalationReasonLabels: Record<string, string> = {
   integration_update_conflict: 'Integration update needs coordination',
   retry_count_exhausted: 'Verification retries exhausted',
   continuation_revision_exhausted: 'Continuation revision exhausted',
+  amendment_budget_exhausted: 'Approved amendment limit reached',
   continuation_budget_exhausted: 'Continuation budget exhausted',
   continuation_invalid_state: 'Continuation state invalid',
   continuation_pr_identity_invalid: 'Continuation PR identity invalid',
