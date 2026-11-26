@@ -18,9 +18,11 @@ from app.models.database import (
 from app.models.schemas import MailApprovalRequestCreate, MailMessageCreate
 from app.services.agent_mail_service import agent_mail_service
 from app.services.github_approval_service import GithubApprovalError, github_approval_service
+from app.services.github_app_auth_service import github_app_auth_service
 from app.services.github_client import GithubClientResponseError, GithubCommitSnapshot, GithubTreeEntry, github_client
 from app.services.github_verification_service import github_verification_service
 from app.services.github_dispatch_service import github_dispatch_service
+from app.services.github_work_item_projection import _work_item_response
 from app.utils import peer_process
 from app.database import Base, configure_sqlite_connection
 from tests.agent_mail.test_api import _dispatch_approval_fixture
@@ -230,6 +232,138 @@ async def initial_path_merge_case(db, a, monkeypatch, *, extra_file=False):
     return client, base_tip
 
 
+async def register_initial_pull(db, a, client, monkeypatch, route):
+    a.item.pr_number = a.item.last_verified_sha = None
+    a.item.dispatch_status = "dispatched"
+    client.pull["draft"] = True
+    if route == "pr_ready":
+        a.scope.github_auth_mode = "app"
+        a.scope.github_app_installation_id = 55
+        client.pull["user"] = {"login": "deck[bot]"}
+        monkeypatch.setattr(settings, "github_app_bot_login", "deck[bot]")
+        monkeypatch.setattr(github_app_auth_service, "require_configuration", lambda **kw: None)
+        monkeypatch.setattr(github_app_auth_service, "mint_repository_token", AsyncMock(return_value="app-token"))
+        client.get_ref = AsyncMock(return_value={"ref": f"refs/heads/{a.item.dispatch_head_ref}"})
+        client.list_pulls_for_head = AsyncMock(return_value=[])
+        client.create_pull = AsyncMock(return_value=client.pull)
+        client.get_pull = AsyncMock(return_value=client.pull)
+        await db.commit()
+        await github_verification_service.report_pr_ready(
+            db, a.item, a.scope, a.item.dispatch_head_ref, a.workspace.lease_token, client)
+    else:
+        await db.commit()
+        await github_verification_service.report_pr_opened(db, a.item, a.scope, client.pull["number"], client)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["pr_opened", "pr_ready"])
+async def test_pr_registration_shows_initial_paths_next_to_ci(db, healthy_attempt, monkeypatch, route):
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch, extra_file=True)
+    await register_initial_pull(db, a, client, monkeypatch, route)
+    await db.refresh(a.item)
+    assert a.item.dispatch_status == "verifying"
+    assert _work_item_response(a.item, a.scope).status_note == "initial_paths_out_of_scope: 'src/added.py'"
+    a.item.status_note = "GitHub checks are still running."
+    note = _work_item_response(a.item, a.scope).status_note
+    assert "GitHub checks are still running." in note and "src/added.py" in note
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["head", "base"])
+async def test_pr_registration_reports_an_inconclusive_comparison_if_the_pr_changes(
+    db, healthy_attempt, monkeypatch, side,
+):
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch, extra_file=True)
+    changed = {**client.pull, side: {**client.pull[side], "sha": "f" * 40}}
+    client.get_pull = AsyncMock(side_effect=[client.pull, changed])
+    await register_initial_pull(db, a, client, monkeypatch, "pr_opened")
+    assert _work_item_response(a.item, a.scope).status_note == (
+        "initial_paths_inconclusive: the PR changed during the comparison."
+    )
+
+
+@pytest.mark.asyncio
+async def test_pr_registration_cannot_publish_the_note_after_the_item_head_moves(db, healthy_attempt, monkeypatch):
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch, extra_file=True)
+    original_pull = client.get_pull
+
+    async def advance_head(*args):
+        pull = await original_pull(*args)
+        if client.pull_calls == 2:
+            await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == a.item.id)
+                             .values(verification_head_sha="1" * 40).execution_options(synchronize_session=False))
+            await db.commit()
+        return pull
+
+    client.get_pull = advance_head
+    await register_initial_pull(db, a, client, monkeypatch, "pr_opened")
+    await db.refresh(a.item)
+    assert a.item.verification_head_sha == "1" * 40
+    assert a.item.initial_paths_readiness is None
+
+
+@pytest.mark.asyncio
+async def test_pr_registration_shows_inconclusive_note_for_unverifiable_plan(db, healthy_attempt, monkeypatch):
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch, extra_file=True)
+    root = await db.get(MailMessage, a.approval.request_message_id)
+    root.payload = {**root.payload, "summary": "Changed after approval"}
+    await register_initial_pull(db, a, client, monkeypatch, "pr_opened")
+    assert _work_item_response(a.item, a.scope).status_note == (
+        "initial_paths_inconclusive: the approved first plan could not be verified."
+    )
+    client.get_merge_base.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_work_item_note_hides_readiness_for_an_older_verification_head(db, healthy_attempt, monkeypatch):
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch, extra_file=True)
+    await register_initial_pull(db, a, client, monkeypatch, "pr_opened")
+    assert "src/added.py" in _work_item_response(a.item, a.scope).status_note
+    a.item.verification_head_sha = "1" * 40
+    a.item.status_note = "GitHub checks are still running."
+    assert _work_item_response(a.item, a.scope).status_note == "GitHub checks are still running."
+
+
+@pytest.mark.asyncio
+async def test_verification_refreshes_the_readiness_note_for_the_new_head(db, healthy_attempt, monkeypatch):
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch, extra_file=True)
+    await register_initial_pull(db, a, client, monkeypatch, "pr_opened")
+    new_head, new_tree = "1" * 40, "2" * 40
+    snapshot, tree = client.get_commit_snapshot.side_effect, client.get_recursive_tree.side_effect
+    client.get_commit_snapshot.side_effect = lambda owner, repo, sha, **kw: (
+        GithubCommitSnapshot(new_head, new_tree) if sha == new_head else snapshot(owner, repo, sha, **kw))
+    client.get_recursive_tree.side_effect = lambda owner, repo, sha, **kw: (
+        {p: e for p, e in tree(owner, repo, a.tree, **kw).items() if p != "src/added.py"}
+        if sha == new_tree else tree(owner, repo, sha, **kw))
+    client.pull["head"]["sha"] = new_head
+    await github_verification_service.process_scope(db, a.scope, client=client)
+    await db.refresh(a.item)
+    assert a.item.verification_head_sha == a.item.initial_paths_readiness["head"] == new_head
+    assert a.item.initial_paths_readiness["note"] is None
+
+
+@pytest.mark.asyncio
+async def test_verification_rechecks_a_moved_base_at_the_same_head(db, healthy_attempt, monkeypatch):
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch, extra_file=True)
+    await register_initial_pull(db, a, client, monkeypatch, "pr_opened")
+    assert "src/added.py" in _work_item_response(a.item, a.scope).status_note
+
+    # The base now includes this commit, so there are no new PR paths to report.
+    client.pull["base"]["sha"] = "1" * 40
+    client.get_merge_base.return_value = a.head
+    await github_verification_service.process_scope(db, a.scope, client=client)
+    await db.refresh(a.item)
+    assert a.item.initial_paths_readiness == {"head": a.head, "base": "1" * 40, "note": None}
+    assert "initial_paths_out_of_scope" not in (_work_item_response(a.item, a.scope).status_note or "")
+
+
 @pytest.mark.asyncio
 async def test_initial_path_gate_merges_in_scope_head_with_base_only_files(db, healthy_attempt, monkeypatch):
     a = healthy_attempt
@@ -245,6 +379,13 @@ async def test_initial_path_gate_holds_extra_file_until_approved_amendment(db, h
 
     a = healthy_attempt
     client, _ = await initial_path_merge_case(db, a, monkeypatch, extra_file=True)
+    await register_initial_pull(db, a, client, monkeypatch, "pr_opened")
+    first_plan_note = a.item.initial_paths_readiness.copy()
+    assert "src/added.py" in _work_item_response(a.item, a.scope).status_note
+    a.item.dispatch_status = "ready_for_review"
+    a.item.last_verified_sha = a.head
+    client.pull["draft"] = False
+    await db.commit()
     await github_verification_service.process_scope(db, a.scope, client=client)
     assert client.merge_calls == 0 and a.item.dispatch_status == "ready_for_review"
     assert a.item.status_note == "initial_paths_out_of_scope: 'src/added.py'"
@@ -259,12 +400,18 @@ async def test_initial_path_gate_holds_extra_file_until_approved_amendment(db, h
     await github_dispatch_service.activate_continuation_revision(db, a.item, a.scope, revision,
         authenticated_owner_member_id=a.owner.id, authenticated_owner_slot_id=a.owner.team_slot_id,
         dispatch_nonce=a.item.dispatch_nonce, lease_token=a.workspace.lease_token)
+    assert "initial_paths_out_of_scope" not in _work_item_response(a.item, a.scope).status_note
     monkeypatch.setattr(client, "get_pull", AsyncMock(return_value=client.pull))
     await github_verification_service.submit_continuation_completion(
         db, a.item, a.scope, authenticated_owner_member_id=a.owner.id,
         authenticated_owner_slot_id=a.owner.team_slot_id, revision_number=revision.revision,
         dispatch_nonce=a.item.dispatch_nonce, current_head_sha=a.head, result_summary="Reviewed the amended paths",
         evidence={}, lease_token=a.workspace.lease_token, client=client)
+    assert a.item.initial_paths_readiness is None
+    # A stored first-plan result must stay hidden after the amendment submits for verification.
+    a.item.initial_paths_readiness = first_plan_note
+    assert "initial_paths_out_of_scope" not in (_work_item_response(a.item, a.scope).status_note or "")
+    await db.refresh(a.item)
     await bind_submitted_review(db, a, revision)
     await require_jobs(db, a, monkeypatch)
     await settle_accepted(db, a, await record_accepted(db, a))
@@ -275,7 +422,7 @@ async def test_initial_path_gate_holds_extra_file_until_approved_amendment(db, h
     await db.refresh(revision)
     assert a.item.active_scope_revision == revision.revision
     assert a.item.dispatch_status == "merged", a.item.status_note
-    assert client.merge_head_shas == [a.head] and client.get_merge_base.await_count == 1
+    assert client.merge_head_shas == [a.head] and client.get_merge_base.await_count == 2
 
 
 @pytest.mark.asyncio

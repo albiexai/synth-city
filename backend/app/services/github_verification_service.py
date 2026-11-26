@@ -269,6 +269,52 @@ class GithubVerificationService:
             return "initial_paths_out_of_scope: " + ", ".join(repr(path) for path in outside)
         return None
 
+    async def _refresh_initial_path_readiness(
+        self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, pull: dict, client: GithubClient,
+    ) -> bool:
+        head = self._head_sha(pull)
+        if item.issue_type != "code" or item.active_scope_revision or not head:
+            return True
+        base = (pull.get("base") or {}).get("sha")
+        prior = item.initial_paths_readiness or {}
+        if prior.get("head") == head and prior.get("base") == base:
+            return True
+        context = {key: getattr(item, key) for key in (
+            *_MERGE_FENCE_ITEM, "ack_received_at", "handoff_state", "verification_head_sha",
+        )}
+        try:
+            paths = await self._initial_merge_paths(db, item)
+        except GithubApprovalError:
+            note = _INITIAL_PLAN_UNVERIFIABLE
+        else:
+            if paths is None:
+                return True
+            try:
+                note = await self._initial_path_hold(scope, client, base, head, paths)
+                if note is None or note.startswith("initial_paths_out_of_scope:"):
+                    read_auth = ({"token": await github_approval_service.github_read_token(scope)}
+                                 if scope.github_auth_mode == "app" else {})
+                    fresh = await client.get_pull(scope.repo_owner, scope.repo_name, item.pr_number, **read_auth)
+                    if not isinstance(fresh.get("head"), dict) or not isinstance(fresh.get("base"), dict):
+                        raise ValueError("PR head and base evidence are missing")
+                    self._verify_pull_identity(fresh, scope, item, expected_base=pull["base"]["ref"])
+                    if (self._classify_pull(fresh) != "open" or fresh.get("number") != item.pr_number
+                            or self._head_sha(fresh) != head or fresh["base"].get("sha") != base):
+                        note = "initial_paths_inconclusive: the PR changed during the comparison."
+            except (ValueError, GithubApprovalError, GithubAppAuthError, GithubClientResponseError, httpx.HTTPError):
+                note = "initial_paths_inconclusive: the PR could not be rechecked."
+        claim = await db.execute(update(GithubWorkItem).where(*(
+            _same_value(getattr(GithubWorkItem, key), value) for key, value in context.items()
+        )).values(initial_paths_readiness={"head": head, "base": base, "note": note})
+            .execution_options(synchronize_session=False))
+        if claim.rowcount != 1:
+            await db.rollback()
+            await db.refresh(item)
+            return False
+        await db.commit()
+        await db.refresh(item, attribute_names=["initial_paths_readiness"])
+        return True
+
     async def submit_continuation_completion(
         self,
         db: AsyncSession,
@@ -828,7 +874,7 @@ class GithubVerificationService:
         if recoverable:
             item.escalation_reason = None
             item.retry_requested_at = None
-        await self._record_selected_pull(db, scope, item, pull, verdict)
+        await self._record_selected_pull(db, scope, item, pull, verdict, client=client)
 
     async def report_pr_ready(
         self,
@@ -919,6 +965,7 @@ class GithubVerificationService:
                 pulls,
                 expected_base=base,
                 verify_author=True,
+                client=client,
             )
             if selected is not None:
                 return selected
@@ -959,6 +1006,7 @@ class GithubVerificationService:
                     pulls,
                     expected_base=base,
                     verify_author=True,
+                    client=client,
                 )
                 if selected is None:
                     raise ValueError("pull_creation_outcome_unresolved")
@@ -971,6 +1019,7 @@ class GithubVerificationService:
                 [created],
                 expected_base=base,
                 verify_author=False,
+                client=client,
             )
             if selected is None:
                 raise ValueError("pull_creation_returned_no_pull")
@@ -1010,6 +1059,7 @@ class GithubVerificationService:
         *,
         expected_base: str,
         verify_author: bool,
+        client: GithubClient | None = None,
     ) -> int | None:
         unique_pulls: dict[int, dict] = {}
         for pull in pulls:
@@ -1064,6 +1114,7 @@ class GithubVerificationService:
                     item,
                     selected[0],
                     "open",
+                    client=client,
                 )
                 return numbers[0]
             if verdict == "merged":
@@ -1096,6 +1147,8 @@ class GithubVerificationService:
         item: GithubWorkItem,
         pull: dict,
         verdict: str,
+        *,
+        client: GithubClient | None = None,
     ) -> None:
         pr_number = self._pull_number(pull)
         head_sha = self._head_sha(pull)
@@ -1137,6 +1190,8 @@ class GithubVerificationService:
             item.status_note = None
         item.updated_at = datetime.utcnow()
         await db.commit()
+        if client is not None:
+            await self._refresh_initial_path_readiness(db, scope, item, pull, client)
 
     async def process_scope(
         self,
@@ -2837,6 +2892,8 @@ class GithubVerificationService:
             item.verification_head_sha = head_sha
             item.verification_started_at = started_at
             await db.commit()
+        if not await self._refresh_initial_path_readiness(db, scope, item, pull, client):
+            return
         checks = await observe_tracked_checks(db, scope, item, client, head_sha or "", policy)
         if ci_context is not None and policy.required_checks and not await self._completion_head_is_current(
                 db, scope, item, client, head_sha, revision=revision):

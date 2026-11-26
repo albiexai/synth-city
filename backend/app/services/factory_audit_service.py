@@ -42,7 +42,7 @@ SAFE_VALUE_FIELDS = {
     # templates are free text that can hold commands; they stay excluded.
     "max_approval_rounds", "max_concurrent_dispatched", "max_verification_retries",
     "max_auto_merges_per_day", "max_build_parallelism", "builds_out_of_tree",
-    "max_item_effort_minutes", "max_plan_estimate_minutes", "review_hold_label", "github_auth_mode",
+    "max_item_effort_minutes", "max_plan_estimate_minutes", "initial_paths_required", "review_hold_label", "github_auth_mode",
     "supervisor_actor_id", "supervisor_grace_seconds", "supervisor_status",
     "origin_kind", "previous_scope_revision", "review_id", "reviewer_member_id",
     "head_sha", "verdict", "outcome",

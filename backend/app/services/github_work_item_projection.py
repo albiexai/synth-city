@@ -19,6 +19,18 @@ from app.services.github_workspace_readiness import work_item_workspace_wait_rea
 from app.services import required_ci_attention
 
 
+def _work_item_status_note(item: GithubWorkItem) -> str | None:
+    status = github_rate_limit_service.work_item_note(item.dispatch_status, item.status_note)
+    readiness = item.initial_paths_readiness or {}
+    if (item.active_scope_revision or item.dispatch_status not in {"verifying", "ready_for_review"}
+            or readiness.get("head") != item.verification_head_sha):
+        return status
+    note = readiness.get("note")
+    if note and note != status:
+        return f"{note}\n{status}" if status else note
+    return status
+
+
 def _work_item_response(
     item: GithubWorkItem,
     scope: TeamGithubScope,
@@ -96,7 +108,7 @@ def _work_item_response(
         last_verified_sha=item.last_verified_sha,
         retry_requested_at=item.retry_requested_at,
         escalation_reason=item.escalation_reason,
-        status_note=github_rate_limit_service.work_item_note(item.dispatch_status, item.status_note),
+        status_note=_work_item_status_note(item),
         checks_unavailable_since=item.checks_unavailable_since,
         checks_unavailable_reason=(required_ci_attention.safe_reason(item.checks_unavailable_reason)
                                    if item.checks_unavailable_since is not None else None),
