@@ -376,6 +376,8 @@ export interface TeamGithubScope {
   max_failed_heads_per_revision: number
   max_scope_paths: number
   max_scope_commands: number
+  review_hold_label?: string | null
+  max_item_effort_minutes?: number
   enabled: boolean
   last_polled_at?: string | null
   created_at: string
@@ -419,7 +421,30 @@ export interface TeamGithubScopeUpdate {
   build_dir_template?: string
   build_command_hint?: string | null
   max_build_parallelism?: number
+  // null clears the hold label; an empty string is invalid.
+  review_hold_label?: string | null
+  max_item_effort_minutes?: number
+  reason?: string
   enabled?: boolean
+}
+
+export interface ScopeSettingDefinition { type?: string; minimum?: number; maximum?: number; default?: unknown }
+export interface ScopeSettingChange { before: unknown; after: unknown }
+export interface ScopeSettingsHistoryEntry {
+  event_id: number
+  occurred_at: string
+  actor_kind: string
+  actor_reference: string | null
+  via: string | null
+  reason: string | null
+  changes: Record<string, ScopeSettingChange>
+  redacted_fields: string[]
+}
+export interface ScopeSettingsResponse {
+  definitions: Record<string, ScopeSettingDefinition>
+  required: string[]
+  history: ScopeSettingsHistoryEntry[]
+  next_before_id: number | null
 }
 
 export interface TeamGithubScopeListResponse {
