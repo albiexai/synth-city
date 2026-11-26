@@ -7589,6 +7589,108 @@ async def test_busy_handoff_queues_without_inviting_acceptance(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("target_state", ["busy", "disabled"])
+async def test_queued_handoff_waits_for_unavailable_target(db, monkeypatch, target_state):
+    _, (owner, target), scope = await _team(db)
+    now = datetime.utcnow()
+    queued = GithubWorkItem(
+        scope_id=scope.id, issue_number=9020, issue_title="Handoff", issue_url="u",
+        github_updated_at=now, dispatch_status="dispatched", owner_slot_id=owner.id,
+        handoff_state="queued", handoff_target_slot_id=target.id,
+        handoff_expires_at=now + timedelta(minutes=30),
+    )
+    db.add(queued)
+    if target_state == "busy":
+        db.add(GithubWorkItem(
+            scope_id=scope.id, issue_number=9021, issue_title="Busy", issue_url="v",
+            github_updated_at=now, dispatch_status="dispatched", owner_slot_id=target.id,
+        ))
+    else:
+        target.enabled = False
+    await db.commit()
+    notice = AsyncMock()
+    monkeypatch.setattr(agent_mail_service, "send_direct_message", notice)
+
+    await github_dispatch_service.dispatch_pending(db, scope, [owner, target])
+
+    assert queued.handoff_state == "queued"
+    assert queued.handoff_target_slot_id == target.id
+    assert queued.handoff_expires_at == now + timedelta(minutes=30)
+    notice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_oldest_queued_handoff_gets_target_across_repository_scopes(db, monkeypatch):
+    preset, (first_owner, target), first_scope = await _team(db)
+    second_scope = TeamGithubScope(preset_id=preset.id, repo_owner="o", repo_name="second", repo_path="/tmp/second")
+    second_owner = AgentTeamSlot(
+        preset_id=preset.id, position=2, display_name="Second owner", provider="codex-cli",
+        repo_id="second", repo_path="/tmp/second", repo_name="second", enabled=True,
+    )
+    db.add_all([second_scope, second_owner])
+    await db.flush()
+    now = datetime.utcnow()
+    older = GithubWorkItem(
+        scope_id=first_scope.id, issue_number=9020, issue_title="Older handoff", issue_url="u",
+        github_updated_at=now, dispatch_status="dispatched", owner_slot_id=first_owner.id,
+        handoff_state="queued", handoff_target_slot_id=target.id,
+        handoff_expires_at=now + timedelta(minutes=15),
+    )
+    newer = GithubWorkItem(
+        scope_id=second_scope.id, issue_number=9021, issue_title="Newer handoff", issue_url="v",
+        github_updated_at=now, dispatch_status="dispatched", owner_slot_id=second_owner.id,
+        handoff_state="queued", handoff_target_slot_id=target.id,
+        handoff_expires_at=now + timedelta(minutes=30),
+    )
+    db.add_all([newer, older])
+    await db.commit()
+    notice = AsyncMock()
+    monkeypatch.setattr(agent_mail_service, "send_direct_message", notice)
+    slots = [first_owner, target, second_owner]
+
+    await github_dispatch_service.dispatch_pending(db, second_scope, slots)
+    assert newer.handoff_state == older.handoff_state == "queued"
+    notice.assert_not_awaited()
+
+    await github_dispatch_service.dispatch_pending(db, first_scope, slots)
+    await github_dispatch_service.dispatch_pending(db, second_scope, slots)
+    assert older.handoff_state == "pending"
+    assert newer.handoff_state == "queued"
+    notice.assert_awaited_once()
+    assert notice.await_args.kwargs["payload"]["work_item_id"] == older.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_status", "retry_requested", "scope_enabled"),
+    [
+        pytest.param("merged", False, True, id="finished-source"),
+        pytest.param("dispatched", True, True, id="retry-requested"),
+        pytest.param("dispatched", False, False, id="disabled-scope"),
+    ],
+)
+async def test_inactive_handoff_source_releases_reservation(db, source_status, retry_requested, scope_enabled):
+    _, (owner, target), scope = await _team(db)
+    now = datetime.utcnow()
+    queued = GithubWorkItem(
+        scope_id=scope.id, issue_number=9020, issue_title="Handoff", issue_url="u",
+        github_updated_at=now, dispatch_status="dispatched", owner_slot_id=owner.id,
+        handoff_state="queued", handoff_target_slot_id=target.id,
+        handoff_expires_at=now + timedelta(minutes=30),
+    )
+    db.add(queued)
+    await db.commit()
+    assert await github_dispatch_service.slot_is_busy(db, target.id)
+
+    queued.dispatch_status = source_status
+    queued.retry_requested_at = now if retry_requested else None
+    scope.enabled = scope_enabled
+    await db.commit()
+
+    assert not await github_dispatch_service.slot_is_busy(db, target.id)
+
+
+@pytest.mark.asyncio
 async def test_expired_handoff_releases_target_before_cleanup(db, monkeypatch):
     _, slots, scope = await _team(db)
     target_id = slots[1].id
