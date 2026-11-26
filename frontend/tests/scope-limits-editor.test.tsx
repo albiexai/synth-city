@@ -1,0 +1,172 @@
+import { MemoryRouter } from 'react-router-dom'
+import { render as renderUi, screen, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { RepositorySettings } from '../src/features/agent-teams/RepositorySettings'
+import { clearOperatorToken, setOperatorToken } from '../src/features/agent-teams/operatorAuth'
+import { fetchScopeSettings, updateTeamGithubScope } from '../src/features/agent-teams/api'
+import type { TeamGithubScope } from '../src/types/agentTeams'
+
+// #1297 part A: the editors for the review hold label and the effort ceiling, with the server's ranges and history.
+vi.mock('../src/features/agent-teams/api', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/features/agent-teams/api')>()),
+  updateTeamGithubScope: vi.fn().mockResolvedValue({}),
+  fetchScopeSettings: vi.fn(),
+}))
+
+const render = (ui: React.ReactElement) => renderUi(ui, { wrapper: MemoryRouter })
+const scope = {
+  id: 2, preset_id: 1, repo_owner: 'example', repo_name: 'project', repo_path: '/tmp/project',
+  dispatch_label: 'ready', design_label: 'design', merge_policy: 'human', github_auth_mode: 'app',
+  github_auth_configured: true, github_poll_token_configured: true, max_approval_rounds: 3,
+  max_concurrent_dispatched: 3, max_verification_retries: 2, max_auto_merges_per_day: 5, base_ref: 'origin/HEAD',
+  builds_out_of_tree: false, max_build_parallelism: 4, continuation_enabled: false, max_continuation_revisions: 3,
+  max_continuation_failed_heads: 8, max_failed_heads_per_revision: 1, max_scope_paths: 4, max_scope_commands: 8,
+  enabled: true, created_at: '2026-09-29T12:00:00Z', updated_at: '2026-09-29T12:00:00Z',
+  review_hold_label: 'review-hold', max_item_effort_minutes: 120,
+} as TeamGithubScope
+// A range that differs from the backend's 15 to 1440, so a pass proves the range comes from the server.
+const definitions = {
+  review_hold_label: { type: 'string' },
+  max_item_effort_minutes: { type: 'integer', minimum: 20, maximum: 600, default: 90 },
+}
+const entry = (id: number, changes: Record<string, { before: unknown; after: unknown }>, extra = {}) => ({
+  event_id: id, occurred_at: '2026-11-26T08:00:00Z', actor_kind: 'operator', actor_reference: 'director', via: null,
+  reason: 'Raised for the audit', changes, redacted_fields: [], ...extra,
+})
+const page = (history: ReturnType<typeof entry>[], next: number | null = null) => ({ definitions, required: [], history, next_before_id: next })
+
+async function openEditor(overrides: Partial<TeamGithubScope> = {}, refresh = vi.fn().mockResolvedValue(undefined)) {
+  const user = userEvent.setup()
+  render(<RepositorySettings scope={{ ...scope, ...overrides }} autonomyEnabled={false} refresh={refresh} onRemoved={vi.fn()} />)
+  await user.click(screen.getByRole('button', { name: 'Edit review hold and effort limit for example/project' }))
+  await screen.findByText(/20 to 600 minutes/)
+  return { user, refresh }
+}
+const effort = () => screen.getByLabelText('Effort ceiling (minutes)')
+const save = () => screen.getByRole('button', { name: 'Save' })
+
+beforeEach(() => {
+  setOperatorToken('director-key')
+  vi.mocked(updateTeamGithubScope).mockClear()
+  vi.mocked(fetchScopeSettings).mockReset().mockResolvedValue(page([entry(7, { max_item_effort_minutes: { before: 60, after: 120 } })]))
+})
+afterEach(() => clearOperatorToken())
+
+describe('the review hold and effort limit editors', () => {
+  it('shows the current values in the repository settings, and "none" for a cleared label', () => {
+    const view = render(<RepositorySettings scope={scope} autonomyEnabled={false} refresh={vi.fn()} onRemoved={vi.fn()} />)
+    const section = screen.getByRole('region', { name: 'Review hold and effort limit' })
+    expect(within(section).getByText('review-hold')).toBeInTheDocument()
+    expect(within(section).getByText('120 minutes')).toBeInTheDocument()
+    view.rerender(<RepositorySettings scope={{ ...scope, review_hold_label: null }} autonomyEnabled={false} refresh={vi.fn()} onRemoved={vi.fn()} />)
+    expect(within(screen.getByRole('region', { name: 'Review hold and effort limit' })).getByText('No hold label')).toBeInTheDocument()
+  })
+
+  it('reads the ranges and the history from the server with the Director key', async () => {
+    await openEditor()
+    expect(fetchScopeSettings).toHaveBeenCalledWith(2, 'director-key', undefined)
+    expect(screen.getByText(/20 to 600 minutes/)).toHaveTextContent('default 90')
+    expect(screen.getByText('Effort ceiling: 60 → 120')).toBeInTheDocument()
+    expect(screen.getByText(/director/)).toBeInTheDocument()
+    expect(screen.getByText('Raised for the audit')).toBeInTheDocument()
+  })
+
+  it.each(['19', '601', '30.5', 'abc', ''])('refuses the effort value "%s" and sends no request', async (value) => {
+    const { user } = await openEditor()
+    await user.clear(effort())
+    if (value) await user.type(effort(), value)
+    await user.click(save())
+    expect(await screen.findByRole('alert')).toHaveTextContent(/whole number of minutes from 20 to 600/)
+    expect(updateTeamGithubScope).not.toHaveBeenCalled()
+  })
+
+  it('accepts the ends of the server range', async () => {
+    const { user } = await openEditor()
+    for (const value of ['20', '600']) {
+      await user.clear(effort()); await user.type(effort(), value); await user.click(save())
+      await waitFor(() => expect(updateTeamGithubScope).toHaveBeenLastCalledWith(2, expect.objectContaining({ max_item_effort_minutes: Number(value) }), 'director-key'))
+    }
+  })
+
+  it('refuses an empty or blank label, and clearing the label sends an explicit null', async () => {
+    const { user } = await openEditor()
+    await user.clear(screen.getByLabelText('Review hold label'))
+    await user.click(save())
+    expect(await screen.findByRole('alert')).toHaveTextContent(/Enter a label, or choose to clear it/)
+    await user.type(screen.getByLabelText('Review hold label'), '   ')
+    await user.click(save())
+    expect(updateTeamGithubScope).not.toHaveBeenCalled()
+    await user.click(screen.getByLabelText('No hold label (clear it)'))
+    await user.click(save())
+    await waitFor(() => expect(updateTeamGithubScope).toHaveBeenCalledWith(2, { review_hold_label: null }, 'director-key'))
+  })
+
+  it('sends only the changed fields and the reason', async () => {
+    const { user } = await openEditor()
+    await user.clear(effort()); await user.type(effort(), '90')
+    await user.type(screen.getByLabelText('Reason (optional)'), 'Shorter items')
+    await user.click(save())
+    await waitFor(() => expect(updateTeamGithubScope).toHaveBeenCalledWith(2, { max_item_effort_minutes: 90, reason: 'Shorter items' }, 'director-key'))
+  })
+
+  it('sends nothing when no value changed, and says so instead of keeping an old refusal on screen', async () => {
+    const { user } = await openEditor()
+    await user.clear(effort()); await user.type(effort(), '19'); await user.click(save())
+    expect(await screen.findByRole('alert')).toHaveTextContent(/from 20 to 600/)
+    await user.clear(effort()); await user.type(effort(), '120'); await user.click(save())
+    expect(await screen.findByRole('alert')).toHaveTextContent('No value changed.')
+    expect(screen.queryByText(/from 20 to 600/)).not.toBeInTheDocument()
+    expect(updateTeamGithubScope).not.toHaveBeenCalled()
+  })
+
+  it('removes an old refusal as soon as a valid save starts', async () => {
+    vi.mocked(updateTeamGithubScope).mockReturnValueOnce(new Promise(() => undefined)) // a save that is still pending
+    const { user } = await openEditor()
+    await user.clear(effort()); await user.type(effort(), '19'); await user.click(save())
+    expect(await screen.findByRole('alert')).toHaveTextContent(/from 20 to 600/)
+    await user.clear(effort()); await user.type(effort(), '90'); await user.click(save())
+    await waitFor(() => expect(updateTeamGithubScope).toHaveBeenCalled())
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('shows a saved change in the history, after the settings refresh', async () => {
+    const { user, refresh } = await openEditor()
+    vi.mocked(fetchScopeSettings).mockResolvedValue(page([
+      entry(9, { max_item_effort_minutes: { before: 120, after: 90 } }, { reason: 'Shorter items' }),
+      entry(7, { max_item_effort_minutes: { before: 60, after: 120 } }),
+    ]))
+    await user.clear(effort()); await user.type(effort(), '90'); await user.click(save())
+    expect(await screen.findByText('Effort ceiling: 120 → 90')).toBeInTheDocument()
+    expect(refresh).toHaveBeenCalled()
+    expect(fetchScopeSettings).toHaveBeenCalledTimes(2)
+  })
+
+  it('pages the history with the cursor, and shows hidden values as hidden', async () => {
+    vi.mocked(fetchScopeSettings).mockResolvedValueOnce(page([entry(7, {}, { redacted_fields: ['build_command_hint'], reason: null })], 7))
+    const { user } = await openEditor()
+    expect(screen.getByText('build_command_hint: changed, value hidden')).toBeInTheDocument()
+    vi.mocked(fetchScopeSettings).mockResolvedValueOnce(page([entry(3, { review_hold_label: { before: null, after: 'review-hold' } })]))
+    await user.click(screen.getByRole('button', { name: 'Load more history' }))
+    expect(await screen.findByText('Review hold label: none → review-hold')).toBeInTheDocument()
+    expect(fetchScopeSettings).toHaveBeenLastCalledWith(2, 'director-key', 7)
+    expect(screen.queryByRole('button', { name: 'Load more history' })).not.toBeInTheDocument()
+  })
+
+  it('shows a server refusal as text and keeps the form', async () => {
+    vi.mocked(updateTeamGithubScope).mockRejectedValueOnce(new Error('max_item_effort_minutes must be at most 600'))
+    const { user } = await openEditor()
+    await user.clear(effort()); await user.type(effort(), '90'); await user.click(save())
+    expect(await screen.findByRole('alert')).toHaveTextContent('max_item_effort_minutes must be at most 600')
+    expect(effort()).toHaveValue('90')
+  })
+
+  it('does not save when the server ranges could not be read', async () => {
+    vi.mocked(fetchScopeSettings).mockRejectedValue(new Error('settings unavailable'))
+    const user = userEvent.setup()
+    render(<RepositorySettings scope={scope} autonomyEnabled={false} refresh={vi.fn()} onRemoved={vi.fn()} />)
+    await user.click(screen.getByRole('button', { name: 'Edit review hold and effort limit for example/project' }))
+    expect(await screen.findByText(/settings unavailable/)).toBeInTheDocument()
+    expect(save()).toBeDisabled()
+  })
+})

@@ -11,6 +11,7 @@ import {
   ContinuationPolicyDialog, ScopeDialog,
   type PolicyDialogState, type ScopeDialogState,
 } from './ScopeSettingsDialogs'
+import { ScopeLimitsDialog } from './ScopeLimitsDialog'
 import { authStatus } from './scopeAuthStatus'
 import { useScopeSettings } from './useScopeSettings'
 
@@ -56,6 +57,7 @@ export function RepositorySettings({ scope, autonomyEnabled, refresh, onRemoved 
   const { saveScope, savePolicy, removeScope, tokenDialog } = useScopeSettings({ refresh })
   const [scopeDialog, setScopeDialog] = useState<ScopeDialogState>(null)
   const [policyDialog, setPolicyDialog] = useState<PolicyDialogState>(null)
+  const [limitsOpen, setLimitsOpen] = useState(false)
   const [scopeToRemove, setScopeToRemove] = useState<TeamGithubScope | null>(null)
   const [removalPending, setRemovalPending] = useState(false)
   const trigger = useRef<HTMLButtonElement | null>(null)
@@ -103,6 +105,14 @@ export function RepositorySettings({ scope, autonomyEnabled, refresh, onRemoved 
         )}
       </Section>
       <Section
+        title="Review hold and effort limit"
+        editLabel={`Edit review hold and effort limit for ${scope.repo_owner}/${scope.repo_name}`}
+        onEdit={(element) => { trigger.current = element; setLimitsOpen(true) }}
+      >
+        <Row label="Review hold label">{scope.review_hold_label ? <code>{scope.review_hold_label}</code> : 'No hold label'}</Row>
+        <Row label="Effort ceiling per item">{scope.max_item_effort_minutes ?? 120} minutes</Row>
+      </Section>
+      <Section
         title="Recovery"
         editLabel={`Edit recovery policy for ${scope.repo_owner}/${scope.repo_name}`}
         onEdit={(element) => { trigger.current = element; setPolicyDialog({ scope }) }}
@@ -139,6 +149,13 @@ export function RepositorySettings({ scope, autonomyEnabled, refresh, onRemoved 
         state={scopeDialog}
         onOpenChange={setScopeDialog}
         onSave={(input) => saveScope(scope.id, input as TeamGithubScopeUpdate)}
+        onReturnFocus={() => trigger.current?.focus()}
+      />
+      <ScopeLimitsDialog
+        scope={scope}
+        open={limitsOpen}
+        onOpenChange={setLimitsOpen}
+        refresh={refresh}
         onReturnFocus={() => trigger.current?.focus()}
       />
       <ContinuationPolicyDialog

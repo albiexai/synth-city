@@ -18,6 +18,7 @@ import type {
   GithubScopeRevision,
   GithubRecoveryGate,
   GithubWorkspace,
+  ScopeSettingsResponse,
   TeamGithubContinuationPolicyUpdate,
   TeamGithubScope,
   TeamGithubScopeInput,
@@ -207,6 +208,14 @@ export function updateTeamGithubScope(
     headers: operatorHeaders(operatorToken),
     body: JSON.stringify(input),
   })
+}
+
+/** The setting ranges and the change history of one repository. Operator-protected (#1297). */
+export function fetchScopeSettings(scopeId: number, operatorToken: string, beforeId?: number): Promise<ScopeSettingsResponse> {
+  return apiClient<ScopeSettingsResponse>(
+    `agent-teams/github-scopes/${scopeId}/settings${beforeId === undefined ? '' : `?before_id=${beforeId}`}`,
+    { headers: operatorHeaders(operatorToken) },
+  )
 }
 
 export function deleteTeamGithubScope(scopeId: number, operatorToken: string): Promise<Record<string, never>> {

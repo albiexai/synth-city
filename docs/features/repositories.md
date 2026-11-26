@@ -24,3 +24,12 @@ Select **Set up a repository** (`/repositories/new`) for a guided configuration.
 6. **Saved setup** — review a current launch plan and launch the selected slots as a separate action. Activation is also separate: it needs a fresh ready check, no shared readiness blockers and acknowledgement of each listed overlap. Enabling the team also resumes its other enabled scopes.
 
 An uncertain create or launch result is reconciled from fresh reads; the page does not repeat the request. Overlap detection is advisory; it is not an atomic ownership guarantee across scopes. Host credential and label procedures remain in [Autonomous GitHub dispatch](/autonomy).
+
+## Review hold label and effort ceiling
+
+Open a repository in [Teams](/features/agent-teams) and select **Edit** in **Review hold and effort limit**. The dialog edits two settings:
+
+- **Review hold label.** The label that holds a pull request until a verifier accepts it. **No hold label (clear it)** removes it. An empty label is not valid.
+- **Effort ceiling (minutes).** The most active minutes one item can use. The dialog shows the server's range and default, and refuses a value outside the range or a number that is not whole.
+
+The dialog reads the history from the server and shows each change with its time, actor, reason and old and new value. A value that the server hides shows as "changed, value hidden". It needs the Director key to read and to save. A save sends only the fields that changed, with an optional reason, and the history reloads.
