@@ -420,6 +420,18 @@ world-writable.
   agent user's `antigravity-cli` files. Otherwise the status is `native_log_unreadable`.
   The passive launch used one host user. Access across two users remains unverified.
 
+## Supervisor Binding
+
+The Supervisor line of a team page has an **Edit** button. It opens the supervisor binding editor. The editor needs the Director key.
+
+- **Bind:** Enter the id of an external actor. Select **Save**. The server checks the id. An unknown id gives "No external actor has this id." The actor list is not in the UI yet (#1291), so you type the id.
+- **Change the grace:** Enter whole seconds, 1 or more. Select **Use the default grace** to remove the override. The default grace is at least 30 minutes.
+- **Remove:** Select **Remove the supervisor** and confirm. This also clears the grace setting.
+- **History:** Each change is recorded in the audit history. The editor lists these changes, newest first, with the actor and the reason.
+- **Other clients:** Each save carries the binding version and the team key that you reviewed. The team key names the life of the team: if another client changed the binding first, or deleted the team and made a new team with the same id, the server refuses the save and the editor shows the current binding. Review it, then save again. A removal confirmation is valid only for the binding that you confirmed.
+- **Older server:** If the server does not report a binding version and a team key, or the team has no key yet, the editor is read-only. Update the server to edit the supervisor.
+- **API:** `PUT /api/v1/agent-teams/presets/{preset_id}/supervisor` accepts the optional `expected_binding_version` and `expected_team_context_key`. They come together (one alone gives `422`). Without them, the write is not checked. With them, a different stored version, or a key that is not the active context key of the team, gives `409 supervisor_binding_changed` and changes nothing. Every binding write adds 1 to `binding_version`; check-ins do not. Every team created through the API gets its context key at once, and a deleted team's key is retired, so a number is never reused for another team.
+
 ## External Local Agents
 
 Local external agents can use the JSON API:

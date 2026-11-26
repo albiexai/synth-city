@@ -1,3 +1,4 @@
+import { useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { Edit, Play, Zap } from 'lucide-react'
 
@@ -7,11 +8,12 @@ import { useObservation } from '@/features/factory/reads'
 import type { WorkListResponse } from '@/types/factory'
 import type { AgentTeamPreset, AgentTeamSummary, TeamGithubScopeListResponse } from '@/types/agentTeams'
 import { autonomousLeaderSlotId } from './leaderSlot'
+import { SupervisorBindingDialog } from './SupervisorBindingDialog'
 import { SupervisorStatus } from './SupervisorStatus'
 
 /**
  * The first thing on a team page: what the team is, whether it runs, who leads
- * it and where its work and repositories are. It holds no form.
+ * it and where its work and repositories are. It holds no form: the supervisor editor opens in a dialog.
  */
 export function TeamHeader({
   preset,
@@ -27,7 +29,10 @@ export function TeamHeader({
   // Opens the Autonomy tab at the existing switch. The switch itself stays there.
   onAutonomy: () => void
 }) {
-  const summary = useObservation<AgentTeamSummary>(`agent-teams/presets/${preset.id}/summary`).data
+  const summaryRead = useObservation<AgentTeamSummary>(`agent-teams/presets/${preset.id}/summary`)
+  const summary = summaryRead.data
+  const [supervisorOpen, setSupervisorOpen] = useState(false)
+  const editSupervisor = useRef<HTMLButtonElement>(null)
   const scopes = useObservation<TeamGithubScopeListResponse>(`agent-teams/presets/${preset.id}/github-scopes`).data
   const work = useObservation<WorkListResponse>(`factory/work-items?team_id=${preset.id}&limit=1`).data
   const leaderId = autonomousLeaderSlotId(preset.leader_slot_id ?? null, preset.slots)
@@ -71,6 +76,25 @@ export function TeamHeader({
           <div className="flex items-center gap-1">
             <dt className="text-muted-foreground">Supervisor:</dt>
             <dd><SupervisorStatus summary={summary} /></dd>
+            <Button
+              ref={editSupervisor}
+              variant="link"
+              size="sm"
+              className="h-auto p-0"
+              aria-label={`Edit supervisor binding for ${preset.name}`}
+              onClick={() => setSupervisorOpen(true)}
+            >
+              Edit
+            </Button>
+            <SupervisorBindingDialog
+              presetId={preset.id}
+              presetName={preset.name}
+              observation={summary.supervisor_observation ?? null}
+              open={supervisorOpen}
+              onOpenChange={setSupervisorOpen}
+              refresh={summaryRead.refresh}
+              onReturnFocus={() => editSupervisor.current?.focus()}
+            />
           </div>
         )}
         {scopes && (

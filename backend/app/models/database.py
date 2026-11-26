@@ -172,6 +172,8 @@ class AgentTeamPreset(Base):
     supervisor_next_check_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     supervisor_note: Mapped[str | None] = mapped_column(String, nullable=True)
     supervisor_grace_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Counts the binding writes of this team. A write that carries the version it reviewed cannot change a newer binding.
+    supervisor_binding_version: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
     supervisor_observed_status: Mapped[str | None] = mapped_column(String, nullable=True)
 
 

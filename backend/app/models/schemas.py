@@ -1988,6 +1988,10 @@ class SupervisorObservation(BaseModel):
     checked_at: datetime | None
     next_check_at: datetime | None
     grace_seconds: int = Field(ge=1)
+    # Counts the binding writes of the team. An older server does not send it.
+    binding_version: int = Field(default=0, ge=0)
+    # The active context key of the team: it names the team lifetime. Null means the team has none yet: a protected write is refused.
+    team_context_key: str | None = None
     note: str | None
     attention: Literal["Supervisor check-in overdue"] | None
     team_idle: list[TeamIdleItem] = Field(default_factory=list)
@@ -1998,6 +2002,20 @@ class SupervisorBindingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     actor_id: int | None = Field(..., gt=0)
     grace_seconds: int | None = Field(default=None, ge=1)
+    # Omitted: the write is not checked. Given: the write applies only to this binding version (409 otherwise).
+    expected_binding_version: int | None = Field(default=None, ge=0, strict=True)
+    # The context key of the team that the caller reviewed. It comes with the version, so an old reviewed state cannot
+    # reach a different team that reuses the numeric id.
+    expected_team_context_key: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _the_expected_pair_comes_together_as_whole_numbers(self):
+        given = [name for name in ("expected_binding_version", "expected_team_context_key") if name in self.model_fields_set]
+        if any(getattr(self, name) is None for name in given):
+            raise ValueError("expected_binding_version must be a whole number and expected_team_context_key a text")
+        if given and len(given) != 2:
+            raise ValueError("expected_binding_version and expected_team_context_key come together")
+        return self
 
 
 class SupervisorCheckinRequest(BaseModel):
