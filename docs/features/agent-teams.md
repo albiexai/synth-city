@@ -256,6 +256,14 @@ switches clear the pulse. A working native event older than three minutes become
 unknown, including long work that produces no native progress events. A completed
 turn can remain Idle while the same process and identity are still current.
 
+If Codex reaches the bounded history limit without a turn boundary, a recent
+`token_count` or `item_completed` event from the verified current process can
+report Working with reason `native_turn_in_progress_long`. The same three-minute
+activity window applies. Visible completion or interruption records and current
+input waits still govern the observation. Missing or expired evidence remains
+unknown. Final delivery keeps the existing team-wide native coverage rules.
+Unknown activity for a member handling work leaves that coverage incomplete.
+
 ### Deployment with separate controller and agent users
 
 Set `harness_agent_user` to the agent user's name so that the Harnesses pages show the global scope that the agents load, not the controller's own. See [Which user the Harnesses pages show as "global"](/guide/installation#which-user-the-harnesses-pages-show-as-global).

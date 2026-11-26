@@ -386,13 +386,14 @@ def _native_state(path: Path, session_id: str, cwd: str, now: datetime, started_
         offset = max(0, size - _TAIL_BYTES)
         stream.seek(offset)
         tail = stream.read(_TAIL_BYTES)
+        clipped_turn = False
         # A long turn can push its task_started out of the tail (#1201). Read adjacent earlier
-        # chunks until a turn boundary is in view, within a fixed history bound. Progress alone
-        # still never starts a turn.
+        # chunks until a turn boundary is in view, within a fixed history bound.
         if tail.endswith(b"\n"):
             while offset and not _codex_has_turn_boundary(tail, offset):
                 remaining = _MAX_HISTORY_BYTES - len(tail)
                 if remaining <= 0:
+                    clipped_turn = True
                     break
                 previous = max(0, offset - min(_TAIL_BYTES, remaining))
                 stream.seek(previous)
@@ -414,6 +415,8 @@ def _native_state(path: Path, session_id: str, cwd: str, now: datetime, started_
         if event not in {"task_started", "task_complete", "turn_aborted", "error",
                          "token_count", "item_completed"}:
             continue
+        if event in _CODEX_TURN_BOUNDARIES:
+            clipped_turn = False
         timestamp = datetime.fromisoformat(record["timestamp"].replace("Z", "+00:00"))
         if timestamp.tzinfo is None or timestamp > now + timedelta(seconds=5):
             return "unknown", "observation_invalid", None
@@ -429,7 +432,10 @@ def _native_state(path: Path, session_id: str, cwd: str, now: datetime, started_
         elif event in {"turn_aborted", "error"}:
             state, reason = "idle", "native_turn_interrupted"
         elif state != "working":
-            continue  # progress alone never starts an inferred turn
+            if not clipped_turn:
+                continue
+            # Only clipped history can supply progress without its start boundary.
+            state, reason = "working", "native_turn_in_progress_long"
         observed_at = timestamp
         cursor = hashlib.sha256(f"{session_id}:{timestamp.isoformat()}:{event}".encode()).hexdigest()
     if provenance is not None:
