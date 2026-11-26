@@ -3196,7 +3196,7 @@ class GithubVerificationService:
             await self._record_readiness_hold(
                 db, item, "PR readiness could not be read; automatic merge is blocked.")
             return
-        if initial_fence is not None and not await db.scalar(initial_fence):
+        if initial_paths is not None and not await db.scalar(initial_fence):
             return
         if not await self._validate_polled_pull_identity(
             db, scope, item, client, fresh_pull, retry_status=item.dispatch_status,
@@ -3228,7 +3228,7 @@ class GithubVerificationService:
             return
         approval_reason = await self._approval_gate_reason(db, scope, item, acceptance_identity)
         if approval_reason is not None:
-            if initial_fence is not None and not await db.scalar(initial_fence):
+            if initial_paths is not None and not await db.scalar(initial_fence):
                 return
             await self._fallback_to_human_merge(
                 db, item, "Auto-merge blocked: distinct current-round leader approval is "
