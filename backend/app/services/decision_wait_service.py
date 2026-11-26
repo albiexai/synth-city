@@ -347,7 +347,8 @@ async def reconcile_operator_waits(db: AsyncSession, *, scope_id: int, now: date
 
     ``hold_cleared`` when the hold's revision ended on its own; ``item_terminal`` when the item ended first. Both
     unattributed. The end takes the transition's own time, never the poll's (V1 review 6070971861): the revision's
-    end, the item's end-stopped event, or else the item's last write, an approximate bound no later than the poll.
+    end or its request's supersession, the item's end-stopped event, or else the item's last write, an approximate
+    bound no later than the poll.
     Whether any end was written.
     """
     from sqlalchemy import func
@@ -393,7 +394,12 @@ async def reconcile_operator_waits(db: AsyncSession, *, scope_id: int, now: date
             outcome, at, evidence = "item_terminal", stopped or written, {"dispatch_status": status}
         else:
             rev_status, stage, cancelled_at, completed_at, expires_at, reason = revision or (None,) * 6
-            ended_at = cancelled_at or completed_at or (expires_at if rev_status == "expired" else None)
+            # Approval cancellation and stale supersession record the request's superseded_at and no revision end
+            # time (V1 review 6071348579).
+            superseded_at = await db.scalar(select(GithubApprovalRequest.superseded_at).where(
+                GithubApprovalRequest.id == values.get("wait_request_id")))
+            ended_at = (cancelled_at or completed_at or (expires_at if rev_status == "expired" else None)
+                        or superseded_at)
             # The item's own terminal transition ended this revision: complete_current_revision completes or
             # supersedes it with its fixed reason, or end-stopped cancelled it at the event's time.
             by_item = item_ended and (rev_status == "completed" or reason == ITEM_TERMINAL_REASON

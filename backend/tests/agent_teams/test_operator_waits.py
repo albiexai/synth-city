@@ -172,6 +172,30 @@ async def test_a_late_reconcile_keeps_the_cancellation_time_and_reason(client, d
     assert (end.after_values["wait_outcome"], end.fact_time) == ("hold_cleared", cancelled)
 
 
+@pytest.mark.parametrize("path", ["cancel", "supersede_stale_continuation"])
+async def test_a_service_cancellation_ends_the_hold_at_its_recorded_time(client, db, monkeypatch, path):
+    """V1 review 6071348579: these paths record the request's superseded_at but no revision end time."""
+    from app.models.database import GithubApprovalRequest
+
+    item, members, _tokens, approval_id, _number = await _held(client, db, monkeypatch)
+    request = await db.get(GithubApprovalRequest, approval_id)
+    if path == "cancel":
+        await github_approval_service.cancel(db, request, requester_member_id=members[1].id)
+    else:
+        revision = await db.scalar(select(GithubAttemptScopeRevision).where(
+            GithubAttemptScopeRevision.approval_request_id == approval_id))
+        await github_approval_service.supersede_stale_continuation(db, request, revision)
+    await db.commit()
+    await db.refresh(request)
+    revision = await db.scalar(select(GithubAttemptScopeRevision).where(
+        GithubAttemptScopeRevision.approval_request_id == approval_id))
+    assert request.superseded_at is not None and revision.cancelled_at is None and revision.completed_at is None
+    await waits.reconcile_operator_waits(db, scope_id=item.scope_id, now=request.superseded_at + timedelta(hours=1))
+    await db.commit()
+    _start, end = await _events(db, HOLD)
+    assert (end.after_values["wait_outcome"], end.fact_time) == ("hold_cleared", request.superseded_at)
+
+
 @pytest.mark.parametrize("ended_by", ["merge", "end_stopped"])
 async def test_an_item_that_ends_first_gives_one_item_terminal_end_at_its_transition(client, db, monkeypatch,
                                                                                    ended_by):
