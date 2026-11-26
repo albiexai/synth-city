@@ -467,6 +467,22 @@ class GithubWorkItem(Base):
     )
 
 
+class GithubMilestoneWait(Base):
+    """A repository issue waiting for a team, projected onto a repository scope.
+
+    A null title clears the wait while retaining its GitHub observation time.
+    """
+
+    __tablename__ = "github_milestone_waits"
+
+    scope_id: Mapped[int] = mapped_column(
+        ForeignKey("team_github_scopes.id", ondelete="CASCADE"), primary_key=True,
+    )
+    issue_number: Mapped[int] = mapped_column(Integer, primary_key=True)
+    milestone_title: Mapped[str | None] = mapped_column(String)
+    github_updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 class GithubIssueClosure(Base):
     """Durable post-merge closure of one already-delivered work item."""
 

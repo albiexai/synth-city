@@ -2,6 +2,7 @@
 import asyncio
 import json
 from datetime import datetime
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -16,6 +17,7 @@ from app.models.database import (
     AgentTeamSlot,
     FactoryAuditEvent,
     GithubApprovalRequest,
+    GithubMilestoneWait,
     GithubWorkItem,
     GithubWorkspace,
     MailExternalActor,
@@ -24,7 +26,7 @@ from app.models.database import (
     TeamGithubScope,
 )
 from app.services.github_client import GithubClient, GithubClientResponseError
-from app.services.github_watcher_service import defer_milestone_exit, github_watcher_service
+from app.services.github_watcher_service import GithubWatcherService, defer_milestone_exit, github_watcher_service
 
 
 class _RecordingTransport(httpx.AsyncBaseTransport):
@@ -328,7 +330,10 @@ async def test_repository_milestone_never_readmits_a_merged_issue(db, previous_a
     await db.commit()
     await github_watcher_service.poll_scope(db, new, _FakeClient(labeled=[_milestone_issue(new, "V2")]))
     await github_watcher_service.poll_scope(db, old, _FakeClient(labeled=[_milestone_issue(old, "V1")]))
+    unmatched = _milestone_issue(new, "V9", "2026-07-05T00:00:00Z")
+    await github_watcher_service.poll_scope(db, new, _FakeClient(labeled=[unmatched]))
     assert (await db.scalars(select(GithubWorkItem.id))).all() == [original.id]
+    assert await _milestone_wait_titles(db) == {}
 
 
 @pytest.mark.asyncio
@@ -472,6 +477,190 @@ async def test_no_exact_milestone_or_conflicting_teams(db, title):
     for scope in scopes:
         await github_watcher_service.poll_scope(db, scope, _FakeClient(labeled=[_milestone_issue(scope, title)]))
     assert await db.scalar(select(GithubWorkItem)) is None
+    expected = {scopes[0].id: "v1"} if title == "v1" else {}
+    assert await _milestone_wait_titles(db) == expected
+
+
+async def _milestone_wait_titles(db):
+    return dict((await db.execute(
+        select(GithubMilestoneWait.scope_id, GithubMilestoneWait.milestone_title)
+        .where(GithubMilestoneWait.milestone_title.is_not(None))
+    )).all())
+
+
+@pytest.mark.asyncio
+async def test_new_issue_milestone_wait_survives_restart_without_duplicates(db):
+    home = await _make_scope(db, milestone="V1")
+    sibling = await _make_scope(db, preset_name="Sibling", milestone="V2", dispatch_label="sibling-ready")
+    other_repo = await _make_scope(db, preset_name="Other repo", milestone="V9")
+    other_repo.repo_name = "another"
+    await db.commit()
+    issue = _milestone_issue(home, "V9")
+    maker = async_sessionmaker(db.bind, expire_on_commit=False)
+
+    async def poll():
+        async with maker() as session:
+            scope = await session.get(TeamGithubScope, home.id)
+            await github_watcher_service.poll_scope(session, scope, _FakeClient(labeled=[issue]))
+
+    await asyncio.gather(poll(), poll())
+    expected = {home.id: "V9", sibling.id: "V9"}
+    assert await _milestone_wait_titles(db) == expected
+    assert await db.scalar(select(GithubWorkItem)) is None
+    await db.commit()
+
+    restarted_engine = create_async_engine(db.bind.url)
+    maker = async_sessionmaker(restarted_engine, expire_on_commit=False)
+    try:
+        async with maker() as restarted:
+            watcher = GithubWatcherService()
+            assert await _milestone_wait_titles(restarted) == expected
+            sibling_scope = await restarted.get(TeamGithubScope, sibling.id)
+            sibling_client = _FakeClient(by_number={issue["number"]: issue})
+            await watcher.poll_scope(restarted, sibling_scope, sibling_client)
+            assert sibling_client.by_number_calls == [[issue["number"]]]
+            home_scope = await restarted.get(TeamGithubScope, home.id)
+            await watcher.poll_scope(restarted, home_scope, _FakeClient(labeled=[issue]))
+            assert await _milestone_wait_titles(restarted) == expected
+            assert len((await restarted.scalars(select(GithubMilestoneWait))).all()) == 2
+    finally:
+        await restarted_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_milestone_wait_for_moved_issue_belongs_only_to_departed_scope(db):
+    home = await _make_scope(db, milestone="V1")
+    sibling = await _make_scope(db, preset_name="Sibling", milestone="V2")
+    assigned = _milestone_issue(home, "V1", "2026-07-05T00:00:00Z")
+    await github_watcher_service.poll_scope(db, home, _FakeClient(labeled=[assigned]))
+    await github_watcher_service.poll_scope(db, sibling, _FakeClient(labeled=[_milestone_issue(home, "V9")]))
+    assert await _milestone_wait_titles(db) == {}
+    moved = _milestone_issue(home, "V9", "2026-07-06T00:00:00Z")
+    for scope in (sibling, home, sibling):
+        await github_watcher_service.poll_scope(db, scope, _FakeClient(labeled=[moved]))
+        assert await _milestone_wait_titles(db) == {home.id: "V9"}
+    items = (await db.scalars(select(GithubWorkItem))).all()
+    assert len(items) == 1 and items[0].scope_id == home.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("destination_milestone", ["V9", None], ids=["milestone-route", "label-only"])
+async def test_milestone_wait_clears_when_team_admits_issue(db, monkeypatch, destination_milestone):
+    home = await _make_scope(db, milestone="V1")
+    destination = await _make_scope(db, preset_name="Destination", milestone="V2")
+    issue = _milestone_issue(home, "V9")
+    client = _FakeClient(labeled=[issue], by_number={issue["number"]: issue})
+    await github_watcher_service.poll_scope(db, home, client)
+    assert await _milestone_wait_titles(db) == {home.id: "V9", destination.id: "V9"}
+
+    preset = await db.get(AgentTeamPreset, destination.preset_id)
+    preset.backlog_milestone = destination_milestone
+    await db.commit()
+    issue = dict(issue, updated_at="2026-07-05T00:00:00Z")
+    client = _FakeClient(labeled=[issue], by_number={issue["number"]: issue})
+    await github_watcher_service.poll_scope(db, home, client)
+    assert await _milestone_wait_titles(db) == {home.id: "V9", destination.id: "V9"}
+    skipped = GithubWatcherService()
+    refused_upsert = AsyncMock(return_value=False)
+    monkeypatch.setattr(skipped, "_upsert_item", refused_upsert)
+    await skipped.poll_scope(db, destination, client)
+    refused_upsert.assert_awaited_once_with(db, destination, issue)
+    assert await db.scalar(select(GithubWorkItem)) is None
+    assert await _milestone_wait_titles(db) == {home.id: "V9", destination.id: "V9"}
+
+    await github_watcher_service.poll_scope(db, destination, client)
+    assert (await db.scalar(select(GithubWorkItem))).scope_id == destination.id
+    assert await _milestone_wait_titles(db) == {}
+    refreshed = dict(issue, updated_at="2026-07-06T00:00:00Z")
+    await github_watcher_service.poll_scope(db, home, _FakeClient(labeled=[refreshed]))
+    assert await _milestone_wait_titles(db) == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_title", ["V2", "V10", None], ids=["routed", "unmatched", "removed"])
+async def test_milestone_wait_clears_for_old_title_when_milestone_changes(db, new_title):
+    home = await _make_scope(db, milestone="V1")
+    sibling = await _make_scope(db, preset_name="Sibling", milestone="V2")
+    waiting = _milestone_issue(home, "V9")
+    await github_watcher_service.poll_scope(db, home, _FakeClient(labeled=[waiting]))
+    changed = _milestone_issue(home, new_title, "2026-07-05T00:00:00Z")
+    await github_watcher_service.poll_scope(db, home, _FakeClient(labeled=[changed]))
+    expected = {home.id: "V10", sibling.id: "V10"} if new_title == "V10" else {}
+    assert await _milestone_wait_titles(db) == expected
+    assert await db.scalar(select(GithubWorkItem)) is None
+
+
+@pytest.mark.asyncio
+async def test_milestone_wait_rechecks_conflicting_milestone_at_same_second(db):
+    home = await _make_scope(db, milestone="V1")
+    sibling = await _make_scope(db, preset_name="Sibling", milestone="V2")
+    waiting = _milestone_issue(home, "V9")
+    await github_watcher_service.poll_scope(db, home, _FakeClient(labeled=[waiting]))
+
+    listed = _milestone_issue(home, "V10", waiting["updated_at"])
+    current = _milestone_issue(home, "V11", waiting["updated_at"])
+    client = _FakeClient(labeled=[listed], by_number={waiting["number"]: current})
+    await github_watcher_service.poll_scope(db, home, client)
+
+    assert client.by_number_calls == [[waiting["number"]]]
+    assert await _milestone_wait_titles(db) == {home.id: "V11", sibling.id: "V11"}
+
+
+@pytest.mark.asyncio
+async def test_milestone_wait_clears_when_issue_is_confirmed_closed(db):
+    home = await _make_scope(db, milestone="V1")
+    sibling = await _make_scope(db, preset_name="Sibling", milestone="V2")
+    waiting = _milestone_issue(home, "V9")
+    await github_watcher_service.poll_scope(db, home, _FakeClient(labeled=[waiting]))
+    assert await _milestone_wait_titles(db) == {home.id: "V9", sibling.id: "V9"}
+
+    closed = dict(waiting, state="closed", updated_at="2026-07-05T00:00:00Z")
+    client = _FakeClient(by_number={closed["number"]: closed})
+    await github_watcher_service.poll_scope(db, home, client)
+
+    assert client.by_number_calls == [[closed["number"]]]
+    assert await _milestone_wait_titles(db) == {}
+    assert await db.scalar(select(GithubWorkItem)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_second", [False, True], ids=["older-snapshot", "same-second"])
+async def test_milestone_wait_clears_on_confirmed_ready_label_removal(db, same_second):
+    home = await _make_scope(db, milestone="V1")
+    sibling = await _make_scope(db, preset_name="Sibling", milestone="V2")
+    issue = _milestone_issue(home, "V9")
+    number = issue["number"]
+    await github_watcher_service.poll_scope(db, home, _FakeClient(labeled=[issue]))
+    await github_watcher_service.poll_scope(db, home, _FakeClient())
+    assert await _milestone_wait_titles(db) == {home.id: "V9", sibling.id: "V9"}
+
+    updated_at = issue["updated_at"] if same_second else "2026-07-05T00:00:00Z"
+    unlabeled = dict(issue, labels=[], updated_at=updated_at)
+    removal = _FakeClient(by_number={number: unlabeled})
+    await github_watcher_service.poll_scope(db, home, removal)
+    assert removal.by_number_calls == [[number]]
+    assert await _milestone_wait_titles(db) == {}
+
+    stale = _FakeClient(labeled=[issue], by_number={number: unlabeled})
+    await github_watcher_service.poll_scope(db, sibling, stale)
+    assert await _milestone_wait_titles(db) == {}
+
+
+@pytest.mark.asyncio
+async def test_milestone_wait_confirmation_failure_preserves_wait_and_admissions(db):
+    class FailingConfirmation(_FakeClient):
+        async def get_issues_by_number(self, owner, repo, numbers):
+            raise httpx.ReadTimeout("confirmation failed")
+
+    scope = await _make_scope(db, milestone="V1")
+    waiting = _milestone_issue(scope, "V9")
+    await github_watcher_service.poll_scope(db, scope, _FakeClient(labeled=[waiting]))
+    ready = dict(_milestone_issue(scope, "V1"), number=2)
+
+    await github_watcher_service.poll_scope(db, scope, FailingConfirmation(labeled=[ready]))
+
+    assert await _milestone_wait_titles(db) == {scope.id: "V9"}
+    assert (await db.scalar(select(GithubWorkItem))).issue_number == ready["number"]
 
 
 @pytest.mark.asyncio
