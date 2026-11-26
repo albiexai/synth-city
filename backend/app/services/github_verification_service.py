@@ -3151,11 +3151,17 @@ class GithubVerificationService:
         if withdrawn is not None:
             await self._record_readiness_hold(db, item, withdrawn)
             return
-        # #1310: the attempt is durable before the fences, which stay the last checks before the call.
+        # #1310: the attempt is durable before each path's final checks, which stay the last before the call.
         attempt_id = await merge_attempts.begin(
-            db, scope_id=scope.id, item_id=item.id, pr_number=int(item.pr_number), head_sha=current_head)
+            db, scope_id=scope.id, item_id=item.id, pr_number=int(item.pr_number), head_sha=current_head,
+            repository=f"{scope.repo_owner}/{scope.repo_name}")
         await db.commit()
-        if fence is not None:
+        if fence is None:
+            if await self._ordinary_final_checks_stop(
+                    db, scope, item, fresh_pull, acceptance_identity, current_head, settled_began,
+                    superseded_ok=superseded_ok, attempt_id=attempt_id):
+                return
+        else:
             # The last await before the merge call is this one statement; the HOLD read and the call follow with none.
             if not await db.scalar(select(self._superseded_fence_holds(scope, item, fence))):
                 await db.rollback()
@@ -3212,6 +3218,31 @@ class GithubVerificationService:
         await merge_attempts.finish(db, attempt_id, merge_attempts.MERGED, None)
         await db.commit()
         await self._notify_blocker_merged(db, scope, item)
+
+    async def _ordinary_final_checks_stop(
+        self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, pull: dict, acceptance_identity,
+        head: str, settled_began, *, superseded_ok: bool, attempt_id: int,
+    ) -> bool:
+        """#1310: the ordinary path's final authority checks, run again once the attempt is durable (V1 review
+        6074761059). Each keeps its handling; a stop refuses the attempt. Whether the merge must stop."""
+        note = await self._acceptance_note(db, scope, item, pull, acceptance_identity)
+        if note is not None:
+            await self._record_readiness_hold(db, item, note)
+            await self._refuse_attempt(db, attempt_id, "acceptance_changed")
+            return True
+        reason = await self._approval_gate_reason(db, scope, item, acceptance_identity)
+        if reason is not None:
+            await self._fallback_to_human_merge(
+                db, item, "Auto-merge blocked: distinct current-round leader approval is "
+                f"required ({reason}).")
+            await self._refuse_attempt(db, attempt_id, "approval_changed")
+            return True
+        withdrawn = await self._settled_context_note(db, scope, item, head, settled_began, superseded_ok=superseded_ok)
+        if withdrawn is not None:
+            await self._record_readiness_hold(db, item, withdrawn)
+            await self._refuse_attempt(db, attempt_id, "settlement_changed")
+            return True
+        return False
 
     async def _refuse_attempt(self, db: AsyncSession, attempt_id: int, reason: str) -> None:
         """#1310: a fence stopped the recorded attempt before the call."""

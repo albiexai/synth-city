@@ -14,7 +14,9 @@ import pytest
 from sqlalchemy import select, update
 
 from app import database
-from app.models.database import GithubMergeAttempt, GithubMergeAttemptCoverage, GithubWorkItem
+from app.models.database import (
+    AgentTeamPreset, GithubMergeAttempt, GithubMergeAttemptCoverage, GithubWorkItem, TeamGithubScope,
+)
 from app.services import github_coordination_service as coordination
 from app.services import github_merge_attempt_service as attempts
 from app.services.github_client import GithubClientResponseError
@@ -25,7 +27,7 @@ from tests.agent_teams.test_head_acceptance import twin  # noqa: F401
 from tests.agent_teams.test_superseded_revision_promotion import HEAD, superseded_case
 from tests.factory.test_factory_audit_metrics import _install_marker, _seed_team, _seed_work, store  # noqa: F401
 from tests.factory.test_pull_request_facts import _Client as _FactsClient
-from tests.factory.test_pull_request_facts import _facts, _merge, _poll
+from tests.factory.test_pull_request_facts import _facts, _merge, _poll, _pull
 
 pytestmark = pytest.mark.asyncio
 GREEN = [{"name": "ci", "status": "completed", "conclusion": "success"}]
@@ -215,8 +217,9 @@ async def _coverage(store, started_at):
 async def _attempt(store, item_id, number, status):
     async with store() as session:
         item = await session.get(GithubWorkItem, item_id)
+        scope = await session.get(TeamGithubScope, item.scope_id)
         attempt_id = await attempts.begin(session, scope_id=item.scope_id, item_id=item.id, pr_number=number,
-                                          head_sha="d" * 40)
+                                          head_sha="d" * 40, repository=f"{scope.repo_owner}/{scope.repo_name}")
         if status != "attempted":
             await attempts.finish(session, attempt_id, status, "test")
         await session.commit()
@@ -270,9 +273,109 @@ async def test_another_pulls_attempt_classifies_nothing(store):
 
 async def test_an_attempt_keeps_its_first_outcome(db, ordinary):
     scope, item, _client = await _ordinary(db)
-    attempt_id = await attempts.begin(db, scope_id=scope.id, item_id=item.id, pr_number=5, head_sha="sha")
+    attempt_id = await attempts.begin(db, scope_id=scope.id, item_id=item.id, pr_number=5, head_sha="sha",
+                                      repository="o/r")
     await attempts.finish(db, attempt_id, attempts.REFUSED, "hold")
     await attempts.finish(db, attempt_id, attempts.MERGED, None)  # a late writer can't rewrite it
     await db.commit()
     (attempt,) = await _attempts(db)
     assert (attempt.status, attempt.reason) == ("refused", "hold")
+
+
+# V1 review 6074761059: an attempt belongs to its repository and pull request, whichever scope observes the merge
+async def test_a_scope_moved_to_another_repository_does_not_borrow_its_old_attempts(store):
+    await _install_marker(store)
+    await _seed_team(store)
+    await _coverage(store, datetime(2026, 10, 1))
+    await _seed_work(store, item_id=304, status="merged", pr_number=90)
+    await _attempt(store, 304, 90, "merged")  # the old repository's pull 90
+    async with store() as session:
+        scope = await session.get(TeamGithubScope, 5)
+        scope.repo_owner, scope.repo_name = "moved-owner", "moved-repo"
+        await session.commit()
+    await _seed_work(store, item_id=305, status="merged", pr_number=90)
+    await _merge(store, 305, 90, seed=False)  # the new repository's pull 90
+    await _poll(store, _FactsClient({90: _pull(90, repo="moved-owner/moved-repo")}))
+    (fact,) = await _facts(store)
+    assert fact["after"]["merge_path"] == "outside"
+
+
+async def test_a_second_team_watching_the_repository_sees_the_first_teams_confirmed_merge(store):
+    await _install_marker(store)
+    await _seed_team(store)
+    await _coverage(store, datetime(2026, 10, 1))
+    async with store() as session:
+        first = await session.get(TeamGithubScope, 5)
+        other = AgentTeamPreset(name="Second team")
+        session.add(other)
+        await session.flush()
+        session.add(TeamGithubScope(id=7, preset_id=other.id, repo_owner=first.repo_owner, repo_name=first.repo_name,
+                                    repo_path="/tmp/second-team", base_ref="origin/main", github_auth_mode="ambient",
+                                    merge_policy="human"))
+        await session.commit()
+    await _seed_work(store, item_id=306, status="merged", pr_number=94)
+    await _attempt(store, 306, 94, "merged")  # the first team's automatic merge
+    await _merge(store, 307, 94, scope_id=7)  # the second team observes the same pull request
+    await _poll(store, _FactsClient(), scope_id=7)
+    (fact,) = await _facts(store)
+    assert fact["after"]["merge_path"] == "automatic"
+
+
+# V1 review 6074761059: the ordinary path's final authority checks follow the durable attempt
+@pytest.mark.parametrize("kind,reason", [("settlement", "settlement_changed"), ("acceptance", "acceptance_changed")])
+async def test_authority_withdrawn_after_the_attempt_refuses_it_on_the_ordinary_path(twin, superseded, monkeypatch,
+                                                                                    kind, reason):
+    from app.models.database import GithubHeadReview
+    from tests.agent_teams.test_settled_revision_promotion import _withdraw, settled_case
+
+    db, maker = twin
+    case = await settled_case(db)
+    statement = _withdraw(case, "revision_superseded") if kind == "settlement" else (
+        update(GithubHeadReview).where(GithubHeadReview.work_item_id == case.item.id)
+        .values(status="superseded", ended_at=datetime.utcnow()))
+    original_begin, original_note, state = attempts.begin, service._acceptance_note, {"begun": False, "fired": False}
+
+    async def begin(*args, **kwargs):
+        state["begun"] = True
+        return await original_begin(*args, **kwargs)
+
+    async def acceptance_note(*args, **kwargs):
+        if state["begun"] and not state["fired"]:  # the attempt is committed; withdraw before the final checks
+            state["fired"] = True
+            async with maker() as other:
+                await other.execute(statement)
+                await other.commit()
+        return await original_note(*args, **kwargs)
+
+    monkeypatch.setattr(attempts, "begin", begin)
+    monkeypatch.setattr(service, "_acceptance_note", acceptance_note)
+    await case.tick()
+    assert state["fired"] and case.client.merge_calls == 0
+    assert [(row.status, row.reason) for row in await _attempts(db)] == [("refused", reason)]
+
+
+async def test_with_nothing_withdrawn_the_ordinary_settled_path_still_merges(twin, superseded):
+    from tests.agent_teams.test_settled_revision_promotion import settled_case
+
+    db, _maker = twin
+    case = await settled_case(db)
+    await case.tick()
+    assert case.client.merge_calls == 1 and case.item.dispatch_status == "merged"
+    assert [(row.status, row.repository) for row in await _attempts(db)] == [("merged", "o/r")]
+
+
+async def test_a_repository_spelled_with_capitals_still_matches_its_attempt(store):
+    """GitHub owner and repository names are case-insensitive, as #1238's facts treat them."""
+    await _install_marker(store)
+    await _seed_team(store)
+    await _coverage(store, datetime(2026, 10, 1))
+    async with store() as session:
+        scope = await session.get(TeamGithubScope, 5)
+        scope.repo_owner, scope.repo_name = "Matrix-Owner", "Matrix-Repo"
+        await session.commit()
+    await _seed_work(store, item_id=308, status="merged", pr_number=95)
+    await _attempt(store, 308, 95, "merged")
+    await _merge(store, 308, 95, seed=False)
+    await _poll(store, _FactsClient({95: _pull(95, repo="Matrix-Owner/Matrix-Repo")}))
+    (fact,) = await _facts(store)
+    assert fact["after"]["merge_path"] == "automatic"

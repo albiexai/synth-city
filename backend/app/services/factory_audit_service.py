@@ -808,9 +808,9 @@ async def record_pull_request_facts(
     # #1310: confirmed attempts, refused or no attempts after the recording began, else unknown.
     from app.services import github_merge_attempt_service as merge_attempts
 
-    number = pull.get("number")
+    repository, _, number = due.artifact.rpartition("/pull/")
     path = "automatic" if automatic is not None else await merge_attempts.merge_path(
-        db, scope_context_key=due.scope_context_key, pr_number=number if type(number) is int else None,
+        db, repository=repository or None, pr_number=int(number) if number.isdigit() else None,
         merged_at=_parse_time(pull.get("merged_at")))
     values = {
         "additions": _count(pull.get("additions")), "deletions": _count(pull.get("deletions")),

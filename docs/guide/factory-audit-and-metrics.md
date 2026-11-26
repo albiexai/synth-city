@@ -66,15 +66,17 @@ The watcher reads later results. Each poll reads at most 20 attempts that are un
 
 The watcher also records the facts of each merged pull request, once per watched repository scope: lines added and deleted, changed files, commits, and who merged it (`pull_request_facts`). The merge marks them as due in its own transaction, and each poll reads at most 20 due pull requests. A failed read writes nothing and is tried again on a later poll. A value that GitHub did not report is unknown, never zero. `merge_path` says how a pull request was merged. Merges recorded before this version have no facts.
 
-Synth City records each automatic-merge attempt (`github_merge_attempts`). The attempt is committed before the merge call's existing fences, which stay the last checks before the call. Its outcome is:
+Synth City records each automatic-merge attempt (`github_merge_attempts`), with the repository and pull request it was for. The attempt is committed before each path's final checks, which stay the last before the call: on the superseded-revision path the authority fence and the HOLD read; on the ordinary path the acceptance, approval and settlement checks, run again after the record. Its outcome is:
 - `merged` when GitHub confirmed the merge;
-- `refused` when GitHub can't have merged: a fence or HOLD stopped it after the record, GitHub answered 4xx, it was rate-limited, or the request was never sent;
+- `refused` when GitHub can't have merged: a final check or HOLD stopped it after the record, GitHub answered 4xx, it was rate-limited, or the request was never sent;
 - `uncertain` when it may have reached GitHub: a 5xx, a timeout or lost connection after sending, or an unreadable answer. An attempt left unfinished by a crash reads the same way.
 
 GitHub can prove whether Synth City made a merge, but not whether a person did, because the factory merges with one shared account. So `merge_path` is:
 - `automatic` with a confirmed attempt;
 - `outside` (merged outside Synth City's automatic merge, by a person, GitHub's auto-merge, a bot or a script) with no attempt or only refused ones;
 - `unknown` with an uncertain or unfinished attempt, or for a pull request merged before attempt recording began.
+
+Attempts are matched by repository and pull request, so every team watching a repository sees the same classification, and a scope moved to another repository can't borrow its old attempts.
 
 `merged_by` stays beside it as a fact, and nothing is inferred from it.
 

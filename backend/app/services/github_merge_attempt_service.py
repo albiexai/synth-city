@@ -33,11 +33,13 @@ async def install_merge_attempt_coverage(conn: AsyncConnection) -> None:
                        {"id": 1, "started_at": _now()})
 
 
-async def begin(db: AsyncSession, *, scope_id: int, item_id: int, pr_number: int, head_sha: str) -> int:
-    """Add (never commit) an attempt; the caller commits it before the merge call's fences."""
+async def begin(db: AsyncSession, *, scope_id: int, item_id: int, pr_number: int, head_sha: str,
+                repository: str) -> int:
+    """Add (never commit) an attempt; the caller commits it before the merge call's final checks."""
     key = await audit.current_context_key(db, "scope", scope_id) or await audit.context_key_for(db, "scope", scope_id)
-    attempt = GithubMergeAttempt(scope_id=scope_id, scope_context_key=key, work_item_id=item_id, pr_number=pr_number,
-                                 head_sha=head_sha, status=ATTEMPTED)
+    attempt = GithubMergeAttempt(scope_id=scope_id, scope_context_key=key, work_item_id=item_id,
+                                 repository=repository.lower(), pr_number=pr_number, head_sha=head_sha,
+                                 status=ATTEMPTED)
     db.add(attempt)
     await db.flush()
     return attempt.id
@@ -63,13 +65,17 @@ def outcome(error: BaseException) -> tuple[str, str]:
     return UNCERTAIN, type(error).__name__  # sent, and the answer was lost or unreadable
 
 
-async def merge_path(db: AsyncSession, *, scope_context_key: str, pr_number: int | None,
+async def merge_path(db: AsyncSession, *, repository: str | None, pr_number: int | None,
                      merged_at: datetime | None) -> str:
-    """``automatic``, ``outside`` or ``unknown`` for one merged pull request in one scope lifetime."""
-    if pr_number is None:
+    """``automatic``, ``outside`` or ``unknown`` for one merged pull request, whichever scope observes it.
+
+    Matched by the repository and pull request recorded at attempt time (V1 review 6074761059): a scope that moved to
+    another repository can't lend its old attempts, and a second team watching the repository sees the first's.
+    """
+    if repository is None or pr_number is None:
         return "unknown"
     statuses = set((await db.scalars(select(GithubMergeAttempt.status).where(
-        GithubMergeAttempt.scope_context_key == scope_context_key,
+        GithubMergeAttempt.repository == repository.lower(),
         GithubMergeAttempt.pr_number == pr_number))).all())
     if MERGED in statuses:
         return "automatic"

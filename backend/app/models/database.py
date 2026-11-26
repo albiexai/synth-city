@@ -592,20 +592,23 @@ class GithubMergeAttempt(Base):
 
     ``attempted`` until its outcome is known: ``merged``, ``refused`` (the call failed, or a fence stopped it after the
     record) or ``uncertain`` (it may have reached GitHub). An attempt left ``attempted`` (a crash) reads as uncertain.
-    Plain ids, so the history survives the work item's deletion; the scope lifetime key binds it to its scope.
+    Plain ids, so the history survives the work item's deletion. The repository and pull request identify the merge
+    for every scope that observes it (V1 review 6074761059); the scope lifetime key keeps the audit trail.
     """
 
     __tablename__ = "github_merge_attempts"
     __table_args__ = (
         CheckConstraint("status IN ('attempted', 'merged', 'refused', 'uncertain')",
                         name="ck_github_merge_attempts_status"),
-        Index("ix_github_merge_attempts_pull", "scope_context_key", "pr_number"),
+        Index("ix_github_merge_attempts_pull", "repository", "pr_number"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     scope_id: Mapped[int] = mapped_column(Integer, nullable=False)
     scope_context_key: Mapped[str] = mapped_column(String, nullable=False)
     work_item_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # "owner/repo" as watched at attempt time, case-folded: GitHub names are case-insensitive.
+    repository: Mapped[str] = mapped_column(String, nullable=False)
     pr_number: Mapped[int] = mapped_column(Integer, nullable=False)
     head_sha: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, default="attempted")
