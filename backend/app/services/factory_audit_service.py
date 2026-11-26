@@ -53,6 +53,8 @@ SAFE_VALUE_FIELDS = {
     "wait_request_id", "awaited_member_id", "awaited_role", "wait_outcome", "answered_by_member_id",
     # #1240: Mail request and input waits.
     "wait_message_id", "wait_binding_id", "owner_actor_id", "awaited_actor_id",
+    # #1338: an observation pause wait, keyed by the pause id.
+    "wait_pause_id",
     # #1238: the facts of a merged pull request, as GitHub reports them, and how it is known to have merged.
     "additions", "deletions", "changed_files", "commit_count", "merged_by", "merged_by_type", "merge_path",
 }

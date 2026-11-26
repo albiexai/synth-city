@@ -84,6 +84,13 @@ A request beyond the scope's effort ceiling waits on the Supervisor. Synth City'
 
 A split has no record of its own, so it counts as whichever of these recorded it. The end names whoever acted, for example the operator for a scope change; the answerer stays unknown, because an operator key or a Leader never proves the Supervisor's or the Director's answer. The notice is not a Mail request, so it is not counted twice.
 
+The owner also waits for the operator at a recovery checkpoint hold and at a recorded observation pause. A hold starts a wait when the revision enters `decision_hold` or `ack_hold` (`hold_wait_started`, keyed by the continuation request id and the stage). A pause starts one when it becomes `paused` (`pause_wait_started`, keyed by the pause id). The release or the resume ends it (`hold_wait_ended` or `pause_wait_ended`), and the end records exactly the actor that action supplied:
+- the operator, only when the operator-authenticated route supplied it;
+- the Supervisor, only when its external-actor identity was supplied;
+- nobody, when no actor was supplied. The operator key does not prove which person used it, so "operator" is never read as the Director.
+
+A wait that nothing released is closed by the monitor, unattributed, at its first resolving transition: `hold_cleared` when the hold's revision ended on its own, or `item_terminal` when the item ended first. The end takes that transition's own time, never the poll time. For a hold that is the revision's recorded end, its approval request's supersession time, or the end-stopped time. When neither is recorded, it uses the item's last write, an approximate bound that is never later than the poll. Neither flow is a Mail request, so neither is counted twice.
+
 ## Review acceptance declarations
 
 An operator can record a review acceptance from a trusted source with `POST /api/v1/factory/review-acceptances`. The declaration names:

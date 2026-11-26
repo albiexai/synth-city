@@ -25,6 +25,12 @@ INPUT_STARTED, INPUT_ENDED = "input_wait_started", "input_wait_ended"
 EFFORT_STARTED, EFFORT_ENDED = "effort_wait_started", "effort_wait_ended"
 # #1300: a Supervisor decision beyond the effort ceiling, keyed by the Mail message id of the ceiling notice.
 CEILING_STARTED, CEILING_ENDED = "ceiling_wait_started", "ceiling_wait_ended"
+# #1338: the owner waits for the operator at a recovery checkpoint hold, keyed by the continuation request id and the
+# held stage, or at a recorded observation pause, keyed by the pause id.
+HOLD_STARTED, HOLD_ENDED = "hold_wait_started", "hold_wait_ended"
+PAUSE_STARTED, PAUSE_ENDED = "pause_wait_started", "pause_wait_ended"
+# The reason complete_current_revision gives a revision it supersedes in an item's terminal transition.
+ITEM_TERMINAL_REASON = "The work item reached a terminal state."
 # The Mail root of a structured request carries this delivery key; its decision wait already counts it.
 STRUCTURED_REQUEST_KEY = "github-approval:"
 
@@ -291,6 +297,167 @@ async def _end_item_waits(
             operation_id=operation_id, correlation_id=correlation_id or operation_id)
 
 
+async def record_hold_wait_started(db: AsyncSession, *, request_id: int, item_id: int, stage: str, source: str) -> None:
+    """#1338: a recovery checkpoint hold starts a wait on the operator, in the hold's own transaction."""
+    owner = await db.scalar(select(GithubApprovalRequest.owner_member_id).where(GithubApprovalRequest.id == request_id))
+    await _start_operator_wait(
+        db, HOLD_STARTED, f"request:{request_id}:{stage}", item_id=item_id, request_id=request_id,
+        fact_source="github_attempt_scope_revisions", fact_time=datetime.now(UTC),
+        values={"wait_request_id": request_id, "request_kind": "checkpoint_hold",
+                "recovery_checkpoint_stage": stage, "owner_member_id": owner, "awaited_role": "operator"},
+        reason=f"{stage} waits on the operator", source=source)
+
+
+async def record_hold_wait_ended(
+    db: AsyncSession, *, request_id: int, item_id: int, stage: str, outcome: str, ended_at: datetime, source: str,
+    actor: dict | None = None, evidence: dict | None = None,
+) -> None:
+    """End a hold wait. ``actor`` is exactly the one the release supplied; none is unknown, never assumed."""
+    await _end_operator_wait(db, HOLD_STARTED, HOLD_ENDED, f"request:{request_id}:{stage}", item_id=item_id,
+                             outcome=outcome, ended_at=ended_at, source=source, actor=actor, evidence=evidence)
+
+
+async def record_pause_wait_started(
+    db: AsyncSession, record, *, item_id: int, owner_member_id: int | None, source: str,
+) -> None:
+    """#1338: a recorded observation pause, once paused, starts a wait on the operator in the pause's commit.
+
+    ``owner_member_id`` is the owner the pause service verified, never whoever resumes the pause.
+    """
+    await db.flush()
+    await _start_operator_wait(
+        db, PAUSE_STARTED, f"pause:{record.id}", item_id=item_id, request_id=None,
+        fact_source="github_owner_observation_pauses", fact_time=record.paused_at,
+        values={"wait_pause_id": record.id, "request_kind": "observation_pause",
+                "owner_member_id": owner_member_id, "awaited_role": "operator"},
+        reason="observation pause waits on the operator", source=source)
+
+
+async def record_pause_wait_ended(
+    db: AsyncSession, *, pause_id: int, item_id: int, outcome: str, ended_at: datetime, source: str,
+    actor: dict | None = None, evidence: dict | None = None,
+) -> None:
+    """End a pause wait. ``actor`` is exactly the one the resume supplied; none is unknown, never assumed."""
+    await _end_operator_wait(db, PAUSE_STARTED, PAUSE_ENDED, f"pause:{pause_id}", item_id=item_id,
+                             outcome=outcome, ended_at=ended_at, source=source, actor=actor, evidence=evidence)
+
+
+async def reconcile_operator_waits(db: AsyncSession, *, scope_id: int, now: datetime) -> bool:
+    """End the scope's open hold and pause waits that nothing released, at their first resolving transition.
+
+    ``hold_cleared`` when the hold's revision ended on its own; ``item_terminal`` when the item ended first. Both
+    unattributed. The end takes the transition's own time, never the poll's (V1 review 6070971861): the revision's
+    end or its request's supersession, the item's end-stopped event, or else the item's last write, an approximate
+    bound no later than the poll.
+    Whether any end was written.
+    """
+    from sqlalchemy import func
+
+    from app.models.database import GithubAttemptScopeRevision, GithubWorkItem
+    from app.services.github_terminal_revision_service import (
+        TERMINAL_ITEMS,
+        TERMINAL_REVISIONS,
+    )
+
+    starts = (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind.in_((HOLD_STARTED, PAUSE_STARTED)),
+        FactoryAuditEvent.item_id.in_(select(GithubWorkItem.id).where(GithubWorkItem.scope_id == scope_id)))
+        .order_by(FactoryAuditEvent.id))).all()
+    wrote = False
+    for start in starts:
+        item_key = await audit.current_context_key(db, "item", start.item_id)
+        start_kind = start.event_kind
+        end_kind = HOLD_ENDED if start_kind == HOLD_STARTED else PAUSE_ENDED
+        suffix = start.operation_id.removeprefix(f"{start_kind}:")
+        if start.item_context_key != item_key or await _once(db, f"{end_kind}:{suffix}", item_key=item_key):
+            continue
+        status, written = (await db.execute(select(GithubWorkItem.dispatch_status, GithubWorkItem.updated_at)
+                                            .where(GithubWorkItem.id == start.item_id))).one()
+        item_ended = status in TERMINAL_ITEMS
+        # End-stopped records its event and cancels the item's revisions with one time.
+        stopped = await db.scalar(select(func.min(FactoryAuditEvent.occurred_at)).where(
+            FactoryAuditEvent.event_kind == "stopped_work_item_ended", FactoryAuditEvent.item_id == start.item_id,
+            FactoryAuditEvent.item_context_key == item_key))
+        values = start.after_values or {}
+        revision = None
+        if start_kind == HOLD_STARTED:
+            revision = (await db.execute(select(
+                GithubAttemptScopeRevision.status, GithubAttemptScopeRevision.recovery_checkpoint_stage,
+                GithubAttemptScopeRevision.cancelled_at, GithubAttemptScopeRevision.completed_at,
+                GithubAttemptScopeRevision.expires_at, GithubAttemptScopeRevision.cancellation_reason,
+            ).where(GithubAttemptScopeRevision.approval_request_id == values.get("wait_request_id")))).first()
+        still_held = revision is not None and revision[0] not in TERMINAL_REVISIONS \
+            and revision[1] == values.get("recovery_checkpoint_stage")
+        if start_kind == PAUSE_STARTED or still_held:
+            if not item_ended:
+                continue
+            outcome, at, evidence = "item_terminal", stopped or written, {"dispatch_status": status}
+        else:
+            rev_status, stage, cancelled_at, completed_at, expires_at, reason = revision or (None,) * 6
+            # Approval cancellation and stale supersession record the request's superseded_at and no revision end
+            # time (V1 review 6071348579).
+            superseded_at = await db.scalar(select(GithubApprovalRequest.superseded_at).where(
+                GithubApprovalRequest.id == values.get("wait_request_id")))
+            ended_at = (cancelled_at or completed_at or (expires_at if rev_status == "expired" else None)
+                        or superseded_at)
+            # The item's own terminal transition ended this revision: complete_current_revision completes or
+            # supersedes it with its fixed reason, or end-stopped cancelled it at the event's time.
+            by_item = item_ended and (rev_status == "completed" or reason == ITEM_TERMINAL_REASON
+                                      or (stopped is not None and ended_at == stopped))
+            if by_item:
+                outcome, at, evidence = "item_terminal", ended_at or stopped or written, {"dispatch_status": status}
+            else:
+                outcome, at, evidence = "hold_cleared", ended_at, {"recovery_checkpoint_stage": stage}
+        await _end_operator_wait(db, start_kind, end_kind, suffix, item_id=start.item_id, outcome=outcome,
+                                 ended_at=min(audit._naive(at), audit._naive(now)) if at else now,
+                                 source="decision_wait_service.reconcile_operator_waits", evidence=evidence)
+        wrote = True
+    return wrote
+
+
+async def _start_operator_wait(
+    db: AsyncSession, start_kind: str, suffix: str, *, item_id: int, request_id: int | None, fact_source: str,
+    fact_time, values: dict, reason: str, source: str,
+) -> None:
+    operation_id = f"{start_kind}:{suffix}"
+    item_key = await audit.current_context_key(db, "item", item_id)
+    if item_key is not None and await _once(db, operation_id, item_key=item_key):
+        return
+    await audit.record_event(
+        db, event_kind=start_kind, source=source, occurred_at=datetime.now(UTC), fact_source=fact_source,
+        fact_time=audit._naive(fact_time), item_id=item_id, request_id=request_id,
+        actor=audit.derive_actor(actor_kind="system"), after_values=values, action_outcome="applied",
+        sanitized_reason=reason, operation_id=operation_id, correlation_id=operation_id)
+
+
+async def _end_operator_wait(
+    db: AsyncSession, start_kind: str, end_kind: str, suffix: str, *, item_id: int, outcome: str,
+    ended_at: datetime, source: str, actor: dict | None = None, evidence: dict | None = None,
+) -> None:
+    """One end per start in its item lifetime, never before it; a missing actor stays unknown (system)."""
+    item_key = await audit.current_context_key(db, "item", item_id)
+    if item_key is None:
+        return
+    started = (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.operation_id == f"{start_kind}:{suffix}",
+        FactoryAuditEvent.item_context_key == item_key).limit(1))).first()
+    operation_id = f"{end_kind}:{suffix}"
+    if started is None or await _once(db, operation_id, item_key=item_key):
+        return
+    key = "wait_request_id" if start_kind == HOLD_STARTED else "wait_pause_id"
+    ended = max(audit._naive(ended_at), started.fact_time or audit._naive(ended_at))
+    await audit.record_event(
+        db, event_kind=end_kind, source=source, occurred_at=datetime.now(UTC), fact_source=started.fact_source,
+        fact_time=ended, item_id=started.item_id, request_id=started.request_id, item_context_key=item_key,
+        scope_context_key=started.scope_context_key, team_context_key=started.team_context_key,
+        actor=actor or audit.derive_actor(actor_kind="system"),
+        after_values={key: (started.after_values or {}).get(key), "wait_outcome": outcome,
+                      "answered_by_member_id": None, **(evidence or {})},
+        action_outcome="applied",
+        sanitized_reason=f"{end_kind.removesuffix('_ended').replace('_', ' ')} ended: {outcome}",
+        operation_id=operation_id, correlation_id=operation_id)
+
+
 @dataclass(frozen=True)
 class DecisionWait:
     request_id: int
@@ -301,7 +468,8 @@ class DecisionWait:
     age_seconds: float | None
     state: str  # "open", or "unknown" when the work item was deleted before the request ended
     reason: str | None = None
-    # "decision", "mail", "effort" or "ceiling" (keyed by message id), or "input" (keyed by pane binding id)
+    # "decision", "mail", "effort" or "ceiling" (keyed by message id), "input" (keyed by pane binding id), "hold"
+    # (keyed by request id) or "pause" (keyed by pause id)
     wait_kind: str = "decision"
     awaited_actor_id: int | None = None
 
@@ -332,7 +500,9 @@ async def unended_decision_waits(
             state="unknown" if deleted else "open", reason="work item deleted" if deleted else None))
     for kind, (start_kind, end_kind) in {"mail": (MAIL_STARTED, MAIL_ENDED), "input": (INPUT_STARTED, INPUT_ENDED),
                                          "effort": (EFFORT_STARTED, EFFORT_ENDED),
-                                         "ceiling": (CEILING_STARTED, CEILING_ENDED)}.items():
+                                         "ceiling": (CEILING_STARTED, CEILING_ENDED),
+                                         "hold": (HOLD_STARTED, HOLD_ENDED),
+                                         "pause": (PAUSE_STARTED, PAUSE_ENDED)}.items():
         query = select(FactoryAuditEvent).where(FactoryAuditEvent.event_kind == start_kind)
         if team_context_key is not None:
             query = query.where(FactoryAuditEvent.team_context_key == team_context_key)
@@ -343,10 +513,12 @@ async def unended_decision_waits(
             if (start.operation_id.replace(start_kind, end_kind, 1), start.item_context_key) in ended_ids:
                 continue
             values, began = start.after_values or {}, start.fact_time or start.occurred_at
-            # An item-bound wait (effort, ceiling) whose work item was deleted is unknown, as for decision waits.
+            # An item-bound wait (effort, ceiling, hold, pause) whose work item was deleted is unknown, as for
+            # decision waits.
             deleted = start.item_context_key is not None and start.item_context_key in retired
             waits.append(DecisionWait(
-                request_id=values.get("wait_message_id") or values.get("wait_binding_id"),
+                request_id=(values.get("wait_message_id") or values.get("wait_binding_id")
+                            or values.get("wait_request_id") or values.get("wait_pause_id")),
                 request_kind=values.get("request_kind"), owner_member_id=values.get("owner_member_id"),
                 awaited_member_id=values.get("awaited_member_id"), started_at=began,
                 age_seconds=None if deleted else (now - began).total_seconds(),
