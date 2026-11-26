@@ -10,6 +10,7 @@ import stat
 import tempfile
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from itertools import count
 from pathlib import Path
@@ -191,7 +192,44 @@ async def _pool(db: AsyncSession, scope_id: int) -> list[GithubWorkspace]:
     return list(await db.scalars(select(GithubWorkspace).where(
         GithubWorkspace.scope_id == scope_id, GithubWorkspace.kind == "worktree",
         or_(GithubWorkspace.enabled.is_(True) & GithubWorkspace.dispatchable.is_(True),
-            GithubWorkspace.provision_error == _PENDING))))
+            GithubWorkspace.provision_error == _PENDING),
+    ).order_by(GithubWorkspace.id).execution_options(populate_existing=True)))
+
+
+@dataclass(frozen=True)
+class DispatchWorktreeBinding:
+    workspace_id: int
+    path: str
+    created_at: datetime
+    updated_at: datetime
+    pending: bool
+
+
+async def dispatch_worktree_bindings(db: AsyncSession, scope_id: int) -> tuple[DispatchWorktreeBinding, ...]:
+    return tuple(
+        DispatchWorktreeBinding(row.id, row.path, row.created_at, row.updated_at, row.provision_error == _PENDING)
+        for row in await _pool(db, scope_id)
+    )
+
+
+async def dispatch_worktrees_match_checkout(bindings: tuple[DispatchWorktreeBinding, ...], repo_path: str) -> bool:
+    """Verify the existing pool against the proposed scope checkout before taking the writer."""
+    if not bindings:
+        return True
+    if any(binding.pending or binding.path == repo_path for binding in bindings):
+        return False
+    try:
+        proposed = await github_workspace_service._probe_identity(repo_path)
+        if proposed is None or proposed[2] != repo_path:
+            return False
+        for binding in bindings:
+            identity = await github_workspace_service._probe_identity(binding.path)
+            if (identity is None or identity[1] != proposed[1] or identity[0] == identity[1]
+                    or identity[2] != binding.path):
+                return False
+        return True
+    except OSError:
+        return False
 
 
 async def ensure_dispatch_capacity(

@@ -799,14 +799,17 @@ async def _resolve_scope_app_installation(scope: TeamGithubScope) -> int:
 def _apply_scope_create(
     scope: TeamGithubScope,
     request: TeamGithubScopeCreate | TeamGithubScopeUpdate,
+    *,
+    normalized_repo_path: str | None = None,
 ) -> None:
     if request.repo_owner is not None:
         scope.repo_owner = _clean_repo_part(request.repo_owner, "Repo owner")
     if request.repo_name is not None:
         scope.repo_name = _clean_repo_part(request.repo_name, "Repo name")
     if request.repo_path is not None:
-        repo_path, _ = agent_team_service.normalize_repo_path(request.repo_path)
-        scope.repo_path = repo_path
+        if normalized_repo_path is None:
+            normalized_repo_path, _ = agent_team_service.normalize_repo_path(request.repo_path)
+        scope.repo_path = normalized_repo_path
     if request.dispatch_label is not None:
         scope.dispatch_label = _clean_label(request.dispatch_label, "Dispatch label")
     if request.design_label is not None:
@@ -2738,17 +2741,19 @@ async def update_github_scope(
     observed = await db.get(TeamGithubScope, scope_id)
     if observed is None:
         raise HTTPException(status_code=404, detail="GitHub scope not found")
+    from app.services.dispatch_workspace_provisioning import dispatch_worktree_bindings, dispatch_worktrees_match_checkout
+
     try:
         observed_configuration = _scope_configuration(observed)
         proposed_owner = _clean_repo_part(request.repo_owner, "Repo owner") if request.repo_owner is not None else observed.repo_owner
         proposed_repo = _clean_repo_part(request.repo_name, "Repo name") if request.repo_name is not None else observed.repo_name
+        proposed_repo_path = (agent_team_service.normalize_repo_path(request.repo_path)[0]
+                              if request.repo_path is not None else observed.repo_path)
+        repo_path_change = proposed_repo_path != observed.repo_path
         identity_change = (
             proposed_owner != observed.repo_owner
             or proposed_repo != observed.repo_name
-            or (
-                request.repo_path is not None
-                and agent_team_service.normalize_repo_path(request.repo_path)[0] != observed.repo_path
-            )
+            or repo_path_change
             or (request.base_ref is not None and _clean_required(request.base_ref, "Base ref") != observed.base_ref)
         )
         auth_change = (
@@ -2761,12 +2766,14 @@ async def update_github_scope(
             auth_change or identity_change or (not observed.enabled and target_enabled)
         )
 
-        # Remote discovery must finish before reserving the SQLite writer.
+        worktree_bindings = await dispatch_worktree_bindings(db, scope_id) if repo_path_change else ()
+        # Remote discovery and Git probes must finish before reserving the SQLite writer.
         # Drop the read snapshot so the later reservation sees concurrent commits.
         await db.rollback()
         installation_id = None
         if resolve_app:
             installation_id = await _resolve_app_installation_for_repository(proposed_owner, proposed_repo)
+        compatible_checkout = await dispatch_worktrees_match_checkout(worktree_bindings, proposed_repo_path)
 
         scope = await _reserve_scope_writer(db, scope_id)
         if _scope_configuration(scope) != observed_configuration:
@@ -2788,8 +2795,13 @@ async def update_github_scope(
             # Residual workspace authority blocks effective changes. Unchanged
             # safe resumes are not affected.
             raise HTTPException(status_code=409, detail="scope_workspace_authority_in_use")
+        if repo_path_change:
+            if worktree_bindings != await dispatch_worktree_bindings(db, scope_id):
+                raise HTTPException(status_code=409, detail="scope_workspace_pool_changed")
+            if not compatible_checkout:
+                raise HTTPException(status_code=409, detail="scope_workspace_repository_mismatch")
         previously_enabled, previous_limit = scope.enabled, scope.max_concurrent_dispatched
-        _apply_scope_create(scope, request)
+        _apply_scope_create(scope, request, normalized_repo_path=proposed_repo_path)
         if scope.github_auth_mode == "app":
             if installation_id is not None:
                 scope.github_app_installation_id = installation_id

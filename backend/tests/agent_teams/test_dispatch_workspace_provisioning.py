@@ -299,6 +299,84 @@ async def test_scope_create_grow_and_shrink_preserve_existing_leased_worktree(sc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["different_clone", "same_common_dir", "pool_changed", "registered_worktree", "resolved_path"])
+async def test_scope_growth_checks_existing_worktrees_against_the_proposed_checkout(scope_database, monkeypatch, change):
+    from app.services import dispatch_workspace_provisioning as provisioning
+
+    sessions, repo_path, team_id = scope_database
+    repo = Path(repo_path)
+    alternate = repo.parent / "alternate-checkout"
+    if change == "different_clone":
+        git(repo, "clone", "--quiet", str(repo), str(alternate))
+        git(alternate, "remote", "set-url", "origin", git(repo, "remote", "get-url", "origin"))
+    elif change != "registered_worktree":
+        git(repo, "worktree", "add", "--quiet", "--detach", str(alternate))
+
+    async with sessions() as db:
+        scope = await agent_teams.create_github_scope(team_id, TeamGithubScopeCreate(repo_owner="example",
+            repo_name="fixture", repo_path=str(repo), base_ref="HEAD", max_concurrent_dispatched=1), None, db)
+        scope_id = scope.id
+        query = select(GithubWorkspace).where(GithubWorkspace.scope_id == scope_id).order_by(GithubWorkspace.id)
+        (original,) = (await db.scalars(query)).all()
+        original_id = original.id
+        if change == "registered_worktree":
+            alternate = Path(original.path)
+        untouched = Path(original.path) / "retained.txt"
+        untouched.write_text("Prior worktree contents", encoding="utf-8")
+        request = TeamGithubScopeUpdate(repo_path=str(alternate), max_concurrent_dispatched=2)
+
+        if change == "resolved_path":
+            normalize = agent_teams.agent_team_service.normalize_repo_path
+            checked = False
+
+            def normalize_once(path):
+                nonlocal checked
+                if path == str(alternate):
+                    assert not checked, "The saved checkout must use the path validated by the preflight"
+                    checked = True
+                return normalize(path)
+
+            monkeypatch.setattr(agent_teams.agent_team_service, "normalize_repo_path", normalize_once)
+
+        if change == "pool_changed":
+            original_probe = provisioning.github_workspace_service._probe_identity
+
+            async def probe_with_pool_change(path):
+                identity = await original_probe(path)
+                if path == str(alternate):
+                    async with sessions.begin() as concurrent:
+                        row = await concurrent.get(GithubWorkspace, original_id)
+                        row.updated_at += timedelta(seconds=1)
+                return identity
+
+            monkeypatch.setattr(provisioning.github_workspace_service, "_probe_identity", probe_with_pool_change)
+
+        compatible = change in {"same_common_dir", "resolved_path"}
+        if compatible:
+            await agent_teams.update_github_scope(scope_id, request, None, db, None)
+        else:
+            with pytest.raises(HTTPException) as refused:
+                await agent_teams.update_github_scope(scope_id, request, None, db, None)
+            assert refused.value.status_code == 409
+            expected_block = ("scope_workspace_pool_changed" if change == "pool_changed"
+                              else "scope_workspace_repository_mismatch")
+            assert refused.value.detail == expected_block
+
+        current = await db.get(TeamGithubScope, scope_id, populate_existing=True)
+        expected_root = alternate if compatible else repo
+        expected_size = 2 if compatible else 1
+        assert current.repo_path == str(expected_root)
+        assert current.max_concurrent_dispatched == expected_size
+        rows = (await db.scalars(query)).all()
+        assert len(rows) == expected_size and rows[0].id == original_id
+        assert untouched.read_text(encoding="utf-8") == "Prior worktree contents"
+        active_common = git(expected_root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        for row in rows:
+            assert row.enabled and row.dispatchable and row.leased_item_id is None
+            assert git(Path(row.path), "rev-parse", "--path-format=absolute", "--git-common-dir") == active_common
+
+
+@pytest.mark.asyncio
 async def test_concurrent_pool_reservations_keep_unverified_checkout_disabled(scope_database, monkeypatch):
     from app.services import dispatch_workspace_provisioning as provisioning
 
