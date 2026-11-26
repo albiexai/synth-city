@@ -36,19 +36,23 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
           fetch-depth: 0
+          persist-credentials: false
+      - name: Check out the workflow's Python check driver
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .workflow-ci
+          sparse-checkout: scripts/factory-static-check.py
+          sparse-checkout-cone-mode: false
           persist-credentials: false
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: python -m pip install ruff==0.14.10
       - name: Check changed Python files
+        working-directory: candidate
         env:
           ACCEPTED_BASE: ${{ github.event.pull_request.base.sha }}
-        run: |
-          CHECK_SCRIPT=scripts/factory-static-check.py
-          if ! test -f "$CHECK_SCRIPT"; then
-            CHECK_SCRIPT="$RUNNER_TEMP/factory-static-check.py"
-            git show "$ACCEPTED_BASE:scripts/factory-static-check.py" > "$CHECK_SCRIPT"
-          fi
-          python "$CHECK_SCRIPT" --base "$ACCEPTED_BASE"
+        run: python ../.workflow-ci/scripts/factory-static-check.py --base "$ACCEPTED_BASE"
