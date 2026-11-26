@@ -3,6 +3,7 @@
 import hashlib
 import json
 import re
+from datetime import datetime
 
 import pytest
 from sqlalchemy import text
@@ -17,7 +18,35 @@ from app.database import (
     _sqlite_columns,
     _sqlite_rebuild_agent_team_slots,
 )
-from app.models.database import AgentTeamPreset, TeamGithubScope
+from app.models.database import AgentTeamPreset, GithubWorkItem, TeamGithubScope
+
+
+@pytest.mark.asyncio
+async def test_handoff_deadline_migration_preserves_existing_pending_handoff():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.connect() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            await conn.commit()
+            async with AsyncSession(bind=conn, expire_on_commit=False) as session:
+                preset = AgentTeamPreset(name="Existing team")
+                session.add(preset)
+                await session.flush()
+                scope = TeamGithubScope(preset_id=preset.id, repo_owner="o", repo_name="r", repo_path="/tmp/r")
+                session.add(scope)
+                await session.flush()
+                session.add(GithubWorkItem(scope_id=scope.id, issue_number=7, issue_title="Existing handoff",
+                    issue_url="url", github_updated_at=datetime.utcnow(), handoff_state="pending"))
+                await session.commit()
+            await conn.execute(text("ALTER TABLE github_work_items DROP COLUMN handoff_expires_at"))
+            await conn.commit()
+            for _ in range(2):
+                await _run_sqlite_compat_migrations(conn)
+            assert (await conn.execute(text(
+                "SELECT handoff_state, handoff_expires_at FROM github_work_items WHERE issue_number=7"
+            ))).one() == ("pending", None)
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
