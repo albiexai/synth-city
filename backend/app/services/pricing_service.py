@@ -4,6 +4,7 @@ Pricing logic adapted from ccusage by ryoppippi
 https://github.com/ryoppippi/ccusage
 Licensed under MIT
 """
+from datetime import date
 from typing import Optional
 
 
@@ -12,6 +13,8 @@ class PricingService:
 
     # Bump when MODEL_PRICING changes so cached usage aggregates are recalculated.
     PRICING_VERSION = "2026-07-02"
+    # #1249: the date the prices below were taken, for "at prices as of <date>". Move it with PRICING_VERSION.
+    PRICES_AS_OF = date(2026, 7, 2)
 
     # Default token threshold for tiered pricing (200k tokens)
     TIERED_THRESHOLD = 200_000
@@ -205,6 +208,19 @@ class PricingService:
             if key in model_name or model_name in key:
                 return self.MODEL_PRICING[key]
 
+        return None
+
+    def dated_price(self, model_name: str) -> Optional[dict]:
+        """#1249: the dated price of exactly this model, or None. Only a provider prefix is ignored.
+
+        Unlike get_model_pricing, no family prefix is stripped and no substring is matched: a newer model is never
+        priced as an older one, and an unpriced model reads unknown, never zero.
+        """
+        if model_name in self.MODEL_PRICING:
+            return self.MODEL_PRICING[model_name]
+        for prefix in ("anthropic/", "anthropic."):
+            if model_name.startswith(prefix) and model_name[len(prefix):] in self.MODEL_PRICING:
+                return self.MODEL_PRICING[model_name[len(prefix):]]
         return None
 
     def calculate_tiered_cost(

@@ -193,3 +193,16 @@ A campaign snapshot holds the campaign's measures from its start to an as-of tim
 The metrics window's samples have no calculation version.
 
 Until #1395 merges, a delivery whose local work item was deleted, or an older item with only an automatic-merge time and no delivery record, may read as not delivered.
+
+### Claude Code cost
+
+The Claude Code reader adds up each member's token use and its API-equivalent cost over a campaign window. It reads the agents' own session files.
+- **Counting:** each assistant message counts once, at the time of its first row, and only when that time is inside the window. The four token kinds (input, cache creation, cache read, output) are summed by model, and each total carries its message count.
+- **Whose usage:** a session counts for a member only when it is the session Synth City recorded for that member's launch. Every other session in the team's folders is listed as unattributed usage, never dropped. The record holds the current launch only, so the sessions of an earlier launch show as unattributed, while a resumed session keeps its id.
+- **Prices:** cost uses the dated price table (`PricingService.PRICES_AS_OF`), so a page can say "at prices as of <date>". A model is priced only by its exact id. A model without an entry shows its tokens, and its cost reads unknown (`price_unknown:<model>`), never zero. Today's newer models (Opus 5.5, Sonnet 5.5, Fable 5.1) have no entry yet.
+- **Unknown, never zero:**
+  - a member without a recorded session: `binding_unverified`;
+  - a missing session file: `no_native_session`;
+  - a file that can't be read safely (a link, another owner, writable by others, or larger than the bound): `native_log_unreadable`;
+  - a row in an unknown format: `format_unknown`;
+  - a Codex member, read by a later item: `harness_not_read`.
