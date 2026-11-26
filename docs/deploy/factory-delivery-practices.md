@@ -100,7 +100,9 @@ Add confirmed flakes to `.github/known-flakes.json`. Each record specifies a uni
 
 Entries remain valid through the expiry date in UTC. Use `null` to record a flake without expiry. Remove the entry when the issue is fixed or update the date after an explicit renewal. Keep the registry file even when its array is empty.
 
-`Full backend regression tests` and `e2e` reject invalid or expired records, including on docs-only changes. On pull requests they read the registry from the merge result, which includes inherited base records and edits made by the pull request. On pushes they read the pushed tree. The shard tests still run as usual and use their regular pass and failure rules.
+`Full backend regression tests` and `e2e` reject invalid or expired records, including on docs-only changes. On pull requests they read the registry from the merge result, which includes inherited base records and edits made by the pull request. On pushes they read the pushed tree.
+
+The backend gate runs every test exactly once. It can tolerate a failure in the test body when the pytest node ID matches exactly and the regex matches the entire concise pytest exception message in the shard's `failure_signature` field. Fixture errors, interrupted runs, mismatched failures, and incomplete evidence fail the gate.
 
 ## Record checks automatically
 

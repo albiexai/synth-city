@@ -70,12 +70,16 @@ def validate(registry, today: date) -> list[str]:
     return errors
 
 
+def read_registry(path: Path):
+    return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_fields)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("registry", type=Path)
     args = parser.parse_args()
     try:
-        registry = json.loads(args.registry.read_text(encoding="utf-8"), object_pairs_hook=_unique_fields)
+        registry = read_registry(args.registry)
     except (OSError, ValueError) as exc:
         print(f"Could not read the known-flakes registry ({exc})", file=sys.stderr)
         return 1

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +17,8 @@ ident = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ident)
 
 FULL = [f"tests/a/test_one.py::test_{name}" for name in "abcdef"]
+SIGNATURE = "TimeoutError: operation did not respond"
+FLAKE = {"test_id": FULL[0], "failure_signature": SIGNATURE, "issue": 123, "expires_on": "9999-12-31"}
 
 
 def shard(collected, executed=None, junit=None, outcome="passed"):
@@ -107,7 +110,7 @@ def test_an_empty_shard_or_an_empty_full_collection_fails():
     assert any("full collection is empty" in problem for problem in ident.check([], good())[0])
 
 
-def _write_artifact(root, index, *, attempt=None, outcome="passed", skip=()):
+def _write_artifact(root, index, *, attempt=None, outcome="passed", signature=None, skip=()):
     name = f"backend-test-timings-{index}"
     if attempt is not None:
         name += f"-attempt-{attempt}"
@@ -118,10 +121,16 @@ def _write_artifact(root, index, *, attempt=None, outcome="passed", skip=()):
         {"id": item, "outcome": outcome if item == ids[0] else "passed", "runs": 1}
         for item in ids
     ]
+    if signature is not None:
+        rows[0]["failure_signature"] = signature
+    failures, errors = int(outcome == "failed"), int(outcome == "error")
     files = {
         f"backend-shard-{index}-collected.txt": "\n".join(ids) + "\n",
         f"backend-shard-{index}-executed.jsonl": "".join(json.dumps(row) + "\n" for row in rows),
-        f"backend-junit-{index}.xml": f'<testsuites><testsuite tests="{len(ids)}"/></testsuites>',
+        f"backend-shard-{index}-pytest-exit.txt": f"{int(bool(failures or errors))}\n",
+        f"backend-junit-{index}.xml": (
+            f'<testsuites><testsuite tests="{len(ids)}" failures="{failures}" errors="{errors}"/></testsuites>'
+        ),
     }
     for name, text in files.items():
         if name not in skip:
@@ -133,11 +142,105 @@ def _write_artifacts(root, count=2, skip=()):
         _write_artifact(root, index, skip=skip)
 
 
-def _run(root, full_ids=FULL, shards=2):
+def _run(root, full_ids=FULL, shards=2, *, registry=None):
     full = root / "full.txt"
     full.write_text("\n".join(full_ids) + "\n", encoding="utf-8")
-    return subprocess.run([sys.executable, str(SCRIPT), "--full", str(full), "--artifacts", str(root / "art"),
-                           "--shards", str(shards)], capture_output=True, text=True, timeout=60)
+    command = [sys.executable, str(SCRIPT), "--full", str(full), "--artifacts", str(root / "art"),
+               "--shards", str(shards)]
+    if registry is not None:
+        path = root / "known-flakes.json"
+        path.write_text(json.dumps(registry), encoding="utf-8")
+        command += ["--registry", str(path)]
+    return subprocess.run(command, capture_output=True, text=True, timeout=60)
+
+
+@pytest.mark.parametrize(("outcome", "signature", "update", "expected"), [
+    ("failed", SIGNATURE, {}, 0),
+    ("failed", "TimeoutError: different operation failed", {}, 1),
+    ("failed", SIGNATURE + " (different condition)", {}, 1),
+    ("failed", None, {}, 1),
+    ("failed", SIGNATURE, {"test_id": FULL[1]}, 1),
+    ("failed", SIGNATURE, {"expires_on": "2000-01-01"}, 1),
+    ("error", SIGNATURE, {}, 1),
+])
+def test_only_the_exact_unexpired_call_failure_is_tolerated(tmp_path, outcome, signature, update, expected):
+    art = tmp_path / "art"
+    art.mkdir()
+    _write_artifact(art, 1, attempt=1, outcome=outcome, signature=signature)
+    _write_artifact(art, 2, attempt=1)
+    done = _run(tmp_path, registry=[FLAKE | update])
+    assert done.returncode == expected, done.stdout + done.stderr
+    if expected == 0:
+        assert "tolerated known failures 1" in done.stdout
+    elif "expires_on" in update:
+        assert "expired" in done.stderr
+    else:
+        assert f"ended as {outcome}" in done.stdout
+
+
+@pytest.mark.parametrize(("file", "contents", "problem"), [
+    ("backend-shard-1-pytest-exit.txt", None, "pytest exit status"),
+    ("backend-shard-1-pytest-exit.txt", "0\n", "pytest exit status"),
+    ("backend-shard-1-pytest-exit.txt", "3\n", "pytest exit status"),
+    ("backend-junit-1.xml", '<testsuite tests="3" failures="1" errors="1"/>', "JUnit"),
+    ("backend-junit-1.xml", '<testsuite tests="3" failures="0" errors="0"/>', "JUnit"),
+    ("backend-junit-1.xml", '<testsuite tests="3" failures="bogus" errors="0"/>', "JUnit"),
+])
+def test_a_known_failure_requires_consistent_run_evidence(tmp_path, file, contents, problem):
+    art = tmp_path / "art"
+    art.mkdir()
+    _write_artifact(art, 1, attempt=1, outcome="failed", signature=SIGNATURE)
+    _write_artifact(art, 2, attempt=1)
+    path = art / "backend-test-timings-1-attempt-1" / file
+    if contents is None:
+        path.unlink()
+    else:
+        path.write_text(contents, encoding="utf-8")
+    done = _run(tmp_path, registry=[FLAKE])
+    assert done.returncode == 1 and problem in done.stdout
+
+
+def test_a_known_failure_cannot_cover_a_missing_identity(tmp_path):
+    art = tmp_path / "art"
+    art.mkdir()
+    _write_artifact(art, 1, attempt=1, outcome="failed", signature=SIGNATURE)
+    _write_artifact(art, 2, attempt=1)
+    done = _run(tmp_path, full_ids=[*FULL, "tests/test_missing.py::test_never_ran"], registry=[FLAKE])
+    assert done.returncode == 1 and "missing or fewer" in done.stdout
+
+
+def test_a_newer_mismatch_cannot_use_an_older_matching_result(tmp_path):
+    art = tmp_path / "art"
+    art.mkdir()
+    _write_artifact(art, 1, attempt=1, outcome="failed", signature=SIGNATURE)
+    _write_artifact(art, 1, attempt=2, outcome="failed", signature="RuntimeError: different failure")
+    _write_artifact(art, 2, attempt=1)
+    done = _run(tmp_path, registry=[FLAKE])
+    assert done.returncode == 1
+    assert "shard 1: backend-test-timings-1-attempt-2" in done.stdout
+    assert f"{FULL[0]} ended as failed" in done.stdout
+
+
+def test_actual_pytest_failure_evidence_matches_the_registry(tmp_path):
+    test = tmp_path / "test_sample.py"
+    test.write_text("def test_known():\n    raise TimeoutError('operation did not respond')\n", encoding="utf-8")
+    node_id = "test_sample.py::test_known"
+    folder = tmp_path / "art" / "backend-test-timings-1-attempt-1"
+    folder.mkdir(parents=True)
+    identities = folder / "backend-shard-1-executed.jsonl"
+    junit = folder / "backend-junit-1.xml"
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", test.name, "-q", "--tb=short", "-p", "no:cacheprovider",
+         "-p", "tests.ci_shard_identity", f"--identity-out={identities}", f"--junitxml={junit}"],
+        cwd=tmp_path, env={"PYTHONPATH": str(ROOT / "backend"), "PATH": os.environ["PATH"]},
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert json.loads(identities.read_text(encoding="utf-8"))["failure_signature"] == SIGNATURE
+    (folder / "backend-shard-1-pytest-exit.txt").write_text(f"{result.returncode}\n", encoding="utf-8")
+    (folder / "backend-shard-1-collected.txt").write_text(f"{node_id}\n", encoding="utf-8")
+    gate = _run(tmp_path, full_ids=[node_id], shards=1, registry=[FLAKE | {"test_id": node_id}])
+    assert gate.returncode == 0, gate.stdout + gate.stderr
 
 
 def test_the_command_passes_a_complete_set_of_artifacts(tmp_path):
@@ -274,6 +377,9 @@ def test_the_plugin_records_one_final_outcome_per_test(tmp_path):
         "test_sample.py::test_teardown_error": "error", "test_sample.py::test_param[1]": "passed",
         "test_sample.py::test_param[2]": "passed"}
     assert all(row["runs"] == 1 for row in rows.values()) and len(rows) == 9     # one line per test
+    assert rows["test_sample.py::test_setup_error"]["failure_signature"] == "RuntimeError: setup"
+    assert rows["test_sample.py::test_teardown_error"]["failure_signature"] == "RuntimeError: teardown"
+    assert "failure_signature" not in rows["test_sample.py::test_passed"]
 
 
 def test_the_plugin_writes_nothing_without_the_option(tmp_path):
