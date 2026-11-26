@@ -314,8 +314,12 @@ class AgentTeamService:
         before = {name: getattr(preset, name) for name, value in changes.items() if getattr(preset, name) != value}
         if before:
             after = {name: changes[name] for name in before}
-            for name, value in after.items():
-                setattr(preset, name, value)
+            preset.mail_request_unanswered_seconds = after.get(
+                "mail_request_unanswered_seconds", preset.mail_request_unanswered_seconds)
+            preset.github_team_idle_timeout_seconds = after.get(
+                "github_team_idle_timeout_seconds", preset.github_team_idle_timeout_seconds)
+            preset.github_publish_summaries_enabled = after.get(
+                "github_publish_summaries_enabled", preset.github_publish_summaries_enabled)
             await _audit.record_event(
                 db, event_kind="policy_change", source=TEAM_WORK_SETTINGS_AUDIT_SOURCE,
                 occurred_at=datetime.utcnow(), actor=audit_actor, team_preset_id=preset.id,
