@@ -83,9 +83,12 @@ async def _event(db: AsyncSession, kind: str, request_id: int, *, item_key: str 
         FactoryAuditEvent.item_context_key == item_key).limit(1))).first()
 
 
-async def _once(db: AsyncSession, operation_id: str) -> bool:
-    return (await db.scalar(select(FactoryAuditEvent.id).where(FactoryAuditEvent.operation_id == operation_id)
-                            .limit(1))) is not None
+async def _once(db: AsyncSession, operation_id: str, *, item_key: str | None = None) -> bool:
+    """Whether the operation is recorded; ``item_key`` binds it to one item lifetime, as the replay key does."""
+    query = select(FactoryAuditEvent.id).where(FactoryAuditEvent.operation_id == operation_id)
+    if item_key is not None:
+        query = query.where(FactoryAuditEvent.item_context_key == item_key)
+    return (await db.scalar(query.limit(1))) is not None
 
 
 async def record_mail_wait_started(db: AsyncSession, message: MailMessage, *, source: str) -> None:
@@ -175,7 +178,9 @@ async def record_effort_wait_started(
 ) -> None:
     """#1299: the effort-limit notice to the Leader starts a wait on the Leader's extension decision."""
     operation_id = f"{EFFORT_STARTED}:message:{notice_id}"
-    if await _once(db, operation_id):  # rebuilt on every reconciliation; the owner may have changed since
+    # Rebuilt on every reconciliation. Bound to the item lifetime: SQLite can reuse a deleted Mail row's id.
+    item_key = await audit.current_context_key(db, "item", item_id)
+    if item_key is not None and await _once(db, operation_id, item_key=item_key):
         return
     await audit.record_event(
         db, event_kind=EFFORT_STARTED, source=source, occurred_at=datetime.utcnow(), fact_source="mail_messages",
@@ -202,7 +207,7 @@ async def record_effort_wait_ended(
             [f"{EFFORT_STARTED}:message:{n}" for n in notice_ids])))).all()
     for started in starts:
         operation_id = started.operation_id.replace(EFFORT_STARTED, EFFORT_ENDED, 1)
-        if await _once(db, operation_id):
+        if await _once(db, operation_id, item_key=item_key):
             continue
         await audit.record_event(
             db, event_kind=EFFORT_ENDED, source=source, occurred_at=datetime.utcnow(), fact_source="mail_messages",
@@ -259,10 +264,11 @@ async def unended_decision_waits(
         query = select(FactoryAuditEvent).where(FactoryAuditEvent.event_kind == start_kind)
         if team_context_key is not None:
             query = query.where(FactoryAuditEvent.team_context_key == team_context_key)
-        ended_ids = set((await db.scalars(select(FactoryAuditEvent.operation_id).where(
-            FactoryAuditEvent.event_kind == end_kind))).all())
+        ended_ids = set((await db.execute(select(FactoryAuditEvent.operation_id, FactoryAuditEvent.item_context_key)
+                                          .where(FactoryAuditEvent.event_kind == end_kind))).all())
         for start in (await db.scalars(query.order_by(FactoryAuditEvent.id))).all():
-            if start.operation_id.replace(start_kind, end_kind, 1) in ended_ids:
+            # An end matches its start's item lifetime too (effort waits; Mail and input waits carry none).
+            if (start.operation_id.replace(start_kind, end_kind, 1), start.item_context_key) in ended_ids:
                 continue
             values, began = start.after_values or {}, start.fact_time or start.occurred_at
             # An item-bound wait (effort) whose work item was deleted is unknown, as for decision waits.

@@ -165,6 +165,64 @@ async def test_another_attempts_notice_is_not_ended_by_this_attempts_extension(f
     assert [e.event_kind for e in await _effort_events(fx)] == [waits.EFFORT_STARTED]
 
 
+async def test_a_redispatch_before_recovery_keeps_the_episode_to_the_items_end(fx, monkeypatch):
+    """V1 review 6068009562 (1): the earlier attempt's notice is recovered within the item lifetime."""
+    await _interrupted_at_limit(fx, monkeypatch)
+    await _set(fx, dispatch_nonce="the-next-attempt", effort_extension_minutes=3)
+    await _set(fx, dispatch_status="merged")
+    await _tick(fx, T0 + timedelta(minutes=3))
+    start, end = await _effort_events(fx)
+    assert start.after_values["wait_message_id"] == (await _leader_notice(fx))[0].id
+    assert (end.after_values["wait_outcome"], end.after_values["answered_by_member_id"]) == ("item_ended", None)
+
+
+@pytest.mark.parametrize("owner_notice", [True, False])
+async def test_a_recovered_start_names_the_owner_notified_at_the_time(fx, monkeypatch, owner_notice):
+    """V1 review 6068009562 (2): never the current assignment; unknown without the owner's notice."""
+    from app.services.github_effort_limit_service import effort_limit_service
+    await _interrupted_at_limit(fx, monkeypatch)
+    async with fx.maker() as session:
+        if not owner_notice:
+            await session.execute(text("UPDATE mail_messages SET delivery_key = NULL WHERE delivery_key LIKE :key"),
+                                  {"key": "github-effort:%:owner"})
+        await session.execute(text("UPDATE github_work_items SET owner_slot_id = NULL WHERE id = :id"),
+                              {"id": fx.item_id})
+        await session.commit()
+        await effort_limit_service._record_effort_waits(session, fx.item_id, now=T0 + timedelta(minutes=1))
+        await session.commit()
+    (start,) = await _effort_events(fx)
+    assert start.after_values["owner_member_id"] == (fx.owner if owner_notice else None)
+
+
+async def test_a_reused_mail_id_still_starts_and_reads_another_items_wait(fx):
+    """V1 review 6068009562 (3): the once-guards and the open-wait reader are bound to the item lifetime."""
+    async with fx.maker() as session:
+        other = GithubWorkItem(scope_id=fx.scope_id, issue_number=94, issue_title="other", issue_url="u",
+                               github_updated_at=T0, dispatch_status="dispatched")
+        session.add(other)
+        await session.flush()
+        from app.services import factory_audit_service as audit
+        await audit.context_key_for(session, "item", other.id)  # a working item already has its lifetime
+        for item_id in (fx.item_id, other.id):  # SQLite gave the second notice the first one's freed id
+            await waits.record_effort_wait_started(
+                session, item_id=item_id, notice_id=7, noticed_at=T0, owner_member_id=None,
+                leader_member_id=fx.leader, source="test")
+        await waits.record_effort_wait_ended(session, item_id=fx.item_id, outcome="extended", ended_at=T0,
+                                             source="test")
+        await waits.record_effort_wait_ended(session, item_id=fx.item_id, outcome="extended", ended_at=T0,
+                                             source="test")  # a replay in the same lifetime adds nothing
+        await session.commit()
+        assert [e.item_id for e in await _events(session, (waits.EFFORT_STARTED, waits.EFFORT_ENDED))] == [
+            fx.item_id, other.id, fx.item_id]
+        (wait,) = await waits.unended_decision_waits(session, now=T0 + timedelta(hours=1))
+        assert (wait.wait_kind, wait.request_id, wait.state) == ("effort", 7, "open")
+        await waits.record_effort_wait_ended(session, item_id=other.id, outcome="item_ended", ended_at=T0,
+                                             source="test")
+        await session.commit()
+        assert len(await _events(session, (waits.EFFORT_ENDED,))) == 2
+        assert await waits.unended_decision_waits(session, now=T0 + timedelta(hours=1)) == []
+
+
 async def test_rebuilding_after_an_owner_change_keeps_the_recorded_start(fx):
     from app.services.github_effort_limit_service import effort_limit_service
     await _at_limit(fx)

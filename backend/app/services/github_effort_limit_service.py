@@ -246,28 +246,32 @@ class GithubEffortLimitService:
         later than the real end. The item's end ends every open one.
         """
         from app.models.database import MailMessage
-        from app.services.agent_mail_service import agent_mail_service
 
         row = (await db.execute(select(
             GithubWorkItem.dispatch_nonce, GithubWorkItem.dispatch_status, GithubWorkItem.effort_extension_minutes,
-            GithubWorkItem.effort_extension_decided_at).where(GithubWorkItem.id == item_id))).one_or_none()
+            GithubWorkItem.effort_extension_decided_at, GithubWorkItem.created_at,
+        ).where(GithubWorkItem.id == item_id))).one_or_none()
         if row is None:
             return
-        nonce, status, total, extended_at = row
-        notices = (await db.scalars(select(MailMessage).where(
-            MailMessage.delivery_key.startswith(f"github-effort:{item_id}:{nonce}:", autoescape=True),
-            MailMessage.delivery_key.endswith(":leader")).order_by(MailMessage.id))).all()
-        owner = None
-        if notices:
-            owner, _leader = await agent_mail_service._dispatch_participants(db, await db.get(GithubWorkItem, item_id))
+        nonce, status, total, extended_at, created_at = row
+        # Every attempt's notices in this item lifetime (V1 review 6068009562): a reused item id's are older.
+        prefix = f"github-effort:{item_id}:"
+        sent = (await db.scalars(select(MailMessage).where(
+            MailMessage.delivery_key.startswith(prefix, autoescape=True),
+            MailMessage.created_at >= created_at).order_by(MailMessage.id))).all()
+        owners = {m.delivery_key.rsplit(":", 1)[0]: m.recipient_member_id
+                  for m in sent if m.delivery_key.endswith(":owner")}
+        notices = [m for m in sent if m.delivery_key.endswith(":leader")]
         source = "github_effort_limit_service._record_effort_waits"
-        for notice in notices:
+        for notice in notices:  # the owner notified with it, never the current assignment; else unknown
             await decision_waits.record_effort_wait_started(
                 db, item_id=item_id, notice_id=notice.id, noticed_at=notice.created_at,
-                owner_member_id=getattr(owner, "id", None), leader_member_id=notice.recipient_member_id, source=source)
+                owner_member_id=owners.get(notice.delivery_key.rsplit(":", 1)[0]),
+                leader_member_id=notice.recipient_member_id, source=source)
         for notice in notices:
             noticed_total = (notice.payload or {}).get("extension_minutes", total)
-            if noticed_total < total:
+            # Only this attempt's extensions end its notices; an earlier attempt's close on the item's end.
+            if notice.delivery_key.startswith(f"{prefix}{nonce}:") and noticed_total < total:
                 answered = noticed_total == extended_from
                 await decision_waits.record_effort_wait_ended(
                     db, item_id=item_id, notice_ids=[notice.id], outcome="extended",
