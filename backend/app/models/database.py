@@ -2,6 +2,7 @@
 from datetime import datetime
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     ForeignKey,
     String,
     Integer,
@@ -1150,6 +1151,34 @@ class FactoryContextKey(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     # R01: set when the live resource is deleted; NULL for the active lifetime.
     retired_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class Campaign(Base):
+    """#1242: a team's campaign across every repository it watches (design §2).
+
+    Bound to the team's lifetime key, so a reused preset id never inherits an old campaign. The selector is
+    ``label:<name>`` or ``milestone:<title>``, matched in each repository. At most one active or finishing campaign
+    per team lifetime. Membership is read live; it is not stored.
+    """
+
+    __tablename__ = "campaigns"
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'finishing', 'finished')", name="ck_campaigns_status"),
+        Index("uix_campaigns_team_open", "team_context_key", unique=True,
+              sqlite_where=text("status IN ('active', 'finishing')"),
+              postgresql_where=text("status IN ('active', 'finishing')")),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    team_context_key: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    preset_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    selector: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="active")
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # The recorded actor reference of whoever finished it (an operator key proves no person).
+    finished_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 # R01: lifetime retirement of context keys. One active key per kind and ID;

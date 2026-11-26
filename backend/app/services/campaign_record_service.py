@@ -1,0 +1,163 @@
+"""#1242: the campaign record across a team's repositories (design §2).
+
+A campaign belongs to one team lifetime and selects issues with ``label:<name>`` or ``milestone:<title>`` in every
+repository the team watches: a label by name, a milestone by title, since GitHub milestones are per repository.
+Membership is read live from GitHub; #1219's deferrals and supersessions since the start take an issue out of it, with
+their reason. A repository that can't be read leaves the membership incomplete, never empty. Finishing (#1261) and
+creation on upgrade (#1243) live elsewhere.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+
+import httpx
+from sqlalchemy import select
+
+from app.models.database import (
+    Campaign,
+    FactoryAuditEvent,
+    GithubWorkItem,
+    TeamGithubScope,
+)
+from app.services import factory_audit_service as audit
+from app.services.github_client import GithubClientResponseError
+
+OPEN_STATUSES = ("active", "finishing")
+_PREFIXES = ("label:", "milestone:")
+
+
+class CampaignError(ValueError):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class CampaignMember:
+    repo: str
+    issue_number: int
+    title: str
+    state: str
+
+
+@dataclass(frozen=True)
+class CampaignDeparture:
+    repo: str
+    issue_number: int
+    outcome: str  # "deferred" or "superseded"
+    destination: str  # the target milestone, or the superseding PR
+    reason: str | None
+    at: datetime
+
+
+@dataclass(frozen=True)
+class RepositoryCoverage:
+    repo: str
+    complete: bool
+    reason: str | None = None  # why the repository's members are unknown
+
+
+@dataclass
+class CampaignMembership:
+    members: list[CampaignMember] = field(default_factory=list)
+    departures: list[CampaignDeparture] = field(default_factory=list)
+    repositories: list[RepositoryCoverage] = field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        return all(repository.complete for repository in self.repositories)
+
+
+def parse_selector(selector: str) -> tuple[str, str]:
+    """The selector's kind and value; refuses anything but a non-empty ``label:`` or ``milestone:``."""
+    for prefix in _PREFIXES:
+        if isinstance(selector, str) and selector.startswith(prefix) and selector[len(prefix):].strip():
+            return prefix[:-1], selector[len(prefix):]
+    raise CampaignError("campaign_selector_invalid")
+
+
+async def current(db, preset_id: int) -> Campaign | None:
+    """The team's active or finishing campaign in its current lifetime, or none."""
+    key = await audit.current_context_key(db, "team", preset_id)
+    if key is None:
+        return None
+    return await db.scalar(select(Campaign).where(
+        Campaign.team_context_key == key, Campaign.status.in_(OPEN_STATUSES)))
+
+
+async def start(db, preset_id: int, selector: str, *, started_at: datetime, actor: dict) -> Campaign:
+    """Start the team's campaign. A second active or finishing one is refused (the database refuses it too)."""
+    parse_selector(selector)
+    if await current(db, preset_id) is not None:
+        raise CampaignError("campaign_already_active")
+    key = await audit.current_context_key(db, "team", preset_id) or await audit.context_key_for(db, "team", preset_id)
+    campaign = Campaign(team_context_key=key, preset_id=preset_id, selector=selector, status="active",
+                        started_at=audit._naive(started_at))
+    db.add(campaign)
+    await db.flush()
+    await audit.record_event(
+        db, event_kind="campaign_started", source="campaign_record_service.start", occurred_at=datetime.now(UTC),
+        actor=actor, team_preset_id=preset_id, team_context_key=key, after_values={"status": "active"},
+        action_outcome="applied", sanitized_reason=f"campaign started: {selector}",
+        operation_id=f"campaign_started:{campaign.id}", correlation_id=f"campaign:{campaign.id}")
+    await db.commit()
+    await db.refresh(campaign)
+    return campaign
+
+
+async def members(db, campaign: Campaign, client) -> CampaignMembership:
+    """The campaign's members in every repository its team watches, and the issues that left it."""
+    kind, value = parse_selector(campaign.selector)
+    scopes = (await db.scalars(select(TeamGithubScope).where(TeamGithubScope.preset_id == campaign.preset_id)
+                               .order_by(TeamGithubScope.repo_owner, TeamGithubScope.repo_name))).all()
+    membership = CampaignMembership(departures=await _departures(db, campaign, scopes))
+    departed = {(d.repo, d.issue_number) for d in membership.departures}
+    for scope in scopes:
+        repo = f"{scope.repo_owner}/{scope.repo_name}"
+        try:
+            if kind == "label":
+                issues = await client.list_label_issues(scope.repo_owner, scope.repo_name, value)
+            else:
+                matches = [m for m in await client.list_milestones(scope.repo_owner, scope.repo_name)
+                           if m.get("title") == value]
+                if len(matches) != 1:
+                    reason = "milestone_not_found" if not matches else "milestone_ambiguous"
+                    membership.repositories.append(RepositoryCoverage(repo, False, reason))
+                    continue
+                issues = await client.list_milestone_issues(scope.repo_owner, scope.repo_name, matches[0]["number"])
+        except (GithubClientResponseError, httpx.HTTPError):
+            membership.repositories.append(RepositoryCoverage(repo, False, "github_unreadable"))
+            continue
+        membership.repositories.append(RepositoryCoverage(repo, True))
+        membership.members.extend(
+            CampaignMember(repo, issue["number"], issue["title"], issue["state"])
+            for issue in sorted(issues, key=lambda issue: issue["number"])
+            if (repo, issue["number"]) not in departed)
+    return membership
+
+
+async def _departures(db, campaign: Campaign, scopes) -> list[CampaignDeparture]:
+    """#1219's deferrals and supersessions of the team's issues while the campaign ran."""
+    repos = {scope.id: f"{scope.repo_owner}/{scope.repo_name}" for scope in scopes}
+    if not repos:
+        return []
+    query = (select(FactoryAuditEvent, GithubWorkItem.scope_id, GithubWorkItem.issue_number)
+             .join(GithubWorkItem, GithubWorkItem.id == FactoryAuditEvent.item_id)
+             .where(FactoryAuditEvent.event_kind == "stopped_work_item_ended",
+                    GithubWorkItem.scope_id.in_(repos), FactoryAuditEvent.occurred_at >= campaign.started_at))
+    if campaign.finished_at is not None:
+        query = query.where(FactoryAuditEvent.occurred_at <= campaign.finished_at)
+    departures = []
+    for event, scope_id, number in (await db.execute(query.order_by(FactoryAuditEvent.occurred_at))).all():
+        values = event.after_values or {}
+        outcome = values.get("outcome")
+        if outcome == "deferred":
+            destination = str(values.get("target_milestone") or "no milestone")
+        elif outcome == "superseded":
+            destination = f"PR #{values.get('superseding_pr_number')}"
+        else:
+            continue
+        departures.append(CampaignDeparture(repos[scope_id], number, outcome, destination, event.sanitized_reason,
+                                            event.occurred_at))
+    return departures
