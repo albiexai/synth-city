@@ -487,6 +487,24 @@
               "title": "Attention Count",
               "type": "integer"
             },
+            "backlog_observed_at": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Backlog Observed At"
+            },
+            "backlog_stale": {
+              "default": false,
+              "title": "Backlog Stale",
+              "type": "boolean"
+            },
             "backlog_state": {
               "enum": [
                 "available",

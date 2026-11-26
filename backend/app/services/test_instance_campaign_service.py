@@ -48,8 +48,7 @@ class TestInstanceCampaignPoller:
 
     async def _run(self):
         while True:
-            # Cache reads remain valid for 60 seconds. Poll more often to refill
-            # expired observations without changing dispatch or any stored row.
+            # Poll more often than the refresh interval without changing dispatch or stored rows.
             await asyncio.sleep(5)
             await self.poll_once()
 

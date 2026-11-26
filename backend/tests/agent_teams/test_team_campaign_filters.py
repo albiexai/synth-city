@@ -20,6 +20,9 @@ from app.services.agent_team_campaign_service import AgentTeamCampaignService, B
 from app.services.agent_team_summary_service import AgentTeamSummaryService
 
 
+BACKLOG_START = datetime(2026, 10, 12, 12, tzinfo=timezone.utc)
+
+
 @pytest_asyncio.fixture
 async def db(tmp_path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'campaign.db'}")
@@ -122,11 +125,13 @@ def _actions(w):
 
 
 async def _service(db, w):
-    campaign = AgentTeamCampaignService(interval_seconds=60, clock=lambda: 0.0)
+    campaign = AgentTeamCampaignService(interval_seconds=60, clock=lambda: 80.0)
     backlog = {"a1": [1, 2, 3, 4, 5, 20], "a2": [6, 7, 8, 21]}
     for scope in await campaign._scopes(db, preset_id=w.team):
         name = scope.repo_name
-        campaign._cache[campaign._key(scope)] = BacklogObservation(1e9, tuple((number, ()) for number in backlog[name]))
+        read_at = 0 if name == "a1" else 40
+        campaign._cache[campaign._key(scope)] = BacklogObservation(read_at,
+            tuple((number, ()) for number in backlog[name]), BACKLOG_START + timedelta(seconds=read_at))
     actors = {w.items[2]: "owner", w.items[3]: "reviewer", w.items[4]: "leader", w.items[5]: "owner",
               w.items[6]: "controller", w.items[8]: "owner", w.items[9]: "owner"}
     return AgentTeamSummaryService(progress=_Progress(actors), attention=_Attention(_actions(w)), campaign=campaign)
@@ -155,6 +160,7 @@ async def test_no_filter_is_the_unfiltered_summary(db, world):
     shape = _shape(result)
     assert {k: shape[k] for k in UNFILTERED} == UNFILTERED
     assert result.campaign.backlog_state == "available"
+    assert result.campaign.backlog_observed_at == BACKLOG_START and result.campaign.backlog_stale
     assert [d.text for d in result.campaign.decisions_ahead] == [
         "Review the pull request.", "Decide whether to merge the pull request.", "Plan the next release."]
     # The explicit no-filter arguments are the same call.
@@ -176,6 +182,8 @@ async def test_a_repository_filter_keeps_only_that_repositorys_work_backlog_and_
                            "actors": ["owner", "operator", "controller"]}
     assert [d.text for d in two.campaign.decisions_ahead] == [
         "Decide whether to merge the pull request.", "Plan the next release."]
+    assert two.campaign.backlog_observed_at == BACKLOG_START + timedelta(seconds=40)
+    assert not two.campaign.backlog_stale
     assert one.remaining_work.reason == "complete" and one.next_actor_coverage_complete
 
 

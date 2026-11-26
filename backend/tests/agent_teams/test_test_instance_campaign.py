@@ -109,6 +109,13 @@ async def test_test_poll_alone_fills_cache_and_expires_after_60_seconds(db, tmp_
         clock[0] = 59.9
         assert (await campaign.summary(db, team.id)).backlog_state == "available"
         clock[0] = 60
+        fresh = await campaign.summary(db, team.id)
+        assert fresh.backlog_state == "available" and not fresh.backlog_stale
+        clock[0] = 61
+        stale = await campaign.summary(db, team.id)
+        assert stale.backlog_state == "available" and stale.backlog_stale
+        assert stale.backlog_observed_at == fresh.backlog_observed_at
+        clock[0] = 180
         assert (await campaign.summary(db, team.id)).backlog_state == "backlog unavailable"
         await poll.poll_once()
         assert (await campaign.summary(db, team.id)).backlog_state == "available"

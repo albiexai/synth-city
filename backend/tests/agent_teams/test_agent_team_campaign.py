@@ -1,10 +1,12 @@
 """Campaign data counts stored work and a fixed GitHub backlog."""
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select
 
 from app.models.database import AgentTeamSlot, GithubWorkItem
+from app.services.agent_team_campaign_service import AgentTeamCampaignService
 from tests.agent_teams.test_agent_team_summary import Attention, seed, service
 
 
@@ -129,9 +131,8 @@ async def test_explicit_milestone_uses_exact_title(db, monkeypatch, title, avail
 
 
 @pytest.mark.asyncio
-async def test_poll_interval_cache_expires_and_configuration_invalidates(db, monkeypatch):
+async def test_backlog_configuration_change_invalidates_retained_counts(db, monkeypatch):
     team, scope, _, summary = await fixed_campaign(db, monkeypatch)
-    from app.services.agent_team_campaign_service import AgentTeamCampaignService
     clock = [0.0]
     summary.campaign = AgentTeamCampaignService(interval_seconds=60, clock=lambda: clock[0])
     client = Backlog([issue(4, "Not started")])
@@ -141,7 +142,7 @@ async def test_poll_interval_cache_expires_and_configuration_invalidates(db, mon
     clock[0] = 61
     team_id, scope_id = team.id, scope.id
     result = await summary.summary(db, team_id)
-    assert result.campaign.not_started_count is None
+    assert result.campaign.not_started_count == 1
     team = await db.get(type(team), team_id)
     team.backlog_milestone = "No match"
     await db.commit()
@@ -149,6 +150,91 @@ async def test_poll_interval_cache_expires_and_configuration_invalidates(db, mon
     await summary.campaign.refresh_scope(db, scope, client)
     result = await summary.summary(db, team_id)
     assert result.campaign.backlog_state == "backlog unavailable"
+
+
+def controlled_campaign(summary):
+    clock = [0.0]
+    start = START.replace(tzinfo=timezone.utc)
+    summary.campaign = AgentTeamCampaignService(interval_seconds=120, clock=lambda: clock[0],
+        wall_clock=lambda: start + timedelta(seconds=clock[0]))
+    return clock, start
+
+
+@pytest.mark.asyncio
+async def test_campaign_backlog_stays_available_between_late_polls(db, monkeypatch):
+    team, scope, _, summary = await fixed_campaign(db, monkeypatch)
+    clock, start = controlled_campaign(summary)
+    client = Backlog([issue(3, "Queued"), issue(4, "Not started"), issue(5, "More work")])
+    await summary.campaign.refresh_scope(db, scope, client)
+
+    for delay in (25, 45, 60):
+        read_at = clock[0]
+        for age in (119, 120, 120 + delay):
+            clock[0] = read_at + age
+            campaign = (await summary.summary(db, team.id)).campaign
+            assert campaign.backlog_state == "available"
+            assert (campaign.queued_count, campaign.not_started_count) == (1, 2)
+            assert campaign.backlog_observed_at == start + timedelta(seconds=read_at)
+            assert campaign.backlog_stale is (age > 120)
+        await summary.campaign.refresh_scope(db, scope, client)
+        refreshed = (await summary.summary(db, team.id)).campaign
+        assert refreshed.backlog_observed_at == start + timedelta(seconds=clock[0])
+        assert not refreshed.backlog_stale
+    assert len(client.calls) == 8
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["network", "incomplete"])
+async def test_failed_refresh_keeps_success_until_the_hard_limit(db, monkeypatch, failure):
+    team, scope, _, summary = await fixed_campaign(db, monkeypatch)
+    clock, start = controlled_campaign(summary)
+    await summary.campaign.refresh_scope(db, scope, Backlog([issue(4, "Not started")]))
+    client = Backlog([{"number": 4}]) if failure == "incomplete" else Backlog([], unavailable=True)
+    for elapsed in (150, 270, 359):
+        clock[0] = elapsed
+        await summary.campaign.refresh_scope(db, scope, client)
+        retained = (await summary.summary(db, team.id)).campaign
+        assert retained.backlog_state == "available" and retained.not_started_count == 1
+        assert retained.backlog_observed_at == start and retained.backlog_stale
+    assert len(client.calls) == (6 if failure == "incomplete" else 3)
+
+    clock[0] = 360
+    expired = (await summary.summary(db, team.id)).campaign
+    assert expired.backlog_state == "backlog unavailable"
+    assert expired.not_started_count is None and expired.backlog_observed_at is None
+    assert not expired.backlog_stale
+
+    clock[0] = 390
+    await summary.campaign.refresh_scope(db, scope, Backlog([]))
+    recovered = (await summary.summary(db, team.id)).campaign
+    assert recovered.backlog_state == "available" and recovered.not_started_count == 0
+    assert recovered.backlog_observed_at == start + timedelta(seconds=390)
+
+
+@pytest.mark.asyncio
+async def test_late_backlog_response_does_not_replace_newer_success(db, monkeypatch):
+    team, scope, _, summary = await fixed_campaign(db, monkeypatch)
+    clock, start = controlled_campaign(summary)
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    class SlowBacklog(Backlog):
+        async def list_milestone_issues(self, owner, repo, milestone):
+            entered.set()
+            await resume.wait()
+            return self.issues
+
+    older = asyncio.create_task(summary.campaign.refresh_scope(db, scope, SlowBacklog([])))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        clock[0] = 1
+        await summary.campaign.refresh_scope(db, scope, Backlog([issue(4, "Newer result")]))
+    finally:
+        resume.set()
+        await older
+
+    current = (await summary.summary(db, team.id)).campaign
+    assert current.not_started_count == 1
+    assert current.backlog_observed_at == start + timedelta(seconds=1)
 
 
 @pytest.mark.asyncio
