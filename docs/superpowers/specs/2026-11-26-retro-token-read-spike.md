@@ -26,7 +26,7 @@ I read two live members on 2026-11-26 at 08:00 UTC: member B4 (Claude Code, work
 
 - **Where:** `<home>/.claude/projects/<folder from the working directory>/<session id>.jsonl`. The session id is the file name and the `sessionId` field of each row.
 - **What:** each `assistant` row has `message.usage` with `input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens` and `output_tokens`. It also has `message.model`, `message.id` and a `timestamp`.
-- **Repeated rows:** one message is written as several rows, one for each content block. In this file all 958 messages had identical usage in every row, and 1,885 rows held 958 messages. A reader that counts rows reports 1.97 times the output tokens. **Count each `message.id` once.**
+- **Repeated rows:** one message is written as several rows, one for each content block. In this file every message had identical usage in all its rows, and 1,915 rows held 974 messages. I measured the sum over all rows against the sum over messages: a reader that counts rows reports 1.96 times the input tokens, 2.17 times the cache creation tokens, 1.97 times the cache read tokens and **2.54 times the output tokens**. The ratio is not the same for each field, because a message with more content blocks has more rows. **Count each `message.id` once.**
 - **Session total:** one `cost-state` row holds `totalCostUSD` and `modelUsage` for the whole session. It has no time, so it cannot give a window. Do not use it for windows.
 
 Sample, member B4 (one session, one model, 958 messages, no row without usage, no sidechain row):
@@ -54,11 +54,11 @@ Sample, member with working directory `build-1` (one session, model `gpt-6.2-sol
 | 04:00 to 06:00 | 28 | 5,571,940 | 5,360,640 | 9,165 | 5,581,105 |
 | 06:00 to 08:00 | 223 | 73,693,529 | 73,465,728 | 102,570 | 73,796,099 |
 
-The first window has no event. That is "no event seen", not proof of zero use: the report must show the event count next to every number.
+The first window has no event. The baseline is the last cumulative total at or before the window start (the session began before this window, so a baseline existed). The first and the last total of the window are the same, so the difference is zero. That is "no event seen", not proof that the member was idle or that no log row is missing: the report must show the event count next to every number.
 
 ## Attribution
 
-- The native session identity is the session id plus the working directory. This is what the product binds for activity observation.
+- The native session identity is the session id plus the working directory. I read from the product code that its activity observers use this pair. **I did not read the product's binding record of any member.** Each sample was matched to a member by its working directory only: B4 by the repository path in its own member status, and the Codex member by the name of its working directory. So the match to the current binding is **inferred, not shown**. #1249 and #1250 must test it against the product's binding record.
 - A member has more than one native session over time. In the folders I read: 3 Codex files for the `review` directory, 2 Claude files each for `build-1` and `build-2`. A window read must cover every session of the member in the window. A session that is not bound to a member is **unattributed usage**: show it, never drop it.
 
 ## Rules for the readers (#1249 and #1250)
