@@ -85,6 +85,23 @@ B4 runs independent checks for changed contracts. Root reads the evidence and so
 Reuse valid results for unchanged source and dependencies. Keep required hosted checks on the final PR head.
 Do not add a broad type checker until its baseline and useful rules are agreed.
 
+## Record known flakes
+
+Add confirmed flakes to `.github/known-flakes.json`. Each record specifies a unique pytest node ID or exact Playwright title, a Python regular expression for the failure, an issue number in this repository, and an expiry.
+
+```json
+{
+  "test_id": "tests/test_example.py::test_operation",
+  "failure_signature": "TimeoutError: operation did not respond",
+  "issue": 123,
+  "expires_on": "2027-01-15"
+}
+```
+
+Entries remain valid through the expiry date in UTC. Use `null` to record a flake without expiry. Remove the entry when the issue is fixed or update the date after an explicit renewal. Keep the registry file even when its array is empty.
+
+`Full backend regression tests` and `e2e` reject invalid or expired records, including on docs-only changes. The shard tests still run as usual and use their regular pass and failure rules.
+
 ## Record checks automatically
 
 Commit the candidate locally. Store receipts outside its Git worktree:

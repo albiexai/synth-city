@@ -210,7 +210,8 @@ def test_workflow_uses_the_same_shard_count_and_attempt_artifacts():
     assert download["with"]["pattern"] == "e2e-journeys-*-attempt-*"
     assert download["with"]["merge-multiple"] is False
     proof = gate["steps"][-1]
-    for step in gate["steps"][1:]:
+    registry = next(step for step in gate["steps"] if step.get("name") == "Validate the known-flakes registry")
+    for step in gate["steps"][gate["steps"].index(registry) + 1:]:
         assert step["if"] == "needs.e2e-scope.outputs.run_suites == 'true'"
     assert "--shards 4" in proof["run"] and '--artifacts "$RUNNER_TEMP/e2e-journey-artifacts"' in proof["run"]
 

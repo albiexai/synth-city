@@ -131,6 +131,8 @@ jobs:
           path: .workflow-ci
           sparse-checkout: scripts/ci
           persist-credentials: false
+      - name: Validate the known-flakes registry
+        run: python3 .workflow-ci/scripts/ci/known_flakes.py candidate/.github/known-flakes.json
       - name: Detect a docs-only change
         id: changes
         working-directory: .
