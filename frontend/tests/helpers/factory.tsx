@@ -51,6 +51,8 @@ export function fixtureFetch(
       };
       if (
         (path === "factory/repositories" && url.searchParams.get("limit") === "100") ||
+        // The milestone list is a side read of the Work page and the Teams page (#1337).
+        path === "factory/milestone-states" ||
         // The recovery panel on the Work item page reads these for the team of the item.
         /^agent-teams\/presets(\/\d+\/(github-work-items|github-scopes|activity))?$/.test(path)
       )

@@ -49,6 +49,13 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 const first = work.first_page.response;
+// The Work page also reads the milestone list (#1337). These tests are about the work list.
+const noMilestoneStates = {
+  deferred: [],
+  deferred_truncated: false,
+  waiting: [],
+  waiting_truncated: false,
+};
 const last = work.next_page.response;
 function standard(path: string) {
   if (path === "factory/overview")
@@ -143,8 +150,10 @@ describe("delivery read authority and filters", () => {
   it("preserves last good observations after failure instead of showing an empty factory", async () => {
     vi.useFakeTimers();
     let fail = false;
-    fixtureFetch(() =>
-      fail
+    fixtureFetch((path) =>
+      path === "factory/milestone-states"
+        ? jsonResponse(noMilestoneStates)
+        : fail
         ? jsonResponse(
             {
               detail: {
@@ -355,6 +364,8 @@ describe("cursor browsing V26/V27", () => {
     const { requests } = fixtureFetch((path, query) => {
       if (path === "factory/repositories")
         return jsonResponse(repositories.normal.response);
+      if (path === "factory/milestone-states")
+        return jsonResponse(noMilestoneStates);
       const cursor = query.get("cursor");
       if (!cursor && ++firstReads === 2)
         return new Promise((resolve) => {

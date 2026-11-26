@@ -259,6 +259,34 @@ export type WorkFilters = {
   team_id: number | null;
 };
 
+export type WaitingIssue = {
+  issue_number: number;
+  milestone: string;
+  observed_at: string;
+  repository: WorkRepository;
+};
+
+export type DeferredIssue = {
+  deferred_at: string;
+  issue_number: number;
+  issue_title: string;
+  previous_branch: string | null;
+  repository: WorkRepository;
+  target_milestone: string | null;
+  team: TeamReference;
+  work_item_id: number;
+};
+
+export type MilestoneStatesResponse = {
+  deferred: DeferredIssue[];
+  deferred_truncated: boolean;
+  filters: WorkFilters;
+  generated_at: string;
+  schema_version: 1;
+  waiting: WaitingIssue[];
+  waiting_truncated: boolean;
+};
+
 export type WorkListResponse = {
   counts: FactoryCounts;
   filters: WorkFilters;
