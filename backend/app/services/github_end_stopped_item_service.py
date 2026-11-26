@@ -166,6 +166,12 @@ async def end_stopped_item(db, item, scope, request, *, actor, before_commit=Non
             raise ValueError("workspace_not_clean")
 
         await end_pending_requests(db, item_id, now=now)
+        # #1300: stopping the work is one of the Supervisor's options. Whoever stopped it acted; the answerer is
+        # unknown.
+        await decision_waits.record_ceiling_wait_ended(
+            db, item_id=item_id, outcome="work_stopped", ended_at=now, actor=actor,
+            source="github_end_stopped_item_service.end_stopped_item",
+            correlation_id=operation_id, evidence={"outcome": request.outcome})
         await db.execute(update(GithubAttemptScopeRevision).where(
             GithubAttemptScopeRevision.work_item_id == item_id,
             GithubAttemptScopeRevision.status.not_in(TERMINAL_REVISIONS))

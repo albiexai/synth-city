@@ -7,7 +7,7 @@ row is deleted only with its work item; such a wait has no end and reads as unkn
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Iterable
 
 from sqlalchemy import select
@@ -23,6 +23,8 @@ MAIL_STARTED, MAIL_ENDED = "mail_wait_started", "mail_wait_ended"
 INPUT_STARTED, INPUT_ENDED = "input_wait_started", "input_wait_ended"
 # #1299: an effort-limit episode, keyed by the Mail message id of the limit notice to the Leader.
 EFFORT_STARTED, EFFORT_ENDED = "effort_wait_started", "effort_wait_ended"
+# #1300: a Supervisor decision beyond the effort ceiling, keyed by the Mail message id of the ceiling notice.
+CEILING_STARTED, CEILING_ENDED = "ceiling_wait_started", "ceiling_wait_ended"
 # The Mail root of a structured request carries this delivery key; its decision wait already counts it.
 STRUCTURED_REQUEST_KEY = "github-approval:"
 
@@ -198,30 +200,89 @@ async def record_effort_wait_ended(
     answered_by_member_id: int | None = None, notice_ids: list[int] | None = None,
 ) -> None:
     """End the item's open effort waits in its current lifetime, or only those of ``notice_ids``."""
+    await _end_item_waits(
+        db, EFFORT_STARTED, EFFORT_ENDED, item_id=item_id, outcome=outcome, ended_at=ended_at, source=source,
+        notice_ids=notice_ids, values={"answered_by_member_id": answered_by_member_id},
+        actor=audit.derive_actor(actor_kind="member", member_id=answered_by_member_id)
+        if answered_by_member_id is not None else audit.derive_actor(actor_kind="system"))
+
+
+async def record_ceiling_wait_started(
+    db: AsyncSession, notice: MailMessage, *, item_id: int, leader_member_id: int | None, source: str,
+) -> None:
+    """#1300: the ceiling notice starts a wait on the Supervisor, in the notice's own transaction."""
+    await db.flush()
+    payload = notice.payload or {}
+    operation_id = f"{CEILING_STARTED}:message:{notice.id}"
+    await audit.record_event(
+        db, event_kind=CEILING_STARTED, source=source, occurred_at=datetime.now(UTC), fact_source="mail_messages",
+        fact_time=audit._naive(notice.created_at), item_id=item_id,
+        actor=audit.derive_actor(actor_kind="member", member_id=leader_member_id)
+        if leader_member_id is not None else audit.derive_actor(actor_kind="system"),
+        after_values={"wait_message_id": notice.id, "request_kind": "effort_ceiling",
+                      "owner_member_id": leader_member_id, "awaited_member_id": None, "awaited_role": "supervisor",
+                      "awaited_actor_id": payload.get("supervisor_actor_id")},
+        action_outcome="applied", sanitized_reason="effort ceiling waits on the supervisor",
+        operation_id=operation_id, correlation_id=operation_id)
+
+
+async def open_ceiling_waits(db: AsyncSession, item_id: int) -> list[FactoryAuditEvent]:
+    """The item's ceiling wait starts in its current lifetime that have no end."""
+    item_key = await audit.current_context_key(db, "item", item_id)
+    if item_key is None:
+        return []
+    starts = (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == CEILING_STARTED, FactoryAuditEvent.item_context_key == item_key)
+        .order_by(FactoryAuditEvent.id))).all()
+    return [start for start in starts if not await _once(
+        db, start.operation_id.replace(CEILING_STARTED, CEILING_ENDED, 1), item_key=item_key)]
+
+
+async def record_ceiling_wait_ended(
+    db: AsyncSession, *, item_id: int, outcome: str, ended_at: datetime, source: str, actor: dict | None = None,
+    notice_ids: list[int] | None = None, evidence: dict | None = None, before_values: dict | None = None,
+    correlation_id: str | None = None,
+) -> None:
+    """End the item's open ceiling waits, or those of ``notice_ids``, on the evidence that resolved them.
+
+    ``actor`` is whoever acted; the answerer stays unknown: an operator token or a Leader never proves the
+    Supervisor's (or the Director's) answer. ``correlation_id`` links the end to the action's own event.
+    """
+    await _end_item_waits(
+        db, CEILING_STARTED, CEILING_ENDED, item_id=item_id, outcome=outcome, ended_at=ended_at, source=source,
+        notice_ids=notice_ids, values={"answered_by_member_id": None, **(evidence or {})},
+        actor=actor or audit.derive_actor(actor_kind="system"), before_values=before_values,
+        correlation_id=correlation_id)
+
+
+async def _end_item_waits(
+    db: AsyncSession, start_kind: str, end_kind: str, *, item_id: int, outcome: str, ended_at: datetime,
+    source: str, actor: dict, values: dict, notice_ids: list[int] | None, before_values: dict | None = None,
+    correlation_id: str | None = None,
+) -> None:
     item_key = await audit.current_context_key(db, "item", item_id)
     if item_key is None:
         return
     starts = (await db.scalars(select(FactoryAuditEvent).where(
-        FactoryAuditEvent.event_kind == EFFORT_STARTED, FactoryAuditEvent.item_context_key == item_key,
+        FactoryAuditEvent.event_kind == start_kind, FactoryAuditEvent.item_context_key == item_key,
         True if notice_ids is None else FactoryAuditEvent.operation_id.in_(
-            [f"{EFFORT_STARTED}:message:{n}" for n in notice_ids])))).all()
+            [f"{start_kind}:message:{n}" for n in notice_ids])))).all()
+    label = end_kind.removesuffix("_ended").replace("_", " ")
     for started in starts:
-        operation_id = started.operation_id.replace(EFFORT_STARTED, EFFORT_ENDED, 1)
+        operation_id = started.operation_id.replace(start_kind, end_kind, 1)
         if await _once(db, operation_id, item_key=item_key):
             continue
         # An extension found after a notice it had already satisfied gives a zero-length episode, never a reversed
         # one (V1, #1334): the end is never before the start.
         ended = max(audit._naive(ended_at), started.fact_time or audit._naive(ended_at))
         await audit.record_event(
-            db, event_kind=EFFORT_ENDED, source=source, occurred_at=datetime.utcnow(), fact_source="mail_messages",
+            db, event_kind=end_kind, source=source, occurred_at=datetime.utcnow(), fact_source="mail_messages",
             fact_time=ended, item_id=started.item_id, item_context_key=item_key,
-            scope_context_key=started.scope_context_key, team_context_key=started.team_context_key,
-            actor=audit.derive_actor(actor_kind="member", member_id=answered_by_member_id)
-            if answered_by_member_id is not None else audit.derive_actor(actor_kind="system"),
+            scope_context_key=started.scope_context_key, team_context_key=started.team_context_key, actor=actor,
             after_values={"wait_message_id": started.after_values.get("wait_message_id"), "wait_outcome": outcome,
-                          "answered_by_member_id": answered_by_member_id},
-            action_outcome="applied", sanitized_reason=f"effort wait ended: {outcome}",
-            operation_id=operation_id, correlation_id=operation_id)
+                          **values}, before_values=before_values,
+            action_outcome="applied", sanitized_reason=f"{label} ended: {outcome}",
+            operation_id=operation_id, correlation_id=correlation_id or operation_id)
 
 
 @dataclass(frozen=True)
@@ -234,7 +295,8 @@ class DecisionWait:
     age_seconds: float | None
     state: str  # "open", or "unknown" when the work item was deleted before the request ended
     reason: str | None = None
-    wait_kind: str = "decision"  # "decision", "mail" (keyed by message id) or "input" (keyed by pane binding id)
+    # "decision", "mail", "effort" or "ceiling" (keyed by message id), or "input" (keyed by pane binding id)
+    wait_kind: str = "decision"
     awaited_actor_id: int | None = None
 
 
@@ -263,7 +325,8 @@ async def unended_decision_waits(
             started_at=began, age_seconds=None if deleted else (now - began).total_seconds(),
             state="unknown" if deleted else "open", reason="work item deleted" if deleted else None))
     for kind, (start_kind, end_kind) in {"mail": (MAIL_STARTED, MAIL_ENDED), "input": (INPUT_STARTED, INPUT_ENDED),
-                                         "effort": (EFFORT_STARTED, EFFORT_ENDED)}.items():
+                                         "effort": (EFFORT_STARTED, EFFORT_ENDED),
+                                         "ceiling": (CEILING_STARTED, CEILING_ENDED)}.items():
         query = select(FactoryAuditEvent).where(FactoryAuditEvent.event_kind == start_kind)
         if team_context_key is not None:
             query = query.where(FactoryAuditEvent.team_context_key == team_context_key)
@@ -274,7 +337,7 @@ async def unended_decision_waits(
             if (start.operation_id.replace(start_kind, end_kind, 1), start.item_context_key) in ended_ids:
                 continue
             values, began = start.after_values or {}, start.fact_time or start.occurred_at
-            # An item-bound wait (effort) whose work item was deleted is unknown, as for decision waits.
+            # An item-bound wait (effort, ceiling) whose work item was deleted is unknown, as for decision waits.
             deleted = start.item_context_key is not None and start.item_context_key in retired
             waits.append(DecisionWait(
                 request_id=values.get("wait_message_id") or values.get("wait_binding_id"),
