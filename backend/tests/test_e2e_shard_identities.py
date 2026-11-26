@@ -344,7 +344,9 @@ def test_required_gates_keep_their_names_and_source_contract():
     python = job("factory-checks.yml", "python")
     assert python["name"] == "Changed Python undefined names"
     assert refs(python) == ["${{ github.event.pull_request.head.sha }}", workflow_sha]
-    assert python["steps"][-1]["working-directory"] == "candidate"
+    python_check = next(step for step in python["steps"] if step.get("name") == "Check changed Python files")
+    assert python_check["run"] == 'python ../.workflow-ci/scripts/factory-static-check.py --base "$ACCEPTED_BASE"'
+    assert python_check["working-directory"] == "candidate"
     assert job("factory-checks.yml", "old_names")["name"] == "Rename old-name guard"
 
     product = job("product-ci.yml", "gate")
