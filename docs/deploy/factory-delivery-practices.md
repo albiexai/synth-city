@@ -104,7 +104,9 @@ Entries remain valid through the expiry date in UTC. Use `null` to record a flak
 
 The backend gate runs every test exactly once. It can tolerate a failure in the test body when the pytest node ID matches exactly and the regex matches the entire concise pytest exception message in the shard's `failure_signature` field. Fixture errors, interrupted runs, mismatched failures, and incomplete evidence fail the gate.
 
-For Playwright, use the exact `spec.title` from the JSON report. It must identify one active journey across the collection. The regex matches the entire single result's `error.message` after removing terminal color codes and surrounding whitespace. Run errors, retries, skipped journeys, and missing evidence still fail. A shard with an unmatched failure stays failed so a failed-jobs rerun executes it again.
+For Playwright, use the exact `spec.title` from the JSON report. It must identify one active journey across the collection. The regex matches the entire result's `error.message` after removing terminal color codes and surrounding whitespace. The report must contain one failed top-level `test.step` in the journey body with that same message.
+
+Registry entries for bare body throws and outer test timeouts have no effect. Setup and teardown failures, run errors, retries, skipped journeys, and missing evidence fail the shard. A failed-jobs rerun runs the affected shard again.
 
 ## Record checks automatically
 

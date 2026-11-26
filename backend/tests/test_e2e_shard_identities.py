@@ -46,12 +46,19 @@ SIGNATURE = "TimeoutError: operation did not respond"
 REGISTRATION = {"test_id": FLAKY[2], "failure_signature": SIGNATURE, "issue": 1304, "expires_on": "9999-12-31"}
 
 
-def failing_report(message=SIGNATURE, *, outcome="failed", entry=FLAKY, extra_errors=False, worker=0):
+def failing_report(message=SIGNATURE, *, outcome="failed", entry=FLAKY, extra_errors=False, worker=0,
+                   body_step="failed", step_message=None):
     data = report(entry, executions=(outcome,))
     test = data["suites"][0]["specs"][0]["tests"][0]
     test["status"] = "unexpected"
     error = {"message": message}
-    test["results"][0].update(error=error, errors=[error, error] if extra_errors else [error], workerIndex=worker)
+    result = test["results"][0]
+    result.update(error=error, errors=[error, error] if extra_errors else [error], workerIndex=worker)
+    if body_step is not None:
+        step = {"title": "journey action"}
+        if body_step == "failed":
+            step["error"] = {"message": message if step_message is None else step_message}
+        result["steps"] = [step]
     return data
 
 
@@ -164,8 +171,14 @@ def artifact(root: Path, shard: int, attempt: int, result, *, exit_status="0") -
 
 @pytest.mark.parametrize(("result", "exit_status", "registration", "expected"), [
     (failing_report(), "1", REGISTRATION, 0),
-    (failing_report("\x1b[31m" + SIGNATURE + "\x1b[39m", outcome="timedOut"), "1", REGISTRATION, 0),
+    (failing_report("\x1b[31m" + SIGNATURE + "\x1b[39m", step_message=SIGNATURE), "1", REGISTRATION, 0),
     (failing_report(SIGNATURE + " (different condition)"), "1", REGISTRATION, 1),
+    (failing_report(body_step=None), "1", REGISTRATION, 1),
+    (failing_report(body_step="passed"), "1", REGISTRATION, 1),
+    (failing_report(step_message="TimeoutError: different"), "1",
+     REGISTRATION | {"failure_signature": "TimeoutError: .*"}, 1),
+    (failing_report(outcome="timedOut", body_step="passed"), "1", REGISTRATION, 1),
+    (failing_report(outcome="timedOut"), "1", REGISTRATION, 1),
     (failing_report(), "1", REGISTRATION | {"test_id": "different journey @active"}, 1),
     (failing_report(), "1", REGISTRATION | {"expires_on": "2000-01-01"}, 1),
     (failing_report(outcome="interrupted"), "1", REGISTRATION, 1),
@@ -316,6 +329,9 @@ def producer_workflow(collect, tmp_path):
 
 @pytest.mark.parametrize(("data", "exit_status", "expected"), [
     (failing_report(), 1, 0),
+    (failing_report(body_step=None), 1, 1),
+    (failing_report(body_step="passed"), 1, 1),
+    (failing_report(outcome="timedOut", body_step="passed"), 1, 1),
     (failing_report(SIGNATURE + " (different condition)"), 1, 1),
     (failing_report() | {"errors": [{"message": "Worker launch failed"}]}, 1, 1),
     (failing_report(), 130, 130),

@@ -129,20 +129,28 @@ def registered_patterns(registry: list[dict], journeys: list[Identity]) -> dict[
             if counts[entry["test_id"]] == 1}
 
 
+def error_signature(error: object) -> str:
+    message = error.get("message") if isinstance(error, dict) else None
+    return TERMINAL_COLOR.sub("", message).strip() if isinstance(message, str) else ""
+
+
 def matching_failure(result: dict, pattern: re.Pattern | None) -> bool:
-    if pattern is None or result.get("status") not in ("failed", "timedOut"):
+    if pattern is None or result.get("status") != "failed":
         return False
-    errors, error = result.get("errors"), result.get("error")
+    errors = result.get("errors")
     if not isinstance(errors, list) or len(errors) != 1 or not isinstance(errors[0], dict):
         return False
     reported = errors[0].get("message")
     if not isinstance(reported, str) or not reported.strip():
         return False
-    message = error.get("message") if isinstance(error, dict) else None
-    if not isinstance(message, str):
+    steps = result.get("steps")
+    if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
         return False
-    signature = TERMINAL_COLOR.sub("", message).strip()
-    return bool(signature) and pattern.fullmatch(signature) is not None
+    # The JSON reporter only includes top-level test.step calls. A hook's steps are nested under the hook.
+    step_errors = [step["error"] for step in steps if step.get("error") is not None]
+    signature = error_signature(result.get("error"))
+    return (len(step_errors) == 1 and bool(signature) and error_signature(step_errors[0]) == signature
+            and pattern.fullmatch(signature) is not None)
 
 
 def verified_report(report: Path, label: str, patterns: dict[str, re.Pattern] | None) -> list[Identity]:
