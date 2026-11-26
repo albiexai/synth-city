@@ -209,14 +209,19 @@ async def record_effort_wait_ended(
 
 async def record_ceiling_wait_started(
     db: AsyncSession, notice: MailMessage, *, item_id: int, leader_member_id: int | None, source: str,
+    launch_id: int | None = None,
 ) -> None:
-    """#1300: the ceiling notice starts a wait on the Supervisor, in the notice's own transaction."""
+    """#1300: the ceiling notice starts a wait on the Supervisor, in the notice's own transaction.
+
+    The snapshot names the notice's attempt by its non-secret launch identity, never by its nonce.
+    """
     await db.flush()
     payload = notice.payload or {}
     operation_id = f"{CEILING_STARTED}:message:{notice.id}"
     await audit.record_event(
         db, event_kind=CEILING_STARTED, source=source, occurred_at=datetime.now(UTC), fact_source="mail_messages",
         fact_time=audit._naive(notice.created_at), item_id=item_id,
+        context_snapshot={"launch_attempt": audit.launch_attempt_key(item_id, launch_id)},
         actor=audit.derive_actor(actor_kind="member", member_id=leader_member_id)
         if leader_member_id is not None else audit.derive_actor(actor_kind="system"),
         after_values={"wait_message_id": notice.id, "request_kind": "effort_ceiling",
@@ -241,24 +246,25 @@ async def open_ceiling_waits(db: AsyncSession, item_id: int) -> list[FactoryAudi
 async def record_ceiling_wait_ended(
     db: AsyncSession, *, item_id: int, outcome: str, ended_at: datetime, source: str, actor: dict | None = None,
     notice_ids: list[int] | None = None, evidence: dict | None = None, before_values: dict | None = None,
-    correlation_id: str | None = None,
+    correlation_id: str | None = None, detail: str | None = None, context_snapshot: dict | None = None,
 ) -> None:
     """End the item's open ceiling waits, or those of ``notice_ids``, on the evidence that resolved them.
 
     ``actor`` is whoever acted; the answerer stays unknown: an operator token or a Leader never proves the
-    Supervisor's (or the Director's) answer. ``correlation_id`` links the end to the action's own event.
+    Supervisor's (or the Director's) answer. ``correlation_id`` links the end to the action's own event. Numbers
+    the value allowlist has no key for go in ``detail``, after the reason.
     """
     await _end_item_waits(
         db, CEILING_STARTED, CEILING_ENDED, item_id=item_id, outcome=outcome, ended_at=ended_at, source=source,
         notice_ids=notice_ids, values={"answered_by_member_id": None, **(evidence or {})},
         actor=actor or audit.derive_actor(actor_kind="system"), before_values=before_values,
-        correlation_id=correlation_id)
+        correlation_id=correlation_id, detail=detail, context_snapshot=context_snapshot)
 
 
 async def _end_item_waits(
     db: AsyncSession, start_kind: str, end_kind: str, *, item_id: int, outcome: str, ended_at: datetime,
     source: str, actor: dict, values: dict, notice_ids: list[int] | None, before_values: dict | None = None,
-    correlation_id: str | None = None,
+    correlation_id: str | None = None, detail: str | None = None, context_snapshot: dict | None = None,
 ) -> None:
     item_key = await audit.current_context_key(db, "item", item_id)
     if item_key is None:
@@ -280,8 +286,8 @@ async def _end_item_waits(
             fact_time=ended, item_id=started.item_id, item_context_key=item_key,
             scope_context_key=started.scope_context_key, team_context_key=started.team_context_key, actor=actor,
             after_values={"wait_message_id": started.after_values.get("wait_message_id"), "wait_outcome": outcome,
-                          **values}, before_values=before_values,
-            action_outcome="applied", sanitized_reason=f"{label} ended: {outcome}",
+                          **values}, before_values=before_values, context_snapshot=context_snapshot,
+            action_outcome="applied", sanitized_reason=f"{label} ended: {outcome}" + (f"; {detail}" if detail else ""),
             operation_id=operation_id, correlation_id=correlation_id or operation_id)
 
 

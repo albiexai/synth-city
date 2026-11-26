@@ -13,9 +13,10 @@ import pytest
 from sqlalchemy import delete, select, text
 
 from app.api.v1 import agent_teams
-from app.models.database import FactoryAuditEvent, GithubWorkItem, MailMessage, TeamGithubScope
+from app.models.database import AgentTeamLaunch, FactoryAuditEvent, GithubWorkItem, MailMessage, TeamGithubScope
 from app.models.schemas import TeamGithubScopeUpdate
 from app.services import decision_wait_service as waits
+from app.services.github_effort_limit_service import effort_limit_service
 from tests.agent_teams.test_effort_limit import (  # noqa: F401
     T0, _bind_supervisor, _ceiling_notices, _code, _extend, _limited, _scope_ceiling, _set, _tick, fx)
 from tests.agent_teams.test_scope_amendments import db  # noqa: F401
@@ -39,6 +40,16 @@ async def _refused(fx, *, limit=60, ceiling=70, minutes=15, supervisor=True):
     assert await _code(_extend(fx, minutes)) == "extension_exceeds_ceiling"
 
 
+async def _launch(fx):
+    """A launch row: the non-secret identity of an attempt (launch_attempt_key)."""
+    async with fx.maker() as session:
+        scope = await session.get(TeamGithubScope, fx.scope_id)
+        launch = AgentTeamLaunch(preset_id=scope.preset_id, plan_hash="fixture-plan")
+        session.add(launch)
+        await session.commit()
+        return launch.id
+
+
 async def _change_scope(fx, monkeypatch, **values):
     """The operator's scope update route, as the API runs it (no access-path context: the plain operator)."""
     monkeypatch.setattr(agent_teams, "_sync_github_jobs", AsyncMock())
@@ -48,6 +59,8 @@ async def _change_scope(fx, monkeypatch, **values):
 
 # The start
 async def test_the_ceiling_notice_starts_one_wait_on_the_supervisor_keyed_by_its_message_id(fx):
+    launch = await _launch(fx)
+    await _set(fx, launch_id=launch)
     await _refused(fx)
     assert await _code(_extend(fx, 12)) == "extension_exceeds_ceiling"  # the same attempt: no second wait
     (notice,) = await _ceiling_notices(fx)
@@ -58,7 +71,8 @@ async def test_the_ceiling_notice_starts_one_wait_on_the_supervisor_keyed_by_its
     assert start.after_values == {"wait_message_id": notice.id, "request_kind": "effort_ceiling",
                                   "owner_member_id": fx.leader, "awaited_member_id": None,
                                   "awaited_role": "supervisor", "awaited_actor_id": 6}
-    assert fx.nonce not in str(start.after_values)
+    assert start.context_snapshot["launch_attempt"] == f"item:{fx.item_id}:launch:{launch}"
+    assert fx.nonce not in str(start.after_values) + str(start.context_snapshot)
 
 
 async def test_no_supervisor_means_no_notice_and_no_wait(fx):
@@ -122,6 +136,8 @@ async def test_a_ceiling_raised_enough_ends_the_wait_with_its_actor_and_evidence
         "wait_message_id": start.after_values["wait_message_id"], "wait_outcome": "ceiling_raised",
         "answered_by_member_id": None, "max_item_effort_minutes": 75}
     assert end.before_values == {"max_item_effort_minutes": 70} and end.correlation_id == policy.correlation_id
+    assert end.sanitized_reason == (
+        "ceiling wait ended: ceiling_raised; the asked 15 minutes now fit: 15 minutes of room, 10 before")
 
 
 @pytest.mark.parametrize("values", [{"max_item_effort_minutes": 74}, {"max_item_effort_minutes": 65},
@@ -213,6 +229,54 @@ async def test_ending_stopped_work_ends_the_wait_with_its_actor_and_outcome(db, 
     assert end.correlation_id == stopped.operation_id
 
 
+@pytest.mark.parametrize("ended", [{"dispatch_status": "merged"}, {"dispatch_nonce": "the-next-attempt"}])
+async def test_an_earlier_item_or_attempt_end_is_not_relabelled_by_a_later_raise(fx, monkeypatch, ended):
+    """V1 review 6069720545: the end keeps the reason of what came first, in either order."""
+    await _refused(fx)
+    await _set(fx, **ended)
+    await _change_scope(fx, monkeypatch, max_item_effort_minutes=120)
+    assert [e.event_kind for e in await _events(fx)] == [waits.CEILING_STARTED]
+    await _tick(fx, T0 + timedelta(minutes=1))
+    _start, end = await _events(fx)
+    assert end.after_values["wait_outcome"] == ("item_terminal" if "dispatch_status" in ended else "attempt_ended")
+
+
+@pytest.mark.parametrize("ended", [{"dispatch_status": "merged"}, {"dispatch_nonce": "the-next-attempt"}])
+async def test_a_raise_before_the_item_or_attempt_ends_keeps_its_own_reason(fx, monkeypatch, ended):
+    await _refused(fx)
+    await _change_scope(fx, monkeypatch, max_item_effort_minutes=120)
+    await _set(fx, **ended)
+    await _tick(fx, T0 + timedelta(minutes=1))
+    _start, end = await _events(fx)
+    assert end.after_values["wait_outcome"] == "ceiling_raised"
+
+
+@pytest.mark.parametrize("ceiling", [68, 80])
+async def test_a_change_after_the_step_already_fits_is_not_a_raise(fx, monkeypatch, ceiling):
+    """The item's limit fell after the notice: 20 minutes of room under 70 already fit the asked 15."""
+    await _refused(fx)
+    await _set(fx, effort_limit_minutes=50)
+    await _change_scope(fx, monkeypatch, max_item_effort_minutes=ceiling)
+    assert [e.event_kind for e in await _events(fx)] == [waits.CEILING_STARTED]
+
+
+@pytest.mark.parametrize("gap", ["raised", "redispatched"])
+async def test_a_change_committed_before_the_notice_leaves_no_notice_and_no_wait(fx, monkeypatch, gap):
+    """V1 review 6069720545: the refusal releases the writer; a raise or a new attempt can land before the notice."""
+    original = effort_limit_service._add_ceiling_notice
+
+    async def raised_first(db, **kwargs):
+        if gap == "raised":  # another session, in the gap: the asked step fits now
+            await _scope_ceiling(fx, 90)
+        else:  # or the refused attempt was replaced: its request is gone
+            await _set(fx, dispatch_nonce="the-next-attempt")
+        return await original(db, **kwargs)
+
+    monkeypatch.setattr(effort_limit_service, "_add_ceiling_notice", raised_first)
+    await _refused(fx)
+    assert await _ceiling_notices(fx) == [] and await _events(fx) == []
+
+
 # The item's end and the attempt's replacement
 @pytest.mark.parametrize("status", ["merged", "cancelled"])
 async def test_an_ended_item_ends_the_wait_unattributed(fx, status):
@@ -238,7 +302,8 @@ async def test_a_replaced_attempt_ends_its_wait_unattributed(fx):
     await _refused(fx)
     await _tick(fx, T0 + timedelta(minutes=1))  # the same attempt: still open
     assert [e.event_kind for e in await _events(fx)] == [waits.CEILING_STARTED]
-    await _set(fx, dispatch_nonce="the-next-attempt")
+    replacement = await _launch(fx)
+    await _set(fx, dispatch_nonce="the-next-attempt", launch_id=replacement)
     seen = (await _ceiling_notices(fx))[0].created_at + timedelta(minutes=5)
     await _tick(fx, seen)
     await _tick(fx, seen + timedelta(minutes=1))  # once
@@ -246,6 +311,9 @@ async def test_a_replaced_attempt_ends_its_wait_unattributed(fx):
     assert (end.actor_kind, end.fact_time, end.after_values["wait_outcome"]) == ("system", seen, "attempt_ended")
     assert end.after_values == {"wait_message_id": _start.after_values["wait_message_id"],
                                 "wait_outcome": "attempt_ended", "answered_by_member_id": None}
+    # The replacement's non-secret launch identity, never a nonce or its digest.
+    assert end.context_snapshot["launch_attempt"] == f"item:{fx.item_id}:launch:{replacement}"
+    assert fx.nonce not in str(end.context_snapshot)
 
 
 async def test_a_mail_id_reused_by_another_item_is_another_wait(fx):
