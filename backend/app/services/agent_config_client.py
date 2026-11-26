@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 from app.config import settings
+from app.services.team_workspace_trust import _primary_checkout, _workspace_under_root
 
+FACTORY_WORK_ROOT = Path("/home/deckproductctl/work")
 _PROVIDERS = frozenset({"codex-cli", "claude-code"})
 _COMMAND = ["/usr/bin/sudo", "-n", "-u", "deckproduct", "--",
             "/opt/albiex-synth-city-product/libexec/agent-config"]
@@ -26,6 +29,15 @@ class AgentConfigBusy(AgentConfigError):
 
 def uses_agent_config(provider: str) -> bool:
     return settings.team_workspace_trust_helper_enabled and provider in _PROVIDERS
+
+
+def resolve_claude_checkout(folder: str) -> str:
+    """Use the writer's work-root checks and primary checkout resolution."""
+    try:
+        workspace = _workspace_under_root(Path(folder), FACTORY_WORK_ROOT)
+        return str(_primary_checkout(workspace, work_root=FACTORY_WORK_ROOT))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise AgentConfigError from None
 
 
 def prepare_workspace_trust_via_helper(provider: str, folder: str) -> bool:

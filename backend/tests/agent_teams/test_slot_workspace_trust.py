@@ -28,6 +28,8 @@ def helper():
     (75, {"ok": False, "error": "agent_config_busy"}, "busy"),
     (1, {"ok": True, "changed": True}, "refused"),
     (75, {"ok": False, "error": "unexpected"}, "refused"),
+    (1, {"ok": False, "error": "agent_config_busy"}, "refused"),
+    (75, {"ok": False, "error": "agent_config_busy", "extra": True}, "refused"),
     (0, {"ok": True, "changed": 1}, "refused"),
 ])
 def test_fixed_helper_command_and_typed_response(helper, monkeypatch, status, result, outcome):
@@ -38,6 +40,8 @@ def test_fixed_helper_command_and_typed_response(helper, monkeypatch, status, re
             "operation": "folder_trust", "provider": "codex-cli", "folder": "/work/example path",
         }
         assert kwargs["timeout"] > 0 and kwargs.get("shell", False) is False
+        assert kwargs["cwd"] == "/"
+        assert kwargs["env"] == {"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8"}
         return subprocess.CompletedProcess(argv, status, json.dumps(result) + "\n", "private fixture")
     monkeypatch.setattr(helper.subprocess, "run", run)
     if outcome == "busy":
@@ -52,7 +56,8 @@ def test_fixed_helper_command_and_typed_response(helper, monkeypatch, status, re
 
 
 @pytest.fixture
-def integrated_helper(helper, monkeypatch):
+def integrated_helper(helper, monkeypatch, tmp_path):
+    monkeypatch.setattr(helper, "FACTORY_WORK_ROOT", tmp_path.parent, raising=False)
     monkeypatch.setattr(settings, "team_workspace_trust_helper_enabled", True)
     calls = []
     errors = []
@@ -151,6 +156,7 @@ async def test_older_slots_can_be_read_after_compatible_sqlite_upgrade(db, tmp_p
         slots=[AgentTeamSlotCreate(display_name="Builder", provider="codex-cli", repo_path=str(tmp_path))],
     ))
     await db.execute(text("ALTER TABLE agent_team_slots DROP COLUMN workspace_trust_status"))
+    await db.execute(text("ALTER TABLE agent_team_slots DROP COLUMN workspace_trust_target"))
     await db.commit()
     async with db.bind.connect() as connection:
         await _run_sqlite_compat_migrations(connection)
@@ -191,3 +197,91 @@ def test_dedicated_spawn_requires_prepared_trust_for_the_same_directory(helper, 
             "codex-cli", SpawnCommandOptions(directory=str(directory), mode="plain"),
             extra_env={"SYNTH_CITY_TEAM_SLOT_ID": "1"}, workspace_trust_prepared=prepared,
         )
+
+
+@pytest.mark.asyncio
+async def test_claude_can_launch_a_trusted_linked_worktree_while_the_helper_is_busy(
+    db, tmp_path, integrated_helper, helper, monkeypatch,
+):
+    calls, errors = integrated_helper
+    primary = tmp_path / "primary"
+    worktree = tmp_path / "dispatch"
+    subprocess.run(["git", "init", "-q", str(primary)], check=True)
+    subprocess.run(["git", "-C", str(primary), "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+                    "commit", "-q", "--allow-empty", "-m", "fixture"], check=True)
+    subprocess.run(["git", "-C", str(primary), "worktree", "add", "-q", "--detach", str(worktree)], check=True)
+    slot_input = AgentTeamSlotCreate(display_name="Builder", provider="claude-code", repo_path=str(primary))
+    created = await agent_team_service.create_preset(db, AgentTeamPresetCreate(
+        name="Shared checkout", slots=[slot_input],
+    ))
+    ready = created.slots[0]
+    assert ready.workspace_trust_status == "ready"
+    errors.extend([helper.AgentConfigBusy, helper.AgentConfigBusy])
+    widened = await agent_team_service.add_slot(db, created.id, slot_input.model_copy(update={"display_name": "Other"}))
+    other = widened.slots[-1]
+    assert other.workspace_trust_status == "pending"
+
+    def plan_for(slot):
+        item = SimpleNamespace(slot_id=slot.id, action="spawn", warnings=[])
+        return SimpleNamespace(can_launch=True, plan_hash="fixture", items=[item],
+                               reuse_count=0, adopt_count=0, spawn_count=1, skipped_count=0, blocked_count=0)
+
+    plan = AsyncMock(return_value=plan_for(ready))
+    monkeypatch.setattr(agent_team_service, "plan_launch", plan)
+    monkeypatch.setattr(agent_team_service, "_bootstrap_prompt", AsyncMock(return_value=None))
+    launches = []
+
+    def spawn(_provider, options, *, workspace_trust_prepared, **kwargs):
+        launches.append((options.directory, workspace_trust_prepared))
+        return {"session_name": "fixture"}
+
+    monkeypatch.setattr("app.services.agent_team_service.spawn_session", spawn)
+    request = AgentTeamLaunchRequest(skip_plan_confirmation=True, reuse_existing=False, slot_ids=[ready.id],
+                                    repo_path_override=str(worktree))
+    launch = await agent_team_service.launch(db, created.id, request)
+    assert launch.items[0].status == "pending_registration"
+    assert launches == [(str(worktree), False)]
+
+    plan.return_value = plan_for(other)
+    launch = await agent_team_service.launch(db, created.id, request.model_copy(
+        update={"slot_ids": [other.id], "repo_path_override": None},
+    ))
+    assert launch.items[0].status == "pending_registration"
+    assert launches[-1] == (str(primary), False)
+    assert calls == [("claude-code", str(primary))] * 2
+    assert errors == [helper.AgentConfigBusy]
+    persisted = await agent_team_service.get_preset(db, created.id)
+    assert persisted.slots[-1].workspace_trust_status == "ready"
+
+    alias = tmp_path / "linked-alias"
+    alias.symlink_to(worktree, target_is_directory=True)
+    refused = await agent_team_service.launch(db, created.id, request.model_copy(
+        update={"slot_ids": [other.id], "repo_path_override": str(alias)},
+    ))
+    assert refused.items[0].block_code == "agent_config_refused"
+    assert len(launches) == 2 and len(calls) == 2
+
+
+def test_controller_refuses_an_unsupported_provider_before_invoking_sudo(helper, monkeypatch):
+    monkeypatch.setattr(helper.subprocess, "run", lambda *args, **kwargs: pytest.fail("sudo invoked"))
+    with pytest.raises(helper.AgentConfigError):
+        helper.prepare_workspace_trust_via_helper("antigravity-cli", "/work/example")
+
+
+@pytest.mark.asyncio
+async def test_changed_claude_checkout_does_not_produce_ready_evidence(db, tmp_path, integrated_helper, monkeypatch):
+    calls, _ = integrated_helper
+    first = str(tmp_path / "first")
+    second = str(tmp_path / "second")
+    resolve = iter([first, second])
+    monkeypatch.setattr("app.services.agent_team_service.resolve_claude_checkout", lambda _path: next(resolve))
+    preset = await agent_team_service.create_preset(db, AgentTeamPresetCreate(
+        name="Moving checkout",
+        slots=[AgentTeamSlotCreate(display_name="Builder", provider="claude-code", repo_path=str(tmp_path))],
+    ))
+    assert preset.slots[0].workspace_trust_status == "failed"
+    assert calls == [("claude-code", str(tmp_path))]
+    row = await db.get(AgentTeamSlot, preset.slots[0].id)
+    assert row.workspace_trust_target is None
+    monkeypatch.setattr(settings, "team_workspace_trust_helper_enabled", False)
+    assert (await agent_team_service.get_preset(db, preset.id)).slots[0].workspace_trust_status is None

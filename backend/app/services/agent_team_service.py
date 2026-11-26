@@ -49,7 +49,7 @@ from app.services import agent_mail_install_service, opencode_version
 from app.services.agent_bridge.discovery import discover_agent_sessions
 from app.services.agent_bridge.spawn import spawn_session
 from app.services.agent_config_client import (
-    AgentConfigBusy, AgentConfigError, prepare_workspace_trust_via_helper, uses_agent_config,
+    AgentConfigBusy, AgentConfigError, prepare_workspace_trust_via_helper, resolve_claude_checkout, uses_agent_config,
 )
 from app.services.agent_mail_service import MCP_HEARTBEAT_TTL_SECONDS, agent_mail_service
 from app.services.github_recovery_gate import configured_recovery_only_attempt
@@ -785,15 +785,22 @@ class AgentTeamService:
 
     async def _provision_slot_workspace_trust(self, slot: AgentTeamSlot) -> None:
         slot.workspace_trust_status = None
+        slot.workspace_trust_target = None
         if uses_agent_config(slot.provider):
             # The result remains on the slot so an operator can retry by launching.
             with suppress(AgentConfigError):
                 await self._prepare_slot_workspace_trust(slot, slot.repo_path)
 
-    async def _prepare_slot_workspace_trust(self, slot: AgentTeamSlot, directory: str) -> bool:
+    async def _prepare_slot_workspace_trust(
+        self, slot: AgentTeamSlot, directory: str, *, target: str | None = None,
+    ) -> bool:
         status = "failed"
         try:
+            if slot.provider == "claude-code" and target is None:
+                target = await asyncio.to_thread(resolve_claude_checkout, directory)
             changed = await asyncio.to_thread(prepare_workspace_trust_via_helper, slot.provider, directory)
+            if target is not None and await asyncio.to_thread(resolve_claude_checkout, directory) != target:
+                raise AgentConfigError
             status = "ready"
             return changed
         except AgentConfigBusy:
@@ -802,6 +809,40 @@ class AgentTeamService:
         finally:
             if directory == slot.repo_path:
                 slot.workspace_trust_status = status
+                slot.workspace_trust_target = target if status == "ready" else None
+
+    async def _prepare_launch_workspace_trust(
+        self, db: AsyncSession, slot: AgentTeamSlot, directory: str,
+    ) -> bool:
+        binding = (await db.execute(select(
+            AgentTeamSlot.provider, AgentTeamSlot.repo_path, AgentTeamSlot.workspace_trust_status,
+        ).where(AgentTeamSlot.id == slot.id, AgentTeamSlot.preset_id == slot.preset_id))).one_or_none()
+        if binding is None or (binding.provider, binding.repo_path) != (slot.provider, slot.repo_path):
+            raise PlanConflictError("The slot workspace changed. Review a new launch plan.")
+        if slot.provider != "claude-code":
+            if directory == slot.repo_path and binding.workspace_trust_status == "ready":
+                return False
+            return await self._prepare_slot_workspace_trust(slot, directory)
+
+        try:
+            target = await asyncio.to_thread(resolve_claude_checkout, directory)
+        except AgentConfigError:
+            if directory == slot.repo_path:
+                slot.workspace_trust_status = "failed"
+                slot.workspace_trust_target = None
+            raise
+        # Dedicated factory slots share one agent account and one Claude trust file.
+        ready_slot = await db.scalar(select(AgentTeamSlot.id).where(
+            AgentTeamSlot.provider == "claude-code",
+            AgentTeamSlot.workspace_trust_status == "ready",
+            AgentTeamSlot.workspace_trust_target == target,
+        ).limit(1))
+        if ready_slot is None:
+            return await self._prepare_slot_workspace_trust(slot, directory, target=target)
+        if directory == slot.repo_path:
+            slot.workspace_trust_status = "ready"
+            slot.workspace_trust_target = target
+        return False
 
     async def delete_slot(self, db: AsyncSession, slot_id: int) -> AgentTeamPresetResponse:
         slot, preset = await self._lock_slot_and_preset(db, slot_id)
@@ -1100,15 +1141,7 @@ class AgentTeamService:
                 # Synth City chooses the OpenCode session id so that resume is exact (#731).
                 options = SpawnCommandOptions(**{**options.__dict__, "session_id": new_opencode_session_id()})
             if uses_agent_config(slot.provider):
-                binding = (await db.execute(select(
-                    AgentTeamSlot.provider, AgentTeamSlot.repo_path, AgentTeamSlot.workspace_trust_status,
-                ).where(AgentTeamSlot.id == slot.id, AgentTeamSlot.preset_id == preset.id))).one_or_none()
-                if binding is None or (binding.provider, binding.repo_path) != (slot.provider, slot.repo_path):
-                    raise PlanConflictError("The slot workspace changed. Review a new launch plan.")
-                if options.directory == slot.repo_path and binding.workspace_trust_status == "ready":
-                    prepared_trust = False
-                else:
-                    prepared_trust = await self._prepare_slot_workspace_trust(slot, options.directory)
+                prepared_trust = await self._prepare_launch_workspace_trust(db, slot, options.directory)
             spawned = spawn_session(
                 slot.provider,
                 options,
