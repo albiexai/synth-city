@@ -1,6 +1,6 @@
 import pytest
 
-from app.services.codex_process_identity import explicit_resume
+from app.services.codex_process_identity import explicit_resume, plain_start
 
 SESSION = '12345678-1234-1234-1234-123456789abc'
 
@@ -25,6 +25,21 @@ def test_exact_resume_selector(arguments,expected):
 def test_resume_refuses_a_different_executable_or_noncanonical_identity():
     assert not explicit_resume([b'other',b'resume',SESSION.encode()],SESSION)
     assert not explicit_resume([b'codex',b'resume',SESSION.upper().encode()],SESSION.upper())
+
+
+@pytest.mark.parametrize(("arguments", "expected"), [
+    ([], True),
+    ([b"--cd", b"/tmp/repo", b"--no-alt-screen", b"Start work"], True),
+    ([b"resume", SESSION.encode()], False),
+    ([b"resume", b"--last"], False),
+    ([b"fork"], False),
+    ([b"exec", b"Start work"], False),
+    ([b"--model"], False),
+    ([b"--unsupported"], False),
+])
+def test_plain_start_requires_codex_options_and_no_resume_selector(arguments, expected):
+    assert plain_start([b"/opt/tools/codex", *arguments, b""]) is expected
+    assert not plain_start([b"/usr/bin/other", *arguments, b""])
 
 
 @pytest.mark.parametrize('arguments,accepted',[

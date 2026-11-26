@@ -18,6 +18,7 @@ from app.services.team_workspace_trust import prepare_workspace_trust
 logger = logging.getLogger(__name__)
 
 _spawned_sessions: dict[str, dict] = {}
+_LAUNCH_TOOLS_MARKER = "agent-tmux: launch-tools="
 
 
 class SpawnSessionError(ValueError):
@@ -55,7 +56,7 @@ def _env_flags(env: dict[str, str]) -> list[str]:
 
 
 def _parse_pane_pid(stdout: str) -> int | None:
-    """Read the pane pid tmux printed for `-F '#{pane_pid}'`."""
+    """Read the pane PID tmux printed for `-F '#{pane_pid}'`."""
     lines = (stdout or "").strip().splitlines()
     if not lines:
         return None
@@ -63,6 +64,17 @@ def _parse_pane_pid(stdout: str) -> int | None:
         return int(lines[0].strip())
     except ValueError:
         return None
+
+
+def _launch_tools_feedback(stderr: str) -> tuple[bool | None, str]:
+    markers, diagnostics = [], []
+    for line in (stderr or "").splitlines():
+        if line.startswith(_LAUNCH_TOOLS_MARKER):
+            markers.append(line.removeprefix(_LAUNCH_TOOLS_MARKER))
+        else:
+            diagnostics.append(line)
+    status = {"present": True, "missing": False}.get(markers[0]) if len(markers) == 1 else None
+    return status, "\n".join(diagnostics)
 
 
 def spawn_session(
@@ -130,8 +142,9 @@ def spawn_session(
     if extra_env:
         env_flags += _env_flags(extra_env)
 
+    team_spawn = bool(extra_env and extra_env.get("SYNTH_CITY_TEAM_SLOT_ID"))
     trust_changed = bool(workspace_trust_prepared)
-    if extra_env and extra_env.get("SYNTH_CITY_TEAM_SLOT_ID") and workspace_trust_prepared is None:
+    if team_spawn and workspace_trust_prepared is None:
         if uses_agent_config(provider.id):
             raise AgentConfigError
         trust_changed = prepare_workspace_trust(provider.id, directory)
@@ -156,8 +169,9 @@ def spawn_session(
             text=True,
             timeout=10,
         )
+        tools_status, stderr = _launch_tools_feedback(result.stderr) if team_spawn else (None, result.stderr)
         if result.returncode != 0:
-            raise SpawnSessionError(f"tmux new-session failed: {result.stderr.strip()}", trust_changed)
+            raise SpawnSessionError(f"tmux new-session failed: {stderr.strip()}", trust_changed)
         pane_pid = _parse_pane_pid(result.stdout)
     except FileNotFoundError:
         raise SpawnSessionError("tmux is not installed or not in PATH", trust_changed)
@@ -180,6 +194,7 @@ def spawn_session(
         "session_name": name,
         "pane_pid": pane_pid,
         "workspace_trust_changed": trust_changed,
+        **({"tools_on_launch_path": tools_status} if team_spawn else {}),
         **({"session_id": options.session_id} if provider.id == "opencode-cli" else {}),
     }
 

@@ -542,6 +542,34 @@ def test_spawn_session_returns_the_pane_pid(monkeypatch, tmp_path):
         SpawnCommandOptions(directory=str(tmp_path), mode="plain"),
     )
     assert result["pane_pid"] == 49769
+    assert "tools_on_launch_path" not in result
+
+
+@pytest.mark.parametrize(("stderr", "status"), [
+    ("agent-tmux: launch-tools=present\n", True),
+    ("agent-tmux: launch-tools=missing\n", False),
+    ("", None),
+    ("agent-tmux: launch-tools=unexpected\n", None),
+    ("agent-tmux: launch-tools=present\nagent-tmux: launch-tools=missing\n", None),
+    ("diagnostic contained agent-tmux: launch-tools=missing\n", None),
+])
+def test_team_launch_reads_the_wrapper_check_without_changing_path(monkeypatch, tmp_path, stderr, status):
+    from app.services.agent_bridge import spawn
+    from app.services.providers.base import SpawnCommandOptions
+
+    def fake_run(args, **kwargs):
+        assert args[args.index("-F") + 1] == "#{pane_pid}"
+        assert not any(arg.startswith("PATH=") for arg in args)
+        return SimpleNamespace(returncode=0, stdout="49769\n", stderr=stderr)
+
+    monkeypatch.setattr(spawn.subprocess, "run", fake_run)
+    result = spawn.spawn_session(
+        "codex-cli", SpawnCommandOptions(directory=str(tmp_path), mode="plain"),
+        extra_env={"SYNTH_CITY_TEAM_SLOT_ID": "7"}, workspace_trust_prepared=False,
+    )
+    assert result["pane_pid"] == 49769
+    assert result["tools_on_launch_path"] is status
+    assert "agent-tmux:" not in str(result)
 
 
 def test_spawn_session_pane_pid_is_none_when_tmux_prints_nothing(monkeypatch, tmp_path):

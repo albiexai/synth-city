@@ -1,6 +1,6 @@
 """Read bounded native activity observations; never infer work from a live PID.
 
-Use authenticated current pane bindings, explicit Codex resume UUIDs, or Pi's
+Use authenticated current pane bindings, verified Codex session identities, or Pi's
 native extension observations. Missing permissions and ambiguous bindings return
 unknown. No transcripts, paths, session IDs or credentials leave this module.
 """
@@ -254,11 +254,23 @@ def _process_rollout_path(pid: int, home: Path, session_id: str) -> Path | None:
     return next(iter(matches), None)
 
 
-def _new_codex_rollout(pid: int, cwd: str, now: datetime, started_at: datetime) -> str | None:
+@dataclass(frozen=True)
+class _FirstCodexRollout:
+    session_id: str
+    path: Path
+    descriptor: Path
+    file_identity: tuple[int, int, int]
+
+
+def _file_identity(info: os.stat_result) -> tuple[int, int, int]:
+    return info.st_dev, info.st_ino, info.st_uid
+
+
+def _new_codex_rollout(pid: int, cwd: str, now: datetime, started_at: datetime) -> _FirstCodexRollout | None:
     """Capture one current rollout from this exact process. This is not work evidence."""
     home = _codex_home(pid)
     uid = (_PROC / str(pid)).stat().st_uid
-    matches = set()
+    matches = {}
     with os.scandir(_PROC / str(pid) / "fd") as entries:
         for index, entry in enumerate(entries):
             if index >= _MAX_PROCESS_DESCRIPTORS:
@@ -275,14 +287,14 @@ def _new_codex_rollout(pid: int, cwd: str, now: datetime, started_at: datetime) 
                     opened = os.stat(entry.path)
                     if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid
                             or info.st_mode & stat.S_IWOTH
-                            or (info.st_dev, info.st_ino) != (opened.st_dev, opened.st_ino)):
+                            or _file_identity(info) != _file_identity(opened)):
                         continue
                     line = stream.readline(65537)
                     if len(line) > 65536 or not line.endswith(b"\n"):
                         continue
                     row = json.loads(line)
                     current = os.stat(entry.path)
-                    if (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
+                    if _file_identity(info) != _file_identity(current):
                         continue
                 payload = row.get("payload", {})
                 if (row.get("type") != "session_meta" or payload.get("id") != identity
@@ -291,12 +303,15 @@ def _new_codex_rollout(pid: int, cwd: str, now: datetime, started_at: datetime) 
                 timestamp = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00"))
                 if timestamp.tzinfo is None or not started_at <= timestamp <= now + timedelta(seconds=5):
                     continue
-                matches.add(identity)
+                file_identity = _file_identity(info)
+                matches[(identity, file_identity)] = _FirstCodexRollout(
+                    identity, target, Path(entry.path), file_identity,
+                )
             except (OSError, ValueError, TypeError, KeyError, AttributeError):
                 continue
     if len(matches) > 1:
         raise ValueError("Native conversation has ambiguous process descriptors")
-    return next(iter(matches), None)
+    return next(iter(matches.values()), None)
 
 
 def _rollout_path(home: Path, session_id: str, cwd: str) -> Path | None:
@@ -351,9 +366,16 @@ def _codex_has_turn_boundary(data: bytes, offset: int) -> bool:
 
 
 def _native_state(path: Path, session_id: str, cwd: str, now: datetime, started_at: datetime,
-                  *, provenance: dict | None = None
+                  *, provenance: dict | None = None, file_identity: tuple[int, int, int] | None = None,
                   ) -> tuple[str, str, datetime | None]:
-    with path.open("rb") as stream:
+    with (path.open("rb") if file_identity is None else os.fdopen(
+        os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb"
+    )) as stream:
+        if file_identity is not None:
+            info = os.fstat(stream.fileno())
+            if (_file_identity(info) != file_identity or not stat.S_ISREG(info.st_mode)
+                    or info.st_mode & stat.S_IWOTH):
+                return "unknown", "native_log_unavailable", None
         metadata = json.loads(stream.readline(65_536))
         payload = metadata.get("payload", {})
         if (metadata.get("type") != "session_meta" or payload.get("id") != session_id
@@ -545,20 +567,9 @@ def _observe(slot_id: int, provider: str, session_id: str | None,
                                       input_wait_binding_id=selected_binding.binding_id)
                 if input_reason != "clear":
                     waiting_input = NativeInputWait(reason=input_reason, observed_at=now)
-        if provider == "codex-cli" and not session_id:
-            argv = (_PROC / str(pid) / "cmdline").read_bytes().split(b"\0")
-            if argv and Path(os.fsdecode(argv[0])).name == "codex":
-                identity = _new_codex_rollout(pid, cwd, now, _process_started_at(start))
-                process_state, current_start = _process(pid)
-                if current_start != start or process_state in _STOPPED_STATES:
-                    return result("unknown", "binding_changed")
-                if identity:
-                    if provenance is not None:
-                        provenance["discovered_session_id"] = identity
-                    return result("unknown", "restart_needed_for_observation")
-        if not session_id or _canonical_session_id(session_id) != session_id:
-            return result("unknown", "session_identity_unavailable")
         if provider == "claude-code":
+            if not session_id or _canonical_session_id(session_id) != session_id:
+                return result("unknown", "session_identity_unavailable")
             options = {"provenance": provenance} if provenance is not None else {}
             state, reason, observed_at = observe_claude(
                 pid, session_id, cwd, now, _process_started_at(start), **options)
@@ -570,31 +581,54 @@ def _observe(slot_id: int, provider: str, session_id: str | None,
             if provenance is not None and provenance.get("session_id"):
                 provenance.update(pane_pid=pid, pane_start=start, provider=provider)
             return result(state, reason, observed_at)
-        argv = (_PROC / str(pid) / "cmdline").read_bytes().split(b"\0")
-        # The running executable must be Codex and explicitly resume this UUID.
-        from app.services.codex_process_identity import explicit_resume
-        if not explicit_resume(argv, session_id):
+        command = _PROC / str(pid) / "cmdline"
+        argv = command.read_bytes().split(b"\0")
+        from app.services.codex_process_identity import explicit_resume, plain_start
+
+        if session_id and _canonical_session_id(session_id) != session_id:
+            return result("unknown", "session_identity_unavailable")
+        first = None
+        started_at = _process_started_at(start)
+        if session_id and explicit_resume(argv, session_id):
+            home = _codex_home(pid)
+            path = _process_rollout_path(pid, home, session_id) or _rollout_path(home, session_id, cwd)
+        else:
             if argv and Path(os.fsdecode(argv[0])).name == "codex":
-                identity = _new_codex_rollout(pid, cwd, now, _process_started_at(start))
-                process_state, current_start = _process(pid)
-                if current_start != start or process_state in _STOPPED_STATES:
-                    return result("unknown", "binding_changed")
-                if identity == session_id:
-                    return result("unknown", "restart_needed_for_observation")
-            return result("unknown", "session_mismatch")
-        home = _codex_home(pid)
-        path = _process_rollout_path(pid, home, session_id) or _rollout_path(home, session_id, cwd)
+                first = _new_codex_rollout(pid, cwd, now, started_at)
+            process_state, current_start = _process(pid)
+            if current_start != start or process_state in _STOPPED_STATES:
+                return result("unknown", "binding_changed")
+            plain = plain_start(argv)
+            if not session_id:
+                if first is not None:
+                    if provenance is not None:
+                        provenance["discovered_session_id"] = first.session_id
+                    if not plain:
+                        return result("unknown", "restart_needed_for_observation")
+                return result("unknown", "session_identity_unavailable")
+            if first is None or first.session_id != session_id:
+                return result("unknown", "session_mismatch")
+            if not plain:
+                return result("unknown", "restart_needed_for_observation")
+            path = first.path
         if path is None:
             return result("unknown", "native_log_unavailable")
-        options = {"provenance": provenance} if provenance is not None else {}
-        state, reason, observed_at = _native_state(path, session_id, cwd, now, _process_started_at(start), **options)
+        native_provenance = {} if provenance is not None else None
+        state, reason, observed_at = _native_state(
+            path, session_id, cwd, now, started_at, provenance=native_provenance,
+            file_identity=first.file_identity if first is not None else None,
+        )
+        if first is not None and _file_identity(first.descriptor.stat()) != first.file_identity:
+            return result("unknown", "native_log_unavailable")
         process_state, current_start = _process(pid)
-        if current_start != start:
+        if current_start != start or (first is not None and command.read_bytes().split(b"\0") != argv):
             return result("unknown", "binding_changed")
         if process_state in _STOPPED_STATES:
             return result("stopped", "process_stopped")
-        if provenance is not None and provenance.get("session_id"):
-            provenance.update(pane_pid=pid, pane_start=start, provider=provider)
+        if provenance is not None and native_provenance is not None:
+            if native_provenance.get("session_id"):
+                native_provenance.update(pane_pid=pid, pane_start=start, provider=provider)
+            provenance.update(native_provenance)
         return result(state, reason, observed_at)
     except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError, RuntimeError):
         return result("unknown", "observation_unavailable")

@@ -521,7 +521,9 @@ def codex_first_launch(tmp_path, monkeypatch):
     path = home / "sessions" / f"rollout-fixture-{session_id}.jsonl"
     header = {"type": "session_meta", "timestamp": (now - timedelta(seconds=4)).isoformat(),
               "payload": {"id": session_id, "cwd": str(cwd)}}
-    path.write_text(json.dumps(header) + "\n")
+    turn = {"type": "event_msg", "timestamp": (now - timedelta(seconds=2)).isoformat(),
+            "payload": {"type": "task_started"}}
+    path.write_text("".join(json.dumps(row) + "\n" for row in (header, turn)))
     (process / "fd" / "3").symlink_to(path)
     monkeypatch.setattr(activity, "_PROC", proc, raising=False)
     monkeypatch.setattr(activity, "_codex_home", lambda pid: home)
@@ -531,11 +533,11 @@ def codex_first_launch(tmp_path, monkeypatch):
     return locals()
 
 
-def test_codex_first_launch_records_rollout_and_requires_restart(codex_first_launch):
+def test_codex_first_launch_captures_identity_before_attributing_activity(codex_first_launch):
     f = codex_first_launch
     provenance = {}
     observed = activity._observe(2, "codex-cli", None, [f["binding"]], False, f["now"], provenance=provenance)
-    assert (observed.state, observed.reason) == ("unknown", "restart_needed_for_observation")
+    assert (observed.state, observed.reason) == ("unknown", "session_identity_unavailable")
     assert provenance["discovered_session_id"] == f["session_id"]
     assert "event_id" not in provenance
     assert f["session_id"] not in observed.model_dump_json()
@@ -569,8 +571,7 @@ def test_codex_rollout_capture_refuses_invalid_evidence(codex_first_launch, inva
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("launch_options", [None, {}])
-async def test_codex_rollout_identity_is_saved_for_later_resume(db, codex_first_launch, monkeypatch, launch_options):
-    from unittest.mock import AsyncMock
+async def test_codex_first_launch_is_observed_after_saving_its_resume_id(db, codex_first_launch, launch_options):
     f = codex_first_launch
     preset = AgentTeamPreset(name="Codex fixture")
     db.add(preset)
@@ -579,20 +580,76 @@ async def test_codex_rollout_identity_is_saved_for_later_resume(db, codex_first_
                          repo_id="fixture", repo_name="fixture", repo_path=str(f["cwd"]),
                          launch_mode="plain", launch_options=launch_options)
     db.add(slot)
+    await db.flush()
+    member = MailTeamMember(identity_key="codex-first-launch-fixture", repo_id="fixture",
+        repo_path=str(f["cwd"]), repo_name="fixture", display_name="Worker",
+        team_preset_id=preset.id, team_slot_id=slot.id)
+    db.add(member)
+    await db.flush()
+    db.add(MailAgentSession(member_id=member.id, provider="codex-cli", source="mcp",
+        session_key="codex-first-launch", cwd=str(f["cwd"]), team_preset_id=preset.id,
+        team_slot_id=slot.id, capability_token_hash="fixture-only", mailbox_status="connected",
+        bound_pane_pid=f["binding"].pane_pid, bound_pane_proc_start=f["binding"].pane_start))
+    db.add(AgentPaneBinding(pane_pid=f["binding"].pane_pid, pane_proc_start=f["binding"].pane_start,
+        slot_id=slot.id, preset_id=preset.id))
     await db.commit()
-    entry = (slot.id, "codex-cli", None, [f["binding"]], False)
-    monkeypatch.setattr(activity, "_team_inputs", AsyncMock(return_value=[entry]))
     result = await activity.observe_team(db, preset.id)
     await db.refresh(slot)
-    assert result.slots[0].reason == "restart_needed_for_observation"
+    assert result.slots[0].state == "unknown"
     assert slot.launch_options["session_id"] == f["session_id"]
     assert slot.launch_mode == "resume"
 
+    next_result = await activity.observe_team(db, preset.id)
+    assert (next_result.slots[0].state, next_result.slots[0].reason) == ("working", "native_turn_started")
+    assert f["session_id"] not in next_result.model_dump_json()
+    assert (f["process"] / "cmdline").read_bytes() == b"codex\0--no-alt-screen\0"
+    private = (await activity.observe_private_team(db, preset.id))[slot.id]
+    assert private.state == "working"
+    assert private.identity and private.binding_identity and private.cursor
+    assert private.settlement_id is None
 
-def test_codex_saved_first_launch_identity_still_requires_restart(codex_first_launch):
+
+def test_codex_refuses_to_observe_an_incorrect_resume_selector(codex_first_launch):
     f = codex_first_launch
-    observed = activity._observe(2, "codex-cli", f["session_id"], [f["binding"]], False, f["now"])
-    assert (observed.state, observed.reason) == ("unknown", "restart_needed_for_observation")
+    (f["process"] / "cmdline").write_bytes(b"codex\0resume\0" + str(uuid4()).encode() + b"\0")
+    provenance = {}
+    observed = activity._observe(2, "codex-cli", f["session_id"], [f["binding"]], False,
+                                 f["now"], provenance=provenance)
+    assert observed.state == "unknown"
+    assert "pane_pid" not in provenance and "event_id" not in provenance
+
+
+@pytest.mark.parametrize("replace_when", ["after_capture", "after_read", "argv"])
+def test_codex_first_launch_refuses_changed_rollout_evidence(codex_first_launch, monkeypatch, replace_when):
+    f = codex_first_launch
+    target = f["process"] / "fd" / "3"
+    original = activity._native_state
+
+    def replace_rollout(path, *args, **kwargs):
+        if replace_when == "argv":
+            result = original(path, *args, **kwargs)
+            (f["process"] / "cmdline").write_bytes(b"other\0")
+            return result
+        content = path.read_bytes()
+        other = path.with_name("other-rollout")
+        target.unlink()
+        if replace_when == "after_capture":
+            path.rename(other)
+            target.symlink_to(other)
+            path.write_bytes(content)
+            return original(path, *args, **kwargs)
+        result = original(path, *args, **kwargs)
+        other.write_bytes(content)
+        target.symlink_to(other)
+        return result
+
+    monkeypatch.setattr(activity, "_native_state", replace_rollout)
+    provenance = {}
+    observed = activity._observe(2, "codex-cli", f["session_id"], [f["binding"]], False,
+                                 f["now"], provenance=provenance)
+    reason = "binding_changed" if replace_when == "argv" else "native_log_unavailable"
+    assert (observed.state, observed.reason) == ("unknown", reason)
+    assert "pane_pid" not in provenance and "event_id" not in provenance
 
 
 def test_codex_capture_refuses_replaced_descriptor_file(codex_first_launch, monkeypatch):
