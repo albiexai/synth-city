@@ -400,6 +400,7 @@ export interface TeamGithubScope {
   max_scope_commands: number
   review_hold_label?: string | null
   max_item_effort_minutes?: number
+  initial_paths_required?: boolean
   enabled: boolean
   last_polled_at?: string | null
   created_at: string
@@ -417,6 +418,7 @@ export interface TeamGithubScopeInput {
   max_concurrent_dispatched?: number
   max_verification_retries?: number
   max_auto_merges_per_day?: number
+  initial_paths_required?: boolean
   base_ref?: string
   github_auth_mode?: 'unknown' | 'ambient' | 'app'
   builds_out_of_tree?: boolean
@@ -446,6 +448,7 @@ export interface TeamGithubScopeUpdate {
   // null clears the hold label; an empty string is invalid.
   review_hold_label?: string | null
   max_item_effort_minutes?: number
+  initial_paths_required?: boolean
   reason?: string
   enabled?: boolean
 }

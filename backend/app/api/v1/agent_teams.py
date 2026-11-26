@@ -355,6 +355,7 @@ from app.services.github_work_item_projection import (
     _load_work_item_authority,
     _reload_work_item_response,
     _work_item_response,
+    _work_item_status_note,
 )
 from app.api.v1.factory_delivery import router as delivery_router
 from app.services.factory_delivery_policy import scope_policy
@@ -517,6 +518,7 @@ def _scope_response(
         max_auto_merges_per_day=scope.max_auto_merges_per_day,
         max_item_effort_minutes=scope.max_item_effort_minutes,
         max_plan_estimate_minutes=effort_limit_service.plan_estimate_limit(scope),
+        initial_paths_required=scope.initial_paths_required,
         auto_merges_last_24h=auto_merges_last_24h,
         base_ref=scope.base_ref,
         builds_out_of_tree=scope.builds_out_of_tree,
@@ -720,7 +722,7 @@ async def _scope_identity_in_use(db: AsyncSession, scope_id: int) -> bool:
 _SCOPE_CONFIGURATION_FIELDS = (
     "preset_id", "repo_owner", "repo_name", "repo_path", "dispatch_label", "design_label",
     "merge_policy", "review_hold_label", "max_approval_rounds", "max_concurrent_dispatched", "max_verification_retries",
-    "max_auto_merges_per_day", "max_item_effort_minutes", "max_plan_estimate_minutes", "base_ref",
+    "max_auto_merges_per_day", "max_item_effort_minutes", "max_plan_estimate_minutes", "initial_paths_required", "base_ref",
     "builds_out_of_tree", "build_dir_template",
     "build_command_hint", "max_build_parallelism", "github_auth_mode", "github_app_installation_id",
     "continuation_enabled", "max_continuation_revisions", "max_continuation_failed_heads",
@@ -839,6 +841,8 @@ def _apply_scope_create(
         scope.max_item_effort_minutes = request.max_item_effort_minutes
     if "max_plan_estimate_minutes" in request.model_fields_set:
         scope.max_plan_estimate_minutes = request.max_plan_estimate_minutes
+    if request.initial_paths_required is not None:
+        scope.initial_paths_required = request.initial_paths_required
     if (scope.max_plan_estimate_minutes is not None
             and scope.max_plan_estimate_minutes > scope.max_item_effort_minutes):
         raise HTTPException(status_code=422, detail="plan_estimate_limit_exceeds_effort_ceiling")
@@ -2316,7 +2320,7 @@ async def claim_github_work_item_continuation(
         workspace_path=workspace.path if workspace is not None else None,
         lease_token=workspace.lease_token if workspace is not None else None,
         leader_member_id=leader_member.id if leader_member is not None else None,
-        status_note=github_rate_limit_service.work_item_note(item.dispatch_status, item.status_note),
+        status_note=_work_item_status_note(item),
         active_revision=(
             _scope_revision_response(active_revision, effort=effort_view, current_view=True)
             if active_revision is not None

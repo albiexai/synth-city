@@ -29,6 +29,7 @@ const scope = {
 const definitions = {
   review_hold_label: { type: 'string' },
   max_item_effort_minutes: { type: 'integer', minimum: 20, maximum: 600, default: 90 },
+  initial_paths_required: { type: 'boolean', default: false },
 }
 const entry = (id: number, changes: Record<string, { before: unknown; after: unknown }>, extra = {}) => ({
   event_id: id, occurred_at: '2026-11-26T08:00:00Z', actor_kind: 'operator', actor_reference: 'director', via: null,
@@ -111,6 +112,19 @@ describe('the review hold and effort limit editors', () => {
     await user.type(screen.getByLabelText('Reason (optional)'), 'Shorter items')
     await user.click(save())
     await waitFor(() => expect(updateTeamGithubScope).toHaveBeenCalledWith(2, { max_item_effort_minutes: 90, reason: 'Shorter items' }, 'director-key'))
+  })
+
+  it('edits the first-plan path requirement and shows it in history', async () => {
+    const { user } = await openEditor()
+    const required = screen.getByRole('checkbox', { name: 'Require paths in the first plan' })
+    expect(required).not.toBeChecked()
+    vi.mocked(fetchScopeSettings).mockResolvedValue(page([
+      entry(9, { initial_paths_required: { before: false, after: true } }),
+    ]))
+    await user.click(required)
+    await user.click(save())
+    expect(await screen.findByText('First-plan paths required: false → true')).toBeInTheDocument()
+    expect(updateTeamGithubScope).toHaveBeenCalledWith(2, { initial_paths_required: true }, 'director-key')
   })
 
   it('sends nothing when no value changed, and says so instead of keeping an old refusal on screen', async () => {

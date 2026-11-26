@@ -46,6 +46,8 @@ export const REFUSAL_REASONS: Record<string, string> = {
 
   allowed_actions_invalid: "Some actions are not allowed in this plan.",
   allowed_paths_invalid: "The plan's file paths are not valid.",
+  plan_allowed_paths_missing: "This repository requires a file list before the Leader can approve the first plan.",
+  initial_plan_unverifiable: "The linked first plan could not be verified.",
   plan_metadata_reserved_key: "A plan may not supply the companion keys that the server writes.",
   continuation_summary_reserved: "A request summary may not contain the reserved companion list line.",
   continuation_failed_head_limit_exceeded: "Too many failed attempts for this plan.",

@@ -242,6 +242,10 @@ Rules, each with a code the server also uses:
 
 Initial plan submission and preflight check the upper end of `plan_metadata.estimate_active_minutes`. Estimates above the item effort ceiling return `effort_estimate_exceeds_ceiling`. An estimate within the ceiling but above `max_plan_estimate_minutes` returns `plan_estimate_exceeds_limit` with a message suggesting a split. An estimate equal to the plan limit is allowed. An accepted estimate sets the item's effort limit. The submit route checks new requests and preserves exact replays of recorded requests.
 
+The audited repository setting `initial_paths_required` defaults to false. Enable it in the repository limits dialog or with `PATCH /api/v1/agent-teams/github-scopes/{scope_id}`. When enabled, a new first-plan approval without a verified file list is refused with `plan_allowed_paths_missing` when the list is absent, or a path or linkage error when the list cannot be verified. Changes appear in the repository settings history.
+
+For an acknowledged first plan with a file list, `pr_opened` and `pr_ready` compare the reported PR head with its merge base. The readiness note names files outside the plan as `initial_paths_out_of_scope` and reports incomplete evidence as `initial_paths_inconclusive`. The note appears alongside CI status, is refreshed for a newly observed head, and clears when an approved amendment takes effect. The final merge gate and any active revision's boundary still govern delivery.
+
 The continuation and amendment submit routes run the same checks and refuse with the same first code and status as before, so a request that passes preflight is not refused for these rules. Rules that need stored state, such as budgets, a pending request or the repository head, are still checked only when you submit.
 
 ## Effort limits and extensions

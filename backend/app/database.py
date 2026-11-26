@@ -924,6 +924,8 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         )
     if scope_columns and "max_plan_estimate_minutes" not in scope_columns:
         await conn.execute(text("ALTER TABLE team_github_scopes ADD COLUMN max_plan_estimate_minutes INTEGER"))
+    if scope_columns and "initial_paths_required" not in scope_columns:
+        await conn.execute(text("ALTER TABLE team_github_scopes ADD COLUMN initial_paths_required BOOLEAN DEFAULT 0 NOT NULL"))
     if scope_columns and "base_ref" not in scope_columns:
         await conn.execute(
             text("ALTER TABLE team_github_scopes ADD COLUMN base_ref VARCHAR DEFAULT 'origin/HEAD' NOT NULL")
@@ -1001,6 +1003,8 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN dispatch_priority INTEGER"))
     if work_item_columns and "status_note" not in work_item_columns:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN status_note VARCHAR"))
+    if work_item_columns and "initial_paths_readiness" not in work_item_columns:
+        await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN initial_paths_readiness JSON"))
     if work_item_columns and "workspace_wait_reason" not in work_item_columns:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN workspace_wait_reason VARCHAR"))
     if work_item_columns and "checks_unavailable_since" not in work_item_columns:

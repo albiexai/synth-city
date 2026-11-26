@@ -213,6 +213,37 @@ async def _linked_initial_plan(fx, db, metadata):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("listed", [False, True])
+async def test_initial_paths_policy_is_checked_at_approval(fx, listed):
+    async with fx.maker() as db:
+        metadata = {"allowed_paths": ["test.py"]} if listed else {}
+        approval = await _linked_initial_plan(fx, db, metadata)
+        item = await _item(fx, db)
+        scope = await db.get(TeamGithubScope, fx.scope_id)
+        assert scope.initial_paths_required is False
+        scope.initial_paths_required = True
+        await db.commit()
+        decision = dict(authenticated_leader_member_id=fx.leader, request_id=approval.id,
+                        decision="approved", reason="proceed")
+        if listed:
+            assert (await github_approval_service.decide(db, item, **decision))[1]
+        else:
+            with pytest.raises(GithubApprovalError) as error:
+                await github_approval_service.decide(db, item, **decision)
+            assert error.value.detail == "plan_allowed_paths_missing"
+            assert (await db.get(GithubApprovalRequest, approval.id)).status == "pending"
+            item = await _item(fx, db)
+            assert item.effort_limit_minutes is None
+            scope = await db.get(TeamGithubScope, fx.scope_id)
+            scope.initial_paths_required = False
+            await db.commit()
+            assert (await github_approval_service.decide(db, item, **decision))[1]
+            scope.initial_paths_required = True
+            await db.commit()
+            assert not (await github_approval_service.decide(db, item, **decision))[1]
+
+
+@pytest.mark.asyncio
 async def test_an_approved_plan_without_an_estimate_uses_the_ceiling_at_decision_time(fx):
     async with fx.maker() as db:
         approval = await _linked_initial_plan(fx, db, {})
