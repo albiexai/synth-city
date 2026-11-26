@@ -18,7 +18,7 @@ from app.models.database import (
 from app.models.schemas import MailApprovalRequestCreate, MailMessageCreate
 from app.services.agent_mail_service import agent_mail_service
 from app.services.github_approval_service import GithubApprovalError, github_approval_service
-from app.services.github_client import GithubCommitSnapshot, github_client
+from app.services.github_client import GithubClientResponseError, GithubCommitSnapshot, GithubTreeEntry, github_client
 from app.services.github_verification_service import github_verification_service
 from app.services.github_dispatch_service import github_dispatch_service
 from app.utils import peer_process
@@ -49,7 +49,7 @@ async def db(request, tmp_path):
 
 
 @pytest_asyncio.fixture
-async def healthy_attempt(db, monkeypatch, tmp_path):
+async def healthy_attempt(db, monkeypatch, tmp_path, request):
     monkeypatch.setattr(settings, "mail_capability_tokens_required", True)
     monkeypatch.setattr(peer_process, "pane_is_alive", lambda *_args: True)
     monkeypatch.setattr(agent_mail_service, "auto_nudge_members", AsyncMock())
@@ -76,9 +76,18 @@ async def healthy_attempt(db, monkeypatch, tmp_path):
     db.add(workspace)
     await db.commit()
     session = await db.scalar(select(MailAgentSession).where(MailAgentSession.member_id == members[1].id))
+    plan_metadata = {"allowed_paths": ["src/base.py"]}
+    variant = getattr(request, "param", None)
+    if variant == "with_companion":
+        from app.services import companion_paths
+        monkeypatch.setattr(companion_paths, "load_map", lambda: {
+            "src/base.py": [{"path": "src/added.py", "kind": "test"}],
+        })
+    elif variant == "without_paths":
+        plan_metadata = {}
     response = await agent_mail.request_work_item_approval(MailApprovalRequestCreate(
         work_item_id=item.id, dispatch_nonce=item.dispatch_nonce, summary="Initial closed scope",
-        plan_metadata={"allowed_paths": ["src/base.py"]}), session, db)
+        plan_metadata=plan_metadata), session, db)
     approval = await db.get(GithubApprovalRequest, response.id)
     await github_approval_service.decide(db, item, authenticated_leader_member_id=members[0].id,
         decision="approved", reason="Fixture initial decision", request_id=approval.id)
@@ -187,6 +196,136 @@ async def test_scope_amendment_cannot_be_approved_after_local_head_moves(db, hea
             request_id=approval.id)
     await db.refresh(approval)
     assert approval.status == "pending" and a.item.active_scope_revision == 0
+
+
+async def initial_path_merge_case(db, a, monkeypatch, *, extra_file=False):
+    from app.services import github_head_acceptance_service
+
+    # This fixture exercises the ordinary auto-merge path after a green, accepted head.
+    monkeypatch.setattr(github_head_acceptance_service, "gate_note", AsyncMock(return_value=None))
+    a.scope.merge_policy = "auto"
+    a.item.dispatch_status = "ready_for_review"
+    a.item.dispatch_base_ref = "origin/release/v4.1"
+    a.item.pr_number = 5
+    a.item.last_verified_sha = a.head
+    base_tip, common_sha, common_tree = "a" * 40, "b" * 40, "c" * 40
+    a.pull["base"]["sha"] = base_tip
+    a.pull["draft"] = False
+    client = _Client(pull=a.pull, check_runs=green_runs(a.head), combined_status={"state": "success", "statuses": []})
+    # The PR already inherited integration.py, and the base tip has moved again. Only the
+    # merge base has the right contents for this comparison.
+    inherited = GithubTreeEntry("src/integration.py", "100644", "blob", "d" * 40)
+    owned = GithubTreeEntry("src/base.py", "100644", "blob", "e" * 40)
+    common = {inherited.path: inherited}
+    head = {**common, owned.path: owned}
+    if extra_file:
+        extra = GithubTreeEntry("src/added.py", "100644", "blob", "f" * 40)
+        head[extra.path] = extra
+    snapshots = {a.head: a.tree, common_sha: common_tree}
+    trees = {a.tree: head, common_tree: common}
+    client.get_merge_base = AsyncMock(return_value=common_sha)
+    client.get_commit_snapshot = AsyncMock(side_effect=lambda _, __, sha, **kw: GithubCommitSnapshot(sha, snapshots[sha]))
+    client.get_recursive_tree = AsyncMock(side_effect=lambda _, __, sha, **kw: trees[sha])
+    await db.commit()
+    return client, base_tip
+
+
+@pytest.mark.asyncio
+async def test_initial_path_gate_merges_in_scope_head_with_base_only_files(db, healthy_attempt, monkeypatch):
+    a = healthy_attempt
+    client, base_tip = await initial_path_merge_case(db, a, monkeypatch)
+    await github_verification_service.process_scope(db, a.scope, client=client)
+    client.get_merge_base.assert_awaited_once_with("o", "approval", base_tip, a.head, token=None)
+    assert a.item.dispatch_status == "merged" and client.merge_head_shas == [a.head]
+
+
+@pytest.mark.asyncio
+async def test_initial_path_gate_holds_extra_file_until_approved_amendment(db, healthy_attempt, monkeypatch):
+    from app.services.github_ci_watch_service import github_ci_watch_service
+
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch, extra_file=True)
+    await github_verification_service.process_scope(db, a.scope, client=client)
+    assert client.merge_calls == 0 and a.item.dispatch_status == "ready_for_review"
+    assert a.item.status_note == "initial_paths_out_of_scope: 'src/added.py'"
+
+    revision, approval, _ = await github_approval_service.create_scope_amendment_request(
+        db, a.item, a.scope, **amendment(a))
+    await github_approval_service.ensure_continuation_request_message(db, a.item, approval, revision)
+    await github_approval_service.decide_continuation(db, a.item, authenticated_leader_member_id=a.leader.id,
+        decision="approved", reason="Approve adding src/added.py", request_id=approval.id)
+    await github_approval_service.ensure_continuation_decision_message(db, a.item, approval, revision)
+    await github_approval_service.deliver_approved_continuation(db, a.item, approval, revision)
+    await github_dispatch_service.activate_continuation_revision(db, a.item, a.scope, revision,
+        authenticated_owner_member_id=a.owner.id, authenticated_owner_slot_id=a.owner.team_slot_id,
+        dispatch_nonce=a.item.dispatch_nonce, lease_token=a.workspace.lease_token)
+    monkeypatch.setattr(client, "get_pull", AsyncMock(return_value=client.pull))
+    await github_verification_service.submit_continuation_completion(
+        db, a.item, a.scope, authenticated_owner_member_id=a.owner.id,
+        authenticated_owner_slot_id=a.owner.team_slot_id, revision_number=revision.revision,
+        dispatch_nonce=a.item.dispatch_nonce, current_head_sha=a.head, result_summary="Reviewed the amended paths",
+        evidence={}, lease_token=a.workspace.lease_token, client=client)
+    await bind_submitted_review(db, a, revision)
+    await require_jobs(db, a, monkeypatch)
+    await settle_accepted(db, a, await record_accepted(db, a))
+
+    monkeypatch.setattr(github_ci_watch_service, "_wake", AsyncMock(return_value=True))
+    await github_verification_service.process_scope(db, a.scope, client=client)
+    await db.refresh(a.item)
+    await db.refresh(revision)
+    assert a.item.active_scope_revision == revision.revision
+    assert a.item.dispatch_status == "merged", a.item.status_note
+    assert client.merge_head_shas == [a.head] and client.get_merge_base.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("healthy_attempt", ["with_companion", "without_paths"], indirect=True)
+async def test_initial_path_gate_uses_only_the_boundary_in_the_approved_plan(db, healthy_attempt, monkeypatch):
+    from app.services import companion_paths
+
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch, extra_file=True)
+
+    def map_unavailable():
+        pytest.fail("Merge authority must come from the approved copy of the plan")
+
+    monkeypatch.setattr(companion_paths, "load_map", map_unavailable)
+    await github_verification_service.process_scope(db, a.scope, client=client)
+    assert a.item.dispatch_status == "merged" and client.merge_head_shas == [a.head]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["base", "tree", "plan", "changed_base", "changed_plan"])
+async def test_initial_path_gate_holds_when_the_comparison_cannot_be_proved(db, healthy_attempt, monkeypatch, missing):
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch)
+    if missing == "base":
+        del client.pull["base"]["sha"]
+    elif missing == "tree":
+        client.get_recursive_tree.side_effect = GithubClientResponseError("recursive tree truncated")
+    elif missing in {"plan", "changed_plan"}:
+        root = await db.get(MailMessage, a.approval.request_message_id)
+        tampered = {**root.payload, "plan_metadata": {"allowed_paths": ["src/added.py"]}}
+        if missing == "plan":
+            root.payload = tampered
+            await db.commit()
+        else:
+            read_pull = client.get_pull
+
+            async def change_plan_on_final_read(*args):
+                if client.pull_calls == 1:
+                    await db.execute(update(MailMessage).where(MailMessage.id == root.id)
+                                     .values(payload=tampered).execution_options(synchronize_session=False))
+                    await db.commit()
+                return await read_pull(*args)
+
+            client.get_pull = change_plan_on_final_read
+    else:
+        moved = {**client.pull, "base": {**client.pull["base"], "sha": "1" * 40}}
+        client.get_pull = AsyncMock(side_effect=[client.pull, moved])
+    await github_verification_service.process_scope(db, a.scope, client=client)
+    assert a.item.dispatch_status == "ready_for_review" and client.merge_calls == 0
+    assert a.item.status_note.startswith("initial_paths_inconclusive:")
 
 
 async def prior_amendment(a, db, number, added, *, status="rejected", approved=False):

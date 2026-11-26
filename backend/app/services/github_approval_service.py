@@ -619,22 +619,32 @@ class GithubApprovalService:
                     approved, root, delivery_key=f"github-approval:{approved.id}:request")
                     or item.ack_received_at is None and not history):
                 raise GithubApprovalError("amendment_baseline_unverifiable")
-            metadata = (root.payload or {}).get("plan_metadata") or {}
-            paths = self.initial_plan_paths(metadata)
-            # Only companions the server presented to the Leader are approved. The fingerprint, checked above,
-            # covers the metadata, and the server-rendered Mail body must show the same list. Old opaque
-            # metadata under the same key keeps the authority it always had.
+            try:
+                paths = self.linked_initial_plan_paths(root)
+            except GithubApprovalError as exc:
+                raise GithubApprovalError("amendment_baseline_unverifiable") from exc
             if paths is None:
                 raise GithubApprovalError("amendment_baseline_unverifiable")
-            companions = companion_paths.verified_companions(
-                metadata, (root.payload or {}).get("summary"), root.body_markdown)
-            paths = [*paths, *(companions or [])]
         if not isinstance(paths, list) or not paths or any(not isinstance(path, str) for path in paths):
             raise GithubApprovalError("amendment_baseline_unverifiable")
         paths = self._canonical_paths(paths)
         if any(path.endswith("/") for path in paths):
             raise GithubApprovalError("amendment_closed_file_paths_required")
         return paths
+
+    @classmethod
+    def linked_initial_plan_paths(cls, root: MailMessage) -> list[str] | None:
+        """Read the path authority of a request whose linked Mail fingerprint already matched."""
+        payload = root.payload or {}
+        metadata = payload.get("plan_metadata")
+        if not isinstance(metadata, dict) or not {"allowed_paths", "paths"}.intersection(metadata):
+            return None
+        paths = cls.initial_plan_paths(metadata)
+        if paths is None:
+            raise GithubApprovalError("allowed_paths_invalid", status_code=400)
+        # Only the server-rendered companions presented to the Leader grant authority.
+        companions = companion_paths.verified_companions(metadata, payload.get("summary"), root.body_markdown)
+        return [*paths, *(companions or [])]
 
     @staticmethod
     def base_ref_matches(github_ref, dispatch_base_ref):

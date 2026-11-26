@@ -28,10 +28,11 @@ from app.models.database import (
     MailTeamMember,
     TeamGithubScope,
 )
-from app.services.github_app_auth_service import github_app_auth_service
+from app.services.github_app_auth_service import GithubAppAuthError, github_app_auth_service
 from app.services.agent_mail_service import agent_mail_service
 from app.services.accepted_source_imports import matching_imported_paths, source_import_claim_conditions
 from app.services.github_approval_service import (
+    GithubApprovalError,
     IMPLEMENTATION_COMPLETION_ACTIONS,
     github_approval_service,
 )
@@ -79,6 +80,7 @@ _HUMAN_MERGE_NOTE_PREFIXES = (
 _CAP_FALLBACK_PREFIX = "Auto-merge budget exhausted"
 _STALL_FALLBACK_PREFIX = "Auto-merge blocked: GitHub checks stalled"
 _MERGE_TRANSIENT_STATUS_CODES = {405, 409, 422}
+_INITIAL_PLAN_UNVERIFIABLE = "initial_paths_inconclusive: the approved first plan could not be verified."
 # Escalations a late PR legitimately resolves: the agent said it was stuck, or Albiex Synth City
 # inferred it from a timer. Anything not listed stays rejected by default.
 _PR_OPENED_RECOVERABLE_ESCALATIONS = frozenset(
@@ -216,6 +218,55 @@ class GithubVerificationService:
             for path in baseline_paths.keys() | current_paths.keys()
             if baseline_paths.get(path) != current_paths.get(path)
         }
+
+    @staticmethod
+    async def _initial_merge_paths(db: AsyncSession, item: GithubWorkItem) -> list[str] | None:
+        """Read the current acknowledged first plan. Older attempts may have no normalized plan or file list."""
+        row = (await db.execute(select(GithubApprovalRequest, _latest_member(item.owner_slot_id)).where(
+            GithubApprovalRequest.work_item_id == item.id,
+            GithubApprovalRequest.dispatch_nonce == item.dispatch_nonce,
+            GithubApprovalRequest.request_kind == "initial_plan",
+        ).order_by(GithubApprovalRequest.approval_round.desc(), GithubApprovalRequest.id.desc()).limit(1)
+            .execution_options(populate_existing=True))).first()
+        if row is None:
+            return None
+        request, owner_member_id = row
+        if (request.status != "approved" or request.approval_round != item.ack_approval_round
+                or request.owner_member_id != owner_member_id
+                or request.leader_member_id != item.ack_approver_member_id or item.ack_received_at is None
+                or request.request_message_id is None):
+            raise GithubApprovalError("initial_plan_unverifiable")
+        root = await db.get(MailMessage, request.request_message_id, populate_existing=True)
+        if root is None or not github_approval_service.matches_linked_request_message(
+                request, root, delivery_key=f"github-approval:{request.id}:request"):
+            raise GithubApprovalError("initial_plan_unverifiable")
+        paths = github_approval_service.linked_initial_plan_paths(root)
+        return github_approval_service._canonical_paths(paths) if paths is not None else None
+
+    async def _initial_path_hold(
+        self, scope: TeamGithubScope, client: GithubClient, base_sha: str | None,
+        head_sha: str, allowed_paths: list[str],
+    ) -> str | None:
+        if not base_sha:
+            return "initial_paths_inconclusive: the PR base SHA could not be read."
+        try:
+            token = await github_approval_service.github_read_token(scope)
+            owner, repo = scope.repo_owner, scope.repo_name
+            common_sha = await client.get_merge_base(owner, repo, base_sha, head_sha, token=token)
+            common = await client.get_commit_snapshot(owner, repo, common_sha, token=token)
+            head = await client.get_commit_snapshot(owner, repo, head_sha, token=token)
+            common_tree = await client.get_recursive_tree(owner, repo, common.tree_sha, token=token)
+            head_tree = await client.get_recursive_tree(owner, repo, head.tree_sha, token=token)
+        except GithubRateLimited:
+            raise
+        except (GithubApprovalError, GithubAppAuthError, GithubClientResponseError, httpx.HTTPError):
+            return "initial_paths_inconclusive: complete GitHub tree evidence could not be verified."
+        # The head's merge base excludes changes only inherited from the PR's base branch.
+        outside = sorted(path for path in self._changed_tree_paths(common_tree, head_tree)
+                         if not github_approval_service.path_is_allowed(path, allowed_paths))
+        if outside:
+            return "initial_paths_out_of_scope: " + ", ".join(repr(path) for path in outside)
+        return None
 
     async def submit_continuation_completion(
         self,
@@ -3106,7 +3157,37 @@ class GithubVerificationService:
             item.updated_at = datetime.utcnow()
             await db.commit()
             return
-        # Owner readiness and labels can change while checks are read.
+        initial_context = None
+        initial_fence = None
+        initial_paths = None
+        initial_base = None
+        if item.active_scope_revision == 0:
+            initial_context = {name: getattr(item, name) for name in (
+                *_MERGE_FENCE_ITEM, "ack_received_at", "handoff_state",
+            )}
+            item_current = exists(select(GithubWorkItem.id).where(*(
+                _same_value(getattr(GithubWorkItem, name), value) for name, value in initial_context.items()
+            )))
+            scope_current = exists(select(TeamGithubScope.id).where(
+                TeamGithubScope.id == scope.id,
+                TeamGithubScope.enabled.is_(True),
+                TeamGithubScope.merge_policy == "auto",
+                TeamGithubScope.repo_owner == scope.repo_owner,
+                TeamGithubScope.repo_name == scope.repo_name,
+            ))
+            initial_fence = select(and_(item_current, scope_current))
+            try:
+                initial_paths = await self._initial_merge_paths(db, item)
+            except GithubApprovalError:
+                await self._record_fenced_note(db, item, initial_context, _INITIAL_PLAN_UNVERIFIABLE)
+                return
+            if initial_paths is not None:
+                initial_base = (pull.get("base") or {}).get("sha")
+                path_note = await self._initial_path_hold(scope, client, initial_base, current_head, initial_paths)
+                if path_note is not None:
+                    await self._record_fenced_note(db, item, initial_context, path_note)
+                    return
+        # Owner readiness, labels and the base used for the comparison can change during GitHub reads.
         try:
             fresh_pull = await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
         except GithubRateLimited:
@@ -3114,6 +3195,8 @@ class GithubVerificationService:
         except (httpx.HTTPError, GithubClientResponseError):
             await self._record_readiness_hold(
                 db, item, "PR readiness could not be read; automatic merge is blocked.")
+            return
+        if initial_fence is not None and not await db.scalar(initial_fence):
             return
         if not await self._validate_polled_pull_identity(
             db, scope, item, client, fresh_pull, retry_status=item.dispatch_status,
@@ -3126,6 +3209,10 @@ class GithubVerificationService:
             item.dispatch_status = "verifying"
             await self._record_readiness_hold(
                 db, item, "Head changed before auto-merge; verifying the current head.")
+            return
+        if initial_paths is not None and (fresh_pull.get("base") or {}).get("sha") != initial_base:
+            await self._record_fenced_note(db, item, initial_context,
+                "initial_paths_inconclusive: the PR base changed during the comparison.")
             return
         readiness_note = self._draft_readiness_note(item, fresh_pull)
         if readiness_note is not None:
@@ -3141,6 +3228,8 @@ class GithubVerificationService:
             return
         approval_reason = await self._approval_gate_reason(db, scope, item, acceptance_identity)
         if approval_reason is not None:
+            if initial_fence is not None and not await db.scalar(initial_fence):
+                return
             await self._fallback_to_human_merge(
                 db, item, "Auto-merge blocked: distinct current-round leader approval is "
                 f"required ({approval_reason}).")
@@ -3150,6 +3239,21 @@ class GithubVerificationService:
         if withdrawn is not None:
             await self._record_readiness_hold(db, item, withdrawn)
             return
+        if initial_fence is not None:
+            try:
+                current_paths = await self._initial_merge_paths(db, item)
+            except GithubApprovalError:
+                await self._record_fenced_note(db, item, initial_context, _INITIAL_PLAN_UNVERIFIABLE)
+                return
+            if current_paths != initial_paths:
+                await self._record_fenced_note(db, item, initial_context,
+                    "initial_paths_inconclusive: the approved file list changed during the comparison.")
+                return
+            if not await db.scalar(initial_fence):
+                return
+            from app.services.github_coordination_service import hold_code
+            if hold_code():
+                return
         if fence is not None:
             # The last await before the merge call is this one statement; the HOLD read and the call follow with none.
             if not await db.scalar(select(self._superseded_fence_holds(scope, item, fence))):
