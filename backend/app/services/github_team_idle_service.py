@@ -164,11 +164,12 @@ class GithubTeamIdleService:
                 await db.commit()
                 return []
             since = _utc(saved.last_progress_at)
-            if blocked or not public or now - since < timedelta(seconds=settings.github_team_idle_timeout_seconds):
+            if blocked or not public:
                 return []
             # Re-read the critical automation bits after all awaits. This grants no execution authority.
             await db.refresh(team)
-            if hold_code() or not team.autonomy_enabled:
+            timeout = team.github_team_idle_timeout_seconds or settings.github_team_idle_timeout_seconds
+            if hold_code() or not team.autonomy_enabled or now - since < timedelta(seconds=timeout):
                 return []
             for _, scope in rows:
                 await db.refresh(scope)

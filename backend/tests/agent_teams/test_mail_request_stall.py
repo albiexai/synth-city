@@ -140,6 +140,22 @@ async def test_threshold_follows_the_setting(db, monkeypatch, seconds, age, repo
 
 
 @pytest.mark.asyncio
+async def test_unanswered_request_uses_only_its_teams_override(db):
+    now = datetime.now(timezone.utc)
+    team, people = await make_team(db)
+    other, other_people = await make_team(db, name="Other")
+    request = await add_request(db, people[0], people[1], age=120, base=now.replace(tzinfo=None))
+    await add_request(db, other_people[0], other_people[1], age=120, base=now.replace(tzinfo=None))
+    team.mail_request_unanswered_seconds = 60
+    await db.commit()
+    assert ids(await observe(db, team, states(people), now=now)) == [request.id]
+    assert ids(await observe(db, other, states(other_people), now=now)) == []
+    team.mail_request_unanswered_seconds = None
+    await db.commit()
+    assert ids(await observe(db, team, states(people), now=now)) == []
+
+
+@pytest.mark.asyncio
 async def test_the_setting_defaults_to_twenty_minutes_and_is_bounded():
     from app.config import Settings
 

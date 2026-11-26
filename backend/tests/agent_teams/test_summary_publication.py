@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import settings
 from app.database import Base
-from app.models.database import GithubApprovalRequest, GithubHeadReview, GithubWorkItem, TeamGithubScope
+from app.models.database import AgentTeamPreset, GithubApprovalRequest, GithubHeadReview, GithubWorkItem, TeamGithubScope
 from app.services import github_summary_publication_service as module
 from app.services.github_client import GithubClient
 from app.services.github_summary_publication_service import (
@@ -372,6 +372,28 @@ async def test_the_disabled_setting_writes_nothing(fx, monkeypatch):
         scope = await db.get(TeamGithubScope, fx.scope_id)
         await service.publish_scope(db, scope, client)
     assert client.comments == {} and client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_summary_publication_honors_both_boolean_values_and_the_live_default(fx, monkeypatch):
+    client = FakeGithub()
+    async with fx.maker() as db:
+        scope = await db.get(TeamGithubScope, fx.scope_id)
+        team = await db.get(AgentTeamPreset, scope.preset_id)
+        team.github_publish_summaries_enabled = False
+        await db.commit()
+        await service.publish_scope(db, scope, client)
+        assert client.calls == []
+        monkeypatch.setattr(settings, "github_publish_summaries_enabled", False)
+        db.add(AgentTeamPreset(name="Other", github_publish_summaries_enabled=True))
+        team.github_publish_summaries_enabled = None
+        await db.commit()
+        await service.publish_scope(db, scope, client)
+        assert client.calls == []
+        team.github_publish_summaries_enabled = True
+        await db.commit()
+        await service.publish_scope(db, scope, client)
+        assert len(client.writes()) == 1
 
 
 @pytest.mark.asyncio

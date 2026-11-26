@@ -19,7 +19,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models.database import GithubApprovalRequest, GithubHeadReview, GithubWorkItem, TeamGithubScope
+from app.models.database import AgentTeamPreset, GithubApprovalRequest, GithubHeadReview, GithubWorkItem, TeamGithubScope
 from app.services.factory_delivery_policy import effective_policy, scope_policy
 
 logger = logging.getLogger(__name__)
@@ -411,7 +411,9 @@ class GithubSummaryPublicationService:
         rendered digest decides whether anything is written, so a withdrawn review, a hold label or a check change
         on the same head refreshes the comment and unchanged facts write nothing.
         """
-        if not settings.github_publish_summaries_enabled:
+        preset = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
+        override = preset.github_publish_summaries_enabled if preset is not None else None
+        if not (override if override is not None else settings.github_publish_summaries_enabled):
             return
         rows = (await db.execute(select(GithubWorkItem).where(
             GithubWorkItem.scope_id == scope.id, GithubWorkItem.pr_number.is_not(None),
