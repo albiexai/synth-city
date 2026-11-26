@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -252,6 +253,46 @@ async def test_exact_progress_issue_endpoint(case):
             assert result is None if case == "missing" else result["number"] == 7
     assert seen[0].method == "GET" and seen[0].url.path == "/repos/owner/repo/issues/7"
     assert seen[0].headers["Authorization"] == "Bearer explicit-token"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["closed", "open", "wrong_issue", "pull", "foreign_endpoint"])
+async def test_close_issue_uses_exact_issue_and_completed_state(case):
+    def handler(request):
+        assert request.method == "PATCH"
+        assert request.url.path == "/repos/owner/repo/issues/7"
+        assert json.loads(request.content) == {"state": "closed", "state_reason": "completed"}
+        assert request.headers["Authorization"] == "Bearer fixture-client"
+        issue = {"number": 7, "html_url": "https://github.com/owner/repo/issues/7", "state": "closed"}
+        if case == "open":
+            issue["state"] = "open"
+        if case == "wrong_issue":
+            issue["number"] = 8
+        if case == "pull":
+            issue["pull_request"] = {}
+        return httpx.Response(200, json=issue)
+
+    base_url = "https://example.invalid" if case == "foreign_endpoint" else "https://api.github.com"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url=base_url) as http:
+        client = GithubClient(http=http, token="fixture-client")
+        if case == "closed":
+            await client.close_issue("owner", "repo", 7)
+        else:
+            with pytest.raises(GithubClientResponseError):
+                await client.close_issue("owner", "repo", 7)
+
+
+@pytest.mark.asyncio
+async def test_issue_comment_search_passes_the_merge_time_filter():
+    def handler(request):
+        assert request.url.path == "/repos/owner/repo/issues/7/comments"
+        assert request.url.params["since"] == "2026-11-26T06:59:59Z"
+        return httpx.Response(200, json=[{"id": 1, "body": "A recent comment"}])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://api.github.com") as http:
+        comments = await GithubClient(http=http).list_issue_comments("owner", "repo", 7,
+            since="2026-11-26T06:59:59Z")
+    assert len(comments) == 1
 
 
 def test_explicit_authorization_does_not_mutate_ambient_token():

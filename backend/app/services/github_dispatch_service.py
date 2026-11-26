@@ -1729,6 +1729,8 @@ class GithubDispatchService:
                         "number and wait for CI verification.",
                     ]
                 )
+                if scope.merge_policy == "auto":
+                    lines.append(f"- Include `Closes #{item.issue_number}` in the pull request description.")
             lines.extend(self._build_instructions(item, scope))
         from app.services.factory_delivery_policy import effective_policy, policy_guidance
         lines.extend(["", policy_guidance(effective_policy(item, scope), item.delivery_policy_revision)])

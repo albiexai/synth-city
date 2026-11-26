@@ -328,6 +328,24 @@ class GithubClient:
             if self._http is None:
                 await client.aclose()
 
+    async def close_issue(self, owner: str, repo: str, number: int) -> None:
+        """Close the exact repository issue as completed."""
+        endpoint = f"/repos/{owner}/{repo}/issues/{number}"
+        client = self._client()
+        try:
+            response = await client.patch(endpoint, headers=self._headers(),
+                json={"state": "closed", "state_reason": "completed"})
+            response.raise_for_status()
+            self._require_expected_response(response, endpoint=endpoint, label="issue close")
+            issue = self._json_object(response, "issue close")
+            if (type(issue.get("number")) is not int or issue["number"] != number
+                    or "pull_request" in issue or issue.get("state") != "closed"
+                    or issue.get("html_url") != f"https://github.com/{owner}/{repo}/issues/{number}"):
+                raise GithubClientResponseError("GitHub issue close response was invalid")
+        finally:
+            if self._http is None:
+                await client.aclose()
+
     async def get_pull(
         self,
         owner: str,
@@ -740,15 +758,20 @@ class GithubClient:
             if self._http is None:
                 await client.aclose()
 
-    async def list_issue_comments(self, owner: str, repo: str, number: int, *, token: str | None = None) -> list[dict]:
-        """The first 500 comments of a pull request, oldest first (five pages of 100)."""
+    async def list_issue_comments(
+        self, owner: str, repo: str, number: int, *, token: str | None = None, since: str | None = None,
+    ) -> list[dict]:
+        """The first 500 matching issue or pull request comments, oldest first."""
         client = self._client()
         try:
             comments: list[dict] = []
             for page in range(1, 6):
+                params = {"per_page": "100", "page": str(page)}
+                if since is not None:
+                    params["since"] = since
                 resp = await client.get(
                     f"/repos/{owner}/{repo}/issues/{number}/comments",
-                    headers=self._headers(token), params={"per_page": "100", "page": str(page)},
+                    headers=self._headers(token), params=params,
                 )
                 resp.raise_for_status()
                 batch = self._json_list(resp, "issue comments")

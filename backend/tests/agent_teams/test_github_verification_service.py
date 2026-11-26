@@ -1655,6 +1655,54 @@ async def test_verifying_merged_pull_fires_blocker_merged_notification(db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "auth_mode,policy,issue_type,pull_merged,issue_state,expects_closure",
+    [
+        ("ambient", "auto", "code", True, "open", True),
+        ("app", "auto", "code", True, "open", True),
+        ("ambient", "auto", "code", True, "closed", False),
+        ("ambient", "human", "code", True, "open", False),
+        ("ambient", "auto", "design", True, "open", False),
+        ("ambient", "auto", "code", False, "open", False),
+    ],
+)
+async def test_verification_poll_closes_only_a_committed_auto_code_delivery(
+    db, monkeypatch, auth_mode, policy, issue_type, pull_merged, issue_state, expects_closure,
+):
+    monkeypatch.setattr(settings, "github_app_bot_login", "fixture-factory[bot]")
+    scope = await _scope(db, merge_policy=policy, github_auth_mode=auth_mode)
+    preset = await db.get(AgentTeamPreset, scope.preset_id)
+    preset.autonomy_enabled = True
+    item = await _item(db, scope, issue_type=issue_type, dispatch_status="verifying", pr_number=5)
+    item_id = item.id
+    merge_sha = "a" * 40
+    pull = _attempt_pull(scope, item, 5, state="closed" if pull_merged else "open",
+        merged_at="2026-11-26T07:00:00Z" if pull_merged else None, author="fixture-factory[bot]")
+    pull.update(merged=pull_merged, merge_commit_sha=merge_sha, draft=False)
+    client = _Client(pull=pull)
+    client.get_issue = AsyncMock(return_value={"number": 1, "state": issue_state, "labels": []})
+    client.list_issue_comments = AsyncMock(return_value=[])
+
+    async def assert_committed(*args):
+        async with async_sessionmaker(db.bind)() as reader:
+            assert (await reader.get(GithubWorkItem, item_id)).dispatch_status == "merged"
+
+    client.create_issue_comment = AsyncMock(side_effect=assert_committed)
+    client.close_issue = AsyncMock(side_effect=assert_committed)
+
+    await github_verification_service.process_scope(db, scope, client=client)
+    await github_verification_service.process_scope(db, scope, client=client)
+
+    assert client.create_issue_comment.await_count == int(expects_closure)
+    assert client.close_issue.await_count == int(expects_closure)
+    if expects_closure:
+        body = client.create_issue_comment.await_args.args[3]
+        assert "#5" in body and merge_sha in body
+        assert client.close_issue.await_args.args[:3] == ("o", "r", 1)
+    assert ((await db.get(GithubWorkItem, item_id, populate_existing=True)).dispatch_status == "merged") is pull_merged
+
+
+@pytest.mark.asyncio
 async def test_human_merge_fires_blocker_merged_notification(db):
     scope = await _scope(db, merge_policy="human")
     await _owner(db, scope)
@@ -3167,7 +3215,9 @@ async def test_failed_check_dispatched_item_with_pr_is_reverified(db):
 
 @pytest.mark.asyncio
 async def test_auto_merge_success_sets_merged_and_budget_timestamp(db):
-    scope = await _scope(db, merge_policy="auto")
+    scope = await _scope(db, merge_policy="auto", github_auth_mode="ambient")
+    preset = await db.get(AgentTeamPreset, scope.preset_id)
+    preset.autonomy_enabled = True
     item = await _item(
         db,
         scope,
@@ -3178,6 +3228,19 @@ async def test_auto_merge_success_sets_merged_and_budget_timestamp(db):
     client = _Client(
         check_runs=[{"name": "ci", "status": "completed", "conclusion": "success"}]
     )
+    client.get_issue = AsyncMock(return_value={"number": 1, "state": "open", "labels": []})
+    client.list_issue_comments = AsyncMock(return_value=[])
+    client.create_issue_comment = AsyncMock()
+    client.close_issue = AsyncMock()
+    merge = client.merge_pull
+
+    async def merge_and_publish_pull(*args, **kwargs):
+        result = await merge(*args, **kwargs)
+        client.pull.update(state="closed", merged=True, merged_at="2026-11-26T07:00:00Z",
+            merge_commit_sha="a" * 40)
+        return result
+
+    client.merge_pull = merge_and_publish_pull
 
     await github_verification_service.process_scope(db, scope, client=client)
 
@@ -3185,6 +3248,8 @@ async def test_auto_merge_success_sets_merged_and_budget_timestamp(db):
     assert item.dispatch_status == "merged"
     assert item.auto_merged_at is not None
     assert client.merge_calls == 1
+    client.create_issue_comment.assert_awaited_once()
+    client.close_issue.assert_awaited_once_with("o", "r", 1)
 
 
 @pytest.mark.asyncio

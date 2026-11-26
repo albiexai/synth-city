@@ -1227,6 +1227,18 @@ class GithubVerificationService:
         await self._reconcile_escalated_merges(
             db, scope, client, recovery_only_attempt=recovery_only_attempt
         )
+        if recovery_only_attempt is None and scope.merge_policy == "auto":
+            from app.services.github_issue_closure_service import process_issue_closures
+
+            try:
+                await process_issue_closures(db, scope.id, client)
+            except GithubRateLimited:
+                raise
+            except Exception as exc:
+                await recover_session(db, exc, discard=True)
+                logger.warning("issue_closure_failed error_type=%s", type(exc).__name__)
+            if inspect(scope).expired:
+                await db.refresh(scope)
         # #940: the generated summary comment, only after every decision above has been committed. It reads no gate,
         # changes no status and never raises into the poll.
         try:
@@ -3906,10 +3918,13 @@ class GithubVerificationService:
         # R02: the sourced merge outcome is recorded in the merge transaction,
         # bound to the attempt, revision and PR artifact.
         from app.services import factory_audit_service as _audit
+        from app.services.github_issue_closure_service import queue_issue_closure
+
         await lock_terminal_transition(db, item)
         await _audit.record_merged_delivery(db, item, pull, source=source)
         self._mark_merged(item)
         await complete_current_revision(db, item, source=source, terminal_status="merged")
+        await queue_issue_closure(db, item)
 
     async def _record_revision_outcome(
         self,

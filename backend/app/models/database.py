@@ -463,6 +463,21 @@ class GithubWorkItem(Base):
     )
 
 
+class GithubIssueClosure(Base):
+    """Durable post-merge closure of one already-delivered work item."""
+
+    __tablename__ = "github_issue_closures"
+
+    work_item_id: Mapped[int] = mapped_column(
+        ForeignKey("github_work_items.id", ondelete="CASCADE"), primary_key=True)
+    repo_owner: Mapped[str] = mapped_column(String, nullable=False)
+    repo_name: Mapped[str] = mapped_column(String, nullable=False)
+    issue_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    pr_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
 class GithubRequiredCheckWatch(Base):
     """Current-head observation and immutable first completion, never review authority."""
 
