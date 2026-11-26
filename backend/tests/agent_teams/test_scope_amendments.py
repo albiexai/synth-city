@@ -769,6 +769,11 @@ async def submitted_attempt(db, healthy_attempt, request):
     a = healthy_attempt
     for number in range(1, getattr(request, "param", 1)):
         await prior_amendment(a, db, number, [], status="completed", approved=True)
+    await submit_amendment_for_review(db, a)
+    return a
+
+
+async def submit_amendment_for_review(db, a):
     revision, approval, _ = await github_approval_service.create_scope_amendment_request(
         db, a.item, a.scope, **amendment(a))
     await github_approval_service.ensure_continuation_request_message(db, a.item, approval, revision)
@@ -786,7 +791,6 @@ async def submitted_attempt(db, healthy_attempt, request):
     a.item.pr_number = 5
     a.item.dispatch_status = "verifying"
     await bind_submitted_review(db, a, revision)
-    return a
 
 
 async def bind_submitted_review(db, a, revision):
@@ -794,16 +798,18 @@ async def bind_submitted_review(db, a, revision):
     from app.services.factory_delivery_policy import effective_policy
     from app.services.github_ci_watch_service import _digest
 
-    slot = AgentTeamSlot(preset_id=a.preset.id, position=2, display_name="Reviewer", provider="codex-cli",
-        repo_id="approval", repo_path=str(a.repo), repo_name="approval", launch_mode="plain",
-        launch_options={}, enabled=True)
-    db.add(slot)
-    await db.flush()
-    reviewer = MailTeamMember(identity_key=f"reviewer:{slot.id}", repo_id="approval", repo_path=str(a.repo),
-        repo_name="approval", display_name="Reviewer", participant_kind="team_slot",
-        team_preset_id=a.preset.id, team_slot_id=slot.id)
-    db.add(reviewer)
-    await db.flush()
+    reviewer = getattr(a, "reviewer", None)
+    if reviewer is None:
+        slot = AgentTeamSlot(preset_id=a.preset.id, position=2, display_name="Reviewer", provider="codex-cli",
+            repo_id="approval", repo_path=str(a.repo), repo_name="approval", launch_mode="plain",
+            launch_options={}, enabled=True)
+        db.add(slot)
+        await db.flush()
+        reviewer = MailTeamMember(identity_key=f"reviewer:{slot.id}", repo_id="approval", repo_path=str(a.repo),
+            repo_name="approval", display_name="Reviewer", participant_kind="team_slot",
+            team_preset_id=a.preset.id, team_slot_id=slot.id)
+        db.add(reviewer)
+        await db.flush()
     watch = GithubRequiredCheckWatch(work_item_id=a.item.id, dispatch_nonce=a.item.dispatch_nonce,
         scope_revision=revision.revision, pr_number=5, head_sha=a.head, owner_slot_id=a.owner.team_slot_id,
         reviewer_member_id=reviewer.id, policy_digest=_digest(effective_policy(a.item, a.scope)),
@@ -954,6 +960,49 @@ async def test_third_amendment_settlement_opens_the_normal_continuation_route(db
         lease_token=a.workspace.lease_token)
     assert a.item.active_scope_revision == revision.revision and a.item.dispatch_status == "dispatched"
     assert a.item.effort_limit_minutes == 55 and a.item.effort_elapsed_seconds == 1200
+
+
+@pytest.mark.asyncio
+async def test_approved_continuation_does_not_count_towards_amendment_cap(db, submitted_continuation):
+    from app.services.github_terminal_revision_service import end_submitted_revision
+
+    a = submitted_continuation
+    assert a.revision.origin_kind == "continuation" and a.revision.approved_at is not None
+    for reason in ("Settle the approved continuation", "Settle the first amendment"):
+        fact = await record_changes(db, a)
+        await end_submitted_revision(db, a.item, review_id=fact.id, leader_member_id=a.leader.id,
+            dispatch_nonce=a.item.dispatch_nonce, reason=reason)
+        await submit_amendment_for_review(db, a)
+
+    assert a.revision.revision == 3 and a.revision.origin_kind == "scope_amendment"
+    fact = await record_changes(db, a)
+    await end_submitted_revision(db, a.item, review_id=fact.id, leader_member_id=a.leader.id,
+        dispatch_nonce=a.item.dispatch_nonce, reason="Settle the second approved amendment")
+    assert a.item.dispatch_status == "dispatched" and a.item.escalation_reason is None
+
+
+@pytest.mark.asyncio
+async def test_capped_item_rejects_replay_of_an_older_consumed_review(db, submitted_attempt):
+    from app.services.github_terminal_revision_service import end_submitted_revision
+
+    a = submitted_attempt
+    old_fact = await record_changes(db, a)
+    old_decision = dict(review_id=old_fact.id, leader_member_id=a.leader.id,
+        dispatch_nonce=a.item.dispatch_nonce, reason="Settle the first amendment")
+    await end_submitted_revision(db, a.item, **old_decision)
+    await db.refresh(old_fact)
+    assert old_fact.status == "consumed"
+
+    for reason in ("Settle the second amendment", "Settle the capped amendment"):
+        await submit_amendment_for_review(db, a)
+        fact = await record_changes(db, a)
+        await end_submitted_revision(db, a.item, review_id=fact.id, leader_member_id=a.leader.id,
+            dispatch_nonce=a.item.dispatch_nonce, reason=reason)
+
+    assert a.item.active_scope_revision == 3 and a.item.dispatch_status == "escalated"
+    assert a.item.escalation_reason == "amendment_budget_exhausted"
+    with pytest.raises(GithubApprovalError, match="current_leader_and_review_required"):
+        await end_submitted_revision(db, a.item, **old_decision)
 
 
 @pytest.mark.asyncio
