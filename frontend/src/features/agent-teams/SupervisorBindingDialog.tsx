@@ -26,6 +26,9 @@ const words = (failure: unknown, fallback: string) => {
 }
 const actorWords = (value: unknown) => (value === null || value === undefined ? 'none' : `actor ${String(value)}`)
 const graceWords = (value: unknown) => (value === null || value === undefined ? 'default' : `${String(value)} seconds`)
+// A binding is named by its version (the writes of the team) and its team lifetime (a deleted team's id can be reused).
+type BindingKey = { version: number; lifetime: number }
+const sameBinding = (a: BindingKey, b: BindingKey | undefined) => b !== undefined && a.version === b.version && a.lifetime === b.lifetime
 const wholeFrom = (text: string, least: number) => (text.trim() !== '' && Number.isInteger(Number(text)) && Number(text) >= least ? Number(text) : null)
 
 function changes(event: AuditEventRead) {
@@ -54,8 +57,8 @@ export function SupervisorBindingDialog({ presetId, presetName, observation, ope
   const [history, setHistory] = useState<AuditEventRead[]>([])
   const [nextPage, setNextPage] = useState<number | null>(null)
   const [historyState, setHistoryState] = useState<'loading' | 'ready' | 'failed'>('loading')
-  const [draft, setDraft] = useState<{ actor?: string; grace?: string; useDefault?: boolean; baseline?: number }>({})
-  const [confirmVersion, setConfirmVersion] = useState<number | null>(null) // the binding version a removal was confirmed for
+  const [draft, setDraft] = useState<{ actor?: string; grace?: string; useDefault?: boolean; baseline?: BindingKey }>({})
+  const [confirmKey, setConfirmKey] = useState<BindingKey | null>(null) // the binding a removal was confirmed for
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const generation = useRef(0) // a newer first page, or closing the dialog, makes older answers obsolete
@@ -65,16 +68,19 @@ export function SupervisorBindingDialog({ presetId, presetName, observation, ope
   const actorText = draft.actor ?? (boundId === null ? '' : String(boundId))
   const graceText = draft.grace ?? (boundId === null ? '' : String(observation?.grace_seconds ?? ''))
   const useDefault = draft.useDefault ?? false
-  // Writes need the binding version of the server. Without it a change by another client could not be detected.
+  // Writes need the binding version and the team lifetime of the server. Without them a change by another client, or
+  // a team that reuses a deleted team's id, could not be detected.
   const version = observation?.binding_version
-  const canWrite = typeof version === 'number'
-  const reviewed = draft.baseline ?? version // the version that the operator saw when the edit began
-  const stale = canWrite && draft.baseline !== undefined && draft.baseline !== version
+  const lifetime = observation?.team_lifetime
+  const current: BindingKey | undefined = typeof version === 'number' && typeof lifetime === 'number' && lifetime >= 1 ? { version, lifetime } : undefined
+  const canWrite = current !== undefined
+  const reviewed = draft.baseline ?? current // the binding that the operator saw when the edit began
+  const stale = canWrite && draft.baseline !== undefined && !sameBinding(draft.baseline, current)
   const locked = saving || !canWrite
-  const confirmOpen = canWrite && confirmVersion !== null && confirmVersion === version
-  const confirmLost = confirmVersion !== null && confirmVersion !== version
+  const confirmOpen = canWrite && confirmKey !== null && sameBinding(confirmKey, current)
+  const confirmLost = confirmKey !== null && !sameBinding(confirmKey, current)
   const edit = (patch: { actor?: string; grace?: string; useDefault?: boolean }) =>
-    setDraft((current) => ({ ...current, ...patch, baseline: current.baseline ?? version }))
+    setDraft((previous) => ({ ...previous, ...patch, baseline: previous.baseline ?? current }))
 
   const load = useCallback(async (page = 1) => {
     if (page === 1) {
@@ -111,7 +117,7 @@ export function SupervisorBindingDialog({ presetId, presetName, observation, ope
       return
     }
     queueMicrotask(() => {
-      setDraft({}); setConfirmVersion(null); setError(null); setSaving(false); setHistory([]); setNextPage(null); setHistoryState('loading')
+      setDraft({}); setConfirmKey(null); setError(null); setSaving(false); setHistory([]); setNextPage(null); setHistoryState('loading')
       void load()
     })
   }, [open, load])
@@ -123,14 +129,14 @@ export function SupervisorBindingDialog({ presetId, presetName, observation, ope
       await withOperatorToken((token) => updateTeamSupervisor(presetId, update, token))
       await refresh()
       if (mine !== session.current) return
-      setDraft({}); setConfirmVersion(null)
+      setDraft({}); setConfirmKey(null)
       await load()
       toast.success('Supervisor binding saved')
     } catch (failure) {
       if (mine === session.current) {
         setError(words(failure, 'Failed to save the supervisor binding'))
         if (failure instanceof Error && failure.message === 'supervisor_binding_changed') {
-          setDraft({}); setConfirmVersion(null)
+          setDraft({}); setConfirmKey(null)
           void refresh().catch(() => undefined)
         }
       }
@@ -147,7 +153,7 @@ export function SupervisorBindingDialog({ presetId, presetName, observation, ope
       setError('Enter the actor id as a whole number, 1 or more.')
       return
     }
-    const update: SupervisorBindingUpdate = { actor_id: actorId, expected_binding_version: reviewed }
+    const update: SupervisorBindingUpdate = { actor_id: actorId, expected_binding_version: reviewed.version, expected_team_lifetime: reviewed.lifetime }
     if (draft.useDefault) {
       update.grace_seconds = null
     } else if (draft.grace !== undefined) {
@@ -177,12 +183,12 @@ export function SupervisorBindingDialog({ presetId, presetName, observation, ope
           {observation === null ? 'The supervisor binding could not be read.' : boundId === null ? 'No supervisor is bound.' : `Bound: ${observation.address?.display_name ?? observation.address?.address ?? 'actor'} (actor ${boundId})`}
         </p>
         {observation !== null && !canWrite && (
-          <p className="text-sm text-muted-foreground">Changes are off: this server does not report a binding version, so a change by another client could not be detected. Update the server to edit the supervisor.</p>
+          <p className="text-sm text-muted-foreground">Changes are off: this server does not report a binding version and a team lifetime, so a change by another client could not be detected. Update the server to edit the supervisor.</p>
         )}
         {stale && (
           <div role="status" className="grid gap-2 rounded-md border border-amber-500/60 p-3 text-sm">
             <p>The binding changed while you edited. Review the current binding.</p>
-            <Button variant="outline" size="sm" onClick={() => { setDraft({}); setConfirmVersion(null) }}>Review the current binding</Button>
+            <Button variant="outline" size="sm" onClick={() => { setDraft({}); setConfirmKey(null) }}>Review the current binding</Button>
           </div>
         )}
         <div className="grid gap-4">
@@ -199,14 +205,14 @@ export function SupervisorBindingDialog({ presetId, presetName, observation, ope
             </div>
           </div>
           <Button onClick={submit} disabled={locked || stale}>Save</Button>
-          {boundId !== null && !confirmOpen && <Button variant="outline" onClick={() => setConfirmVersion(version ?? null)} disabled={locked}>Remove the supervisor</Button>}
+          {boundId !== null && !confirmOpen && <Button variant="outline" onClick={() => setConfirmKey(current ?? null)} disabled={locked}>Remove the supervisor</Button>}
           {confirmLost && !confirmOpen && <p className="text-sm text-muted-foreground">The binding changed, so the removal was not confirmed.</p>}
           {confirmOpen && (
             <div className="grid gap-2 rounded-md border p-3 text-sm">
               <p>Remove this supervisor? Its grace setting is cleared.</p>
               <div className="flex gap-2">
-                <Button variant="destructive" size="sm" onClick={() => { if (confirmVersion !== null) void send({ actor_id: null, expected_binding_version: confirmVersion }) }} disabled={saving}>Remove</Button>
-                <Button variant="outline" size="sm" onClick={() => setConfirmVersion(null)} disabled={saving}>Keep the supervisor</Button>
+                <Button variant="destructive" size="sm" onClick={() => { if (confirmKey !== null) void send({ actor_id: null, expected_binding_version: confirmKey.version, expected_team_lifetime: confirmKey.lifetime }) }} disabled={saving}>Remove</Button>
+                <Button variant="outline" size="sm" onClick={() => setConfirmKey(null)} disabled={saving}>Keep the supervisor</Button>
               </div>
             </div>
           )}

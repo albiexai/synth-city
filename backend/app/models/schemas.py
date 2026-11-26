@@ -1990,6 +1990,8 @@ class SupervisorObservation(BaseModel):
     grace_seconds: int = Field(ge=1)
     # Counts the binding writes of the team. An older server does not send it.
     binding_version: int = Field(default=0, ge=0)
+    # The number of the team lifetime. 0 means the database has not assigned one: a protected write is refused.
+    team_lifetime: int = Field(default=0, ge=0)
     note: str | None
     attention: Literal["Supervisor check-in overdue"] | None
     team_idle: list[TeamIdleItem] = Field(default_factory=list)
@@ -2002,11 +2004,17 @@ class SupervisorBindingRequest(BaseModel):
     grace_seconds: int | None = Field(default=None, ge=1)
     # Omitted: the write is not checked. Given: the write applies only to this binding version (409 otherwise).
     expected_binding_version: int | None = Field(default=None, ge=0, strict=True)
+    # The lifetime of the team that the caller reviewed. It comes with the version, so an old reviewed state cannot
+    # reach a different team that reuses the numeric id.
+    expected_team_lifetime: int | None = Field(default=None, ge=1, strict=True)
 
     @model_validator(mode="after")
-    def _expected_version_is_a_number_when_given(self):
-        if "expected_binding_version" in self.model_fields_set and self.expected_binding_version is None:
-            raise ValueError("expected_binding_version must be a whole number of 0 or more")
+    def _the_expected_pair_comes_together_as_whole_numbers(self):
+        given = [name for name in ("expected_binding_version", "expected_team_lifetime") if name in self.model_fields_set]
+        if any(getattr(self, name) is None for name in given):
+            raise ValueError("expected_binding_version and expected_team_lifetime must be whole numbers")
+        if given and len(given) != 2:
+            raise ValueError("expected_binding_version and expected_team_lifetime come together")
         return self
 
 

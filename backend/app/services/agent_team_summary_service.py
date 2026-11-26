@@ -142,7 +142,7 @@ class AgentTeamSummaryService:
             AgentTeamPreset.supervisor_actor_id, AgentTeamPreset.supervisor_checked_at,
             AgentTeamPreset.supervisor_next_check_at, AgentTeamPreset.supervisor_grace_seconds,
             AgentTeamPreset.supervisor_note, AgentTeamPreset.supervisor_observed_status,
-            AgentTeamPreset.supervisor_binding_version,
+            AgentTeamPreset.supervisor_binding_version, AgentTeamPreset.supervisor_lifetime,
             MailExternalActor.display_name.label("supervisor_display_name"))
             .outerjoin(MailExternalActor, MailExternalActor.id == AgentTeamPreset.supervisor_actor_id)
             .where(AgentTeamPreset.id == preset_id))).one_or_none()

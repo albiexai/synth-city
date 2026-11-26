@@ -172,9 +172,53 @@ class AgentTeamPreset(Base):
     supervisor_note: Mapped[str | None] = mapped_column(String, nullable=True)
     supervisor_grace_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Counts the binding writes of this team. A write that carries the version it reviewed cannot change a newer binding.
-    # The database default is 0, so a raw insert that omits the column (the e2e seed does) gets 0; a NULL also counts as 0.
-    supervisor_binding_version: Mapped[int | None] = mapped_column(Integer, default=0, server_default="0", nullable=True)
+    supervisor_binding_version: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    # The number of this team lifetime. The database assigns it by trigger on every insert (0 means not yet assigned),
+    # so a team that reuses a deleted team's numeric id gets a different number. The application never writes it.
+    supervisor_lifetime: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+
+    __table_args__ = (
+        Index("uix_agent_team_presets_supervisor_lifetime", "supervisor_lifetime", unique=True,
+              sqlite_where=text("supervisor_lifetime <> 0")),
+    )
     supervisor_observed_status: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class AgentTeamLifetime(Base):
+    """One row for each team lifetime (#1298).
+
+    SQLite never reuses an AUTOINCREMENT number, even after rows are deleted, and nothing deletes these rows. So a
+    number names exactly one team lifetime, whatever happens to the numeric team id.
+    """
+
+    __tablename__ = "agent_team_lifetimes"
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=text("CURRENT_TIMESTAMP"), nullable=False)
+
+
+# Every insert into agent_team_presets gets a fresh lifetime number, whatever value the insert supplied.
+TEAM_LIFETIME_TRIGGER = (
+    "CREATE TRIGGER IF NOT EXISTS trg_agent_team_presets_assign_lifetime AFTER INSERT ON agent_team_presets BEGIN"
+    " INSERT INTO agent_team_lifetimes (created_at) VALUES (CURRENT_TIMESTAMP);"
+    " UPDATE agent_team_presets SET supervisor_lifetime = last_insert_rowid() WHERE id = NEW.id; END"
+)
+
+
+def _install_team_lifetime_trigger(_metadata, connection, **_kwargs) -> None:
+    """Create the trigger on a database that has the column. An older table gets it from the compat upgrade."""
+    if connection.dialect.name != "sqlite":
+        return
+    tables = {row[0] for row in connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+    if not {"agent_team_presets", "agent_team_lifetimes"} <= tables:
+        return
+    columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(agent_team_presets)").fetchall()}
+    if "supervisor_lifetime" in columns:
+        connection.exec_driver_sql(TEAM_LIFETIME_TRIGGER)
+
+
+event.listen(Base.metadata, "after_create", _install_team_lifetime_trigger)
 
 
 class AgentTeamSlot(Base):

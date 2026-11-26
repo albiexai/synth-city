@@ -428,9 +428,9 @@ The Supervisor line of a team page has an **Edit** button. It opens the supervis
 - **Change the grace:** Enter whole seconds, 1 or more. Select **Use the default grace** to remove the override. The default grace is at least 30 minutes.
 - **Remove:** Select **Remove the supervisor** and confirm. This also clears the grace setting.
 - **History:** Each change is recorded in the audit history. The editor lists these changes, newest first, with the actor and the reason.
-- **Other clients:** Each save carries the binding version that you reviewed. If another client changed the binding first, the server refuses the save and the editor shows the current binding. Review it, then save again. A removal confirmation is valid only for the binding that you confirmed.
-- **Older server:** If the server does not report a binding version, the editor is read-only. Update the server to edit the supervisor.
-- **API:** `PUT /api/v1/agent-teams/presets/{preset_id}/supervisor` accepts the optional `expected_binding_version`. Without it, the write is not checked. With it, a different stored version gives `409 supervisor_binding_changed` and changes nothing. Every binding write adds 1 to `binding_version`. Check-ins do not.
+- **Other clients:** Each save carries the binding version and the team lifetime that you reviewed. If another client changed the binding first, or deleted the team and made a new team with the same id, the server refuses the save and the editor shows the current binding. Review it, then save again. A removal confirmation is valid only for the binding that you confirmed.
+- **Older server:** If the server does not report a binding version and a team lifetime, the editor is read-only. Update the server to edit the supervisor.
+- **API:** `PUT /api/v1/agent-teams/presets/{preset_id}/supervisor` accepts the optional `expected_binding_version` and `expected_team_lifetime`. They come together (one alone gives `422`). Without them, the write is not checked. With them, a different stored value gives `409 supervisor_binding_changed` and changes nothing. Every binding write adds 1 to `binding_version`; check-ins do not. The database assigns `team_lifetime` to every new team, and a number is never reused.
 
 ## External Local Agents
 

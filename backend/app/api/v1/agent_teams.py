@@ -378,7 +378,8 @@ async def update_supervisor(preset_id: int, request: SupervisorBindingRequest,
     try:
         return await bind_supervisor(db, preset_id, actor_id=request.actor_id,
             grace_seconds=request.grace_seconds, set_grace="grace_seconds" in request.model_fields_set,
-            expected_binding_version=request.expected_binding_version)
+            expected_binding_version=request.expected_binding_version,
+            expected_team_lifetime=request.expected_team_lifetime)
     except ValueError as exc:
         code = str(exc)
         raise HTTPException(status_code=409 if code == "supervisor_binding_changed" else 404,

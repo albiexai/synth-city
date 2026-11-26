@@ -94,7 +94,7 @@ def preset(s: Seeder, preset_id: int, name: str, description: str, *, autonomy: 
     s.insert(
         "agent_team_presets", id=preset_id, name=name, description=description,
         created_by="e2e-seed", created_at=at(days=20), updated_at=at(days=1),
-        autonomy_enabled=int(autonomy), leader_slot_id=leader_slot,
+        autonomy_enabled=int(autonomy), leader_slot_id=leader_slot, supervisor_binding_version=0, supervisor_lifetime=0,
     )
 
 
