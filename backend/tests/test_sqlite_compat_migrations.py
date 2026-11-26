@@ -36,8 +36,8 @@ async def test_work_item_admission_migration_preserves_history_and_current_uniqu
                 session.add(scope)
                 await session.commit()
             ddl = await conn.scalar(text("SELECT sql FROM sqlite_master WHERE name='github_work_items'"))
-            if "milestone_replaced" in ddl:
-                ddl = re.sub(r"\n\s*milestone_replaced [^\n]*,", "", ddl)
+            if "milestone_replaced_at" in ddl:
+                ddl = re.sub(r"\n\s*milestone_replaced_at [^\n]*,", "", ddl)
                 ddl = ddl[:ddl.rfind(")")] + ", CONSTRAINT uix_scope_issue UNIQUE (scope_id, issue_number))"
             await conn.execute(text("DROP TABLE github_work_items"))
             await conn.execute(text(ddl))
@@ -54,10 +54,11 @@ async def test_work_item_admission_migration_preserves_history_and_current_uniqu
                 "VALUES ('old-deferral', 1, 'deferred', 'test', CURRENT_TIMESTAMP)"))
             await conn.commit()
             await _run_sqlite_compat_migrations(conn)
-            await conn.execute(text("UPDATE github_work_items SET milestone_replaced=1 WHERE id=1"))
+            assert await conn.scalar(text("SELECT milestone_replaced_at FROM github_work_items WHERE id=1")) is None
+            await conn.execute(text("UPDATE github_work_items SET milestone_replaced_at=CURRENT_TIMESTAMP WHERE id=1"))
             await conn.execute(insert, {"id": 2, "scope": scope.id, "status": "pending"})
             await _run_sqlite_compat_migrations(conn)
-            assert (await conn.execute(text("SELECT id, dispatch_status, milestone_replaced "
+            assert (await conn.execute(text("SELECT id, dispatch_status, milestone_replaced_at IS NOT NULL "
                 "FROM github_work_items ORDER BY id"))).all() == [(1, "cancelled", 1), (2, "pending", 0)]
             assert await conn.scalar(text("SELECT work_item_id FROM github_maintenance_events")) == 1
             assert await conn.scalar(text("SELECT name FROM sqlite_master WHERE name='historical_branch_lookup'"))

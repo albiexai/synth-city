@@ -324,7 +324,7 @@ async def test_repository_milestone_never_readmits_a_merged_issue(db, previous_a
     await github_watcher_service.poll_scope(db, old, _FakeClient(labeled=[_milestone_issue(old, "V1")]))
     original = await db.scalar(select(GithubWorkItem))
     original.dispatch_status = "merged"
-    original.milestone_replaced = previous_admission
+    original.milestone_replaced_at = datetime.utcnow() if previous_admission else None
     await db.commit()
     await github_watcher_service.poll_scope(db, new, _FakeClient(labeled=[_milestone_issue(new, "V2")]))
     await github_watcher_service.poll_scope(db, old, _FakeClient(labeled=[_milestone_issue(old, "V1")]))

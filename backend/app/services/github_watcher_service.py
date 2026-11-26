@@ -212,6 +212,15 @@ async def _admission_blocked(db, scope, number):
     ).limit(1)) is not None
 
 
+def _milestone_deferral_facts():
+    return (
+        FactoryAuditEvent.event_kind == "stopped_work_item_ended",
+        FactoryAuditEvent.source == "github_end_stopped_item_service.end_stopped_item",
+        FactoryAuditEvent.action_outcome == "applied",
+        FactoryAuditEvent.after_values["outcome"].as_string() == "deferred",
+    )
+
+
 def _milestone_deferrals(scope, number):
     return (
         select(GithubWorkItem)
@@ -220,10 +229,7 @@ def _milestone_deferrals(scope, number):
         .where(
             *_repository_scope(scope), GithubWorkItem.issue_number == number,
             GithubWorkItem.dispatch_status == "cancelled",
-            FactoryAuditEvent.event_kind == "stopped_work_item_ended",
-            FactoryAuditEvent.source == "github_end_stopped_item_service.end_stopped_item",
-            FactoryAuditEvent.action_outcome == "applied",
-            FactoryAuditEvent.after_values["outcome"].as_string() == "deferred",
+            *_milestone_deferral_facts(),
         )
         .order_by(FactoryAuditEvent.id.desc())
         .limit(1)
@@ -309,6 +315,15 @@ class GithubWatcherService:
         milestone = routes.get(scope.preset_id)
         admitted = set()
         open_labeled = {issue["number"]: issue for issue in labeled}
+        departures = dict((await db.execute(select(
+            GithubWorkItem.issue_number, GithubWorkItem.github_updated_at,
+        ).join(FactoryAuditEvent, FactoryAuditEvent.item_id == GithubWorkItem.id).where(
+            GithubWorkItem.scope_id == scope_id,
+            GithubWorkItem.dispatch_status == "cancelled",
+            GithubWorkItem.milestone_replaced_at.is_(None),
+            GithubWorkItem.issue_number.in_(open_labeled),
+            *_milestone_deferral_facts(),
+        ).distinct())).all())
         for number, issue in open_labeled.items():
             title = milestone_title(issue)
             matches = {team_id for team_id, configured in routes.items() if configured and configured == title}
@@ -316,8 +331,18 @@ class GithubWatcherService:
                 continue
             if await _admission_blocked(db, scope, number):
                 continue
-            if await self._upsert_item(db, scope, issue, client=client):
-                admitted.add(number)
+            departure = departures.get(number)
+            if departure is not None and _parse_gh_ts(issue["updated_at"]) == departure:
+                # GitHub timestamps have one-second resolution. Confirm an ambiguous return.
+                current = (await client.get_open_issues_by_number(
+                    scope.repo_owner, scope.repo_name, [number]
+                )).get(number)
+                if (current is None or milestone_title(current) != title
+                        or _parse_gh_ts(current["updated_at"]) < departure
+                        or scope.dispatch_label not in {label["name"] for label in current.get("labels", [])}):
+                    continue
+            await self._upsert_item(db, scope, issue)
+            admitted.add(number)
         # The admitted items are durable before any per-item completion runs: a later
         # rollback can then only discard that completion's own work, and the poll time
         # below is never written over upserts that were thrown away.
@@ -364,22 +389,20 @@ class GithubWatcherService:
             logger.info("Campaign backlog unavailable for scope %s", scope_id)
             await db.refresh(scope)
 
-    async def _upsert_item(
-        self, db: AsyncSession, scope: TeamGithubScope, issue: dict, *, client: GithubClient | None = None,
-    ) -> bool:
+    async def _upsert_item(self, db: AsyncSession, scope: TeamGithubScope, issue: dict) -> None:
         label_names = {label["name"] for label in issue.get("labels", [])}
         issue_type = "design" if scope.design_label in label_names else "code"
         github_updated_at = _parse_gh_ts(issue["updated_at"])
         deferrals = _milestone_deferrals(scope, issue["number"])
         predecessor = await db.scalar(deferrals)
         if predecessor is not None and github_updated_at < predecessor.github_updated_at:
-            return False
+            return
         existing = (
             await db.execute(
                 select(GithubWorkItem).where(
                     GithubWorkItem.scope_id == scope.id,
                     GithubWorkItem.issue_number == issue["number"],
-                    GithubWorkItem.milestone_replaced.is_(False),
+                    GithubWorkItem.milestone_replaced_at.is_(None),
                 )
             )
         ).scalar_one_or_none()
@@ -389,17 +412,8 @@ class GithubWatcherService:
                     or await db.scalar(deferrals.where(GithubWorkItem.id == existing.id)) is None
                     or await db.scalar(select(GithubWorkspace.id).where(
                         GithubWorkspace.leased_item_id == existing.id)) is not None):
-                return False
-            if github_updated_at == existing.github_updated_at:
-                # GitHub timestamps have one-second resolution. Confirm an ambiguous return before replacing history.
-                same_second = (await client.get_open_issues_by_number(
-                    scope.repo_owner, scope.repo_name, [existing.issue_number]
-                )).get(existing.issue_number) if client else None
-                if (same_second is None or milestone_title(same_second) != milestone_title(issue)
-                        or _parse_gh_ts(same_second["updated_at"]) < github_updated_at
-                        or scope.dispatch_label not in {label["name"] for label in same_second.get("labels", [])}):
-                    return False
-            existing.milestone_replaced = True
+                return
+            existing.milestone_replaced_at = datetime.utcnow()
             await db.flush()
             existing = None
 
@@ -416,7 +430,7 @@ class GithubWatcherService:
                     dispatch_priority=priority_from_labels(label_names),
                 )
             )
-            return True
+            return
 
         if (
             existing.dispatch_status in _RECOVERABLE_STATUSES
@@ -433,7 +447,6 @@ class GithubWatcherService:
         existing.github_updated_at = github_updated_at
         existing.issue_title = issue["title"]
         existing.updated_at = datetime.utcnow()
-        return True
 
     async def _recheck_active_items(
         self, db: AsyncSession, scope: TeamGithubScope, client: GithubClient, *, milestone=None

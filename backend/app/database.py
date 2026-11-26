@@ -211,10 +211,10 @@ async def _sqlite_migrate_work_item_admissions(conn) -> None:
     columns = await _sqlite_columns(conn, "github_work_items")
     if not {"scope_id", "issue_number"} <= columns:
         return
-    if "milestone_replaced" not in columns:
+    if "milestone_replaced_at" not in columns:
         await conn.execute(text(
-            "ALTER TABLE github_work_items ADD COLUMN milestone_replaced BOOLEAN DEFAULT 0 NOT NULL"))
-        columns.add("milestone_replaced")
+            "ALTER TABLE github_work_items ADD COLUMN milestone_replaced_at DATETIME"))
+        columns.add("milestone_replaced_at")
     ddl = await conn.scalar(text(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='github_work_items'"))
     current_ddl = re.sub(
@@ -244,8 +244,8 @@ async def _sqlite_migrate_work_item_admissions(conn) -> None:
                 await conn.execute(text(statement))
         await _sqlite_ensure_unique_partial_index(
             conn, table_name="github_work_items", index_name="uix_scope_issue_current",
-            columns=("scope_id", "issue_number"), predicate="milestone_replaced = 0",
-            duplicate_preflight="SELECT 1 FROM github_work_items WHERE milestone_replaced = 0 "
+            columns=("scope_id", "issue_number"), predicate="milestone_replaced_at IS NULL",
+            duplicate_preflight="SELECT 1 FROM github_work_items WHERE milestone_replaced_at IS NULL "
                                 "GROUP BY scope_id, issue_number HAVING COUNT(*) > 1 LIMIT 1",
         )
         if rebuild:

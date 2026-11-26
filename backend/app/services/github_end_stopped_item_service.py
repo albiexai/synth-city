@@ -130,12 +130,10 @@ async def end_stopped_item(
         "handoff_state", "handoff_target_slot_id", "approval_round_count", "active_scope_revision",
         "pr_number", "dispatch_base_ref", "retry_requested_at", "dispatch_head_ref", "dispatched_at",
     )
-    observation = {}
     if observed_github_updated_at is not None:
         if observed_github_updated_at < item.github_updated_at:
             raise ValueError("end_stopped_item_context_changed")
         identity_fields += ("github_updated_at",)
-        observation["github_updated_at"] = observed_github_updated_at
     original_status = item.dispatch_status
     conditions = [GithubWorkItem.id == item_id, *(
         getattr(GithubWorkItem, field) == getattr(item, field) for field in identity_fields)]
@@ -164,7 +162,8 @@ async def end_stopped_item(
             ~exists().where(GithubWorkspace.leased_item_id == item_id))
             .values(dispatch_status="cancelled", escalation_reason=None, pending_reason=None,
                     handoff_state=None, handoff_target_slot_id=None,
-                    status_note=f"{destination}. {reason}", updated_at=now, **observation)
+                    status_note=f"{destination}. {reason}", updated_at=now,
+                    github_updated_at=observed_github_updated_at or GithubWorkItem.github_updated_at)
             .execution_options(synchronize_session="fetch"))
         if claim.rowcount != 1:
             raise ValueError("end_stopped_item_context_changed")
