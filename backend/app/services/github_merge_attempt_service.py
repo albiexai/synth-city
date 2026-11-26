@@ -11,12 +11,16 @@ from datetime import UTC, datetime
 from typing import cast
 
 import httpx
-from sqlalchemy import Table, select, update
+from sqlalchemy import Table, func, select, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
-from app.models.database import GithubMergeAttempt, GithubMergeAttemptCoverage
+from app.models.database import (
+    FactoryAuditEvent,
+    GithubMergeAttempt,
+    GithubMergeAttemptCoverage,
+)
 from app.services import factory_audit_service as audit
 from app.services.github_rate_limit_service import GithubRateLimited
 
@@ -46,10 +50,34 @@ async def begin(db: AsyncSession, *, scope_id: int, item_id: int, pr_number: int
 
 
 async def finish(db: AsyncSession, attempt_id: int, status: str, reason: str | None) -> None:
-    """Record an attempt's outcome once (never commit); a finished attempt keeps its first outcome."""
-    await db.execute(update(GithubMergeAttempt).where(
+    """Record an attempt's outcome once (never commit); a finished attempt keeps its first outcome.
+
+    A merged or refused outcome also settles what other scopes observed while the attempt was open.
+    """
+    result = await db.execute(update(GithubMergeAttempt).where(
         GithubMergeAttempt.id == attempt_id, GithubMergeAttempt.status == ATTEMPTED,
     ).values(status=status, reason=reason, finished_at=_now()).execution_options(synchronize_session=False))
+    if result.rowcount == 1 and status in (MERGED, REFUSED):
+        row = (await db.execute(select(GithubMergeAttempt.repository, GithubMergeAttempt.pr_number)
+                                .where(GithubMergeAttempt.id == attempt_id))).one()
+        await settle_observations(db, repository=row.repository, pr_number=row.pr_number)
+
+
+async def settle_observations(db: AsyncSession, *, repository: str, pr_number: int) -> None:
+    """Settle the stored ``unknown`` merge paths of one pull request in every observing scope (V1 review
+    6075629605). A scope that read the facts while an attempt was open recorded ``unknown``, accurately, and its fact
+    is immutable: a follow-up event settles it, once, and the original stays as observed. ``unknown`` stays."""
+    artifact = f"{repository.lower()}/pull/{pr_number}"
+    facts = (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == audit.PULL_FACTS_KIND,
+        func.lower(FactoryAuditEvent.context_snapshot["artifact"].as_string()) == artifact,
+    ).order_by(FactoryAuditEvent.id))).all()
+    for fact in facts:
+        if (fact.after_values or {}).get("merge_path") != "unknown":
+            continue
+        path = await merge_path(db, repository=repository, pr_number=pr_number, merged_at=fact.fact_time)
+        if path != "unknown":
+            await audit.record_merge_path_settlement(db, fact, path)
 
 
 def outcome(error: BaseException) -> tuple[str, str]:

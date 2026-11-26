@@ -7,11 +7,12 @@ with an uncertain one or before the recording started.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 
 import httpx
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 
 from app import database
 from app.models.database import (
@@ -379,3 +380,78 @@ async def test_a_repository_spelled_with_capitals_still_matches_its_attempt(stor
     await _poll(store, _FactsClient({95: _pull(95, repo="Matrix-Owner/Matrix-Repo")}))
     (fact,) = await _facts(store)
     assert fact["after"]["merge_path"] == "automatic"
+
+
+# V1 review 6075629605: a second team that observed the merge before the attempt finished is settled by its outcome
+async def _two_teams(store):
+    await _install_marker(store)
+    await _seed_team(store)
+    await _coverage(store, datetime(2026, 10, 1))
+    async with store() as session:
+        first = await session.get(TeamGithubScope, 5)
+        other = AgentTeamPreset(name="Second team")
+        session.add(other)
+        await session.flush()
+        session.add(TeamGithubScope(id=7, preset_id=other.id, repo_owner=first.repo_owner, repo_name=first.repo_name,
+                                    repo_path="/tmp/second-team", base_ref="origin/main", github_auth_mode="ambient",
+                                    merge_policy="human"))
+        await session.commit()
+    await _seed_work(store, item_id=310, status="merged", pr_number=96)
+    async with store() as session:  # team A's attempt is still open
+        item = await session.get(GithubWorkItem, 310)
+        attempt_id = await attempts.begin(session, scope_id=5, item_id=item.id, pr_number=96, head_sha="d" * 40,
+                                          repository="matrix-owner/matrix-repo")
+        await session.commit()
+    await _merge(store, 311, 96, scope_id=7)  # team B observes the merged pull request first
+    await _poll(store, _FactsClient(), scope_id=7)
+    (fact,) = await _facts(store)
+    assert fact["after"]["merge_path"] == "unknown"  # accurate while the attempt is open
+    return attempt_id
+
+
+async def _settlements(store):
+    async with store() as session:
+        rows = (await session.execute(text("SELECT * FROM factory_audit_events "
+                                           "WHERE event_kind = 'pull_request_merge_path' ORDER BY id"))).mappings().all()
+    return [dict(row, after=json.loads(row["after_values"]), before=json.loads(row["before_values"])) for row in rows]
+
+
+@pytest.mark.parametrize("status,path", [("merged", "automatic"), ("refused", "outside")])
+async def test_the_attempts_outcome_settles_a_second_teams_earlier_observation(store, status, path):
+    attempt_id = await _two_teams(store)
+    async with store() as session:
+        await attempts.finish(session, attempt_id, status, "test")
+        await session.commit()
+    await _merge(store, 310, 96, seed=False)  # team A's own delivery of the same pull request
+    await _poll(store, _FactsClient(), scope_id=7)
+    await _poll(store, _FactsClient(), scope_id=5)
+    assert sorted(f["after"]["merge_path"] for f in await _facts(store)) == sorted([path, "unknown"])
+    async with store() as session:  # settling again touches only stored unknowns: team A's fact needs none
+        await attempts.settle_observations(session, repository="matrix-owner/matrix-repo", pr_number=96)
+        await session.commit()
+    (original,) = [f for f in await _facts(store) if f["after"]["merge_path"] == "unknown"]  # preserved as observed
+    (settled,) = await _settlements(store)
+    assert (settled["before"], settled["after"]) == ({"merge_path": "unknown"}, {"merge_path": path})
+    assert settled["scope_context_key"] == original["scope_context_key"]
+    assert settled["correlation_id"] == original["operation_id"]
+
+
+async def test_an_uncertain_outcome_leaves_the_observation_unknown(store):
+    attempt_id = await _two_teams(store)
+    async with store() as session:
+        await attempts.finish(session, attempt_id, "uncertain", "ReadTimeout")
+        await attempts.settle_observations(session, repository="matrix-owner/matrix-repo", pr_number=96)
+        await session.commit()
+    assert await _settlements(store) == []
+
+
+async def test_a_settlement_is_written_once(store):
+    attempt_id = await _two_teams(store)
+    async with store() as session:
+        await attempts.finish(session, attempt_id, "merged", None)
+        await attempts.settle_observations(session, repository="matrix-owner/matrix-repo", pr_number=96)
+        await session.commit()
+    async with store() as session:
+        await attempts.settle_observations(session, repository="Matrix-Owner/Matrix-Repo", pr_number=96)
+        await session.commit()
+    assert [s["after"]["merge_path"] for s in await _settlements(store)] == ["automatic"]

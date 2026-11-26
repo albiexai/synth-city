@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from typing import Any
 
 from sqlalchemy import func, literal, select, text
@@ -659,6 +659,8 @@ def _parse_time(value: Any) -> datetime | None:
 # #1238: the event kind of a merged pull request's facts, the mark of a delivery fact that waits for them, and the
 # delivery source that confirms Synth City's own automatic merge.
 PULL_FACTS_KIND = "pull_request_facts"
+# #1310: a later settlement of a pull request's `unknown` merge path, once its merge attempt finished.
+MERGE_PATH_KIND = "pull_request_merge_path"
 PULL_FACTS_DUE = "due"
 AUTOMATIC_MERGE_SOURCE = "github_verification_service._process_review_item.auto_merge"
 
@@ -830,6 +832,26 @@ async def record_pull_request_facts(
         after_values=values, action_outcome="applied", operation_id=operation_id, correlation_id=operation_id,
         sanitized_reason="pull request facts"
         + (f": GitHub did not report {', '.join(unknown)}" if unknown else ""))
+
+
+async def record_merge_path_settlement(db: AsyncSession, fact: FactoryAuditEvent, path: str) -> FactoryAuditEvent:
+    """#1310: settle one scope's stored ``unknown`` merge path, once; the original fact stays as it was observed."""
+    artifact = str((fact.context_snapshot or {}).get("artifact", "")).lower()
+    operation_id = f"merge_path:{artifact}"
+    existing = (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == MERGE_PATH_KIND, FactoryAuditEvent.operation_id == operation_id,
+        FactoryAuditEvent.scope_context_key == fact.scope_context_key).limit(1))).first()
+    if existing is not None:
+        return existing
+    return await record_event(
+        db, event_kind=MERGE_PATH_KIND, source="github_merge_attempt_service.settle_observations",
+        occurred_at=datetime.now(UTC), fact_source="github_merge_attempts", fact_time=fact.fact_time,
+        actor=derive_actor(actor_kind="system"), scope_context_key=fact.scope_context_key,
+        team_context_key=fact.team_context_key,
+        context_snapshot={"artifact": artifact, "fact_source": "github_merge_attempts"},
+        before_values={"merge_path": "unknown"}, after_values={"merge_path": path}, action_outcome="applied",
+        operation_id=operation_id, correlation_id=fact.operation_id,
+        sanitized_reason=f"merge path settled by the merge attempt's outcome: {path}")
 
 
 async def record_revision_outcome(

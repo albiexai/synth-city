@@ -76,7 +76,7 @@ GitHub can prove whether Synth City made a merge, but not whether a person did, 
 - `outside` (merged outside Synth City's automatic merge, by a person, GitHub's auto-merge, a bot or a script) with no attempt or only refused ones;
 - `unknown` with an uncertain or unfinished attempt, or for a pull request merged before attempt recording began.
 
-Attempts are matched by repository and pull request, so every team watching a repository sees the same classification, and a scope moved to another repository can't borrow its old attempts.
+Attempts are matched by repository and pull request, so every team watching a repository sees the same classification, and a scope moved to another repository can't borrow its old attempts. A team that recorded the facts while an attempt was still open stores `unknown`, which was accurate then. When the attempt finishes as merged or refused, a one-time `pull_request_merge_path` event settles that team's classification, and the original fact stays as it was observed. An uncertain outcome settles nothing.
 
 `merged_by` stays beside it as a fact, and nothing is inferred from it.
 
