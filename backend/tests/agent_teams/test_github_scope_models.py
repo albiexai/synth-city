@@ -15,7 +15,7 @@ from app.models.database import (
     GithubWorkItem,
     GithubWorkspace,
 )
-from app.models.schemas import TeamGithubContinuationPolicyUpdate
+from app.models.schemas import TeamGithubContinuationPolicyUpdate, TeamGithubScopeCreate, TeamGithubScopeUpdate
 
 
 @pytest_asyncio.fixture
@@ -68,7 +68,6 @@ async def test_team_github_scope_round_trips(db):
 @pytest.mark.asyncio
 async def test_review_hold_label_api_apply_omission_and_clear(db):
     from app.api.v1.agent_teams import _apply_scope_create, _scope_response
-    from app.models.schemas import TeamGithubScopeUpdate
 
     preset = AgentTeamPreset(name="Review hold configuration")
     db.add(preset)
@@ -85,6 +84,19 @@ async def test_review_hold_label_api_apply_omission_and_clear(db):
     _apply_scope_create(scope, TeamGithubScopeUpdate(review_hold_label=None))
     await db.commit()
     assert _scope_response(scope).review_hold_label is None
+
+
+@pytest.mark.parametrize(("field", "invalid"), [
+    ("max_approval_rounds", 0), ("max_concurrent_dispatched", 0),
+    ("max_verification_retries", -1), ("max_auto_merges_per_day", -1),
+    ("max_item_effort_minutes", 14), ("max_item_effort_minutes", 1441),
+    ("max_build_parallelism", 0),
+])
+def test_scope_create_and_patch_share_setting_bounds(field, invalid):
+    with pytest.raises(ValidationError):
+        TeamGithubScopeCreate(repo_owner="o", repo_name="r", repo_path="/tmp/r", **{field: invalid})
+    with pytest.raises(ValidationError):
+        TeamGithubScopeUpdate(**{field: invalid})
 
 
 def test_continuation_policy_rejects_invalid_caps():

@@ -2789,6 +2789,11 @@ class GithubAttemptDeliveryPolicyUpdate(BaseModel):
     reason: str = Field(min_length=1, max_length=1000)
 
 
+_PositiveScopeCount = Annotated[int, Field(ge=1)]
+_NonnegativeScopeCount = Annotated[int, Field(ge=0)]
+_ScopeEffortMinutes = Annotated[int, Field(ge=15, le=1440)]
+
+
 class TeamGithubScopeCreate(BaseModel):
     repo_owner: str
     repo_name: str
@@ -2797,17 +2802,17 @@ class TeamGithubScopeCreate(BaseModel):
     design_label: str = "albiex-synth-city-design"
     merge_policy: Literal["human", "auto"] = "human"
     review_hold_label: Optional[str] = None
-    max_approval_rounds: int = Field(default=3, ge=1)
-    max_concurrent_dispatched: int = Field(default=3, ge=1)
-    max_verification_retries: int = Field(default=2, ge=0)
-    max_auto_merges_per_day: int = Field(default=5, ge=0)
-    max_item_effort_minutes: int = Field(default=120, ge=15, le=1440)
+    max_approval_rounds: _PositiveScopeCount = 3
+    max_concurrent_dispatched: _PositiveScopeCount = 3
+    max_verification_retries: _NonnegativeScopeCount = 2
+    max_auto_merges_per_day: _NonnegativeScopeCount = 5
+    max_item_effort_minutes: _ScopeEffortMinutes = 120
     base_ref: str = "origin/HEAD"
     github_auth_mode: Literal["unknown", "ambient", "app"] = "unknown"
     builds_out_of_tree: bool = False
     build_dir_template: str = "build"
     build_command_hint: Optional[str] = None
-    max_build_parallelism: int = Field(default=4, ge=1)
+    max_build_parallelism: _PositiveScopeCount = 4
     enabled: bool = True
 
 
@@ -2819,18 +2824,43 @@ class TeamGithubScopeUpdate(BaseModel):
     design_label: Optional[str] = None
     merge_policy: Optional[Literal["human", "auto"]] = None
     review_hold_label: Optional[str] = None
-    max_approval_rounds: Optional[int] = Field(default=None, ge=1)
-    max_concurrent_dispatched: Optional[int] = Field(default=None, ge=1)
-    max_verification_retries: Optional[int] = Field(default=None, ge=0)
-    max_auto_merges_per_day: Optional[int] = Field(default=None, ge=0)
-    max_item_effort_minutes: Optional[int] = Field(default=None, ge=15, le=1440)
+    max_approval_rounds: _PositiveScopeCount | None = None
+    max_concurrent_dispatched: _PositiveScopeCount | None = None
+    max_verification_retries: _NonnegativeScopeCount | None = None
+    max_auto_merges_per_day: _NonnegativeScopeCount | None = None
+    max_item_effort_minutes: _ScopeEffortMinutes | None = None
     base_ref: Optional[str] = None
     github_auth_mode: Optional[Literal["unknown", "ambient", "app"]] = None
     builds_out_of_tree: Optional[bool] = None
     build_dir_template: Optional[str] = None
     build_command_hint: Optional[str] = None
-    max_build_parallelism: Optional[int] = Field(default=None, ge=1)
+    max_build_parallelism: _PositiveScopeCount | None = None
     enabled: Optional[bool] = None
+
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+class ScopeSettingChange(BaseModel):
+    before: Any
+    after: Any
+
+
+class ScopeSettingsHistoryEntry(BaseModel):
+    event_id: int
+    occurred_at: datetime
+    actor_kind: str
+    actor_reference: str | None
+    via: str | None
+    reason: str | None
+    changes: dict[str, ScopeSettingChange]
+    redacted_fields: list[str]
+
+
+class TeamGithubScopeSettingsResponse(BaseModel):
+    definitions: dict[str, dict[str, Any]]
+    required: list[str]
+    history: list[ScopeSettingsHistoryEntry]
+    next_before_id: int | None = None
 
 
 class GithubRateLimitStatus(BaseModel):

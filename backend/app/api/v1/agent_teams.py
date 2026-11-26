@@ -12,7 +12,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from app.models.api_model import format_utc_time
-from sqlalchemy import and_, exists, func, or_, select, update
+from sqlalchemy import String, and_, cast, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -36,6 +36,7 @@ from app.models.database import (
     AgentTeamSlot,
     AgentTeamPreset,
     AgentPaneBinding,
+    FactoryAuditEvent,
     GithubApprovalRequest,
     GithubAttemptScopeRevision,
     GithubWorkItem,
@@ -94,6 +95,7 @@ from app.models.schemas import (
     TeamGithubContinuationPolicyUpdate,
     TeamGithubScopeListResponse,
     TeamGithubScopeResponse,
+    TeamGithubScopeSettingsResponse,
     TeamGithubScopeUpdate,
     SupervisorBindingRequest,
     SupervisorObservation,
@@ -2673,12 +2675,60 @@ async def create_github_scope(
         scope, await github_verification_service.auto_merges_last_24h(db, scope.id))
 
 
+@router.get("/github-scopes/{scope_id}/settings", response_model=TeamGithubScopeSettingsResponse)
+async def read_github_scope_settings(
+    scope_id: int,
+    limit: int = Query(25, ge=1, le=100),
+    before_id: int | None = Query(None, ge=1, le=2**63 - 1),
+    _operator: None = Depends(require_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services import factory_audit_service as audit
+
+    if await db.get(TeamGithubScope, scope_id) is None:
+        raise HTTPException(status_code=404, detail="GitHub scope not found")
+    definition = TeamGithubScopeCreate.model_json_schema()
+    scope_context = await audit.current_context_key(db, "scope", scope_id)
+    records = []
+    if scope_context is not None:
+        query = select(FactoryAuditEvent).where(
+            FactoryAuditEvent.scope_context_key == scope_context,
+            FactoryAuditEvent.event_kind == "policy_change",
+            FactoryAuditEvent.source == "agent_teams.update_github_scope",
+            FactoryAuditEvent.action_outcome == "applied",
+            or_(
+                cast(FactoryAuditEvent.before_values, String) != cast(FactoryAuditEvent.after_values, String),
+                func.json_array_length(FactoryAuditEvent.context_snapshot["scope_changed_fields"]) > 0,
+            ),
+        )
+        if before_id is not None:
+            query = query.where(FactoryAuditEvent.id < before_id)
+        records = (await db.scalars(query.order_by(FactoryAuditEvent.id.desc()).limit(limit + 1))).all()
+    history = []
+    for record in records[:limit]:
+        before = record.before_values or {}
+        after = record.after_values or {}
+        changes = {
+            name: {"before": before[name], "after": after[name]}
+            for name in before.keys() & after.keys() if before[name] != after[name]
+        }
+        recorded_fields = (record.context_snapshot or {}).get("scope_changed_fields", [])
+        redacted_fields = sorted(set(recorded_fields) - changes.keys())
+        if changes or redacted_fields:
+            history.append(dict(event_id=record.id, occurred_at=record.occurred_at,
+                actor_kind=record.actor_kind, actor_reference=record.actor_reference,
+                via=record.via, reason=record.sanitized_reason, changes=changes, redacted_fields=redacted_fields))
+    return dict(definitions=definition["properties"], required=definition["required"], history=history,
+                next_before_id=records[limit - 1].id if len(records) > limit else None)
+
+
 @router.patch("/github-scopes/{scope_id}", response_model=TeamGithubScopeResponse)
 async def update_github_scope(
     scope_id: int,
     request: TeamGithubScopeUpdate,
     _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
+    write_context: dict | None = Depends(operator_write_context),
 ):
     observed = await db.get(TeamGithubScope, scope_id)
     if observed is None:
@@ -2753,12 +2803,18 @@ async def update_github_scope(
             event_kind="policy_change",
             source="agent_teams.update_github_scope",
             occurred_at=datetime.now(timezone.utc),
-            actor=_operator_actor(),
+            actor=_write_actor(write_context),
             scope_id=scope.id,
-            context_snapshot=_policy_event_snapshot(scope, request),
+            context_snapshot={
+                **_policy_event_snapshot(scope, request),
+                "scope_changed_fields": [
+                    name for name in TeamGithubScopeCreate.model_fields
+                    if _policy_before.get(name) != _policy_after.get(name)
+                ],
+            },
             before_values=_policy_before,
             after_values=_policy_after,
-            sanitized_reason="scope configuration update",
+            sanitized_reason=(request.reason or "").strip() or "scope configuration update",
             action_outcome="applied",
             correlation_id=f"policy:scope:{scope.id}:{scope.updated_at.isoformat()}",
         )
@@ -2780,7 +2836,11 @@ async def update_github_scope(
             db, "scope_changed_during_update", scope_id=scope_id)
         raise HTTPException(status_code=409, detail="scope_changed_during_update") from exc
     except ValueError as exc:
+        await db.rollback()
         raise _bad_request(exc) from exc
+    except Exception:
+        await db.rollback()
+        raise
     await _sync_github_jobs(db)
     return _scope_response(
         scope, await github_verification_service.auto_merges_last_24h(db, scope.id))

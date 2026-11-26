@@ -13,6 +13,7 @@ from app.database import get_db
 from app.main import app
 from app.models.database import (
     AgentPaneBinding,
+    FactoryAuditEvent,
     GithubApprovalRequest,
     GithubAcceptedSourceImport,
     GithubAttemptScopeRevision,
@@ -141,6 +142,103 @@ async def test_generic_scope_patch_cannot_enable_continuation(client, db, tmp_pa
     assert response.json()["continuation_enabled"] is False
     await db.refresh(scope)
     assert scope.continuation_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_scope_settings_read_definitions_and_audit_history(client, db, tmp_path):
+    _, scope = await _scope(db, tmp_path / "settings-repo")
+    _, other = await _scope(db, tmp_path / "other-settings-repo")
+    scope_id, other_scope_id = scope.id, other.id
+    path = f"/api/v1/agent-teams/github-scopes/{scope_id}"
+    assert (await client.get(f"{path}/settings")).status_code == 401
+    response = await client.get(f"{path}/settings", headers=OPERATOR_HEADERS)
+    assert response.status_code == 200
+    definitions = response.json()["definitions"]
+    assert set(response.json()["required"]) == {"repo_owner", "repo_name", "repo_path"}
+    effort = definitions["max_item_effort_minutes"]
+    assert (effort["type"], effort["minimum"], effort["maximum"], effort["default"]) == ("integer", 15, 1440, 120)
+    assert definitions["merge_policy"]["enum"] == ["human", "auto"]
+    assert definitions["builds_out_of_tree"]["default"] is False
+    assert response.json()["history"] == []
+
+    invalid = await client.patch(path, headers=OPERATOR_HEADERS, json={"max_item_effort_minutes": 14})
+    assert invalid.status_code == 422
+    update_response = await client.patch(path, headers=OPERATOR_HEADERS, json={
+        "max_item_effort_minutes": 45, "review_hold_label": "needs-review", "reason": "Use the project review gate",
+    })
+    assert update_response.status_code == 200
+    clear_response = await client.patch(path, headers=OPERATOR_HEADERS, json={"review_hold_label": None})
+    assert clear_response.status_code == 200
+    assert (await client.patch(path, headers=OPERATOR_HEADERS, json={"review_hold_label": None})).status_code == 200
+
+    page = (await client.get(f"{path}/settings", headers=OPERATOR_HEADERS, params={"limit": 1})).json()
+    latest, = page["history"]
+    assert latest["changes"] == {"review_hold_label": {"before": "needs-review", "after": None}}
+    assert latest["reason"] == "scope configuration update"
+    assert latest["actor_kind"] == "operator"
+    assert latest["via"] == "api"
+    assert latest["occurred_at"]
+    assert page["next_before_id"] == latest["event_id"]
+
+    older = (await client.get(f"{path}/settings", headers=OPERATOR_HEADERS, params={
+        "limit": 1, "before_id": page["next_before_id"],
+    })).json()
+    first, = older["history"]
+    assert first["changes"] == {
+        "review_hold_label": {"before": None, "after": "needs-review"},
+        "max_item_effort_minutes": {"before": 120, "after": 45},
+    }
+    assert first["reason"] == "Use the project review gate"
+    assert older["next_before_id"] is None
+    event = await db.get(FactoryAuditEvent, first["event_id"])
+    assert (event.scope_id, event.source) == (scope_id, "agent_teams.update_github_scope")
+    assert event.before_values["max_item_effort_minutes"] == 120
+    assert event.after_values["max_item_effort_minutes"] == 45
+    other_history = await client.get(
+        f"/api/v1/agent-teams/github-scopes/{other_scope_id}/settings", headers=OPERATOR_HEADERS)
+    assert other_history.json()["history"] == []
+
+
+@pytest.mark.asyncio
+async def test_scope_settings_history_records_private_fields_without_values(client, db, tmp_path):
+    _, scope = await _scope(db, tmp_path / "private-settings-repo")
+    path = f"/api/v1/agent-teams/github-scopes/{scope.id}"
+    payload = {"build_command_hint": "private-local-operation {parallelism}"}
+    for _ in range(2):
+        assert (await client.patch(path, headers=OPERATOR_HEADERS, json=payload)).status_code == 200
+
+    response = await client.get(f"{path}/settings", headers=OPERATOR_HEADERS)
+    assert response.status_code == 200
+    entry, = response.json()["history"]
+    assert entry["changes"] == {}
+    assert entry["redacted_fields"] == ["build_command_hint"]
+    assert "private-local-operation" not in response.text
+
+    event = await db.get(FactoryAuditEvent, entry["event_id"])
+    assert event.context_snapshot["scope_changed_fields"] == ["build_command_hint"]
+    assert "build_command_hint" not in event.before_values
+    assert "build_command_hint" not in event.after_values
+
+
+@pytest.mark.asyncio
+async def test_scope_patch_rolls_back_settings_and_history_on_audit_error(client, db, tmp_path, monkeypatch):
+    from app.services import factory_audit_service as audit
+
+    _, scope = await _scope(db, tmp_path / "audit-settings-repo")
+    scope_id = scope.id
+    original = audit.record_event
+
+    async def fail_after_insert(*args, **kwargs):
+        await original(*args, **kwargs)
+        raise RuntimeError("synthetic settings audit failure")
+
+    monkeypatch.setattr(audit, "record_event", fail_after_insert)
+    with pytest.raises(RuntimeError, match="synthetic settings audit failure"):
+        await client.patch(f"/api/v1/agent-teams/github-scopes/{scope_id}", headers=OPERATOR_HEADERS,
+                           json={"max_item_effort_minutes": 45, "reason": "Change budget"})
+    await db.refresh(scope)
+    assert scope.max_item_effort_minutes == 120
+    assert await db.scalar(select(FactoryAuditEvent.id).where(FactoryAuditEvent.scope_id == scope_id)) is None
 
 
 class ApiGitRunner:
