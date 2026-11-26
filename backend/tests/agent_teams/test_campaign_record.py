@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import select, update
+from sqlalchemy import event, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -36,6 +36,9 @@ OPERATOR = audit.derive_actor(actor_kind="operator")
 @pytest_asyncio.fixture
 async def db(tmp_path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'campaigns.db'}")
+    # As the application runs SQLite (V1 review 6072435444): with foreign keys enforced.
+    event.listen(engine.sync_engine, "connect", lambda connection, _record: connection.execute(
+        "PRAGMA foreign_keys=ON"))
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     try:
@@ -62,6 +65,7 @@ class FakeGithub:
         self.milestone_issues, self.broken = milestone_issues or {}, set(broken)
 
     def _check(self, repo):
+        self.read = getattr(self, "read", []) + [repo]
         if repo in self.broken:
             raise GithubClientResponseError("unreadable")
 
@@ -272,6 +276,71 @@ async def test_a_finished_campaign_ignores_departures_after_its_finish(db, world
     await _stopped(db, world.items[("a1", 2)], "deferred", T0 + timedelta(days=2), target_milestone="v4.5")
     membership = await campaigns.members(db, campaign, FakeGithub(labelled={"a1": [_issue("a1", 2)], "a2": []}))
     assert [(m.issue_number) for m in membership.members] == [2] and membership.departures == []
+
+
+# Team lifetime and retained history (V1 review 6072435444)
+async def _delete_team(db, preset_id):
+    """Delete a team as the application does; the lifetime trigger retires its key."""
+    scopes = "SELECT id FROM team_github_scopes WHERE preset_id = :team"
+    await db.execute(text(f"DELETE FROM github_work_items WHERE scope_id IN ({scopes})"), {"team": preset_id})
+    await db.execute(text("DELETE FROM team_github_scopes WHERE preset_id = :team"), {"team": preset_id})
+    await db.execute(text("DELETE FROM agent_team_presets WHERE id = :team"), {"team": preset_id})
+    await db.commit()
+
+
+async def test_a_retired_campaign_never_reads_the_replacement_teams_repositories(db, world):
+    campaign = await campaigns.start(db, world.team, "label:v4.4", started_at=T0, actor=OPERATOR)
+    await _delete_team(db, world.team)
+    # A new team takes the same id and watches another repository.
+    db.add(AgentTeamPreset(id=world.team, name="Replacement"))
+    await db.flush()
+    db.add(TeamGithubScope(preset_id=world.team, repo_owner="o", repo_name="c1", repo_path="/private/c1",
+                           enabled=True))
+    await db.commit()
+    github = FakeGithub(labelled={"c1": [_issue("c1", 7)]})
+    membership = await campaigns.members(db, campaign, github)
+    assert membership.members == [] and membership.complete is False
+    assert membership.unavailable == "team_retired" and not getattr(github, "read", [])
+    assert await campaigns.current(db, world.team) is None
+
+
+async def test_a_deferral_survives_deleting_its_work_item(db, world):
+    campaign = await campaigns.start(db, world.team, "label:v4.4", started_at=T0, actor=OPERATOR)
+    await _stopped(db, world.items[("a1", 2)], "deferred", T0 + timedelta(hours=2), target_milestone="v4.5")
+    await db.execute(text("DELETE FROM github_work_items WHERE id = :id"), {"id": world.items[("a1", 2)]})
+    await db.commit()
+    membership = await campaigns.members(db, campaign, FakeGithub(labelled={"a1": [_issue("a1", 2)], "a2": []}))
+    assert membership.members == []  # the still-labelled issue stays out
+    (departure,) = membership.departures
+    assert (departure.repo, departure.issue_number, departure.destination, departure.reason) == (
+        "o/a1", 2, "v4.5", "Tracking moved to the recorded destination.")
+
+
+async def test_a_reused_work_item_id_cannot_redirect_a_recorded_departure(db, world):
+    team_campaign = await campaigns.start(db, world.team, "label:v4.4", started_at=T0, actor=OPERATOR)
+    other_campaign = await campaigns.start(db, world.other, "label:v4.4", started_at=T0, actor=OPERATOR)
+    item_id = world.items[("a1", 2)]
+    await _stopped(db, item_id, "deferred", T0 + timedelta(hours=2), target_milestone="v4.5")
+    await db.execute(text("DELETE FROM github_work_items WHERE id = :id"), {"id": item_id})
+    await db.commit()
+    # The id comes back as another team's issue.
+    db.add(GithubWorkItem(id=item_id, scope_id=world.scopes["b1"], issue_number=2, issue_title="Other",
+                          issue_url="https://x/b1/2", github_updated_at=T0, dispatch_status="pending"))
+    await db.commit()
+    other = await campaigns.members(db, other_campaign, FakeGithub(labelled={"b1": [_issue("b1", 2)]}))
+    assert [(m.repo, m.issue_number) for m in other.members] == [("o/b1", 2)] and other.departures == []
+    team = await campaigns.members(db, team_campaign, FakeGithub(labelled={"a1": [], "a2": []}))
+    assert [(d.repo, d.issue_number) for d in team.departures] == [("o/a1", 2)]
+
+
+async def test_a_campaign_for_a_missing_team_is_refused_before_anything_is_written(db, world):
+    with pytest.raises(campaigns.CampaignError) as refused:
+        await campaigns.start(db, 999, "label:v4.4", started_at=T0, actor=OPERATOR)
+    assert refused.value.code == "campaign_team_not_found"
+    assert (await db.scalars(select(Campaign))).all() == []
+    assert await audit.current_context_key(db, "team", 999) is None
+    assert (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == "campaign_started"))).all() == []
 
 
 # The label reader

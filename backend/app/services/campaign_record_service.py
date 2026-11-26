@@ -15,9 +15,9 @@ import httpx
 from sqlalchemy import select
 
 from app.models.database import (
+    AgentTeamPreset,
     Campaign,
     FactoryAuditEvent,
-    GithubWorkItem,
     TeamGithubScope,
 )
 from app.services import factory_audit_service as audit
@@ -63,10 +63,12 @@ class CampaignMembership:
     members: list[CampaignMember] = field(default_factory=list)
     departures: list[CampaignDeparture] = field(default_factory=list)
     repositories: list[RepositoryCoverage] = field(default_factory=list)
+    # Why no repository could be read at all, e.g. "team_retired": the campaign's team lifetime has ended.
+    unavailable: str | None = None
 
     @property
     def complete(self) -> bool:
-        return all(repository.complete for repository in self.repositories)
+        return self.unavailable is None and all(repository.complete for repository in self.repositories)
 
 
 def parse_selector(selector: str) -> tuple[str, str]:
@@ -89,6 +91,9 @@ async def current(db, preset_id: int) -> Campaign | None:
 async def start(db, preset_id: int, selector: str, *, started_at: datetime, actor: dict) -> Campaign:
     """Start the team's campaign. A second active or finishing one is refused (the database refuses it too)."""
     parse_selector(selector)
+    # Before any key, campaign or event (V1 review 6072435444): a later team with this id must not inherit it.
+    if await db.get(AgentTeamPreset, preset_id) is None:
+        raise CampaignError("campaign_team_not_found")
     if await current(db, preset_id) is not None:
         raise CampaignError("campaign_already_active")
     key = await audit.current_context_key(db, "team", preset_id) or await audit.context_key_for(db, "team", preset_id)
@@ -109,9 +114,13 @@ async def start(db, preset_id: int, selector: str, *, started_at: datetime, acto
 async def members(db, campaign: Campaign, client) -> CampaignMembership:
     """The campaign's members in every repository its team watches, and the issues that left it."""
     kind, value = parse_selector(campaign.selector)
+    membership = CampaignMembership(departures=await _departures(db, campaign))
+    # Only the campaign's own team lifetime: a preset id reused by a new team never lends it its repositories.
+    if await audit.current_context_key(db, "team", campaign.preset_id) != campaign.team_context_key:
+        membership.unavailable = "team_retired"
+        return membership
     scopes = (await db.scalars(select(TeamGithubScope).where(TeamGithubScope.preset_id == campaign.preset_id)
                                .order_by(TeamGithubScope.repo_owner, TeamGithubScope.repo_name))).all()
-    membership = CampaignMembership(departures=await _departures(db, campaign, scopes))
     departed = {(d.repo, d.issue_number) for d in membership.departures}
     for scope in scopes:
         repo = f"{scope.repo_owner}/{scope.repo_name}"
@@ -137,20 +146,24 @@ async def members(db, campaign: Campaign, client) -> CampaignMembership:
     return membership
 
 
-async def _departures(db, campaign: Campaign, scopes) -> list[CampaignDeparture]:
-    """#1219's deferrals and supersessions of the team's issues while the campaign ran."""
-    repos = {scope.id: f"{scope.repo_owner}/{scope.repo_name}" for scope in scopes}
-    if not repos:
-        return []
-    query = (select(FactoryAuditEvent, GithubWorkItem.scope_id, GithubWorkItem.issue_number)
-             .join(GithubWorkItem, GithubWorkItem.id == FactoryAuditEvent.item_id)
-             .where(FactoryAuditEvent.event_kind == "stopped_work_item_ended",
-                    GithubWorkItem.scope_id.in_(repos), FactoryAuditEvent.occurred_at >= campaign.started_at))
+async def _departures(db, campaign: Campaign) -> list[CampaignDeparture]:
+    """#1219's deferrals and supersessions of the team's issues while the campaign ran.
+
+    Read from each event's own record (V1 review 6072435444): the team lifetime key and the repository and issue it
+    named. Deleting the local work item, or reusing its id, changes nothing.
+    """
+    query = select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind == "stopped_work_item_ended",
+        FactoryAuditEvent.team_context_key == campaign.team_context_key,
+        FactoryAuditEvent.occurred_at >= campaign.started_at)
     if campaign.finished_at is not None:
         query = query.where(FactoryAuditEvent.occurred_at <= campaign.finished_at)
     departures = []
-    for event, scope_id, number in (await db.execute(query.order_by(FactoryAuditEvent.occurred_at))).all():
-        values = event.after_values or {}
+    for event in (await db.scalars(query.order_by(FactoryAuditEvent.occurred_at, FactoryAuditEvent.id))).all():
+        values, snapshot = event.after_values or {}, event.context_snapshot or {}
+        owner, name, number = snapshot.get("repo_owner"), snapshot.get("repo_name"), snapshot.get("issue_number")
+        if not (isinstance(owner, str) and isinstance(name, str) and isinstance(number, int)):
+            continue
         outcome = values.get("outcome")
         if outcome == "deferred":
             destination = str(values.get("target_milestone") or "no milestone")
@@ -158,6 +171,6 @@ async def _departures(db, campaign: Campaign, scopes) -> list[CampaignDeparture]
             destination = f"PR #{values.get('superseding_pr_number')}"
         else:
             continue
-        departures.append(CampaignDeparture(repos[scope_id], number, outcome, destination, event.sanitized_reason,
+        departures.append(CampaignDeparture(f"{owner}/{name}", number, outcome, destination, event.sanitized_reason,
                                             event.occurred_at))
     return departures
