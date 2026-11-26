@@ -247,7 +247,7 @@ async def handle_observation_gap(db, scope, item):
         except (TimeoutError, OSError, ValueError):
             gap = True  # Identity must still pass the independent bound checks below.
         await _lock_item(db, item)
-        current, _workspace, _session = await bound_authority(db, scope, item)
+        current, _workspace, session = await bound_authority(db, scope, item)
         if current != expected or item.dispatch_status != "dispatched":
             raise ValueError("observation_pause_context_changed")
         if not gap:
@@ -274,7 +274,8 @@ async def handle_observation_gap(db, scope, item):
             item.updated_at = now
             # #1338: the owner now waits for the operator to resume this pause.
             await decision_waits.record_pause_wait_started(
-                db, record, item_id=item.id, source="owner_observation_pause.handle_observation_gap")
+                db, record, item_id=item.id, owner_member_id=session.member_id,
+                source="owner_observation_pause.handle_observation_gap")
         await db.commit()
         if record.status == "paused" and record.notice_status == "pending":
             from app.services.github_dispatch_service import github_dispatch_service

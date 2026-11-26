@@ -13,7 +13,7 @@ from sqlalchemy import select, text, update
 
 from app.config import settings
 from app.models.database import (
-    FactoryAuditEvent, GithubAttemptScopeRevision, GithubOwnerObservationPause, GithubWorkItem,
+    FactoryAuditEvent, GithubAttemptScopeRevision, GithubOwnerObservationPause, GithubWorkItem, MailAgentSession,
 )
 from app.services import decision_wait_service as waits
 from app.services import factory_audit_service as audit
@@ -150,6 +150,67 @@ async def test_a_hold_is_no_mail_wait_and_its_decision_wait_stays_its_own(client
     assert hold.operation_id != decision[0].operation_id
 
 
+async def _cancelled(db, item, at, reason="Operator cancelled the held continuation."):
+    await db.execute(update(GithubAttemptScopeRevision).where(GithubAttemptScopeRevision.work_item_id == item.id)
+                     .values(status="cancelled", cancelled_at=at, cancellation_reason=reason))
+    await db.commit()
+
+
+async def test_a_late_reconcile_keeps_the_cancellation_time_and_reason(client, db, monkeypatch):
+    """V1 review 6070971861: the first resolving transition and its own time, however late the monitor runs."""
+    item, *_ = await _held(client, db, monkeypatch)
+    (start,) = await _events(db, HOLD)
+    cancelled = start.fact_time + timedelta(minutes=2)
+    await _cancelled(db, item, cancelled)
+    # The item closes 15 minutes after the cancellation, before the monitor's next pass an hour later.
+    await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == item.id).values(
+        dispatch_status="closed", updated_at=cancelled + timedelta(minutes=15)))
+    await db.commit()
+    await waits.reconcile_operator_waits(db, scope_id=item.scope_id, now=cancelled + timedelta(hours=1))
+    await db.commit()
+    _start, end = await _events(db, HOLD)
+    assert (end.after_values["wait_outcome"], end.fact_time) == ("hold_cleared", cancelled)
+
+
+@pytest.mark.parametrize("ended_by", ["merge", "end_stopped"])
+async def test_an_item_that_ends_first_gives_one_item_terminal_end_at_its_transition(client, db, monkeypatch,
+                                                                                   ended_by):
+    item, *_ = await _held(client, db, monkeypatch)
+    (start,) = await _events(db, HOLD)
+    ended = start.fact_time + timedelta(minutes=5)
+    if ended_by == "merge":  # complete_current_revision supersedes the held revision in the merge's transaction
+        await _cancelled(db, item, ended, reason="The work item reached a terminal state.")
+        status = "merged"
+    else:  # end-stopped cancels the revisions and records its event with the same time
+        await _cancelled(db, item, ended, reason="Deferred to v4.5. Tracking moved.")
+        await audit.record_event(
+            db, event_kind="stopped_work_item_ended", source="test", occurred_at=ended,
+            actor=audit.derive_actor(actor_kind="operator"), item_id=item.id, action_outcome="applied",
+            operation_id=f"end_stopped_item:test-{item.id}", sanitized_reason="ended")
+        status = "cancelled"
+    await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == item.id).values(
+        dispatch_status=status, updated_at=ended + timedelta(minutes=30)))
+    await db.commit()
+    for _ in range(2):  # once
+        await waits.reconcile_operator_waits(db, scope_id=item.scope_id, now=ended + timedelta(hours=1))
+        await db.commit()
+    _start, end = await _events(db, HOLD)
+    assert (end.after_values["wait_outcome"], end.fact_time) == ("item_terminal", ended)
+
+
+async def test_an_item_ending_while_still_held_uses_its_last_write_not_the_poll(client, db, monkeypatch):
+    item, *_ = await _held(client, db, monkeypatch)
+    (start,) = await _events(db, HOLD)
+    written = start.fact_time + timedelta(minutes=10)
+    await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == item.id).values(
+        dispatch_status="closed", updated_at=written))
+    await db.commit()
+    await waits.reconcile_operator_waits(db, scope_id=item.scope_id, now=written + timedelta(hours=1))
+    await db.commit()
+    _start, end = await _events(db, HOLD)
+    assert (end.after_values["wait_outcome"], end.fact_time) == ("item_terminal", written)
+
+
 # Observation pauses
 async def _paused(db, monkeypatch, tmp_path):
     """A recorded observation pause after its bounded wait: the owner waits for the operator to resume it."""
@@ -173,8 +234,11 @@ async def test_a_pause_waits_on_the_operator_until_the_operator_route_resumes_it
     scope, item, record = await _paused(db, monkeypatch, tmp_path)
     (start,) = await _events(db, PAUSE)
     assert start.operation_id == f"pause_wait_started:pause:{record.id}"
+    owner = await db.scalar(select(MailAgentSession.member_id).where(
+        MailAgentSession.member_id.is_not(None)).order_by(MailAgentSession.id.desc()).limit(1))
     assert start.after_values == {"wait_pause_id": record.id, "request_kind": "observation_pause",
-                                  "awaited_role": "operator"}
+                                  "owner_member_id": owner, "awaited_role": "operator"}
+    assert owner is not None
     assert start.fact_time == record.paused_at
     async with _api(db, monkeypatch) as api:
         for _ in range(2):  # a replay adds nothing
@@ -205,14 +269,19 @@ async def test_a_resume_records_only_the_actor_it_was_given(db, monkeypatch, tmp
 async def test_a_pause_open_when_the_item_ends_closes_with_item_terminal(db, monkeypatch, tmp_path):
     scope, item, _record = await _paused(db, monkeypatch, tmp_path)
     (wait,) = [w for w in await waits.unended_decision_waits(db, now=datetime.utcnow()) if w.wait_kind == "pause"]
-    assert wait.state == "open"
+    assert wait.state == "open" and wait.owner_member_id is not None  # the verified owner, not the operator
+    await waits.reconcile_operator_waits(db, scope_id=scope.id, now=datetime.utcnow())  # a live item: still open
+    assert [e.event_kind for e in await _events(db, PAUSE)] == [waits.PAUSE_STARTED]
+    written = datetime.utcnow()
     item.dispatch_status = "cancelled"
+    item.updated_at = written
     await db.commit()
     for _ in range(2):  # once
-        await waits.reconcile_operator_waits(db, scope_id=scope.id, now=datetime.utcnow())
+        await waits.reconcile_operator_waits(db, scope_id=scope.id, now=written + timedelta(hours=1))
         await db.commit()
     _start, end = await _events(db, PAUSE)
     assert (end.actor_kind, end.after_values["wait_outcome"]) == ("system", "item_terminal")
+    assert end.fact_time == written  # the item's last write bounds the end, not the late poll
 
 
 async def test_the_pause_notice_is_no_mail_wait(db, monkeypatch, tmp_path):

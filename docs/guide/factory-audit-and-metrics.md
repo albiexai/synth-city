@@ -89,7 +89,7 @@ The owner also waits for the operator at a recovery checkpoint hold and at a rec
 - the Supervisor, only when its external-actor identity was supplied;
 - nobody, when no actor was supplied. The operator key does not prove which person used it, so "operator" is never read as the Director.
 
-A wait that nothing released closes when the monitor finds it, unattributed: `item_terminal` when the item ended, or `hold_cleared` when the hold's revision left the held stage or ended. Neither flow is a Mail request, so neither is counted twice.
+A wait that nothing released is closed by the monitor, unattributed, at its first resolving transition: `hold_cleared` when the hold's revision ended on its own, or `item_terminal` when the item ended first. The end takes that transition's own time, never the poll time. For a hold that is the revision's recorded end, or the end-stopped time. When neither is recorded, it uses the item's last write, an approximate bound that is never later than the poll. Neither flow is a Mail request, so neither is counted twice.
 
 ## Review acceptance declarations
 
