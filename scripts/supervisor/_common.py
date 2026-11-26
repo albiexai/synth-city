@@ -92,13 +92,20 @@ def read_token_file(path):
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as error:
         raise ConfigError(f"cannot read the token file ({error.strerror})") from None
-    with os.fdopen(fd) as stream:
-        info = os.fstat(stream.fileno())
+    try:
+        info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise ConfigError("the token file is not a regular file")
         if info.st_mode & 0o077 or info.st_uid != os.geteuid():
             raise ConfigError("the token file mode must be 600 and the file must belong to you")
-        value = stream.read(4097).strip()
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
+        with os.fdopen(fd) as stream:
+            value = stream.read(4097).strip()
+    except (OSError, UnicodeDecodeError):
+        raise ConfigError("the token file cannot be read as text") from None
     if not value or len(value) > 4096:
         raise ConfigError("the token file must hold one token of up to 4096 characters")
     return value
@@ -122,9 +129,10 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 class Client:
     """Read-only GET client. It follows no redirect, ignores proxy settings and bounds time and size.
 
-    Each wait for data stops after TIMEOUT_SECONDS. The body of the answer is also checked against the same limit in
-    total, between reads, so a slow body can run over by at most one wait. The status line and the headers are bounded
-    per wait only: the standard library accepts up to 100 header lines, so a slow server can hold them much longer.
+    Each wait for data stops after TIMEOUT_SECONDS. The body is also checked against the same limit in total, but only
+    between reads. A body with a Content-Length gives one wait per read, so it can run over by at most one wait. A
+    chunked body can do several waits inside one read, so it has no tighter bound than the per-wait one. The status
+    line and the headers are bounded per wait only: the standard library accepts up to 100 header lines.
     """
 
     def __init__(self, base_url, redact):

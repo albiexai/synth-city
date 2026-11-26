@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _common as common  # noqa: E402
 
 INBOX_LIMIT = 50
+FINISHED_ACTIONS = ("historical", "resolved")
 
 
 def parse_time(value):
@@ -40,12 +41,14 @@ def is_count(value):
 
 
 def health(data, args):
-    need(isinstance(data, dict) and isinstance(data.get("status"), str) and isinstance(data.get("health"), str),
-         "status and health")
-    parts = [f"status {data.get('status')}", f"health {data.get('health', 'ok')}", f"{data.get('open_findings')} open findings"]
+    need(isinstance(data, dict) and isinstance(data.get("status"), str) and isinstance(data.get("health"), str)
+         and "open_findings" in data and (data["open_findings"] is None or is_count(data["open_findings"])),
+         "status, health and findings count")
+    parts = [f"status {data.get('status')}", f"health {data.get('health')}",
+             "unknown open findings" if data["open_findings"] is None else f"{data['open_findings']} open findings"]
     if data.get("reasons"):
         parts.append("reasons " + ", ".join(common.clean(r, 40) for r in data["reasons"]))
-    bad = data.get("status") != "ok" or data.get("health", "ok") != "ok"
+    bad = data["status"] != "ok" or data["health"] != "ok" or data["open_findings"] is None
     return [("attention" if bad else "ok", ", ".join(parts))]
 
 
@@ -59,9 +62,18 @@ def summary(data, args):
         found.append(f"hold {common.clean(data['hold_code'], 40)}")
     for item in data.get("attention") or []:
         found.append(f"attention {common.clean(item.get('code'), 40)}" + (f" #{item['issue_number']}" if item.get("issue_number") else ""))
-    for item in data.get("human_actions") or []:
-        if item.get("state") in ("requested", "context_pending", "head_changed"):
-            found.append(f"human action {common.clean(item.get('kind'), 40)} #{item.get('issue_number')} {common.clean(item.get('state'), 40)}")
+    ready, blocked = [], []
+    for item in data["human_actions"]:
+        state = item.get("state")
+        if state in FINISHED_ACTIONS:
+            continue
+        label = f"{common.clean(item.get('kind'), 40)} #{common.clean(item.get('issue_number'), 20)}"
+        # Only a request the operator can act on now is "act now". Every other state waits on something else.
+        (ready if state == "requested" else blocked).append(label if state == "requested" else f"{label} {common.clean(state, 40)}")
+    if ready:
+        found.append("human action, act now: " + ", ".join(ready))
+    if blocked:
+        found.append("human action, blocked: " + ", ".join(blocked))
     for item in data.get("required_ci_unreadable") or []:
         found.append(f"required CI unreadable #{item.get('issue_number')}")
     if data.get("coverage_complete") is False:
@@ -104,8 +116,9 @@ def overview(data, args):
 
 
 def inbox(messages, args):
-    need(isinstance(messages, list), "message list")
-    seen = [m for m in messages if isinstance(m, dict) and is_count(m.get("id"))]
+    # A row without a valid id cannot be counted, so the page has no confirmed cursor: refuse it whole.
+    need(isinstance(messages, list) and all(isinstance(m, dict) and is_count(m.get("id")) for m in messages), "message ids")
+    seen = messages
     fresh = [m for m in seen if m["id"] > args.since_id]
     highest = max([args.since_id, *(m["id"] for m in fresh)])
     # The route gives the newest INBOX_LIMIT messages. A full page that stays above the saved id may hide older ones.

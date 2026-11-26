@@ -390,6 +390,9 @@ def test_every_emitted_line_is_printable_whatever_the_server_sends(serve, token_
 @pytest.mark.parametrize("name,answer", [
     ("health", {}),
     ("health", {"status": "ok"}),
+    ("health", {"status": "ok", "health": "ok", "reasons": []}),
+    ("health", {"status": "ok", "health": "ok", "reasons": [], "open_findings": -1}),
+    ("health", {"status": "ok", "health": "ok", "reasons": [], "open_findings": "3"}),
     ("summary", {}),
     ("summary", {"hold_code": None, "attention": [], "human_actions": []}),
     ("summary", {"attention": [], "human_actions": [], "coverage_complete": True}),
@@ -473,3 +476,74 @@ def test_a_member_state_the_script_does_not_know_is_reported(serve):
     slots = [{"slot_id": 7, "state": "paused", "reason": "r", "observed_at": NOW}]
     code, out, _ = run(serve(activity={"checked_at": NOW, "slots": slots}))
     assert code == 1 and "slot 7 paused" in out
+
+
+# --- V1's third review (#1116 part 1) ---
+
+def summary_with(*actions, coverage=True):
+    return {"hold_code": None, "attention": [], "human_actions": list(actions), "required_ci_unreadable": [],
+            "coverage_complete": coverage}
+
+
+@pytest.mark.parametrize("state", ["waiting_for_prerequisites", "context_pending", "pr_unavailable",
+                                   "pr_identity_unavailable", "head_changed", "surprise_state"])
+def test_a_blocked_human_action_is_reported_with_its_issue_and_state(serve, state):
+    action = {"kind": "merge_pr", "issue_number": 7, "state": state}
+    code, out, _ = run(serve(summary=summary_with(action)))
+    assert code == 1 and f"blocked: merge_pr #7 {state}" in out and "act now" not in out
+
+
+def test_a_request_the_operator_can_act_on_is_told_apart_from_a_blocked_one(serve):
+    ready = {"kind": "review_pr", "issue_number": 5, "state": "requested"}
+    blocked = {"kind": "merge_pr", "issue_number": 7, "state": "waiting_for_prerequisites"}
+    _, out, _ = run(serve(summary=summary_with(ready, blocked)))
+    assert "act now: review_pr #5" in out and "blocked: merge_pr #7 waiting_for_prerequisites" in out
+
+
+def test_an_incomplete_coverage_still_names_the_outstanding_action(serve):
+    action = {"kind": "merge_pr", "issue_number": 7, "state": "pr_unavailable"}
+    _, out, _ = run(serve(summary=summary_with(action, coverage=False)))
+    assert "coverage incomplete" in out and "merge_pr #7 pr_unavailable" in out
+
+
+def test_a_finished_human_action_is_not_reported(serve):
+    done = [{"kind": "review_pr", "issue_number": 5, "state": s} for s in ("historical", "resolved")]
+    code, out, _ = run(serve(summary=summary_with(*done)))
+    assert code == 0 and "no human action" in out
+
+
+def test_an_unreadable_findings_count_is_unknown_and_never_zero(serve):
+    health = {"status": "ok", "health": "degraded", "reasons": ["findings_unreadable"], "open_findings": None}
+    code, out, _ = run(serve(health=health))
+    assert code == 1 and "attention health" in out and "unknown open findings" in out and "None" not in out
+    quiet = {"status": "ok", "health": "ok", "reasons": [], "open_findings": None}  # unknown is never the same as zero
+    code, out, _ = run(serve(health=quiet))
+    assert code == 1 and "attention health" in out and "unknown open findings" in out
+
+
+@pytest.mark.parametrize("rows", [
+    [{"sender_name": "m", "subject": "no id"}],
+    [{"id": "5", "sender_name": "m", "subject": "text id"}],
+    [{"id": True, "sender_name": "m", "subject": "bool id"}],
+    [{"id": 5, "sender_name": "m", "subject": "ok"}, "not an object"],
+])
+def test_an_inbox_row_that_cannot_be_counted_is_an_error_with_no_cursor(serve, token_file, rows):
+    code, out, _ = run(serve(inbox=rows), "--supervisor-token-file", str(token_file))
+    assert code == 2 and "error inbox: the answer has no valid message ids" in out and "highest inbox id" not in out
+
+
+def test_a_directory_as_the_token_file_is_a_setup_error_and_exit_2(serve, tmp_path):
+    fake = serve()
+    code, out, err = run(fake, "--supervisor-token-file", str(tmp_path))
+    assert code == 2 and fake.seen == [] and "regular file" in err and "Traceback" not in out + err
+    with pytest.raises(_common.ConfigError, match="regular file"):
+        _common.read_token_file(tmp_path)
+
+
+def test_a_token_file_that_is_not_text_is_a_setup_error_and_exit_2(serve, tmp_path):
+    binary = tmp_path / "binary.token"
+    binary.write_bytes(b"\xff\xfe\x00\x80")
+    binary.chmod(0o600)
+    fake = serve()
+    code, out, err = run(fake, "--supervisor-token-file", str(binary))
+    assert code == 2 and fake.seen == [] and "Traceback" not in out + err
