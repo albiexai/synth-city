@@ -174,7 +174,9 @@ async def record_effort_wait_started(
     leader_member_id: int, source: str,
 ) -> None:
     """#1299: the effort-limit notice to the Leader starts a wait on the Leader's extension decision."""
-    operation_id = f"{EFFORT_STARTED}:message:{notice_id}"  # a repeat replays identically and adds nothing
+    operation_id = f"{EFFORT_STARTED}:message:{notice_id}"
+    if await _once(db, operation_id):  # rebuilt on every reconciliation; the owner may have changed since
+        return
     await audit.record_event(
         db, event_kind=EFFORT_STARTED, source=source, occurred_at=datetime.utcnow(), fact_source="mail_messages",
         fact_time=audit._naive(noticed_at), item_id=item_id,
@@ -188,14 +190,16 @@ async def record_effort_wait_started(
 
 async def record_effort_wait_ended(
     db: AsyncSession, *, item_id: int, outcome: str, ended_at: datetime, source: str,
-    answered_by_member_id: int | None = None,
+    answered_by_member_id: int | None = None, notice_ids: list[int] | None = None,
 ) -> None:
-    """End the item's open effort wait in its current lifetime: by an extension, or when the item ends."""
+    """End the item's open effort waits in its current lifetime, or only those of ``notice_ids``."""
     item_key = await audit.current_context_key(db, "item", item_id)
     if item_key is None:
         return
     starts = (await db.scalars(select(FactoryAuditEvent).where(
-        FactoryAuditEvent.event_kind == EFFORT_STARTED, FactoryAuditEvent.item_context_key == item_key))).all()
+        FactoryAuditEvent.event_kind == EFFORT_STARTED, FactoryAuditEvent.item_context_key == item_key,
+        True if notice_ids is None else FactoryAuditEvent.operation_id.in_(
+            [f"{EFFORT_STARTED}:message:{n}" for n in notice_ids])))).all()
     for started in starts:
         operation_id = started.operation_id.replace(EFFORT_STARTED, EFFORT_ENDED, 1)
         if await _once(db, operation_id):

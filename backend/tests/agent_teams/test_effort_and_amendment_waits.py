@@ -91,6 +91,98 @@ async def test_an_escalated_item_keeps_its_wait_open(fx):
     assert [event.event_kind for event in await _effort_events(fx)] == [waits.EFFORT_STARTED]
 
 
+async def _interrupted_at_limit(fx, monkeypatch):
+    """V1 on 37eeada9: the Leader's notice is durable but the wait start was never written."""
+    from app.services import github_effort_limit_service as effort
+
+    async def interrupted(*_args, **_kwargs):
+        raise RuntimeError("interrupted after the notice")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(effort.decision_waits, "record_effort_wait_started", interrupted)
+        with pytest.raises(RuntimeError):
+            await _at_limit(fx)
+    assert len(await _leader_notice(fx)) == 1 and await _effort_events(fx) == []
+
+
+async def test_an_extension_after_an_interrupted_start_records_the_whole_episode(fx, monkeypatch):
+    await _interrupted_at_limit(fx, monkeypatch)
+    await _extend(fx, 3)  # also the concurrent case: the extension sees the notice before the start
+    (notice,) = await _leader_notice(fx)
+    start, end = await _effort_events(fx)
+    assert (start.after_values["wait_message_id"], start.fact_time) == (notice.id, notice.created_at)
+    assert (end.after_values["wait_outcome"], end.after_values["answered_by_member_id"], end.fact_time) == (
+        "extended", fx.leader, T0)
+    async with fx.maker() as session:  # the interrupted writer finishing late adds nothing
+        from app.services import github_effort_limit_service as effort
+        await effort.effort_limit_service._record_effort_waits(session, fx.item_id, now=T0 + timedelta(minutes=9))
+        await session.commit()
+        assert await waits.unended_decision_waits(session, now=T0 + timedelta(hours=1)) == []
+    assert len(await _effort_events(fx)) == 2
+
+
+async def test_an_item_end_after_an_interrupted_start_records_the_whole_episode(fx, monkeypatch):
+    await _interrupted_at_limit(fx, monkeypatch)
+    await _set(fx, dispatch_status="merged")
+    await _tick(fx, T0 + timedelta(minutes=3))
+    start, end = await _effort_events(fx)
+    assert start.event_kind == waits.EFFORT_STARTED and end.after_values["wait_outcome"] == "item_ended"
+
+
+@pytest.mark.parametrize("found_by", ["a later extension", "reconciliation"])
+async def test_a_notice_the_extension_did_not_answer_ends_unattributed(fx, monkeypatch, found_by):
+    from app.services import github_effort_limit_service as effort
+    await _interrupted_at_limit(fx, monkeypatch)
+
+    async def unseen(*_args, **_kwargs):  # the first extension did not see the notice: it was committed later
+        return None
+
+    with monkeypatch.context() as patched:
+        patched.setattr(effort.effort_limit_service, "_record_effort_waits", unseen)
+        await _extend(fx, 3)
+    if found_by == "a later extension":
+        await _extend(fx, 3, expected=3)
+    else:  # the next limit's notice finds it; it ends at the extension's time and the new wait stays open
+        await _set(fx, effort_elapsed_seconds=18 * 60 - 1, effort_last_tick_at=T0 + timedelta(minutes=5))
+        await _tick(fx, T0 + timedelta(minutes=5, seconds=2))
+    end = next(e for e in await _effort_events(fx) if e.event_kind == waits.EFFORT_ENDED)
+    assert (end.after_values["wait_outcome"], end.after_values["answered_by_member_id"]) == ("extended", None)
+    assert (end.actor_member_id, end.fact_time) == (None, T0)
+    if found_by == "reconciliation":
+        later = (await _leader_notice(fx))[-1]
+        async with fx.maker() as session:
+            open_waits = await waits.unended_decision_waits(session, now=T0 + timedelta(hours=1))
+        assert [(w.wait_kind, w.request_id) for w in open_waits] == [("effort", later.id)]
+
+
+async def test_another_attempts_notice_is_not_ended_by_this_attempts_extension(fx):
+    from app.services.github_effort_limit_service import effort_limit_service
+    await _at_limit(fx)
+    await _set(fx, dispatch_nonce="the-next-attempt", effort_extension_minutes=3)
+    async with fx.maker() as session:
+        await effort_limit_service._record_effort_waits(session, fx.item_id, now=T0 + timedelta(minutes=1))
+        await session.commit()
+    assert [e.event_kind for e in await _effort_events(fx)] == [waits.EFFORT_STARTED]
+
+
+async def test_rebuilding_after_an_owner_change_keeps_the_recorded_start(fx):
+    from app.services.github_effort_limit_service import effort_limit_service
+    await _at_limit(fx)
+    await _set(fx, owner_slot_id=None)
+    async with fx.maker() as session:
+        await effort_limit_service._record_effort_waits(session, fx.item_id, now=T0 + timedelta(minutes=1))
+        await session.commit()
+    (start,) = await _effort_events(fx)
+    assert start.after_values["owner_member_id"] == fx.owner
+
+
+async def test_the_next_tick_at_the_limit_writes_an_interrupted_start(fx, monkeypatch):
+    await _interrupted_at_limit(fx, monkeypatch)
+    await _tick(fx, T0 + timedelta(seconds=62))
+    (start,) = await _effort_events(fx)
+    assert start.after_values["wait_message_id"] == (await _leader_notice(fx))[0].id
+
+
 async def test_an_unanswered_effort_wait_stays_open_with_its_age(fx):
     await _at_limit(fx)
     (notice,) = await _leader_notice(fx)
@@ -122,6 +214,8 @@ async def test_ending_a_reused_items_wait_leaves_the_deleted_items_wait_unknown(
         await audit.context_key_for(session, "item", fx.item_id)  # the new item's own lifetime
         await waits.record_effort_wait_ended(session, item_id=fx.item_id, outcome="extended", ended_at=T0,
                                              answered_by_member_id=fx.leader, source="test")
+        from app.services.github_effort_limit_service import effort_limit_service
+        await effort_limit_service._record_effort_waits(session, fx.item_id, now=T0)  # the old notice is not its own
         await session.commit()
         assert await _events(session, (waits.EFFORT_ENDED,)) == []
         (wait,) = await waits.unended_decision_waits(session, now=T0 + timedelta(hours=1))
