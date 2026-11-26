@@ -33,12 +33,16 @@ T0 = datetime(2026, 11, 20, 9, 0, 0)
 OPERATOR = audit.derive_actor(actor_kind="operator")
 
 
+def _app_pragmas(connection, _record):
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("PRAGMA journal_mode=WAL")
+
+
 @pytest_asyncio.fixture
 async def db(tmp_path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'campaigns.db'}")
     # As the application runs SQLite (V1 review 6072435444): with foreign keys enforced.
-    event.listen(engine.sync_engine, "connect", lambda connection, _record: connection.execute(
-        "PRAGMA foreign_keys=ON"))
+    event.listen(engine.sync_engine, "connect", _app_pragmas)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     try:
@@ -296,12 +300,52 @@ async def test_a_retired_campaign_never_reads_the_replacement_teams_repositories
     await db.flush()
     db.add(TeamGithubScope(preset_id=world.team, repo_owner="o", repo_name="c1", repo_path="/private/c1",
                            enabled=True))
+    await audit.context_key_for(db, "team", world.team)  # the new team's own lifetime is live
     await db.commit()
     github = FakeGithub(labelled={"c1": [_issue("c1", 7)]})
     membership = await campaigns.members(db, campaign, github)
     assert membership.members == [] and membership.complete is False
     assert membership.unavailable == "team_retired" and not getattr(github, "read", [])
     assert await campaigns.current(db, world.team) is None
+
+
+async def test_a_replacement_during_the_membership_read_is_never_queried(db, world, tmp_path):
+    """V1 review 6073257579: a second session replaces the team while the first is reading its lifetime."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    campaign = await campaigns.start(db, world.team, "label:v4.4", started_at=T0, actor=OPERATOR)
+    other = create_engine(f"sqlite:///{tmp_path / 'campaigns.db'}")
+    event.listen(other, "connect", _app_pragmas)
+    fired = []
+
+    def replace(_conn, _cursor, statement, _parameters, _context, _many):
+        if fired or "factory_context_keys" not in statement:
+            return
+        fired.append(statement)
+        scopes = "SELECT id FROM team_github_scopes WHERE preset_id = :team"
+        with other.begin() as writer:  # a real second connection commits the replacement mid-read
+            writer.execute(text(f"DELETE FROM github_work_items WHERE scope_id IN ({scopes})"), {"team": world.team})
+            writer.execute(text("DELETE FROM team_github_scopes WHERE preset_id = :team"), {"team": world.team})
+            writer.execute(text("DELETE FROM agent_team_presets WHERE id = :team"), {"team": world.team})
+        with Session(other) as writer:
+            writer.add(AgentTeamPreset(id=world.team, name="Replacement"))
+            writer.flush()
+            writer.add(TeamGithubScope(preset_id=world.team, repo_owner="o", repo_name="c1",
+                                       repo_path="/private/c1", enabled=True))
+            writer.commit()
+
+    sync_engine = db.bind.sync_engine
+    event.listen(sync_engine, "after_cursor_execute", replace)
+    github = FakeGithub(labelled={"a1": [_issue("a1", 1)], "a2": [], "c1": [_issue("c1", 7)]})
+    try:
+        membership = await campaigns.members(db, campaign, github)
+    finally:
+        event.remove(sync_engine, "after_cursor_execute", replace)
+        other.dispose()
+    assert fired  # the replacement really landed during the read
+    assert "c1" not in getattr(github, "read", [])
+    assert [(m.repo, m.issue_number) for m in membership.members] == [("o/a1", 1)]
 
 
 async def test_a_deferral_survives_deleting_its_work_item(db, world):

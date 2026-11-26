@@ -12,12 +12,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import and_, select
 
 from app.models.database import (
     AgentTeamPreset,
     Campaign,
     FactoryAuditEvent,
+    FactoryContextKey,
     TeamGithubScope,
 )
 from app.services import factory_audit_service as audit
@@ -115,12 +116,17 @@ async def members(db, campaign: Campaign, client) -> CampaignMembership:
     """The campaign's members in every repository its team watches, and the issues that left it."""
     kind, value = parse_selector(campaign.selector)
     membership = CampaignMembership(departures=await _departures(db, campaign))
-    # Only the campaign's own team lifetime: a preset id reused by a new team never lends it its repositories.
-    if await audit.current_context_key(db, "team", campaign.preset_id) != campaign.team_context_key:
+    # Only the campaign's own team lifetime: a preset id reused by a new team never lends it its repositories. The
+    # lifetime and its scopes come from one statement, one snapshot (V1 review 6073257579): a replacement landing
+    # between two reads can't hand over its repositories.
+    scopes = (await db.scalars(select(TeamGithubScope).join(FactoryContextKey, and_(
+        FactoryContextKey.key_kind == "team", FactoryContextKey.numeric_id == TeamGithubScope.preset_id,
+        FactoryContextKey.context_key == campaign.team_context_key, FactoryContextKey.retired_at.is_(None),
+    )).where(TeamGithubScope.preset_id == campaign.preset_id)
+        .order_by(TeamGithubScope.repo_owner, TeamGithubScope.repo_name))).all()
+    if not scopes and await audit.current_context_key(db, "team", campaign.preset_id) != campaign.team_context_key:
         membership.unavailable = "team_retired"
         return membership
-    scopes = (await db.scalars(select(TeamGithubScope).where(TeamGithubScope.preset_id == campaign.preset_id)
-                               .order_by(TeamGithubScope.repo_owner, TeamGithubScope.repo_name))).all()
     departed = {(d.repo, d.issue_number) for d in membership.departures}
     for scope in scopes:
         repo = f"{scope.repo_owner}/{scope.repo_name}"
