@@ -4,6 +4,7 @@ The sharded backend job loads it with ``-p tests.ci_shard_identity --identity-ou
 these executed identities with the collected ones, so a test that was collected but never ran, or ran twice,
 is noticed. Each line is a JSON object: ``{"id": <node id>, "outcome": <outcome>, "runs": <int>}``. The outcome
 is the worst of the setup, call and teardown reports: error, failed, xpassed, xfailed, skipped, passed.
+A failed report also records its concise pytest exception message as ``failure_signature`` when available.
 """
 from __future__ import annotations
 
@@ -33,6 +34,12 @@ def pytest_runtest_logreport(report):
     outcome = _phase_outcome(report)
     if _RANK[outcome] > _RANK[record["outcome"]]:
         record["outcome"] = outcome
+        if report.failed:
+            record.pop("failure_signature", None)
+            crash = getattr(report.longrepr, "reprcrash", None)
+            message = getattr(crash, "message", None)
+            if isinstance(message, str) and message.strip():
+                record["failure_signature"] = message.strip()
 
 
 def pytest_sessionfinish(session):

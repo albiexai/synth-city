@@ -72,6 +72,7 @@ def test_the_gate_cannot_pass_on_a_failed_cancelled_or_skipped_shard():
 def test_the_gate_proves_the_partition_and_keeps_the_fixtures_check():
     text = _steps_text(_gate())
     assert "scripts/ci/backend_shard_identities.py" in text
+    assert "--registry .workflow-ci/.github/known-flakes.json" in text
     assert "--collect-only" in text and "--ignore=tests/test_cc_bridge_real_sudo.py" in text
     downloads = [step for step in _gate()["steps"] if step.get("uses", "").startswith("actions/download-artifact@")]
     assert len(downloads) == 1 and downloads[0]["with"] == {
@@ -92,9 +93,21 @@ def test_each_shard_collects_then_runs_with_the_identity_plugin_and_keeps_its_ar
     assert len(uploads) == 1
     assert uploads[0]["with"]["name"] == "backend-test-timings-${{ matrix.shard }}-attempt-${{ github.run_attempt }}"
     assert uploads[0]["with"]["if-no-files-found"] == "error"
-    for kind in ("collected.txt", "executed.jsonl"):
+    for kind in ("collected.txt", "executed.jsonl", "pytest-exit.txt"):
         assert f"backend-shard-${{{{ matrix.shard }}}}-{kind}" in uploads[0]["with"]["path"]
     assert (ROOT / "backend" / "tests" / "ci_shard_identity.py").is_file()
+
+
+def test_shard_defers_only_pytest_test_failures_and_records_the_real_exit(tmp_path):
+    step = next(step for step in _jobs()["backend"]["steps"]
+                if step.get("name") == "Run this shard of the backend suite")
+    assert not step.get("continue-on-error", False)
+    run = step["run"].replace("${{ matrix.shard }}", "1")
+    (tmp_path / "backend-shard-files.txt").write_text("tests/test_example.py\n", encoding="utf-8")
+    for code in (0, 1, 2, 3, 4, 5, 6, 139):
+        result = subprocess.run(["bash", "-e", "-c", f"python() {{ return {code}; }}\n{run}"], cwd=tmp_path)
+        assert result.returncode == (0 if code <= 1 else code)
+        assert (tmp_path / "backend-shard-1-pytest-exit.txt").read_text(encoding="utf-8") == f"{code}\n"
 
 
 def test_no_job_adds_a_permission_and_the_real_sudo_job_is_unchanged():

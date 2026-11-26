@@ -84,7 +84,14 @@ jobs:
         working-directory: backend
         # The 30 slowest tests go to the log. The JUnit file keeps the time of every test case (#866). The
         # identity plugin records every executed test once, for the partition check of the gate (#1013).
-        run: python -m pytest $(cat backend-shard-files.txt) -q --tb=short -p tests.ci_shard_identity --identity-out=backend-shard-${{ matrix.shard }}-executed.jsonl --durations=30 --durations-min=1.0 --junitxml=backend-junit-${{ matrix.shard }}.xml
+        # The gate evaluates ordinary test failures using the identities, JUnit and pytest exit status.
+        run: |
+          pytest_exit=0
+          python -m pytest $(cat backend-shard-files.txt) -q --tb=short -p tests.ci_shard_identity --identity-out=backend-shard-${{ matrix.shard }}-executed.jsonl --durations=30 --durations-min=1.0 --junitxml=backend-junit-${{ matrix.shard }}.xml || pytest_exit=$?
+          printf '%s\n' "$pytest_exit" > backend-shard-${{ matrix.shard }}-pytest-exit.txt
+          if [ "$pytest_exit" -gt 1 ]; then
+            exit "$pytest_exit"
+          fi
       - name: Keep the backend test timings and identities
         # Runs after a failed suite too, so a failing run still keeps what pytest wrote.
         if: always() && steps.changes.outputs.run_suites != 'false'
@@ -95,11 +102,12 @@ jobs:
             backend/backend-junit-${{ matrix.shard }}.xml
             backend/backend-shard-${{ matrix.shard }}-collected.txt
             backend/backend-shard-${{ matrix.shard }}-executed.jsonl
+            backend/backend-shard-${{ matrix.shard }}-pytest-exit.txt
           if-no-files-found: error
           retention-days: 14
 
-  # The required check keeps its name and meaning (#1013). It passes only when every shard succeeded and the
-  # shards together ran every test of the full collection exactly once.
+  # Every shard must complete and together they must run the full collection exactly once (#1013).
+  # The gate permits ordinary test failures only when they match the known-flakes registry (#1303).
   backend-gate:
     name: Full backend regression tests
     needs: backend
@@ -183,7 +191,10 @@ jobs:
           grep '::' backend-full-collect.txt > backend-full-collected.txt
       - name: Prove that the shards ran every test exactly once
         if: steps.changes.outputs.run_suites != 'false'
-        run: python .workflow-ci/scripts/ci/backend_shard_identities.py --full candidate/backend/backend-full-collected.txt --artifacts shard-artifacts --shards ${{ env.BACKEND_SHARDS }}
+        run: >-
+          python .workflow-ci/scripts/ci/backend_shard_identities.py
+          --full candidate/backend/backend-full-collected.txt --artifacts shard-artifacts --shards ${{ env.BACKEND_SHARDS }}
+          --registry .workflow-ci/.github/known-flakes.json
       - name: Check the active factory fixtures
         if: steps.changes.outputs.run_suites != 'false'
         working-directory: candidate
