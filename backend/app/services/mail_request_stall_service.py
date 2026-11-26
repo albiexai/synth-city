@@ -24,7 +24,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import aliased
 
 from app.config import settings
-from app.models.database import MailExternalActor, MailMessage, MailTeamMember
+from app.models.database import AgentTeamPreset, MailExternalActor, MailMessage, MailTeamMember
 from app.models.schemas import MAIL_REQUEST_KINDS, UnansweredRequestItem, UnansweredRequestView
 from app.services.factory_audit_service import sanitize_text
 
@@ -308,7 +308,9 @@ class MailRequestStallService:
 
     async def _observe(self, db, preset_id, now, native_states, native_ok,
                        native_fence=None, native_baseline=_UNSET, native_failure=None) -> UnansweredRequestView:
-        threshold = int(settings.mail_request_unanswered_seconds)
+        preset = await db.get(AgentTeamPreset, preset_id, populate_existing=True)
+        override = preset.mail_request_unanswered_seconds if preset is not None else None
+        threshold = override if override is not None else settings.mail_request_unanswered_seconds
         page, more = await self._candidates(db, preset_id)
         reasons: set[str] = {native_failure} if native_failure else set()
         if await self._nested_ambiguous(db, preset_id, now, threshold):

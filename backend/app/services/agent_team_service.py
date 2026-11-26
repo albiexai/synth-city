@@ -44,6 +44,7 @@ from app.models.schemas import (
     AgentTeamSlotCreate,
     AgentTeamSlotResponse,
     AgentTeamSlotUpdate,
+    TeamWorkSettings,
 )
 from app.services import agent_mail_install_service, opencode_version
 from app.services.agent_bridge.discovery import discover_agent_sessions
@@ -103,6 +104,7 @@ class TeamDeletionConflictError(ValueError):
 
 
 _UNSET = object()
+TEAM_WORK_SETTINGS_AUDIT_SOURCE = "agent_team_service.update_work_settings"
 _OPTION_FIELDS = {field.name for field in fields(SpawnCommandOptions)}
 _PROVIDER_IDS = {provider.id for provider in get_providers()}
 _MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$")
@@ -189,7 +191,7 @@ class AgentTeamService:
         reason: str,
     ) -> AgentTeamPresetResponse:
         """Change Leader authority only while the team is stopped and quiescent."""
-        preset = await self._lock_preset_for_slot_mutation(db, preset_id)
+        preset = await self._lock_preset_for_mutation(db, preset_id)
         expected_time = expected_updated_at.replace(tzinfo=None)
         if (preset.leader_slot_id != expected_leader_slot_id
                 or preset.updated_at != expected_time):
@@ -282,6 +284,7 @@ class AgentTeamService:
         planned_decisions: list | None | object = _UNSET,
         leader_ack_timeout_seconds: int | None | object = _UNSET,
         leader_ack_max_wait_seconds: int | None | object = _UNSET,
+        work_settings: TeamWorkSettings | None = None,
         actor: dict | None = None,
         session_invalid: bool = False,
     ) -> AgentTeamPresetResponse:
@@ -298,7 +301,9 @@ class AgentTeamService:
         validated_campaign = AgentTeamPresetUpdate(**campaign_changes)
         if parent_issue_url is not _UNSET:
             parent_issue_url = AgentTeamPresetUpdate(parent_issue_url=parent_issue_url).parent_issue_url
-        preset = await self._require_preset(db, preset_id)
+        changes = work_settings.model_dump(exclude_unset=True) if work_settings else {}
+        preset = (await self._lock_preset_for_mutation(db, preset_id)
+                  if changes else await self._require_preset(db, preset_id))
         initial = (preset.leader_ack_timeout_seconds if leader_ack_timeout_seconds is _UNSET
                    else leader_ack_timeout_seconds)
         maximum = (preset.leader_ack_max_wait_seconds if leader_ack_max_wait_seconds is _UNSET
@@ -306,6 +311,21 @@ class AgentTeamService:
         _validate_ack_windows(initial, maximum)
         preset.leader_ack_timeout_seconds = initial
         preset.leader_ack_max_wait_seconds = maximum
+        before = {name: getattr(preset, name) for name, value in changes.items() if getattr(preset, name) != value}
+        if before:
+            after = {name: changes[name] for name in before}
+            preset.mail_request_unanswered_seconds = after.get(
+                "mail_request_unanswered_seconds", preset.mail_request_unanswered_seconds)
+            preset.github_team_idle_timeout_seconds = after.get(
+                "github_team_idle_timeout_seconds", preset.github_team_idle_timeout_seconds)
+            preset.github_publish_summaries_enabled = after.get(
+                "github_publish_summaries_enabled", preset.github_publish_summaries_enabled)
+            await _audit.record_event(
+                db, event_kind="policy_change", source=TEAM_WORK_SETTINGS_AUDIT_SOURCE,
+                occurred_at=datetime.utcnow(), actor=audit_actor, team_preset_id=preset.id,
+                before_values=before, after_values=after, context_snapshot=audit_snapshot,
+                action_outcome="applied", sanitized_reason="team work settings changed",
+            )
         if parent_issue_url is not _UNSET:
             preset.parent_issue_url = parent_issue_url
         campaign_before: dict = {}
@@ -540,6 +560,9 @@ class AgentTeamService:
             parent_issue_url=source.parent_issue_url,
             leader_ack_timeout_seconds=source.leader_ack_timeout_seconds,
             leader_ack_max_wait_seconds=source.leader_ack_max_wait_seconds,
+            mail_request_unanswered_seconds=source.mail_request_unanswered_seconds,
+            github_team_idle_timeout_seconds=source.github_team_idle_timeout_seconds,
+            github_publish_summaries_enabled=source.github_publish_summaries_enabled,
             backlog_milestone=source.backlog_milestone,
             planned_decisions=([dict(decision) for decision in source.planned_decisions]
                                if source.planned_decisions is not None else None),
@@ -2046,10 +2069,10 @@ class AgentTeamService:
             raise ValueError("Agent team slot not found")
         return slot
 
-    async def _lock_preset_for_slot_mutation(
+    async def _lock_preset_for_mutation(
         self, db: AsyncSession, preset_id: int
     ) -> AgentTeamPreset:
-        """Serialize slot changes with authority assignment before reading state."""
+        """Serialize protected preset and slot mutations before reading state."""
         if db.get_bind().dialect.name != "sqlite":
             raise ValueError("leader_assignment_protection_unavailable")
         if not db.in_transaction():
@@ -2081,7 +2104,7 @@ class AgentTeamService:
         )).scalar_one_or_none()
         if preset_id is None:
             raise ValueError("Agent team slot not found")
-        preset = await self._lock_preset_for_slot_mutation(db, preset_id)
+        preset = await self._lock_preset_for_mutation(db, preset_id)
         slot = (await db.execute(
             select(AgentTeamSlot).where(
                 AgentTeamSlot.id == slot_id,
