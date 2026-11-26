@@ -5,6 +5,8 @@ import asyncio
 import errno
 import os
 import subprocess
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -122,6 +124,110 @@ async def test_failed_provision_preserves_unverified_public_path(checkout):
     assert (destination / "retained.txt").read_text(encoding="utf-8") == "owned by another workspace"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["staged", "common_dir", "source", "parent", "published"])
+async def test_provision_refuses_changed_identity_at_each_boundary(checkout, monkeypatch, boundary):
+    from app.services import dispatch_workspace_provisioning as provisioning
+
+    scope, destination, private_root = checkout
+    repo = Path(scope.repo_path)
+    service = GithubWorkspaceService()
+    original_verify = provisioning._verify_path
+    original_probe = service._probe_identity
+    original_backlink = provisioning._owned_backlink
+    source_checks = 0
+    backlink_open = False
+
+    def verify(path, identity):
+        nonlocal source_checks
+        if path == repo:
+            source_checks += 1
+        if ((boundary == "staged" and path.is_relative_to(private_root))
+                or (boundary == "source" and path == repo and source_checks > 1)
+                or (boundary == "parent" and path == destination.parent)
+                or (boundary == "published" and path == destination and backlink_open)):
+            identity = (identity[0], -1)
+        original_verify(path, identity)
+
+    async def probe(path):
+        result = await original_probe(path)
+        if boundary == "common_dir" and Path(path).name == destination.name:
+            git_dir, _, top = result
+            return git_dir, str(private_root / "another-common-dir"), top
+        return result
+
+    @contextmanager
+    def open_backlink(*args):
+        nonlocal backlink_open
+        assert boundary != "common_dir", "The probe must reject another common directory before opening a backlink"
+        with original_backlink(*args) as stream:
+            backlink_open = True
+            try:
+                yield stream
+            finally:
+                backlink_open = False
+
+    monkeypatch.setattr(provisioning, "_verify_path", verify)
+    monkeypatch.setattr(service, "_probe_identity", probe)
+    monkeypatch.setattr(provisioning, "_owned_backlink", open_backlink)
+
+    with pytest.raises(GithubWorkspaceError) as refused:
+        await provisioning.provision_owned_worktree(service, scope, destination, staging_root=private_root)
+
+    assert refused.value.block_code == "workspace_path_changed"
+    assert f"worktree {destination}" not in git(repo, "worktree", "list", "--porcelain")
+    assert destination.exists() == (boundary == "published")
+
+
+@pytest.mark.parametrize("fault", ["content", "owner", "link_count"])
+def test_worktree_backlink_requires_its_original_content_and_ownership(tmp_path, monkeypatch, fault):
+    from app.services import dispatch_workspace_provisioning as provisioning
+
+    common_dir = tmp_path / "git"
+    git_dir = common_dir / "worktrees" / "fixture"
+    git_dir.mkdir(parents=True)
+    staged = tmp_path / "staged"
+    backlink = git_dir / "gitdir"
+    target = tmp_path / "different-checkout" if fault == "content" else staged
+    content = os.fsencode(target / ".git") + b"\n"
+    backlink.write_bytes(content)
+    original = backlink.stat()
+    fstat = os.fstat
+
+    def observed_stat(fd):
+        info = fstat(fd)
+        if (info.st_dev, info.st_ino) != (original.st_dev, original.st_ino):
+            return info
+        return SimpleNamespace(st_mode=info.st_mode, st_uid=info.st_uid + int(fault == "owner"),
+                               st_nlink=info.st_nlink + int(fault == "link_count"))
+
+    monkeypatch.setattr(provisioning.os, "fstat", observed_stat)
+    with pytest.raises(GithubWorkspaceError):
+        with provisioning._owned_backlink(git_dir, common_dir, staged):
+            pytest.fail("An unverified backlink was opened for writing")
+
+    assert backlink.read_bytes() == content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [0o770, 0o702])
+async def test_worktree_staging_directory_must_be_private(checkout, mode):
+    from app.services.dispatch_workspace_provisioning import provision_owned_worktree
+
+    scope, destination, private_root = checkout
+    private_root.chmod(mode)
+
+    async def runner(_arguments):
+        pytest.fail("Git ran without a private staging directory")
+
+    with pytest.raises(GithubWorkspaceError) as refused:
+        await provision_owned_worktree(GithubWorkspaceService(runner), scope, destination, staging_root=private_root)
+
+    assert refused.value.block_code == "workspace_staging_unavailable"
+    assert list(private_root.iterdir()) == []
+    assert not destination.exists()
+
+
 @pytest_asyncio.fixture
 async def scope_database(tmp_path, monkeypatch, checkout):
     from app.services import dispatch_workspace_provisioning as provisioning
@@ -159,8 +265,6 @@ async def scope_database(tmp_path, monkeypatch, checkout):
 
 @pytest.mark.asyncio
 async def test_scope_create_grow_and_shrink_preserve_existing_leased_worktree(scope_database):
-    from datetime import datetime
-
     sessions, repo, team_id = scope_database
     async with sessions() as db:
         scope = await agent_teams.create_github_scope(team_id, TeamGithubScopeCreate(repo_owner="example",
@@ -239,7 +343,7 @@ async def test_concurrent_pool_reservations_keep_unverified_checkout_disabled(sc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["scope", "trust", "capacity"])
+@pytest.mark.parametrize("change", ["scope", "trust", "capacity", "directory", "leased_row", "replaced_row"])
 async def test_scope_or_trust_changed_before_publication_keeps_workspace_disabled(scope_database, monkeypatch, change):
     from app.services import dispatch_workspace_provisioning as provisioning
 
@@ -251,21 +355,48 @@ async def test_scope_or_trust_changed_before_publication_keeps_workspace_disable
         await db.flush()
         scope_id = scope.id
 
-    async def change_before_enable(*args):
+    verify = provisioning._verify_path
+    ending_identity = None
+
+    def verify_at_finalization(path, identity):
+        if ending_identity is not None and path == ending_identity:
+            identity = (identity[0], -1)
+        verify(path, identity)
+
+    async def change_before_enable(_repo, path, _identity):
+        nonlocal ending_identity
         if change == "trust":
             raise GithubWorkspaceError("Fixture trust unavailable", "workspace_git_trust_unavailable")
+        if change == "directory":
+            ending_identity = path
+            return
         async with sessions.begin() as db:
             if change == "scope":
                 (await db.get(TeamGithubScope, scope_id)).base_ref = "different"
-            else:
+            elif change == "capacity":
                 db.add(GithubWorkspace(scope_id=scope_id, path=str(Path(repo).parent / "other-worktree")))
+            else:
+                row = await db.scalar(select(GithubWorkspace).where(GithubWorkspace.path == str(path)))
+                if change == "replaced_row":
+                    row.created_at += timedelta(seconds=1)
+                else:
+                    item = GithubWorkItem(scope_id=scope_id, issue_number=42, issue_title="Fixture lease",
+                        issue_url="https://github.com/example/fixture/issues/42", github_updated_at=datetime.utcnow())
+                    db.add(item)
+                    await db.flush()
+                    row.leased_item_id = item.id
 
+    monkeypatch.setattr(provisioning, "_verify_path", verify_at_finalization)
     monkeypatch.setattr(provisioning, "prepare_dispatch_workspace_trust", change_before_enable)
     async with sessions() as db:
         await provisioning.ensure_dispatch_capacity(db, scope_id, agent_teams._reserve_scope_writer)
         workspace = await db.scalar(select(GithubWorkspace).where(GithubWorkspace.path.endswith("/dispatch-1")))
         assert not workspace.enabled and not workspace.dispatchable
         assert provisioning.automatic_provision_is_incomplete(workspace)
+        if change in {"leased_row", "replaced_row"}:
+            assert workspace.provision_error == provisioning._PENDING
+        if change == "leased_row":
+            assert workspace.leased_item_id is not None
         assert Path(workspace.path, "example.txt").is_file()
 
 
