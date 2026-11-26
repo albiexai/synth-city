@@ -12,8 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.database import (
     AgentTeamPreset,
     AgentTeamSlot,
+    FactoryAuditEvent,
     GithubAttemptScopeRevision,
     GithubWorkItem,
+    GithubWorkspace,
     MailMessage,
     TeamGithubScope,
 )
@@ -22,9 +24,9 @@ from app.services.github_dispatch_service import github_dispatch_service
 from app.services.github_dispatch_priority import priority_from_labels
 from app.services.agent_team_campaign_service import agent_team_campaign_service
 from app.services.github_rate_limit_service import GithubRateLimited
+from app.services.github_terminal_revision_service import TERMINAL_ITEMS
 from app.services.operations_health_service import operations_health_service
 from app.services.session_recovery import recover_session
-from app.services.work_item_states import FINISHED_STATUSES
 
 _ACTIVE_STATUSES = ("dispatched", "verifying", "awaiting_human_review")
 _RECOVERABLE_STATUSES = ("failed", "escalated")
@@ -199,14 +201,47 @@ def milestone_title(issue):
     return title if isinstance(title, str) else None
 
 
-async def _owned_elsewhere(db, scope, number):
+async def _admission_blocked(db, scope, number):
     return await db.scalar(select(GithubWorkItem.id).join(TeamGithubScope).where(
-        *_repository_scope(scope), GithubWorkItem.issue_number == number, GithubWorkItem.scope_id != scope.id,
-        (GithubWorkItem.dispatch_status.not_in(FINISHED_STATUSES) | (GithubWorkItem.dispatch_status == "merged")),
+        *_repository_scope(scope), GithubWorkItem.issue_number == number,
+        (GithubWorkItem.dispatch_status == "merged") | (
+            (GithubWorkItem.scope_id != scope.id)
+            & (GithubWorkItem.dispatch_status.not_in(TERMINAL_ITEMS)
+               | select(GithubWorkspace.id).where(GithubWorkspace.leased_item_id == GithubWorkItem.id).exists())
+        ),
     ).limit(1)) is not None
 
 
-async def defer_milestone_exit(db, scope, item, title):
+def _milestone_deferral_facts():
+    return (
+        FactoryAuditEvent.event_kind == "stopped_work_item_ended",
+        FactoryAuditEvent.source == "github_end_stopped_item_service.end_stopped_item",
+        FactoryAuditEvent.action_outcome == "applied",
+        FactoryAuditEvent.after_values["outcome"].as_string() == "deferred",
+    )
+
+
+def _milestone_deferrals(scope, number):
+    return (
+        select(GithubWorkItem)
+        .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
+        .join(FactoryAuditEvent, FactoryAuditEvent.item_id == GithubWorkItem.id)
+        .where(
+            *_repository_scope(scope), GithubWorkItem.issue_number == number,
+            GithubWorkItem.dispatch_status == "cancelled",
+            *_milestone_deferral_facts(),
+        )
+        .order_by(FactoryAuditEvent.id.desc())
+        .limit(1)
+    )
+
+
+async def milestone_predecessor(db, scope, item):
+    previous = await db.scalar(_milestone_deferrals(scope, item.issue_number).where(GithubWorkItem.id != item.id))
+    return (previous.id, previous.dispatch_head_ref) if previous is not None else None
+
+
+async def defer_milestone_exit(db, scope, item, title, updated_at=None):
     from mcp_shim.work_remaining_protocol import public_generation
 
     from app.services import factory_audit_service as audit
@@ -219,7 +254,8 @@ async def defer_milestone_exit(db, scope, item, title):
         reason="The issue left this team's backlog milestone.", target_milestone=(title or "no milestone")[:120])
     try:
         await end_stopped_item(db, item, scope, request, allow_unstarted=True,
-            actor=audit.derive_actor(actor_kind="scheduler", scheduler=_WATCHER_SCHEDULER))
+            actor=audit.derive_actor(actor_kind="scheduler", scheduler=_WATCHER_SCHEDULER),
+            observed_github_updated_at=_parse_gh_ts(updated_at) if updated_at else None)
     except ValueError as exc:
         if item.dispatch_status != "pending" or str(exc) != "item_not_stopped":
             raise
@@ -279,13 +315,32 @@ class GithubWatcherService:
         milestone = routes.get(scope.preset_id)
         admitted = set()
         open_labeled = {issue["number"]: issue for issue in labeled}
+        departures = dict((await db.execute(select(
+            GithubWorkItem.issue_number, GithubWorkItem.github_updated_at,
+        ).join(FactoryAuditEvent, FactoryAuditEvent.item_id == GithubWorkItem.id).where(
+            GithubWorkItem.scope_id == scope_id,
+            GithubWorkItem.dispatch_status == "cancelled",
+            GithubWorkItem.milestone_replaced_at.is_(None),
+            GithubWorkItem.issue_number.in_(open_labeled),
+            *_milestone_deferral_facts(),
+        ).distinct())).all())
         for number, issue in open_labeled.items():
             title = milestone_title(issue)
             matches = {team_id for team_id, configured in routes.items() if configured and configured == title}
             if (matches != {scope.preset_id} if milestone else bool(matches)):
                 continue
-            if await _owned_elsewhere(db, scope, number):
+            if await _admission_blocked(db, scope, number):
                 continue
+            departure = departures.get(number)
+            if departure is not None and _parse_gh_ts(issue["updated_at"]) == departure:
+                # GitHub timestamps have one-second resolution. Confirm an ambiguous return.
+                current = (await client.get_open_issues_by_number(
+                    scope.repo_owner, scope.repo_name, [number]
+                )).get(number)
+                if (current is None or milestone_title(current) != title
+                        or _parse_gh_ts(current["updated_at"]) < departure
+                        or scope.dispatch_label not in {label["name"] for label in current.get("labels", [])}):
+                    continue
             await self._upsert_item(db, scope, issue)
             admitted.add(number)
         # The admitted items are durable before any per-item completion runs: a later
@@ -338,14 +393,29 @@ class GithubWatcherService:
         label_names = {label["name"] for label in issue.get("labels", [])}
         issue_type = "design" if scope.design_label in label_names else "code"
         github_updated_at = _parse_gh_ts(issue["updated_at"])
+        deferrals = _milestone_deferrals(scope, issue["number"])
+        predecessor = await db.scalar(deferrals)
+        if predecessor is not None and github_updated_at < predecessor.github_updated_at:
+            return
         existing = (
             await db.execute(
                 select(GithubWorkItem).where(
                     GithubWorkItem.scope_id == scope.id,
                     GithubWorkItem.issue_number == issue["number"],
+                    GithubWorkItem.milestone_replaced_at.is_(None),
                 )
             )
         ).scalar_one_or_none()
+
+        if existing is not None and existing.dispatch_status == "cancelled":
+            if (github_updated_at < existing.github_updated_at
+                    or await db.scalar(deferrals.where(GithubWorkItem.id == existing.id)) is None
+                    or await db.scalar(select(GithubWorkspace.id).where(
+                        GithubWorkspace.leased_item_id == existing.id)) is not None):
+                return
+            existing.milestone_replaced_at = datetime.utcnow()
+            await db.flush()
+            existing = None
 
         if existing is None:
             db.add(
@@ -447,7 +517,7 @@ class GithubWatcherService:
         observed = issue.get("updated_at")
         if item is not None and item.dispatch_status in ("pending", *_RECOVERABLE_STATUSES) and (
                 observed is None or _parse_gh_ts(observed) >= item.github_updated_at):
-            await defer_milestone_exit(db, scope, item, milestone_title(issue))
+            await defer_milestone_exit(db, scope, item, milestone_title(issue), observed)
 
     async def _reconcile_closed_issues(
         self,

@@ -1252,7 +1252,9 @@ class GithubDispatchService:
 
         # #1081: owner slots a higher-ranked item found busy in this poll. A slot that frees during the walk goes to
         # the top-ranked waiting item on the next poll, not to whichever item is checked next.
-        from app.services.github_watcher_service import defer_milestone_exit, milestone_routes, milestone_title
+        from app.services.github_watcher_service import (
+            defer_milestone_exit, milestone_predecessor, milestone_routes, milestone_title,
+        )
 
         milestone = preset.backlog_milestone if preset else None
         milestone_conflict = milestone and list((await milestone_routes(db, scope)).values()).count(milestone) > 1
@@ -1265,7 +1267,7 @@ class GithubDispatchService:
             details = issue_details_by_number.get(item.issue_number)
             if milestone and details is not None and milestone_title(details) != milestone:
                 try:
-                    await defer_milestone_exit(db, scope, item, milestone_title(details))
+                    await defer_milestone_exit(db, scope, item, milestone_title(details), details.get("updated_at"))
                 except ValueError as exc:
                     if str(exc) != "item_not_stopped":
                         await db.rollback()
@@ -1462,6 +1464,7 @@ class GithubDispatchService:
                     leader_member=leader_member,
                     supervisor=supervisor_address(supervisor),
                     issue_details=issue_details_by_number.get(item.issue_number),
+                    previous_milestone_item=await milestone_predecessor(db, scope, item),
                 )
                 await self._send_dispatch_brief_to_slot(
                     db,
@@ -1574,6 +1577,7 @@ class GithubDispatchService:
         leader_member: MailTeamMember | None = None,
         supervisor: dict | None = None,
         issue_details: dict | None = None,
+        previous_milestone_item: tuple[int, str | None] | None = None,
     ) -> str:
         leader = self._leader_slot(preset_slots, leader_slot_id)
         owner = next((slot for slot in preset_slots if slot.id == owner_slot_id), None)
@@ -1600,6 +1604,10 @@ class GithubDispatchService:
             f"- Pipeline: {item.issue_type}",
             f"- Owner slot: {owner.display_name if owner else owner_slot_id}",
         ]
+        if previous_milestone_item is not None:
+            prior_id, prior_branch = previous_milestone_item
+            branch = f"`{prior_branch}`" if prior_branch else "no recorded branch"
+            lines.append(f"- Previous milestone work item {prior_id}, branch {branch}.")
         if workspace.kind == "worktree":
             lines.extend(
                 [

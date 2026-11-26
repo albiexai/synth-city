@@ -2,6 +2,7 @@
 import hashlib
 import json
 import logging
+import re
 
 from sqlalchemy import event
 from sqlalchemy import text
@@ -204,6 +205,56 @@ def _canonical_payload_fingerprint(payload: dict) -> str:
         ensure_ascii=False,
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+async def _sqlite_migrate_work_item_admissions(conn) -> None:
+    columns = await _sqlite_columns(conn, "github_work_items")
+    if not {"scope_id", "issue_number"} <= columns:
+        return
+    if "milestone_replaced_at" not in columns:
+        await conn.execute(text(
+            "ALTER TABLE github_work_items ADD COLUMN milestone_replaced_at DATETIME"))
+        columns.add("milestone_replaced_at")
+    ddl = await conn.scalar(text(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='github_work_items'"))
+    current_ddl = re.sub(
+        r',\s*CONSTRAINT\s+"?uix_scope_issue"?\s+UNIQUE\s*\(\s*"?scope_id"?\s*,\s*"?issue_number"?\s*\)',
+        "", ddl, flags=re.IGNORECASE,
+    )
+    rebuild = current_ddl != ddl
+    if rebuild:
+        # Keep the same row IDs and inbound references when removing SQLite's inline unique constraint.
+        await conn.commit()
+        await conn.execute(text("PRAGMA foreign_keys=OFF"))
+        await conn.commit()
+    try:
+        if rebuild:
+            await conn.execute(text("BEGIN IMMEDIATE"))
+            artifacts = (await conn.execute(text(
+                "SELECT sql FROM sqlite_master WHERE tbl_name='github_work_items' "
+                "AND type IN ('index', 'trigger') AND sql IS NOT NULL"
+            ))).scalars().all()
+            await conn.execute(text("CREATE TABLE github_work_items_admissions " + current_ddl[current_ddl.index("("):]))
+            names = ", ".join(_sqlite_ident(name) for name in sorted(columns))
+            await conn.execute(text(
+                f"INSERT INTO github_work_items_admissions ({names}) SELECT {names} FROM github_work_items"))
+            await conn.execute(text("DROP TABLE github_work_items"))
+            await conn.execute(text("ALTER TABLE github_work_items_admissions RENAME TO github_work_items"))
+            for statement in artifacts:
+                await conn.execute(text(statement))
+        await _sqlite_ensure_unique_partial_index(
+            conn, table_name="github_work_items", index_name="uix_scope_issue_current",
+            columns=("scope_id", "issue_number"), predicate="milestone_replaced_at IS NULL",
+            duplicate_preflight="SELECT 1 FROM github_work_items WHERE milestone_replaced_at IS NULL "
+                                "GROUP BY scope_id, issue_number HAVING COUNT(*) > 1 LIMIT 1",
+        )
+        if rebuild:
+            await conn.commit()
+    finally:
+        if rebuild:
+            await conn.rollback()
+            await conn.execute(text("PRAGMA foreign_keys=ON"))
+            await conn.commit()
 
 
 def _historical_approval_payload(payload: dict, body_markdown: str) -> dict:
@@ -1216,6 +1267,7 @@ async def _run_sqlite_compat_migrations(conn) -> None:
                 "WHERE pr_number IS NOT NULL AND retry_requested_at IS NOT NULL"
             )
         )
+    await _sqlite_migrate_work_item_admissions(conn)
     # R01: context keys belong to one resource lifetime. Legacy key rows stay
     # active for their current resource; deletion retires them from now on.
     key_columns = await _sqlite_columns(conn, "factory_context_keys")

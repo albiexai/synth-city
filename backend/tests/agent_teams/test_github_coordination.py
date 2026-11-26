@@ -461,6 +461,10 @@ async def test_unrelated_history_does_not_expand_guard_or_invalidate_assessment(
     await service.assess(db, team.scope_id, team.leader, report(row), team.client)
     db.add_all([GithubWorkItem(scope_id=team.scope_id, issue_number=n, issue_title="Historical",
         issue_url="u", github_updated_at=datetime.utcnow(), dispatch_status="merged") for n in range(100, 1300)])
+    db.add_all([GithubWorkItem(scope_id=team.scope_id, issue_number=7, issue_title="Previously deferred",
+        issue_url="u", github_updated_at=datetime.utcnow(), dispatch_status="cancelled",
+        milestone_replaced_at=datetime.utcnow())
+        for _ in range(65)])
     await db.commit()
     assert (await service.summary(db, team.scope_id))["assessment_current"]
     await service.reconcile(db, team.scope_id, team.client)
@@ -788,6 +792,54 @@ async def test_standing_pr_and_future_gate_are_reported_without_dispatch_or_quot
     assert await db.scalar(select(func.count()).select_from(GithubWorkItem))==1
     assert (await service.state(db, team.scope_id)).daily_requests==0
     assert (await service.state(db, team.scope_id)).request_sequence==0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replaced", [False, True])
+async def test_leader_pr_action_retirement_uses_current_admission(db, team, replaced):
+    from app.services.github_operator_attention_service import github_operator_attention_service as attention
+
+    db.add(GithubWorkItem(
+        scope_id=team.scope_id, issue_number=8, issue_title="Cancelled", issue_url="u",
+        github_updated_at=datetime.utcnow(), dispatch_status="cancelled",
+        milestone_replaced_at=datetime.utcnow() if replaced else None,
+    ))
+    if replaced:
+        db.add(GithubWorkItem(
+            scope_id=team.scope_id, issue_number=8, issue_title="Returned", issue_url="u",
+            github_updated_at=datetime.utcnow(), dispatch_status="dispatched", pr_number=38,
+        ))
+    await db.commit()
+    await service.assess(db, team.scope_id, team.leader, await human_report(db, team), team.client)
+    actions = (await attention.summary(db, team.preset.id, team.client))["actions"]
+    assert any(a["source"] == "leader" and a["pull_request_number"] == 38
+               and a["state"] == "requested" for a in actions) is replaced
+
+
+@pytest.mark.asyncio
+async def test_final_gate_binds_unbound_action_to_current_admission(db, team, monkeypatch):
+    from app.models.factory_schemas import AgentTeamSummaryResponse, TeamSummaryHumanAction
+    from app.services.agent_team_summary_service import AgentTeamSummaryService
+
+    historical = GithubWorkItem(
+        scope_id=team.scope_id, issue_number=team.item.issue_number, issue_title="Previous", issue_url="u",
+        github_updated_at=datetime.utcnow(), dispatch_status="cancelled",
+        milestone_replaced_at=datetime.utcnow(), created_at=team.item.created_at - timedelta(days=1),
+    )
+    db.add(historical)
+    await db.commit()
+    action = TeamSummaryHumanAction(
+        scope_id=team.scope_id, issue_number=team.item.issue_number, kind="merge_pr",
+        state="requested", source="leader", assessment_current=True, pull_request_number=25,
+    )
+    observed = AgentTeamSummaryResponse.model_construct(
+        coverage_complete=True, hold_code=None, valid_until=datetime.utcnow() + timedelta(minutes=1),
+        attention=[], human_actions=[action],
+    )
+    summaries = AgentTeamSummaryService()
+    monkeypatch.setattr(summaries, "summary", AsyncMock(return_value=observed))
+    assert (await summaries.for_work_item(db, team.preset.id, team.item.id)).human_actions == [action]
+    assert (await summaries.for_work_item(db, team.preset.id, historical.id)).human_actions == []
 
 
 @pytest.mark.asyncio

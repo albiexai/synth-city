@@ -94,7 +94,9 @@ async def end_pending_requests(db, item_id: int, *, now: datetime) -> None:
         db, pending, outcome="superseded", ended_at=now, source="github_end_stopped_item_service.end_stopped_item")
 
 
-async def end_stopped_item(db, item, scope, request, *, actor, before_commit=None, allow_unstarted=False):
+async def end_stopped_item(
+    db, item, scope, request, *, actor, before_commit=None, allow_unstarted=False, observed_github_updated_at=None,
+):
     """Record the disposition and clear the same inspected acquisition in one transaction."""
     item_id, scope_id = item.id, item.scope_id
     operation_id = f"end_stopped_item:{request.operation_id}"
@@ -128,6 +130,10 @@ async def end_stopped_item(db, item, scope, request, *, actor, before_commit=Non
         "handoff_state", "handoff_target_slot_id", "approval_round_count", "active_scope_revision",
         "pr_number", "dispatch_base_ref", "retry_requested_at", "dispatch_head_ref", "dispatched_at",
     )
+    if observed_github_updated_at is not None:
+        if observed_github_updated_at < item.github_updated_at:
+            raise ValueError("end_stopped_item_context_changed")
+        identity_fields += ("github_updated_at",)
     original_status = item.dispatch_status
     conditions = [GithubWorkItem.id == item_id, *(
         getattr(GithubWorkItem, field) == getattr(item, field) for field in identity_fields)]
@@ -156,7 +162,8 @@ async def end_stopped_item(db, item, scope, request, *, actor, before_commit=Non
             ~exists().where(GithubWorkspace.leased_item_id == item_id))
             .values(dispatch_status="cancelled", escalation_reason=None, pending_reason=None,
                     handoff_state=None, handoff_target_slot_id=None,
-                    status_note=f"{destination}. {reason}", updated_at=now)
+                    status_note=f"{destination}. {reason}", updated_at=now,
+                    github_updated_at=observed_github_updated_at or GithubWorkItem.github_updated_at)
             .execution_options(synchronize_session="fetch"))
         if claim.rowcount != 1:
             raise ValueError("end_stopped_item_context_changed")

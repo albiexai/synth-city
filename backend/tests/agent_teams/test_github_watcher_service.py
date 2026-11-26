@@ -24,7 +24,7 @@ from app.models.database import (
     TeamGithubScope,
 )
 from app.services.github_client import GithubClient, GithubClientResponseError
-from app.services.github_watcher_service import github_watcher_service
+from app.services.github_watcher_service import defer_milestone_exit, github_watcher_service
 
 
 class _RecordingTransport(httpx.AsyncBaseTransport):
@@ -262,8 +262,8 @@ def _issue(number, labels, updated="2026-07-04T00:00:00Z"):
     }
 
 
-def _milestone_issue(scope, title):
-    return dict(_issue(1, [scope.dispatch_label]), milestone={"title": title} if title else None)
+def _milestone_issue(scope, title, updated="2026-07-04T00:00:00Z"):
+    return dict(_issue(1, [scope.dispatch_label], updated=updated), milestone={"title": title} if title else None)
 
 
 @pytest.mark.asyncio
@@ -287,7 +287,7 @@ async def test_milestone_move_waits_for_original_owner_in_either_poll_order(db, 
         original.pending_reason = "queued_no_workspace"
         await db.commit()
 
-    moved = _milestone_issue(old, "V2")
+    moved = dict(_milestone_issue(old, "V2"), updated_at="2026-07-05T00:00:00Z")
     for scope in ([new, old] if reverse else [old, new]):
         await github_watcher_service.poll_scope(db, scope, _FakeClient(labeled=[moved]))
     assert original.dispatch_status == "cancelled"
@@ -297,6 +297,170 @@ async def test_milestone_move_waits_for_original_owner_in_either_poll_order(db, 
     await github_watcher_service.poll_scope(db, new, _FakeClient(labeled=[moved]))
     assert (await db.scalars(select(GithubWorkItem.scope_id).order_by(GithubWorkItem.id))).all() == [
         old.id, new.id]
+
+    await github_watcher_service.poll_scope(db, old, _FakeClient(labeled=[issue]))
+    assert original.dispatch_status == "cancelled"
+    returned = dict(_milestone_issue(old, "V1"), updated_at="2026-07-06T00:00:00Z")
+    for scope in ([new, old] if reverse else [old, new]):
+        await github_watcher_service.poll_scope(db, scope, _FakeClient(labeled=[returned]))
+    await github_watcher_service.poll_scope(db, old, _FakeClient(labeled=[returned]))
+    await github_watcher_service.poll_scope(db, old, _FakeClient(labeled=[returned]))
+    history, departure, current = (await db.scalars(
+        select(GithubWorkItem).order_by(GithubWorkItem.id))).all()
+    assert history.id == original.id
+    assert history.dispatch_status == departure.dispatch_status == "cancelled"
+    assert history.dispatch_head_ref == ("work/issue-1" if prepared else None)
+    assert history.dispatch_nonce == ("prepared" if prepared else None)
+    assert (current.scope_id, current.dispatch_status, current.active_scope_revision) == (old.id, "pending", 0)
+    assert current.dispatch_nonce is None and current.pr_number is None
+    assert (await db.get(FactoryAuditEvent, event.id)).item_id == history.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("previous_admission", [False, True])
+async def test_repository_milestone_never_readmits_a_merged_issue(db, previous_admission):
+    old = await _make_scope(db, preset_name="Old", milestone="V1")
+    new = await _make_scope(db, preset_name="New", milestone="V2")
+    await github_watcher_service.poll_scope(db, old, _FakeClient(labeled=[_milestone_issue(old, "V1")]))
+    original = await db.scalar(select(GithubWorkItem))
+    original.dispatch_status = "merged"
+    original.milestone_replaced_at = datetime.utcnow() if previous_admission else None
+    await db.commit()
+    await github_watcher_service.poll_scope(db, new, _FakeClient(labeled=[_milestone_issue(new, "V2")]))
+    await github_watcher_service.poll_scope(db, old, _FakeClient(labeled=[_milestone_issue(old, "V1")]))
+    assert (await db.scalars(select(GithubWorkItem.id))).all() == [original.id]
+
+
+@pytest.mark.asyncio
+async def test_same_second_milestone_return_uses_current_issue(db):
+    scope = await _make_scope(db, milestone="V1")
+    home = _milestone_issue(scope, "V1")
+    away = _milestone_issue(scope, "V2")
+    await github_watcher_service.poll_scope(db, scope, _FakeClient(labeled=[home]))
+    await github_watcher_service.poll_scope(db, scope, _FakeClient(labeled=[away]))
+    original = await db.scalar(select(GithubWorkItem))
+    assert original.dispatch_status == "cancelled"
+    await github_watcher_service.poll_scope(db, scope, _FakeClient(labeled=[home], by_number={1: away}))
+    assert (await db.scalars(select(GithubWorkItem.id))).all() == [original.id]
+    await github_watcher_service.poll_scope(db, scope, _FakeClient(labeled=[home], by_number={1: home}))
+    assert (await db.scalars(select(GithubWorkItem.dispatch_status).order_by(GithubWorkItem.id))).all() == [
+        "cancelled", "pending",
+    ]
+
+
+async def _prior_route(db, scope, *, status="pending"):
+    item = GithubWorkItem(
+        scope_id=scope.id, issue_number=1, issue_title="Previous route", issue_url="u",
+        github_updated_at=datetime(2026, 7, 4), dispatch_status=status,
+    )
+    db.add(item)
+    await db.commit()
+    return item
+
+
+@pytest.mark.asyncio
+async def test_terminal_source_with_lease_blocks_destination_admission(db):
+    source = await _make_scope(db, preset_name="Source", milestone="V1")
+    destination = await _make_scope(db, preset_name="Destination", milestone="V2")
+    prior = await _prior_route(db, source, status="cancelled")
+    lease = GithubWorkspace(scope_id=source.id, path="/tmp/leased-source", leased_item_id=prior.id)
+    db.add(lease)
+    await db.commit()
+    await github_watcher_service.poll_scope(db, destination, _FakeClient(
+        labeled=[_milestone_issue(destination, "V2", "2026-07-06T00:00:00Z")],
+    ))
+    assert (await db.scalars(select(GithubWorkItem.id))).all() == [prior.id]
+    assert lease.leased_item_id == prior.id
+
+
+@pytest.mark.asyncio
+async def test_stale_foreign_poll_cannot_admit_after_deferral(db):
+    source = await _make_scope(db, preset_name="Source", milestone="V1")
+    destination = await _make_scope(db, preset_name="Destination", milestone="V2")
+    prior = await _prior_route(db, source)
+    await defer_milestone_exit(db, source, prior, "V2", "2026-07-06T00:00:00Z")
+    await github_watcher_service.poll_scope(db, destination, _FakeClient(
+        labeled=[_milestone_issue(destination, "V2", "2026-07-05T00:00:00Z")],
+    ))
+    assert (await db.scalars(select(GithubWorkItem.id))).all() == [prior.id]
+
+
+@pytest.mark.asyncio
+async def test_older_same_scope_return_cannot_replace_newer_departure(db):
+    home = await _make_scope(db, preset_name="Home", milestone="V1")
+    other = await _make_scope(db, preset_name="Other", milestone="V2")
+    previous_home = await _prior_route(db, home)
+    await defer_milestone_exit(db, home, previous_home, "V2", "2026-07-07T00:00:00Z")
+    previous_other = await _prior_route(db, other)
+    # The last deferral fact was recorded later, from an older issue observation.
+    await defer_milestone_exit(db, other, previous_other, "V1", "2026-07-05T00:00:00Z")
+    await github_watcher_service.poll_scope(db, home, _FakeClient(
+        labeled=[_milestone_issue(home, "V1", "2026-07-06T00:00:00Z")],
+    ))
+    assert previous_home.milestone_replaced_at is None
+    assert (await db.scalars(select(GithubWorkItem.id).order_by(GithubWorkItem.id))).all() == [
+        previous_home.id, previous_other.id,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_item_without_milestone_deferral_stays_closed(db):
+    scope = await _make_scope(db, milestone="V1")
+    prior = await _prior_route(db, scope, status="cancelled")
+    await github_watcher_service.poll_scope(db, scope, _FakeClient(
+        labeled=[_milestone_issue(scope, "V1", "2026-07-06T00:00:00Z")],
+    ))
+    assert (await db.scalars(select(GithubWorkItem.id))).all() == [prior.id]
+    assert prior.milestone_replaced_at is None
+
+
+@pytest.mark.asyncio
+async def test_leased_cancelled_deferral_cannot_be_replaced_in_its_scope(db):
+    scope = await _make_scope(db, milestone="V1")
+    prior = await _prior_route(db, scope)
+    await defer_milestone_exit(db, scope, prior, "V2", "2026-07-05T00:00:00Z")
+    lease = GithubWorkspace(scope_id=scope.id, path="/tmp/leased-return", leased_item_id=prior.id)
+    db.add(lease)
+    await db.commit()
+    await github_watcher_service.poll_scope(db, scope, _FakeClient(
+        labeled=[_milestone_issue(scope, "V1", "2026-07-06T00:00:00Z")],
+    ))
+    assert (await db.scalars(select(GithubWorkItem.id))).all() == [prior.id]
+    assert prior.milestone_replaced_at is None and lease.leased_item_id == prior.id
+
+
+@pytest.mark.asyncio
+async def test_same_second_return_requires_ready_label_on_confirmation(db):
+    scope = await _make_scope(db, milestone="V1")
+    prior = await _prior_route(db, scope)
+    await defer_milestone_exit(db, scope, prior, "V2", "2026-07-04T00:00:00Z")
+    returned = _milestone_issue(scope, "V1")
+    await github_watcher_service.poll_scope(db, scope, _FakeClient(
+        labeled=[returned], by_number={1: dict(returned, labels=[])},
+    ))
+    assert (await db.scalars(select(GithubWorkItem.id))).all() == [prior.id]
+    assert prior.milestone_replaced_at is None
+
+
+@pytest.mark.asyncio
+async def test_milestone_deferral_records_observed_departure_time(db):
+    scope = await _make_scope(db, milestone="V1")
+    prior = await _prior_route(db, scope)
+    await defer_milestone_exit(db, scope, prior, "V2", "2026-07-06T00:00:00Z")
+    await db.refresh(prior)
+    assert (prior.dispatch_status, prior.github_updated_at) == ("cancelled", datetime(2026, 7, 6))
+
+
+@pytest.mark.asyncio
+async def test_milestone_deferral_rejects_older_terminal_observation(db):
+    scope = await _make_scope(db, milestone="V1")
+    prior = await _prior_route(db, scope)
+    with pytest.raises(ValueError, match="end_stopped_item_context_changed"):
+        await defer_milestone_exit(db, scope, prior, "V2", "2026-07-03T00:00:00Z")
+    assert (prior.dispatch_status, prior.github_updated_at) == ("pending", datetime(2026, 7, 4))
+    assert await db.scalar(select(FactoryAuditEvent.id).where(
+        FactoryAuditEvent.event_kind == "stopped_work_item_ended",
+    )) is None
 
 
 @pytest.mark.asyncio

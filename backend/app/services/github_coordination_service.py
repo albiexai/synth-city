@@ -251,7 +251,7 @@ class GithubCoordinationService:
             raise CoordinationError("coordination_context_limit")
         leader, slots = await self.current_leader(db, scope)
         # Historical unrelated attempts cannot change capacity or assigned gates.
-        relevant_items = (GithubWorkItem.scope_id == scope_id) & or_(
+        relevant_items = (GithubWorkItem.scope_id == scope_id) & GithubWorkItem.milestone_replaced_at.is_(None) & or_(
             GithubWorkItem.issue_number.in_(numbers),
             GithubWorkItem.dispatch_status.in_(["dispatched", "verifying"]),
         )
