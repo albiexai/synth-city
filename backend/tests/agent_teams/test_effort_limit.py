@@ -244,6 +244,33 @@ async def test_initial_paths_policy_is_checked_at_approval(fx, listed):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("invalid_path", "expected"), [
+    (False, "initial_plan_unverifiable"),
+    (True, "allowed_paths_invalid"),
+])
+async def test_initial_paths_policy_refuses_unverified_link_or_invalid_paths(fx, invalid_path, expected):
+    async with fx.maker() as db:
+        path = "../outside.py" if invalid_path else "approved.py"
+        approval = await _linked_initial_plan(fx, db, {"allowed_paths": [path]})
+        scope = await db.get(TeamGithubScope, fx.scope_id)
+        scope.initial_paths_required = True
+        if not invalid_path:
+            root = await db.get(MailMessage, approval.request_message_id)
+            root.payload = {**root.payload, "plan_metadata": {"allowed_paths": ["different.py"]}}
+        await db.commit()
+
+        item = await _item(fx, db)
+        with pytest.raises(GithubApprovalError) as error:
+            await github_approval_service.decide(
+                db, item, authenticated_leader_member_id=fx.leader, request_id=approval.id,
+                decision="approved", reason="proceed",
+            )
+        assert error.value.detail == expected
+    async with fx.maker() as db:
+        assert (await db.get(GithubApprovalRequest, approval.id)).status == "pending"
+
+
+@pytest.mark.asyncio
 async def test_an_approved_plan_without_an_estimate_uses_the_ceiling_at_decision_time(fx):
     async with fx.maker() as db:
         approval = await _linked_initial_plan(fx, db, {})

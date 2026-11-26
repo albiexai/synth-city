@@ -306,6 +306,30 @@ async def test_pr_registration_cannot_publish_the_note_after_the_item_head_moves
 
 
 @pytest.mark.asyncio
+async def test_pr_registration_shows_inconclusive_note_for_unverifiable_plan(db, healthy_attempt, monkeypatch):
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch, extra_file=True)
+    root = await db.get(MailMessage, a.approval.request_message_id)
+    root.payload = {**root.payload, "summary": "Changed after approval"}
+    await register_initial_pull(db, a, client, monkeypatch, "pr_opened")
+    assert _work_item_response(a.item, a.scope).status_note == (
+        "initial_paths_inconclusive: the approved first plan could not be verified."
+    )
+    client.get_merge_base.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_work_item_note_hides_readiness_for_an_older_verification_head(db, healthy_attempt, monkeypatch):
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch, extra_file=True)
+    await register_initial_pull(db, a, client, monkeypatch, "pr_opened")
+    assert "src/added.py" in _work_item_response(a.item, a.scope).status_note
+    a.item.verification_head_sha = "1" * 40
+    a.item.status_note = "GitHub checks are still running."
+    assert _work_item_response(a.item, a.scope).status_note == "GitHub checks are still running."
+
+
+@pytest.mark.asyncio
 async def test_verification_refreshes_the_readiness_note_for_the_new_head(db, healthy_attempt, monkeypatch):
     a = healthy_attempt
     client, _ = await initial_path_merge_case(db, a, monkeypatch, extra_file=True)
@@ -325,6 +349,22 @@ async def test_verification_refreshes_the_readiness_note_for_the_new_head(db, he
 
 
 @pytest.mark.asyncio
+async def test_verification_rechecks_a_moved_base_at_the_same_head(db, healthy_attempt, monkeypatch):
+    a = healthy_attempt
+    client, _ = await initial_path_merge_case(db, a, monkeypatch, extra_file=True)
+    await register_initial_pull(db, a, client, monkeypatch, "pr_opened")
+    assert "src/added.py" in _work_item_response(a.item, a.scope).status_note
+
+    # The base now includes this commit, so there are no new PR paths to report.
+    client.pull["base"]["sha"] = "1" * 40
+    client.get_merge_base.return_value = a.head
+    await github_verification_service.process_scope(db, a.scope, client=client)
+    await db.refresh(a.item)
+    assert a.item.initial_paths_readiness == {"head": a.head, "base": "1" * 40, "note": None}
+    assert "initial_paths_out_of_scope" not in (_work_item_response(a.item, a.scope).status_note or "")
+
+
+@pytest.mark.asyncio
 async def test_initial_path_gate_merges_in_scope_head_with_base_only_files(db, healthy_attempt, monkeypatch):
     a = healthy_attempt
     client, base_tip = await initial_path_merge_case(db, a, monkeypatch)
@@ -340,6 +380,7 @@ async def test_initial_path_gate_holds_extra_file_until_approved_amendment(db, h
     a = healthy_attempt
     client, _ = await initial_path_merge_case(db, a, monkeypatch, extra_file=True)
     await register_initial_pull(db, a, client, monkeypatch, "pr_opened")
+    first_plan_note = a.item.initial_paths_readiness.copy()
     assert "src/added.py" in _work_item_response(a.item, a.scope).status_note
     a.item.dispatch_status = "ready_for_review"
     a.item.last_verified_sha = a.head
@@ -366,6 +407,11 @@ async def test_initial_path_gate_holds_extra_file_until_approved_amendment(db, h
         authenticated_owner_slot_id=a.owner.team_slot_id, revision_number=revision.revision,
         dispatch_nonce=a.item.dispatch_nonce, current_head_sha=a.head, result_summary="Reviewed the amended paths",
         evidence={}, lease_token=a.workspace.lease_token, client=client)
+    assert a.item.initial_paths_readiness is None
+    # A stored first-plan result must stay hidden after the amendment submits for verification.
+    a.item.initial_paths_readiness = first_plan_note
+    assert "initial_paths_out_of_scope" not in (_work_item_response(a.item, a.scope).status_note or "")
+    await db.refresh(a.item)
     await bind_submitted_review(db, a, revision)
     await require_jobs(db, a, monkeypatch)
     await settle_accepted(db, a, await record_accepted(db, a))
