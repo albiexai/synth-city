@@ -2604,6 +2604,18 @@ class GithubApprovalService:
             .execution_options(synchronize_session=False)
         )
         try:
+            if result.rowcount == 1 and decision == "approved":
+                # Read the ceiling in the decision transaction and keep the missing estimate as NULL.
+                defaulted = await db.execute(
+                    update(GithubWorkItem)
+                    .where(*item_conditions, GithubWorkItem.effort_estimate_minutes.is_(None),
+                           GithubWorkItem.effort_limit_minutes.is_(None))
+                    .values(effort_limit_minutes=select(TeamGithubScope.max_item_effort_minutes)
+                            .where(TeamGithubScope.id == GithubWorkItem.scope_id).scalar_subquery())
+                    .execution_options(synchronize_session=False)
+                )
+                if defaulted.rowcount == 1:
+                    await db.refresh(item, attribute_names=["effort_limit_minutes"])
             if result.rowcount == 1 and actor is not None:
                 await _record_decision_fact(
                     db,

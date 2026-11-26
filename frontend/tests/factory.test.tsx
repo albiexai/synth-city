@@ -874,6 +874,24 @@ describe("name filters", () => {
 describe("work item page", () => {
   const itemFor = (response: unknown) => fixtureFetch(() => jsonResponse(response));
 
+  it("shows the default effort limit on Work", async () => {
+    const response = structuredClone(first);
+    Object.assign(response.items[0].item, { scope_default_effort_limit_minutes: 75 });
+    fixtureFetch((path) => path === "factory/work-items" ? jsonResponse(response) : standard(path));
+    renderRoute(<WorkPage />);
+    await settle();
+    expect(screen.getAllByText("Limit: scope ceiling (no estimate) · 75 min")).toHaveLength(1);
+  });
+
+  it("shows the default effort limit on the work detail", async () => {
+    const response = structuredClone(detail.completed.response);
+    Object.assign(response.work_item.item, { scope_default_effort_limit_minutes: 75 });
+    itemFor(response);
+    renderRoute(<WorkDetailPage />, "/work/9", "/work/:workItemId");
+    await settle();
+    expect(screen.getByText("Limit: scope ceiling (no estimate) · 75 min")).toBeInTheDocument();
+  });
+
   it("links back to Work from a breadcrumb and titles the page with the issue", async () => {
     itemFor(detail.completed.response);
     renderRoute(<WorkDetailPage />, "/work/9", "/work/:workItemId");
@@ -883,6 +901,7 @@ describe("work item page", () => {
     const title = `#${detail.completed.response.work_item.item.issue_number} ${detail.completed.response.work_item.item.issue_title}`;
     expect(screen.getByRole("heading", { level: 2 })).toHaveTextContent(title);
     expect(within(crumbs).getByText(title)).toBeInTheDocument();
+    expect(screen.queryByText(/scope ceiling \(no estimate\)/)).not.toBeInTheDocument();
   });
 
   it("shows a merged item with an outcome, no recovery, and unknowns only in Technical details", async () => {

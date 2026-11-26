@@ -6,6 +6,7 @@ import { GithubLink } from "../components/GithubLink";
 import { ProtectedRemedies } from "../components/ProtectedRemedies";
 import { RequiredCiNotice } from "../components/RequiredCiNotice";
 import { ReadStatus } from "../components/ReadStatus";
+import { ScopeEffortLimit } from "../components/ScopeEffortLimit";
 import { anchor, panel } from "../components/styles";
 import { Time } from "../components/Time";
 import { stateLabel } from "../filterHelpers";
@@ -51,6 +52,7 @@ export function WorkDetailPage() {
                 ? `${w.owner.name} (${w.owner.provider_label ?? "harness unknown"})`
                 : "Unassigned"}
             </p>
+            <ScopeEffortLimit minutes={w.item.scope_default_effort_limit_minutes} />
             {w.waiting && (
               <p>
                 Waiting for {waitingActorLabel(w.waiting.actor)}

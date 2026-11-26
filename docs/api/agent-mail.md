@@ -246,6 +246,10 @@ The continuation and amendment submit routes run the same checks and refuse with
 
 ## Effort limits and extensions
 
+When the Leader approves an initial plan without an estimate, the item's base effort limit takes the scope ceiling in effect at that decision. The recorded estimate stays empty. Work and its item detail show the base limit as “scope ceiling (no estimate).” Items already approved without a limit retain that state and continue to return `effort_limit_not_set` on extension requests.
+
+The effort monitor sends its usual advisory notice at the limit. A defaulted limit uses all room under an unchanged scope ceiling. A ceiling increase can create room for an extension under the usual Leader rules.
+
 - `POST /api/v1/agent-mail/effort-extensions` takes a Mail session of the item's current Leader. The body has `work_item_id`, `dispatch_nonce`, `minutes` (a whole number, at most the step cap), `expected_extension_minutes` (the extension total the Leader saw), `reason` and `evidence`. The MCP tool is `synth_city_extend_effort_limit`.
 - A refusal's `detail` is one code: `effort_extension_stale`, `not_item_leader`, `extension_reason_required`, `extension_evidence_required`, `expected_extension_minutes_required`, `effort_limit_not_set`, `extension_exceeds_cap`, `effort_extension_total_changed`, `extension_exceeds_ceiling`, `effort_extension_not_acknowledged`, `effort_extension_paused` or `effort_extension_no_recent_activity`.
 - At approval an estimate over the ceiling is refused with `effort_estimate_exceeds_ceiling`, and an unreadable estimate with `effort_estimate_invalid`.

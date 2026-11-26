@@ -3055,6 +3055,18 @@
               "title": "Retry Count",
               "type": "integer"
             },
+            "scope_default_effort_limit_minutes": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Scope Default Effort Limit Minutes"
+            },
             "scope_id": {
               "exclusiveMinimum": 0,
               "title": "Scope Id",
@@ -4070,6 +4082,18 @@
             "retry_count": {
               "title": "Retry Count",
               "type": "integer"
+            },
+            "scope_default_effort_limit_minutes": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Scope Default Effort Limit Minutes"
             },
             "scope_id": {
               "exclusiveMinimum": 0,

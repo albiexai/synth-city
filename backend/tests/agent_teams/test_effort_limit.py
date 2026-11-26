@@ -14,12 +14,14 @@ import pytest_asyncio
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.api.v1.agent_mail import _persist_initial_approval
 from app.config import settings
 from app.database import Base
 from app.models.database import (
     AgentTeamPreset, FactoryAuditEvent, GithubApprovalRequest, GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace,
-    MailMessage, TeamGithubScope,
+    MailAgentSession, MailMessage, TeamGithubScope,
 )
+from app.models.schemas import MailApprovalRequestCreate
 from app.services.agent_mail_service import agent_mail_service
 from app.services.github_approval_service import GithubApprovalError, github_approval_service
 from app.services.github_effort_limit_service import (
@@ -191,7 +193,7 @@ async def test_a_recorded_plan_replays_after_the_scope_lowers_its_limit(fx, stat
 
 
 @pytest.mark.asyncio
-async def test_a_missing_estimate_stores_no_limit(fx):
+async def test_a_pending_plan_without_an_estimate_stores_no_limit(fx):
     async with fx.maker() as db:
         item = await _item(fx, db)
         await github_approval_service.create_initial_request(
@@ -199,6 +201,109 @@ async def test_a_missing_estimate_stores_no_limit(fx):
     async with fx.maker() as db:
         item = await _item(fx, db)
         assert item.effort_limit_minutes is None
+
+
+async def _linked_initial_plan(fx, db, metadata):
+    session = await db.scalar(select(MailAgentSession).where(MailAgentSession.member_id == fx.owner))
+    return await _persist_initial_approval(
+        MailApprovalRequestCreate(work_item_id=fx.item_id, dispatch_nonce=fx.nonce,
+                                  summary="plan", plan_metadata=metadata),
+        session, db,
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_approved_plan_without_an_estimate_uses_the_ceiling_at_decision_time(fx):
+    async with fx.maker() as db:
+        approval = await _linked_initial_plan(fx, db, {})
+        item = await _item(fx, db)
+        scope = await db.get(TeamGithubScope, fx.scope_id)
+        assert scope.max_item_effort_minutes == 120
+        await db.commit()
+        await _scope_ceiling(fx, 15)
+
+        decision_args = dict(authenticated_leader_member_id=fx.leader, request_id=approval.id,
+                             decision="approved", reason="proceed")
+        decided, applied = await github_approval_service.decide(db, item, **decision_args)
+        assert applied
+        root = await db.get(MailMessage, decided.request_message_id)
+        assert root.payload["plan_metadata"].get("estimate_active_minutes") is None
+        assert item.effort_limit_minutes == 15
+
+    async with fx.maker() as db:
+        item = await _item(fx, db)
+        assert item.effort_estimate_minutes is None
+        assert service.effort_view(item, await db.get(TeamGithubScope, fx.scope_id, populate_existing=True)) == {
+            "estimate_minutes": None, "limit_minutes": 15, "extension_minutes": 0,
+            "effective_limit_minutes": 15, "ceiling_minutes": 15, "extension_cap_minutes": 0,
+        }
+
+    assert await _code(_extend(fx, 1)) == "extension_exceeds_ceiling"
+    await _set(fx, effort_elapsed_seconds=899, effort_last_tick_at=T0)
+    await _tick(fx, T0 + timedelta(seconds=2))
+    assert len(await _notices(fx)) == 2
+
+    await _scope_ceiling(fx, 20)
+    async with fx.maker() as db:
+        item = await _item(fx, db)
+        _, applied = await github_approval_service.decide(db, item, **decision_args)
+        assert not applied and item.effort_limit_minutes == 15
+    assert (await _extend(fx, 1))["effective_limit_minutes"] == 16
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("decision", "metadata", "legacy", "expected"), [
+    ("approved", {"estimate_active_minutes": 60}, False, (60, 60)),
+    ("rejected", {}, False, (None, None)),
+    ("approved", {}, True, (None, None)),
+])
+async def test_initial_decision_preserves_explicit_estimates_rejections_and_legacy_replays(
+    fx, decision, metadata, legacy, expected,
+):
+    async with fx.maker() as db:
+        approval = await _linked_initial_plan(fx, db, metadata)
+        if legacy:
+            stored = await db.get(GithubApprovalRequest, approval.id)
+            stored.status = "approved"
+            stored.reason = "decision"
+            await db.commit()
+        item = await _item(fx, db)
+        _, applied = await github_approval_service.decide(
+            db, item, authenticated_leader_member_id=fx.leader, request_id=approval.id,
+            decision=decision, reason="decision",
+        )
+        assert applied is not legacy
+        assert (item.effort_estimate_minutes, item.effort_limit_minutes) == expected
+    if legacy:
+        assert await _code(_extend(fx, 1)) == "effort_limit_not_set"
+
+
+@pytest.mark.asyncio
+async def test_a_lost_approval_update_does_not_default_a_legacy_limit(fx, monkeypatch):
+    resolve = github_approval_service.resolve_for_decision
+
+    async def resolve_before_legacy_approval(db, item, **kwargs):
+        pending = await resolve(db, item, **kwargs)
+        assert pending.status == "pending"
+        # A concurrent decision from the old path commits after the replay reads the request.
+        async with fx.maker() as other:
+            await other.execute(update(GithubApprovalRequest).where(GithubApprovalRequest.id == pending.id)
+                                .values(status="approved", reason="decision", decided_at=T0))
+            await other.commit()
+        return pending
+
+    monkeypatch.setattr(github_approval_service, "resolve_for_decision", resolve_before_legacy_approval)
+    async with fx.maker() as db:
+        approval = await _linked_initial_plan(fx, db, {})
+        item = await _item(fx, db)
+        decided, applied = await github_approval_service.decide(
+            db, item, authenticated_leader_member_id=fx.leader, request_id=approval.id,
+            decision="approved", reason="decision",
+        )
+        assert not applied and decided.status == "approved"
+
+    async with fx.maker() as db:
+        assert (await _item(fx, db)).effort_limit_minutes is None
 
 
 @pytest.mark.asyncio
