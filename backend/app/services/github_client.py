@@ -306,6 +306,24 @@ class GithubClient:
             raise GithubClientResponseError("GitHub campaign pagination was inconsistent")
         return issues
 
+    async def list_label_issues(self, owner: str, repo: str, label: str) -> list[dict]:
+        """#1242: every issue carrying ``label`` in all states, across pages; pull requests are left out."""
+        values = await self._campaign_list(f"/repos/{owner}/{repo}/issues",
+            {"labels": label, "state": "all", "per_page": "100"})
+        issues = [value for value in values if "pull_request" not in value]
+        for issue in issues:
+            number, labels = issue.get("number"), issue.get("labels")
+            if (type(number) is not int or number <= 0 or not isinstance(issue.get("title"), str)
+                    or issue.get("state") not in {"open", "closed"}
+                    or issue.get("html_url") != f"https://github.com/{owner}/{repo}/issues/{number}"
+                    or not isinstance(labels, list)
+                    or not all(isinstance(value, dict) and isinstance(value.get("name"), str) for value in labels)
+                    or label not in {value["name"] for value in labels}):
+                raise GithubClientResponseError("GitHub campaign issue identity was invalid")
+        if len({issue["number"] for issue in issues}) != len(issues):
+            raise GithubClientResponseError("GitHub campaign pagination was inconsistent")
+        return issues
+
     async def get_issue(
         self, owner: str, repo: str, number: int, *, token: str | None = None,
     ) -> dict | None:

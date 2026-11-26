@@ -139,3 +139,12 @@ Slice 1 applies this to `PATCH /api/v1/agent-teams/presets/{id}`. That route now
 - Events are retained for the life of the database. No automatic purge exists.
 
 See the [Factory API](/api/factory) for the route contracts.
+
+## Campaigns
+
+A campaign records one stretch of a team's work for its retrospective. It belongs to the team's lifetime, so a team recreated with the same id starts fresh. Its selector is `label:<name>` or `milestone:<title>`, and it covers every repository the team watches. A label is matched by name and a milestone by title, because each repository has its own milestones. A team has at most one `active` or `finishing` campaign at a time. Starting a campaign records a `campaign_started` event.
+
+Membership is read from GitHub when it is needed, in all issue states:
+- An issue deferred or superseded through the end-stopped action after the campaign started leaves the membership, even if it still matches. It is listed among the departures with its destination (the target milestone or the superseding pull request) and its reason. Departures come from the recorded event itself (the team lifetime, repository and issue it named), so deleting the local work item, or reusing its id, changes nothing.
+- A repository that GitHub could not read, or where the milestone title doesn't name exactly one milestone, marks the membership incomplete, with the reason. It is never counted as zero members.
+- Once the campaign's team is deleted, its repositories are no longer read, even if a new team takes the same id. The membership is incomplete (`team_retired`). A campaign can only be started for an existing team.
