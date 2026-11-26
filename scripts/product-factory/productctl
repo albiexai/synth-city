@@ -49,9 +49,27 @@ def status():
  sup=json.loads((STATE/'supervisor-state.json').read_text()) if (STATE/'supervisor-state.json').exists() else {}
  result={'controller':URL,'pin':json.loads((STATE/'preparation.json').read_text())['pin'],'preset':p['name'],'autonomy_enabled':p['autonomy_enabled'],'repo':s['repo_owner']+'/'+s['repo_name'],'scope_enabled':s['enabled'],'merge_policy':s['merge_policy'],'concurrency':s['max_concurrent_dispatched'],'github_poll_credential_configured':s['github_poll_token_configured'],'hold':(WORK/'operations/HOLD.json').exists(),'supervisor_mode':sup.get('mode'),'supervisor_last_tick':sup.get('last_tick'),'slots':[{'id':x['id'],'name':x['display_name'],'repo_path':x['repo_path'],'model':x['launch_options'].get('model')} for x in p['slots']]}
  print(json.dumps(result,indent=2));return result
+
+
+def agent_config_sudoers():
+ directory = pathlib.Path(__file__).resolve().parent
+ if directory.name == "product-factory":
+  module_directory = directory.parent.parent / "backend" / "app" / "services"
+ else:
+  module_directory = directory.parent / "libexec"
+ if not (module_directory / "agent_config_settings.py").is_file():
+  raise ImportError("Missing agent-config settings module")
+ sys.path.insert(0, str(module_directory))
+ from agent_config_settings import load_agent_config_settings
+ return load_agent_config_settings().sudoers_line()
+
+
 parser=argparse.ArgumentParser();parser.add_argument('command',choices=['status','print-agent-config-sudoers','plan','launch-bootstrap','configure-ambient-github','arm','pause']);parser.add_argument('--confirm',action='store_true');args=parser.parse_args()
 if args.command == 'print-agent-config-sudoers':
- print(f'deckproductctl ALL=(deckproduct) NOPASSWD: {BASE}/libexec/agent-config ""')
+ try:
+  print(agent_config_sudoers())
+ except (ImportError, OSError, ValueError):
+  sys.exit('Agent-config policy could not be read safely.')
  sys.exit(0)
 if os.geteuid()!=0:sys.exit('Run with sudo; operator credentials are kept outside agent access.')
 if args.command=='status':status()

@@ -34,9 +34,11 @@ The scripts and unit files beside this document are the installed operational so
 
 [#1262](https://github.com/albiexai/synth-city/issues/1262) adds the dedicated factory's first `agent-config` helper. It accepts one JSON request on standard input with `operation` set to `folder_trust`, `provider` set to `codex-cli` or `claude-code`, and `folder` set to a directory under the factory work root. The controller runs the helper as `deckproduct`. The helper takes zero command-line arguments and writes one JSON result.
 
-The checkpoint owner installs `scripts/product-factory/agent-config` as `/opt/albiex-synth-city-product/libexec/agent-config` and installs the same release's `backend/app/services/team_workspace_trust.py` beside it as `team_workspace_trust.py`. The install directories, helper, writer, and Python environment (including `tomlkit`) must be root-owned and writable only by root. The helper uses the agent's passwd home. It keeps a private `.synth-city.bak` beside an existing config when trust changes.
+The checkpoint owner installs `scripts/product-factory/agent-config` under the chosen installation's `libexec` directory, together with the same release's `backend/app/services/team_workspace_trust.py` and `backend/app/services/agent_config_settings.py`. Install `productctl` under `bin` and Python with `tomlkit` under `venv` in that installation. Root must own the installation directories, helper, modules, and Python environment and be the only account with write access. The helper uses its configured account's passwd home and keeps a private `.synth-city.bak` beside an existing config when trust changes.
 
-`productctl print-agent-config-sudoers` prints the exact command-scoped sudoers entry for the reference factory.
+The controller, `productctl`, and helper read `/etc/albiex-synth-city/agent-config.json`. The directory and policy file must be root-owned and writable only by root, with the policy readable by both factory accounts. The policy can override `agent_config_helper_path`, `agent_config_agent_user`, `agent_config_controller_user`, and `agent_config_work_root`. On split-user deployments, the controller's existing `HARNESS_AGENT_USER` must match `agent_config_agent_user` for dispatch Git trust. Set `agent_config_helper_path` to the absolute installed helper path, such as `/opt/claude-deck-product/libexec/agent-config`.
+
+Without a policy file, the default work root is `/home/deckproductctl/work` and `productctl print-agent-config-sudoers` prints this exact rule.
 
 ```sudoers
 deckproductctl ALL=(deckproduct) NOPASSWD: /opt/albiex-synth-city-product/libexec/agent-config ""
