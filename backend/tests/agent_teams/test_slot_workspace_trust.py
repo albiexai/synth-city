@@ -15,6 +15,7 @@ from app.database import _run_sqlite_compat_migrations
 from app.models.database import AgentTeamSlot
 from app.models.schemas import AgentTeamLaunchRequest, AgentTeamPresetCreate, AgentTeamSlotCreate, AgentTeamSlotUpdate
 from app.services.agent_team_service import agent_team_service
+from app.services.agent_config_settings import AgentConfigSettings
 
 
 @pytest.fixture
@@ -33,6 +34,7 @@ def helper():
     (0, {"ok": True, "changed": 1}, "refused"),
 ])
 def test_fixed_helper_command_and_typed_response(helper, monkeypatch, status, result, outcome):
+    monkeypatch.setattr(type(settings), "agent_config", property(lambda _: AgentConfigSettings()))
     def run(argv, **kwargs):
         assert argv == ["/usr/bin/sudo", "-n", "-u", "deckproduct", "--",
                         "/opt/albiex-synth-city-product/libexec/agent-config"]
@@ -56,8 +58,9 @@ def test_fixed_helper_command_and_typed_response(helper, monkeypatch, status, re
 
 
 @pytest.fixture
-def integrated_helper(helper, monkeypatch, tmp_path):
-    monkeypatch.setattr(helper, "FACTORY_WORK_ROOT", tmp_path.parent, raising=False)
+def integrated_helper(monkeypatch, tmp_path):
+    policy = AgentConfigSettings(agent_config_work_root=str(tmp_path.parent))
+    monkeypatch.setattr(type(settings), "agent_config", property(lambda _: policy))
     monkeypatch.setattr(settings, "team_workspace_trust_helper_enabled", True)
     calls = []
     errors = []

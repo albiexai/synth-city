@@ -8,10 +8,7 @@ from pathlib import Path
 from app.config import settings
 from app.services.team_workspace_trust import _primary_checkout, _workspace_under_root
 
-FACTORY_WORK_ROOT = Path("/home/deckproductctl/work")
 _PROVIDERS = frozenset({"codex-cli", "claude-code"})
-_COMMAND = ["/usr/bin/sudo", "-n", "-u", "deckproduct", "--",
-            "/opt/albiex-synth-city-product/libexec/agent-config"]
 
 
 class AgentConfigError(ValueError):
@@ -34,8 +31,9 @@ def uses_agent_config(provider: str) -> bool:
 def resolve_claude_checkout(folder: str) -> str:
     """Use the writer's work-root checks and primary checkout resolution."""
     try:
-        workspace = _workspace_under_root(Path(folder), FACTORY_WORK_ROOT)
-        return str(_primary_checkout(workspace, work_root=FACTORY_WORK_ROOT))
+        work_root = Path(settings.agent_config.agent_config_work_root)
+        workspace = _workspace_under_root(Path(folder), work_root)
+        return str(_primary_checkout(workspace, work_root=work_root))
     except (OSError, ValueError, subprocess.SubprocessError):
         raise AgentConfigError from None
 
@@ -54,7 +52,7 @@ def prepare_dispatch_git_trust_via_helper(folder: str, repo: str, identity: tupl
 def _run_agent_config(request: dict[str, str | int]) -> bool:
     try:
         result = subprocess.run(
-            _COMMAND, input=json.dumps(request), capture_output=True, encoding="utf-8", check=False,
+            settings.agent_config.command(), input=json.dumps(request), capture_output=True, encoding="utf-8", check=False,
             cwd="/", env={"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8"}, timeout=6,
         )
         lines = result.stdout.splitlines()

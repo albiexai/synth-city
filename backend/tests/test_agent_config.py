@@ -5,6 +5,7 @@ import io
 import json
 import os
 import runpy
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import tomlkit
 
+from app.services import agent_config_client, agent_config_settings
 from app.services import team_workspace_trust as trust
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -29,12 +31,13 @@ def helper(tmp_path, monkeypatch, capsys):
     home.mkdir()
     proc = tmp_path / "proc"
     proc.mkdir()
-    monkeypatch.setitem(main.__globals__, "WORK_ROOT", work_root)
+    policy = agent_config_settings.AgentConfigSettings(agent_config_work_root=str(work_root))
     monkeypatch.setitem(main.__globals__, "PROC", proc)
-    monkeypatch.setitem(main.__globals__, "agent_home", lambda: home)
+    monkeypatch.setitem(main.__globals__, "agent_home", lambda _name: home)
     monkeypatch.setitem(main.__globals__, "load_writer", lambda: trust)
 
-    def run(provider="codex-cli", folder=workspace, *, payload=None, argv=()):
+    def run(provider="codex-cli", folder=workspace, *, payload=None, argv=(), settings=policy):
+        monkeypatch.setitem(main.__globals__, "load_policy", lambda: settings)
         if payload is None:
             payload = json.dumps({"operation": "folder_trust", "provider": provider, "folder": str(folder)}).encode()
         status = main(list(argv), io.BytesIO(payload))
@@ -334,10 +337,137 @@ def test_unreadable_claude_process_state_defers_the_write(helper):
     assert list(home.iterdir()) == []
 
 
-def test_operator_command_prints_only_the_exact_sudoers_line():
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT.with_name("productctl")), "print-agent-config-sudoers"],
-        capture_output=True, text=True, check=True,
-    )
+def print_sudoers(installation, policy=None):
+    productctl = installation / "bin" / "productctl"
+    settings_module = installation / "libexec" / "agent_config_settings.py"
+    productctl.parent.mkdir(parents=True)
+    settings_module.parent.mkdir()
+    productctl.write_bytes(SCRIPT.with_name("productctl").read_bytes())
+    settings_source = Path(agent_config_settings.__file__).read_text(encoding="utf-8")
+    fixture_read = "raise FileNotFoundError" if policy is None else f"return {json.dumps(policy).encode()!r}"
+    settings_module.write_text(settings_source + f"\n\ndef _read_policy():\n    {fixture_read}\n", encoding="utf-8")
+    result = subprocess.run([sys.executable, str(productctl), "print-agent-config-sudoers"],
+                            check=True, capture_output=True, text=True, cwd=installation)
     assert result.stderr == ""
-    assert result.stdout == 'deckproductctl ALL=(deckproduct) NOPASSWD: /opt/albiex-synth-city-product/libexec/agent-config ""\n'
+    return result.stdout
+
+
+def test_operator_command_prints_only_the_exact_default_sudoers_line(tmp_path):
+    assert print_sudoers(tmp_path / "installation") == (
+        'deckproductctl ALL=(deckproduct) NOPASSWD: /opt/albiex-synth-city-product/libexec/agent-config ""\n'
+    )
+
+
+def test_overrides_share_the_sudo_target_and_bound_helper_work_root(helper, tmp_path, monkeypatch):
+    run, original, _, _ = helper
+    work_root = tmp_path / "alternate-work"
+    workspace = work_root / "member"
+    workspace.mkdir(parents=True)
+    helper_path = "/opt/claude-deck-product/libexec/agent-config"
+    values = {"agent_config_helper_path": helper_path, "agent_config_agent_user": "fixture-agent",
+              "agent_config_controller_user": "fixture-controller", "agent_config_work_root": str(work_root)}
+    assert print_sudoers(tmp_path / "alternate-install", values) == (
+        f'fixture-controller ALL=(fixture-agent) NOPASSWD: {helper_path} ""\n'
+    )
+    monkeypatch.setattr(agent_config_settings, "_read_policy", lambda: json.dumps(values).encode())
+    policy = agent_config_settings.load_agent_config_settings()
+
+    def run_command(argv, **kwargs):
+        assert argv == ["/usr/bin/sudo", "-n", "-u", "fixture-agent", "--", helper_path]
+        assert "AGENT_CONFIG_WORK_ROOT" not in kwargs["env"]
+        assert json.loads(kwargs["input"]) == {"operation": "folder_trust", "provider": "codex-cli",
+                                              "folder": str(workspace)}
+        return subprocess.CompletedProcess(argv, 0, '{"ok": true, "changed": true}\n', "")
+
+    monkeypatch.setattr(agent_config_client.subprocess, "run", run_command)
+    assert agent_config_client.prepare_workspace_trust_via_helper("codex-cli", str(workspace)) is True
+    assert run(folder=workspace, settings=policy) == (0, {"ok": True, "changed": True})
+    assert run(folder=original, settings=policy) == (1, {"ok": False, "error": "agent_config_refused"})
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("agent_config_agent_user", "root"), ("agent_config_controller_user", "ALL"),
+    ("agent_config_agent_user", "#0"), ("agent_config_helper_path", "/opt/helpers/*"),
+    ("agent_config_helper_path", "/opt/helper\nALL ALL=NOPASSWD: ALL"),
+    ("agent_config_work_root", "relative/work"), ("agent_config_work_root", "/"),
+])
+def test_agent_config_settings_reject_unsafe_sudoers_fields_and_work_roots(field, value, monkeypatch):
+    monkeypatch.setattr(agent_config_settings, "_read_policy", lambda: json.dumps({field: value}).encode())
+    with pytest.raises(ValueError):
+        agent_config_settings.load_agent_config_settings()
+
+
+def test_agent_config_policy_rejects_an_agent_alias_for_uid_zero(monkeypatch):
+    monkeypatch.setattr(agent_config_settings.pwd, "getpwnam", lambda _: SimpleNamespace(pw_uid=0))
+    with pytest.raises(ValueError, match="Invalid agent-config account"):
+        agent_config_settings.AgentConfigSettings(agent_config_agent_user="fixture-agent")
+
+
+@pytest.mark.parametrize("fault", ["owner", "policy_write", "parent_write", "symlink"])
+def test_policy_requires_a_root_controlled_regular_file(tmp_path, monkeypatch, fault):
+    path = tmp_path / "policy.json"
+    path.write_text("{}", encoding="utf-8")
+    observed_path = path
+    if fault == "symlink":
+        observed_path = tmp_path / "policy-link.json"
+        observed_path.symlink_to(path)
+    monkeypatch.setattr(agent_config_settings, "POLICY_PATH", observed_path)
+    parent = tmp_path.stat()
+    fstat = os.fstat
+
+    def observed_stat(fd):
+        info = fstat(fd)
+        mode = info.st_mode & ~0o022
+        if stat.S_ISREG(info.st_mode):
+            return SimpleNamespace(st_uid=int(fault == "owner"), st_mode=mode | (0o020 if fault == "policy_write" else 0))
+        if fault == "parent_write" and (info.st_dev, info.st_ino) == (parent.st_dev, parent.st_ino):
+            mode |= 0o020
+        return SimpleNamespace(st_uid=0, st_mode=mode)
+
+    monkeypatch.setattr(os, "fstat", observed_stat)
+    with pytest.raises((ValueError, OSError)):
+        agent_config_settings.load_agent_config_settings()
+
+
+def test_helper_uses_the_alternate_installations_isolated_python(tmp_path, monkeypatch):
+    program = runpy.run_path(str(SCRIPT))
+    helper = tmp_path / "alternate" / "libexec" / "agent-config"
+    python = str(helper.parent.parent / "venv" / "bin" / "python")
+    calls = []
+    monkeypatch.setattr(os, "execv", lambda path, argv: calls.append((path, argv)))
+    program["use_install_python"](helper)
+    assert calls == [(python, [python, "-I", str(helper)])]
+
+
+def test_helper_home_uses_the_configured_unprivileged_account(tmp_path, monkeypatch):
+    program = runpy.run_path(str(SCRIPT))
+    calls = []
+
+    def passwd(name):
+        calls.append(name)
+        return SimpleNamespace(pw_uid=812, pw_dir=str(tmp_path))
+
+    monkeypatch.setattr(program["pwd"], "getpwnam", passwd)
+    monkeypatch.setattr(os, "getuid", lambda: 812)
+    monkeypatch.setattr(os, "geteuid", lambda: 812)
+    assert program["agent_home"]("alternate-agent") == tmp_path
+    assert calls == ["alternate-agent"]
+    monkeypatch.setattr(os, "geteuid", lambda: 813)
+    with pytest.raises(ValueError):
+        program["agent_home"]("alternate-agent")
+
+
+def test_installed_helper_refuses_a_policy_for_another_executable(tmp_path, monkeypatch, capsys):
+    main = runpy.run_path(str(SCRIPT))["main"]
+    policy = agent_config_settings.AgentConfigSettings(agent_config_helper_path=str(tmp_path / "agent-config"))
+    monkeypatch.setitem(main.__globals__, "load_policy", lambda: policy)
+
+    def unexpected_bootstrap(_path):
+        pytest.fail("A mismatched helper reached the installation bootstrap")
+
+    monkeypatch.setitem(main.__globals__, "use_install_python", unexpected_bootstrap)
+    request = {"operation": "folder_trust", "provider": "codex-cli", "folder": str(tmp_path)}
+    assert main([], io.BytesIO(json.dumps(request).encode()), installed=True) == 1
+    output = capsys.readouterr()
+    assert json.loads(output.out) == {"ok": False, "error": "agent_config_refused"}
+    assert output.err == ""

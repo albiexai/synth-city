@@ -504,15 +504,17 @@ async def test_scope_or_trust_changed_before_publication_keeps_workspace_disable
 
 
 @pytest.mark.asyncio
-async def test_split_user_trust_uses_both_fixed_accounts_and_the_same_identity(tmp_path, monkeypatch):
+async def test_split_user_trust_uses_the_configured_accounts_and_the_same_identity(tmp_path, monkeypatch):
     from app.services import dispatch_workspace_provisioning as provisioning
+    from app.services.agent_config_settings import AgentConfigSettings
 
     current = os.geteuid()
-    monkeypatch.setattr(provisioning.settings, "harness_agent_user", "deckproduct")
+    monkeypatch.setattr(provisioning.settings, "harness_agent_user", "fixture-agent")
     monkeypatch.setattr(provisioning.settings, "team_workspace_trust_helper_enabled", True)
-    monkeypatch.setattr(provisioning, "FACTORY_WORK_ROOT", tmp_path)
     monkeypatch.setattr(provisioning.pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=current + 1))
     monkeypatch.setattr(provisioning.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path / "controller")))
+    policy = AgentConfigSettings(agent_config_agent_user="fixture-agent", agent_config_work_root=str(tmp_path))
+    monkeypatch.setattr(type(provisioning.settings), "agent_config", property(lambda _: policy))
     calls = []
     monkeypatch.setattr(provisioning, "prepare_dispatch_git_trust",
         lambda *args, **kwargs: calls.append(("controller", args, kwargs["user"].uid)))
