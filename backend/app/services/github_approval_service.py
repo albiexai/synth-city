@@ -2605,6 +2605,18 @@ class GithubApprovalService:
         )
         try:
             if result.rowcount == 1 and decision == "approved":
+                paths_required = await db.scalar(select(TeamGithubScope.initial_paths_required)
+                                                 .where(TeamGithubScope.id == decision_scope_id))
+                if paths_required:
+                    root = await db.get(MailMessage, request.request_message_id, populate_existing=True)
+                    if root is None or not self.matches_linked_request_message(
+                        request, root, delivery_key=f"github-approval:{request.id}:request"
+                    ):
+                        raise GithubApprovalError("initial_plan_unverifiable")
+                    paths = self.linked_initial_plan_paths(root)
+                    if paths is None:
+                        raise GithubApprovalError("plan_allowed_paths_missing")
+                    self._canonical_paths(paths)
                 # Read the ceiling in the decision transaction and keep the missing estimate as NULL.
                 defaulted = await db.execute(
                     update(GithubWorkItem)
@@ -2646,7 +2658,7 @@ class GithubApprovalService:
                 raise GithubApprovalError(stop)
             await db.commit()
         except Exception:
-            if escalated_rejection:
+            if escalated_rejection or (result.rowcount == 1 and decision == "approved"):
                 await db.rollback()
             raise
         await db.refresh(request)

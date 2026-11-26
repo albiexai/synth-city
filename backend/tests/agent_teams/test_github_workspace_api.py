@@ -241,14 +241,18 @@ async def test_scope_settings_read_definitions_and_audit_history(client, db, tmp
     assert (effort["type"], effort["minimum"], effort["maximum"], effort["default"]) == ("integer", 15, 1440, 120)
     assert definitions["merge_policy"]["enum"] == ["human", "auto"]
     assert definitions["builds_out_of_tree"]["default"] is False
+    assert definitions["initial_paths_required"]["type"] == "boolean"
+    assert definitions["initial_paths_required"]["default"] is False
     assert response.json()["history"] == []
 
     invalid = await client.patch(path, headers=OPERATOR_HEADERS, json={"max_item_effort_minutes": 14})
     assert invalid.status_code == 422
     update_response = await client.patch(path, headers=OPERATOR_HEADERS, json={
         "max_item_effort_minutes": 45, "review_hold_label": "needs-review", "reason": "Use the project review gate",
+        "initial_paths_required": True,
     })
     assert update_response.status_code == 200
+    assert update_response.json()["initial_paths_required"] is True
     clear_response = await client.patch(path, headers=OPERATOR_HEADERS, json={"review_hold_label": None})
     assert clear_response.status_code == 200
     assert (await client.patch(path, headers=OPERATOR_HEADERS, json={"review_hold_label": None})).status_code == 200
@@ -269,6 +273,7 @@ async def test_scope_settings_read_definitions_and_audit_history(client, db, tmp
     assert first["changes"] == {
         "review_hold_label": {"before": None, "after": "needs-review"},
         "max_item_effort_minutes": {"before": 120, "after": 45},
+        "initial_paths_required": {"before": False, "after": True},
     }
     assert first["reason"] == "Use the project review gate"
     assert older["next_before_id"] is None

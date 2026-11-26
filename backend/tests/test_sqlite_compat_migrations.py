@@ -660,7 +660,7 @@ async def test_compat_migrations_add_pr2_continuation_columns_idempotently():
                     text(
                         "SELECT continuation_enabled, max_continuation_revisions, "
                         "max_continuation_failed_heads, max_failed_heads_per_revision, "
-                        "max_scope_paths, max_scope_commands "
+                        "max_scope_paths, max_scope_commands, initial_paths_required "
                         "FROM team_github_scopes WHERE id = 1"
                     )
                 )
@@ -671,13 +671,13 @@ async def test_compat_migrations_add_pr2_continuation_columns_idempotently():
                         "SELECT active_scope_revision, attempt_phase, "
                         "diagnostic_retry_count, diagnostic_last_verified_sha, "
                         "continuation_nudged_at, continuation_activated_at, "
-                        "pr_number, retry_count, dispatch_nonce, status_note "
+                        "pr_number, retry_count, dispatch_nonce, status_note, initial_paths_readiness "
                         "FROM github_work_items WHERE id = 1"
                     )
                 )
             ).one()
 
-            assert tuple(scope) == (0, 6, 8, 2, 32, 16)
+            assert tuple(scope) == (0, 6, 8, 2, 32, 16, 0)
             assert tuple(item) == (
                 0,
                 "implementation",
@@ -689,6 +689,7 @@ async def test_compat_migrations_add_pr2_continuation_columns_idempotently():
                 7,
                 "0123456789abcdef",
                 "preserve me",
+                None,
             )
             assert "submitted_head_sha" in await _sqlite_columns(
                 conn, "github_attempt_scope_revisions"

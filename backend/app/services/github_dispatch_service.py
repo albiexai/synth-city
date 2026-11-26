@@ -500,7 +500,8 @@ class GithubDispatchService:
                 ack_approval_round=values["ack_approval_round"], ack_enforcement_epoch=values["ack_enforcement_epoch"],
                 ack_evidence_message_id=values["ack_evidence_message_id"],
                 continuation_activated_at=values["continuation_activated_at"],
-                continuation_nudged_at=None, last_nudge_at=None, status_note=values["status_note"], updated_at=now)
+                continuation_nudged_at=None, last_nudge_at=None, status_note=values["status_note"],
+                initial_paths_readiness=None, updated_at=now)
             .execution_options(synchronize_session=False))
         workspace_result = await db.execute(update(GithubWorkspace).where(
             GithubWorkspace.id == context["workspace_id"],
@@ -883,6 +884,7 @@ class GithubDispatchService:
         item.ack_approval_round = None
         item.last_verified_sha = None
         item.verification_head_sha = None
+        item.initial_paths_readiness = None
         item.verification_started_at = None
         item.merge_wait_head_sha = None
         item.merge_wait_started_at = None

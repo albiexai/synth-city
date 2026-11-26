@@ -11,7 +11,11 @@ import type { ScopeSettingDefinition, ScopeSettingsHistoryEntry, TeamGithubScope
 import { fetchScopeSettings, updateTeamGithubScope } from './api'
 import { useOperatorTokenFlow } from './useOperatorTokenFlow'
 
-const NAMES: Record<string, string> = { review_hold_label: 'Review hold label', max_item_effort_minutes: 'Effort ceiling' }
+const NAMES: Record<string, string> = {
+  review_hold_label: 'Review hold label',
+  max_item_effort_minutes: 'Effort ceiling',
+  initial_paths_required: 'First-plan paths required',
+}
 const show = (value: unknown) => (value === null || value === undefined ? 'none' : String(value))
 
 /**
@@ -26,12 +30,12 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
   onReturnFocus: () => void
 }) {
   const { withOperatorToken, tokenDialog } = useOperatorTokenFlow('to read or change repository limits')
-  const [range, setRange] = useState<ScopeSettingDefinition | null>(null)
+  const [definitions, setDefinitions] = useState<Record<string, ScopeSettingDefinition>>({})
   const [history, setHistory] = useState<ScopeSettingsHistoryEntry[]>([])
   const [next, setNext] = useState<number | null>(null)
   const [historyState, setHistoryState] = useState<'loading' | 'ready' | 'failed'>('loading')
   // A field the user has not touched is undefined and follows the server, so a background refresh never erases a draft.
-  const [draft, setDraft] = useState<{ label?: string; clear?: boolean; minutes?: string; reason: string }>({ reason: '' })
+  const [draft, setDraft] = useState<{ label?: string; clear?: boolean; minutes?: string; requirePaths?: boolean; reason: string }>({ reason: '' })
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const generation = useRef(0) // a newer first load, or closing the dialog, makes older answers obsolete
@@ -40,6 +44,8 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
   const label = draft.label ?? scope.review_hold_label ?? ''
   const clear = draft.clear ?? scope.review_hold_label == null
   const minutes = draft.minutes ?? String(scope.max_item_effort_minutes ?? '')
+  const pathsRequired = scope.initial_paths_required ?? false
+  const requirePaths = draft.requirePaths ?? pathsRequired
   const reason = draft.reason
 
   const load = useCallback(async (beforeId?: number) => {
@@ -55,7 +61,7 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
     try {
       const page = await withOperatorToken((token) => fetchScopeSettings(scope.id, token, beforeId))
       if (mine !== generation.current) return
-      setRange(page.definitions.max_item_effort_minutes ?? null)
+      setDefinitions(page.definitions)
       setHistory((current) => (beforeId === undefined ? page.history : [...current, ...page.history.filter((item) => !current.some((seen) => seen.event_id === item.event_id))]))
       setNext(page.next_before_id)
       setHistoryState('ready')
@@ -79,11 +85,12 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
       return
     }
     queueMicrotask(() => {
-      setDraft({ reason: '' }); setRange(null); setHistory([]); setNext(null); setSaving(false); setHistoryState('loading')
+      setDraft({ reason: '' }); setDefinitions({}); setHistory([]); setNext(null); setSaving(false); setHistoryState('loading')
       void load()
     })
   }, [open, load])
 
+  const range = definitions.max_item_effort_minutes
   const min = range?.minimum, max = range?.maximum
   const submit = async () => {
     const update: TeamGithubScopeUpdate = {}
@@ -98,6 +105,7 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
       return
     }
     if (value !== scope.max_item_effort_minutes) update.max_item_effort_minutes = value
+    if (requirePaths !== pathsRequired) update.initial_paths_required = requirePaths
     if (clear ? scope.review_hold_label != null : label.trim() !== scope.review_hold_label) update.review_hold_label = clear ? null : label.trim()
     if (Object.keys(update).length === 0) {
       setError('No value changed.')
@@ -112,7 +120,7 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
       if (mine !== session.current) return
       setDraft({ reason: '' })
       await load()
-      toast.success('Review hold and effort limit saved')
+      toast.success('Repository limits saved')
     } catch (failure) {
       if (mine === session.current) setError(failure instanceof Error ? failure.message : 'Failed to save the limits')
     } finally {
@@ -142,6 +150,13 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
             <Input id="limits-minutes" inputMode="numeric" value={minutes} disabled={saving} onChange={(event) => setDraft((current) => ({ ...current, minutes: event.target.value }))} />
             {range && <p className="text-xs text-muted-foreground">Whole minutes, {min} to {max} minutes{range.default !== undefined && `, default ${String(range.default)}`}.</p>}
           </div>
+          {definitions.initial_paths_required?.type === 'boolean' && (
+            <div className="flex items-center gap-2 text-sm">
+              <Checkbox id="limits-require-paths" checked={requirePaths} disabled={saving}
+                onCheckedChange={(checked) => setDraft((current) => ({ ...current, requirePaths: checked === true }))} />
+              <Label htmlFor="limits-require-paths">Require paths in the first plan</Label>
+            </div>
+          )}
           <div className="grid gap-2">
             <Label htmlFor="limits-reason">Reason (optional)</Label>
             <Input id="limits-reason" maxLength={1000} value={reason} disabled={saving} onChange={(event) => setDraft((current) => ({ ...current, reason: event.target.value }))} />
