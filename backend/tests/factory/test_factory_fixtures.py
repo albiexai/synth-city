@@ -206,7 +206,7 @@ async def test_v13_frozen_responses_enforce_explicit_field_allowlist():
     The frozen files equal live responses (checked above), so the allowlist
     assertions here also cover the live read routes.
     """
-    safe_item_keys = set(wire.SafeWorkItem.model_fields)
+    safe_item_keys = set(wire.SafeWorkItem.model_fields) - {"scope_default_effort_limit_minutes"}
     summary = json.loads((FIXTURES / "schema.json").read_text())["models"]["AgentTeamSummaryResponse"]
     assert set(summary["properties"]) == set(wire.AgentTeamSummaryResponse.model_fields)
     assert not (set(summary["properties"]) & V13_FORBIDDEN_FIELDS)

@@ -50,6 +50,29 @@ async def test_ci_signal_reaches_work_list_and_detail_with_safe_reason(factory_c
     assert cleared["required_ci_unreadable"] is None and cleared["checks_unavailable_since"] is None
 
 
+async def test_only_defaulted_effort_limit_is_exposed_on_work_list_and_detail(factory_client, factory_store):
+    defaulted = factory_store.ids.by_status["verifying"]
+    estimated = factory_store.ids.by_status["dispatched"]
+    async with factory_store.maker() as db:
+        legacy = await db.scalar(select(GithubWorkItem.id).where(
+            GithubWorkItem.dispatch_status == "verifying", GithubWorkItem.id != defaulted).limit(1))
+        for item_id, estimate in ((defaulted, None), (estimated, 75)):
+            await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == item_id).values(
+                effort_estimate_minutes=estimate, effort_limit_minutes=75))
+        await db.commit()
+
+    listing = await get_ok(factory_client, "work-items", category="active", limit=100)
+    rows = {row["item"]["id"]: row["item"] for row in listing["items"]}
+    field = "scope_default_effort_limit_minutes"
+    for item_id in (defaulted, estimated, legacy):
+        item = (await get_ok(factory_client, f"work-items/{item_id}"))["work_item"]["item"]
+        assert rows[item_id] == item
+        if item_id == defaulted:
+            assert item[field] == 75
+        else:
+            assert field not in item
+
+
 async def test_complete_counts_and_timestamp_id_pagination(factory_client, factory_store):
     first = await get_ok(factory_client, "work-items", limit=100)
     assert first["total"] == 132
@@ -233,7 +256,7 @@ async def test_redaction_list_detail_overview_and_repository(factory_client, fac
         assert PRIVATE not in response.text
     result = await get_ok(factory_client, f"work-items/{factory_store.ids.by_status['escalated']}")
     item = result["work_item"]
-    assert set(item["item"]) == set(wire.SafeWorkItem.model_fields)
+    assert set(item["item"]) == set(wire.SafeWorkItem.model_fields) - {"scope_default_effort_limit_minutes"}
     assert set(item["team"]) == set(wire.TeamReference.model_fields)
     assert "parent_issue_url" not in item["item"]
     assert "outcome" not in item["item"]

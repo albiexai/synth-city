@@ -173,6 +173,7 @@ class SafeWorkItem(FactoryModel):
     checks_unavailable_since: Timestamp | None = None
     checks_unavailable_reason: Literal["permission_missing", "workflow_missing", "api_error", "unknown"] | None = None
     required_ci_unreadable: RequiredCIUnreadableSignal | None = None
+    scope_default_effort_limit_minutes: int | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class WorkProjection(FactoryModel):
