@@ -491,9 +491,13 @@ async def _delete_item(db, item_id):
     await db.commit()
 
 
-async def test_a_deleted_items_recorded_merge_still_counts_as_merged(db, world):
+@pytest.mark.parametrize("scope_link", [True, False], ids=["scope_kept", "scope_link_gone"])
+async def test_a_deleted_items_recorded_merge_still_counts_as_merged(db, world, scope_link):
     campaign = await _campaign(db, world)
     await _delete_item(db, world.items[("a1", 2)])
+    if not scope_link:  # the team key alone places it
+        await db.execute(text("UPDATE factory_audit_events SET scope_id = NULL WHERE event_kind = 'delivery_evidence'"))
+        await db.commit()
     by_name = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False))
     assert (by_name["merged"].value, by_name["closed_without_delivery"].value) == (1, 1)
     assert (by_name["merged"].unknown_count, by_name["merged"].coverage) == (0, "full")
@@ -553,8 +557,8 @@ def _strip(*fields):
 async def test_an_upgraded_delivery_row_without_its_identity_is_read_through_its_live_item(db, world):
     campaign = await _campaign(db, world)
     await db.execute(_strip("issue_number", "repo_owner", "repo_name"))
-    await db.execute(text("UPDATE factory_audit_events SET team_context_key = NULL "
-                          "WHERE event_kind = 'delivery_evidence'"))
+    await db.execute(text("UPDATE factory_audit_events SET team_context_key = NULL, scope_id = NULL "
+                          "WHERE event_kind = 'delivery_evidence'"))  # the live item alone places it
     await db.commit()
     by_name = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False))
     assert (by_name["merged"].value, by_name["closed_without_delivery"].value) == (1, 1)
