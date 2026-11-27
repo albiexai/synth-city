@@ -20,7 +20,7 @@ A Supervisor works within its recorded delegation. If an action is not delegated
 Follow these rules in every step of this guide.
 
 - **No pattern kills.** Never use `pkill`, `killall`, `pgrep -f` or `ps | grep` to choose a process. Stop only a PID that you started and recorded. Never signal the tmux server or an agent pane.
-- **Kill tmux sessions before a backend restart.** Otherwise a Codex member reconnects as a duplicate.
+- **Do not stop a native owner session for an upgrade or a restart.** The supported upgrade preserves native sessions. Restarting a waiting owner can also invalidate the process lifetime that operator recovery needs. Read the wait reason first. Stop a session only when you have identified that exact session and hold specific authority for it. After any restart, run the [check and resume list](/guide/supervised-factory-playbook#check-and-resume) of the playbook before you enable anything again.
 - **Never print a token or a dispatch nonce.** Never write one to a file, a log, a commit or a GitHub text. Keep dispatch nonces off GitHub.
 - **Read the database read-only.** Never edit a row to get past a guard.
 - **Give an unattended member no interactive question tool.** Give every charter a Supervisor address and the escalation order: Leader, then Supervisor, then Director.
@@ -52,7 +52,7 @@ python3 -B scripts/supervisor/checkin.py --preset PRESET_ID \
 | `--base-url` | The product address. The default is `http://127.0.0.1:8000`. |
 | `--supervisor-token-file` | The token file for the supervisor inbox. Without it the inbox step is skipped. |
 | `--prompt-operator-token` | Ask for the operator token with hidden input. |
-| `--since-id` | Show inbox messages above this id. Use the highest id of the last check-in. |
+| `--since-id` | Show inbox messages above this id. Start at 0. Use the id from the last run only when that run printed `highest inbox id:` (see [Keep the inbox cursor](#keep-the-inbox-cursor)). |
 | `--idle-minutes` | Report a member that is idle longer than this. The default is 20. |
 
 The script sends only GET requests and writes no file. The product's activity and summary reads can record native observations on the server, as they do for the web page.
@@ -67,9 +67,18 @@ Each step prints one line that starts with `ok`, `attention` or `error`. One fai
 | `summary` | `GET /api/v1/agent-teams/presets/PRESET/summary` | A hold, an attention item, a human action, unreadable required CI, incomplete coverage, or a late or absent Supervisor check-in. |
 | `activity` | `GET /api/v1/agent-teams/presets/PRESET/activity` | A member that is stopped, waiting for input, or idle longer than `--idle-minutes`. |
 | `overview` | `GET /api/v1/factory/overview?team_id=PRESET` | Work items that need attention. |
-| `inbox` | `GET /api/v1/external/agent-mail/supervisor-inbox` | New messages for the Supervisor. The line shows the highest id seen. |
+| `inbox` | `GET /api/v1/external/agent-mail/supervisor-inbox` | New messages for the Supervisor. The script reads the newest 50. |
 
 The exit code is `0` when every step is ok, `1` when a step needs attention, and `2` when a step or the setup failed.
+
+### Keep the inbox cursor
+
+The `inbox` step ends with one of two lines.
+
+- `highest inbox id: N` means that the read was complete. Save N and use it as `--since-id` in the next run.
+- `highest inbox id seen: N (not a confirmed cursor)` means that the newest page was full and every message in it was above your saved id. Older messages above your saved id may be missing. Keep your saved id. Do not use N. Read the older decisions first: call the route with a larger `limit` (the route allows up to 100) from a client that keeps the token out of the command line, or read them in the Agent Mail page. If a gap is still not covered, report incomplete coverage to the Director.
+
+An unseen decision is worse than a message that is shown twice, so never advance the saved id past a gap.
 
 ### What to do with a finding
 
@@ -80,9 +89,21 @@ The exit code is `0` when every step is ok, `1` when a step needs attention, and
 | `human action, act now` | Tell the Director. The request has a current assessment. |
 | `human action, stale` | Ask the Leader to refresh the assessment. |
 | `required CI unreadable` | Check GitHub access and the configured workflows. This consumes no retry budget. |
-| A member idle or waiting for input | Read that member's Mail and pane. An unanswered decision is the usual cause. Answer it or restart the member. |
-| New inbox messages | Answer by direct message. Use `synth_city_send_message` with the member as the recipient. |
-| `supervisor check-in late` | Call `synth_city_supervisor_checkin(preset_id, next_check_at, note)` after a successful check. |
+| A member idle or waiting for input | Read that member's Mail and pane. An unanswered decision is the usual cause. Answer it. Do not restart a waiting member unless you have identified that session and hold specific authority (see the safety rules). |
+| New inbox messages | Answer with the Supervisor's own identity (see [Answer as the Supervisor](#answer-as-the-supervisor)). |
+| `supervisor check-in late` | Record the next check after a successful run (see [Answer as the Supervisor](#answer-as-the-supervisor)). |
+
+### Answer as the Supervisor
+
+The Supervisor is a bound external Mail actor. It is not a team member, so the member tool `synth_city_send_message` does not send as the Supervisor. Use the actor's token as `Authorization: Bearer ...` on these routes. The helper's `--supervisor-token-file` applies to the helper process only. It does not authenticate any other call.
+
+| Action | Route and body |
+|---|---|
+| List members, to find a recipient | `GET /api/v1/external/agent-mail/members` |
+| Answer by direct message | `POST /api/v1/external/agent-mail/messages` with `recipient_member_id`, `subject` and `body_markdown` |
+| Promise the next check | `POST /api/v1/external/agent-mail/supervisor-checkin` with `preset_id`, `next_check_at` (an ISO 8601 UTC time within 24 hours) and `note` |
+
+An agent Supervisor can promise the next check with the MCP tool `synth_city_supervisor_checkin(preset_id, next_check_at, note)`. The tool reads the actor's token from the environment variable `SYNTH_CITY_EXTERNAL_ACTOR_TOKEN` and accepts no token argument. Only the bound actor can use it. Make the call after each successful check-in. A check-in grants no approval, retry, lease or merge authority.
 
 ### What the script does not read
 
@@ -119,7 +140,7 @@ The script lists the pull requests of the scope's base branch with GitHub GET re
 | `PR #N merged with exact-head acceptance.` | Good. |
 | `PR #N merged without proven exact-head acceptance.` | Investigate. A bad merge is reverted by the Supervisor, with the reason recorded. |
 | `PR #N is open without proven exact-head acceptance.` | The PR must not merge yet. |
-| `PR #N lacks a unique work item in the selected scope.` | The PR has no work item (for example a release PR). List it separately with its recorded reason. |
+| `PR #N lacks a unique work item in the selected scope.` | Zero work items or more than one work item match the PR. The script prints the same line for both. Investigate the mapping and keep the finding. The exit code stays 1, and `--restore-hold` skips the PR. List a release PR separately only after you have established its exception independently. |
 | `PR #N hold restored.` | Only with `--restore-hold`. The script checked the PR again first. |
 
 The exit code is `0` for no finding, `1` for a review gap, and `2` for a setup or evidence error. With two verifiers, a verdict from either current verifier counts.
@@ -128,13 +149,14 @@ The product does not store the accepted head on the merge record. The audit comp
 
 ### The recovery merge
 
-Merge by hand only when the daily automatic merge cap blocks a PR that is otherwise ready. Check all of these at the same head:
+Merge by hand only when the daily automatic merge cap is the sole reason that a PR waits. Do all of these checks, at the same head, in this order:
 
-1. The PR is not a draft and has no hold label.
-2. A current verifier accepted that exact head.
-3. Every latest required check for that head is `completed` and `success`, and all of them are present. Count them.
+1. The work item note ends with `[auto_merge_cap_reached: n of N automatic merges in the last 24 hours]`. This is the cap-specific notice. Read [When automatic merge does not fire](/autonomy#when-automatic-merge-does-not-fire). Another notice, such as `[item_not_eligible: escalated: ...]`, is a different reason. Stop and keep the human gate.
+2. The PR is not a draft, has no hold label, and targets the intended base branch of the intended repository.
+3. A current independent verifier accepted that exact head, and the Leader's approval of the item is current. Read both again now. Also read the team's current holds.
+4. Every latest required check for that head is `completed` and `success`, and all of them are present. Count them.
 
-Then run `gh pr merge N --merge --match-head-commit HEAD_SHA`. The head guard refuses if anything was pushed. Add this PR comment: "Recorded Supervisor recovery merge: the daily auto-merge cap is reached. The verifier accepted this exact head (`HEAD8`) and every latest required check is green." Add a line to the Supervisor's notes. Never merge by hand for any other reason.
+Then run `gh pr merge N --merge --match-head-commit HEAD_SHA`. The head guard refuses if anything was pushed. Add this PR comment: "Recorded Supervisor recovery merge: the daily auto-merge cap is reached. The verifier accepted this exact head (`HEAD8`) and every latest required check is green." Add a line to the Supervisor's notes. Never merge by hand for any other reason. Use it only within your recorded delegation. It grants no other merge authority.
 
 ## Split an issue
 
@@ -188,7 +210,7 @@ These routes need the operator token in the header `x-synth-city-operator-token`
 
 - **Finalize a merged item** that did not settle: `POST /api/v1/agent-teams/presets/PRESET/work-items/ITEM/finalize-merged`. Send `{"dry_run": true}` first. A real call sends the returned `expected_context_sha256`, an `operation_id` and a `reason` of up to 240 characters.
 - **End a stopped item**: `POST /api/v1/agent-teams/presets/PRESET/work-items/ITEM/end-stopped`. Send `operation_id`, `expected_dispatch_generation` (64 hex characters, or null), `expected_scope_revision` (the item's `active_scope_revision`), `reason`, and an outcome. Use `deferred` with `target_milestone`, or `superseded` with `superseding_pr_number`. The PR must differ from the item's own PR.
-- **Free a stale workspace**: `POST /api/v1/agent-teams/github-scopes/SCOPE/workspaces/WORKSPACE/force-release`. Send `force: true`, the lease's `expected_leased_at` and a `reason`. Read `unpushed_commits` and `discarded_paths` in the answer. Use it only when the owner has stopped.
+- **Free a stale workspace**: `POST /api/v1/agent-teams/github-scopes/SCOPE/workspaces/WORKSPACE/force-release`. The call measures the dirty paths and the unpushed commits and releases the lease in one step, so the answer comes too late to save work. Before the call, inspect the exact lease and its workspace for dirty paths and unpushed commits, with the authorized identity. Preserve unpublished work, or record an explicit decision to discard it. Use the call only when the owner has stopped. Then send `force: true`, the lease's `expected_leased_at` and a `reason`, and read `unpushed_commits` and `discarded_paths` in the answer to confirm what was lost.
 
 ## Gaps found in the product
 

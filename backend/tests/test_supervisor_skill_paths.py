@@ -78,3 +78,19 @@ def test_the_guide_keeps_the_safety_rules_and_the_exit_codes():
                    "--match-head-commit", "dry run", "never closes the original"):
         assert phrase in guide, phrase
     assert guide.count("The exit code is `0`") >= 2
+
+
+def test_the_guide_keeps_the_corrections_of_review_6093796586():
+    guide = GUIDE.read_text()
+    for phrase in (
+        "Do not stop a native owner session",  # 1: sessions are preserved through maintenance
+        "not a confirmed cursor", "highest inbox id:", "Keep your saved id",  # 2: the inbox cursor moves only after a full read
+        "/api/v1/external/agent-mail/messages", "recipient_member_id", "SYNTH_CITY_EXTERNAL_ACTOR_TOKEN",  # 3: the Supervisor's identity
+        "Zero work items or more than one work item", "keep the finding",  # 4: an ambiguous PR stays a finding
+        "auto_merge_cap_reached", "item_not_eligible", "Leader's approval",  # 5: the cap is the sole blocker
+        "does not send as the Supervisor",  # 3: the member tool is not the Supervisor's identity
+        "Before the call, inspect the exact lease",  # 6: inspect before force-release
+    ):
+        assert phrase in guide, phrase
+    for gone in ("Kill tmux sessions", "or restart the member", "Use `synth_city_send_message`"):
+        assert gone not in guide, gone
