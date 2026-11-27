@@ -2,6 +2,7 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -104,6 +105,49 @@ def service(monkeypatch, values=None, attention=None, hold=None, **kwargs):
     monkeypatch.setattr("app.services.agent_team_summary_service.hold_code", lambda: hold)
     reads = Progress(values)
     return AgentTeamSummaryService(progress=reads, attention=attention or Attention(), **kwargs), reads
+
+
+class ObservationClock:
+    """Advance the summary deadline only when a test read spends time."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.deadline = 0.0
+
+    def time(self):
+        return self.now
+
+    async def wait_for(self, read, timeout):
+        self.deadline = self.now + timeout
+        task = asyncio.create_task(read)
+        try:
+            return await task
+        except asyncio.CancelledError:
+            if task.cancelled() and self.now == self.deadline:
+                raise TimeoutError from None
+            raise
+
+    async def spend(self, seconds):
+        self.now = min(self.now + seconds, self.deadline)
+        if self.now == self.deadline:
+            asyncio.current_task().cancel()
+            await asyncio.sleep(0)  # Deliver cancellation without waiting on wall time.
+
+
+@pytest.fixture
+def observation_clock(monkeypatch):
+    from app.models.schemas import UnansweredRequestView
+    from app.services import agent_team_summary_service as summary_module
+    from app.services.mail_request_stall_service import mail_request_stall_service
+
+    clock = ObservationClock()
+    monkeypatch.setattr(summary_module, "asyncio", SimpleNamespace(
+        get_running_loop=lambda: clock, wait_for=clock.wait_for,
+    ))
+    # Mail has its own real monotonic deadline. These cases exercise progress reads only.
+    monkeypatch.setattr(mail_request_stall_service, "capture_baseline", AsyncMock(return_value=(None, None)))
+    monkeypatch.setattr(mail_request_stall_service, "observe", AsyncMock(return_value=UnansweredRequestView()))
+    return clock
 
 
 @pytest.mark.asyncio
@@ -654,41 +698,18 @@ async def test_stopped_attempts_and_recorded_pauses_use_existing_signals(db, mon
 
 
 @pytest.mark.asyncio
-async def test_shared_time_limit_and_item_limit_keep_unknown_coverage(db, monkeypatch):
+async def test_shared_time_limit_and_item_limit_keep_unknown_coverage(db, monkeypatch, observation_clock):
     team, _, items = await seed(db, ("dispatched", "dispatched"))
-    # Deterministic collaborators for this test only: the pre-item activity and
-    # supervisor reads return instantly, so the shared budget below is spent
-    # only on the real snapshot/pauses reads and the blocked item read. The
-    # budget does not race their scheduling latency (the old flake: when those
-    # reads ate the 0.5s budget, the item read was never invoked).
-    from types import SimpleNamespace
-
-    async def no_supervisor(db, preset_id, now=None):
-        return None
-
-    async def empty_activity(db, preset_id, **kwargs):
-        return SimpleNamespace(slots=[], valid_until=datetime.now(timezone.utc) + timedelta(seconds=60))
-
-    async def empty_inputs(db, preset_id, max_rows=None):
-        return []
-
-    monkeypatch.setattr("app.services.agent_team_summary_service.observe_supervisor", no_supervisor)
-    monkeypatch.setattr("app.services.agent_activity_service.observe_team", empty_activity)
-    monkeypatch.setattr("app.services.agent_activity_service._team_inputs", empty_inputs)
     started, cancelled = [], []
-    never = asyncio.Event()
 
     async def blocked(db, item_id):
         started.append(item_id)
         try:
-            await never.wait()
+            await observation_clock.spend(2)
         except asyncio.CancelledError:
             cancelled.append(item_id)
             raise
 
-    # The blocked read can never complete on its own, at any budget length, so
-    # a 1s budget (vs ~0.01-0.03s of real pre-item sqlite reads) keeps the same
-    # time-limit semantics as 0.5s: only deadline cancellation can end the read.
     summary, reads = service(monkeypatch, {items[0].id: blocked}, observation_seconds=1)
     item_id, team_id = items[0].id, team.id
     result = await summary.summary(db, team.id)
@@ -927,17 +948,22 @@ async def test_deleted_team_during_read_returns_none(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_observation_budget_is_shared_across_items(db, monkeypatch):
+async def test_observation_budget_is_shared_across_items(db, monkeypatch, observation_clock):
     team, _, items = await seed(db, ("dispatched", "dispatched"))
+    item_ids = [item.id for item in items]
+
     async def delayed(db, item_id):
-        await asyncio.sleep(0.3)
+        await observation_clock.spend(3)
         return progress(item_id)
-    summary, reads = service(monkeypatch, {item.id: delayed for item in items}, observation_seconds=0.5)
+
+    summary, reads = service(monkeypatch, dict.fromkeys(item_ids, delayed), observation_seconds=4)
     result = await summary.summary(db, team.id)
-    assert len(reads.calls) == 2
+    assert reads.calls == item_ids
     assert result.remaining_work.reported_items == 1
     assert result.remaining_work.state == "unknown"
     assert not result.next_actor_coverage_complete
+    assert [(entry.code, entry.source, entry.work_item_id) for entry in result.coverage_reason] == [
+        ("observation_timeout", "progress", item_ids[1])]
 
 
 @pytest.mark.asyncio
