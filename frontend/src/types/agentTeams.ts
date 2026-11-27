@@ -423,7 +423,14 @@ export interface DeliveryPolicyEvent {
 }
 export interface DeliveryPolicyHistoryResponse { events: DeliveryPolicyEvent[] }
 
-export interface TeamGithubScope {
+export interface TeamGithubScopeSafetyBounds {
+  max_scope_amendments?: number
+  max_scope_amendment_requests?: number
+  max_amendment_added_paths?: number
+  max_companion_paths?: number
+}
+
+export interface TeamGithubScope extends TeamGithubScopeSafetyBounds {
   id: number
   preset_id: number
   repo_owner: string
@@ -484,7 +491,7 @@ export interface TeamGithubScopeInput {
   enabled?: boolean
 }
 
-export interface TeamGithubScopeUpdate {
+export interface TeamGithubScopeUpdate extends TeamGithubScopeSafetyBounds {
   repo_owner?: string
   repo_name?: string
   repo_path?: string
@@ -505,6 +512,7 @@ export interface TeamGithubScopeUpdate {
   review_hold_label?: string | null
   max_item_effort_minutes?: number
   initial_paths_required?: boolean
+  confirm?: string
   reason?: string
   enabled?: boolean
 }

@@ -38,6 +38,7 @@ SAFE_VALUE_FIELDS = {
     "continuation_enabled", "max_continuation_revisions",
     "max_continuation_failed_heads", "max_failed_heads_per_revision",
     "max_scope_paths", "max_scope_commands",
+    "max_scope_amendments", "max_scope_amendment_requests", "max_amendment_added_paths", "max_companion_paths",
     # R05: every audited finite scope policy setting. Command hints and
     # templates are free text that can hold commands; they stay excluded.
     "max_approval_rounds", "max_concurrent_dispatched", "max_verification_retries",
