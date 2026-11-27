@@ -736,9 +736,8 @@ async def _scope_identity_in_use(db: AsyncSession, scope_id: int) -> bool:
     return active_attempt is not None
 
 
-_SCOPE_TIMING_FIELDS = ("merge_check_wait_minutes", "effort_extension_cap_minutes", "effort_extension_cap_percent")
 _SCOPE_CONFIGURATION_FIELDS = (
-    *_SCOPE_TIMING_FIELDS,
+    "merge_check_wait_minutes", "effort_extension_cap_minutes", "effort_extension_cap_percent",
     "preset_id", "repo_owner", "repo_name", "repo_path", "dispatch_label", "design_label",
     "merge_policy", "review_hold_label", "max_approval_rounds", "max_concurrent_dispatched", "max_verification_retries",
     "max_auto_merges_per_day", "max_item_effort_minutes", "max_plan_estimate_minutes", "initial_paths_required", "base_ref",
@@ -858,10 +857,12 @@ def _apply_scope_create(
         scope.max_auto_merges_per_day = request.max_auto_merges_per_day
     if request.max_item_effort_minutes is not None:
         scope.max_item_effort_minutes = request.max_item_effort_minutes
-    for field in _SCOPE_TIMING_FIELDS:
-        value = getattr(request, field)
-        if value is not None:
-            setattr(scope, field, value)
+    if request.merge_check_wait_minutes is not None:
+        scope.merge_check_wait_minutes = request.merge_check_wait_minutes
+    if request.effort_extension_cap_minutes is not None:
+        scope.effort_extension_cap_minutes = request.effort_extension_cap_minutes
+    if request.effort_extension_cap_percent is not None:
+        scope.effort_extension_cap_percent = request.effort_extension_cap_percent
     if "max_plan_estimate_minutes" in request.model_fields_set:
         scope.max_plan_estimate_minutes = request.max_plan_estimate_minutes
     if request.initial_paths_required is not None:
