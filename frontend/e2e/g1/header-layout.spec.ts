@@ -208,7 +208,7 @@ test.describe('at 1440 px', () => {
         // The baseline: logo at the left padding (24 px), subtitle beside it, toggle at the right padding.
         const byName = (name: string) => boxes.find(box => box.name === name)
         expect(byName('Albiex Synth City')!.left).toBe(24)
-        expect(byName('Your local agent command centre')).toBeDefined()
+        expect(byName('Self-directing AI product teams')).toBeDefined()
         expect(byName('Toggle theme')!.right).toBe(1440 - 24)
         if (state === 'cli-warning') {
           // From sm up the warning keeps its text.
