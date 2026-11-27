@@ -81,8 +81,21 @@ async def monitor(db, attempt, minutes, service=github_dispatch_service):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scenario", ["eligible", "busy", "low", "hold", "owner", "audit_failure"])
-async def test_plan_decision_reroutes_with_atomic_authority(db, timed_attempt, monkeypatch, scenario):
+@pytest.mark.parametrize(("scenario", "detail"), [
+    ("eligible", None), ("busy", None), ("audit_failure", None),
+    ("low", "handoff_target_below_difficulty"), ("owner", "not_designated_leader"),
+    ("approved", "reroute_requires_rejection"), ("changed_nonce", "stale_approval_context"),
+    ("hold_before", "hold"), ("hold_after", "hold"),
+    ("wrong_status", "stale_approval_context"), ("pr", "stale_approval_context"),
+    ("acked", "stale_approval_context"), ("retry", "stale_approval_context"),
+    ("revision", "stale_approval_context"),
+    ("same_slot", "invalid_handoff_target"), ("other_team", "invalid_handoff_target"),
+    ("disabled", "invalid_handoff_target"), ("leader", "invalid_handoff_target"),
+    ("coordinator", "invalid_handoff_target"), ("no_lease", "lease_not_current"),
+    ("last_round", "approval_rounds_exhausted"), ("paused", "dispatch_paused"),
+    ("disabled_scope", "dispatch_paused"),
+])
+async def test_plan_decision_reroutes_with_atomic_authority(db, timed_attempt, monkeypatch, scenario, detail):
     from fastapi import HTTPException
     from app.services import factory_audit_service, github_coordination_service
     from app.services.github_workspace_service import github_workspace_service
@@ -94,11 +107,17 @@ async def test_plan_decision_reroutes_with_atomic_authority(db, timed_attempt, m
     target = AgentTeamSlot(
         preset_id=attempt.scope.preset_id, position=2, display_name="Target", provider="codex-cli",
         repo_id="approval", repo_path="/tmp/approval", repo_name="approval", launch_mode="plain",
-        enabled=True, capability_tier="low" if scenario == "low" else "medium",
+        enabled=scenario != "disabled", capability_tier="low" if scenario == "low" else "medium",
+        role=" Coordinator " if scenario == "coordinator" else None,
     )
+    if scenario == "other_team":
+        preset = AgentTeamPreset(name="Other team", description="", created_by="test")
+        db.add(preset)
+        await db.flush()
+        target.preset_id = preset.id
     db.add(target)
     await db.flush()
-    target_id = target.id
+    target_id = {"same_slot": owner_id, "leader": attempt.leader.team_slot_id}.get(scenario, target.id)
     if scenario == "busy":
         blocker = GithubWorkItem(scope_id=attempt.scope.id, issue_number=92, issue_title="Busy",
             issue_url="u", github_updated_at=START, dispatch_status="dispatched", owner_slot_id=target_id)
@@ -106,14 +125,54 @@ async def test_plan_decision_reroutes_with_atomic_authority(db, timed_attempt, m
     await db.commit()
     approval = await request_plan(db, attempt)
     request_id, root_id = approval.id, approval.request_message_id
+    overrides = {
+        "wrong_status": ("dispatch_status", "verifying"), "pr": ("pr_number", 85),
+        "acked": ("ack_received_at", START), "retry": ("retry_requested_at", START),
+        "revision": ("active_scope_revision", 1),
+    }
+    if scenario in overrides:
+        field, value = overrides[scenario]
+        setattr(attempt.item, field, value)
+    if scenario == "no_lease":
+        attempt.workspace.leased_item_id = None
+    elif scenario == "last_round":
+        attempt.scope.max_approval_rounds = 1
+    elif scenario == "paused":
+        preset = await db.get(AgentTeamPreset, attempt.scope.preset_id)
+        preset.dispatch_paused = True
+    elif scenario == "disabled_scope":
+        attempt.scope.enabled = False
+    await db.commit()
+    lease_binding = attempt.workspace.leased_item_id, attempt.workspace.lease_token, attempt.workspace.leased_owner_pid
     caller = attempt.owner if scenario == "owner" else attempt.leader
     session = await db.scalar(select(MailAgentSession).where(MailAgentSession.member_id == caller.id))
     decision = MailDecisionRequest(work_item_id=item_id, dispatch_nonce=attempt.item.dispatch_nonce,
-        approval_request_id=request_id, decision="rejected", reason="Choose a different builder",
+        approval_request_id=request_id, decision="approved" if scenario == "approved" else "rejected",
+        reason="Choose a different builder",
         reassign_to_slot_id=target_id)
 
-    if scenario == "hold":
-        monkeypatch.setattr(github_coordination_service, "hold_code", lambda: "hold")
+    if scenario in {"hold_before", "hold_after"}:
+        hold = "hold" if scenario == "hold_before" else None
+        stage = github_dispatch_service.stage_plan_reroute
+
+        async def stage_then_change_hold(*args, **kwargs):
+            nonlocal hold
+            notice = await stage(*args, **kwargs)
+            hold = "hold" if scenario == "hold_after" else None
+            return notice
+
+        monkeypatch.setattr(github_coordination_service, "hold_code", lambda: hold)
+        monkeypatch.setattr(github_dispatch_service, "stage_plan_reroute", stage_then_change_hold)
+    if scenario == "changed_nonce":
+        dispatch_module = importlib.import_module("app.services.github_dispatch_service")
+        lock = dispatch_module._lock_dispatch_team
+
+        async def lock_then_replace_nonce(db_, preset_id):
+            await lock(db_, preset_id)
+            await db_.execute(update(GithubWorkItem).where(GithubWorkItem.id == item_id)
+                .values(dispatch_nonce="replacement").execution_options(synchronize_session=False))
+
+        monkeypatch.setattr(dispatch_module, "_lock_dispatch_team", lock_then_replace_nonce)
     if scenario == "audit_failure":
         record = factory_audit_service.record_event
 
@@ -125,15 +184,16 @@ async def test_plan_decision_reroutes_with_atomic_authority(db, timed_attempt, m
         monkeypatch.setattr(factory_audit_service, "record_event", fail_handoff)
         with pytest.raises(RuntimeError, match="synthetic audit failure"):
             await agent_mail.decide_work_item(decision, session, db)
-    elif scenario in {"low", "hold", "owner"}:
+    elif detail:
         with pytest.raises(HTTPException) as refused:
             await agent_mail.decide_work_item(decision, session, db)
-        assert refused.value.detail == {
-            "low": "handoff_target_below_difficulty", "hold": "hold", "owner": "not_designated_leader",
-        }[scenario]
+        assert refused.value.detail == detail
     else:
+        apply_decision = AsyncMock(wraps=github_dispatch_service.apply_approval_decision)
+        monkeypatch.setattr(github_dispatch_service, "apply_approval_decision", apply_decision)
         answer = await agent_mail.decide_work_item(decision, session, db)
         assert answer.decision == "rejected" and answer.payload["reassign_to_slot_id"] == target_id
+        apply_decision.assert_not_awaited()
 
     await db.refresh(attempt.item)
     await db.refresh(attempt.workspace)
@@ -141,17 +201,27 @@ async def test_plan_decision_reroutes_with_atomic_authority(db, timed_attempt, m
     root = await db.get(MailMessage, root_id, populate_existing=True)
     reroute = await db.scalar(select(FactoryAuditEvent).where(
         FactoryAuditEvent.request_id == request_id, FactoryAuditEvent.event_kind == "handoff_reassignment"))
-    assert attempt.workspace.leased_item_id == item_id and attempt.item.owner_slot_id == owner_id
+    assert (attempt.workspace.leased_item_id, attempt.workspace.lease_token,
+            attempt.workspace.leased_owner_pid) == lease_binding
+    assert attempt.item.owner_slot_id == owner_id
     if scenario not in {"eligible", "busy"}:
         assert approval.status == root.request_status == "pending"
         assert approval.decision_message_id is None and reroute is None
         assert attempt.item.handoff_state is None and attempt.item.approval_round_count == 1
+        assert await db.scalar(select(FactoryAuditEvent.id).where(
+            FactoryAuditEvent.request_id == request_id, FactoryAuditEvent.event_kind == "approval_decision",
+            FactoryAuditEvent.action_outcome == "applied")) is None
         return
 
     assert approval.decision_message_id == answer.id
     assert attempt.item.approval_round_count == 2 and attempt.item.ack_received_at is None
     assert reroute.actor_member_id == attempt.leader.id
     assert attempt.item.handoff_target_slot_id == target_id
+    escalated = AsyncMock()
+    monkeypatch.setattr(github_dispatch_service, "escalate", escalated)
+    await github_dispatch_service.monitor_dispatched(db, attempt.scope, attempt.slots,
+        wake_state_by_slot={attempt.leader.team_slot_id: "wakeable", owner_id: "offline"})
+    escalated.assert_not_awaited()
     with pytest.raises(HTTPException) as refused:
         await request_plan(db, attempt)
     assert refused.value.detail == "approval_handoff_pending"
@@ -172,6 +242,43 @@ async def test_plan_decision_reroutes_with_atomic_authority(db, timed_attempt, m
         db, attempt.item, authenticated_owner_member_id=target_member.id, summary="New owner's plan")
     assert created and new_plan.approval_round == 2
     assert attempt.item.owner_slot_id == target_id and attempt.workspace.leased_owner_pid == 202
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["leader", "coordinator"])
+async def test_existing_handoff_refuses_ineligible_roles_on_offer_and_acceptance(db, timed_attempt, monkeypatch, role):
+    from app.services.github_dispatch_service import ResumeAttemptError
+    from app.services.github_workspace_service import github_workspace_service
+
+    attempt = timed_attempt
+    item, scope = attempt.item, attempt.scope
+    owner_id, target_id = item.owner_slot_id, attempt.leader.team_slot_id
+    if role == "coordinator":
+        target = AgentTeamSlot(preset_id=scope.preset_id, position=2, display_name="Coordinator",
+            provider="codex-cli", repo_id="approval", repo_path="/tmp/approval", repo_name="approval",
+            launch_mode="plain", enabled=True, role="Coordinator")
+        db.add(target)
+        await db.flush()
+        target_id = target.id
+    await db.commit()
+    with pytest.raises(ResumeAttemptError) as refused:
+        await github_dispatch_service.initiate_handoff(db, item, scope,
+            initiating_slot_id=owner_id, target_slot_id=target_id)
+    assert refused.value.block_code == "invalid_handoff_target"
+    assert item.handoff_state is None and item.owner_slot_id == owner_id
+
+    # A pending offer can predate a role change.
+    item.handoff_state, item.handoff_target_slot_id = "pending", target_id
+    attempt.workspace.kind = "primary"
+    await db.commit()
+    revoke = AsyncMock()
+    monkeypatch.setattr(github_workspace_service, "revoke_push_token", revoke)
+    with pytest.raises(ValueError, match="handoff state changed before acceptance"):
+        await github_dispatch_service.accept_handoff(db, item, target_id,
+            accepting_pane_pid=202, accepting_pane_proc_start="2002")
+    revoke.assert_not_awaited()
+    await db.refresh(item)
+    assert item.handoff_state == "pending" and item.owner_slot_id == owner_id
 
 
 @pytest.mark.asyncio
