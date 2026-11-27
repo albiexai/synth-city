@@ -406,6 +406,42 @@ class AgentTeamService:
         await db.refresh(preset)
         return await self._preset_response(db, preset)
 
+    async def set_dispatch_pause(
+        self, db: AsyncSession, preset_id: int, *, paused: bool, reason: str, actor: dict | None = None,
+    ) -> AgentTeamPresetResponse:
+        from app.services import factory_audit_service as audit
+
+        reason = audit.sanitize_reason(reason.strip())
+        if not reason:
+            raise ValueError("Dispatch pause requires a reason")
+        audit_actor = actor or audit.derive_actor(actor_kind="operator")
+        try:
+            preset = await self._lock_preset_for_mutation(db, preset_id)
+            if preset.dispatch_paused != paused:
+                previous = preset.dispatch_paused
+                now = datetime.utcnow()
+                preset.dispatch_paused = paused
+                preset.dispatch_pause_reason = reason if paused else None
+                preset.dispatch_paused_by = audit_actor["actor_kind"] if paused else None
+                preset.updated_at = now
+                if not paused:
+                    scopes = select(TeamGithubScope.id).where(TeamGithubScope.preset_id == preset_id)
+                    await db.execute(update(GithubWorkItem).where(
+                        GithubWorkItem.scope_id.in_(scopes), GithubWorkItem.dispatch_status == "pending",
+                        GithubWorkItem.pending_reason == "dispatch_paused",
+                    ).values(pending_reason=None, updated_at=now).execution_options(synchronize_session=False))
+                await audit.record_event(
+                    db, event_kind="policy_change", source="agent_team_service.set_dispatch_pause",
+                    occurred_at=now, actor=audit_actor, team_preset_id=preset_id,
+                    before_values={"dispatch_paused": previous}, after_values={"dispatch_paused": paused},
+                    sanitized_reason=reason, action_outcome="applied",
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        return await self._preset_response(db, preset)
+
     async def delete_preset(self, db: AsyncSession, preset_id: int) -> None:
         try:
             # SQLite is the supported persistence engine. A row lock alone on
@@ -2038,6 +2074,9 @@ class AgentTeamService:
             created_at=preset.created_at,
             updated_at=preset.updated_at,
             autonomy_enabled=preset.autonomy_enabled,
+            dispatch_paused=preset.dispatch_paused,
+            dispatch_pause_reason=preset.dispatch_pause_reason,
+            dispatch_paused_by=preset.dispatch_paused_by,
             leader_slot_id=preset.leader_slot_id,
             slots=[self._slot_response(slot) for slot in slots],
         )

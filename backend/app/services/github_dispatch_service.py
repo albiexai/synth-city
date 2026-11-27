@@ -194,6 +194,7 @@ def restored_escalation_reason(revision) -> str:
 
 PENDING_REASONS = frozenset(
     {
+        "dispatch_paused",
         "queued_repo_cap",
         "queued_low_memory",
         "queued_slot_busy",
@@ -1142,13 +1143,17 @@ class GithubDispatchService:
         if item.dispatch_status != "pending" or expected_identity != _item_identity(item):
             await db.commit()
             return False
+        preset = await db.get(AgentTeamPreset, preset_id, populate_existing=True)
+        if scope.preset_id == preset_id and preset is not None and preset.dispatch_paused:
+            item.pending_reason = "dispatch_paused"
+            await db.commit()
+            return False
         if (not await self._dispatch_authorized(db, scope, require_autonomy=require_autonomy)
             or scope.preset_id != preset_id or owner is None or not owner.enabled
             or owner.preset_id != preset_id):
             item.pending_reason = "leader_unavailable"
             await db.commit()
             return False
-        preset = await db.get(AgentTeamPreset, preset_id, populate_existing=True)
         if _ineligible_owner(owner, preset.leader_slot_id if preset else None):
             item.pending_reason = "no_eligible_owner"
             item.status_note = NO_ELIGIBLE_OWNER_NOTE
@@ -1259,6 +1264,19 @@ class GithubDispatchService:
         slots_by_id = {slot.id: slot for slot in preset_slots}
         preset = await db.get(AgentTeamPreset, scope.preset_id)
         leader = next((slot for slot in preset_slots if preset and slot.id == preset.leader_slot_id and slot.enabled), None)
+        if leader is not None:
+            await github_workspace_service.reclaim_stale(db, scope)
+            await self._advance_queued_handoffs(db, scope, require_autonomy=require_autonomy)
+        pause = select(AgentTeamPreset.id).where(
+            AgentTeamPreset.id == scope.preset_id, AgentTeamPreset.dispatch_paused.is_(True),
+        )
+        if await db.scalar(pause):
+            await db.execute(update(GithubWorkItem).where(
+                GithubWorkItem.scope_id == scope.id, GithubWorkItem.dispatch_status == "pending",
+                GithubWorkItem.pending_reason.is_distinct_from("dispatch_paused"), pause.exists(),
+            ).values(pending_reason="dispatch_paused", updated_at=datetime.utcnow()))
+            await db.commit()
+            return
         if leader is None:
             for item in (await db.execute(select(GithubWorkItem).where(
                 GithubWorkItem.scope_id == scope.id,
@@ -1267,9 +1285,6 @@ class GithubDispatchService:
                 await self._update_current_item(db, item, _item_identity(item), pending_reason="leader_unavailable")
             await db.commit()
             return
-        await github_workspace_service.reclaim_stale(db, scope)
-        await self._advance_queued_handoffs(db, scope, require_autonomy=require_autonomy)
-
         pending = (
             await db.execute(
                 select(GithubWorkItem).where(

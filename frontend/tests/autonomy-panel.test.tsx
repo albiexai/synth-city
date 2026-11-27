@@ -106,6 +106,7 @@ function panelProps(overrides: Partial<Parameters<typeof AutonomyPanel>[0]> = {}
     loadError: null,
     onRefresh: vi.fn().mockResolvedValue(undefined),
     onToggleAutonomy: vi.fn().mockResolvedValue(undefined),
+    onSetDispatchPause: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   }
 }
@@ -211,4 +212,28 @@ describe('OperatorTokenDialog', () => {
 
     expect(screen.queryByText(/Synth City needs the key/)).not.toBeInTheDocument()
   })
+})
+
+
+
+it('sends a reason for dispatch pause through the Director key flow', async () => {
+  const user = userEvent.setup()
+  setOperatorToken('fixture-operator-key')
+  try {
+    const props = panelProps({ preset: { ...preset, autonomy_enabled: true }, workItems: [] })
+    const view = render(<AutonomyPanel {...props} />)
+    await user.click(screen.getByRole('button', { name: 'Pause new dispatch' }))
+    expect(screen.getByRole('button', { name: 'Pause dispatch' })).toBeDisabled()
+    await user.type(screen.getByRole('textbox', { name: 'Reason' }), 'Drain for checkpoint')
+    await user.click(screen.getByRole('button', { name: 'Pause dispatch' }))
+    await waitFor(() => expect(props.onSetDispatchPause).toHaveBeenCalledWith(true, 'Drain for checkpoint', 'fixture-operator-key'))
+    expect(screen.getByRole('switch', { name: 'Enable autonomous GitHub dispatch' })).toBeChecked()
+    view.rerender(<AutonomyPanel {...props} preset={{ ...props.preset, dispatch_paused: true }} />)
+    await user.click(screen.getByRole('button', { name: 'Resume new dispatch' }))
+    await user.type(screen.getByRole('textbox', { name: 'Reason' }), 'Checkpoint finished')
+    await user.click(screen.getByRole('button', { name: 'Resume dispatch' }))
+    await waitFor(() => expect(props.onSetDispatchPause).toHaveBeenLastCalledWith(false, 'Checkpoint finished', 'fixture-operator-key'))
+  } finally {
+    clearOperatorToken()
+  }
 })

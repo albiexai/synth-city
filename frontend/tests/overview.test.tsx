@@ -602,3 +602,19 @@ describe('Overview filters', () => {
     expect(within(needsYouList()).getByRole('link', { name: /Open #47/ })).toBeInTheDocument()
   })
 })
+
+
+
+it('shows the paused intake reason and operator beside the running team on Overview', async () => {
+  serve({
+    presets: [{ ...preset(1, 'Release crew', true), dispatch_paused: true,
+      dispatch_pause_reason: 'Drain for checkpoint', dispatch_paused_by: 'operator' }],
+    summaries: { 1: summary() },
+    overview: overviewWith({}),
+  })
+  await open()
+  const card = screen.getByRole('region', { name: 'Team summary: Release crew' })
+  expect(within(card).getByText('Dispatch paused')).toBeInTheDocument()
+  expect(within(card).getByText(/Drain for checkpoint.*Set by Operator/)).toBeInTheDocument()
+  expect(within(card).getByText('Running')).toBeInTheDocument()
+})

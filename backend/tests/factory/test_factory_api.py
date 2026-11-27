@@ -351,3 +351,20 @@ async def test_factory_gets_do_not_write_or_call_runtime_mutations(factory_clien
     async with factory_store.maker() as db:
         after = {table.name: (await db.execute(select(table))).all() for table in Base.metadata.tables.values()}
     assert after == before
+
+
+
+async def test_dispatch_pause_blocks_intake_but_preserves_poll_freshness(factory_client, factory_store):
+    team_id = factory_store.ids.teams[0]
+    scope_id = factory_store.ids.scopes[0]
+    before = (await get_ok(factory_client, f"repositories/{scope_id}"))["repository"]
+    async with factory_store.maker() as db:
+        await db.execute(update(AgentTeamPreset).where(AgentTeamPreset.id == team_id).values(dispatch_paused=True))
+        await db.commit()
+    paused = (await get_ok(factory_client, f"repositories/{scope_id}"))["repository"]
+    assert paused["configured_enabled"] and paused["intake"]["state"] == "blocked"
+    assert paused["intake"]["reason_code"] == "dispatch_paused"
+    assert paused["poll"]["freshness"] == before["poll"]["freshness"] != "suspended"
+    summary = (await get_ok(factory_client, "overview", scope_id=scope_id))["automation"]
+    assert summary["enabled_scopes"] == summary["intake_blocked_scopes"] == 1
+    assert summary["intake_eligible_scopes"] == summary["stale_scopes"] == summary["never_polled_scopes"] == 0

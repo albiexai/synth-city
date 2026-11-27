@@ -57,6 +57,7 @@ from app.models.schemas import (
     AgentTeamActivityResponse,
     AgentTeamCreateFromBridgeRequest,
     AgentTeamCreateFromMailRequest,
+    AgentTeamDispatchPauseRequest,
     AgentTeamLaunchPlan,
     AgentTeamLaunchRequest,
     AgentTeamLaunchResult,
@@ -2600,6 +2601,22 @@ async def update_preset(
     if request.autonomy_enabled is not None:
         await _sync_github_jobs(db)
     return response
+
+
+@router.put("/presets/{preset_id}/dispatch-pause", response_model=AgentTeamPresetResponse,
+            dependencies=[Depends(require_director_action())])
+async def set_team_dispatch_pause(
+    preset_id: int,
+    request: AgentTeamDispatchPauseRequest,
+    db: AsyncSession = Depends(get_db),
+    write_context: dict = Depends(operator_write_context),
+):
+    try:
+        return await agent_team_service.set_dispatch_pause(
+            db, preset_id, paused=request.paused, reason=request.reason, actor=_write_actor(write_context),
+        )
+    except ValueError as exc:
+        raise _bad_request(exc) from exc
 
 
 @router.get("/presets/{preset_id}/work-settings", response_model=TeamWorkSettingsResponse)

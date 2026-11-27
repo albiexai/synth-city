@@ -76,6 +76,9 @@ export interface AgentTeamPreset {
   created_at: string
   updated_at: string
   autonomy_enabled: boolean
+  dispatch_paused?: boolean
+  dispatch_pause_reason?: string | null
+  dispatch_paused_by?: string | null
   leader_slot_id?: number | null
   slots: AgentTeamSlot[]
 }

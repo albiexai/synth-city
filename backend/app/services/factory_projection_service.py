@@ -39,6 +39,7 @@ STATUS_CATEGORY = {status: category for category, statuses in CATEGORY_STATUSES.
 REASON_SUMMARIES = {
     "unknown": "State needs inspection.",
     "team_paused": "Team automation is paused.", "scope_paused": "Repository intake is paused.",
+    "dispatch_paused": "New dispatch is paused. Work in flight continues.",
     "recovery_only_gate": "Normal intake is blocked while recovery mode is active.",
     "scheduler_stopped": "The scheduler is stopped.",
     "runtime_not_observed": "Runtime availability has not been observed.",
@@ -220,13 +221,15 @@ def intake(scope, team, runtime: RuntimeSnapshot) -> wire.IntakeProjection:
         code, state = "runtime_not_observed", "unknown"
     elif github_dispatch_scheduler._job_id(scope.repo_owner, scope.repo_name) not in runtime.job_ids:
         code, state = "job_not_scheduled", "blocked"
+    elif team.dispatch_paused:
+        code, state = "dispatch_paused", "blocked"
     else:
         code, state = "intake_eligible", "eligible"
     return wire.IntakeProjection(state=state, reason_code=code, summary=REASON_SUMMARIES[code])
 
 
 def poll(scope, effective_intake, now) -> wire.PollObservation:
-    if effective_intake.state == "blocked":
+    if effective_intake.state == "blocked" and effective_intake.reason_code != "dispatch_paused":
         freshness = "suspended"
     elif effective_intake.state == "unknown":
         freshness = "unknown"
@@ -470,9 +473,10 @@ async def overview(db, filters):
             automation["paused_scopes"] += 1
             continue
         automation["enabled_scopes"] += 1
-        freshness = poll(scope, effective, now).freshness
-        automation["never_polled_scopes"] += freshness == "never_polled"
-        automation["stale_scopes"] += freshness == "stale"
+        if effective.state == "eligible":
+            freshness = poll(scope, effective, now).freshness
+            automation["never_polled_scopes"] += freshness == "never_polled"
+            automation["stale_scopes"] += freshness == "stale"
     from app.services.github_operator_attention_service import github_operator_attention_service
     reminders = await github_operator_attention_service.reminder_snapshot(
         db, [scope for scope, team in scopes], provider=filters.provider, now=now)
