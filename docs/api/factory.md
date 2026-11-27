@@ -10,7 +10,7 @@ A route with **Operator token** access accepts only the operator token; a sessio
 
 | Class | Route | Access | Behavior |
 | --- | --- | --- | --- |
-| Safe observation | GET `/api/v1/factory/overview`, `/api/v1/factory/work-items`, `/api/v1/factory/work-items/{item_id}`, `/api/v1/factory/repositories`, `/api/v1/factory/repositories/{scope_id}` | None | Reads local records and a bounded scheduler observation |
+| Safe observation | GET `/api/v1/factory/overview`, `/api/v1/factory/work-items`, `/api/v1/factory/work-items/{item_id}`, `/api/v1/factory/repositories`, `/api/v1/factory/repositories/{scope_id}`, `/api/v1/factory/campaigns` | None | Reads local records and a bounded scheduler observation |
 | Safe observation | GET `/api/v1/factory/metrics` | None | Reads ledger aggregates |
 | Protected observation | GET `/api/v1/factory/audit-events` | Operator token | Reads ledger history |
 | Protected observation | POST `/api/v1/factory/setup-preflight` | Operator token | Checks the checkout, GitHub access, labels, base branch and selected authentication presence; creates or changes no records |
@@ -35,6 +35,7 @@ All paths below begin with `/api/v1/factory`. These GET routes read local factor
 | GET `/work-items/{item_id}` | One safe work projection |
 | GET `/repositories` | Paginated repository scopes with intake, poll and overlap observations |
 | GET `/repositories/{scope_id}` | One repository scope observation |
+| GET `/campaigns` | Paginated campaigns with their repositories and recorded issue counts (see [Campaigns list](#campaigns-list)) |
 
 ## Filters and pagination
 
@@ -161,6 +162,23 @@ The following overview comes from checked-in disposable fixtures, not a live fac
 ```
 
 Complete nested schemas, nullable fields and bounded reason mappings are in `backend/app/models/factory_schemas.py` and `backend/tests/factory/fixtures/v1/`. The checked-in fixtures are synthetic examples of this versioned contract.
+
+## Campaigns list
+
+`GET /api/v1/factory/campaigns` lists the campaigns of every team for Insights, Retrospectives. It reads the database and the snapshot cache in memory. It never calls GitHub and never builds, refreshes or freezes a snapshot.
+
+Query: `team_id`, `scope_id` (the same filters as the other routes), `status` (`live`, `finished` or `all`, the default), `limit` (1 to 100) and `cursor`. A `scope_id` keeps every campaign whose repositories include that repository's owner and name, in any team. A `scope_id` that does not belong to `team_id` returns 422. A bad `status` or `cursor` returns 422, and a `scope_id` or `team_id` that does not exist returns 404.
+
+Each row has the team (`null` after the team was retired), the selector, the status (`active`, `finishing` or `finished`), the start and finish times, `merged` and `in_scope`, the `repositories` with their issue counts, and the `source` of the counts. A `team_id` selects the current lifetime of that team only: a campaign of an earlier team with the same id is not listed.
+
+`merged` and `in_scope` keep the snapshot's own `coverage`, `unknown_count` and `reasons`. A value with `coverage` `partial` is a known count with some outcomes still unknown, for example a closed issue with no recorded delivery.
+
+- **Count source.** The latest frozen snapshot, else the last live snapshot built in this process, else none. `source.kind` is `frozen` or `live`. `source.as_of` is the cutoff that the counts describe, taken from the snapshot itself. For a frozen snapshot, `source.frozen_at` is when that version was stored. The list never refreshes a count.
+- **Unknown is never zero.** A number that is not recorded is `null` with a `reason`: `not_read_yet` (a live campaign with no snapshot yet, which still names the team's repositories), `incomplete_read` (a repository could not be read), `membership_read_after_cutoff`, `departure_after_cutoff` or `delivery_after_cutoff` (a gap at the cutoff leaves every repository count unknown, as it does the total), `repository_added_after_snapshot` (a live campaign covers a repository that the last snapshot does not list), `no_repositories_watched` (a live campaign whose team watches no repository now, or a frozen snapshot that recorded an empty repository list with a known zero total and full coverage; this is known, not missing evidence, so a repository filter neither keeps nor hides it), `snapshot_without_repository_counts` (a snapshot made before the counts existed), or `no_snapshot` (a finished campaign with no snapshot).
+- **Before recording.** A campaign gets `before_recording` instead of `no_snapshot` only when the recording marker exists and the campaign began before it. A missing snapshot alone never says it. `finished_before_recording` counts only finished campaigns that ended before the marker.
+- **Repository filter.** A campaign whose repositories are unknown is not kept by a `scope_id` filter. `hidden_unknown_repositories` counts the ones that the `status` filter would show. A live campaign covers exactly the repositories its team watches now, never an older snapshot's list: it stays under a repository that was added after its last snapshot, with an unknown count, and it lists none when the team watches none.
+
+The response also has `total`, `counts` (`live` and `finished`, before the `status` filter), `has_more` and `next_cursor`.
 
 ## Audit events and delivery metrics
 

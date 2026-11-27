@@ -421,7 +421,7 @@ async def end_submitted_revision(db, item, *, review_id, leader_member_id, dispa
             raise GithubApprovalError('current_leader_and_review_required', status_code=403)
         if context['dispatch_status'] == 'escalated':
             if (item.escalation_reason != 'amendment_budget_exhausted'
-                    or revision.origin_kind != 'scope_amendment' or revision.revision != context['active_scope_revision']):
+                    or revision.revision != context['active_scope_revision']):
                 raise GithubApprovalError('current_leader_and_review_required', status_code=403)
             context['escalation_reason'] = 'amendment_budget_exhausted'
         await approval.claim_healthy_scope_context(db, context)
@@ -438,19 +438,18 @@ async def end_submitted_revision(db, item, *, review_id, leader_member_id, dispa
     scope = await db.get(TeamGithubScope, item.scope_id)
     await _read_review_head(scope, context, fact.head_sha)
     await _claim_review_context(db, context)
-    capped = False
-    if revision.origin_kind == 'scope_amendment' and revision.approved_at is not None:
-        # Compare both proposal caps under the existing attempt writer.
-        await db.refresh(scope, attribute_names=("max_scope_amendments", "max_scope_amendment_requests"),
-                         with_for_update=True)
-        approved_count, request_count = (await db.execute(select(
-            func.count(GithubAttemptScopeRevision.approved_at), func.count(),
-        ).select_from(GithubAttemptScopeRevision).where(
-            GithubAttemptScopeRevision.work_item_id == item.id,
-            GithubAttemptScopeRevision.dispatch_nonce == context['dispatch_nonce'],
-            GithubAttemptScopeRevision.origin_kind == 'scope_amendment',
-        ))).one()
-        capped = approved_count >= scope.max_scope_amendments or request_count >= scope.max_scope_amendment_requests
+    # Both revision origins need another bounded route after a negative disposition.
+    # Read the amendment limits under the existing attempt writer.
+    await db.refresh(scope, attribute_names=("max_scope_amendments", "max_scope_amendment_requests"),
+                     with_for_update=True)
+    approved_count, request_count = (await db.execute(select(
+        func.count(GithubAttemptScopeRevision.approved_at), func.count(),
+    ).select_from(GithubAttemptScopeRevision).where(
+        GithubAttemptScopeRevision.work_item_id == item.id,
+        GithubAttemptScopeRevision.dispatch_nonce == context['dispatch_nonce'],
+        GithubAttemptScopeRevision.origin_kind == 'scope_amendment',
+    ))).one()
+    capped = approved_count >= scope.max_scope_amendments or request_count >= scope.max_scope_amendment_requests
     consumed = await db.execute(update(GithubRevisionReview).where(*(
         _same(getattr(GithubRevisionReview, key), value) for key, value in fact_values.items()))
         .values(status='consumed', ended_at=datetime.utcnow(), settled_by_member_id=leader_member_id,
@@ -464,7 +463,7 @@ async def end_submitted_revision(db, item, *, review_id, leader_member_id, dispa
     if capped:
         stopped = stopped.values(dispatch_status='escalated', escalation_reason='amendment_budget_exhausted',
             updated_at=datetime.utcnow(),
-            status_note='The Leader settled changes required on a scope amendment after the attempt reached an amendment limit. '
+            status_note='The Leader settled changes required after the attempt reached an amendment limit. '
                         'The owner can request a bounded continuation within the remaining budgets.')
         context.update(dispatch_status='escalated', escalation_reason='amendment_budget_exhausted')
     else:

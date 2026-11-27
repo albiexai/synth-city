@@ -859,8 +859,13 @@ async def bind_submitted_review(db, a, revision):
 @pytest_asyncio.fixture
 async def submitted_continuation(db, healthy_attempt, monkeypatch, request):
     a = healthy_attempt
-    for number in range(1, getattr(request, "param", 0) + 1):
+    approved, rejected = getattr(request, "param", (0, 0))
+    for number in range(1, approved + 1):
         await prior_amendment(a, db, number, [], status="completed", approved=True)
+    if rejected:
+        a.scope.max_continuation_revisions = 10
+        for number in range(approved + 1, approved + rejected + 1):
+            await prior_amendment(a, db, number, [])
     monkeypatch.setattr(github_client, "get_recursive_tree", AsyncMock(return_value={}))
     a.item.pr_number = 5
     await github_dispatch_service.escalate_without_notification(db, a.item, "plan_blocked")
@@ -1186,16 +1191,42 @@ async def test_settlement_counts_only_approved_amendments_of_this_attempt(db, su
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("submitted_continuation", [3], indirect=True)
-async def test_settling_a_continuation_does_not_use_the_amendment_cap_route(db, submitted_continuation):
+@pytest.mark.parametrize("submitted_continuation,capped", [
+    ((3, 0), True),
+    ((2, 0), False),
+    ((0, 8), True),
+    ((0, 7), False),
+], indirect=["submitted_continuation"], ids=["approval_cap", "below_approval_cap", "request_cap", "below_request_cap"])
+async def test_settling_a_continuation_uses_the_amendment_caps(db, submitted_continuation, capped):
     from app.services.github_terminal_revision_service import end_submitted_revision
 
     a = submitted_continuation
     fact = await record_changes(db, a)
-    await end_submitted_revision(db, a.item, review_id=fact.id, leader_member_id=a.leader.id,
-        dispatch_nonce=a.item.dispatch_nonce, reason="Settle a non-amendment submission")
+    decision = dict(review_id=fact.id, leader_member_id=a.leader.id,
+                    dispatch_nonce=a.item.dispatch_nonce, reason="Settle the submitted continuation")
+    await end_submitted_revision(db, a.item, **decision)
+    await db.refresh(fact)
     assert a.revision.origin_kind == "continuation"
-    assert a.item.dispatch_status == "dispatched" and a.item.escalation_reason is None
+    assert a.revision.status == "superseded" and fact.status == "consumed"
+    assert a.item.active_scope_revision == a.revision.revision and a.item.ack_received_at is None
+    assert a.workspace.leased_item_id == a.item.id
+
+    if capped:
+        assert a.item.dispatch_status == "escalated"
+        assert a.item.escalation_reason == "amendment_budget_exhausted"
+        settled_at = a.revision.completed_at
+        replay = await end_submitted_revision(db, a.item, **decision)
+        assert replay.id == a.revision.id and replay.completed_at == settled_at
+        revision, _, created = await github_approval_service.create_continuation_request(
+            db, a.item, a.scope, **amendment(a))
+        assert created and revision.status == "proposed" and revision.revision == a.revision.revision + 1
+        assert revision.originating_escalation_reason == "amendment_budget_exhausted"
+    else:
+        assert a.item.dispatch_status == "dispatched" and a.item.escalation_reason is None
+        with pytest.raises(GithubApprovalError, match="continuation_not_escalated"):
+            await github_approval_service.create_continuation_request(db, a.item, a.scope, **amendment(a))
+        revision, _, created = await github_approval_service.create_scope_amendment_request(db, a.item, a.scope, **amendment(a))
+        assert created and revision.origin_kind == "scope_amendment" and revision.status == "proposed"
 
 
 @pytest.mark.asyncio

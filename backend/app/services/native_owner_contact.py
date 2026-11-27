@@ -1,7 +1,6 @@
 """Fresh native work renews contact only for an unchanged, unexpired owner."""
 from __future__ import annotations
 
-import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
@@ -145,9 +144,11 @@ async def renew_native_owner_contact(db: AsyncSession, scope: TeamGithubScope,
         auxiliary_pid if provider == "pi-cli" else None,
         auxiliary_start if provider == "pi-cli" else None,
     )
+    observations = await activity.observe_poll_team(
+        db, scope.preset_id, timeout=_NATIVE_RESPONSE_SECONDS, source="owner_contact")
+    if observations is None:
+        return False
     try:
-        observations = await asyncio.wait_for(
-            activity.observe_private_team(db, scope.preset_id, max_input_rows=256), timeout=_NATIVE_RESPONSE_SECONDS)
         observed = observations.get(slot.id)
         if (observed is None or observed.state != "working" or not observed.identity
                 or observed.binding_identity != expected_binding
@@ -167,7 +168,7 @@ async def renew_native_owner_contact(db: AsyncSession, scope: TeamGithubScope,
         auxiliary_state, current_auxiliary_start = activity._process(auxiliary_pid)
         if auxiliary_state in activity._STOPPED_STATES or current_auxiliary_start != auxiliary_start:
             return False
-    except (OSError, ValueError, TimeoutError):
+    except (OSError, ValueError):
         return False
     if now - anchor > timedelta(seconds=idle + grace) or (
         nudge is not None and nudge >= anchor and now - nudge > timedelta(seconds=grace)

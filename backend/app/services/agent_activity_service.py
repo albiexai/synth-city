@@ -18,6 +18,7 @@ import stat
 import subprocess
 import threading
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
@@ -25,8 +26,8 @@ from pathlib import Path
 from uuid import UUID
 
 from sqlalchemy import JSON, and_, exists, or_, select, update
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
 from app.models.database import (
     AgentPaneBinding, AgentTeamPreset, AgentTeamSlot, MailAgentSession, MailMessage, MailReceipt, MailPaneLifecycle, MailTeamMember,
@@ -973,8 +974,10 @@ def private_binding_identity(provider: str, pane_pid: int, pane_start: str, cwd:
     ).encode()).hexdigest()
 
 
-async def observe_private_team(db: AsyncSession, preset_id: int,
-                               max_input_rows: int | None = None) -> dict[int, PrivateActivity]:
+async def observe_private_team(
+    db: AsyncSession, preset_id: int, max_input_rows: int | None = None, *,
+    defer_records: Callable[[Callable[[AsyncSession], Awaitable[None]]], None] | None = None,
+) -> dict[int, PrivateActivity]:
     inputs = await _team_inputs(db, preset_id, max_input_rows)
     now = datetime.now(timezone.utc)
     captured = []
@@ -1017,6 +1020,38 @@ async def observe_private_team(db: AsyncSession, preset_id: int,
     for entry in inputs:
         if current.get(entry[0]) != entry:
             values[entry[0]] = PrivateActivity("unknown", "binding_changed", None, None, None)
-    await _save_codex_identities(db, inputs, captured, current)
-    await _record_input_waits(db, preset_id, inputs, captured, current, now=now)
+
+    async def record(target: AsyncSession) -> None:
+        await _save_codex_identities(target, inputs, captured, current)
+        await _record_input_waits(target, preset_id, inputs, captured, current, now=now)
+
+    if defer_records is None:
+        await record(db)
+    else:
+        defer_records(record)
     return values
+
+
+async def observe_poll_team(db: AsyncSession, preset_id: int, *, timeout: float,
+                            source: str) -> dict[int, PrivateActivity] | None:
+    """A deadline may invalidate a connection. Keep that transaction off the poll session."""
+    bind = db.bind
+    if isinstance(bind, AsyncConnection):
+        bind = bind.engine
+    sessions = async_sessionmaker(bind, expire_on_commit=False, autoflush=False)
+    records: list[Callable[[AsyncSession], Awaitable[None]]] = []
+    try:
+        async with sessions() as observation_db:
+            async with asyncio.timeout(timeout):
+                observed = await observe_private_team(
+                    observation_db, preset_id, max_input_rows=256, defer_records=records.append)
+    except (TimeoutError, OSError, ValueError, SQLAlchemyError) as error:
+        # The isolated context has discarded its transaction. Leave the poll's
+        # transaction and original error details out of the observation failure.
+        logger.warning("native_team_observation_failed source=%s error_type=%s", source, type(error).__name__)
+        return None
+    # The poll may already own SQLite's writer lock. Apply the fenced records
+    # on that transaction after the timed reader closes.
+    for record in records:
+        await record(db)
+    return observed
