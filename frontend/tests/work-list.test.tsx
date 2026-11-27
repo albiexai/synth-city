@@ -158,8 +158,11 @@ describe("compact Work list", () => {
     expect(screen.getByRole("option", { name: "Avery · Builder" })).toBeInTheDocument();
     expect(screen.getByText(/Expected order, recomputed on each poll/)).toBeInTheDocument();
     const rows = within(screen.getByRole("table")).getAllByRole("row").slice(1);
-    expect(rows[0]).toHaveTextContent("next · " + queued.repository.display_name);
-    expect(rows[1]).toHaveTextContent("3rd · " + queued.repository.display_name);
+    for (const [index, label] of ["next", "3rd"].entries()) {
+      const cells = within(rows[index]).getAllByRole("cell");
+      expect(within(cells[0]).getByText(queued.repository.display_name)).toBeInTheDocument();
+      expect(within(cells[2]).getByText(label, { exact: true })).toBeInTheDocument();
+    }
   });
 
   it("uses one plain sentence as the intro", async () => {

@@ -87,8 +87,16 @@ for (const width of [1280, 390]) {
       await expect(select).toHaveValue(owner)
       const rows = page.locator(ROW)
       await expect(rows).toHaveCount(2)
-      await expect(rows.nth(0)).toContainText('next')
-      await expect(rows.nth(1)).toContainText('2nd')
+      for (const [index, label] of ['next', '2nd'].entries()) {
+        const ordinal = rows.nth(index).getByText(new RegExp('^' + label + '\\b'))
+        const { clientWidth, scrollWidth } = await ordinal.evaluate(element => ({
+          clientWidth: element.clientWidth,
+          scrollWidth: element.scrollWidth,
+        }))
+        expect(clientWidth, `${label} has room in its row`).toBeGreaterThan(0)
+        expect(scrollWidth, `${label} fits without clipping`).toBeLessThanOrEqual(clientWidth)
+        await expect(ordinal).toHaveText(label)
+      }
       await expect(page.getByText(/^Expected order, recomputed on each poll/)).toBeVisible()
       expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width)
       expect(await contrastFailures(page.locator('main'))).toEqual([])
