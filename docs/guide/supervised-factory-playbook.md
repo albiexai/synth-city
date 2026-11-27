@@ -358,6 +358,22 @@ A required job that runs only on pull requests never appears on an integration p
 
 When two Done-when conditions conflict after both merge, such as a new panel that pushes a list below the fold, file one gate fix that keeps both. Do not drop either condition to pass.
 
+### Audit exact-head merge review
+
+Run the Supervisor merge audit with existing GitHub CLI access and an explicit SQLite evidence file and scope ID. Use a fixture or isolated database when testing it.
+
+```sh
+python3 -B scripts/supervisor/audit_merges.py --db PATH_TO_SQLITE --scope-id SCOPE_ID
+```
+
+The script opens SQLite in read-only mode and uses GitHub GET requests by default. It checks pull requests into the scope's configured base and reports whether the recorded head has an active acceptance from a current independent verifier. The output uses the PR number and a fixed result message. [GitHub pull request reads](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests)
+
+The product does not store the accepted head on the merge record. The audit compares GitHub's reported PR head to the review and roster evidence available at the time of the audit. Its result covers the review condition. The merge fence has separate checks.
+
+Add `--restore-hold` to restore the configured review hold on an eligible open, non-draft PR with a unique work item in the selected scope and no qualifying acceptance. The script rechecks the PR and review evidence before adding the label. GitHub applies label additions in a separate request, so the head can change between those operations. Existing labels are preserved. [GitHub label additions](https://docs.github.com/en/rest/issues/labels#add-labels-to-an-issue)
+
+Exit codes are `0` for an audit with no findings, `1` for review gaps observed during the scan, and `2` for setup or evidence errors. Restoring a hold leaves the review gap visible.
+
 ## 7. Use external reviewers where they add evidence
 
 Use the team's independent verifier for ordinary completed candidates. Add external source review for a material cross-cutting or operational change, such as lease authority, recovery, CI selection, controller cutover or rollback. Do not add a second full review to every ordinary PR.
