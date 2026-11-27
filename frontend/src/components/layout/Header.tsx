@@ -47,7 +47,7 @@ export function Header() {
             alt="Albiex Synth City"
             className="h-10 w-auto shrink-0"
           />
-          <p className="hidden text-xs text-muted-foreground sm:block">Your local agent command centre</p>
+          <p className="hidden text-xs text-muted-foreground sm:block">Self-directing AI product teams</p>
         </div>
         <div className="flex min-w-0 items-center gap-1 sm:gap-2">
           {!status && (

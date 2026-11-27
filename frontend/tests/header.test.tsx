@@ -53,7 +53,7 @@ describe("Header", () => {
 
   it("keeps the subtitle, and hides it below the sm breakpoint so the narrow header fits one row", () => {
     renderHeader();
-    const subtitle = screen.getByText("Your local agent command centre");
+    const subtitle = screen.getByText("Self-directing AI product teams");
     expect(subtitle).toBeInTheDocument();
     expect(subtitle).toHaveClass("hidden", "sm:block");
   });
