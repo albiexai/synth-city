@@ -283,13 +283,13 @@ class AgentTeamCampaignService:
     @staticmethod
     async def _campaign_record(db, preset_id):
         """The team lifetime's recorded campaigns (#1415): the open one's status, else ``finished`` when it has only
-        finished ones, and how many have finished."""
-        from app.services import factory_audit_service as audit
+        finished ones, and how many have finished. The key is read with the team, in the same statement (#1356), so a
+        replacement team's key never meets this team's campaigns."""
+        from app.services.agent_team_supervisor_service import active_team_key_subquery
 
-        key = await audit.current_context_key(db, "team", preset_id)
-        if key is None:
-            return {}
-        statuses = (await db.scalars(select(Campaign.status).where(Campaign.team_context_key == key))).all()
+        statuses = (await db.scalars(select(Campaign.status).select_from(AgentTeamPreset)
+            .join(Campaign, Campaign.team_context_key == active_team_key_subquery())
+            .where(AgentTeamPreset.id == preset_id))).all()
         status = next((status for status in ("active", "finishing", "finished") if status in statuses), None)
         return {"campaign_status": status, "finished_campaign_count": statuses.count("finished")}
 
