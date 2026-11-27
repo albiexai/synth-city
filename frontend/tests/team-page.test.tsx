@@ -3,6 +3,7 @@ import { cleanup, render, screen, waitFor, within } from '@testing-library/react
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AgentTeamsPage } from '../src/features/agent-teams/AgentTeamsPage'
+import { OperatorTokenDialog } from '../src/features/agent-teams/OperatorTokenDialog'
 import {
   deleteAgentTeamPreset, deleteAgentTeamSlot, duplicateAgentTeamPreset, fetchAgentTeamPresets,
   planAgentTeamLaunch, reorderAgentTeamSlots, updateAgentTeamLeader, updateAgentTeamPreset,
@@ -96,6 +97,32 @@ function open(path = '/teams/1?tab=roster') {
     </MemoryRouter>,
   )
 }
+
+describe('shared OS user warning', () => {
+  it.each([true, false])('follows the installation state on Teams and in the key prompt (%s)', async (shared) => {
+    const users = [{ name: 'controller', is_controller: true, is_default: shared }]
+    if (!shared) users.push({ name: 'agent', is_controller: false, is_default: true })
+    const { requests } = fixtureFetch((path) => path === 'harness-scope'
+      ? jsonResponse({ users, default_user: shared ? 'controller' : 'agent' })
+      : jsonResponse({ detail: 'not needed by this test' }, 404))
+    const warning = /agents running as the controller can read the operator token/i
+
+    open()
+    if (shared) expect(await screen.findByText(warning)).toBeVisible()
+    else {
+      await waitFor(() => expect(requests.filter(({ path }) => path === 'harness-scope')).toHaveLength(1))
+      expect(screen.queryByText(warning)).not.toBeInTheDocument()
+    }
+
+    render(<OperatorTokenDialog open value="" error={null} onValueChange={vi.fn()} onSubmit={vi.fn()} onCancel={vi.fn()} />)
+    const dialog = screen.getByRole('dialog', { name: 'Director key' })
+    if (shared) expect(await within(dialog).findByText(warning)).toBeVisible()
+    else {
+      await waitFor(() => expect(requests.filter(({ path }) => path === 'harness-scope')).toHaveLength(2))
+      expect(within(dialog).queryByText(warning)).not.toBeInTheDocument()
+    }
+  })
+})
 
 describe('header', () => {
   it('shows the name, state, description, Leader, supervisor, repositories and work first', async () => {

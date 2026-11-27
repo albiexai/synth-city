@@ -156,7 +156,8 @@ async def observe_supervisor(db, preset_id: int, *, now: datetime | None = None)
 async def bind_supervisor(db, preset_id: int, *, actor_id: int | None,
                           grace_seconds: int | None, set_grace: bool, now: datetime | None = None,
                           expected_binding_version: int | None = None,
-                          expected_team_context_key: str | None = None) -> dict:
+                          expected_team_context_key: str | None = None,
+                          recording_actor: dict | None = None) -> dict:
     """Register an operator-selected actor without changing team permissions.
 
     ``expected_binding_version`` and ``expected_team_context_key``: when given (they come together), the write applies only to
@@ -194,7 +195,7 @@ async def bind_supervisor(db, preset_id: int, *, actor_id: int | None,
         await db.rollback()
         raise ValueError("supervisor_binding_changed")
     await _commit_event(db, event_kind="policy_change", source="agent_team_supervisor.registration",
-        occurred_at=current, actor=audit.derive_actor(actor_kind="operator"), team_preset_id=preset_id,
+        occurred_at=current, actor=recording_actor or audit.derive_actor(actor_kind="operator"), team_preset_id=preset_id,
         before_values={"supervisor_actor_id": old_actor, "supervisor_grace_seconds": old_grace},
         after_values={"supervisor_actor_id": actor_id,
                       "supervisor_grace_seconds": values.get("supervisor_grace_seconds", old_grace)},

@@ -85,6 +85,7 @@ import type { MailMemberResponse } from '@/types/agentMail'
 import { AgentTeamsHelpDialog } from './AgentTeamsHelpDialog'
 import { ProviderLaunchOptionsFields } from '@/features/providers/ProviderLaunchOptionsFields'
 import { AutonomyPanel, OperatorTokenDialog } from './AutonomyPanel'
+import { SharedOperatorUserWarning } from './SharedOperatorUserWarning'
 import { MilestoneStates } from '@/features/factory/components/MilestoneStates'
 import { HumanActionSummary } from './HumanActionSummary'
 import { TeamSummaryCard } from './TeamSummaryCard'
@@ -1394,6 +1395,7 @@ export function AgentTeamsPage() {
         </div>
       </div>
 
+      <SharedOperatorUserWarning />
       <div className="space-y-4">
         <nav aria-label="Saved teams" className="flex flex-wrap items-center gap-2">
           {presets.length === 0 && <span className="text-sm text-muted-foreground">No teams saved.</span>}

@@ -149,7 +149,7 @@ async def terminal_revision_report(db, preset_id):
         "limits": "Read-only report. Reconcile one inspected row explicitly. No retry, lease, approval, merge or delivery authority."}
 
 
-async def reconcile_terminal_revision(db, item, revision_id, expected_context, operation_id, reason):
+async def reconcile_terminal_revision(db, item, revision_id, expected_context, operation_id, reason, *, actor=None):
     """Apply one operator decision after a full context check under the item writer."""
     item_id = item.id
     operation = f"terminal_revision_reconcile:{operation_id}"
@@ -180,7 +180,7 @@ async def reconcile_terminal_revision(db, item, revision_id, expected_context, o
     db.add(GithubMaintenanceEvent(operation_id=operation, work_item_id=item_id,
         outcome="terminal_revision_reconciled", request_sha256=request_digest))
     await audit.record_revision_outcome(db, item_id=item_id, revision_id=revision.id, status=outcome,
-        source="factory_maintenance.reconcile_terminal_revision", actor=audit.derive_actor(actor_kind="operator"),
+        source="factory_maintenance.reconcile_terminal_revision", actor=actor or audit.derive_actor(actor_kind="operator"),
         operation_id=operation, correlation_id=request_digest, before_values={"status": before},
         sanitized_reason=audit.sanitize_reason(reason))
     await db.commit()

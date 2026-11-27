@@ -14,7 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.api.v1.deps import require_operator
+from app.api.v1.deps import operator_audit_actor, operator_write_context, require_operator
 from app.config import settings
 from app.models import factory_schemas as wire
 from app.models.schemas import (
@@ -593,6 +593,7 @@ async def declare_review_acceptance(
     declaration: FactoryReviewAcceptanceDeclaration,
     _operator: None = Depends(require_operator),
     db=Depends(get_db),
+    write_context: dict | None = Depends(operator_write_context),
 ):
     """A32: record one trusted review acceptance declaration.
 
@@ -606,7 +607,7 @@ async def declare_review_acceptance(
     from app.services import factory_audit_service as audit
 
     operation_id = f"review_acceptance:{declaration.declaration_id}"
-    recording_actor = audit.derive_actor(actor_kind="operator")
+    recording_actor = operator_audit_actor(write_context)
     replay = (await db.execute(text(
         "SELECT id FROM factory_audit_events WHERE operation_id = :op"
         " AND event_kind = 'review_acceptance_declared' LIMIT 1"),
