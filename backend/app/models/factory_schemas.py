@@ -150,6 +150,13 @@ class WorkspaceAssociation(FactoryModel):
     state: Literal["leased", "released", "unknown"]
 
 
+class PlanRefusal(FactoryModel):
+    code: Literal["plan_estimate_exceeds_limit"]
+    estimate_minutes: float
+    limit_minutes: int
+    split_suggestion: str
+
+
 class SafeWorkItem(FactoryModel):
     id: PositiveId
     scope_id: PositiveId
@@ -177,6 +184,7 @@ class SafeWorkItem(FactoryModel):
     # The accepted plan estimate and the scope's plan limit. Both are left out when the item has no estimate.
     plan_estimate_minutes: int | None = Field(default=None, exclude_if=lambda value: value is None)
     plan_limit_minutes: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    plan_refusal: PlanRefusal | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class WorkProjection(FactoryModel):

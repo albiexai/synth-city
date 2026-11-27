@@ -22,6 +22,7 @@ from app.services.agent_mail_service import MCP_HEARTBEAT_TTL_SECONDS
 from app.services.github_coordination_service import hold_code
 from app.services.github_dispatch_scheduler import github_dispatch_scheduler
 from app.services.github_dispatch_service import ESCALATION_REASONS
+from app.services.github_plan_refusal_service import current_plan_refusals
 from app.services.github_stopped_attempt_actor import StoppedAttemptStep, stopped_attempt_policy, stopped_attempt_step
 from app.services.github_work_item_projection import _load_work_item_authority, _work_item_response
 from app.services.providers import get_providers
@@ -366,7 +367,9 @@ async def work_projections(db, rows, now):
     from app.services.agent_status_service import agent_status_service
     if not rows:
         return []
-    authority = await _load_work_item_authority(db, [item for item, _, _ in rows])
+    items = [item for item, _, _ in rows]
+    authority = await _load_work_item_authority(db, items)
+    refusals = await current_plan_refusals(db, [item.id for item in items])
     team_ids = {team.id for _, _, team in rows}
     slots, members, sessions, bindings, retired = await actor_evidence(db, team_ids, authority)
     display_statuses = await agent_status_service.for_snapshot(
@@ -429,7 +432,13 @@ async def work_projections(db, rows, now):
         leader_session.agent_status = display_statuses.get(leader_member.id) if leader_member else None
         offline_slot = (slot if owner_session.state == "offline" else
                         leader_slot if leader_session.state == "offline" else None)
-        safe = {name: getattr(legacy, name) for name in wire.SafeWorkItem.model_fields}
+        safe = {name: getattr(legacy, name) for name in wire.SafeWorkItem.model_fields if name != "plan_refusal"}
+        refusal = refusals.get(item.id)
+        if refusal is not None:
+            safe["plan_refusal"] = wire.PlanRefusal(
+                code=refusal.code, estimate_minutes=refusal.estimate_minutes,
+                limit_minutes=refusal.limit_minutes, split_suggestion=refusal.split_suggestion,
+            )
         if (item.pr_number is None or item.attempt_phase == "diagnostic"
                 or not re.fullmatch(r"[0-9a-fA-F]{40}", item.last_verified_sha or "")):
             safe["last_verified_sha"] = None

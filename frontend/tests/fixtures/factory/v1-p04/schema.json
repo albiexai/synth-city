@@ -2876,6 +2876,36 @@
           "title": "OwnerReference",
           "type": "object"
         },
+        "PlanRefusal": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "plan_estimate_exceeds_limit",
+              "title": "Code",
+              "type": "string"
+            },
+            "estimate_minutes": {
+              "title": "Estimate Minutes",
+              "type": "number"
+            },
+            "limit_minutes": {
+              "title": "Limit Minutes",
+              "type": "integer"
+            },
+            "split_suggestion": {
+              "title": "Split Suggestion",
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "estimate_minutes",
+            "limit_minutes",
+            "split_suggestion"
+          ],
+          "title": "PlanRefusal",
+          "type": "object"
+        },
         "RequiredCIUnreadableSignal": {
           "properties": {
             "code": {
@@ -3069,6 +3099,17 @@
               ],
               "default": null,
               "title": "Plan Limit Minutes"
+            },
+            "plan_refusal": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PlanRefusal"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             },
             "pr_number": {
               "anyOf": [
@@ -3928,6 +3969,36 @@
           "title": "OwnerReference",
           "type": "object"
         },
+        "PlanRefusal": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "plan_estimate_exceeds_limit",
+              "title": "Code",
+              "type": "string"
+            },
+            "estimate_minutes": {
+              "title": "Estimate Minutes",
+              "type": "number"
+            },
+            "limit_minutes": {
+              "title": "Limit Minutes",
+              "type": "integer"
+            },
+            "split_suggestion": {
+              "title": "Split Suggestion",
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "estimate_minutes",
+            "limit_minutes",
+            "split_suggestion"
+          ],
+          "title": "PlanRefusal",
+          "type": "object"
+        },
         "RequiredCIUnreadableSignal": {
           "properties": {
             "code": {
@@ -4121,6 +4192,17 @@
               ],
               "default": null,
               "title": "Plan Limit Minutes"
+            },
+            "plan_refusal": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PlanRefusal"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             },
             "pr_number": {
               "anyOf": [

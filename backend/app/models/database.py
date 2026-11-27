@@ -1013,6 +1013,24 @@ class MailReceipt(Base):
     )
 
 
+class GithubPlanRefusal(Base):
+    """Bounded history of initial plans refused by the scope's plan limit."""
+
+    __tablename__ = "github_plan_refusals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    work_item_id: Mapped[int] = mapped_column(ForeignKey("github_work_items.id", ondelete="CASCADE"))
+    dispatch_nonce: Mapped[str] = mapped_column(String)
+    estimate_minutes: Mapped[float]
+    limit_minutes: Mapped[int]
+    code: Mapped[str] = mapped_column(String)
+    split_suggestion: Mapped[str] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    cleared: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    __table_args__ = (Index("ix_github_plan_refusals_attempt", "work_item_id", "dispatch_nonce", "id"),)
+
+
 class GithubApprovalRequest(Base):
     """Normalized authority for a GitHub work-item approval request."""
 

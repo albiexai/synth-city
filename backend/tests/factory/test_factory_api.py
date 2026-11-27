@@ -11,11 +11,12 @@ from app.database import Base
 from app.models.database import AgentTeamPreset, AgentTeamSlot, GithubWorkItem, TeamGithubScope
 from app.models import factory_schemas as wire
 from app.services import factory_projection_service as projection
+from app.services.github_plan_refusal_service import record_plan_refusal
 
 NOW = datetime(2026, 9, 30, 12, tzinfo=timezone.utc)
 PRIVATE = "synthetic-private-forbidden"
 # Effort fields that the wire leaves out when they are empty.
-OPTIONAL_EFFORT_FIELDS = {"scope_default_effort_limit_minutes", "plan_estimate_minutes", "plan_limit_minutes"}
+OPTIONAL_PLAN_FIELDS = {"scope_default_effort_limit_minutes", "plan_estimate_minutes", "plan_limit_minutes", "plan_refusal"}
 
 pytestmark = pytest.mark.asyncio
 
@@ -103,6 +104,35 @@ async def test_accepted_estimate_shows_with_the_scope_plan_limit_on_work_list_an
     without = (await get_ok(factory_client, f"work-items/{plain}"))["work_item"]["item"]
     assert "plan_estimate_minutes" not in without and "plan_limit_minutes" not in without
     assert rows[plain] == without
+
+
+async def test_work_projects_only_the_current_attempts_latest_plan_refusal(factory_client, factory_store):
+    item_id = factory_store.ids.by_status["dispatched"]
+    async with factory_store.maker() as db:
+        item = await db.get(GithubWorkItem, item_id)
+        item.dispatch_nonce = PRIVATE
+        await record_plan_refusal(db, item, 51, 45, already_admitted=False)
+        await record_plan_refusal(db, item, 60.5, 45, already_admitted=False)
+        await db.commit()
+
+    detail = await get_ok(factory_client, f"work-items/{item_id}")
+    listing = await get_ok(factory_client, "work-items", category="active", limit=100)
+    expected = {
+        "code": "plan_estimate_exceeds_limit",
+        "estimate_minutes": 60.5,
+        "limit_minutes": 45,
+        "split_suggestion": "Split the issue into parts estimated at 45 active minutes or less.",
+    }
+    row = next(row for row in listing["items"] if row["item"]["id"] == item_id)
+    assert row["item"]["plan_refusal"] == detail["work_item"]["item"]["plan_refusal"] == expected
+    assert PRIVATE not in json.dumps(detail) and PRIVATE not in json.dumps(listing)
+
+    async with factory_store.maker() as db:
+        item = await db.get(GithubWorkItem, item_id)
+        item.dispatch_nonce = "synthetic-next-attempt"
+        await db.commit()
+    detail = await get_ok(factory_client, f"work-items/{item_id}")
+    assert "plan_refusal" not in detail["work_item"]["item"]
 
 
 async def test_complete_counts_and_timestamp_id_pagination(factory_client, factory_store):
@@ -288,7 +318,7 @@ async def test_redaction_list_detail_overview_and_repository(factory_client, fac
         assert PRIVATE not in response.text
     result = await get_ok(factory_client, f"work-items/{factory_store.ids.by_status['escalated']}")
     item = result["work_item"]
-    assert set(item["item"]) == set(wire.SafeWorkItem.model_fields) - OPTIONAL_EFFORT_FIELDS
+    assert set(item["item"]) == set(wire.SafeWorkItem.model_fields) - OPTIONAL_PLAN_FIELDS
     assert set(item["team"]) == set(wire.TeamReference.model_fields)
     assert "parent_issue_url" not in item["item"]
     assert "outcome" not in item["item"]

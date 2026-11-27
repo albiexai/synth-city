@@ -917,6 +917,30 @@ describe("work item page", () => {
     expect(screen.queryByText(/Plan estimate/)).not.toBeInTheDocument();
   });
 
+  it.each(["list", "detail"])("shows the plan-limit refusal on Work %s", async (view) => {
+    const refusal = {
+      code: "plan_estimate_exceeds_limit",
+      estimate_minutes: 60.5,
+      limit_minutes: 45,
+      split_suggestion: "Split the issue into parts estimated at 45 active minutes or less.",
+    };
+    if (view === "list") {
+      const response = structuredClone(first);
+      Object.assign(response.items[0].item, { plan_refusal: refusal });
+      fixtureFetch((path) => path === "factory/work-items" ? jsonResponse(response) : standard(path));
+      renderRoute(<WorkPage />);
+    } else {
+      const response = structuredClone(detail.completed.response);
+      Object.assign(response.work_item.item, { plan_refusal: refusal });
+      itemFor(response);
+      renderRoute(<WorkDetailPage />, "/work/9", "/work/:workItemId");
+    }
+    await settle();
+    expect(screen.getByText(refusal.code)).toBeInTheDocument();
+    expect(screen.getByText("Estimate up to 60.5 min · plan limit 45 min")).toBeInTheDocument();
+    expect(screen.getByText(refusal.split_suggestion)).toBeInTheDocument();
+  });
+
   it("shows a plan at or under its limit, and an older plan over it, with no warning", async () => {
     for (const [estimate, limit] of [[45, 45], [30, 45], [80, 60]]) {
       const response = structuredClone(detail.completed.response);
