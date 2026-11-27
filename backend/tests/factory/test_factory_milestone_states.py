@@ -1,9 +1,12 @@
 """#1337: items deferred by a milestone move and issues waiting for a team, read-only."""
 from datetime import datetime, timedelta
+from hashlib import sha256
 
 import pytest
 
-from app.models.database import GithubMilestoneWait, GithubWorkItem, TeamGithubScope
+from sqlalchemy import select
+
+from app.models.database import FactoryAuditEvent, GithubMilestoneWait, GithubWorkItem, TeamGithubScope
 from app.services import milestone_state_service
 from app.services.github_watcher_service import defer_milestone_exit
 
@@ -238,8 +241,8 @@ async def test_only_the_rows_of_the_list_are_built(factory_client, factory_store
     for number in range(9200, 9212):
         await add_wait(factory_store.maker, factory_store.ids.scopes[0], number, "v4.5")
     built = []
-    original = milestone_state_service._repository
-    monkeypatch.setattr(milestone_state_service, "_repository", lambda scope: built.append(scope.id) or original(scope))
+    original = milestone_state_service.wire.WaitingIssue
+    monkeypatch.setattr(milestone_state_service.wire, "WaitingIssue", lambda **row: built.append(row) or original(**row))
     body = await get_states(factory_client)
     assert len(body["waiting"]) == 3 and body["waiting_truncated"] is True
     # The list builds its rows and the one more that proves the cut, and no other row.
@@ -329,17 +332,83 @@ async def test_an_unlinked_wait_counts_toward_the_cut(factory_client, factory_st
     assert body["waiting_truncated"] is True
 
 
-async def test_after_an_upgrade_a_wait_from_before_a_repository_change_shows_without_a_repository(factory_client, factory_store):
-    """The scope PATCH of the earlier version left waits behind. They carry no repository of their own."""
+async def test_after_an_upgrade_the_waits_of_a_scope_that_changed_repository_show_without_a_repository(factory_client, factory_store):
+    """The scope PATCH of the earlier version left waits behind. They carry no repository of their own.
+
+    The GitHub update time of a wait does not say where the watcher saw the issue, so a wait of a scope with a
+    repository change shows no link, whatever its time. The repository stamp that would prove it is #1372.
+    """
     scope = await idle_scope(factory_store.maker, 0, "up-orig", factory_store.ids)
     await move_scope(factory_client, scope, repo_name="up-new")
-    # The earlier version kept this wait, recorded for "up-orig" before the move. The current PATCH deleted
-    # none, because the wait did not exist yet. A wait seen after the move sits next to it.
     await add_wait(factory_store.maker, scope, 9501, "v4.5", at=MOMENT)
+    # A GitHub clock ahead of the host gives a time after the change for a wait that is older than it.
     await add_wait(factory_store.maker, scope, 9502, "v4.5", at=datetime.utcnow() + timedelta(minutes=5))
     rows = {r["issue_number"]: r["repository"] for r in (await get_states(factory_client))["waiting"]}
-    assert rows[9501] is None
-    assert rows[9502]["github"] == {"owner": "fixture", "name": "up-new"}
+    assert rows == {9501: None, 9502: None}
+
+
+async def test_an_audited_move_with_equal_sanitized_names_is_still_a_move(factory_client, factory_store):
+    """The ledger can store the same sanitized value for two different names. Its receipt still names the field."""
+    prior, current = (sha256(label.encode()).hexdigest() for label in ("prior", "current"))
+    scope = await idle_scope(factory_store.maker, 0, prior, factory_store.ids)
+    await add_wait(factory_store.maker, scope, 9741, "v4.5", at=MOMENT)
+    await move_scope(factory_client, scope, repo_name=current)
+    async with factory_store.maker() as db:
+        event = await db.scalar(select(FactoryAuditEvent).where(
+            FactoryAuditEvent.scope_id == scope, FactoryAuditEvent.event_kind == "policy_change"))
+        # The fixture holds only if the ledger cannot tell the two names apart.
+        assert "repo_name" in event.context_snapshot["scope_changed_fields"]
+        assert event.before_values["repo_name"] == event.after_values["repo_name"]
+        await db.execute(GithubMilestoneWait.__table__.delete().where(GithubMilestoneWait.scope_id == scope))
+        db.add(GithubMilestoneWait(scope_id=scope, issue_number=9741, milestone_title="v4.5", github_updated_at=MOMENT))
+        await db.commit()
+    rows = (await get_states(factory_client, scope_id=scope))["waiting"]
+    assert [(r["issue_number"], r["repository"]) for r in rows] == [(9741, None)]
+
+
+async def test_an_unproven_wait_does_not_collapse_into_a_proven_wait_of_the_same_issue(factory_client, factory_store):
+    old = await idle_scope(factory_store.maker, 0, "twin-old", factory_store.ids)
+    current = await idle_scope(factory_store.maker, 1, "twin-new", factory_store.ids)
+    await move_scope(factory_client, old, repo_name="twin-new")
+    await add_wait(factory_store.maker, old, 9741, "old milestone", at=MOMENT)
+    await add_wait(factory_store.maker, current, 9741, "current milestone", at=MOMENT + timedelta(seconds=1))
+    # Both scopes now name the repository fixture/twin-new. Only the second wait has a proven repository.
+    rows = (await get_states(factory_client))["waiting"]
+    assert sorted((r["milestone"], r["repository"] and r["repository"]["display_name"]) for r in rows) == [
+        ("current milestone", "fixture/twin-new"), ("old milestone", None)]
+    assert [r["milestone"] for r in (await get_states(factory_client, scope_id=old))["waiting"]] == ["old milestone"]
+
+
+async def test_waits_of_two_scopes_with_the_same_refused_identity_stay_separate(factory_client, factory_store):
+    first = await idle_scope(factory_store.maker, 0, "bad name!", factory_store.ids)
+    second = await idle_scope(factory_store.maker, 1, "bad name!", factory_store.ids)
+    await add_wait(factory_store.maker, first, 9743, "first milestone", at=MOMENT)
+    await add_wait(factory_store.maker, second, 9743, "second milestone", at=MOMENT + timedelta(seconds=1))
+    rows = (await get_states(factory_client))["waiting"]
+    assert sorted((r["milestone"], r["repository"]) for r in rows) == [("first milestone", None), ("second milestone", None)]
+
+
+async def test_two_proven_waits_of_the_same_repository_and_issue_still_show_once(factory_client, factory_store):
+    first = await idle_scope(factory_store.maker, 0, "pair", factory_store.ids)
+    second = await idle_scope(factory_store.maker, 1, "pair", factory_store.ids)
+    await add_wait(factory_store.maker, first, 9742, "v4.5", at=MOMENT)
+    await add_wait(factory_store.maker, second, 9742, "v4.5", at=MOMENT + timedelta(seconds=1))
+    assert [r["issue_number"] for r in (await get_states(factory_client))["waiting"]] == [9742]
+
+
+async def test_a_newer_blank_observation_does_not_hide_a_valid_wait(factory_client, factory_store):
+    first = await idle_scope(factory_store.maker, 0, "blank-twin", factory_store.ids)
+    second = await idle_scope(factory_store.maker, 1, "blank-twin", factory_store.ids)
+    await add_wait(factory_store.maker, first, 9760, "v4.5", at=MOMENT)
+    await add_wait(factory_store.maker, second, 9760, "  \t ", at=MOMENT + timedelta(seconds=1))
+    assert [(r["issue_number"], r["milestone"]) for r in (await get_states(factory_client))["waiting"]] == [(9760, "v4.5")]
+
+
+async def test_a_newer_row_with_no_issue_number_does_not_hide_a_valid_wait(factory_client, factory_store):
+    first = await idle_scope(factory_store.maker, 0, "zero-twin", factory_store.ids)
+    await add_wait(factory_store.maker, first, 9761, "v4.5", at=MOMENT)
+    await add_wait(factory_store.maker, first, 0, "v4.5", at=MOMENT + timedelta(seconds=1))
+    assert [r["issue_number"] for r in (await get_states(factory_client))["waiting"]] == [9761]
 
 
 async def test_a_wait_stays_linked_when_the_scope_changed_something_other_than_its_repository(factory_client, factory_store):

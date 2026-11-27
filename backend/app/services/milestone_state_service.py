@@ -6,17 +6,18 @@ GitHub or sends Mail.
 
 A row keeps the repository it was recorded for. A deferral takes it from the GitHub issue URL that its
 item stored at admission. A wait has no stored repository, so the scope PATCH deletes the waits of a
-scope when its repository changes. A wait recorded before a repository change that the PATCH of an
-earlier version left behind has no provable repository: its row stays in the list with no repository.
-The repository stamp that would prove it is #1372.
+scope when its repository changes. The PATCH of an earlier version left them behind, and the GitHub
+update time of a wait does not say where the watcher saw the issue. So the waits of a scope that has
+any applied repository change have no provable repository: each row stays in the list with its issue
+number and no repository, and it is never merged with another row. The repository stamp that would
+prove it is #1372.
 """
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
 
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -59,33 +60,56 @@ def _recorded_repository(scope_id: int, issue_url: str, number: int) -> wire.Wor
                                display_name=f"{match.group(1)}/{match.group(2)}")
 
 
-def _naive_utc(moment: datetime) -> datetime:
-    return moment.astimezone(timezone.utc).replace(tzinfo=None) if moment.tzinfo else moment
+_REPOSITORY_FIELDS = ("repo_owner", "repo_name")
+# The characters that make a milestone title blank. SQL and Python use the same set, so the database and
+# the view agree on which wait rows can be shown.
+_BLANK = " \t\r\n\x0b\x0c"
 
 
-async def _repository_moves(db: AsyncSession, filters: wire.FactoryFilters) -> dict[int, datetime]:
-    """When each selected scope last changed its repository, from the applied scope-change events.
+def _changes_repository(changed_fields, before: dict, after: dict) -> bool:
+    """Whether one applied scope-change event changed the repository of its scope.
 
-    A change of case only is not a change of repository. The scope PATCH records the event in the
-    transaction that changes the scope, and it has done so since the policy ledger began.
+    A change of case only is not a change of repository. The ledger stores sanitized values, so two
+    different names can look the same. When the receipt names the field and the values cannot tell,
+    the repository is unknown, and the event counts as a change.
+    """
+    named = [name for name in _REPOSITORY_FIELDS if name in (changed_fields or [])]
+    for name in _REPOSITORY_FIELDS:
+        if str(before.get(name) or "").lower() != str(after.get(name) or "").lower():
+            return True
+    return any(before.get(name) == after.get(name) for name in named)
+
+
+async def _unproven_scopes(db: AsyncSession, filters: wire.FactoryFilters) -> set[int]:
+    """The selected scopes whose waits prove no repository.
+
+    These are the scopes with an applied repository change, and the scopes whose identity the factory refuses.
+    """
+    unproven = await _moved_scopes(db, filters)
+    for scope in (await db.scalars(_selected_scopes(select(TeamGithubScope), filters))).all():
+        try:
+            _repository(scope)
+        except (FactoryReadError, ValidationError):
+            unproven.add(scope.id)
+    return unproven
+
+
+async def _moved_scopes(db: AsyncSession, filters: wire.FactoryFilters) -> set[int]:
+    """The selected scopes that have an applied repository change, from the scope-change events.
+
+    The scope PATCH records the event in the transaction that changes the scope, and it has done so
+    since the policy ledger began.
     """
     events = (await db.execute(_selected_scopes(
-        select(FactoryAuditEvent.scope_id, FactoryAuditEvent.occurred_at,
+        select(FactoryAuditEvent.scope_id, FactoryAuditEvent.context_snapshot,
                FactoryAuditEvent.before_values, FactoryAuditEvent.after_values)
         .join(TeamGithubScope, TeamGithubScope.id == FactoryAuditEvent.scope_id)
         .where(FactoryAuditEvent.event_kind == "policy_change",
                FactoryAuditEvent.source == "agent_teams.update_github_scope",
                FactoryAuditEvent.action_outcome == "applied"), filters,
     ))).all()
-    moves: dict[int, datetime] = {}
-    for scope_id, occurred_at, before, after in events:
-        before, after = before or {}, after or {}
-        same = all(str(before.get(key) or "").lower() == str(after.get(key) or "").lower()
-                   for key in ("repo_owner", "repo_name"))
-        if not same:
-            moved = _naive_utc(occurred_at)
-            moves[scope_id] = max(moves.get(scope_id, moved), moved)
-    return moves
+    return {scope_id for scope_id, snapshot, before, after in events
+            if _changes_repository((snapshot or {}).get("scope_changed_fields"), before or {}, after or {})}
 
 
 async def _page(db: AsyncSession, query, build):
@@ -110,8 +134,11 @@ async def _page(db: AsyncSession, query, build):
 
 
 async def _waiting(db: AsyncSession, filters: wire.FactoryFilters):
-    # One row for each repository and issue, even when several scopes recorded the same wait. The database
-    # keeps the newest, orders and cuts, so a response builds at most one row more than it returns.
+    unproven = await _unproven_scopes(db, filters)
+    # One row for each repository and issue, even when several scopes recorded the same wait. The rows of a
+    # scope that proves no repository are each their own row. A row that cannot be
+    # shown is left out before the ranking, so it never takes the place of one that can. The database keeps
+    # the newest, orders and cuts, so a response builds at most one row more than it returns.
     ranked = _selected_scopes(
         select(
             TeamGithubScope.id.label("id"), TeamGithubScope.repo_owner.label("repo_owner"),
@@ -120,28 +147,22 @@ async def _waiting(db: AsyncSession, filters: wire.FactoryFilters):
             GithubMilestoneWait.github_updated_at.label("observed_at"),
             func.row_number().over(
                 partition_by=(func.lower(TeamGithubScope.repo_owner), func.lower(TeamGithubScope.repo_name),
-                              GithubMilestoneWait.issue_number),
+                              GithubMilestoneWait.issue_number,
+                              case((TeamGithubScope.id.in_(unproven), TeamGithubScope.id), else_=0)),
                 order_by=(GithubMilestoneWait.github_updated_at.desc(), GithubMilestoneWait.scope_id),
             ).label("rank"),
         )
         .join(TeamGithubScope, TeamGithubScope.id == GithubMilestoneWait.scope_id)
-        .where(GithubMilestoneWait.milestone_title.is_not(None)), filters,
+        .where(GithubMilestoneWait.milestone_title.is_not(None),
+               func.length(func.trim(GithubMilestoneWait.milestone_title, _BLANK)) > 0), filters,
     ).subquery()
 
-    moves = await _repository_moves(db, filters)
-
     def build(row):
-        if not row.milestone.strip():
+        if not row.milestone.strip(_BLANK):
             return None
-        # A wait seen before its scope changed repository may belong to the old repository. Nothing stored
-        # says which, so such a row, and a row whose scope identity the factory refuses, names none.
-        moved = moves.get(row.id)
-        repository = None
-        if moved is None or _naive_utc(row.observed_at) > moved:
-            try:
-                repository = _repository(row)
-            except (FactoryReadError, ValidationError):
-                repository = None
+        # A scope with a repository change, and a scope whose identity the factory refuses, prove no
+        # repository for its waits. Those rows name none.
+        repository = None if row.id in unproven else _repository(row)
         try:
             return wire.WaitingIssue(repository=repository, issue_number=row.issue_number,
                                      milestone=row.milestone, observed_at=row.observed_at)
