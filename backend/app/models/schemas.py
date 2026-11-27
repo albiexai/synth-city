@@ -2683,6 +2683,8 @@ class TeamWorkSettings(BaseModel):
     github_publish_summaries_enabled: bool | None = Field(default=None, strict=True)
     github_owner_idle_timeout_seconds: int | None = Field(default=None, strict=True, ge=60, le=86400)
     github_nudge_grace_seconds: int | None = Field(default=None, strict=True, ge=30, le=3600)
+    wake_followup_enabled: bool | None = Field(default=None, strict=True)
+    wake_followup_delay_seconds: int | None = Field(default=None, strict=True, ge=30, le=3600)
 
 
 class AgentTeamPresetUpdate(CampaignPresetFields, TeamWorkSettings):

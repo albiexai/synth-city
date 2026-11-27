@@ -9,12 +9,12 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import event, select
+from sqlalchemy import event, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import settings
 from app.database import Base
-from app.models.database import MailMessage, MailReceipt, MailTeamMember, MailWakeAttempt
+from app.models.database import AgentTeamPreset, MailMessage, MailReceipt, MailTeamMember, MailWakeAttempt
 from app.services.agent_mail_service import MailWakeError, agent_mail_service
 from app.services.agent_status_service import agent_status_service
 from app.services.wake_followup_service import wake_followup_service
@@ -63,9 +63,9 @@ def native(monkeypatch):
     return states
 
 
-async def member(db, name="b2"):
+async def member(db, name="b2", *, preset_id=None):
     row = MailTeamMember(identity_key=f"slot:{name}", repo_id="r", repo_path=f"/tmp/{name}",
-                         repo_name=name, display_name=name)
+                         repo_name=name, display_name=name, team_preset_id=preset_id)
     db.add(row)
     await db.commit()
     return row
@@ -243,6 +243,69 @@ async def test_the_follow_up_can_be_switched_off(db, rewakes, native, monkeypatc
 
     await wake_followup_service.tick(db, NOW)
 
+    assert rewakes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("installation_enabled", [False, True])
+async def test_teams_use_their_own_wake_policy_and_clear_to_defaults(
+    db, rewakes, native, monkeypatch, installation_enabled,
+):
+    monkeypatch.setattr(settings, "wake_followup_enabled", installation_enabled)
+    monkeypatch.setattr(settings, "wake_followup_delay_seconds", 120)
+    enabled = AgentTeamPreset(name="Enabled", wake_followup_enabled=True, wake_followup_delay_seconds=60)
+    disabled = AgentTeamPreset(name="Disabled", wake_followup_enabled=False, wake_followup_delay_seconds=30)
+    delayed = AgentTeamPreset(name="Delayed", wake_followup_delay_seconds=180)
+    inherited = AgentTeamPreset(name="Inherited")
+    presets = [enabled, disabled, delayed, inherited]
+    db.add_all(presets)
+    await db.commit()
+    expected = {}
+    for preset in presets:
+        candidate = await member(db, preset.name, preset_id=preset.id)
+        await delivered_wake(db, candidate.id)
+        newest = await delivered_wake(db, candidate.id, at=NOW - timedelta(seconds=60))
+        native[candidate.id] = idle(aware(WAKE_AT - timedelta(minutes=10)))
+        expected[preset.name] = (candidate.id, "rewake", f"rewake:{newest.id}")
+
+    await wake_followup_service.tick(db, NOW - timedelta(seconds=1))
+    assert rewakes == []
+    await wake_followup_service.tick(db, NOW)
+    assert rewakes == [expected["Enabled"]]
+    await wake_followup_service.tick(db, NOW + timedelta(seconds=60))
+    assert rewakes == ([expected["Enabled"], expected["Inherited"]]
+                       if installation_enabled else [expected["Enabled"]])
+
+    disabled.wake_followup_enabled = None
+    delayed.wake_followup_delay_seconds = None
+    await db.commit()
+    await wake_followup_service.tick(db, NOW + timedelta(seconds=60))
+    assert set(rewakes[1:]) == ({expected[name] for name in ("Disabled", "Delayed", "Inherited")}
+                                if installation_enabled else set())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "value"), [("wake_followup_enabled", False), ("wake_followup_delay_seconds", 301)])
+async def test_policy_change_during_delivery_guard_cancels_the_rewake(db, rewakes, monkeypatch, field, value):
+    preset = AgentTeamPreset(name="Team", wake_followup_enabled=True)
+    db.add(preset)
+    await db.commit()
+    candidate = await member(db, preset_id=preset.id)
+    await delivered_wake(db, candidate.id)
+    reads = []
+
+    async def changes_policy(session, members, *, activities=None):
+        reads.append(1)
+        if len(reads) == 2:
+            await session.execute(update(AgentTeamPreset).where(AgentTeamPreset.id == preset.id)
+                                  .values({field: value}).execution_options(synchronize_session=False))
+            await session.commit()
+        return {candidate.id: idle(aware(WAKE_AT - timedelta(minutes=10)))}
+
+    monkeypatch.setattr(agent_status_service, "for_members", changes_policy)
+    await wake_followup_service.tick(db, NOW)
+
+    assert len(reads) == 2
     assert rewakes == []
 
 

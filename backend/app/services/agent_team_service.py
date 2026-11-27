@@ -324,6 +324,9 @@ class AgentTeamService:
                 "github_owner_idle_timeout_seconds", preset.github_owner_idle_timeout_seconds)
             preset.github_nudge_grace_seconds = after.get(
                 "github_nudge_grace_seconds", preset.github_nudge_grace_seconds)
+            preset.wake_followup_enabled = after.get("wake_followup_enabled", preset.wake_followup_enabled)
+            preset.wake_followup_delay_seconds = after.get(
+                "wake_followup_delay_seconds", preset.wake_followup_delay_seconds)
             await _audit.record_event(
                 db, event_kind="policy_change", source=TEAM_WORK_SETTINGS_AUDIT_SOURCE,
                 occurred_at=datetime.utcnow(), actor=audit_actor, team_preset_id=preset.id,
@@ -569,6 +572,8 @@ class AgentTeamService:
             github_publish_summaries_enabled=source.github_publish_summaries_enabled,
             github_owner_idle_timeout_seconds=source.github_owner_idle_timeout_seconds,
             github_nudge_grace_seconds=source.github_nudge_grace_seconds,
+            wake_followup_enabled=source.wake_followup_enabled,
+            wake_followup_delay_seconds=source.wake_followup_delay_seconds,
             backlog_milestone=source.backlog_milestone,
             planned_decisions=([dict(decision) for decision in source.planned_decisions]
                                if source.planned_decisions is not None else None),

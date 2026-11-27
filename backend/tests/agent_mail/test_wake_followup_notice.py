@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import settings
@@ -39,9 +39,9 @@ def idle(since):
     return SimpleNamespace(activity_state="idle", idle_since=since)
 
 
-async def team(db, *, supervisor=SUPERVISOR_ID, work_item=True):
+async def team(db, *, supervisor=SUPERVISOR_ID, work_item=True, **overrides):
     """A preset with a Leader slot and a builder slot, and optionally the builder's active work item."""
-    preset = AgentTeamPreset(name="v4.3", supervisor_actor_id=supervisor)
+    preset = AgentTeamPreset(name="v4.3", supervisor_actor_id=supervisor, **overrides)
     db.add(preset)
     await db.commit()
     slots = {}
@@ -117,6 +117,49 @@ async def test_a_silent_rewake_notifies_the_leader_and_the_supervisor_once_each(
         assert t.builder.display_name in message.body_markdown
         assert "#1060" in message.body_markdown and "Notify after a re-wake" in message.body_markdown
         assert message.sender_type == "system"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("enabled", "delay", "installation_enabled", "due"), [
+    (True, 300, False, True),
+    (False, 300, True, False),
+    (None, 301, True, False),
+    (None, None, True, True),
+    (None, None, False, False),
+])
+async def test_notice_uses_current_team_policy(
+    db, native, no_wakes, monkeypatch, enabled, delay, installation_enabled, due,
+):
+    monkeypatch.setattr(settings, "wake_followup_enabled", installation_enabled)
+    monkeypatch.setattr(settings, "wake_followup_delay_seconds", 120)
+    t = await team(db, wake_followup_enabled=enabled, wake_followup_delay_seconds=delay)
+    await delivered_rewake(db, t.builder.id)
+    native[t.builder.id] = idle(aware(REWAKE_AT - timedelta(minutes=10)))
+
+    await wake_followup_service.tick(db, NOW)
+
+    keys = sorted(m.delivery_key for m in await notices(db))
+    assert keys == (["rewake-notice:7:leader", "rewake-notice:7:supervisor"] if due else [])
+    no_wakes.wake.assert_not_called()
+    no_wakes.nudge.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "value"), [("wake_followup_enabled", False), ("wake_followup_delay_seconds", 301)])
+async def test_policy_change_during_native_read_cancels_notice(db, no_wakes, monkeypatch, field, value):
+    t = await team(db, wake_followup_enabled=True)
+    await delivered_rewake(db, t.builder.id)
+
+    async def changes_policy(session, members, *, activities=None):
+        await session.execute(update(AgentTeamPreset).where(AgentTeamPreset.id == t.preset.id)
+                              .values({field: value}).execution_options(synchronize_session=False))
+        await session.commit()
+        return {t.builder.id: idle(aware(REWAKE_AT - timedelta(minutes=10)))}
+
+    monkeypatch.setattr(agent_status_service, "for_members", changes_policy)
+    await wake_followup_service.tick(db, NOW)
+
+    assert await notices(db) == []
 
 
 @pytest.mark.asyncio

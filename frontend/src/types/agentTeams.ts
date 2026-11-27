@@ -346,6 +346,8 @@ export interface TeamWorkSettings {
   github_publish_summaries_enabled: boolean | null
   github_owner_idle_timeout_seconds: number | null
   github_nudge_grace_seconds: number | null
+  wake_followup_enabled: boolean | null
+  wake_followup_delay_seconds: number | null
 }
 
 export interface AgentTeamPresetUpdate extends Partial<TeamWorkSettings> {
