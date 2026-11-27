@@ -7,7 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { MODAL_SIZES } from '@/lib/constants'
 import { formatServerTime } from '@/lib/serverTime'
-import type { ScopeSettingDefinition, ScopeSettingsHistoryEntry, TeamGithubScope, TeamGithubScopeSafetyBounds, TeamGithubScopeUpdate } from '@/types/agentTeams'
+import type { ScopeSettingDefinition, ScopeSettingsHistoryEntry, TeamGithubScope, TeamGithubScopeUpdate } from '@/types/agentTeams'
 import { fetchScopeSettings, updateTeamGithubScope } from './api'
 import { useOperatorTokenFlow } from './useOperatorTokenFlow'
 
@@ -19,16 +19,26 @@ const NAMES: Record<string, string> = {
   max_scope_amendment_requests: 'Amendment requests',
   max_amendment_added_paths: 'Named paths added by amendments',
   max_companion_paths: 'Companion paths',
+  continuation_allowed_reasons: 'Continuation reasons',
+  verifier_roles: 'Verifier roles',
 }
-const SAFETY_EFFECTS: Record<keyof TeamGithubScopeSafetyBounds, string> = {
+const SAFETY_EFFECTS = {
   max_scope_amendments: 'approved amendments per attempt',
   max_scope_amendment_requests: 'amendment requests per attempt',
   max_amendment_added_paths: 'distinct named paths added by amendments per attempt',
   max_companion_paths: 'companion paths per amendment',
 }
-const SAFETY_KEYS = Object.keys(SAFETY_EFFECTS) as Array<keyof TeamGithubScopeSafetyBounds>
+const SAFETY_KEYS = Object.keys(SAFETY_EFFECTS) as Array<keyof typeof SAFETY_EFFECTS>
 const SAFETY_CONFIRMATION = 'safety_bounds'
-const show = (value: unknown) => (value === null || value === undefined ? 'none' : String(value))
+const show = (name: string, value: unknown) => {
+  if (Array.isArray(value)) return value.join(', ') || 'none allowed'
+  if (value != null) return String(value)
+  return name === 'verifier_roles' || name === 'continuation_allowed_reasons' ? 'scope defaults' : 'none'
+}
+const addsChoice = (before: string[], after: string[]) => after.some((choice) => !before.includes(choice))
+const parseRoles = (input: string) => [...new Set(input.split(',').map((role) =>
+  role.replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, '').replace(/[A-Z]/g, (letter) => letter.toLowerCase()),
+).filter(Boolean))].sort()
 
 /**
  * Edit the review hold label and the effort ceiling of one repository (#1297 part A). The ranges and the history
@@ -49,7 +59,8 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
   // A field the user has not touched is undefined and follows the server, so a background refresh never erases a draft.
   const [draft, setDraft] = useState<{
     label?: string; clear?: boolean; minutes?: string; requirePaths?: boolean; reason: string
-    bounds?: Partial<Record<keyof TeamGithubScopeSafetyBounds, string>>; confirm?: string
+    bounds?: Partial<Record<keyof typeof SAFETY_EFFECTS, string>>; confirm?: string
+    continuationReasons?: string[]; roles?: string | null
   }>({ reason: '' })
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
@@ -71,6 +82,17 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
     const number = Number(value)
     return Number.isInteger(number) && number > previous && number <= (definition.maximum ?? -1)
   })
+
+  const reasonChoices = definitions.continuation_allowed_reasons?.choices
+  const previousReasons = scope.continuation_allowed_reasons ?? reasonChoices ?? []
+  const selectedReasons = draft.continuationReasons ?? previousReasons
+  const reasonsWiden = addsChoice(previousReasons, selectedReasons)
+  const defaultHeadRoles = definitions.verifier_roles?.default_head_roles
+  const previousRoles = scope.verifier_roles ?? null
+  const roleText = draft.roles === undefined ? previousRoles?.join(', ') ?? null : draft.roles
+  const roles = roleText === null ? null : parseRoles(roleText)
+  const rolesWiden = roles === null ? previousRoles !== null : addsChoice(previousRoles ?? defaultHeadRoles ?? [], roles)
+  const widens = increases.length > 0 || reasonsWiden || rolesWiden
 
   const load = useCallback(async (beforeId?: number) => {
     const key = beforeId ?? 0
@@ -141,7 +163,17 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
       }
       if (number !== previous) update[key] = number
     }
-    if (increases.length > 0) {
+    if (reasonChoices && (reasonsWiden || addsChoice(selectedReasons, previousReasons))) {
+      update.continuation_allowed_reasons = selectedReasons.length === reasonChoices.length ? null : selectedReasons
+    }
+    if (defaultHeadRoles && draft.roles !== undefined && JSON.stringify(roles) !== JSON.stringify(previousRoles)) {
+      if (roles && (roles.length > 32 || roles.some((role) => [...role].length > 64))) {
+        setError('Enter up to 32 verifier roles with at most 64 characters each.')
+        return
+      }
+      update.verifier_roles = roles
+    }
+    if (widens) {
       if (draft.confirm !== SAFETY_CONFIRMATION) {
         setError(`Type ${SAFETY_CONFIRMATION} to confirm the increases.`)
         return
@@ -208,12 +240,51 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
               <p className="text-xs text-muted-foreground">{definition.minimum} to {definition.maximum}, default {String(definition.default)}.</p>
             </div>
           ))}
-          {increases.length > 0 && (
+          {reasonChoices && (
+            <fieldset className="grid gap-2">
+              <legend className="mb-2 text-sm font-medium">Continuation reasons</legend>
+              {reasonChoices.map((choice) => (
+                <div className="flex items-center gap-2" key={choice}>
+                  <Checkbox id={`limits-reason-${choice}`} checked={selectedReasons.includes(choice)} disabled={saving}
+                    onCheckedChange={(checked) => setDraft((current) => ({
+                      ...current, confirm: '', continuationReasons: checked === true
+                        ? [...selectedReasons, choice] : selectedReasons.filter((reason) => reason !== choice),
+                    }))} />
+                  <Label htmlFor={`limits-reason-${choice}`} className="font-normal">{choice.replaceAll('_', ' ')}</Label>
+                </div>
+              ))}
+            </fieldset>
+          )}
+          {defaultHeadRoles && (
+            <fieldset className="grid gap-2">
+              <legend className="mb-2 text-sm font-medium">Verifier eligibility</legend>
+              <div className="flex items-center gap-2">
+                <Checkbox id="limits-default-roles" checked={roleText === null} disabled={saving}
+                  onCheckedChange={(checked) => setDraft((current) => ({
+                    ...current, confirm: '', roles: checked === true ? null : defaultHeadRoles.join(', '),
+                  }))} />
+                <Label htmlFor="limits-default-roles">Use default verifier rules</Label>
+              </div>
+              {roleText === null ? (
+                <p className="text-xs text-muted-foreground">Head verdicts require the {defaultHeadRoles.join(', ')} role. Named revision verdicts allow any role on an eligible independent reviewer.</p>
+              ) : (
+                <div className="grid gap-2">
+                  <Label htmlFor="limits-verifier-roles">Verifier roles</Label>
+                  <Input id="limits-verifier-roles" value={roleText} disabled={saving} aria-describedby="limits-role-description"
+                    onChange={(event) => setDraft((current) => ({ ...current, roles: event.target.value, confirm: '' }))} />
+                  <p id="limits-role-description" className="text-xs text-muted-foreground">Separate roles with commas. Leave blank to disable both verdict paths.</p>
+                </div>
+              )}
+            </fieldset>
+          )}
+          {widens && (
             <div className="grid gap-2 rounded-md border border-destructive/40 p-3">
               <ul className="list-disc pl-4 text-sm">
                 {increases.map(({ key, previous, value }) => (
                   <li key={key}>Allows up to {Number(value)} {SAFETY_EFFECTS[key]}. The current limit is {previous}.</li>
                 ))}
+                {reasonsWiden && <li>Allows additional escalation reasons for continuations.</li>}
+                {rolesWiden && <li>Allows more roles to record verdicts on at least one review path.</li>}
               </ul>
               <Label htmlFor="limits-confirm">Type {SAFETY_CONFIRMATION} to confirm</Label>
               <Input id="limits-confirm" value={draft.confirm ?? ''} disabled={saving}
@@ -234,7 +305,7 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
             {history.map((item) => (
               <li key={item.event_id} className="rounded-md border p-2">
                 <p className="text-xs text-muted-foreground">{formatServerTime(item.occurred_at)} · {item.actor_reference ?? item.actor_kind}</p>
-                {Object.entries(item.changes).map(([name, change]) => <p key={name}>{NAMES[name] ?? name}: {show(change.before)} → {show(change.after)}</p>)}
+                {Object.entries(item.changes).map(([name, change]) => <p key={name}>{NAMES[name] ?? name}: {show(name, change.before)} → {show(name, change.after)}</p>)}
                 {item.redacted_fields.map((name) => <p key={name}>{NAMES[name] ?? name}: changed, value hidden</p>)}
                 {item.reason && <p className="break-words text-muted-foreground">{item.reason}</p>}
               </li>

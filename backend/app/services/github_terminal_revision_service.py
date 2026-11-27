@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.api_model import format_utc_time
 from app.models.database import (
-    FactoryAuditEvent, GithubAttemptScopeRevision, GithubMaintenanceEvent, GithubWorkItem, TeamGithubScope,
+    AgentTeamSlot, FactoryAuditEvent, GithubAttemptScopeRevision, GithubMaintenanceEvent, GithubWorkItem, TeamGithubScope,
 )
 from app.services import factory_audit_service as audit
 
@@ -217,11 +217,11 @@ async def _bind_submitted_review_approval(db, context, revision):
 
 
 async def _review_context(db, item, *, revision_number, dispatch_nonce, head_sha, reviewer_member_id,
-                          actor=None, recording=False):
+                          actor=None, recording=False, require_current_role=False):
     """Bind a disposition to current independent assignment and source."""
     import re
     from app.models.database import GithubRequiredCheckWatch
-    from app.services.github_approval_service import github_approval_service as approval, GithubApprovalError
+    from app.services.github_approval_service import github_approval_service as approval, GithubApprovalError, reviewer_role_matches
     from app.services.github_ci_watch_service import github_ci_watch_service as watches, _digest as policy_digest
     from app.services.factory_delivery_policy import effective_policy
     scope = await db.get(TeamGithubScope, item.scope_id)
@@ -249,6 +249,10 @@ async def _review_context(db, item, *, revision_number, dispatch_nonce, head_sha
         raise GithubApprovalError('current_independent_reviewer_required', status_code=403) from exc
     from app.models.database import MailTeamMember
     reviewer = await db.get(MailTeamMember, reviewer_member_id)
+    context['check_reviewer_role'] = recording or require_current_role
+    if context['check_reviewer_role'] and not await db.scalar(select(AgentTeamSlot.id).where(
+            AgentTeamSlot.id == reviewer.team_slot_id, reviewer_role_matches(scope.verifier_roles))):
+        raise GithubApprovalError('current_independent_reviewer_required', status_code=403)
     context['reviewer_binding'] = (reviewer.id, reviewer.team_slot_id)
     context['review_watch'] = _values(watch)
     await _read_review_head(scope, context, head_sha)
@@ -278,15 +282,16 @@ def _review_approval_exists(context):
 def _review_conditions(context):
     from sqlalchemy import and_, or_
     from sqlalchemy.orm import aliased
-    from app.models.database import AgentTeamSlot, MailTeamMember, GithubRequiredCheckWatch
-    from app.services.github_approval_service import github_approval_service as approval
+    from app.models.database import MailTeamMember, GithubRequiredCheckWatch
+    from app.services.github_approval_service import github_approval_service as approval, reviewer_role_matches
     member, newer = aliased(MailTeamMember), aliased(MailTeamMember)
     reviewer, slot = context['reviewer_binding']
+    roles = context['scope']['verifier_roles'] if context.get('check_reviewer_role') else None
     conditions = [*approval.healthy_scope_conditions(context),
         exists(select(member.id).join(AgentTeamSlot, AgentTeamSlot.id == member.team_slot_id).where(
             member.id == reviewer, member.team_slot_id == slot, member.team_preset_id == context['team_id'],
             member.participant_kind == 'team_slot', AgentTeamSlot.preset_id == context['team_id'],
-            AgentTeamSlot.enabled.is_(True),
+            AgentTeamSlot.enabled.is_(True), reviewer_role_matches(roles),
             ~exists(select(newer.id).where(newer.team_slot_id == slot,
                 or_(newer.updated_at > member.updated_at,
                     and_(newer.updated_at == member.updated_at, newer.id > member.id)))))),
@@ -310,6 +315,7 @@ async def read_current_named_review_attempt(db, context, watch, reviewer_slot_id
     if context['dispatch_status'] == 'escalated':
         revision = await _submitted_review_revision(db, context, watch.head_sha)
         await _bind_submitted_review_approval(db, context, revision)
+    context['check_reviewer_role'] = True
     context['reviewer_binding'] = (watch.reviewer_member_id, reviewer_slot_id)
     context['review_watch'] = {key: getattr(watch, key) for key in (
         'id', 'work_item_id', 'dispatch_nonce', 'scope_revision', 'pr_number', 'head_sha',
@@ -506,7 +512,8 @@ async def settle_accepted_revision(db, item, *, review_id, leader_member_id, dis
         raise GithubApprovalError('current_accepted_review_required')
     fact_values = _values(fact)
     context, revision, watch, leader = await _review_context(db, item, revision_number=item.active_scope_revision,
-        dispatch_nonce=dispatch_nonce, head_sha=fact.head_sha, reviewer_member_id=fact.reviewer_member_id, actor=actor)
+        dispatch_nonce=dispatch_nonce, head_sha=fact.head_sha, reviewer_member_id=fact.reviewer_member_id,
+        actor=actor, require_current_role=True)
     if (leader.id != leader_member_id or leader.id == revision.owner_member_id or fact.revision_id != revision.id
             or fact.watch_id != watch.id
             or fact.expected_lease_token_hash != approval.lease_token_hash(context['lease_token'])):

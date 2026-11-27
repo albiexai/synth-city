@@ -70,6 +70,19 @@ const TEAM_ACTIVITY_TEXT: Partial<Record<NonNullable<TeamSummaryCoverageReason['
   native_log_unreadable: 'The native activity log could not be read.',
   ambiguous_binding: 'More than one activity binding could apply.',
   duplicate_native_identity: 'More than one slot uses the same native session.',
+  session_mismatch: 'The observed session does not match.',
+  native_event_before_process: 'The activity event predates the current process.',
+  native_event_stale: 'No recent native progress was observed.',
+  native_event_unsupported: 'The harness recorded an unsupported activity event.',
+  native_history_limit: 'The turn start is outside the activity history limit.',
+  native_identity_mismatch: 'The observed native process identity does not match.',
+  native_progress_without_start: 'The harness recorded progress without a turn start.',
+  native_session_ended: 'The harness reports that the native session ended.',
+  native_wait_unconfirmed: 'The native wait could not be confirmed.',
+  observation_incomplete: 'The native observation is incomplete.',
+  observation_invalid: 'The native observation is invalid.',
+  observation_unavailable: 'The controller could not confirm this activity observation.',
+  provider_unsupported: 'This harness has no native activity observer.',
 }
 
 const TEAM_COVERAGE_SOURCE: Record<NonNullable<TeamSummaryCoverageReason['source']>, string> = {

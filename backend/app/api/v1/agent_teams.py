@@ -101,6 +101,8 @@ from app.models.schemas import (
     TeamGithubContinuationPolicyUpdate,
     TeamGithubScopeListResponse,
     TeamGithubScopeResponse,
+    CONTINUABLE_ESCALATIONS,
+    DEFAULT_HEAD_VERIFIER_ROLES,
     TeamGithubScopeSafetyBounds,
     TeamGithubScopeSettingsResponse,
     TeamGithubScopeUpdate,
@@ -117,8 +119,8 @@ from app.services.agent_mail_service import (
 from app.services.agent_activity_service import observe_team
 from app.services.sqlite_busy_retry import SqliteBusyExhausted, is_sqlite_busy, retry_when_busy
 from app.services.github_approval_service import (
-    CONTINUABLE_ESCALATIONS,
     ActiveCancellationNoticeError,
+    continuation_reasons,
     GithubApprovalError,
     github_approval_service,
 )
@@ -537,6 +539,8 @@ def _scope_response(
         max_scope_amendment_requests=scope.max_scope_amendment_requests,
         max_amendment_added_paths=scope.max_amendment_added_paths,
         max_companion_paths=scope.max_companion_paths,
+        continuation_allowed_reasons=scope.continuation_allowed_reasons,
+        verifier_roles=scope.verifier_roles,
         enabled=scope.enabled,
         last_polled_at=scope.last_polled_at,
         created_at=scope.created_at,
@@ -2307,7 +2311,7 @@ async def claim_github_work_item_continuation(
         continuation_block_code = None
     elif item.dispatch_status != "escalated":
         continuation_block_code = "continuation_not_escalated"
-    elif item.escalation_reason not in CONTINUABLE_ESCALATIONS:
+    elif item.escalation_reason not in continuation_reasons(scope):
         continuation_block_code = "continuation_reason_not_allowed"
     elif item.pr_number is None:
         continuation_block_code = "continuation_pr_required"
@@ -2837,8 +2841,21 @@ async def read_github_scope_settings(
                 actor_kind=record.actor_kind, actor_reference=record.actor_reference,
                 via=record.via, reason=record.sanitized_reason, changes=changes, redacted_fields=redacted_fields))
     definitions = definition["properties"] | TeamGithubScopeSafetyBounds.model_json_schema()["properties"]
+    definitions["continuation_allowed_reasons"]["choices"] = sorted(CONTINUABLE_ESCALATIONS)
+    definitions["verifier_roles"]["default_head_roles"] = list(DEFAULT_HEAD_VERIFIER_ROLES)
     return dict(definitions=definitions, required=definition["required"], history=history,
                 next_before_id=records[limit - 1].id if len(records) > limit else None)
+
+
+def _widens_safety_bound(name, before, after):
+    if name == "continuation_allowed_reasons":
+        return bool(set(CONTINUABLE_ESCALATIONS if after is None else after)
+                    - set(CONTINUABLE_ESCALATIONS if before is None else before))
+    if name == "verifier_roles":
+        if after is None:
+            return before is not None  # The named revision path restores eligibility for every role.
+        return bool(set(after) - set(DEFAULT_HEAD_VERIFIER_ROLES if before is None else before))
+    return after is not None and after > before
 
 
 @router.patch("/github-scopes/{scope_id}", response_model=TeamGithubScopeResponse)
@@ -2889,10 +2906,12 @@ async def update_github_scope(
         scope = await _reserve_scope_writer(db, scope_id, actor=_write_actor(write_context))
         if _scope_configuration(scope) != observed_configuration:
             raise HTTPException(status_code=409, detail="scope_changed_during_app_lookup")
-        bounds = request.model_dump(include=set(TeamGithubScopeSafetyBounds.model_fields), exclude_none=True)
+        bounds = request.model_dump(include=set(TeamGithubScopeSafetyBounds.model_fields), exclude_unset=True)
+        bounds = {name: value for name, value in bounds.items()
+                  if value is not None or name in {"continuation_allowed_reasons", "verifier_roles"}}
         increases = {
             name: {"before": getattr(scope, name), "after": value}
-            for name, value in bounds.items() if value > getattr(scope, name)
+            for name, value in bounds.items() if _widens_safety_bound(name, getattr(scope, name), value)
         }
         if increases and request.confirm != "safety_bounds":
             raise HTTPException(status_code=400, detail={
@@ -2902,6 +2921,8 @@ async def update_github_scope(
         scope.max_scope_amendment_requests = bounds.get("max_scope_amendment_requests", scope.max_scope_amendment_requests)
         scope.max_amendment_added_paths = bounds.get("max_amendment_added_paths", scope.max_amendment_added_paths)
         scope.max_companion_paths = bounds.get("max_companion_paths", scope.max_companion_paths)
+        scope.continuation_allowed_reasons = bounds.get("continuation_allowed_reasons", scope.continuation_allowed_reasons)
+        scope.verifier_roles = bounds.get("verifier_roles", scope.verifier_roles)
         if identity_change and await _scope_identity_in_use(db, scope_id):
             raise HTTPException(status_code=409, detail="scope_identity_in_use")
         if auth_change and await _scope_identity_in_use(db, scope_id):

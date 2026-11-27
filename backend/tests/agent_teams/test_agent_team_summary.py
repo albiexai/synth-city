@@ -172,7 +172,13 @@ async def test_empty_team_has_zero_effort_and_no_actor(db, monkeypatch):
     ("restart_needed_for_observation", "restart_needed_for_observation"),
     ("no_native_event", "no_native_event"),
     ("completion_unconfirmed", "completion_unconfirmed"),
-    ("private-native-debug-value", None),
+    ("native_event_unsupported", "native_event_unsupported"),
+    ("native_progress_without_start", "native_progress_without_start"),
+    ("native_history_limit", "native_history_limit"),
+    ("observation_invalid", "observation_invalid"),
+    ("observation_incomplete", "observation_incomplete"),
+    (None, "observation_unavailable"),
+    ("private-native-debug-value", "observation_unavailable"),
 ])
 async def test_summary_reports_public_native_reason_without_private_identity(db, monkeypatch, reason, expected):
     team, _, items = await seed(db)
@@ -318,9 +324,8 @@ async def test_only_quiet_live_slots_without_work_stop_blocking_coverage(
     summary, _ = service(monkeypatch)
     result = await summary.summary(db, team.id, scope_id=scope_filter)
     assert result.coverage_complete is expected_complete
-    public_reason = None if reason == "native_event_stale" else reason
     assert [(row.code, row.slot_id, row.activity_reason) for row in result.coverage_reason] == (
-        [] if expected_complete else [("native_unknown", slot_id, public_reason)])
+        [] if expected_complete else [("native_unknown", slot_id, reason)])
     assert [row.reason for row in result.waiting_input] == (["question"] if scenario == "waiting-for-input" else [])
 
 
@@ -566,7 +571,7 @@ async def test_harness_filter_keeps_a_reason_without_exposing_the_other_slot(db,
     result = await summary.needs_you(db, team.id, provider="codex-cli")
     assert not result.coverage_complete and not result.next_actor_coverage_complete
     assert [(entry.code, entry.slot_id, entry.activity_reason) for entry in result.coverage_reason] == [
-        ("native_unknown", None, None)]
+        ("native_unknown", None, "observation_unavailable")]
 
 
 @pytest.mark.asyncio

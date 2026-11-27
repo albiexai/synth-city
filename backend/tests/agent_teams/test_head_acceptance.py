@@ -9,6 +9,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.sql.dml import Update
 
 from app.config import settings
 from app.database import Base
@@ -85,6 +86,44 @@ async def make_case(db, monkeypatch, *, labels=None, **item_values):
         client.pull["labels"] = labels
     _, verifier = await slot_member(db, scope, role="verifier", name="V1")
     return Case(db, scope, item, client, verifier, monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_scope_verifier_roles_change_head_eligibility_without_allowing_the_owner(db, monkeypatch):
+    case = await make_case(db, monkeypatch)
+    case.scope.verifier_roles = ["reviewer"]
+    _, reviewer = await slot_member(db, case.scope, role="Reviewer", name="R1")
+    with pytest.raises(GithubApprovalError, match="current_independent_reviewer_required"):
+        await case.record(HEAD_A)
+    assert (await case.record(HEAD_A, member=reviewer)).reviewer_member_id == reviewer.id
+    case.item.owner_slot_id = reviewer.team_slot_id
+    await db.commit()
+    with pytest.raises(GithubApprovalError, match="current_independent_reviewer_required"):
+        await case.record(HEAD_A, member=reviewer)
+
+
+@pytest.mark.asyncio
+async def test_head_review_rechecks_role_after_taking_the_write_lock(db, monkeypatch):
+    case = await make_case(db, monkeypatch)
+    db.add(GithubRequiredCheckWatch(work_item_id=case.item.id, dispatch_nonce=case.item.dispatch_nonce,
+        scope_revision=0, pr_number=5, head_sha=HEAD_A, owner_slot_id=case.item.owner_slot_id,
+        policy_digest="d", reviewer_member_id=case.verifier.id, checks=[],
+        observed_at=case.item.created_at, changed_at=case.item.created_at))
+    await db.commit()
+
+    execute = db.execute
+    slot_id = case.verifier.team_slot_id
+
+    async def execute_with_role_change(statement, *args, **kwargs):
+        if isinstance(statement, Update) and statement.table.name == GithubHeadReview.__tablename__:
+            await execute(update(AgentTeamSlot).where(AgentTeamSlot.id == slot_id)
+                .values(role="implementer").execution_options(synchronize_session=False))
+        return await execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, "execute", execute_with_role_change)
+    with pytest.raises(GithubApprovalError, match="current_independent_reviewer_required"):
+        await case.record(HEAD_A)
+    assert await db.scalar(select(GithubHeadReview.id)) is None
 
 
 @pytest.mark.asyncio

@@ -275,7 +275,10 @@ export interface TeamSummaryCoverageReason {
     | 'restart_needed_for_observation' | 'no_native_event' | 'completion_unconfirmed'
     | 'session_identity_unavailable' | 'native_identity_unavailable' | 'native_log_unavailable'
     | 'native_log_unreadable' | 'binding_changed' | 'session_mismatch' | 'observation_unavailable'
-    | 'history_window_exceeded' | 'no_current_binding' | 'ambiguous_binding' | 'duplicate_native_identity' | null
+    | 'history_window_exceeded' | 'no_current_binding' | 'ambiguous_binding' | 'duplicate_native_identity'
+    | 'native_event_before_process' | 'native_event_stale' | 'native_event_unsupported' | 'native_history_limit'
+    | 'native_identity_mismatch' | 'native_progress_without_start' | 'native_session_ended' | 'native_wait_unconfirmed'
+    | 'observation_incomplete' | 'observation_invalid' | 'provider_unsupported' | null
 }
 
 // GET agent-teams/presets/{id}/summary. A display-only read: it grants no action.
@@ -424,6 +427,8 @@ export interface DeliveryPolicyEvent {
 export interface DeliveryPolicyHistoryResponse { events: DeliveryPolicyEvent[] }
 
 export interface TeamGithubScopeSafetyBounds {
+  continuation_allowed_reasons?: string[] | null
+  verifier_roles?: string[] | null
   max_scope_amendments?: number
   max_scope_amendment_requests?: number
   max_amendment_added_paths?: number
@@ -517,7 +522,7 @@ export interface TeamGithubScopeUpdate extends TeamGithubScopeSafetyBounds {
   enabled?: boolean
 }
 
-export interface ScopeSettingDefinition { type?: string; minimum?: number; maximum?: number; default?: unknown }
+export interface ScopeSettingDefinition { type?: string; minimum?: number; maximum?: number; default?: unknown; choices?: string[]; default_head_roles?: string[] }
 export interface ScopeSettingChange { before: unknown; after: unknown }
 export interface ScopeSettingsHistoryEntry {
   event_id: number

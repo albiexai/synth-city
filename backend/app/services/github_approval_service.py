@@ -11,7 +11,7 @@ from pathlib import PurePosixPath
 from weakref import WeakValueDictionary
 
 import httpx
-from sqlalchemy import and_, exists, func, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, true, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -31,7 +31,7 @@ from app.models.database import (
     MailTeamMember,
     TeamGithubScope,
 )
-from app.models.schemas import MailMessageCreate, TeamGithubScopeSafetyBounds
+from app.models.schemas import CONTINUABLE_ESCALATIONS, ROLE_TRIM, MailMessageCreate, TeamGithubScopeSafetyBounds
 from app.services import companion_paths, request_preflight
 from app.services import decision_wait_service as decision_waits
 from app.services import factory_audit_service as audit
@@ -53,18 +53,24 @@ from app.services.sqlite_busy_retry import SqliteBusyExhausted, retry_when_busy
 logger = logging.getLogger(__name__)
 
 
-CONTINUABLE_ESCALATIONS = frozenset(
-    {
-        "retry_count_exhausted",
-        "plan_blocked",
-        "owner_idle_timeout",
-        "owner_offline",
-        "leader_offline",
-        "leader_ack_timeout",
-        "continuation_revision_exhausted",
-        "amendment_budget_exhausted",
-    }
-)
+def continuation_reasons(scope):
+    configured = getattr(scope, "continuation_allowed_reasons", None)
+    return CONTINUABLE_ESCALATIONS if configured is None else CONTINUABLE_ESCALATIONS.intersection(configured)
+
+
+def continuation_policy_matches(scope):
+    return exists(select(TeamGithubScope.id).where(
+        TeamGithubScope.id == scope.id, TeamGithubScope.continuation_enabled == scope.continuation_enabled,
+        TeamGithubScope.continuation_allowed_reasons == scope.continuation_allowed_reasons,
+    ))
+
+
+def reviewer_role_matches(roles):
+    if roles is None:
+        return true()
+    return func.lower(func.trim(AgentTeamSlot.role, ROLE_TRIM)).in_(roles)
+
+
 _CONTINUATION_ACTIONS = frozenset(
     {
         "edit_production",
@@ -518,7 +524,7 @@ class GithubApprovalService:
         context["scope"] = {key: getattr(scope, key) for key in (
             "id", "preset_id", "repo_owner", "repo_name", "github_auth_mode", "continuation_enabled",
             "max_scope_paths", "max_scope_commands", "max_continuation_revisions",
-            "max_continuation_failed_heads", "max_failed_heads_per_revision")}
+            "max_continuation_failed_heads", "max_failed_heads_per_revision", "verifier_roles")}
         if escalated_review:
             context["escalation_reason"] = item.escalation_reason
         if not await db.scalar(select(exists(select(GithubWorkItem.id).where(
@@ -1019,6 +1025,7 @@ class GithubApprovalService:
         ``actor`` is the trusted actor of the authenticated caller. Without
         it, the hold fact names the authenticated owner member only.
         """
+        await db.refresh(scope, attribute_names=["continuation_enabled", "continuation_allowed_reasons"])
         if not scope.continuation_enabled:
             raise GithubApprovalError("continuation_disabled")
         if item.scope_id != scope.id:
@@ -1033,8 +1040,9 @@ class GithubApprovalService:
             checkpoint_stage = "decision_hold"
         if item.dispatch_status != "escalated":
             raise GithubApprovalError("continuation_not_escalated")
-        if item.escalation_reason not in CONTINUABLE_ESCALATIONS:
+        if item.escalation_reason not in continuation_reasons(scope):
             raise GithubApprovalError("continuation_reason_not_allowed")
+        policy_matches = continuation_policy_matches(scope)
         if item.pr_number is None:
             raise GithubApprovalError("continuation_pr_required")
         if item.dispatch_nonce != dispatch_nonce:
@@ -1232,6 +1240,7 @@ class GithubApprovalService:
                 GithubWorkItem.owner_slot_id == authenticated_owner_slot_id,
                 GithubWorkItem.pr_number == item.pr_number,
                 GithubWorkItem.escalation_reason == item.escalation_reason,
+                policy_matches,
                 lease_exists,
             )
             .values(updated_at=GithubWorkItem.updated_at)
@@ -2840,6 +2849,12 @@ class GithubApprovalService:
         now = datetime.utcnow()
         if revision.expires_at is not None and revision.expires_at <= now:
             raise GithubApprovalError("continuation_request_expired")
+        policy_conditions = []
+        if decision == "approved":
+            scope = await db.get(TeamGithubScope, item.scope_id, populate_existing=True)
+            if item.escalation_reason not in continuation_reasons(scope):
+                raise GithubApprovalError("continuation_reason_not_allowed")
+            policy_conditions.append(continuation_policy_matches(scope))
         # Scalars for the hold fact are captured before the guarded updates.
         entering_ack_hold = (
             decision == "approved"
@@ -2900,6 +2915,7 @@ class GithubApprovalService:
                 GithubWorkItem.pr_number.is_not(None),
                 GithubWorkItem.escalation_reason
                 == revision.originating_escalation_reason,
+                *policy_conditions,
             )
             .values(updated_at=GithubWorkItem.updated_at)
             .execution_options(synchronize_session=False)

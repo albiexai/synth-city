@@ -63,6 +63,54 @@ def test_claude_duration_deduplicates_completion(native):
     assert second["event_source"] == "claude_end_turn"
 
 
+@pytest.mark.parametrize("with_recap", [False, True], ids=["completed", "completed-with-recap"])
+@pytest.mark.parametrize("process_state,matching,state,reason", [
+    ("S", True, "idle", "native_turn_completed"),
+    ("T", True, "stopped", "process_stopped"),
+    ("S", False, "unknown", "session_mismatch"),
+])
+def test_claude_old_completion_requires_a_live_bound_process(
+    native, monkeypatch, process_state, matching, state, reason, with_recap,
+):
+    completion_at = native["now"] - timedelta(minutes=30)
+    for row in native["records"]:
+        row["timestamp"] = (datetime.fromisoformat(row["timestamp"]) - timedelta(minutes=30)
+                            + timedelta(seconds=1)).isoformat()
+    if with_recap:
+        native["records"].append(native["row"]("system", -27 * 60, subtype="away_summary",
+            parentUuid=native["duration"]["uuid"]))
+    native["write"]()
+    monkeypatch.setattr(activity, "_process_started_at", lambda start: completion_at - timedelta(minutes=5))
+    monkeypatch.setattr(activity, "_process", lambda pid: (process_state, "1000"))
+    provenance = {}
+    result = native["observe"](identity=native["session"] if matching else str(uuid4()), provenance=provenance)
+    assert (result.state, result.reason) == (state, reason)
+    if state == "idle":
+        assert result.observed_at == completion_at
+        assert provenance["event_source"] == "claude_end_turn"
+
+
+def test_claude_recap_without_a_completed_turn_cannot_report_idle(native):
+    recap = native["row"]("system", 0, subtype="away_summary", parentUuid=native["user"]["uuid"])
+    native["write"]([native["user"], recap])
+    provenance = {}
+    result = native["observe"](provenance=provenance)
+    assert (result.state, result.reason) == ("unknown", "native_event_unsupported")
+    assert "event_source" not in provenance
+
+
+@pytest.mark.parametrize("seconds,fields,reason", [
+    (0, {"sessionId": "other-session"}, "session_mismatch"),
+    (0, {"cwd": "/different"}, "session_mismatch"),
+    (-2, {}, "observation_invalid"),
+])
+def test_claude_recap_must_pass_the_existing_binding_checks(native, seconds, fields, reason):
+    recap = native["row"]("system", seconds, subtype="away_summary", **fields)
+    native["write"](native["records"] + [recap])
+    result = native["observe"]()
+    assert (result.state, result.reason) == ("unknown", reason)
+
+
 @pytest.mark.parametrize("field,value", [("sessionId",str(uuid4())),("cwd","/different"),("timestamp","2099-01-01T00:00:00Z")])
 def test_claude_invalid_record_is_unknown(native, field, value):
     native["end"][field] = value; native["write"]()
