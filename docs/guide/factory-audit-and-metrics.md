@@ -193,3 +193,18 @@ A campaign snapshot holds the campaign's measures from its start to an as-of tim
 The metrics window's samples have no calculation version.
 
 Until #1395 merges, a delivery whose local work item was deleted, or an older item with only an automatic-merge time and no delivery record, may read as not delivered.
+
+### Claude Code cost
+
+The Claude Code reader adds up each member's token use and its API-equivalent cost over a campaign window. It reads the agents' own session files.
+- **Counting:** each assistant message counts once, at the time of its first row, and only when that time is inside the window. The four token kinds (input, cache creation, cache read, output) are summed by model, and each total carries its message count.
+- **Whose usage:** a session counts for a member only when it is the session Synth City recorded for that member's launch. Every other session in the team's folders is listed as unattributed usage, never dropped. The record holds the current launch only, so the sessions of an earlier launch show as unattributed, while a resumed session keeps its id. Each team folder is read once, however its workspace is spelled, and that includes a Codex member's workspace, so an earlier Claude Code session there is unattributed too. Every assistant row must name the recorded session and a working directory inside the member's workspace. When two members claim one session, both read unknown and the session is listed once as unattributed. Two limits remain until #1410: when two workspaces encode to the same project folder, an unattributed session there may be listed under the wrong workspace; and a project folder that can't be listed shows no unattributed usage instead of incomplete coverage.
+- **Prices:** cost uses the dated price table (`PricingService.PRICES_AS_OF`), so a page can say "at prices as of <date>". A model is priced only by its exact id. A request whose whole prompt (input, cache creation and cache read) is over 200,000 tokens is priced at the long-context rates for every kind, output included, when the model has them. A model without an entry shows its tokens, and its cost reads unknown (`price_unknown:<model>`), never zero. Today's newer models (Opus 5.5, Sonnet 5.5, Fable 5.1) have no entry yet.
+- **Unknown, never zero:**
+  - a member without a recorded session, with one that isn't a canonical UUID, or whose workspace path can't be resolved: `binding_unverified`;
+  - a session two members claim: `competing_binding`;
+  - a row that names another session, or a working directory outside the workspace or that can't be resolved: `session_mismatch`;
+  - a missing session file: `no_native_session`;
+  - a file that can't be read safely (not a regular file, a link, another owner, writable by others, larger than the bound, or a failed read): `native_log_unreadable`, for that session only;
+  - a row in an unknown format, including one without a row type: `format_unknown`. A window with no assistant usage is a known zero;
+  - a Codex member, read by a later item: `harness_not_read`.
