@@ -22,7 +22,10 @@ function waitingText(work: WorkProjection) {
   return `Waiting for ${waitingActorLabel(work.waiting.actor)}: ${work.waiting.summary}`;
 }
 
-export function WorkTable({ rows }: { rows: WorkProjection[] }) {
+const ordinals = new Intl.PluralRules("en", { type: "ordinal" });
+const suffix: Record<string, string> = { one: "st", two: "nd", few: "rd" };
+
+export function WorkTable({ rows, showOwnerQueue = false }: { rows: WorkProjection[]; showOwnerQueue?: boolean }) {
   return (
     <div data-work-table className="relative overflow-x-auto rounded-lg border">
       <table className="w-full min-w-[720px] table-fixed text-left text-sm">
@@ -48,6 +51,7 @@ export function WorkTable({ rows }: { rows: WorkProjection[] }) {
         <tbody>
           {rows.map((work) => {
             const waiting = waitingText(work);
+            const position = showOwnerQueue ? work.owner_queue_position : undefined;
             return (
               <tr key={work.item.id} className="border-t align-top">
                 <td className="px-3 py-2">
@@ -73,6 +77,11 @@ export function WorkTable({ rows }: { rows: WorkProjection[] }) {
                     >
                       {stateLabel(work)}
                     </span>
+                    {position && (
+                      <span className="shrink-0 text-xs font-medium">
+                        {position === 1 ? "next" : position + (suffix[ordinals.select(position)] ?? "th")}
+                      </span>
+                    )}
                     {work.item.required_ci_unreadable && (
                       <span
                         className="shrink-0 rounded border border-amber-500/60 px-2 text-xs font-medium text-amber-800 dark:text-amber-300"

@@ -322,8 +322,9 @@ def filters(
 def work_filters(
     selected: wire.FactoryFilters = Depends(filters),
     category: str = Query("all", pattern="^(all|open|queued|active|review|attention|finished|unknown)$"),
+    owner_slot_id: int | None = Query(None, ge=1, le=2**63 - 1),
 ):
-    return wire.WorkFilters(**selected.model_dump(), category=category)
+    return wire.WorkFilters(**selected.model_dump(), category=category, owner_slot_id=owner_slot_id)
 
 
 @router.get("/overview", response_model=wire.OverviewResponse)
