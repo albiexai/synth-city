@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import event, select, text, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.database import Base, configure_sqlite_connection
@@ -529,6 +530,85 @@ async def test_poll_observation_propagates_external_cancellation(db, monkeypatch
         await task
     assert await db.scalar(text("SELECT 1")) == 1
     assert not any("native_team_observation_failed" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_poll_observation_saves_identity_without_waiting_on_its_writer(monkeypatch, tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'writer.db'}")
+    discovered_id = "00000000-0000-4000-8000-000000000146"
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def configure(connection, _record):
+        configure_sqlite_connection(connection, busy_timeout_ms=1500)
+
+    def observe(*_args, provenance):
+        provenance["discovered_session_id"] = discovered_id
+        return observed_work("idle", "no_native_event", None, None, None)
+
+    monkeypatch.setattr(native.activity, "_observe", observe)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+        async with sessions() as db:
+            scope, item = await scope_and_item(db)
+            slot = AgentTeamSlot(preset_id=scope.preset_id, position=0, display_name="Owner",
+                                 provider="codex-cli", launch_mode="plain", repo_id="fixture",
+                                 repo_name="fixture", repo_path=str(tmp_path))
+            db.add(slot)
+            await db.commit()
+            item_id, slot_id = item.id, slot.id
+            await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == item_id)
+                             .values(status_note="pending poll write"))
+
+            clock = asyncio.get_running_loop()
+            started = clock.time()
+            observed = await native.activity.observe_poll_team(db, scope.preset_id, timeout=0.5,
+                                                               source="owner_contact")
+            assert clock.time() - started < 0.5
+            assert observed[slot_id].reason == "no_native_event"
+            await db.refresh(slot)
+            assert slot.launch_options == {"session_id": discovered_id, "use_last": False}
+            await db.commit()
+        async with sessions() as reader:
+            saved_item = await reader.get(GithubWorkItem, item_id)
+            saved_slot = await reader.get(AgentTeamSlot, slot_id)
+            assert saved_item.status_note == "pending poll write"
+            assert saved_slot.launch_mode == "resume"
+            assert saved_slot.launch_options["session_id"] == discovered_id
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_poll_observation_logs_error_type_without_error_text(db, monkeypatch, caplog):
+    async def observe(*_args, **_kwargs):
+        raise SQLAlchemyError("synthetic driver text includes /private/factory.db")
+
+    monkeypatch.setattr(native.activity, "observe_private_team", observe)
+    assert await native.activity.observe_poll_team(db, 1, timeout=2, source="owner_contact") is None
+    assert await db.scalar(text("SELECT 1")) == 1
+    messages = [record.getMessage() for record in caplog.records if "native_team_observation_failed" in record.message]
+    assert messages == ["native_team_observation_failed source=owner_contact error_type=SQLAlchemyError"]
+    assert "/private/factory.db" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unavailable_poll_observation_starts_the_existing_gap_wait(db, monkeypatch, tmp_path):
+    from app.models.database import GithubOwnerObservationPause
+    from app.services import owner_observation_pause as pause
+
+    scope, item, _workspace, revision, *_ = await observation_fixture(db, monkeypatch, tmp_path)
+
+    async def observe(*_args, **_kwargs):
+        raise TimeoutError()
+
+    monkeypatch.setattr(native.activity, "observe_private_team", observe)
+    assert await pause.handle_observation_gap(db, scope, item)
+    wait = await db.scalar(select(GithubOwnerObservationPause).where(
+        GithubOwnerObservationPause.work_item_id == item.id))
+    assert wait.status == "waiting"
+    assert item.dispatch_status == "dispatched" and revision.status == "active"
 
 
 @pytest.mark.parametrize("race", ["policy", "terminal", "revision"])
