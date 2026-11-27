@@ -647,6 +647,7 @@ async def decide_work_item(
     decision_scope_id = item.scope_id
     decided = False
     escalated_rejection = item.dispatch_status == "escalated" and request.decision == "rejected"
+    reroute = request.reassign_to_slot_id is not None
     try:
         approval, _decided = await github_approval_service.decide(
             db,
@@ -656,10 +657,11 @@ async def decide_work_item(
             reason=request.reason,
             request_id=request.approval_request_id,
             actor=actor,
+            reassign_to_slot_id=request.reassign_to_slot_id,
         )
         decided = True
         decision_delivery_key = f"github-approval:{approval.id}:decision"
-        decision_message = github_approval_service.initial_decision_message(approval)
+        decision_message = github_approval_service.initial_decision_message(approval, request.reassign_to_slot_id)
         linked_message = None
         if approval.decision_message_id is not None:
             linked_message = await db.get(MailMessage, approval.decision_message_id)
@@ -668,7 +670,7 @@ async def decide_work_item(
                 or linked_message.delivery_key != decision_delivery_key
             ):
                 raise GithubApprovalError("approval_decision_link_mismatch")
-        if escalated_rejection and linked_message is not None:
+        if (reroute or escalated_rejection) and linked_message is not None:
             if not await agent_mail_service._same_delivery(
                 db, linked_message, decision_message, sender_actor_id=None, sender_type="member",
                 operator_authorized=False,
@@ -692,7 +694,7 @@ async def decide_work_item(
             db, actor=actor, scope_id=decision_scope_id, item_id=decision_item_id,
             request_id=request.approval_request_id, outcome="applied",
             reason="decision notice delivered")
-        if not escalated_rejection:
+        if not (reroute or escalated_rejection):
             await github_dispatch_service.apply_approval_decision(
                 db,
                 item,
@@ -708,6 +710,8 @@ async def decide_work_item(
         )
     except Exception as exc:
         if not decided:
+            if reroute:
+                await db.rollback()
             if isinstance(exc, GithubApprovalError) and exc.status_code != 404:
                 # C09: an authenticated decision refusal is recorded.
                 await factory_audit_service.record_observation(

@@ -58,6 +58,18 @@
         "title": "Reason",
         "type": "string"
       },
+      "reassign_to_slot_id": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Reassign To Slot Id"
+      },
       "work_item_id": {
         "title": "Work Item Id",
         "type": "integer"

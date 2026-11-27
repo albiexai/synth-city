@@ -2093,6 +2093,7 @@ class MailDecisionRequest(BaseModel):
     approval_request_id: int
     decision: Literal["approved", "rejected"]
     reason: str = Field(min_length=1)
+    reassign_to_slot_id: int | None = Field(default=None, gt=0)
 
 
 class MailRequiredCheckWatchCreate(BaseModel):

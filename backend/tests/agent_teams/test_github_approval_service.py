@@ -11,11 +11,11 @@ from sqlalchemy import select, text, update
 from app.api.v1 import agent_mail
 from app.config import settings
 from app.models.database import (
-    AgentTeamPreset, AgentTeamSlot, GithubApprovalRequest, GithubAttemptScopeRevision,
+    AgentTeamPreset, AgentTeamSlot, FactoryAuditEvent, GithubApprovalRequest, GithubAttemptScopeRevision,
     GithubWorkItem, GithubWorkspace, MailAgentSession, MailMessage, TeamGithubScope,
     MailExternalActor,
 )
-from app.models.schemas import MailApprovalRequestCreate
+from app.models.schemas import MailApprovalRequestCreate, MailDecisionRequest
 from app.services.agent_mail_service import agent_mail_service
 from app.services.github_approval_service import GithubApprovalError, github_approval_service
 from app.services.github_dispatch_service import GithubDispatchService, github_dispatch_service
@@ -78,6 +78,100 @@ async def monitor(db, attempt, minutes, service=github_dispatch_service):
     await service.monitor_dispatched(db, attempt.scope, attempt.slots,
         wake_state_by_slot={slot.id: "wakeable" for slot in attempt.slots})
     await db.refresh(attempt.item)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["eligible", "busy", "low", "hold", "owner", "audit_failure"])
+async def test_plan_decision_reroutes_with_atomic_authority(db, timed_attempt, monkeypatch, scenario):
+    from fastapi import HTTPException
+    from app.services import factory_audit_service, github_coordination_service
+    from app.services.github_workspace_service import github_workspace_service
+
+    attempt = timed_attempt
+    item_id, owner_id = attempt.item.id, attempt.owner.team_slot_id
+    attempt.item.issue_difficulty = "medium"
+    attempt.workspace.kind = "primary"
+    target = AgentTeamSlot(
+        preset_id=attempt.scope.preset_id, position=2, display_name="Target", provider="codex-cli",
+        repo_id="approval", repo_path="/tmp/approval", repo_name="approval", launch_mode="plain",
+        enabled=True, capability_tier="low" if scenario == "low" else "medium",
+    )
+    db.add(target)
+    await db.flush()
+    target_id = target.id
+    if scenario == "busy":
+        blocker = GithubWorkItem(scope_id=attempt.scope.id, issue_number=92, issue_title="Busy",
+            issue_url="u", github_updated_at=START, dispatch_status="dispatched", owner_slot_id=target_id)
+        db.add(blocker)
+    await db.commit()
+    approval = await request_plan(db, attempt)
+    request_id, root_id = approval.id, approval.request_message_id
+    caller = attempt.owner if scenario == "owner" else attempt.leader
+    session = await db.scalar(select(MailAgentSession).where(MailAgentSession.member_id == caller.id))
+    decision = MailDecisionRequest(work_item_id=item_id, dispatch_nonce=attempt.item.dispatch_nonce,
+        approval_request_id=request_id, decision="rejected", reason="Choose a different builder",
+        reassign_to_slot_id=target_id)
+
+    if scenario == "hold":
+        monkeypatch.setattr(github_coordination_service, "hold_code", lambda: "hold")
+    if scenario == "audit_failure":
+        record = factory_audit_service.record_event
+
+        async def fail_handoff(*args, **kwargs):
+            if kwargs["event_kind"] == "handoff_reassignment":
+                raise RuntimeError("synthetic audit failure")
+            return await record(*args, **kwargs)
+
+        monkeypatch.setattr(factory_audit_service, "record_event", fail_handoff)
+        with pytest.raises(RuntimeError, match="synthetic audit failure"):
+            await agent_mail.decide_work_item(decision, session, db)
+    elif scenario in {"low", "hold", "owner"}:
+        with pytest.raises(HTTPException) as refused:
+            await agent_mail.decide_work_item(decision, session, db)
+        assert refused.value.detail == {
+            "low": "handoff_target_below_difficulty", "hold": "hold", "owner": "not_designated_leader",
+        }[scenario]
+    else:
+        answer = await agent_mail.decide_work_item(decision, session, db)
+        assert answer.decision == "rejected" and answer.payload["reassign_to_slot_id"] == target_id
+
+    await db.refresh(attempt.item)
+    await db.refresh(attempt.workspace)
+    await db.refresh(approval)
+    root = await db.get(MailMessage, root_id, populate_existing=True)
+    reroute = await db.scalar(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.request_id == request_id, FactoryAuditEvent.event_kind == "handoff_reassignment"))
+    assert attempt.workspace.leased_item_id == item_id and attempt.item.owner_slot_id == owner_id
+    if scenario not in {"eligible", "busy"}:
+        assert approval.status == root.request_status == "pending"
+        assert approval.decision_message_id is None and reroute is None
+        assert attempt.item.handoff_state is None and attempt.item.approval_round_count == 1
+        return
+
+    assert approval.decision_message_id == answer.id
+    assert attempt.item.approval_round_count == 2 and attempt.item.ack_received_at is None
+    assert reroute.actor_member_id == attempt.leader.id
+    assert attempt.item.handoff_target_slot_id == target_id
+    with pytest.raises(HTTPException) as refused:
+        await request_plan(db, attempt)
+    assert refused.value.detail == "approval_handoff_pending"
+    await db.refresh(attempt.item)
+    await db.refresh(target)
+    if scenario == "busy":
+        assert attempt.item.handoff_state == "queued"
+        blocker.dispatch_status = "completed"
+        await db.commit()
+        await db.refresh(attempt.scope)
+        await github_dispatch_service._advance_queued_handoffs(db, attempt.scope, require_autonomy=True)
+    assert attempt.item.handoff_state == "pending"
+    monkeypatch.setattr(github_workspace_service, "revoke_push_token", AsyncMock())
+    await github_dispatch_service.accept_handoff(db, attempt.item, target_id,
+        accepting_pane_pid=202, accepting_pane_proc_start="2002")
+    target_member = await agent_mail_service.get_or_create_slot_member(db, target)
+    new_plan, created = await github_approval_service.create_initial_request(
+        db, attempt.item, authenticated_owner_member_id=target_member.id, summary="New owner's plan")
+    assert created and new_plan.approval_round == 2
+    assert attempt.item.owner_slot_id == target_id and attempt.workspace.leased_owner_pid == 202
 
 
 @pytest.mark.asyncio
