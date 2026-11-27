@@ -1906,6 +1906,65 @@ async def test_refused_plan_limit_is_recorded_without_approval_then_cleared_on_a
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("approval_status", ["pending", "approved"])
+async def test_refused_plan_limit_keeps_history_hidden_when_plan_is_already_admitted(
+    client, db, monkeypatch, approval_status
+):
+    monkeypatch.setattr(settings, "mail_capability_tokens_required", True)
+    item, _members, tokens = await _dispatch_approval_fixture(db)
+    item_id, scope_id, nonce = item.id, item.scope_id, item.dispatch_nonce
+    scope = await db.get(TeamGithubScope, scope_id)
+    scope.max_plan_estimate_minutes = 45
+    scope.max_item_effort_minutes = 120
+    await db.commit()
+
+    owner_headers = {"X-Synth-City-Session-Token": tokens[1]}
+    endpoint = "/api/v1/agent-mail/approval-requests"
+    attempt = {"work_item_id": item_id, "dispatch_nonce": nonce}
+    admitted = await client.post(endpoint, headers=owner_headers, json={
+        **attempt, "summary": "Admit a bounded plan.",
+        "plan_metadata": {"estimate_active_minutes": 40},
+    })
+    assert admitted.status_code == 200
+    assert admitted.json()["status"] == "pending"
+    approval_id = admitted.json()["id"]
+    if approval_status == "approved":
+        decision = await client.post(
+            "/api/v1/agent-mail/decisions",
+            headers={"X-Synth-City-Session-Token": tokens[0]},
+            json={**attempt, "approval_request_id": approval_id,
+                  "decision": "approved", "reason": "The estimate fits the limit."},
+        )
+        assert decision.status_code == 200
+        assert decision.json()["decision"] == "approved"
+
+    refused = await client.post(endpoint, headers=owner_headers, json={
+        **attempt, "summary": "Submit a larger plan for the same attempt.",
+        "plan_metadata": {"estimate_active_minutes": 60},
+    })
+    assert refused.status_code == 400
+    assert refused.json()["detail"]["code"] == "plan_estimate_exceeds_limit"
+    await db.rollback()  # The refusal must survive the request transaction.
+
+    history = await db.execute(select(GithubPlanRefusal).where(GithubPlanRefusal.work_item_id == item_id))
+    refusal = history.scalar_one()
+    assert (refusal.dispatch_nonce, refusal.estimate_minutes, refusal.limit_minutes) == (nonce, 60, 45)
+    assert refusal.code == "plan_estimate_exceeds_limit"
+    assert refusal.cleared
+    assert await db.scalar(select(current_plan_refusal_id()).where(GithubWorkItem.id == item_id)) is None
+    approval = await db.get(GithubApprovalRequest, approval_id)
+    assert approval.status == approval_status
+
+    detail = await client.get(f"/api/v1/factory/work-items/{item_id}")
+    assert detail.status_code == 200
+    assert "plan_refusal" not in detail.json()["work_item"]["item"]
+    listing = await client.get("/api/v1/factory/work-items", params={"scope_id": scope_id})
+    assert listing.status_code == 200
+    row = next(row["item"] for row in listing.json()["items"] if row["item"]["id"] == item_id)
+    assert "plan_refusal" not in row
+
+
+@pytest.mark.asyncio
 async def test_explicit_initial_approval_route_commits_authority_then_links_mail(
     client, db, monkeypatch
 ):
