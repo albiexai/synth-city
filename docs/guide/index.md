@@ -1,5 +1,7 @@
 # Introduction
 
+New to Synth City? Read [Start here: how Synth City works](/guide/how-it-works) first.
+
 A self-hosted workspace to observe and intervene in bounded coding-agent attempts on GitHub issues, with mixed harnesses, visible policies and recovery controls.
 
 ## Find work needing attention

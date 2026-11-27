@@ -1,5 +1,7 @@
 # Quick Start
 
+New to Synth City? Read [Start here: how Synth City works](/guide/how-it-works) first.
+
 Start Albiex Synth City, inspect existing work, or launch a manual session before deciding whether to connect a repository.
 
 ## Start the Dev Servers

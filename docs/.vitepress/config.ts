@@ -34,6 +34,7 @@ export default defineConfig({
           text: 'Guide',
           items: [
             { text: 'Introduction', link: '/guide/' },
+            { text: 'Start here: how Synth City works', link: '/guide/how-it-works' },
             { text: 'Installation', link: '/guide/installation' },
             { text: 'Quick Start', link: '/guide/quick-start' },
             { text: 'Moving to v4.0.0', link: '/guide/migration-v4' },
@@ -45,6 +46,7 @@ export default defineConfig({
             { text: 'Factory Audit & Metrics', link: '/guide/factory-audit-and-metrics' },
             { text: 'Isolated Runtime Kit', link: '/guide/isolated-runtime-kit' },
             { text: 'Contributing', link: '/guide/contributing' },
+            { text: 'Glossary', link: '/guide/glossary' },
             { text: 'Changelog', link: '/changelog' },
           ],
         },
