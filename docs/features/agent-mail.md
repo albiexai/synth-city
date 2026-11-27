@@ -181,22 +181,22 @@ The Install tab also shows manual Codex snippets and Copilot fallback commands/h
 
 ## Check a request before you submit it
 
-Most rejected plan and continuation requests fail on mechanical rules, not on design: the wrong phase for the work, a missing completion action, an omitted companion path, a path list that is not closed. `synth_city_preflight_request` checks a plan, scope amendment or continuation request first and returns every problem at once, as a code, a field and a message. It creates nothing and sends no Mail, so it is safe to call as often as needed, and only the item's owner can call it. The continuation and amendment submit tools use the same checks, so a request that passes is not refused for these rules.
+Most rejected plan and continuation requests fail on mechanical rules, not on design: the wrong phase for the work, a missing completion action, an omitted companion path, a path list that is not closed. `synth_city_preflight_request` checks a plan, work item scope amendment or continuation request first and returns every problem at once, as a code, a field and a message. It creates nothing and sends no Mail, so it is safe to call as often as needed, and only the item's owner can call it. The continuation and amendment submit tools use the same checks, so a request that passes is not refused for these rules.
 
-It also compares an optional estimate (`estimate_active_minutes`, in minutes) with the current authority window, reports unread stop or hold Mail for the owner, and lists the companion paths the server will add. Companions don't use up the scope's path limit or an amendment's added-path cap; they have their own bound of 32 per request, so a correction batch that only brings the companions of approved files is never refused for path count. The window is the scope's `max_item_effort_minutes` (default 120, from 15 to 1440). An estimate above it is refused, and one within 10 minutes of it gets a warning. Budgets, a request already pending and the repository head are checked only when you submit. See the [API reference](../api/agent-mail.md#check-a-request-before-submitting-it) for every rule and code.
+It also compares an optional estimate (`estimate_active_minutes`, in minutes) with the current authority window, reports unread stop or hold Mail for the owner, and lists the companion paths the server will add. Companions don't use up the repository scope's path limit or an amendment's added-path cap; they have their own bound of 32 per request, so a correction batch that only brings the companions of approved files is never refused for path count. The window is the repository scope's `max_item_effort_minutes` (default 120, from 15 to 1440). An estimate above it is refused, and one within 10 minutes of it gets a warning. Budgets, a request already pending and the repository head are checked only when you submit. See the [API reference](../api/agent-mail.md#check-a-request-before-submitting-it) for every rule and code.
 
 ## Effort limits and extensions
 
-An approved plan's `estimate_active_minutes` becomes the item's effort limit, rounded up from its upper bound. A plan without an estimate has no limit. An upper bound above the scope's `max_item_effort_minutes` is refused at approval with `effort_estimate_exceeds_ceiling`, before anything is written.
+An approved plan's `estimate_active_minutes` becomes the item's effort limit, rounded up from its upper bound. A plan without an estimate has no limit. An upper bound above the repository scope's `max_item_effort_minutes` is refused at approval with `effort_estimate_exceeds_ceiling`, before anything is written.
 
 The limit is an advisory ledger, not a stop. It counts the item's working time while it is dispatched and acknowledged, and stops counting while an owner observation is waiting or paused. When the counted time reaches the limit, the Leader and the owner each receive one message, and each receives another after every extension. Nothing is stopped or expired. The owner's own report of active effort is separate from the ledger.
 
 The Leader may extend the limit with `synth_city_extend_effort_limit` while the item is `dispatched` or `verifying`. Each step states the extension total the Leader saw, a reason and evidence; a total that has changed is refused with `effort_extension_total_changed`. An extension is also refused while the owner has not acknowledged the approval, while observation is paused, or when the owner shows no recent activity. One step adds at most the smaller of 30 minutes and 25 percent of the original limit, and the limit plus all extensions stays within `max_item_effort_minutes`. A step beyond that room is refused with `extension_exceeds_ceiling`, and the Supervisor is told once for the attempt. The per-step cap always comes from the original limit, so repeated steps do not grow it.
 
-## Amend an approved scope and end a submitted revision
+## Amend an approved work item scope and end a submitted revision
 
-An owner can request a healthy scope amendment before or after opening a PR. The current Leader
-reviews the normalized path/action/command scope, then the owner separately acknowledges the
+An owner can request a healthy work item scope amendment before or after opening a PR. The current Leader
+reviews the normalized path/action/command work item scope, then the owner separately acknowledges the
 delivered approval. Held workspace edits remain intact. Three approved amendments, eight amendment
 requests of any outcome and sixteen cumulative unique added file paths are the attempt limits; any
 stricter configured limits remain in force. A rejected amendment does not count toward the three
@@ -220,5 +220,5 @@ The reviewer gets the attempt binding it needs for those reviews from `synth_cit
 
 Cancelled and timed-out CI runs remain blocked and visible without consuming a failed-head unit.
 Closing an unmerged submitted PR on an escalated attempt supersedes that revision without
-implicitly authorizing a retry or releasing the workspace. See the [API workflow](../api/agent-mail.md#healthy-scope-amendments-and-submitted-review-settlement)
+implicitly authorizing a retry or releasing the workspace. See the [API workflow](../api/agent-mail.md#healthy-work-item-scope-amendments-and-submitted-review-settlement)
 for tools, authentication, compatibility limits and separate review/merge gates.

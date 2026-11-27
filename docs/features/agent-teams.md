@@ -12,7 +12,7 @@ Teams retains saved rosters and manual launch planning alongside factory work. O
 
 Autonomy configures watched repositories, existing primary checkout, labels, merge policy and finite dispatch/recovery limits. GitHub polling uses host access separately from operator authorization; GitHub App dispatch settings alone do not authenticate polling. Repository setup checks access and labels without creating records or labels. New teams start with automation off; new repository scopes start disabled. Explicit Leader changes require operator authority, a disabled team, and a quiescent team.
 
-Team/scope enablement controls intake. Pausing retains configuration; inspect current attempts/processes separately. Code follows configured merge policy with the rolling automatic-merge cap; design-labelled work always requires human PR review. Leader plan approval, operator intervention and human PR review are separate.
+Team and repository scope enablement control intake. Pausing retains configuration; inspect current attempts/processes separately. Code follows configured merge policy with the rolling automatic-merge cap; design-labelled work always requires human PR review. Leader plan approval, operator intervention and human PR review are separate.
 
 Build directory, command and parallelism fields are hints in the owner's brief; Albiex Synth City does not run those build commands. Editable numeric drafts validate on save; clearing a field does not silently increase a budget or authorize recovery.
 
@@ -28,13 +28,13 @@ before launching the owner.
 
 Separate issues track authenticated difficulty writes and plan-time rerouting. [Difficulty writes](https://github.com/albiexai/synth-city/issues/1404) · [Plan-time rerouting](https://github.com/albiexai/synth-city/issues/1405)
 
-### Continuation path scope
+### Work item scope of a continuation
 
-A continuation request must list its allowed paths explicitly. `README.md` permits changes to that exact file. `docs/` permits changes below that directory, including nested files. It does not permit changes below `docs-old/`. It does not permit replacement of the directory itself with a file.
+The **work item scope** is the files, commands and actions that the approved plan lets one work item use. It is not a repository scope. A continuation request must list its allowed paths explicitly. `README.md` permits changes to that exact file. `docs/` permits changes below that directory, including nested files. It does not permit changes below `docs-old/`. It does not permit replacement of the directory itself with a file.
 
-Directory permission requires the trailing slash in the approved request. Existing entries such as `docs` keep their exact-file meaning. Use a new approved revision to change the scope. Globs, absolute paths, parent paths and the repository root are not valid scopes.
+Directory permission requires the trailing slash in the approved request. Existing entries such as `docs` keep their exact-file meaning. Use a new approved revision to change the work item scope. Globs, absolute paths, parent paths and the repository root are not valid entries.
 
-The path limit counts entries in the approved request. Each directory entry grants the stated subtree. Tree observations, commands, actions, ownership, workspace leases and failed-head budgets retain their own limits. Completion checks each changed file against the approved scope. An accepted-source import records only exact accepted files outside that scope. It does not grant edit permission.
+The path limit counts entries in the approved request. Each directory entry grants the stated subtree. Tree observations, commands, actions, ownership, workspace leases and failed-head budgets retain their own limits. Completion checks each changed file against the approved work item scope. An accepted-source import records only exact accepted files outside that work item scope. It does not grant edit permission.
 
 ## Authorization, reuse and deletion
 
@@ -116,7 +116,7 @@ These instructions do not prove summary quality or replace independent review an
 The progress view shows three short lines:
 
 - **Remaining:** The tasks and decisions that still need work.
-- **Estimate:** A range of active effort, with confidence and scope, or **Unknown**.
+- **Estimate:** A range of active effort, with confidence and what it covers, or **Unknown**.
 - **Next:** The next actor and action.
 
 The owner supplies the estimate. The Leader calls `synth_city_prepare_work_remaining_summary` after a safe published checkpoint or review handoff.
@@ -124,11 +124,11 @@ The Leader places the returned block near the start of the main issue and PR. Ke
 The tool formats the block. It does not write to GitHub. Use existing authorized GitHub access.
 
 An estimate excludes waiting for another actor. It is not a promised finish time.
-Do not infer completion from commits, elapsed time, or passing tests. State the unit and scope of any count.
+Do not infer completion from commits, elapsed time, or passing tests. State the unit and the coverage of any count.
 Put completed work and estimate assumptions in the optional detail fields. The UI keeps them in a closed disclosure.
 
 The report names its author, update time, and source checkpoint. It expires after two hours.
-A changed item, dispatch, owner, scope revision, published source, or phase makes it historical.
+A changed item, dispatch, owner, work item scope revision, published source, or phase makes it historical.
 When Synth City cannot confirm the source or find a current report, it shows **Unknown** and the current next action.
 Refresh the block after changes or review corrections. A team report does not clear approval, review, CI, merge, or milestone gates.
 
@@ -159,7 +159,7 @@ It names delegated maintenance explicitly. A delegated repair must not look like
 The team Leader prepares and publishes these instructions through the team's existing authorized GitHub access.
 This task covers automatic dispatch escalations and review requests as well as milestone and pilot decisions.
 The Leader updates the record when the request changes and clears or supersedes it when the request ends.
-Other issue facts and records from other scopes remain intact.
+Other issue facts and records from other repository scopes remain intact.
 
 Synth City checks the current record before showing an action as ready. A PR record identifies its target and reviewed head.
 A new assessment with missing or stale instructions is refused. Older or automatic requests remain visible as **Action details pending**.

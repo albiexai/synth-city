@@ -8,9 +8,17 @@ Select a figure to open it at full size. Parts marked **Not implemented** descri
 This page calls the human role the **Director**. Agent Mail already uses that name. The UI calls the Director's token the **Director key**. The API and code still say *operator* for the same role: the operator token, and `require_operator` on the factory routes. A supervisor uses it only under delegation.
 :::
 
+## Repository scope
+
+A **repository scope** is one team's watch on one GitHub repository. It holds the repository, the base branch, the dispatch label, the primary checkout, the dispatch workspaces, the required checks and the delivery policy. A team has one repository scope for each owner and name of a repository. Use the same spelling every time: the server keeps the case, so `example/repo` and `EXAMPLE/repo` count as two. A different base branch or label does not make a second scope. Different teams can watch the same repository. All slots of a team work for all of its scopes.
+
+[![Two teams and their repository scopes: team A watches repositories Y and X, team B watches repository X, and each team's slots work for all of its scopes](/images/operating-model/repository-scope.svg)](/images/operating-model/repository-scope.svg)
+
+The word "scope" has two other meanings in these pages. A **work item scope** is the files, commands and actions that the approved plan lets one work item use. A **configuration scope** is where a setting applies: user, project or local. The [Glossary](/guide/glossary) defines each term. The API calls repository scopes `github-scopes`.
+
 ## Director actions
 
-Director actions require the operator token through the UI or operator API. These actions include creating, launching, or deleting teams, editing rosters and models, changing scope and delivery policies, enabling autonomy, binding a Supervisor, and editing campaign metadata. Launch planning remains available to eligible Mail sessions. When an action requires typed confirmation, include its exact name in the `confirm` field.
+Director actions require the operator token through the UI or operator API. These actions include creating, launching, or deleting teams, editing rosters and models, changing repository scopes and delivery policies, enabling autonomy, binding a Supervisor, and editing campaign metadata. Launch planning remains available to eligible Mail sessions. When an action requires typed confirmation, include its exact name in the `confirm` field.
 
 The server returns `403 director_action_not_via_mail` when a Director action carries a current Agent Mail session, including when the operator token is absent. The audit event records `via = mail_tool` and the current session. It identifies the session member unless the operator credential is verified. `ui` and `api` describe the request path and provide no identity proof. Dedicated mode separates the controller and agents by OS user. In a shared-user installation, a process that can access the operator token can authenticate a direct API request, so this check cannot enforce role separation on its own.
 
@@ -33,7 +41,7 @@ When a rule can do a job, the job belongs in the controller, not in an agent pro
 - The line of command is Director → Leader → implementers and verifiers.
 - The supervisor and the refinement helper are **staff roles** beside that line. Both are optional. Without a supervisor, the Leader reports directly to the Director.
 - The supervisor uses the Director's powers only within the recorded delegation. It does not take the Leader's authority over plans and backlog assessments.
-- Each team has one Leader, selected by `leader_slot_id`. The Director chooses the number of implementers and verifiers. Scope limits such as `max_concurrent_dispatched` limit concurrent work, not team size.
+- Each team has one Leader, selected by `leader_slot_id`. The Director chooses the number of implementers and verifiers. Repository scope limits such as `max_concurrent_dispatched` limit concurrent work, not team size.
 - The Synth City controller and GitHub are not ranks. The controller enforces the hierarchy with tokens, leases, limits and Mail identity. GitHub holds the backlog and the record.
 - An external agent, such as OpenClaw, takes the supervisor role. It is not a second Director.
 
@@ -102,7 +110,7 @@ The supervisor works on the factory from outside it, and it does not run inside 
 |---|---|---|---|---|---|---|
 | **Director** (human) | Write and order issues; apply the dispatch label | Write the outcome and delegation; authorize the start | Refine at any time; read the summary | Approve or decide on GitHub | Only for a security HOLD | Approve publication |
 | **Supervisor** (AI agent, optional) | Draft issues for the Director | Run startup checks | Fix routine blockers within delegation | Prepare the exact request and evidence | Fix, hand off, run the reviewed upgrade | Reconcile records; disable dispatch |
-| **Synth City controller** (non-agent) | Poll labelled issues | Store scopes, leases and Mail identity | Dispatch; bound attempts; show signals | List the human action | Record the operation; preserve authority and leases | Show the result |
+| **Synth City controller** (non-agent) | Poll labelled issues | Store repository scopes, leases and Mail identity | Dispatch; bound attempts; show signals | List the human action | Record the operation; preserve authority and leases | Show the result |
 | **Leader and team** (AI agents) | Optional readiness assessment | Mail canary | Assess, plan, implement, verify | Independent work continues | Owner checkpoint, then hold | Report results |
 | **GitHub** (non-agent) | The Director's backlog | Parent issue and backlog | PRs and required CI | Exact instructions in the issue | Only live status surface | Final record |
 

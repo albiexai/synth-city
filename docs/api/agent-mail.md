@@ -205,7 +205,7 @@ Receipt recipients are snapshotted when the message is stored. A keyed replay us
 
 ## Check a request before submitting it
 
-`POST /api/v1/agent-mail/preflight-request` (MCP tool `synth_city_preflight_request`) reports every mechanical problem of a plan, scope amendment or continuation request. It is read-only: it creates no request, Mail, nudge or audit row. It needs the owner's member session, and only the item's owner may ask (`403 not_item_owner` otherwise).
+`POST /api/v1/agent-mail/preflight-request` (MCP tool `synth_city_preflight_request`) reports every mechanical problem of a plan, work item scope amendment or continuation request. It is read-only: it creates no request, Mail, nudge or audit row. It needs the owner's member session, and only the item's owner may ask (`403 not_item_owner` otherwise).
 
 ```json
 {
@@ -230,15 +230,15 @@ Receipt recipients are snapshotted when the message is stored. A keyed replay us
 Rules, each with a code the server also uses:
 
 - **Phase and actions:** `continuation_phase_invalid`; an amendment must be implementation (`amendment_diagnostic_restoration_required`); `execution_target_invalid`; unknown actions (`allowed_actions_invalid`); an implementation needs `push_pr_head` and `request_verification` (`implementation_completion_actions_required`); a diagnostic needs `revert_diagnostic_changes` (`diagnostic_revert_required`) and, when hosted-only, no local build command; `install_hosted_ci_tool` and `tool_fallbacks` go together (`hosted_tool_fallback_required`, `tool_fallbacks_invalid`, `hosted_tool_target_required`).
-- **Paths:** repo-relative, no `..`, no absolute or backslash form, no glob characters (`allowed_paths_invalid`, `allowed_paths_required`); an amendment names closed files (`amendment_closed_file_paths_required`). Companion paths from the checked-in map that the request omits are listed as a warning (`companion_paths_added`). They are counted on their own bound of 32 per request (`continuation_path_limit_exceeded` when over it), not against the scope's path limit, which counts only the named paths, and they never count toward an amendment's added-path cap. Only companions recorded in the amendment's digest-verified trailer are counted this way; any other path counts as named.
+- **Paths:** repo-relative, no `..`, no absolute or backslash form, no glob characters (`allowed_paths_invalid`, `allowed_paths_required`); an amendment names closed files (`amendment_closed_file_paths_required`). Companion paths from the checked-in map that the request omits are listed as a warning (`companion_paths_added`). They are counted on their own bound of 32 per request (`continuation_path_limit_exceeded` when over it), not against the repository scope's path limit, which counts only the named paths, and they never count toward an amendment's added-path cap. Only companions recorded in the amendment's digest-verified trailer are counted this way; any other path counts as named.
 - **Submit schema:** the limits the real submit routes enforce with a 422 are reported as problems too (`request_schema_invalid`, with the field and the constraint, never the value you sent): `max_failed_heads` of at least 1, a summary of at most 12000 characters, a tool-fallback package of at most 200 characters, and the field types. The submit responses are unchanged.
 - **Field types:** a value of the wrong type for any field, such as a list or object given as `phase`, `execution_target` or `summary`, is a problem on that field (never a server error), and the other fields are still checked.
 - **Independent fields:** each field is judged on its own, so one bad field does not hide another field's problem, including the path and command limits and the companion bound.
 - **Action rule:** an implementation needs `push_pr_head` and `request_verification`, as the submit routes have always required; `edit_production` is not required, so a tests-only implementation stays a tests-only grant.
-- **Limits:** paths, commands and failed heads per revision, from the scope (`continuation_path_limit_exceeded`, `continuation_command_limit_exceeded`, `continuation_failed_head_limit_exceeded`); an empty summary or the reserved companion trailer in a summary.
+- **Limits:** paths, commands and failed heads per revision, from the repository scope (`continuation_path_limit_exceeded`, `continuation_command_limit_exceeded`, `continuation_failed_head_limit_exceeded`); an empty summary or the reserved companion trailer in a summary.
 - **Initial plan:** `plan_metadata.allowed_paths` must be a non-empty list of closed file paths (`plan_allowed_paths_missing`); later amendments read it. Reserved keys are refused.
 - **Stale authority:** unread stop, hold or decision Mail for the owner (`unread_authority_mail`, which names only the message id).
-- **Amendment and continuation estimates:** an optional `estimate_active_minutes` (a number, or an object with `high` and optionally `low`) is compared with the scope's `max_item_effort_minutes` (default 120). An upper bound above it is `estimate_exceeds_window`, and one within 10 minutes produces `estimate_near_window`. An unusable value returns `estimate_invalid`. Preflight never stores the estimate. The one-hour proposal expiry (`github_continuation_proposal_expiry_seconds`) bounds the path from proposal to activation.
+- **Amendment and continuation estimates:** an optional `estimate_active_minutes` (a number, or an object with `high` and optionally `low`) is compared with the repository scope's `max_item_effort_minutes` (default 120). An upper bound above it is `estimate_exceeds_window`, and one within 10 minutes produces `estimate_near_window`. An unusable value returns `estimate_invalid`. Preflight never stores the estimate. The one-hour proposal expiry (`github_continuation_proposal_expiry_seconds`) bounds the path from proposal to activation.
 
 Initial plan submission and preflight check the upper end of `plan_metadata.estimate_active_minutes`. Estimates above the item effort ceiling return `effort_estimate_exceeds_ceiling`. An estimate within the ceiling but above `max_plan_estimate_minutes` returns `plan_estimate_exceeds_limit` with a message suggesting a split. An estimate equal to the plan limit is allowed. An accepted estimate sets the item's effort limit. The submit route checks new requests and preserves exact replays of recorded requests.
 
@@ -250,16 +250,16 @@ The continuation and amendment submit routes run the same checks and refuse with
 
 ## Effort limits and extensions
 
-When the Leader approves an initial plan without an estimate, the item's base effort limit takes the scope ceiling in effect at that decision. The recorded estimate stays empty. Work and its item detail show the base limit as “scope ceiling (no estimate).” Items already approved without a limit retain that state and continue to return `effort_limit_not_set` on extension requests.
+When the Leader approves an initial plan without an estimate, the item's base effort limit takes the ceiling of the repository scope in effect at that decision. The recorded estimate stays empty. Work and its item detail show the base limit as “scope ceiling (no estimate).” Items already approved without a limit retain that state and continue to return `effort_limit_not_set` on extension requests.
 
-The effort monitor sends its usual advisory notice at the limit. A defaulted limit uses all room under an unchanged scope ceiling. A ceiling increase can create room for an extension under the usual Leader rules.
+The effort monitor sends its usual advisory notice at the limit. A defaulted limit uses all room under an unchanged repository scope ceiling. A ceiling increase can create room for an extension under the usual Leader rules.
 
 - `POST /api/v1/agent-mail/effort-extensions` takes a Mail session of the item's current Leader. The body has `work_item_id`, `dispatch_nonce`, `minutes` (a whole number, at most the step cap), `expected_extension_minutes` (the extension total the Leader saw), `reason` and `evidence`. The MCP tool is `synth_city_extend_effort_limit`.
 - A refusal's `detail` is one code: `effort_extension_stale`, `not_item_leader`, `extension_reason_required`, `extension_evidence_required`, `expected_extension_minutes_required`, `effort_limit_not_set`, `extension_exceeds_cap`, `effort_extension_total_changed`, `extension_exceeds_ceiling`, `effort_extension_not_acknowledged`, `effort_extension_paused` or `effort_extension_no_recent_activity`.
 - At approval an estimate over the ceiling is refused with `effort_estimate_exceeds_ceiling`, and an unreadable estimate with `effort_estimate_invalid`.
-- The scope setting is `max_item_effort_minutes`, changed with `PATCH /api/v1/agent-teams/github-scopes/{scope_id}` (operator token). It accepts 15 to 1440 and defaults to 120.
+- The repository scope setting is `max_item_effort_minutes`, changed with `PATCH /api/v1/agent-teams/github-scopes/{scope_id}` (operator token). It accepts 15 to 1440 and defaults to 120.
 
-## Healthy scope amendments and submitted review settlement
+## Healthy work item scope amendments and submitted review settlement
 
 These routes use the `/api/v1/agent-teams` prefix and current member session authentication.
 The owner requests `POST /github-work-items/{id}/scope-amendments` with the same normalized
@@ -302,7 +302,7 @@ Leader, policy, lease and pause/HOLD fences after external reads. It supersedes 
 revision and clears owner acknowledgement. In the usual case, resuming source work requires
 a fresh bounded amendment, Leader approval and owner activation.
 
-If the submitted revision is an approved scope amendment, settlement escalates the item with
+If the submitted revision is an approved work item scope amendment, settlement escalates the item with
 `amendment_budget_exhausted` when the current attempt reaches three approved amendments
 (`amendment_count_limit`) or eight amendment requests of any outcome (`amendment_request_limit`).
 The item, PR and workspace lease stay bound to the attempt. The owner can use
@@ -348,7 +348,7 @@ and differs from the owner, there is no pause or HOLD, and a Supervisor is bound
   lease in place and returns only the work item ID, workspace ID, and UTC lease start.
   Release requires a terminal item and a clean, readable tree. Commits outside the local base must
   match the head, branch and source repository of the recorded PR, including a closed unmerged PR.
-- **End stopped work** uses the generation and scope revision from `synth_city_list_work_items`. It records
+- **End stopped work** uses the generation and work item scope revision from `synth_city_list_work_items`. It records
   `deferred` with a target milestone or `superseded` with the delivering merged PR. It releases a verified clean
   lease and clears the stopped item's current attention. See [Maintenance](agent-teams.md#maintenance).
 
@@ -396,12 +396,12 @@ prompt use this wording:
 
 ### Reviewer binding (#999)
 
-`synth_city_get_review_binding`, or `GET /github-work-items/{id}/review-binding`, gives an assigned reviewer `work_item_id`, `pr_number`, `dispatch_nonce` and `active_scope_revision`. A complete comparison for the current first-plan PR adds `initial_path_comparison`, with the compared head and base, changed files in scope, approved companions, files outside scope, and any outside-scope note. The nonce is private and only belongs in the review tools. The comparison grants no review or merge authority.
+`synth_city_get_review_binding`, or `GET /github-work-items/{id}/review-binding`, gives an assigned reviewer `work_item_id`, `pr_number`, `dispatch_nonce` and `active_scope_revision`. A complete comparison for the current first-plan PR adds `initial_path_comparison`, with the compared head and base, changed files inside the work item scope, approved companions, files outside the work item scope, and any outside-scope note. The nonce is private and only belongs in the review tools. The comparison grants no review or merge authority.
 
 The caller comes from the authenticated session (no session: 401 `session_token_required`; a session without a team slot: 403 `session_not_slot_bound`). Exactly two callers are allowed, and every check reads fresh values:
 
 - **The team's current verifier**, by the same rule as a head review: the current member of an enabled slot of this team whose role is `verifier`, not the owner or the Leader.
-- **The reviewer named on the item's required-check watch.** The watch must be for the current nonce, the current scope revision, the pull request's **exact current head** (read from GitHub, with the checks used when the watch is registered: open, not merged, the item's branch, this repository) and the **current delivery policy**. The reviewer must still be the current member of an enabled slot of the team, and not the owner or the Leader. After the GitHub read, the whole authority is checked again: a healthy context, and the same attempt, revision, pull request, owner, team, Leader, branch, repository and delivery policy. The observed pull request, the watch and the reviewer are checked against those post-read values.
+- **The reviewer named on the item's required-check watch.** The watch must be for the current nonce, the current work item scope revision, the pull request's **exact current head** (read from GitHub, with the checks used when the watch is registered: open, not merged, the item's branch, this repository) and the **current delivery policy**. The reviewer must still be the current member of an enabled slot of the team, and not the owner or the Leader. After the GitHub read, the whole authority is checked again: a healthy context, and the same attempt, revision, pull request, owner, team, Leader, branch, repository and delivery policy. The observed pull request, the watch and the reviewer are checked against those post-read values.
 
 Everyone else gets 403 `current_independent_reviewer_required`.
 
@@ -451,7 +451,7 @@ Next) that the owner publishes. Only the current Leader may read it.
   response). A published block that still carries a `dispatch_nonce`, or an old counter-only `attempt`, is treated
   as invalid and is never trusted; the product does not rewrite old blocks, so the operator removes them by hand.
 - **Final fence.** After its last awaited Leader check the route reads one joined projection of the item and its
-  workspace lease, then compares nonce, owner slot, scope revision, generation and the item status the context was
+  workspace lease, then compares nonce, owner slot, work item scope revision, generation and the item status the context was
   built under (`remaining_work_context_status`) before it answers; a recorded-head context also needs a terminal
   status, no leased workspace and the same verified head. Nothing awaits after that projection. Any difference
   returns `409 progress_context_unavailable`.

@@ -218,7 +218,7 @@ POST /api/v1/agent-teams/github-scopes/{scope_id}/operator-action-contexts/prepa
 
 The body is `{ "entries": [...] }`. Use the assessment entry schema for the intended assigned issues.
 The current authenticated Leader can prepare one to sixteen unique actions and at most eight PRs.
-This route checks scope, role, current inspection state, and PR identity. It returns text templates and section markers.
+This route checks repository scope, role, current inspection state, and PR identity. It returns text templates and section markers.
 It does not publish to GitHub or grant workflow authority. OFF and HOLD prevent this preparation.
 
 Use `synth_city_prepare_operator_action_contexts(scope_id, entries)` for intended Leader requests.
@@ -269,14 +269,14 @@ It includes report state, author, time, source SHA, and optional completed work 
 The ordinary progress read makes no GitHub writes and changes no dispatch authority.
 The progress read is not authenticated, so it names a dispatch by `dispatch_generation`, a public one-way digest of the
 work-item id and the dispatch nonce, and never returns the nonce: `dispatch_nonce` is `null`. The same holds for the
-preset work-item list. The authenticated routes (scope revisions, approval requests, workspaces) keep the nonce that
+preset work-item list. The authenticated routes (work item scope revisions, approval requests, workspaces) keep the nonce that
 operator actions need, and add the same `dispatch_generation`. The generation is a public reference, not a secret,
 and no endpoint accepts it as a capability. Limit: the dispatch branch name still embeds the nonce and is public on
 GitHub; that exposure is tracked separately from this field.
 
 The current Leader uses `synth_city_prepare_work_remaining_summary` to prepare a report.
 The tool reads `/github-work-items/{item_id}/remaining-work-context` with its Agent Mail capability.
-That route requires the current Leader for this item's scope. It checks the Leader again after asynchronous observations.
+That route requires the current Leader for this item's repository scope. It checks the Leader again after asynchronous observations.
 An unavailable published source returns `progress_context_unavailable`. It does not create a report for an unconfirmed checkpoint.
 A merged, completed or closed item has no workspace to observe; its context rests on the recorded verified head, is read
 once more after the last Leader check, and the response carries no nonce.
@@ -292,7 +292,7 @@ Copy it to the PR when requesting review. Replace only that block and keep other
 The read path accepts one marked, validated block from the exact expected GitHub issue endpoint.
 It caches only the sanitized report, not the issue body.
 
-The report must match item, dispatch, owner, scope revision, source SHA, and phase.
+The report must match item, dispatch, owner, work item scope revision, source SHA, and phase.
 It becomes historical after a mismatch or two hours. A missing, invalid, or unavailable report has no current estimate.
 The UI shows an explicit **Unknown** and retains the authoritative next action.
 Reports remain advisory. They do not grant execution, recovery, approval, review, merge, or milestone authority.
@@ -302,7 +302,7 @@ Reports remain advisory. They do not grant execution, recovery, approval, review
 1. Prepare the intended records. Keep the generated metadata, headings, and labels.
 2. Fill every `WRITE_` placeholder. State the exact operator steps and the condition that clears each request.
 3. Put one marked section within the first 4096 characters of the main issue body. Use the exact heading `Current operator actions`.
-4. Use existing authorized GitHub access. Preserve other issue facts, human edits, and records that belong to other scopes.
+4. Use existing authorized GitHub access. Preserve other issue facts, human edits, and records that belong to other repository scopes.
 5. Read the current issue again before updating it. Reconcile concurrent edits. Confirm the published section after the update.
 6. Read fresh backlog coordination after publication. Pass its private token to the complete assessment.
 7. Update the section when the actor, evidence, PR head, checkpoint, or requested action changes.
@@ -339,7 +339,7 @@ Keep at most sixteen records in the section. Do not alter a generated public ID 
 
 All declared human actions need a current matching record before the new assessment is accepted.
 HTTP 422 `human_action_context_required` retains the previous assessment when instructions are absent, stale, or mismatched.
-`human_action_context_not_cleared` means that the issue still requests a superseded action from this scope.
+`human_action_context_not_cleared` means that the issue still requests a superseded action from this repository scope.
 `human_action_actor_required` rejects a declared human action assigned to an agent.
 `human_action_completed` rejects an action on a completed disposition.
 `human_action_attempt_changed` means an inspection no longer matches the current stopped attempt or checkpoint.
@@ -404,13 +404,13 @@ These routes need the operator token. They are generic references; IDs in paths 
 
 | Route | Behavior |
 | --- | --- |
-| PATCH `/api/v1/agent-teams/github-scopes/{scope_id}/delivery-policy` | Changes the scope's default delivery policy. The body has `expected_revision`, `policy` and `reason`. A changed revision returns 409 `delivery_policy_revision_changed`. New dispatch attempts record the new defaults. |
-| PATCH `/api/v1/agent-teams/github-work-items/{item_id}/delivery-policy` | Applies the current scope policy to one existing attempt. The body has `expected_dispatch_nonce`, `expected_scope_revision`, `expected_policy_revision`, `target_policy_revision` and `reason`. A changed context returns 409 `attempt_delivery_policy_context_changed`. |
+| PATCH `/api/v1/agent-teams/github-scopes/{scope_id}/delivery-policy` | Changes the repository scope's default delivery policy. The body has `expected_revision`, `policy` and `reason`. A changed revision returns 409 `delivery_policy_revision_changed`. New dispatch attempts record the new defaults. |
+| PATCH `/api/v1/agent-teams/github-work-items/{item_id}/delivery-policy` | Applies the current repository scope policy to one existing attempt. The body has `expected_dispatch_nonce`, `expected_scope_revision`, `expected_policy_revision`, `target_policy_revision` and `reason`. A changed context returns 409 `attempt_delivery_policy_context_changed`. |
 | GET `/api/v1/agent-teams/github-scopes/{scope_id}/delivery-policy/history` | Lists the latest 100 policy change events for the scope. The history is append-only. |
 
 ### Delivery policy fields and attempt snapshots
 
-`policy` takes the fields below. Unknown fields are rejected, and every field has a default. The policy is data: it grants no approval, merge, scope or execution authority.
+`policy` takes the fields below. Unknown fields are rejected, and every field has a default. The policy is data: it grants no approval, merge, work item scope or execution authority.
 
 | Field | Values (default) | Effect |
 | --- | --- | --- |
@@ -433,7 +433,7 @@ Attempt snapshots follow these rules:
 - A new dispatch copies the scope's current policy and revision into the attempt. Later scope changes do not alter that attempt.
 - An attempt created before the upgrade has no stored policy. It keeps the legacy rules until it is adopted.
 - The scope PATCH applies only when `expected_revision` is current. A success records a history event and increments the revision.
-- The attempt PATCH copies the scope's current policy into the attempt. It runs only while the attempt is `pending`, `dispatched` or `escalated`, its nonce, scope revision and policy revision match the request, and the scope is still at `target_policy_revision`. Any other state returns 409 `attempt_delivery_policy_context_changed`.
+- The attempt PATCH copies the scope's current policy into the attempt. It runs only while the attempt is `pending`, `dispatched` or `escalated`, its nonce, work item scope revision and policy revision match the request, and the scope is still at `target_policy_revision`. Any other state returns 409 `attempt_delivery_policy_context_changed`.
 - History returns up to 100 events for the scope, newest first. Attempt adoptions appear with `work_item_id` set.
 
 ### Maintenance
@@ -452,10 +452,10 @@ remain under their existing repository workflows.
 
 | Route | Behavior |
 | --- | --- |
-| POST `/api/v1/agent-teams/presets/{preset_id}/work-items/{item_id}/accepted-source-imports` | Records one accepted-source import for the item. Inconclusive evidence returns 409 `source_import_evidence_inconclusive`; a changed context returns 409 `source_import_context_changed`; another refusal returns 409 with its reason. The original owner scope, baseline and budgets remain. |
+| POST `/api/v1/agent-teams/presets/{preset_id}/work-items/{item_id}/accepted-source-imports` | Records one accepted-source import for the item. Inconclusive evidence returns 409 `source_import_evidence_inconclusive`; a changed context returns 409 `source_import_context_changed`; another refusal returns 409 with its reason. The original owner, work item scope, baseline and budgets remain. |
 | GET `/api/v1/agent-teams/presets/{preset_id}/work-items/{item_id}/accepted-source-imports` | Lists at most 64 recorded imports, with `truncated` when more exist. |
 | GET `/api/v1/agent-teams/presets/{preset_id}/work-items/{item_id}/observation-pauses` | Lists the latest 20 recorded owner observation pauses. |
 | POST `/api/v1/agent-teams/presets/{preset_id}/work-items/{item_id}/resume-observation` | Resumes one unchanged recorded pause. The body has `pause_id` and `reason`. It does not restart work, acknowledge Mail, retry or reset a budget. |
-| POST `/api/v1/agent-teams/presets/{preset_id}/work-items/{item_id}/integration-outcome` | Records one idempotent integration outcome (`completed` or `needs_coordination`) for the expected dispatch nonce, scope revision and owner slot. `needs_coordination` escalates the item. A replay with different content returns 409 `maintenance_replay_conflict`; a changed context returns 409 `maintenance_context_changed`. |
+| POST `/api/v1/agent-teams/presets/{preset_id}/work-items/{item_id}/integration-outcome` | Records one idempotent integration outcome (`completed` or `needs_coordination`) for the expected dispatch nonce, work item scope revision and owner slot. `needs_coordination` escalates the item. A replay with different content returns 409 `maintenance_replay_conflict`; a changed context returns 409 `maintenance_context_changed`. |
 
 Responses from the maintenance routes use `Cache-Control: no-store`. An item outside the named team returns 404.

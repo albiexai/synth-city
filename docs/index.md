@@ -35,7 +35,7 @@ Start at [Overview](/features/dashboard), follow [Work](/features/work), and ins
 
 Factory filters are independent of the saved native harness preference and local project. [Harnesses](/features/harnesses), [Teams](/features/agent-teams), [Live sessions](/features/agent-bridge) and [Agent Mail](/features/agent-mail) remain useful for manual and configuration-only work.
 
-## Available scope
+## What this release covers
 
 This reference describes the integrated product source candidate. Earlier packaged releases and separately pinned runtime or pilot environments can retain previous navigation and capabilities; integrating source does not upgrade those environments.
 

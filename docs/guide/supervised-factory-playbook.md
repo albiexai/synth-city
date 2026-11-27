@@ -89,7 +89,7 @@ Read optional `supervisor_observation` for the bound actor, clock health and ove
 Read optional `waiting_input` for verified slot waits. Its reasons are `question`, `trust` and `sign_in`.
 An unknown or changed read supplies no current wait claim.
 
-Keep a short campaign record. Use the parent GitHub issue for public scope and current status. Keep the machine record and sensitive runtime details in protected local storage.
+Keep a short campaign record. Use the parent GitHub issue for the public goals and current status. Keep the machine record and sensitive runtime details in protected local storage.
 
 Agree on these fields before dispatch:
 
@@ -153,7 +153,7 @@ Add the integration branch to the `pull_request` and `push` triggers of every re
 
 Begin with human or delegated supervisor merges. Enable automatic integration only after the current-head checks and independent review have an enforceable gate. A review comment or label alone does not establish enforcement. Design-labelled work retains Synth City’s human-review pipeline.
 
-For several repositories, configure one watched scope per repository in the same team. Each scope has its own checkout, base branch, labels, checks and delivery policy. The team shares slot capacity. Cross-repository dependencies still need explicit evidence and Leader assessment.
+For several repositories, configure one repository scope for each repository in the same team. A team cannot have two repository scopes for the same owner and name of a repository. Use the same spelling every time, because the server keeps the case. Each scope has its own checkout, base branch, labels, checks and delivery policy. The team shares slot capacity. Cross-repository dependencies still need explicit evidence and Leader assessment.
 
 The Leader keeps the eligible queue current. A PR awaiting human merge does not automatically block unrelated work. Continue another item only when its dependencies, gates, owner capacity and workspace are ready. Do not route a dependent item around an unmet milestone.
 
@@ -190,7 +190,7 @@ These names are examples. Save the real paths. Check read and write access under
 
 When the controller and the native sessions run as different OS users, git refuses a repository that another user owns. Add each checkout to that user's `safe.directory` list: the controller's list for the primary checkout and slot workspaces, and the native user's list for the dispatch workspaces. Then confirm that every slot reports the same repository identity as the scope. If the identities differ, dispatch cannot match the slots to the scope. After you correct the ownership, save each slot's repository path again so that Synth City recomputes the identity.
 
-Register one dispatch workspace for each concurrent item with `POST /api/v1/agent-teams/github-scopes/{scope_id}/workspaces`. Use a path that is a direct sibling of the scope checkout. The controller provisions the worktree. A scope without dispatchable workspaces dispatches nothing, and its items stay `pending` without an error. Separate directories alone do not isolate credentials or the operator token from same-user processes.
+Register one dispatch workspace for each concurrent item with `POST /api/v1/agent-teams/github-scopes/{scope_id}/workspaces`. Use a path that is a direct sibling of the primary checkout of the repository scope. The controller provisions the worktree. A scope without dispatchable workspaces dispatches nothing, and its items stay `pending` without an error. Separate directories alone do not isolate credentials or the operator token from same-user processes.
 
 Schedule shared-file edits. Set host limits for heavy suites, builds and browser workloads. Agent count is not build concurrency. Use an enforceable shared lock where required; lightweight checks can remain parallel.
 
@@ -215,7 +215,7 @@ Before enabling intake:
 - Confirm the controller version, API health, UI and actual database path. Back up existing state.
 - Record the API address, runtime environment, controller checkout, service units, state directory and supervisor identity.
 - Confirm GitHub polling access, dispatch authentication, configured labels and CI read permissions.
-- Prepare watched scopes and dispatch workspaces. Keep them disabled during setup.
+- Prepare repository scopes and dispatch workspaces. Keep them disabled during setup.
 - Save the intended Leader and roster. Confirm the selected native CLI and model access.
 - Launch or reuse sessions through Synth City. Reuse only sessions with valid intended slot bindings.
 - Check each member's authenticated Mail identity and one successful tool call.
@@ -329,9 +329,9 @@ Bind receipts to the commit, tree, command, dependencies and environment. Store 
 
 Final hosted gates must still cover the actual PR head and current workflow execution. Old successful runs do not override a new pending or failed required run. Do not rerun the same broad suite at every handoff solely to manufacture another receipt.
 
-Complete one bounded correction batch before final review. Keep one finding register with stable IDs, requirements, locations, decisive checks and state. Repair in-scope findings under valid existing authority. Use a new approved scope when the existing continuation no longer authorizes the change.
+Complete one bounded correction batch before final review. Keep one finding register with stable IDs, requirements, locations, decisive checks and state. Repair findings that are inside the work item scope under valid existing authority. Use a new approved work item scope when the existing continuation no longer authorizes the change.
 
-The effective delivery policy belongs to each repository and attempt. New scope defaults do not silently update an active attempt. See the [Factory API](../api/factory.md) and the [delivery policy fields](../api/agent-teams.md#delivery-policy-fields-and-attempt-snapshots).
+The effective delivery policy belongs to each repository and attempt. New repository scope defaults do not silently update an active attempt. See the [Factory API](../api/factory.md) and the [delivery policy fields](../api/agent-teams.md#delivery-policy-fields-and-attempt-snapshots).
 
 ### Companion paths
 
@@ -344,7 +344,7 @@ How the map is used:
 1. **Plan.** File the plan's files as `plan_metadata.allowed_paths`. `paths` is accepted as an alias: a plan that carries only `paths` is read the same way, and one that carries both is read only when they name the same files. A plan with neither, or with a malformed or conflicting list, has no verifiable baseline and cannot be amended. When an initial plan lists its files, Synth City looks the canonical form of each path up in the map and adds `companion_paths` and a `companion_provenance` marker to the plan before the Leader sees it. These two keys belong to the server: a new plan that supplies either is refused. The Leader's request message lists the companions in their own section, and the request fingerprint covers them. The Leader therefore approves the companions with the plan. A plan whose paths have no map entry, or whose path list fails validation, is unchanged.
 2. **Replay.** A request that already exists for the attempt keeps the metadata it was filed with. Editing the map afterwards never changes a pending or decided plan, and an identical resubmission is still the same request. A pending request filed before this feature, whose Mail is missing or unlinked, is repaired under its original fingerprint and gains no companions.
 3. **Amendment.** The approved paths plus the companions the server presented form the amendment baseline. A companion counts only when the provenance marker is present and the Mail body is exactly the server's rendering; an older plan that carries a `companion_paths` key as plain metadata keeps the authority it always had. Changing an approved companion needs no amendment and no new revision. A companion added to the map after approval has no authority until an amendment shows it. An amendment that names a new source file also lists that file's companions, so the Leader approves them together; the stored summary records the added companions with a digest, and an identical retry after a map edit returns the same proposal. A new amendment summary may not contain the reserved line `Companion paths added from the checked-in map:`, but an exact retry of an older request that already carries similar text is still recognized as the same request.
-4. **Everything else.** A path that is neither named in the plan nor an approved companion still needs a scope amendment. Completion-time path enforcement and the amendment limits are unchanged.
+4. **Everything else.** A path that is neither named in the plan nor an approved companion still needs a work item scope amendment. Completion-time path enforcement and the amendment limits are unchanged.
 
 To add a pair, add or extend an entry in the map and run `backend/tests/agent_teams/test_companion_paths.py`. Add a pair only when a real change needed the companion; a long speculative list widens every plan.
 
@@ -378,7 +378,7 @@ Exit codes are `0` for an audit with no findings, `1` for review gaps observed d
 
 Use the team's independent verifier for ordinary completed candidates. Add external source review for a material cross-cutting or operational change, such as lease authority, recovery, CI selection, controller cutover or rollback. Do not add a second full review to every ordinary PR.
 
-An Astra reviewer or a Claude Opus 5.5 reviewer can perform either source review or process analysis. Name the assigned role and scope. The prior campaigns used Astra for demanding maintenance reviews and Opus for delivery retrospectives. The process depends on independent evidence, not a particular model name.
+An Astra reviewer or a Claude Opus 5.5 reviewer can perform either source review or process analysis. Name the assigned role and what the review covers. The prior campaigns used Astra for demanding maintenance reviews and Opus for delivery retrospectives. The process depends on independent evidence, not a particular model name.
 
 ### Source review handoff
 
@@ -399,7 +399,7 @@ Fix blocking correctness findings before acceptance. Record minor follow-ups sep
 
 Use a retrospective after a milestone, a difficult issue, an effort limit or repeated stalls. Give the reviewer pushed source, the finding register, check receipts and an event timeline. Include active work, external waiting and factory downtime separately. Exclude private credentials and raw sensitive transcripts.
 
-Useful measures include time to a complete published candidate, review rounds, blocking findings, repeated broad runs and factory pauses. State their scope and evidence coverage. The audit ledger does not supply missing historical events, human benefit measurements or known total cost.
+Useful measures include time to a complete published candidate, review rounds, blocking findings, repeated broad runs and factory pauses. State what they cover and the evidence coverage. The audit ledger does not supply missing historical events, human benefit measurements or known total cost.
 
 Ask for the largest causes of lost time, evidence for each cause, and a few prioritized changes. Distinguish model limitations, factory defects and process costs. When several factors changed together, do not attribute all improvement to one model.
 
@@ -465,12 +465,12 @@ Use `synth_city_prepare_operator_action_contexts` and the Leader's current asses
 Before you write the request, run a preflight on the target:
 
 - **Startup migrations.** Read the target's compatibility migrations. A column added at startup changes the retained-authority snapshot. Controllers before #654 then fail after cutover. For those, add nullable columns to the live database after a backup and before the operation, and measure the snapshot on a database copy.
-- **Owner checkpoints.** Controllers before #654 refuse a checkpoint from an owner whose session runs outside the dispatch workspace. For those, run the upgrade when no item is dispatched or verifying. Hold a pending item by removing its dispatch label. Removing the label from a dispatched, verifying or awaiting-review item escalates it. An escalated or failed item retries automatically only after a later issue update, and only when it has no PR, its scope revision is 0, no retry is requested and no approval is pending.
+- **Owner checkpoints.** Controllers before #654 refuse a checkpoint from an owner whose session runs outside the dispatch workspace. For those, run the upgrade when no item is dispatched or verifying. Hold a pending item by removing its dispatch label. Removing the label from a dispatched, verifying or awaiting-review item escalates it. An escalated or failed item retries automatically only after a later issue update, and only when it has no PR, its work item scope revision is 0, no retry is requested and no approval is pending.
 - **Accepted pulls.** Each accepted pull must be merged, with all of its head's checks complete and successful.
 - **Proof receipts.** Run the proof in a clean checkout that the checking user owns. A test may write into the tree. The receipt binds the commit and tree, not the path.
 - **Refusal codes.** Older CLIs print only the exception type. Call the operation's function directly to read the reason code.
 
-Turning off team autonomy or a watched scope stops intake. It does not stop an already executing owner. Prove the safe handoff before changing the controller or an owner's source.
+Turning off team autonomy or a repository scope stops intake. It does not stop an already executing owner. Prove the safe handoff before changing the controller or an owner's source.
 
 A shared controller upgrade can affect all teams on its database. Coordinate every active owner. Wait for in-progress verification to finish, or resolve it through a supported handoff. Preserve unrelated teams' original enablement settings.
 
@@ -516,11 +516,11 @@ python scripts/factory-maintenance.py integration-update \
   --request /private/integration-update.json --execute
 ```
 
-This operation needs the accepted integration PR, exact tip, required checks and owner checkpoint. It retains supervision and does not disarm team autonomy. It preserves original approval, ACK, lease and counters. Accepted files outside a continuation scope are recorded as imports; they do not become editable paths.
+This operation needs the accepted integration PR, exact tip, required checks and owner checkpoint. It retains supervision and does not disarm team autonomy. It preserves original approval, ACK, lease and counters. Accepted files outside the work item scope of a continuation are recorded as imports; they do not become editable paths.
 
 On conflict, preserve commits and conflict files. Coordinate the outcome instead of resetting or force-pushing. A continuation directory permission needs a trailing slash, such as `docs/`; `docs` permits only that exact path.
 
-When the attempt policy has `accepted_base_update: disabled` and a PR needs a change that is already on its base branch, such as a required CI fix, the Supervisor uses GitHub's **Update branch** on the PR. It is a conflict-free merge of the current base into the PR branch. The owner then reports `continuation_completed` at the new head as usual. Files the base merge brought in are not scope growth: completion counts a path outside the revision's paths only when the PR's own diff changes it, at the baseline or at the head, relative to its merge base with the current base. An edit outside the paths in the PR's own changes is still refused, and a merge base that can't be read makes completion inconclusive. On conflict, don't resolve it in the PR; coordinate as above.
+When the attempt policy has `accepted_base_update: disabled` and a PR needs a change that is already on its base branch, such as a required CI fix, the Supervisor uses GitHub's **Update branch** on the PR. It is a conflict-free merge of the current base into the PR branch. The owner then reports `continuation_completed` at the new head as usual. Files the base merge brought in are not work item scope growth: completion counts a path outside the revision's paths only when the PR's own diff changes it, at the baseline or at the head, relative to its merge base with the current base. An edit outside the paths in the PR's own changes is still refused, and a merge base that can't be read makes completion inconclusive. On conflict, don't resolve it in the PR; coordinate as above.
 
 ### Check and resume
 
@@ -604,7 +604,7 @@ and mark the goal complete. Do not mark it complete at the preview stage.
 ```text
 Review [issue/PR] at full SHA [candidate]. Base: [SHA].
 Role: [source verifier / runtime reviewer / process reviewer].
-Question and scope: [bounded question].
+Question and limits: [bounded question].
 Requirements: [links]. Evidence: [checks, receipts, finding register, timeline].
 Limits: [unperformed checks and uncertain observations].
 Return [ACCEPT or CHANGES_REQUIRED with source-bound findings / prioritized process advice].

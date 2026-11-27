@@ -18,7 +18,7 @@ Agents propose plans for designated Leader decisions. Operators configure polici
 
 [Harnesses](/features/harnesses) lists implemented native pages and manual entry points. [Teams](/features/agent-teams), [Live sessions](/features/agent-bridge) and [Agent Mail](/features/agent-mail) can be used without watching a repository or enabling autonomy. Native/project preferences do not select factory work. Coverage differs; see [Multi-Provider and Codex CLI](/guide/multi-provider-codex-v2).
 
-## Current scope
+## What this release covers
 
 This reference describes the integrated product source candidate. Earlier packaged releases and separately pinned runtime or pilot environments can retain previous navigation and capabilities; integrating source does not upgrade those environments.
 

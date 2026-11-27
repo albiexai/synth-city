@@ -1,12 +1,12 @@
 # Overview
 
-Overview is the default home page for work across this backend. Team, scope and harness filters are independent of the saved native harness and local project.
+Overview is the default home page for work across this backend. Team, repository scope and harness filters are independent of the saved native harness and local project.
 
 ## Read the observations
 
 Counts describe the complete filtered dataset: queued, active, review, attention, finished and unknown tracking. Follow [Work](/features/work) to inspect records. Finished is not independently reviewed delivery, reliability or time saved. Read failures remain visible rather than becoming zero counts.
 
-Automation separates configured scopes/enablement from effective intake. Runtime normal/recovery-only/unknown mode, scheduler state and runtime time are independent observations. Recovery-only blocks normal intake; missing evidence stays unknown. Stale/never-polled counts cover eligible polling, not paused or blocked scopes. See [Repositories](/features/repositories).
+Automation separates configured repository scopes and enablement from effective intake. Runtime normal/recovery-only/unknown mode, scheduler state and runtime time are independent observations. Recovery-only blocks normal intake; missing evidence stays unknown. Stale/never-polled counts cover eligible polling, not paused or blocked scopes. See [Repositories](/features/repositories).
 
 ## Refresh and next steps
 
