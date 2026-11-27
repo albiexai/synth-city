@@ -268,7 +268,7 @@ Each limit stops a different kind of runaway.
 
 ## Delivery policy
 
-The delivery policy holds the rules of your project for "delivered". It makes Synth City work with any repository and any CI. It belongs to the repository scope. It has a revision number and a history. The **Required checks** dialog on the [Repositories](/features/repositories#required-checks) page edits the list of required checks. The other fields have no dialog yet. Use the API for them.
+The delivery policy holds the rules of your project for "delivered". It makes Synth City work with any repository and any CI. It belongs to the repository scope. It has a revision number and a history. The **Required checks** dialog on the [Repositories](/features/repositories#required-checks) page edits the list of required checks. The **Delivery policy** dialog on the same page edits the other fields. The API does the same work.
 
 | Field | Default | Example | What it decides |
 |---|---|---|---|

@@ -42,12 +42,24 @@ The dialog reads the history from the server and shows each change with its time
 
 ## Required checks
 
-Open a repository in [Teams](/features/agent-teams) and select **Edit** in **Required checks**. The dialog edits the list of CI checks that must succeed on the exact head before a pull request can merge. The list is one field of the delivery policy. The other fields of the delivery policy are not in a dialog yet.
+Open a repository in [Teams](/features/agent-teams) and select **Edit** in **Required checks**. The dialog edits the list of CI checks that must succeed on the exact head before a pull request can merge. The list is one field of the delivery policy. The other fields have their own dialog: see [Delivery policy](#delivery-policy).
 
 - **A check** has a name and an app (the default is `github-actions`). The name and the app together are its identity. Add a check, remove it, or move it up or down.
 - **Rules of the server, shown before a save.** A name is required and has at most 200 characters. An app uses lowercase letters, digits and hyphens, and has at most 100 characters. The same name and app cannot appear twice. The list has at most 32 checks. The list cannot be empty while the broad checks run on hosted CI.
 - **Reason.** A reason is required. It is kept in the history with the new list.
 - **A save replaces the whole policy.** The dialog sends the current policy with only the list changed, and the revision that you started from. If the policy changed on the server after that, nothing is saved. The dialog says so, and you can discard your changes to see the current list.
 - **History.** The dialog reads the latest 100 changes of the delivery policy. It shows what each change added, removed or reordered, with the revision, the time, the reason and, for an attempt that took over the policy, the attempt.
+
+The dialog needs the Director key to read the history and to save.
+
+## Delivery policy
+
+Select **Edit** in **Delivery policy**. The dialog edits the other fields of the delivery policy. The required checks keep their own dialog. A change applies to the next attempt. It does not grant authority.
+
+- **Choices.** Broad checks (`local` or `hosted`), the accepted base update (`disabled`, `fast_forward` or `merge`) and the owner contact (`reports` or `native`). The accepted base update controls the operator integration-update command only. With `disabled`, that command is refused, and you can still use GitHub's **Update branch** by hand.
+- **Timers.** Each timer shows its range in seconds: owner idle time (60 to 86400), owner nudge grace (30 to 3600), owner observation wait (30 to 1800), owner observation resume (60 to 3600) and checkpoint delay report (60 to 86400). Each has a one-line explanation. A timer that the server allows to be unset (all but the resume time) is unset when its box is empty. The observation wait starts after a nudge, when native evidence is unknown. When it ends, the item pauses for the operator. The resume time is the operator's deadline: an unchanged pause can be resumed before it, and the service refuses a resume at or after it.
+- **Switches.** Caller inventory required, and regression proof required.
+- **Rules of the server, shown before a save.** Each number must be a whole number in its range. An observation wait needs native owner contact. Hosted broad checks need at least one required check. Add the check in **Required checks** first.
+- **Reason, revision and history.** These work as in **Required checks**. A reason is required. A save replaces the whole policy and sends the revision that you started from. A stale revision is refused, and you can discard your changes. The history shows every field that changed, from the old value to the new value.
 
 The dialog needs the Director key to read the history and to save.

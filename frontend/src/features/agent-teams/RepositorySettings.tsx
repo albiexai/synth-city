@@ -11,7 +11,9 @@ import {
   ContinuationPolicyDialog, ScopeDialog,
   type PolicyDialogState, type ScopeDialogState,
 } from './ScopeSettingsDialogs'
+import { DeliveryPolicyDialog } from './DeliveryPolicyDialog'
 import { RequiredChecksDialog } from './RequiredChecksDialog'
+import { useDeliveryRevisions } from './useDeliveryPolicy'
 import { ScopeLimitsDialog } from './ScopeLimitsDialog'
 import { authStatus } from './scopeAuthStatus'
 import { useScopeSettings } from './useScopeSettings'
@@ -49,17 +51,26 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
  * confirmation moved here from the Autonomy tab (#536), with the same
  * requests, Director key prompts and confirmations.
  */
-export function RepositorySettings({ scope, autonomyEnabled, refresh, onRemoved }: {
+export function RepositorySettings(props: SettingsProps) {
+  // Another repository starts with no drafts, no pending save and no revision state of the one before (V1 review 437).
+  return <RepositorySettingsBody key={props.scope.id} {...props} />
+}
+
+type SettingsProps = {
   scope: TeamGithubScope
   autonomyEnabled: boolean
   refresh: () => Promise<void>
   onRemoved: () => void
-}) {
+}
+
+function RepositorySettingsBody({ scope, autonomyEnabled, refresh, onRemoved }: SettingsProps) {
   const { saveScope, savePolicy, removeScope, tokenDialog } = useScopeSettings({ refresh })
   const [scopeDialog, setScopeDialog] = useState<ScopeDialogState>(null)
   const [policyDialog, setPolicyDialog] = useState<PolicyDialogState>(null)
   const [limitsOpen, setLimitsOpen] = useState(false)
   const [checksOpen, setChecksOpen] = useState(false)
+  const [deliveryOpen, setDeliveryOpen] = useState(false)
+  const revisions = useDeliveryRevisions() // one view of the policy revision for both delivery policy dialogs
   const [scopeToRemove, setScopeToRemove] = useState<TeamGithubScope | null>(null)
   const [removalPending, setRemovalPending] = useState(false)
   const trigger = useRef<HTMLButtonElement | null>(null)
@@ -135,6 +146,21 @@ export function RepositorySettings({ scope, autonomyEnabled, refresh, onRemoved 
         {scope.delivery_policy_revision !== undefined && <Row label="Policy revision">{scope.delivery_policy_revision}</Row>}
       </Section>
       <Section
+        title="Delivery policy"
+        editLabel={`Edit delivery policy for ${scope.repo_owner}/${scope.repo_name}`}
+        onEdit={(element) => { trigger.current = element; setDeliveryOpen(true) }}
+      >
+        {!scope.delivery_policy ? <Row label="Choices">Not available from this server</Row> : (
+          <>
+            <Row label="Broad checks">{scope.delivery_policy.broad_checks}</Row>
+            <Row label="Accepted base update">{scope.delivery_policy.accepted_base_update.replace('_', ' ')}</Row>
+            <Row label="Owner contact">{scope.delivery_policy.owner_contact}</Row>
+            <Row label="Caller inventory">{scope.delivery_policy.caller_inventory_required ? 'required' : 'not required'}</Row>
+            <Row label="Regression proof">{scope.delivery_policy.regression_proof_required ? 'required' : 'not required'}</Row>
+          </>
+        )}
+      </Section>
+      <Section
         title="Recovery"
         editLabel={`Edit recovery policy for ${scope.repo_owner}/${scope.repo_name}`}
         onEdit={(element) => { trigger.current = element; setPolicyDialog({ scope }) }}
@@ -182,8 +208,17 @@ export function RepositorySettings({ scope, autonomyEnabled, refresh, onRemoved 
       />
       <RequiredChecksDialog
         scope={scope}
+        revisions={revisions}
         open={checksOpen}
         onOpenChange={setChecksOpen}
+        refresh={refresh}
+        onReturnFocus={() => trigger.current?.focus()}
+      />
+      <DeliveryPolicyDialog
+        scope={scope}
+        revisions={revisions}
+        open={deliveryOpen}
+        onOpenChange={setDeliveryOpen}
         refresh={refresh}
         onReturnFocus={() => trigger.current?.focus()}
       />
