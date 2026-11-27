@@ -929,12 +929,34 @@ async def test_deleted_team_during_read_returns_none(db, monkeypatch):
 @pytest.mark.asyncio
 async def test_observation_budget_is_shared_across_items(db, monkeypatch):
     team, _, items = await seed(db, ("dispatched", "dispatched"))
+    start = asyncio.get_running_loop().time()
+    elapsed = 0.0
+    current_timeout = 0.0
+    progress_timeouts = []
+
+    async def wait_with_budget(awaitable, *, timeout: float):
+        nonlocal current_timeout
+        current_timeout = timeout
+        return await awaitable
+
     async def delayed(db, item_id):
-        await asyncio.sleep(0.3)
+        nonlocal elapsed
+        progress_timeouts.append(current_timeout)
+        elapsed += min(0.3, current_timeout)
+        if current_timeout < 0.3:
+            raise TimeoutError
         return progress(item_id)
+
+    # Virtualize only the summary's wait boundary. Setup and other observers
+    # still use the real loop, without consuming this test's virtual budget.
+    loop = SimpleNamespace(time=lambda: start + elapsed)
+    monkeypatch.setattr("app.services.agent_team_summary_service.asyncio", SimpleNamespace(
+        get_running_loop=lambda: loop, wait_for=wait_with_budget,
+    ))
     summary, reads = service(monkeypatch, {item.id: delayed for item in items}, observation_seconds=0.5)
     result = await summary.summary(db, team.id)
     assert len(reads.calls) == 2
+    assert progress_timeouts == pytest.approx([0.5, 0.2])
     assert result.remaining_work.reported_items == 1
     assert result.remaining_work.state == "unknown"
     assert not result.next_actor_coverage_complete
