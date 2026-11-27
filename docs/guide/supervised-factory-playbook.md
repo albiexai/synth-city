@@ -636,14 +636,14 @@ Private evidence references: [protected paths; no secret values].
 
 ## Use the companion skill
 
-The repository contains `skills/deck-factory-supervisor/SKILL.md`. Give that directory to the supervising harness through its supported skill loader. Keep the Synth City source checkout available: the skill reads this playbook from that checkout rather than keeping another copy.
+The repository contains `skills/synth-city-supervisor/SKILL.md`. It was `skills/deck-factory-supervisor/` before; a short pointer stays at that old path for one release. For the daily work (the check-in, the merge audit, splitting an issue and recovery), use the [Supervisor guide](/guide/supervisor-guide). Give that directory to the supervising harness through its supported skill loader. Keep the Synth City source checkout available: the skill reads this playbook from that checkout rather than keeping another copy.
 
 For Claude Code, the current Synth City skill documentation lists `.claude/skills/` and `~/.claude/skills/`. For Codex, the skill authoring convention uses `~/.codex/skills/`. Other harnesses can use their own loader or an explicit instruction to read the skill file. Installation and invocation differ; confirm the installed harness's behavior. Synth City’s native Skills page is not a universal installer for every harness.
 
 An explicit request can use this form:
 
 ```text
-Use the deck-factory-supervisor skill at [path]/SKILL.md.
+Use the synth-city-supervisor skill at [path]/SKILL.md.
 The Synth City source checkout is [path]. The campaign brief is [reference].
 Prepare or resume the team within the permissions in that brief.
 ```
