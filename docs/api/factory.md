@@ -61,13 +61,15 @@ Successful responses include `schema_version: 1` and UTC ISO-8601 `generated_at`
 | --- | --- |
 | Overview | `filters`, `counts`, `automation` |
 | Work list | `filters`, `total`, `has_more`, `next_cursor`, `counts`, `items` |
-| Work detail | `work_item` |
+| Work detail | `work_item`, optional `initial_path_comparison` |
 | Repository list | `filters`, `total`, `has_more`, `next_cursor`, `repositories` |
 | Repository detail | `repository` |
 
 `total` and category counts describe the full selected dataset before pagination, including the selected category. Repository total counts scopes, not distinct GitHub names. `next_cursor` is null exactly when `has_more` is false.
 
-Work projections contain an allowlisted `item`, team/repository context, category, nullable owner/approver/waiting/workspace, separate owner and approver session associations, policy, action observations and typed link hints. Basic details do not expand the private legacy payload. Dispatch nonces/head identity, host workspace paths, credentials/hashes, private commands and freeform recovery summaries are omitted. Last verified SHA is nullable and belongs only to the displayed PR; it is null for diagnostic execution. Treat titles and raw statuses as display text.
+Work projections contain an allowlisted `item`, team/repository context, category, nullable owner/approver/waiting/workspace, separate owner and approver session associations, policy, action observations and typed link hints. Dispatch nonces, assigned branch refs, host workspace paths, credentials/hashes, private commands and freeform recovery summaries are omitted. Last verified SHA is nullable and belongs only to the displayed PR; it is null for diagnostic execution. Treat titles and raw statuses as display text.
+
+Work detail includes `initial_path_comparison` when a complete first-plan comparison is current. It contains the PR head and base SHAs, changed repository-relative files grouped as `in_scope`, `approved_companions`, and `outside_scope`, and an outside-scope note when applicable.
 
 ## Status and action meaning
 

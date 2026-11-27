@@ -245,6 +245,14 @@ export type WorkDetailResponse = {
   generated_at: string;
   schema_version: 1;
   work_item: WorkProjection;
+  initial_path_comparison?: {
+    head_sha: string;
+    base_sha: string;
+    in_scope: string[];
+    approved_companions: string[];
+    outside_scope: string[];
+    note: string | null;
+  };
 };
 
 export type WorkFilters = {
