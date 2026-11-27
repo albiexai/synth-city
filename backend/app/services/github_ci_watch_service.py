@@ -9,10 +9,11 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import exists, inspect, select, update
 from sqlalchemy.exc import OperationalError
 
-from app.models.database import (AgentTeamPreset, AgentTeamSlot, GithubOwnerObservationPause,
+from app.models.database import (AgentTeamPreset, AgentTeamSlot, GithubAttemptScopeRevision, GithubOwnerObservationPause,
     GithubRequiredCheckRecipient, GithubRequiredCheckWatch, GithubWorkItem, GithubWorkspace,
     MailAgentSession, MailTeamMember, TeamGithubScope)
 from app.models.schemas import MailMessageCreate
+from app.services import required_ci_attention
 from app.services.agent_mail_service import agent_mail_service, MailWakeError, MCP_HEARTBEAT_TTL_SECONDS
 from app.services.factory_delivery_policy import effective_policy, policy_context, policy_context_conditions
 from app.services.github_coordination_service import hold_code
@@ -202,6 +203,18 @@ class GithubCIWatchService:
             await db.rollback(); raise PermissionError('current_leader_required')
         await self._require_leader_session(db, context, actor_member_id, session_binding)
         await self._reviewer(db, context, reviewer_member_id)
+        if scope_revision > 0 and reviewer_member_id is not None:
+            settled_head = await db.scalar(select(GithubAttemptScopeRevision.submitted_head_sha).where(
+                GithubAttemptScopeRevision.work_item_id == work_item_id,
+                GithubAttemptScopeRevision.dispatch_nonce == dispatch_nonce,
+                GithubAttemptScopeRevision.revision == scope_revision,
+                GithubAttemptScopeRevision.phase == "implementation",
+                GithubAttemptScopeRevision.status == "completed",
+                GithubAttemptScopeRevision.completed_at.is_not(None),
+            ))
+            if settled_head and settled_head != head_sha:
+                await db.rollback()
+                raise ValueError("settled_head_amendment_required")
         watch = await self._watch(db, context, head_sha, policy, datetime.utcnow())
         if watch is None:
             await db.rollback(); raise ValueError('check_watch_policy_changed')
@@ -209,6 +222,8 @@ class GithubCIWatchService:
             item.verification_head_sha = head_sha
             item.verification_started_at = datetime.utcnow()
             context['verification_head_sha'] = head_sha
+        if required_ci_attention.stale_for_head(item, head_sha):
+            required_ci_attention.note_readable(item)
         watch.reviewer_member_id = reviewer_member_id
         await db.flush()
         await self._deliver(db, context, watch)

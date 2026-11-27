@@ -101,7 +101,8 @@ async def watch_required_checks(request: MailRequiredCheckWatchCreate,
         await db.rollback()
         raise HTTPException(status_code=409, detail=str(exc) if str(exc) in {
             "full_head_required", "stale_check_watch_context", "named_required_checks_required",
-            "current_pr_head_required", "check_watch_policy_changed", "reviewer_not_current_team_member"
+            "current_pr_head_required", "check_watch_policy_changed", "reviewer_not_current_team_member",
+            "settled_head_amendment_required",
         } else "check_watch_unavailable") from None
 
 async def require_mail_director(

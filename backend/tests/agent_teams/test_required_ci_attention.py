@@ -67,3 +67,22 @@ def test_unknown_reason_never_exposes_exception_prose(reason):
 
 def test_known_missing_workflow_reason_is_retained():
     assert attention.error_reason(GithubCheckObservationError("workflow_missing")) == "workflow_missing"
+
+
+def test_unreadable_since_restarts_only_for_a_different_head():
+    first = datetime(2026, 11, 27, 12)
+    repeated = first + timedelta(minutes=16)
+    next_head = repeated + timedelta(seconds=1)
+    item = SimpleNamespace(
+        checks_unavailable_since=None, checks_unavailable_reason=None,
+        checks_unavailable_head_sha=None, dispatch_status="verifying",
+    )
+    attention.note_unreadable(item, "api_error", head_sha="a" * 40, now=first)
+    attention.note_unreadable(item, "api_error", head_sha="a" * 40, now=repeated)
+    assert item.checks_unavailable_since == first
+    assert attention.signal(item, now=repeated) is not None
+
+    attention.note_unreadable(item, "permission_missing", head_sha="b" * 40, now=next_head)
+    assert item.checks_unavailable_since == next_head
+    assert item.checks_unavailable_head_sha == "b" * 40
+    assert attention.signal(item, now=next_head) is None

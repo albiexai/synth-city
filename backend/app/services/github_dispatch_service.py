@@ -45,6 +45,7 @@ from app.services.github_app_auth_service import (
     github_app_auth_service,
 )
 from app.services import decision_wait_service as decision_waits
+from app.services import required_ci_attention
 from app.services.github_approval_service import (
     CONTINUABLE_ESCALATIONS,
     GithubApprovalError,
@@ -907,6 +908,7 @@ class GithubDispatchService:
         item.verification_head_sha = None
         item.initial_paths_readiness = None
         item.verification_started_at = None
+        required_ci_attention.note_readable(item)
         item.merge_wait_head_sha = None
         item.merge_wait_started_at = None
         item.retry_count = 0
@@ -2089,8 +2091,10 @@ class GithubDispatchService:
             return (
                 "This attempt uses a scoped or diagnostic continuation. Follow its "
                 "current approved revision, paths, commands and finite budgets. A "
-                "completed revision does not authorize another head; use supported "
-                "continuation recovery if additional work is needed. A revision's "
+                "completed revision does not authorize another head. For a healthy "
+                "attempt, request a fresh scope amendment and acknowledge its "
+                "approval before editing, even within the prior paths. Escalated "
+                "attempts follow supported recovery. A revision's "
                 "prohibited actions apply only while it is active or submitted. This "
                 "guidance does not grant approval. Respect operator pauses and safety holds."
             )
@@ -2187,6 +2191,11 @@ class GithubDispatchService:
             "- Route independent review findings back to the current owner and "
             "reconcile whether they fit the approved plan before requesting "
             "recovery authority.\n- " + self.review_rework_guidance() + "\n"
+            "- After a scoped implementation revision is settled, route further "
+            "source corrections through a fresh healthy scope amendment and owner "
+            "acknowledgement, even within the previous paths. A changed head on the "
+            "settled revision returns settled_head_amendment_required from the "
+            "reviewer assignment tool.\n"
             "- Track review disposition by full PR head SHA. A changed head needs "
             "fresh independent review and CI; an older acceptance or ready state "
             "does not accept it."
