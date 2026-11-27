@@ -18,6 +18,7 @@ from app.models.factory_schemas import (
     CampaignUnderWayItem, TeamCampaignSummary,
 )
 from app.models.schemas import PlannedCampaignDecision
+from app.services.github_client import GithubCampaignPaginationError
 from app.services.github_dispatch_priority import dispatch_order_key, effective_priority
 from app.services.work_item_states import is_done, needs_attention
 
@@ -65,6 +66,7 @@ class AgentTeamCampaignService:
         self.clock = clock
         self.wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
         self._cache: dict[tuple, BacklogObservation] = {}
+        self._logged_pagination_refusals: set[int] = set()
 
     def _expires_at(self, observation: BacklogObservation) -> float:
         # A failed first read delays the next attempt for one interval.
@@ -147,14 +149,21 @@ class AgentTeamCampaignService:
         if cached and cached.read_at + self.interval_seconds > started:
             return
         observed_at = self.wall_clock()
+        refusal = None
         try:
             issues = await asyncio.wait_for(self._read_backlog(captured, client), timeout=8)
+        except GithubCampaignPaginationError as exc:
+            refusal = exc.reason
+            issues = None
         except Exception:
             # Never expose credential-bearing request objects or raw GitHub errors.
             issues = None
         fresh = await self._scopes(db, scope_id=scope_id)
         if not fresh or self._key(fresh[0]) != key:
             return
+        if refusal is not None and scope_id not in self._logged_pagination_refusals:
+            self._logged_pagination_refusals.add(scope_id)
+            logger.warning("GitHub campaign pagination refused for scope %s: %s", scope_id, refusal)
         now = self.clock()
         latest = self._cache.get(key)
         if latest is not None:
