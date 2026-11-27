@@ -11,6 +11,7 @@ import {
   ContinuationPolicyDialog, ScopeDialog,
   type PolicyDialogState, type ScopeDialogState,
 } from './ScopeSettingsDialogs'
+import { DeliveryPolicyDialog } from './DeliveryPolicyDialog'
 import { RequiredChecksDialog } from './RequiredChecksDialog'
 import { ScopeLimitsDialog } from './ScopeLimitsDialog'
 import { authStatus } from './scopeAuthStatus'
@@ -60,6 +61,7 @@ export function RepositorySettings({ scope, autonomyEnabled, refresh, onRemoved 
   const [policyDialog, setPolicyDialog] = useState<PolicyDialogState>(null)
   const [limitsOpen, setLimitsOpen] = useState(false)
   const [checksOpen, setChecksOpen] = useState(false)
+  const [deliveryOpen, setDeliveryOpen] = useState(false)
   const [scopeToRemove, setScopeToRemove] = useState<TeamGithubScope | null>(null)
   const [removalPending, setRemovalPending] = useState(false)
   const trigger = useRef<HTMLButtonElement | null>(null)
@@ -135,6 +137,21 @@ export function RepositorySettings({ scope, autonomyEnabled, refresh, onRemoved 
         {scope.delivery_policy_revision !== undefined && <Row label="Policy revision">{scope.delivery_policy_revision}</Row>}
       </Section>
       <Section
+        title="Delivery policy"
+        editLabel={`Edit delivery policy for ${scope.repo_owner}/${scope.repo_name}`}
+        onEdit={(element) => { trigger.current = element; setDeliveryOpen(true) }}
+      >
+        {!scope.delivery_policy ? <Row label="Choices">Not available from this server</Row> : (
+          <>
+            <Row label="Broad checks">{scope.delivery_policy.broad_checks}</Row>
+            <Row label="Accepted base update">{scope.delivery_policy.accepted_base_update.replace('_', ' ')}</Row>
+            <Row label="Owner contact">{scope.delivery_policy.owner_contact}</Row>
+            <Row label="Caller inventory">{scope.delivery_policy.caller_inventory_required ? 'required' : 'not required'}</Row>
+            <Row label="Regression proof">{scope.delivery_policy.regression_proof_required ? 'required' : 'not required'}</Row>
+          </>
+        )}
+      </Section>
+      <Section
         title="Recovery"
         editLabel={`Edit recovery policy for ${scope.repo_owner}/${scope.repo_name}`}
         onEdit={(element) => { trigger.current = element; setPolicyDialog({ scope }) }}
@@ -184,6 +201,13 @@ export function RepositorySettings({ scope, autonomyEnabled, refresh, onRemoved 
         scope={scope}
         open={checksOpen}
         onOpenChange={setChecksOpen}
+        refresh={refresh}
+        onReturnFocus={() => trigger.current?.focus()}
+      />
+      <DeliveryPolicyDialog
+        scope={scope}
+        open={deliveryOpen}
+        onOpenChange={setDeliveryOpen}
         refresh={refresh}
         onReturnFocus={() => trigger.current?.focus()}
       />
