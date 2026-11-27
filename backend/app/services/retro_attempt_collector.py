@@ -32,9 +32,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from sqlalchemy import select
+from sqlalchemy.orm import aliased
 
 from app.models.database import (
     FactoryAuditEvent,
+    FactoryContextKey,
     GithubApprovalRequest,
     GithubAttemptScopeRevision,
     GithubCheckRunHistory,
@@ -80,6 +82,10 @@ class CollectedAttempt:
 class TeamAttempts:
     attempts: list[CollectedAttempt] = field(default_factory=list)
     unattributed: list[Unattributed] = field(default_factory=list)
+    # #1419: each collected item's (repository, issue), read in the same query as the items themselves
+    item_identity: dict[int, tuple[str, int]] = field(default_factory=dict)
+    # items whose lifetime changed while they were read (V1 review 121): dropped, never another lifetime's evidence
+    unstable_items: set[int] = field(default_factory=set)
 
 
 def _naive(value: datetime | None) -> datetime | None:
@@ -127,16 +133,56 @@ def _end_of(start: FactoryAuditEvent, family: str, ends: dict[str, datetime]) ->
     return ends.get(op.replace(f"{family}_wait_started", f"{family}_wait_ended", 1)) if op else None
 
 
-async def collect_team_attempts(db, preset_id: int, *, campaign_start: datetime, as_of: datetime) -> TeamAttempts:
-    """Every recorded attempt of the team's items, with its window and intervals, and what could not be attributed."""
+async def collect_team_attempts(db, preset_id: int, *, campaign_start: datetime, as_of: datetime,
+                                team_context_key: str | None = None) -> TeamAttempts:
+    """Every recorded attempt of the team's items, with its window and intervals, and what could not be attributed.
+
+    Team-wide waits are read from ``team_context_key``'s lifetime, the current team's by default: a campaign passes
+    its own, so a replacement team reusing the preset id never adds its waits to a retired campaign (#1419)."""
     campaign_start, as_of = _naive(campaign_start), _naive(as_of)
     out, period = TeamAttempts(), (campaign_start, as_of)
-    items = (await db.scalars(select(GithubWorkItem).join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
-                              .where(TeamGithubScope.preset_id == preset_id).order_by(GithubWorkItem.id))).all()
+    item_keys = aliased(FactoryContextKey)  # each item's lifetime key, bound in the same read as its identity
+    query = (select(GithubWorkItem, TeamGithubScope.repo_owner, TeamGithubScope.repo_name, item_keys.context_key)
+             .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
+             .outerjoin(item_keys, (item_keys.key_kind == "item") & (item_keys.numeric_id == GithubWorkItem.id)
+                        & item_keys.retired_at.is_(None)))
+    if team_context_key:  # the team lifetime's own scopes, never a replacement team reusing the preset id
+        query = query.join(FactoryContextKey, (FactoryContextKey.key_kind == "team")
+                           & (FactoryContextKey.numeric_id == TeamGithubScope.preset_id)
+                           & (FactoryContextKey.context_key == team_context_key)
+                           & FactoryContextKey.retired_at.is_(None))
+    else:
+        query = query.where(TeamGithubScope.preset_id == preset_id)
+    rows = (await db.execute(query.order_by(GithubWorkItem.id))).all()
+    out.item_identity = {row[0].id: (f"{row[1]}/{row[2]}".lower(), row[0].issue_number) for row in rows}
+    keys = {row[0].id: row[3] for row in rows}
+    seen = {row[0].id: (row[0].scope_id, row[0].issue_number, row[0].created_at) for row in rows}
     every: list[CollectedAttempt] = []  # shown or not: who was open when a wait began (V1 review 434)
-    for item in items:
-        every += await _collect_item(db, item, out, period)
-    team_key = await audit.current_context_key(db, "team", preset_id)
+    for row in rows:
+        every += await _collect_item(db, row[0], out, period, keys[row[0].id])
+
+    async def same_row(item_id: int) -> bool:
+        now = (await db.execute(select(GithubWorkItem.scope_id, GithubWorkItem.issue_number, GithubWorkItem.created_at)
+                                .where(GithubWorkItem.id == item_id))).first()
+        return now is not None and tuple(now) == seen[item_id]
+
+    # Rows read by numeric id carry no lifetime: an item whose key changed meanwhile is dropped entirely. A first key
+    # on the same row is the same lifetime's first event, so it is read under that key and checked again.
+    for row in rows:
+        item_id, key = row[0].id, keys[row[0].id]
+        current = await audit.current_context_key(db, "item", item_id)
+        if current == key:
+            continue
+        if key is None and current is not None and await same_row(item_id):
+            every += await _collect_item(db, row[0], out, period, current)
+            if await audit.current_context_key(db, "item", item_id) == current and await same_row(item_id):
+                continue
+        out.unstable_items.add(item_id)
+    if out.unstable_items:
+        out.attempts = [a for a in out.attempts if a.item_id not in out.unstable_items]
+        out.unattributed = [u for u in out.unattributed if u.item_id not in out.unstable_items]
+        every = [a for a in every if a.item_id not in out.unstable_items]
+    team_key = team_context_key or await audit.current_context_key(db, "team", preset_id)
     events = (await db.scalars(select(FactoryAuditEvent).where(
         FactoryAuditEvent.team_context_key == team_key, FactoryAuditEvent.team_context_key.is_not(None),
         FactoryAuditEvent.event_kind.in_([f"{f}_wait_{s}" for f in TEAM_WAITS for s in ("started", "ended")]))
@@ -157,9 +203,8 @@ async def collect_team_attempts(db, preset_id: int, *, campaign_start: datetime,
     return out
 
 
-async def _collect_item(db, item: GithubWorkItem, out: TeamAttempts, period):
+async def _collect_item(db, item: GithubWorkItem, out: TeamAttempts, period, item_key: str | None = None):
     campaign_start, as_of = period
-    item_key = await audit.current_context_key(db, "item", item.id)
     if item_key is None:
         return []
     events = (await db.scalars(select(FactoryAuditEvent).where(FactoryAuditEvent.item_context_key == item_key)
