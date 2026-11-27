@@ -459,3 +459,15 @@ remain under their existing repository workflows.
 | POST `/api/v1/agent-teams/presets/{preset_id}/work-items/{item_id}/integration-outcome` | Records one idempotent integration outcome (`completed` or `needs_coordination`) for the expected dispatch nonce, work item scope revision and owner slot. `needs_coordination` escalates the item. A replay with different content returns 409 `maintenance_replay_conflict`; a changed context returns 409 `maintenance_context_changed`. |
 
 Responses from the maintenance routes use `Cache-Control: no-store`. An item outside the named team returns 404.
+
+### Activation, workspace, coordination and recovery routes
+
+These routes need the operator token, unless a row says otherwise.
+
+| Route | Behavior |
+| --- | --- |
+| GET `/api/v1/agent-teams/github-scopes/{scope_id}/activation-readiness` | Read only. Returns `status` (`ready` or `blocked`), `observed_at` and `blockers`. The blockers cover the bound Leader, the owner of each slot and the Agent Mail session of each member. It does not check workspaces or GitHub access. |
+| GET `/api/v1/agent-teams/github-scopes/{scope_id}/workspaces/readiness` | Read only. Returns the `workspaces` of the repository scope and the `waiting_items` that wait for one. |
+| POST `/api/v1/agent-teams/github-scopes/{scope_id}/workspaces/{workspace_id}/force-release` | Frees a leased dispatch workspace. The body has `force` (`true`), `expected_leased_at`, a `reason` and an optional `requested_by`. A lease time that is not current returns 409 and names the current state. A workspace that is not leased returns 409 `workspace_not_leased`. The response has the workspace, `released_item_id`, `discarded_paths` and `unpushed_commits`. |
+| PUT `/api/v1/agent-teams/github-scopes/{scope_id}/coordination-policy` | Sets the coordination policy of the repository scope. The body has `expected_version`, `enabled` (default `false`), `issue_numbers` (at most 32 positive numbers, no repeats), `fallback_seconds` (300 to 86400, default 1800) and `max_daily_requests` (1 to 48, default 12). A stale version returns 409 `coordination_policy_changed`. |
+| POST `/api/v1/agent-teams/presets/{preset_id}/work-items/{item_id}/finalize-merged` | Settles an item whose PR merged but that the poll cannot settle. With `dry_run` set to `true`, it reads fresh merge evidence and returns the context digest, and it changes nothing. A real call needs `operation_id`, `expected_context_sha256` and a `reason`. A changed context returns 409 `finalize_merged_context_changed`. The current Leader has the same operation under `/api/v1/agent-teams/github-work-items/{item_id}/leader-recovery/finalize-merged`, with a `/preview` route. |
