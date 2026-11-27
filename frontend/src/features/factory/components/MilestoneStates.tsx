@@ -17,9 +17,17 @@ function Issue({ item }: { item: Pick<DeferredIssue, "issue_number" | "repositor
 }
 
 function Waiting({ item }: { item: WaitingIssue }) {
+  const { repository } = item;
   return (
     <li className={row}>
-      <Issue item={item} />
+      {repository ? (
+        <Issue item={{ issue_number: item.issue_number, repository }} />
+      ) : (
+        <>
+          <span>#{item.issue_number}</span>
+          <span className="text-muted-foreground">repository not recorded</span>
+        </>
+      )}
       <span>
         Waiting: no team for milestone <strong className="font-medium">{item.milestone}</strong>
       </span>
@@ -88,8 +96,11 @@ export function MilestoneStates({ teamId, scopeId }: { teamId?: number; scopeId?
         <div className="space-y-2">
           <h4 className="text-sm font-medium">Waiting for a team</h4>
           <ul className="space-y-2">
-            {waiting.map((item) => (
-              <Waiting key={`${item.repository.github.owner}/${item.repository.github.name}#${item.issue_number}`} item={item} />
+            {waiting.map((item, index) => (
+              <Waiting
+                key={item.repository ? `${item.repository.github.owner}/${item.repository.github.name}#${item.issue_number}` : `unrecorded-${index}`}
+                item={item}
+              />
             ))}
           </ul>
           {data?.waiting_truncated && (

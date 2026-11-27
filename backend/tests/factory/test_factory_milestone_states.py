@@ -1,5 +1,5 @@
 """#1337: items deferred by a milestone move and issues waiting for a team, read-only."""
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -291,23 +291,80 @@ async def test_a_later_item_with_another_number_does_not_hide_the_deferral(facto
     assert [r["issue_number"] for r in (await get_states(factory_client))["deferred"]] == [9811]
 
 
-async def test_waiting_rows_that_cannot_be_shown_are_omitted_and_the_read_succeeds(factory_client, factory_store):
+async def test_a_wait_whose_scope_identity_is_refused_shows_without_a_repository(factory_client, factory_store):
     bad_identity = await idle_scope(factory_store.maker, 0, "bad name!", factory_store.ids)
     good = factory_store.ids.scopes[0]
     await add_wait(factory_store.maker, bad_identity, 9340, "v4.5")
+    await add_wait(factory_store.maker, good, 9342, "v4.6")
+    rows = (await get_states(factory_client))["waiting"]
+    # The row stays in the list. It names no repository, because none can be proven.
+    assert {r["issue_number"]: r["repository"] is None for r in rows} == {9340: True, 9342: False}
+
+
+async def test_waits_that_are_not_waits_are_omitted_and_the_read_succeeds(factory_client, factory_store):
+    good = factory_store.ids.scopes[0]
     await add_wait(factory_store.maker, good, 9341, "")
+    await add_wait(factory_store.maker, good, 9343, "   ")
     await add_wait(factory_store.maker, good, 0, "v4.5")
     await add_wait(factory_store.maker, good, 9342, "v4.6")
     assert [r["issue_number"] for r in (await get_states(factory_client))["waiting"]] == [9342]
 
 
-async def test_an_invalid_waiting_row_does_not_hide_a_valid_one_at_the_page_limit(factory_client, factory_store, monkeypatch):
+async def test_a_row_that_cannot_be_built_does_not_hide_a_valid_one_at_the_page_limit(factory_client, factory_store, monkeypatch):
     monkeypatch.setattr(milestone_state_service, "ROW_LIMIT", 1)
-    bad_identity = await idle_scope(factory_store.maker, 0, "bad name!", factory_store.ids)
-    await add_wait(factory_store.maker, bad_identity, 9350, "v4.5", at=datetime(2026, 11, 26, 11, 0))
-    await add_wait(factory_store.maker, factory_store.ids.scopes[0], 9351, "v4.5")
+    good = factory_store.ids.scopes[0]
+    await add_wait(factory_store.maker, good, 0, "v4.5", at=datetime(2026, 11, 26, 11, 0))
+    await add_wait(factory_store.maker, good, 9351, "v4.5")
     body = await get_states(factory_client)
     assert [r["issue_number"] for r in body["waiting"]] == [9351] and body["waiting_truncated"] is False
+
+
+async def test_an_unlinked_wait_counts_toward_the_cut(factory_client, factory_store, monkeypatch):
+    monkeypatch.setattr(milestone_state_service, "ROW_LIMIT", 1)
+    bad_identity = await idle_scope(factory_store.maker, 0, "bad name!", factory_store.ids)
+    await add_wait(factory_store.maker, bad_identity, 9352, "v4.5", at=datetime(2026, 11, 26, 11, 0))
+    await add_wait(factory_store.maker, factory_store.ids.scopes[0], 9353, "v4.5")
+    body = await get_states(factory_client)
+    assert [(r["issue_number"], r["repository"] is None) for r in body["waiting"]] == [(9352, True)]
+    assert body["waiting_truncated"] is True
+
+
+async def test_after_an_upgrade_a_wait_from_before_a_repository_change_shows_without_a_repository(factory_client, factory_store):
+    """The scope PATCH of the earlier version left waits behind. They carry no repository of their own."""
+    scope = await idle_scope(factory_store.maker, 0, "up-orig", factory_store.ids)
+    await move_scope(factory_client, scope, repo_name="up-new")
+    # The earlier version kept this wait, recorded for "up-orig" before the move. The current PATCH deleted
+    # none, because the wait did not exist yet. A wait seen after the move sits next to it.
+    await add_wait(factory_store.maker, scope, 9501, "v4.5", at=MOMENT)
+    await add_wait(factory_store.maker, scope, 9502, "v4.5", at=datetime.utcnow() + timedelta(minutes=5))
+    rows = {r["issue_number"]: r["repository"] for r in (await get_states(factory_client))["waiting"]}
+    assert rows[9501] is None
+    assert rows[9502]["github"] == {"owner": "fixture", "name": "up-new"}
+
+
+async def test_a_wait_stays_linked_when_the_scope_changed_something_other_than_its_repository(factory_client, factory_store):
+    scope = await idle_scope(factory_store.maker, 0, "stays", factory_store.ids)
+    await add_wait(factory_store.maker, scope, 9511, "v4.5", at=MOMENT)
+    await move_scope(factory_client, scope, dispatch_label="ready-two")
+    rows = (await get_states(factory_client))["waiting"]
+    assert [(r["issue_number"], r["repository"]["github"]) for r in rows] == [(9511, {"owner": "fixture", "name": "stays"})]
+
+
+async def test_a_case_only_change_of_the_repository_is_not_a_repository_change(factory_client, factory_store):
+    scope = await idle_scope(factory_store.maker, 0, "casing", factory_store.ids)
+    await add_wait(factory_store.maker, scope, 9512, "v4.5", at=MOMENT)
+    await move_scope(factory_client, scope, repo_name="CASING")
+    rows = (await get_states(factory_client))["waiting"]
+    assert [(r["issue_number"], r["repository"] is not None) for r in rows] == [(9512, True)]
+
+
+async def test_a_repository_change_of_another_scope_does_not_unlink_the_wait(factory_client, factory_store):
+    other = await idle_scope(factory_store.maker, 0, "other-moves", factory_store.ids)
+    kept = await idle_scope(factory_store.maker, 1, "kept-link", factory_store.ids)
+    await add_wait(factory_store.maker, kept, 9513, "v4.5", at=MOMENT)
+    await move_scope(factory_client, other, repo_name="other-moved")
+    rows = (await get_states(factory_client))["waiting"]
+    assert [(r["issue_number"], r["repository"] is not None) for r in rows] == [(9513, True)]
 
 
 async def test_an_older_item_of_the_same_issue_does_not_hide_the_deferral(factory_client, factory_store):

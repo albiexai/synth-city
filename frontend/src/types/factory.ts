@@ -266,7 +266,8 @@ export type WaitingIssue = {
   issue_number: number;
   milestone: string;
   observed_at: string;
-  repository: WorkRepository;
+  // null: the repository of the wait is not recorded, so the issue has no link (#1372 adds the stamp).
+  repository: WorkRepository | null;
 };
 
 export type DeferredIssue = {

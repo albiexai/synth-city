@@ -454,7 +454,7 @@ The Supervisor line of a team page has an **Edit** button. It opens the supervis
 
 ## Milestone Moves
 
-A team admits the issues that have its backlog milestone. When an issue gets a different milestone, two states can follow. The Teams page (Autonomy tab) and the Work page show both. Each row links to the GitHub issue.
+A team admits the issues that have its backlog milestone. When an issue gets a different milestone, two states can follow. The Teams page (Autonomy tab) and the Work page show both. Each row links to the GitHub issue, except a waiting row whose repository is not recorded (see below).
 
 - **Deferred by a milestone move:** the team ended its work item because the issue now has another milestone. The row shows the new milestone, the team, and when it happened. If the milestone was not recorded, the row says so.
 - **Waiting for a team:** the issue has the ready label, and no team has its milestone. The row shows the milestone. A wait stores no issue title, so the row shows the issue number only.
@@ -462,6 +462,8 @@ A team admits the issues that have its backlog milestone. When an issue gets a d
 A deferral shows only while it is the newest item of its issue in the repository. An issue that another team admits, or that was merged, does not show as deferred. A cleared wait does not show.
 
 A row keeps the repository it was recorded for. A deferral takes it from the GitHub issue URL that its work item stored, and a deferral whose URL does not name its issue is not shown. A wait stores no repository, so changing the repository of a scope deletes the waits of that scope. The next poll records the waits of the new repository. A poll that began before such a change writes nothing for that scope.
+
+A wait recorded before a repository change that an earlier version left in the database has no provable repository. Every wait stays in the list. A waiting row whose repository cannot be proven shows the issue number as plain text with the words "repository not recorded". It has no link and names no repository. A wait is unproven when its GitHub update time is not newer than the last applied repository change of its scope, or when the identity of the scope is not valid. The scope-change audit event gives the time of that change. A change of case only is not a change of repository. A wait for an issue that has not changed on GitHub since a repository change also shows without a link, until a new GitHub update or the repository stamp (#1372) records it. A row with a proven repository keeps its link.
 
 The Teams page shows the rows of the selected team. The Work page follows the team and repository filters of its URL. The view is read-only. It shows at most 100 rows of each kind and says when a list is cut. It shows nothing when both lists are empty.
 

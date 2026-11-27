@@ -6,11 +6,14 @@ GitHub or sends Mail.
 
 A row keeps the repository it was recorded for. A deferral takes it from the GitHub issue URL that its
 item stored at admission. A wait has no stored repository, so the scope PATCH deletes the waits of a
-scope when its repository changes. A row whose repository cannot be proven is not shown.
+scope when its repository changes. A wait recorded before a repository change that the PATCH of an
+earlier version left behind has no provable repository: its row stays in the list with no repository.
+The repository stamp that would prove it is #1372.
 """
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 
 from pydantic import ValidationError
 from sqlalchemy import func, select
@@ -56,6 +59,35 @@ def _recorded_repository(scope_id: int, issue_url: str, number: int) -> wire.Wor
                                display_name=f"{match.group(1)}/{match.group(2)}")
 
 
+def _naive_utc(moment: datetime) -> datetime:
+    return moment.astimezone(timezone.utc).replace(tzinfo=None) if moment.tzinfo else moment
+
+
+async def _repository_moves(db: AsyncSession, filters: wire.FactoryFilters) -> dict[int, datetime]:
+    """When each selected scope last changed its repository, from the applied scope-change events.
+
+    A change of case only is not a change of repository. The scope PATCH records the event in the
+    transaction that changes the scope, and it has done so since the policy ledger began.
+    """
+    events = (await db.execute(_selected_scopes(
+        select(FactoryAuditEvent.scope_id, FactoryAuditEvent.occurred_at,
+               FactoryAuditEvent.before_values, FactoryAuditEvent.after_values)
+        .join(TeamGithubScope, TeamGithubScope.id == FactoryAuditEvent.scope_id)
+        .where(FactoryAuditEvent.event_kind == "policy_change",
+               FactoryAuditEvent.source == "agent_teams.update_github_scope",
+               FactoryAuditEvent.action_outcome == "applied"), filters,
+    ))).all()
+    moves: dict[int, datetime] = {}
+    for scope_id, occurred_at, before, after in events:
+        before, after = before or {}, after or {}
+        same = all(str(before.get(key) or "").lower() == str(after.get(key) or "").lower()
+                   for key in ("repo_owner", "repo_name"))
+        if not same:
+            moved = _naive_utc(occurred_at)
+            moves[scope_id] = max(moves.get(scope_id, moved), moved)
+    return moves
+
+
 async def _page(db: AsyncSession, query, build):
     """The first ROW_LIMIT rows that `build` accepts, and whether one more exists.
 
@@ -96,13 +128,24 @@ async def _waiting(db: AsyncSession, filters: wire.FactoryFilters):
         .where(GithubMilestoneWait.milestone_title.is_not(None)), filters,
     ).subquery()
 
+    moves = await _repository_moves(db, filters)
+
     def build(row):
         if not row.milestone.strip():
             return None
+        # A wait seen before its scope changed repository may belong to the old repository. Nothing stored
+        # says which, so such a row, and a row whose scope identity the factory refuses, names none.
+        moved = moves.get(row.id)
+        repository = None
+        if moved is None or _naive_utc(row.observed_at) > moved:
+            try:
+                repository = _repository(row)
+            except (FactoryReadError, ValidationError):
+                repository = None
         try:
-            return wire.WaitingIssue(repository=_repository(row), issue_number=row.issue_number,
+            return wire.WaitingIssue(repository=repository, issue_number=row.issue_number,
                                      milestone=row.milestone, observed_at=row.observed_at)
-        except (FactoryReadError, ValidationError):
+        except ValidationError:
             return None
 
     return await _page(db, select(ranked).where(ranked.c.rank == 1)

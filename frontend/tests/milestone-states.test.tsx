@@ -87,6 +87,36 @@ describe('the list', () => {
       .toHaveAttribute('href', 'https://github.com/albiexai/synth-city/issues/1400')
   })
 
+  it('shows a waiting issue whose repository is not recorded with its number and no link', async () => {
+    serve(body({ waiting: [waiting({ repository: null })] }))
+    show()
+    const section = await screen.findByRole('region', { name: 'Milestone moves' })
+    const item = within(section).getByRole('listitem')
+    expect(within(item).getByText('#1400')).toBeInTheDocument()
+    expect(within(item).getByText('repository not recorded')).toBeInTheDocument()
+    expect(within(item).queryByRole('link')).not.toBeInTheDocument()
+    expect(item).not.toHaveTextContent('albiex')
+    expect(within(item).getByText('v4.5')).toBeInTheDocument()
+  })
+
+  it('keeps the link of a waiting issue with a proven repository next to an unlinked one', async () => {
+    serve(body({ waiting: [waiting({ repository: null, issue_number: 1500 }), waiting({ issue_number: 1501 })] }))
+    show()
+    const section = await screen.findByRole('region', { name: 'Milestone moves' })
+    const items = within(section).getAllByRole('listitem')
+    expect(items).toHaveLength(2)
+    expect(within(items[0]).queryByRole('link')).not.toBeInTheDocument()
+    expect(within(items[1]).getByRole('link', { name: 'albiexai/synth-city#1501' }))
+      .toHaveAttribute('href', 'https://github.com/albiexai/synth-city/issues/1501')
+  })
+
+  it('shows two unlinked waiting issues with the same number', async () => {
+    serve(body({ waiting: [waiting({ repository: null }), waiting({ repository: null })] }))
+    show()
+    const section = await screen.findByRole('region', { name: 'Milestone moves' })
+    expect(within(section).getAllByRole('listitem')).toHaveLength(2)
+  })
+
   it('shows both states together', async () => {
     serve(body({ deferred: [deferred()], waiting: [waiting()] }))
     show()
