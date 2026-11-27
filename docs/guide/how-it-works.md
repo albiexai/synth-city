@@ -87,6 +87,7 @@ Why a token, when it is your own machine? The agents can call the Synth City API
 
 ## Where to go next
 
+- [Configure the factory](/guide/configure-the-factory): what to set, and in which order, after the installation.
 - [Quick Start](/guide/quick-start): start the product and look at existing work.
 - [Teams](/features/agent-teams): rosters, Leaders, charters, Supervisor binding.
 - [Repositories](/features/repositories): repository scopes and guided setup.

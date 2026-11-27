@@ -35,7 +35,7 @@ Use [Harnesses](/features/harnesses) for guarded native pages. Local projects sc
 
 ## Connect a backlog with the current flow
 
-Open Repositories and select **Set up a repository** for [guided configuration](/features/repositories#guided-configuration). It checks access and labels without changes, then saves an inactive team or uses an existing team, with a disabled scope. Launch and activation are separate, reviewed steps. You can also add an existing primary checkout in Teams > Autonomy.
+Open Repositories and select **Set up a repository** for [guided configuration](/features/repositories#guided-configuration). It checks access and labels without changes, then saves an inactive team or uses an existing team, with a disabled scope. Launch and activation are separate, reviewed steps. You can also add an existing primary checkout in Teams > Autonomy. [Configure the factory](/guide/configure-the-factory) lists every setting, in the order to set it.
 
 The Leader is the team's explicit `leader_slot_id`. Guided setup names it for a new team; for an existing team, use **Set Leader** in the roster while automation is off. Slot order and Role text do not select it. Configure GitHub polling access on the host and dispatch/design/area labels on GitHub, as described in [Autonomous GitHub dispatch](/autonomy). Choose merge policy and finite budgets; review the enable confirmation only when ready.
 

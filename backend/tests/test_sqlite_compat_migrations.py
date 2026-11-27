@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
@@ -16,9 +16,86 @@ from app.database import (
     _run_sqlite_compat_migrations,
     _sqlite_agent_team_slots_has_unique_preset_repo_index,
     _sqlite_columns,
+    _sqlite_migrate_wait_repositories,
     _sqlite_rebuild_agent_team_slots,
 )
-from app.models.database import AgentTeamPreset, GithubWorkItem, TeamGithubScope
+from app.models.database import AgentTeamPreset, FactoryAuditEvent, GithubMilestoneWait, GithubWorkItem, TeamGithubScope
+
+
+@pytest.mark.asyncio
+async def test_milestone_wait_upgrade_stamps_only_provable_repositories():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    observed = datetime(2026, 11, 26, 9)
+    try:
+        async with engine.connect() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            await conn.commit()
+            async with AsyncSession(bind=conn, expire_on_commit=False) as session:
+                team = AgentTeamPreset(name="Existing waits")
+                session.add(team)
+                await session.flush()
+                scopes = [
+                    TeamGithubScope(preset_id=team.id, repo_owner=owner, repo_name=name, repo_path=f"/tmp/{index}")
+                    for index, (owner, name) in enumerate([
+                        ("first", "Repo"), ("second", "repo"), ("first", "moved"),
+                        ("first", "secure"), ("first", "Secure-Other"), ("first", "bad name"),
+                    ])
+                ]
+                session.add_all(scopes)
+                await session.flush()
+                for scope, before, after in [
+                    (scopes[0], "repo", "Repo"),
+                    (scopes[2], "original", "moved"),
+                    (scopes[3], "[redacted]", "[redacted]"),
+                    (scopes[4], "secure-[redacted]", "Secure-[redacted]"),
+                ]:
+                    session.add(FactoryAuditEvent(
+                        scope_id=scope.id, event_kind="policy_change", source="agent_teams.update_github_scope",
+                        actor_kind="operator", occurred_at=observed, action_outcome="applied",
+                        context_snapshot={"scope_changed_fields": ["repo_name"]},
+                        before_values={"repo_name": before}, after_values={"repo_name": after},
+                    ))
+                session.add_all(GithubMilestoneWait(
+                    scope_id=scope.id, issue_number=7, milestone_title="v4.5", github_updated_at=observed,
+                ) for scope in scopes)
+                session.add(GithubMilestoneWait(scope_id=scopes[1].id, issue_number=8, github_updated_at=observed))
+                await session.commit()
+            if "repository" in await _sqlite_columns(conn, "github_milestone_waits"):
+                await conn.execute(text("ALTER TABLE github_milestone_waits DROP COLUMN repository"))
+            await conn.commit()
+
+            def interrupt_backfill(_conn, _cursor, statement, _params, _context, _many):
+                if statement.startswith("UPDATE github_milestone_waits SET repository"):
+                    raise RuntimeError("wait backfill interrupted")
+
+            event.listen(conn.sync_connection, "before_cursor_execute", interrupt_backfill)
+            try:
+                with pytest.raises(RuntimeError, match="wait backfill interrupted"):
+                    await _sqlite_migrate_wait_repositories(conn)
+            finally:
+                event.remove(conn.sync_connection, "before_cursor_execute", interrupt_backfill)
+            await conn.rollback()
+            assert "repository" not in await _sqlite_columns(conn, "github_milestone_waits")
+
+            await _run_sqlite_compat_migrations(conn)
+            read = text("SELECT scope_id, issue_number, milestone_title, github_updated_at, repository "
+                        "FROM github_milestone_waits ORDER BY scope_id, issue_number")
+            after = (await conn.execute(read)).all()
+            assert [(row.scope_id, row.issue_number, row.milestone_title, row.repository) for row in after] == [
+                (scopes[0].id, 7, "v4.5", "first/Repo"),
+                (scopes[1].id, 7, "v4.5", "second/repo"),
+                (scopes[1].id, 8, None, "second/repo"),
+                *((scope.id, 7, "v4.5", None) for scope in scopes[2:]),
+            ]
+            assert {datetime.fromisoformat(row.github_updated_at) for row in after} == {observed}
+            # A later scope change cannot make an unresolved legacy wait provable.
+            await conn.execute(text("UPDATE team_github_scopes SET repo_name = 'valid' WHERE id=:scope_id"),
+                               {"scope_id": scopes[-1].id})
+            await conn.commit()
+            await _run_sqlite_compat_migrations(conn)
+            assert (await conn.execute(read)).all() == after
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

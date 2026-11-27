@@ -277,7 +277,7 @@ class WorkDetailResponse(FactoryEnvelope):
 class WaitingIssue(FactoryModel):
     """A ready issue whose milestone has no team. The wait stores no issue title.
 
-    `repository` is None when the repository of the wait cannot be proven from stored data (#1372 adds it).
+    `repository` is None when the wait has no proven repository stamp.
     """
 
     repository: WorkRepository | None
