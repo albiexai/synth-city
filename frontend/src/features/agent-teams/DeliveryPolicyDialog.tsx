@@ -6,7 +6,7 @@ import { Label } from '@/components/ui/label'
 import { MODAL_SIZES } from '@/lib/constants'
 import type { DeliveryPolicy, TeamGithubScope } from '@/types/agentTeams'
 import { DeliveryPolicyHistory } from './DeliveryPolicyHistory'
-import { FIELD_LABELS, MAX_REASON, useDeliveryPolicy } from './useDeliveryPolicy'
+import { type DeliveryRevisions, FIELD_LABELS, MAX_REASON, useDeliveryPolicy } from './useDeliveryPolicy'
 
 type Timer = 'owner_idle_seconds' | 'owner_nudge_grace_seconds' | 'owner_observation_wait_seconds' | 'owner_observation_resume_seconds' | 'checkpoint_delay_report_seconds'
 /**
@@ -14,19 +14,31 @@ type Timer = 'owner_idle_seconds' | 'owner_nudge_grace_seconds' | 'owner_observa
  * so tests pin these numbers. A field that may be unset is sent as null when its box is empty.
  */
 const TIMERS: { key: Timer; min: number; max: number; nullable: boolean; help: string }[] = [
-  { key: 'owner_idle_seconds', min: 60, max: 86400, nullable: true, help: 'How long an owner can be quiet before the Leader asks for a report. Empty: the team or server default.' },
-  { key: 'owner_nudge_grace_seconds', min: 30, max: 3600, nullable: true, help: 'How long an owner has to answer a nudge. Empty: the team or server default.' },
-  { key: 'owner_observation_wait_seconds', min: 30, max: 1800, nullable: true, help: 'A short wait for native evidence before a nudge. Needs native owner contact. Empty: no wait.' },
-  { key: 'owner_observation_resume_seconds', min: 60, max: 3600, nullable: false, help: 'How long an observation pause lasts before the operator must resume it.' },
-  { key: 'checkpoint_delay_report_seconds', min: 60, max: 86400, nullable: true, help: 'How long a checkpoint can wait before the delay is reported. Empty: builders get no instruction to report a delay.' },
+  { key: 'owner_idle_seconds', min: 60, max: 86400, nullable: true, help: 'How long an owner can show no activity before the factory nudges it. Empty: the team or server default.' },
+  { key: 'owner_nudge_grace_seconds', min: 30, max: 3600, nullable: true, help: 'The grace period after a nudge. Empty: the team or server default.' },
+  { key: 'owner_observation_wait_seconds', min: 30, max: 1800, nullable: true, help: 'After a nudge, how long to wait when native evidence is unknown, before the item pauses for the operator. Needs native owner contact. Empty: no wait.' },
+  { key: 'owner_observation_resume_seconds', min: 60, max: 3600, nullable: false, help: 'How long a paused item waits for the operator. An unchanged pause can be resumed before this deadline. At or after it, the resume is refused.' },
+  { key: 'checkpoint_delay_report_seconds', min: 60, max: 86400, nullable: true, help: 'Builders are told to report a checkpoint publication delay after this time. Empty: builders get no such instruction.' },
 ]
 const SWITCHES: { key: 'caller_inventory_required' | 'regression_proof_required'; help: string }[] = [
-  { key: 'caller_inventory_required', help: 'A change must list the callers of what it changes.' },
-  { key: 'regression_proof_required', help: 'A fix must show a test that failed before the fix.' },
+  { key: 'caller_inventory_required', help: 'Builders record and review the caller inventory before they edit shared consumers.' },
+  { key: 'regression_proof_required', help: 'For each regression, a builder shows a failing assertion on the known defective source and a pass on the candidate.' },
 ]
-const BROAD = [['local', 'Local: the owner runs the broad checks.'], ['hosted', 'Hosted: the required checks run on hosted CI.']] as const
-const BASE_UPDATE = [['disabled', 'Disabled: never update an accepted head.'], ['fast_forward', 'Fast forward: update only when the history stays linear.'], ['merge', 'Merge: merge the base into the head.']] as const
-const CONTACT = [['reports', 'Reports: the owner sends progress reports.'], ['native', 'Native: the factory reads the owner session directly.']] as const
+// Each option has a short label for the box and an explanation that shows under the field, because a box cuts a long text.
+type Option = readonly [value: string, label: string, help: string]
+const BROAD: readonly Option[] = [
+  ['local', 'Local', 'Builders run the agreed broad checks once before they publish a batch.'],
+  ['hosted', 'Hosted', 'Builders run focused checks. The required hosted jobs give the final evidence.'],
+]
+const BASE_UPDATE: readonly Option[] = [
+  ['disabled', 'Disabled', 'The operator integration-update command is refused. Use GitHub Update branch by hand.'],
+  ['fast_forward', 'Fast forward', 'The command moves the workspace to the accepted base only when the history stays linear.'],
+  ['merge', 'Merge', 'The command merges the accepted base into the workspace.'],
+]
+const CONTACT: readonly Option[] = [
+  ['reports', 'Reports', 'The owner sends progress reports before the idle time ends.'],
+  ['native', 'Native', 'Fresh activity in the owner session can renew owner contact.'],
+]
 
 type Values = { broad_checks: string; accepted_base_update: string; owner_contact: string; caller_inventory_required: boolean; regression_proof_required: boolean } & Record<Timer, string>
 const toValues = (policy: DeliveryPolicy): Values => ({
@@ -55,13 +67,14 @@ function validate(values: Values, checkCount: number) {
   return { timers, parsed, cross, valid: Object.keys(timers).length === 0 && cross.length === 0 }
 }
 
-function Choice({ id, name, value, options, disabled, onChange }: { id: string; name: string; value: string; options: readonly (readonly [string, string])[]; disabled: boolean; onChange: (value: string) => void }) {
+function Choice({ id, name, value, options, disabled, onChange }: { id: string; name: string; value: string; options: readonly Option[]; disabled: boolean; onChange: (value: string) => void }) {
   return (
     <div className="grid gap-1">
       <Label htmlFor={id}>{name}</Label>
-      <select id={id} className="h-9 w-full min-w-0 rounded-md border bg-background px-2 text-sm" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)}>
+      <select id={id} aria-describedby={`${id}-help`} className="h-9 w-full min-w-0 rounded-md border bg-background px-2 text-sm" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)}>
         {options.map(([option, text]) => <option key={option} value={option}>{text}</option>)}
       </select>
+      <p id={`${id}-help`} className="text-xs text-muted-foreground">{options.find(([option]) => option === value)?.[2]}</p>
     </div>
   )
 }
@@ -71,15 +84,16 @@ function Choice({ id, name, value, options, disabled, onChange }: { id: string; 
  * policy on a save, so the save sends the current policy with only these fields changed. The required checks keep
  * their own editor. A stale revision is refused.
  */
-export function DeliveryPolicyDialog({ scope, open, onOpenChange, refresh, onReturnFocus }: {
+export function DeliveryPolicyDialog({ scope, revisions, open, onOpenChange, refresh, onReturnFocus }: {
   scope: TeamGithubScope
+  revisions: DeliveryRevisions
   open: boolean
   onOpenChange: (open: boolean) => void
   refresh: () => Promise<void>
   onReturnFocus: () => void
 }) {
   const { policy, revision, locked, obsolete, isStale, reason, setReason, reasonTooLong, events, historyState, error, setError, saving, save, readAgain, tokenDialog } =
-    useDeliveryPolicy({ scope, open, refresh, tokenReason: 'to read or change the delivery policy' })
+    useDeliveryPolicy({ scope, open, refresh, tokenReason: 'to read or change the delivery policy', revisions })
   // Fields that the user has not touched follow the server, so a background refresh never erases a draft.
   const [draft, setDraft] = useState<{ base: number; values: Values } | null>(null)
   useEffect(() => {

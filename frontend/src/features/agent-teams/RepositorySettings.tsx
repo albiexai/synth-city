@@ -13,6 +13,7 @@ import {
 } from './ScopeSettingsDialogs'
 import { DeliveryPolicyDialog } from './DeliveryPolicyDialog'
 import { RequiredChecksDialog } from './RequiredChecksDialog'
+import { useDeliveryRevisions } from './useDeliveryPolicy'
 import { ScopeLimitsDialog } from './ScopeLimitsDialog'
 import { authStatus } from './scopeAuthStatus'
 import { useScopeSettings } from './useScopeSettings'
@@ -62,6 +63,7 @@ export function RepositorySettings({ scope, autonomyEnabled, refresh, onRemoved 
   const [limitsOpen, setLimitsOpen] = useState(false)
   const [checksOpen, setChecksOpen] = useState(false)
   const [deliveryOpen, setDeliveryOpen] = useState(false)
+  const revisions = useDeliveryRevisions(scope.id) // one view of the policy revision for both delivery policy dialogs
   const [scopeToRemove, setScopeToRemove] = useState<TeamGithubScope | null>(null)
   const [removalPending, setRemovalPending] = useState(false)
   const trigger = useRef<HTMLButtonElement | null>(null)
@@ -199,6 +201,7 @@ export function RepositorySettings({ scope, autonomyEnabled, refresh, onRemoved 
       />
       <RequiredChecksDialog
         scope={scope}
+        revisions={revisions}
         open={checksOpen}
         onOpenChange={setChecksOpen}
         refresh={refresh}
@@ -206,6 +209,7 @@ export function RepositorySettings({ scope, autonomyEnabled, refresh, onRemoved 
       />
       <DeliveryPolicyDialog
         scope={scope}
+        revisions={revisions}
         open={deliveryOpen}
         onOpenChange={setDeliveryOpen}
         refresh={refresh}

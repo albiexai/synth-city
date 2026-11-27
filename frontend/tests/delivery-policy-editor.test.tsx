@@ -47,6 +47,12 @@ async function openEditor(over: Partial<TeamGithubScope> = {}, refresh = vi.fn()
   await flush()
   return { user, refresh, rerender: (next: Partial<TeamGithubScope>) => rendered.rerender(view(next, refresh)) }
 }
+const openOther = async (user: ReturnType<typeof userEvent.setup>, button: string) => {
+  await user.keyboard('{Escape}')
+  await user.click(screen.getByRole('button', { name: `${button} for example/project` }))
+  await screen.findByText('History')
+  await flush()
+}
 const field = (label: RegExp | string) => screen.getByLabelText(label)
 const timer = (label: string) => screen.getByLabelText(new RegExp(`^${label} \\(seconds`))
 const save = () => screen.getByRole('button', { name: 'Save' })
@@ -323,5 +329,107 @@ describe('the history', () => {
     expect(screen.getByText('The history is not available.')).toBeInTheDocument()
     expect(screen.queryByText('No changes recorded yet.')).not.toBeInTheDocument()
     expect(field('Broad checks')).toBeEnabled()
+  })
+})
+
+describe('both delivery policy editors share what the repository is known to hold (V1 review 436)', () => {
+  it('uses a revision and policy that the delivery policy dialog saved, in the required checks dialog, before the read catches up', async () => {
+    vi.mocked(updateTeamGithubDeliveryPolicy).mockResolvedValueOnce({ scope_id: 2, revision: 5, policy: policy({ caller_inventory_required: true }) })
+    const { user } = await openEditor() // the read stays at revision 4
+    await user.click(field('Caller inventory required'))
+    await type(user, field('Reason'), 'Inventory')
+    await user.click(save())
+    await screen.findByText('Delivery policy saved').catch(() => undefined)
+    await openOther(user, 'Edit required checks')
+    await user.click(screen.getByRole('button', { name: 'Remove check 2' }))
+    await type(user, field('Reason'), 'Drop lint')
+    await user.click(save())
+    expect(vi.mocked(updateTeamGithubDeliveryPolicy).mock.calls[1][1]).toMatchObject({ expected_revision: 5, policy: { caller_inventory_required: true, required_checks: [check('Unit tests')] } })
+  })
+
+  it('uses a revision and policy that the required checks dialog saved, in the delivery policy dialog', async () => {
+    vi.mocked(updateTeamGithubDeliveryPolicy).mockResolvedValueOnce({ scope_id: 2, revision: 5, policy: policy({ required_checks: [check('Unit tests')] }) })
+    const { user } = await openEditor()
+    await openOther(user, 'Edit required checks')
+    await user.click(screen.getByRole('button', { name: 'Remove check 2' }))
+    await type(user, field('Reason'), 'Drop lint')
+    await user.click(save())
+    await flush()
+    await openOther(user, 'Edit delivery policy')
+    await user.click(field('Regression proof required'))
+    await type(user, field('Reason'), 'Proof')
+    await user.click(save())
+    expect(vi.mocked(updateTeamGithubDeliveryPolicy).mock.calls[1][1]).toMatchObject({ expected_revision: 5, policy: { regression_proof_required: true, required_checks: [check('Unit tests')] } })
+  })
+
+  it('keeps the required checks dialog read-only after the delivery policy dialog got a 409 on the same revision', async () => {
+    vi.mocked(updateTeamGithubDeliveryPolicy).mockRejectedValueOnce(new ApiHttpError('delivery_policy_revision_changed', 409))
+    const { user } = await openEditor()
+    await user.click(field('Caller inventory required'))
+    await type(user, field('Reason'), 'Conflict')
+    await user.click(save())
+    await screen.findByText(/revision 4 is out of date/)
+    await openOther(user, 'Edit required checks')
+    expect(screen.getByText(/revision 4 is out of date/)).toBeInTheDocument()
+    expect(screen.getByLabelText('Check 1 name')).toBeDisabled()
+  })
+
+  it('keeps the delivery policy dialog read-only after the required checks dialog got a 409 on the same revision', async () => {
+    vi.mocked(updateTeamGithubDeliveryPolicy).mockRejectedValueOnce(new ApiHttpError('delivery_policy_revision_changed', 409))
+    const { user } = await openEditor()
+    await openOther(user, 'Edit required checks')
+    await user.click(screen.getByRole('button', { name: 'Remove check 2' }))
+    await type(user, field('Reason'), 'Conflict')
+    await user.click(save())
+    await screen.findByText(/revision 4 is out of date/)
+    await openOther(user, 'Edit delivery policy')
+    expect(screen.getByText(/revision 4 is out of date/)).toBeInTheDocument()
+    expect(field('Broad checks')).toBeDisabled()
+  })
+
+  it('forgets a rejected revision when the settings show another repository', async () => {
+    vi.mocked(updateTeamGithubDeliveryPolicy).mockRejectedValueOnce(new ApiHttpError('delivery_policy_revision_changed', 409))
+    const { user, rerender } = await openEditor()
+    await user.click(field('Caller inventory required'))
+    await type(user, field('Reason'), 'Conflict')
+    await user.click(save())
+    await screen.findByText(/revision 4 is out of date/)
+    rerender({ id: 3 })
+    await openOther(user, 'Edit required checks')
+    expect(screen.getByLabelText('Check 1 name')).toBeEnabled()
+    expect(screen.queryByText(/is out of date/)).not.toBeInTheDocument()
+  })
+
+  it('keeps a draft in each dialog separate', async () => {
+    const { user } = await openEditor()
+    await user.click(field('Caller inventory required'))
+    await openOther(user, 'Edit required checks')
+    expect(save()).toBeDisabled() // no draft in this dialog, even though the other one has one
+  })
+})
+
+describe('the one-line explanations match what the service does', () => {
+  it('says that the observation wait starts after a nudge and the pause has a resume deadline', async () => {
+    await openEditor()
+    expect(screen.getByText(/After a nudge, how long to wait when native evidence is unknown, before the item pauses for the operator/)).toBeInTheDocument()
+    expect(screen.getByText(/An unchanged pause can be resumed before this deadline\. At or after it, the resume is refused\./)).toBeInTheDocument()
+  })
+
+  it('says what the selected accepted base update does, and that GitHub Update branch stays possible when it is disabled', async () => {
+    const { user } = await openEditor() // the policy holds merge
+    expect(screen.getByText('The command merges the accepted base into the workspace.')).toBeInTheDocument()
+    await user.selectOptions(field('Accepted base update'), 'disabled')
+    expect(screen.getByText('The operator integration-update command is refused. Use GitHub Update branch by hand.')).toBeInTheDocument()
+    await user.selectOptions(field('Accepted base update'), 'fast_forward')
+    expect(screen.getByText('The command moves the workspace to the accepted base only when the history stays linear.')).toBeInTheDocument()
+  })
+
+  it('keeps the option labels short and explains the selected broad checks and owner contact choice', async () => {
+    const { user } = await openEditor()
+    expect(within(field('Accepted base update')).getAllByRole('option').map((option) => option.textContent)).toEqual(['Disabled', 'Fast forward', 'Merge'])
+    expect(screen.getByText('Builders run focused checks. The required hosted jobs give the final evidence.')).toBeInTheDocument()
+    expect(screen.getByText('Fresh activity in the owner session can renew owner contact.')).toBeInTheDocument()
+    await user.selectOptions(field('Owner contact'), 'reports')
+    expect(screen.getByText('The owner sends progress reports before the idle time ends.')).toBeInTheDocument()
   })
 })

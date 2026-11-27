@@ -7,7 +7,7 @@ import { Label } from '@/components/ui/label'
 import { MODAL_SIZES } from '@/lib/constants'
 import type { DeliveryRequiredCheck, TeamGithubScope } from '@/types/agentTeams'
 import { DeliveryPolicyHistory } from './DeliveryPolicyHistory'
-import { charCount, MAX_REASON, useDeliveryPolicy } from './useDeliveryPolicy'
+import { charCount, type DeliveryRevisions, MAX_REASON, useDeliveryPolicy } from './useDeliveryPolicy'
 
 const DEFAULT_APP = 'github-actions'
 const MAX_CHECKS = 32 // the server's limits (FactoryDeliveryPolicy, DeliveryRequiredCheck)
@@ -46,15 +46,16 @@ function validate(rows: Row[], hosted: boolean) {
  * Edit the required checks of one repository (#1345, part B1 of #1297). The server replaces the whole delivery
  * policy on a save, so the save sends the current policy with only the list changed. A stale revision is refused.
  */
-export function RequiredChecksDialog({ scope, open, onOpenChange, refresh, onReturnFocus }: {
+export function RequiredChecksDialog({ scope, revisions, open, onOpenChange, refresh, onReturnFocus }: {
   scope: TeamGithubScope
+  revisions: DeliveryRevisions
   open: boolean
   onOpenChange: (open: boolean) => void
   refresh: () => Promise<void>
   onReturnFocus: () => void
 }) {
   const { policy, revision, locked, obsolete, isStale, reason, setReason, reasonTooLong, events, historyState, error, setError, saving, save, readAgain, tokenDialog } =
-    useDeliveryPolicy({ scope, open, refresh, tokenReason: 'to read or change the required checks' })
+    useDeliveryPolicy({ scope, open, refresh, tokenReason: 'to read or change the required checks', revisions })
   // A list the user has not touched is undefined and follows the server, so a background refresh never erases a draft.
   const [draft, setDraft] = useState<{ base: number; rows: Row[] } | null>(null)
   const nextKey = useRef(1)

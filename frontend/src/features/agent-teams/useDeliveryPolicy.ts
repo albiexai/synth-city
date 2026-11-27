@@ -24,22 +24,38 @@ export const FIELD_LABELS: Record<PolicyField, string> = {
   regression_proof_required: 'Regression proof required',
 }
 
+type Confirmed = { revision: number; policy: DeliveryPolicy }
+/**
+ * What the repository is known to hold, kept above both editors (V1 review 436). A save or a rejection in one editor
+ * is a fact about the repository, so the other editor must see it before the repository read catches up.
+ */
+export function useDeliveryRevisions(scopeId: number) {
+  const empty = { scopeId, confirmed: null as Confirmed | null, obsolete: 0 }
+  const [state, setState] = useState(empty)
+  const current = state.scopeId === scopeId ? state : empty
+  const setConfirmed = (update: (value: Confirmed | null) => Confirmed | null) =>
+    setState((previous) => { const base = previous.scopeId === scopeId ? previous : empty; return { ...base, confirmed: update(base.confirmed) } })
+  const setObsolete = (update: (value: number) => number) =>
+    setState((previous) => { const base = previous.scopeId === scopeId ? previous : empty; return { ...base, obsolete: update(base.obsolete) } })
+  return { confirmed: current.confirmed, obsolete: current.obsolete, setConfirmed, setObsolete }
+}
+export type DeliveryRevisions = ReturnType<typeof useDeliveryRevisions>
+
 /**
  * The revision logic that the delivery policy editors share (#1345, #1346). The server replaces the whole policy on
  * a save and refuses a stale `expected_revision`. The repository read can lag behind a save or a rejection, so the
  * hook compares every base revision with what it knows: the read, the last confirmed save and the last rejection.
  */
-export function useDeliveryPolicy({ scope, open, refresh, tokenReason }: {
+export function useDeliveryPolicy({ scope, open, refresh, tokenReason, revisions }: {
   scope: TeamGithubScope
+  revisions: DeliveryRevisions
   open: boolean
   refresh: () => Promise<void>
   tokenReason: string
 }) {
   const { withOperatorToken, tokenDialog } = useOperatorTokenFlow(tokenReason)
-  // The policy that the last confirmed save returned. It stands in until the repository read catches up with it.
-  const [confirmed, setConfirmed] = useState<{ revision: number; policy: DeliveryPolicy } | null>(null)
-  // The highest revision that a 409 proved obsolete. A read that still shows it, or an older one, is not current.
-  const [obsolete, setObsolete] = useState(0)
+  // The policy that the last confirmed save returned, and the highest revision that a 409 proved obsolete. Both editors share them.
+  const { confirmed, setConfirmed, obsolete, setObsolete } = revisions
   const confirmedNewer = confirmed !== null && (scope.delivery_policy_revision === undefined || confirmed.revision > scope.delivery_policy_revision)
   const policy = confirmedNewer ? confirmed.policy : scope.delivery_policy
   const revision = confirmedNewer ? confirmed.revision : scope.delivery_policy_revision
