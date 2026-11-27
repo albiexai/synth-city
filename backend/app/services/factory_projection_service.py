@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.database import (
-    AgentPaneBinding, AgentTeamPreset, AgentTeamSlot, GithubWorkItem, GithubWorkspace,
+    AgentPaneBinding, AgentTeamPreset, AgentTeamSlot, GithubPlanRefusal, GithubWorkItem, GithubWorkspace,
     MailAgentSession, MailPaneLifecycle, MailTeamMember, TeamGithubScope,
 )
 from app.models import factory_schemas as wire
@@ -22,7 +22,7 @@ from app.services.agent_mail_service import MCP_HEARTBEAT_TTL_SECONDS
 from app.services.github_coordination_service import hold_code
 from app.services.github_dispatch_scheduler import github_dispatch_scheduler
 from app.services.github_dispatch_service import ESCALATION_REASONS
-from app.services.github_plan_refusal_service import current_plan_refusals
+from app.services.github_plan_refusal_service import current_plan_refusal_id
 from app.services.github_stopped_attempt_actor import StoppedAttemptStep, stopped_attempt_policy, stopped_attempt_step
 from app.services.github_work_item_projection import _load_work_item_authority, _work_item_response
 from app.services.providers import get_providers
@@ -367,9 +367,7 @@ async def work_projections(db, rows, now):
     from app.services.agent_status_service import agent_status_service
     if not rows:
         return []
-    items = [item for item, _, _ in rows]
-    authority = await _load_work_item_authority(db, items)
-    refusals = await current_plan_refusals(db, [item.id for item in items])
+    authority = await _load_work_item_authority(db, [item for item, _, _ in rows])
     team_ids = {team.id for _, _, team in rows}
     slots, members, sessions, bindings, retired = await actor_evidence(db, team_ids, authority)
     display_statuses = await agent_status_service.for_snapshot(
@@ -389,16 +387,23 @@ async def work_projections(db, rows, now):
         slot = slots_by_id.get(member.team_slot_id)
         if slot is not None and slot.preset_id == member.team_preset_id:
             members_by_slot[slot.id].append(member)
-    workspaces = (await db.execute(select(GithubWorkspace).where(
-        GithubWorkspace.leased_item_id.in_([row[0].id for row in rows])))).scalars().all()
-    by_item = {w.leased_item_id: w for w in workspaces}
+    bindings_by_item = {
+        item_id: (workspace, refusal)
+        for item_id, workspace, refusal in await db.execute(
+            select(GithubWorkItem.id, GithubWorkspace, GithubPlanRefusal)
+            .select_from(GithubWorkItem)
+            .outerjoin(GithubWorkspace, GithubWorkspace.leased_item_id == GithubWorkItem.id)
+            .outerjoin(GithubPlanRefusal, GithubPlanRefusal.id == current_plan_refusal_id())
+            .where(GithubWorkItem.id.in_([item.id for item, _, _ in rows]))
+        )
+    }
     providers = {p.id: p.display_name for p in get_providers()}
     result = []
     hold, recovery_attempt = stopped_attempt_policy(hold_code())
     routing_time = naive_utc(utc_now())
     for item, scope, team in rows:
         auth = authority[item.id]
-        workspace = by_item.get(item.id)
+        workspace, refusal = bindings_by_item.get(item.id, (None, None))
         legacy = _work_item_response(item, scope, workspace.path if workspace else None,
             active_revision=auth.active_revision, pending_approval=auth.pending_approval,
             pending_revision=auth.pending_revision, continuation_revision_count=auth.revision_count,
@@ -433,7 +438,6 @@ async def work_projections(db, rows, now):
         offline_slot = (slot if owner_session.state == "offline" else
                         leader_slot if leader_session.state == "offline" else None)
         safe = {name: getattr(legacy, name) for name in wire.SafeWorkItem.model_fields if name != "plan_refusal"}
-        refusal = refusals.get(item.id)
         if refusal is not None:
             safe["plan_refusal"] = wire.PlanRefusal(
                 code=refusal.code, estimate_minutes=refusal.estimate_minutes,

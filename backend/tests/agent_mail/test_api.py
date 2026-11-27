@@ -44,7 +44,7 @@ from app.services.github_approval_service import (
 )
 from app.services.github_client import GithubCommitSnapshot, github_client
 from app.services.github_dispatch_service import github_dispatch_service
-from app.services.github_plan_refusal_service import MAX_REFUSALS_PER_ATTEMPT, current_plan_refusals
+from app.services.github_plan_refusal_service import MAX_REFUSALS_PER_ATTEMPT, current_plan_refusal_id
 from app.utils import peer_process
 
 
@@ -1864,6 +1864,7 @@ async def test_refused_plan_limit_is_recorded_without_approval_then_cleared_on_a
         "plan_metadata": {"estimate_active_minutes": {"low": 40, "high": 60.5}},
     }
     endpoint = "/api/v1/agent-mail/approval-requests"
+    current_refusal = select(current_plan_refusal_id()).where(GithubWorkItem.id == item_id)
 
     preflight = await client.post("/api/v1/agent-mail/preflight-request", headers=headers,
                                   json={**payload, "kind": "initial_plan"})
@@ -1879,7 +1880,7 @@ async def test_refused_plan_limit_is_recorded_without_approval_then_cleared_on_a
     assert response.status_code == 400
     assert response.json()["detail"]["code"] == "plan_estimate_exceeds_limit"
     await db.rollback()  # The HTTP refusal must already be durable.
-    refusal = (await current_plan_refusals(db, [item_id]))[item_id]
+    refusal = await db.get(GithubPlanRefusal, await db.scalar(current_refusal))
     assert (refusal.estimate_minutes, refusal.limit_minutes, refusal.dispatch_nonce) == (60.5, 45, nonce)
     assert refusal.split_suggestion in response.json()["detail"]["message"]
     assert await db.scalar(select(GithubApprovalRequest.id)) is None
@@ -1894,12 +1895,12 @@ async def test_refused_plan_limit_is_recorded_without_approval_then_cleared_on_a
         assert response.status_code == 400
     history = list(await db.scalars(select(GithubPlanRefusal).order_by(GithubPlanRefusal.id)))
     assert [r.estimate_minutes for r in history] == list(range(51, 51 + MAX_REFUSALS_PER_ATTEMPT))
-    assert (await current_plan_refusals(db, [item_id]))[item_id].id == history[-1].id
+    assert await db.scalar(current_refusal) == history[-1].id
 
     admitted = await client.post(endpoint, headers=headers, json={**payload, "plan_metadata": {}})
     assert admitted.status_code == 200
     assert admitted.json()["status"] == "pending"
-    assert await current_plan_refusals(db, [item_id]) == {}
+    assert await db.scalar(current_refusal) is None
     kept = list(await db.scalars(select(GithubPlanRefusal).execution_options(populate_existing=True)))
     assert len(kept) == MAX_REFUSALS_PER_ATTEMPT and all(row.cleared for row in kept)
 
