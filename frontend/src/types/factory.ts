@@ -324,3 +324,32 @@ export type WorkListResponse = {
   schema_version: 1;
   total: number;
 };
+
+// #1252: the campaigns list (GET /factory/campaigns). A count that is not recorded is null with a reason, never 0.
+export type CampaignStatus = "active" | "finishing" | "finished";
+export type CampaignMeasure = { value: number | null; reason: string | null };
+export type CampaignRepositoryCount = { repo: string; issues: number | null; reason: string | null };
+export type CampaignRow = {
+  id: number;
+  team: TeamReference | null;
+  selector: string;
+  status: CampaignStatus;
+  started_at: string;
+  finished_at: string | null;
+  merged: CampaignMeasure;
+  in_scope: CampaignMeasure;
+  repositories: CampaignRepositoryCount[];
+  repositories_unknown_reason: string | null;
+  source: { kind: "frozen" | "live"; as_of: string } | null;
+};
+export type CampaignListResponse = {
+  schema_version: 1;
+  generated_at: string;
+  campaigns: CampaignRow[];
+  total: number;
+  counts: { live: number; finished: number };
+  hidden_unknown_repositories: number;
+  finished_before_recording: number;
+  has_more: boolean;
+  next_cursor: string | null;
+};
