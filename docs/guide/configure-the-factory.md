@@ -337,7 +337,7 @@ This policy is optional. The Leader reviews a list of issues and records, for ea
 | `fallback_seconds` | `1800` (300 to 86400) | How long to wait before the Leader gets a new request, if nothing changed. |
 | `max_daily_requests` | `12` (1 to 48) | A cap on Leader requests in 24 hours. |
 
-The Leader records one of these results for each issue: `eligible`, `dependency_blocked`, `human_decision_blocked`, `resource_blocked`, `needs_scope_clarification`, `completed` or `standing`. Builders then do not get work that cannot finish yet. Set the policy with `PUT /api/v1/agent-teams/github-scopes/{scope_id}/coordination-policy` (it needs `expected_version`), or on the Repositories page. Most teams leave it off. They add ready labels in the order of their dependencies.
+The Leader records one of these results for each issue: `eligible`, `dependency_blocked`, `human_decision_blocked`, `resource_blocked`, `needs_scope_clarification`, `completed` or `standing`. Builders then do not get work that cannot finish yet. Set the policy with `PUT /api/v1/agent-teams/github-scopes/{scope_id}/coordination-policy` (it needs `expected_version`), or in the Autonomy panel of the Teams page. Most teams leave it off. They add ready labels in the order of their dependencies.
 
 ## Dispatch workspaces
 
