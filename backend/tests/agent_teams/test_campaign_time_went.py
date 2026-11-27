@@ -229,6 +229,9 @@ async def test_unattributed_evidence_is_unknown_with_its_reason(db, world):
     went = (await _build(db, world, [10])).time_went
     assert (went.unattributed, went.coverage) == (1, "partial")
     assert "no_open_attempt" in went.unknown_reasons
+    # V1 review 119: the wait it couldn't place makes waiting a lower bound, not 0 with full coverage
+    assert went.group_coverage["waiting"] == "partial"
+    assert "waiting: unattributed_evidence" in went.unknown_reasons
 
 
 async def test_check_runs_recorded_too_late_make_the_section_partial(db, world):
@@ -256,6 +259,60 @@ async def test_a_member_tracked_by_two_rows_with_overlapping_attempts_is_ambiguo
     went = (await _build(db, world, [10])).time_went
     assert (went.items, went.attempts, went.unknown_items, went.total_seconds) == (0, 0, 1, None)
     assert "ambiguous_tracking" in went.unknown_reasons
+    assert "no_attempt_recorded" not in went.unknown_reasons  # both rows recorded attempts (V1 review 119)
+
+
+async def test_a_zero_length_second_row_does_not_erase_the_members_time(db, world):
+    """V1 review 119: a row created, dispatched and failed at minute 30 shares no positive time with the first."""
+    await _recording(db)
+    twin = TeamGithubScope(preset_id=world.team, repo_owner="O", repo_name="A1", repo_path="/twin", enabled=True)
+    db.add(twin)
+    await db.flush()
+    first = await _item(db, world, 10)
+    await _dispatch(db, first.id, 0, launch=0)
+    second = GithubWorkItem(scope_id=twin.id, issue_number=10, issue_title="I", issue_url="u/twin",
+                            github_updated_at=T0, dispatch_status="failed", created_at=_m(30))
+    db.add(second)
+    await db.flush()
+    await _dispatch(db, second.id, 30, launch=0)
+    await audit.record_event(
+        db, event_kind="work_lifecycle", source="test", occurred_at=_m(30), actor=audit.derive_actor(actor_kind="system"),
+        item_id=second.id, after_values={"dispatch_status": "failed"},
+        context_snapshot={"launch_attempt": audit.launch_attempt_key(second.id, 0)}, action_outcome="applied")
+    went = (await _build(db, world, [10])).time_went
+    assert (went.items, went.attempts, went.total_seconds) == (1, 2, 180 * MIN)
+    assert "ambiguous_tracking" not in went.unknown_reasons
+
+
+@pytest.mark.parametrize("issue", [999, 10], ids=["another_issue", "the_same_issue"])
+async def test_an_item_id_reused_between_the_snapshots_reads_adds_nothing(db, world, monkeypatch, issue):
+    """V1 review 119: the team retires and a replacement issue takes the numeric item id between two reads. Even the
+    same issue number, tracked by the replacement team, belongs to another team lifetime."""
+    from app.services import retro_attempt_collector as collector
+
+    await _recording(db)
+    old = await _item(db, world, 10)
+    original = collector.collect_team_attempts
+
+    async def racing(session, preset_id, **kwargs):
+        campaign = await campaigns.current(session, world.team)
+        await session.execute(text("UPDATE factory_context_keys SET retired_at = :t WHERE key_kind IN ('team', 'item')"),
+                              {"t": _m(1)})
+        await session.execute(text("DELETE FROM github_work_items WHERE id = :i"), {"i": old.id})
+        session.add(GithubWorkItem(id=old.id, scope_id=world.scopes["a1"], issue_number=issue, issue_title="R",
+                                   issue_url=f"u/{issue}", github_updated_at=T0, dispatch_status="dispatched",
+                                   created_at=CREATED))
+        await session.flush()
+        await _dispatch(session, old.id, 0, launch=0)
+        await session.commit()
+        assert campaign is not None
+        return await original(session, preset_id, **kwargs)
+
+    await _build(db, world, [10])  # start the campaign before the race
+    snapshots.clear_cache()
+    monkeypatch.setattr(collector, "collect_team_attempts", racing)
+    went = (await _build(db, world, [10])).time_went
+    assert (went.attempts, went.items, went.total_seconds) == (0, 0, None)
 
 
 async def test_two_rows_tracking_one_issue_one_after_the_other_still_sum(db, world):

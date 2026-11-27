@@ -330,6 +330,12 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
         time_went=time_went)
 
 
+_LOST_GROUP = {source: "waiting" for source in ("dispatch", "decision", "effort", "ceiling", "hold", "pause", "mail",
+                                                 "input")} | {
+    source: "process" for source in ("required_check", "review", "check_watch", "head_review", "revision_review")} | {
+    source: "active" for source in ("planning", "building", "approval_request")}
+
+
 async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], coverage, as_of: datetime,
                      gaps: list[str]) -> TimeWentSection:
     """The campaign members' attempt time, split by the stage engine and summed; it reconciles with item time.
@@ -341,14 +347,11 @@ async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], cov
     from app.services.retro_stage_engine import GROUPS, breakdown
 
     started = _naive_utc(campaign.started_at)
-    member_items = {row.id: _identity(f"{row.repo_owner}/{row.repo_name}", row.issue_number) for row in (
-        await db.execute(select(GithubWorkItem.id, GithubWorkItem.issue_number, TeamGithubScope.repo_owner,
-                                TeamGithubScope.repo_name)
-                         .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
-                         .join(FactoryContextKey, _lifetime(campaign.team_context_key)))).all()}
     wanted = set(members)
     collected = await collect_team_attempts(db, campaign.preset_id, campaign_start=started, as_of=as_of,
                                             team_context_key=campaign.team_context_key)
+    # Members come from the collector's own lifetime-bound item read, never a separate one (V1 review 119).
+    member_items = collected.item_identity
     by_member: dict[tuple[str, int], list] = {}
     for attempt in collected.attempts:
         if member_items.get(attempt.item_id) in wanted:
@@ -356,8 +359,8 @@ async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], cov
     reasons = set(gaps)
     attempts = []
     for found in by_member.values():
-        if any(a.item_id != b.item_id and a.window.start < b.window.end and b.window.start < a.window.end
-               for a in found for b in found):
+        if any(a.item_id != b.item_id and min(a.window.end, b.window.end) > max(a.window.start, b.window.start)
+               for a in found for b in found):  # a shared positive duration, not a zero-length window
             reasons.add("ambiguous_tracking")  # two lifetimes track one issue at once: neither is counted
             continue
         attempts.extend(found)
@@ -377,7 +380,7 @@ async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], cov
             sums[0], sums[1], sums[2] = sums[0] + row.share_seconds, sums[1] + row.wall_seconds, sums[2] + 1
             sums[3] = sums[3] or (row.stage == "dispatch" and attempt.window.start_label == FIRST_LABEL)
     reasons |= {u.reason for u in lost}
-    if len(timed) < len(wanted):
+    if wanted - set(by_member):  # members with no recorded attempt at all; ambiguous ones say so instead
         reasons.add("no_attempt_recorded")
     earliest = min((a.window.start for a in attempts), default=None)
     marker = await audit.instrumentation_start(db)
@@ -395,6 +398,11 @@ async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], cov
         elif earliest is not None and _naive_utc(entry.started_at) > earliest:
             group_coverage[group] = "partial"  # what was recorded is kept, as a lower bound
             reasons.add(f"{measure}: recording_started_late")
+    # Evidence the collector couldn't place makes the group it would have fed a lower bound (V1 review 119).
+    for group in sorted({_LOST_GROUP[u.source] for u in lost if u.source in _LOST_GROUP}):
+        if group_coverage[group] == "full":
+            group_coverage[group] = "partial"
+        reasons.add(f"{group}: unattributed_evidence")
     known = bool(attempts)
     if not known:
         group_coverage = dict.fromkeys(GROUPS, "unavailable")

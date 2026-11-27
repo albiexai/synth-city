@@ -35,6 +35,7 @@ from sqlalchemy import select
 
 from app.models.database import (
     FactoryAuditEvent,
+    FactoryContextKey,
     GithubApprovalRequest,
     GithubAttemptScopeRevision,
     GithubCheckRunHistory,
@@ -80,6 +81,8 @@ class CollectedAttempt:
 class TeamAttempts:
     attempts: list[CollectedAttempt] = field(default_factory=list)
     unattributed: list[Unattributed] = field(default_factory=list)
+    # #1419: each collected item's (repository, issue), read in the same query as the items themselves
+    item_identity: dict[int, tuple[str, int]] = field(default_factory=dict)
 
 
 def _naive(value: datetime | None) -> datetime | None:
@@ -135,8 +138,18 @@ async def collect_team_attempts(db, preset_id: int, *, campaign_start: datetime,
     its own, so a replacement team reusing the preset id never adds its waits to a retired campaign (#1419)."""
     campaign_start, as_of = _naive(campaign_start), _naive(as_of)
     out, period = TeamAttempts(), (campaign_start, as_of)
-    items = (await db.scalars(select(GithubWorkItem).join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
-                              .where(TeamGithubScope.preset_id == preset_id).order_by(GithubWorkItem.id))).all()
+    query = (select(GithubWorkItem, TeamGithubScope.repo_owner, TeamGithubScope.repo_name)
+             .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id))
+    if team_context_key:  # the team lifetime's own scopes, never a replacement team reusing the preset id
+        query = query.join(FactoryContextKey, (FactoryContextKey.key_kind == "team")
+                           & (FactoryContextKey.numeric_id == TeamGithubScope.preset_id)
+                           & (FactoryContextKey.context_key == team_context_key)
+                           & FactoryContextKey.retired_at.is_(None))
+    else:
+        query = query.where(TeamGithubScope.preset_id == preset_id)
+    rows = (await db.execute(query.order_by(GithubWorkItem.id))).all()
+    items = [row[0] for row in rows]
+    out.item_identity = {row[0].id: (f"{row[1]}/{row[2]}".lower(), row[0].issue_number) for row in rows}
     every: list[CollectedAttempt] = []  # shown or not: who was open when a wait began (V1 review 434)
     for item in items:
         every += await _collect_item(db, item, out, period)
