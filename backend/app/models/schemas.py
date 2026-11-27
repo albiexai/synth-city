@@ -2858,7 +2858,13 @@ class GithubAttemptDeliveryPolicyUpdate(BaseModel):
 _PositiveScopeCount = Annotated[int, Field(ge=1)]
 _NonnegativeScopeCount = Annotated[int, Field(ge=0)]
 _ScopeEffortMinutes = Annotated[int, Field(ge=15, le=1440)]
+_ScopeMergeWaitMinutes = Annotated[int, Field(strict=True, ge=1, le=1440)]
+_ScopeExtensionMinutes = Annotated[int, Field(strict=True, ge=0, le=1440)]
+_ScopeExtensionPercent = Annotated[int, Field(strict=True, ge=0, le=100)]
 DEFAULT_PLAN_ESTIMATE_MINUTES = 60
+DEFAULT_MERGE_CHECK_WAIT_MINUTES = 60
+DEFAULT_EFFORT_EXTENSION_CAP_MINUTES = 30
+DEFAULT_EFFORT_EXTENSION_CAP_PERCENT = 25
 
 
 class TeamGithubScopeCreate(BaseModel):
@@ -2874,6 +2880,9 @@ class TeamGithubScopeCreate(BaseModel):
     max_verification_retries: _NonnegativeScopeCount = 2
     max_auto_merges_per_day: _NonnegativeScopeCount = 5
     max_item_effort_minutes: _ScopeEffortMinutes = 120
+    merge_check_wait_minutes: _ScopeMergeWaitMinutes = DEFAULT_MERGE_CHECK_WAIT_MINUTES
+    effort_extension_cap_minutes: _ScopeExtensionMinutes = DEFAULT_EFFORT_EXTENSION_CAP_MINUTES
+    effort_extension_cap_percent: _ScopeExtensionPercent = DEFAULT_EFFORT_EXTENSION_CAP_PERCENT
     max_plan_estimate_minutes: _ScopeEffortMinutes = Field(
         DEFAULT_PLAN_ESTIMATE_MINUTES,
         description="The initial plan limit. The default is capped by the item effort ceiling.",
@@ -2901,6 +2910,9 @@ class TeamGithubScopeUpdate(BaseModel):
     max_verification_retries: _NonnegativeScopeCount | None = None
     max_auto_merges_per_day: _NonnegativeScopeCount | None = None
     max_item_effort_minutes: _ScopeEffortMinutes | None = None
+    merge_check_wait_minutes: _ScopeMergeWaitMinutes | None = None
+    effort_extension_cap_minutes: _ScopeExtensionMinutes | None = None
+    effort_extension_cap_percent: _ScopeExtensionPercent | None = None
     max_plan_estimate_minutes: _ScopeEffortMinutes | None = None
     initial_paths_required: bool | None = None
     base_ref: Optional[str] = None
@@ -2973,6 +2985,9 @@ class TeamGithubScopeResponse(BaseModel):
     max_verification_retries: int
     max_auto_merges_per_day: int
     max_item_effort_minutes: int = 120
+    merge_check_wait_minutes: int = DEFAULT_MERGE_CHECK_WAIT_MINUTES
+    effort_extension_cap_minutes: int = DEFAULT_EFFORT_EXTENSION_CAP_MINUTES
+    effort_extension_cap_percent: int = DEFAULT_EFFORT_EXTENSION_CAP_PERCENT
     max_plan_estimate_minutes: int = DEFAULT_PLAN_ESTIMATE_MINUTES
     initial_paths_required: bool = False
     auto_merges_last_24h: Optional[int] = None

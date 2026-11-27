@@ -235,8 +235,11 @@ A repository scope is one team's watch on one GitHub repository. Add it on the [
 | `review_hold_label` | none | `my-project-review-hold` | Blocks automatic merge while it is on the PR or the issue. |
 | `merge_policy` | `human` | `auto` | `human`: PRs wait for a person. `auto`: the backend merges when the required checks are green, a verifier accepted the exact head and no hold label is on. |
 | `max_auto_merges_per_day` | `5` | `10` | A cap on automatic merges in 24 hours. |
+| `merge_check_wait_minutes` | `60` | `30` | Minutes a pending check may delay automatic merge before human fallback (1 to 1440). |
 | `max_concurrent_dispatched` | `3` | `2` | Items that run at the same time. Each one needs its own workspace. |
 | `max_item_effort_minutes` | `120` | `120` | The effort ceiling of an item (15 to 1440). See below. |
+| `effort_extension_cap_minutes` | `30` | `15` | Minutes one extension may add (0 to 1440). |
+| `effort_extension_cap_percent` | `25` | `20` | Percentage of the original effort limit one extension may add (0 to 100). |
 | `max_plan_estimate_minutes` | `60` (never above the ceiling) | `60` | The largest estimate that a first plan may state (15 to 1440). Set it by API. |
 | `initial_paths_required` | `false` | `false` | When `true`, a first plan must list its files. |
 | `max_approval_rounds` | `3` | `3` | Plan rounds before the item escalates. |
@@ -259,7 +262,7 @@ Each limit stops a different kind of runaway.
 | `max_auto_merges_per_day` | A bad rule or a broken check merges many PRs before you notice. | Use a low number while you build trust. |
 :::
 
-**Effort.** The estimate in the approved plan becomes the effort limit of the item. Reaching it stops nothing. The Leader and the builder each get one message. The Leader can then extend the limit in steps. Each step is at most 30 minutes, or 25% of the original limit if that is less. An extension never goes past `max_item_effort_minutes`. It is a speedometer, not a brake. A plan with no estimate gets the ceiling as its limit.
+**Effort.** The estimate in the approved plan becomes the effort limit of the item. Reaching it stops nothing. The Leader and the builder each get one message. The Leader can then extend the limit in steps. Each step is bounded by the smaller of the scope's minutes cap and its percentage of the original limit. Setting either cap to zero disables extensions. An extension never goes past `max_item_effort_minutes`. It is a speedometer, not a brake. A plan with no estimate gets the ceiling as its limit.
 
 **Merge policy.** Start with `human` while you learn how your team works. Nothing reaches your branch without your click. Move to `auto` when you trust the verifier and the checks. Design work always waits for a person, whatever the policy.
 

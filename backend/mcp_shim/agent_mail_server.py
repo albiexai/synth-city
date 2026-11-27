@@ -789,8 +789,9 @@ def synth_city_extend_effort_limit(
 ) -> dict:
     """Leader only: extend a work item's effort limit, and extend again up to the scope ceiling.
 
-    Each step adds at most 30 minutes or 25 percent of the original limit, whichever is smaller. The limit plus all
-    extensions may not pass the scope ceiling (max_item_effort_minutes); a step beyond it is refused with
+    The scope sets the minutes and percentage bounds for one step. The default is the smaller of 30 minutes and
+    25 percent of the original limit. The limit plus all extensions must stay within the scope ceiling
+    (max_item_effort_minutes). An extension beyond the ceiling is refused with
     extension_exceeds_ceiling and notifies the Supervisor once per attempt, because beyond the ceiling the Supervisor
     decides. The item's effort shows the room left as extension_cap_minutes.
 

@@ -531,6 +531,9 @@ def _scope_response(
         max_verification_retries=scope.max_verification_retries,
         max_auto_merges_per_day=scope.max_auto_merges_per_day,
         max_item_effort_minutes=scope.max_item_effort_minutes,
+        merge_check_wait_minutes=scope.merge_check_wait_minutes,
+        effort_extension_cap_minutes=scope.effort_extension_cap_minutes,
+        effort_extension_cap_percent=scope.effort_extension_cap_percent,
         max_plan_estimate_minutes=effort_limit_service.plan_estimate_limit(scope),
         initial_paths_required=scope.initial_paths_required,
         auto_merges_last_24h=auto_merges_last_24h,
@@ -734,6 +737,7 @@ async def _scope_identity_in_use(db: AsyncSession, scope_id: int) -> bool:
 
 
 _SCOPE_CONFIGURATION_FIELDS = (
+    "merge_check_wait_minutes", "effort_extension_cap_minutes", "effort_extension_cap_percent",
     "preset_id", "repo_owner", "repo_name", "repo_path", "dispatch_label", "design_label",
     "merge_policy", "review_hold_label", "max_approval_rounds", "max_concurrent_dispatched", "max_verification_retries",
     "max_auto_merges_per_day", "max_item_effort_minutes", "max_plan_estimate_minutes", "initial_paths_required", "base_ref",
@@ -853,6 +857,12 @@ def _apply_scope_create(
         scope.max_auto_merges_per_day = request.max_auto_merges_per_day
     if request.max_item_effort_minutes is not None:
         scope.max_item_effort_minutes = request.max_item_effort_minutes
+    if request.merge_check_wait_minutes is not None:
+        scope.merge_check_wait_minutes = request.merge_check_wait_minutes
+    if request.effort_extension_cap_minutes is not None:
+        scope.effort_extension_cap_minutes = request.effort_extension_cap_minutes
+    if request.effort_extension_cap_percent is not None:
+        scope.effort_extension_cap_percent = request.effort_extension_cap_percent
     if "max_plan_estimate_minutes" in request.model_fields_set:
         scope.max_plan_estimate_minutes = request.max_plan_estimate_minutes
     if request.initial_paths_required is not None:

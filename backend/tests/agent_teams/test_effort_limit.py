@@ -559,6 +559,24 @@ async def _code(coro):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "value", "cap"), [
+    ("effort_extension_cap_minutes", 7, 7),
+    ("effort_extension_cap_percent", 10, 6),
+    ("effort_extension_cap_percent", 0, 0),
+])
+async def test_configured_extension_bound_applies_to_view_and_decision(fx, field, value, cap):
+    await _limited(fx, limit=60)
+    async with fx.maker() as db:
+        scope = await db.get(TeamGithubScope, fx.scope_id)
+        setattr(scope, field, value)
+        await db.commit()
+        assert service.effort_view(await _item(fx, db), scope)["extension_cap_minutes"] == cap
+    assert await _code(_extend(fx, cap + 1)) == "extension_exceeds_cap"
+    if cap:
+        assert (await _extend(fx, cap))["extension_minutes"] == cap
+
+
+@pytest.mark.asyncio
 async def test_the_leader_extends_once_within_the_cap(fx):
     await _limited(fx, limit=60)
     result = await _extend(fx, 15)

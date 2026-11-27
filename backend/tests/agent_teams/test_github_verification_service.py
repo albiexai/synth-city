@@ -3890,8 +3890,9 @@ async def test_completed_merge_checks_charge_only_after_waiting(db, merge_state)
 
 
 @pytest.mark.parametrize("signal", ["check", "status"])
+@pytest.mark.parametrize("configured_wait", [None, 12])
 @pytest.mark.asyncio
-async def test_pending_merge_checks_timeout_survives_polling_and_reload(db, monkeypatch, signal):
+async def test_pending_merge_checks_timeout_survives_polling_and_reload(db, monkeypatch, signal, configured_wait):
     import app.services.github_verification_service as verification_module
 
     class Clock(datetime):
@@ -3903,6 +3904,10 @@ async def test_pending_merge_checks_timeout_survives_polling_and_reload(db, monk
 
     monkeypatch.setattr(verification_module, "datetime", Clock)
     scope = await _scope(db, merge_policy="auto")
+    if configured_wait is not None:
+        scope.merge_check_wait_minutes = configured_wait
+        await db.commit()
+    wait = configured_wait or 60
     item = await _item(db, scope, dispatch_status="ready_for_review", pr_number=5, last_verified_sha="sha")
     item_id = item.id
     client = _Client(check_runs=[{"name": "ci", "status": "completed", "conclusion": "success"}])
@@ -3912,7 +3917,7 @@ async def test_pending_merge_checks_timeout_survives_polling_and_reload(db, monk
     else:
         client.check_runs.append({"name": "optional", "status": "in_progress", "conclusion": None})
     started = Clock.now
-    for elapsed in (0, 30, 59):
+    for elapsed in (0, wait // 2, wait - 1):
         Clock.now = started + timedelta(minutes=elapsed)
         await github_verification_service.process_scope(db, scope, client=client)
         assert item.retry_count == 0
@@ -3921,11 +3926,11 @@ async def test_pending_merge_checks_timeout_survives_polling_and_reload(db, monk
         assert item.merge_wait_started_at == started
     db.expunge_all()
     item = await db.get(GithubWorkItem, item_id)
-    Clock.now = started + timedelta(minutes=60)
+    Clock.now = started + timedelta(minutes=wait)
     await github_verification_service.process_scope(db, scope, client=client)
     assert item.retry_count == 0
     assert item.dispatch_status == "ready_for_review"
-    assert "stalled" in item.status_note
+    assert f"stalled for {wait} minutes" in item.status_note
     assert "optional" in item.status_note
     assert item.merge_wait_started_at == started
     note = item.status_note
