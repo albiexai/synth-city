@@ -248,7 +248,12 @@ describe('saving', () => {
     await user.click(save())
     expect(await screen.findByText(/the policy changed on the server, so nothing was saved/i)).toBeInTheDocument()
     await waitFor(() => expect(refresh).toHaveBeenCalled())
-    expect(name(1)).toBeEnabled() // the dialog is usable again
+    // revision 4 is known to be out of date, so the editor waits for a newer one
+    expect(screen.getByText(/The current policy is not available yet/)).toBeInTheDocument()
+    expect(name(1)).toBeDisabled()
+    refresh.mockClear()
+    await user.click(screen.getByRole('button', { name: 'Read again' }))
+    expect(refresh).toHaveBeenCalledTimes(1)
   })
 
   it('shows another server error as it is', async () => {
@@ -260,10 +265,10 @@ describe('saving', () => {
     expect(await screen.findByText('Hosted broad checks need required check identities.')).toBeInTheDocument()
   })
 
-  it('does not let a save from an older open of the dialog change the new one', async () => {
+  it('reconciles a save that finishes after a reopen, and keeps the new draft but marks it stale', async () => {
     const pending = deferred<{ scope_id: number; revision: number; policy: DeliveryPolicy }>()
     vi.mocked(updateTeamGithubDeliveryPolicy).mockReturnValue(pending.promise)
-    const { user } = await openEditor()
+    const { user, refresh } = await openEditor() // revision 4: Unit tests, Lint
     await user.click(screen.getByRole('button', { name: 'Remove check 2' }))
     await type(user, reason(), 'Drop lint')
     await user.click(save())
@@ -271,11 +276,17 @@ describe('saving', () => {
     await user.click(screen.getByRole('button', { name: 'Edit required checks for example/project' }))
     await screen.findByText('History')
     await flush()
-    await type(user, name(1), 'Fresh draft')
-    await act(async () => { pending.resolve({ scope_id: 2, revision: 5, policy: policy() }) })
+    await type(user, name(1), 'Fresh draft') // a new draft on revision 4
+    vi.mocked(fetchDeliveryPolicyHistory).mockClear()
+    await act(async () => { pending.resolve({ scope_id: 2, revision: 5, policy: policy([check('Unit tests')]) }) })
     await flush()
+    // the repository state moved to revision 5 even though the dialog was reopened
+    expect(refresh).toHaveBeenCalled()
+    expect(screen.getByText(/revision 4 to 5/)).toBeInTheDocument()
+    expect(save()).toBeDisabled()
+    // the new draft and its reason belong to the new opening, so they stay; the old opening changed no history
     expect(name(1)).toHaveValue('Fresh draft')
-    expect(save()).toBeEnabled()
+    expect(fetchDeliveryPolicyHistory).not.toHaveBeenCalled()
   })
 })
 
@@ -334,9 +345,9 @@ describe('answers that arrive late or out of order (V1 review 106)', () => {
     expect(name(2)).toHaveValue('End-to-end tests')
   })
 
-  it('keeps a draft blocked after a 409 while the repository read still shows the old revision', async () => {
+  it('keeps a draft blocked after a 409, and never sends a second save on the rejected revision', async () => {
     vi.mocked(updateTeamGithubDeliveryPolicy).mockRejectedValue(new ApiHttpError('delivery_policy_revision_changed', 409))
-    const { user, refresh } = await openEditor() // the mocked refresh changes nothing: revision 4 stays
+    const { user, refresh, rerender } = await openEditor() // the mocked refresh changes nothing: revision 4 stays
     await user.click(screen.getByRole('button', { name: 'Remove check 2' }))
     await type(user, reason(), 'Drop lint')
     await user.click(save())
@@ -345,18 +356,80 @@ describe('answers that arrive late or out of order (V1 review 106)', () => {
     expect(save()).toBeDisabled()
     expect(screen.queryByLabelText('Check 2 name')).not.toBeInTheDocument() // the draft is still there
     await user.click(screen.getByRole('button', { name: 'Discard my changes' }))
+    // the read still shows revision 4, which is known to be out of date: the list is read-only
+    expect(screen.getByText(/The current policy is not available yet/)).toBeInTheDocument()
     expect(name(2)).toHaveValue('Lint')
-    expect(screen.queryByText(/The server refused the save/)).not.toBeInTheDocument()
-    // a new draft is not blocked by the old conflict
-    await type(user, name(1), 'Renamed tests')
+    expect(name(1)).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Add a check' })).toBeDisabled()
+    expect(save()).toBeDisabled()
+    expect(updateTeamGithubDeliveryPolicy).toHaveBeenCalledTimes(1)
+    // a newer revision unlocks the editor, and the next save sends that revision
+    vi.mocked(updateTeamGithubDeliveryPolicy).mockResolvedValue({ scope_id: 2, revision: 6, policy: policy() })
+    rerender({ delivery_policy: policy([check('Other'), check('Lint')]), delivery_policy_revision: 5 })
+    expect(screen.queryByText(/The current policy is not available yet/)).not.toBeInTheDocument()
+    await type(user, name(1), 'Renamed')
     await type(user, reason(), 'Rename')
-    expect(save()).toBeEnabled()
-    expect(screen.queryByRole('button', { name: 'Discard my changes' })).not.toBeInTheDocument()
+    await user.click(save())
+    await waitFor(() => expect(updateTeamGithubDeliveryPolicy).toHaveBeenCalledTimes(2))
+    expect(vi.mocked(updateTeamGithubDeliveryPolicy).mock.calls[1][1].expected_revision).toBe(5)
   })
 
-  it('does not carry a conflict into the next opening of the dialog', async () => {
+  it('keeps the draft blocked after a 409 when the refresh fails too, and offers Read again', async () => {
     vi.mocked(updateTeamGithubDeliveryPolicy).mockRejectedValue(new ApiHttpError('delivery_policy_revision_changed', 409))
+    const refresh = vi.fn().mockRejectedValue(new Error('offline'))
+    const { user } = await openEditor({}, refresh)
+    await user.click(screen.getByRole('button', { name: 'Remove check 2' }))
+    await type(user, reason(), 'Drop lint')
+    await user.click(save())
+    expect(await screen.findByRole('button', { name: 'Discard my changes' })).toBeInTheDocument()
+    await waitFor(() => expect(refresh).toHaveBeenCalled())
+    expect(save()).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Read again' })).toBeInTheDocument()
+  })
+
+  it('keeps the newest confirmed policy when an older save answers last', async () => {
+    const first = deferred<{ scope_id: number; revision: number; policy: DeliveryPolicy }>()
+    const second = deferred<{ scope_id: number; revision: number; policy: DeliveryPolicy }>()
+    vi.mocked(updateTeamGithubDeliveryPolicy).mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
     const { user } = await openEditor()
+    await user.click(screen.getByRole('button', { name: 'Remove check 2' }))
+    await type(user, reason(), 'First')
+    await user.click(save())
+    await user.keyboard('{Escape}')
+    await user.click(screen.getByRole('button', { name: 'Edit required checks for example/project' }))
+    await screen.findByText('History')
+    await flush()
+    await type(user, name(1), 'Second change')
+    await type(user, reason(), 'Second')
+    await user.click(save())
+    await act(async () => { second.resolve({ scope_id: 2, revision: 6, policy: policy([check('Second change'), check('Lint')]) }) })
+    await act(async () => { first.resolve({ scope_id: 2, revision: 5, policy: policy([check('Unit tests')]) }) })
+    await flush()
+    expect(name(1)).toHaveValue('Second change') // revision 6 stays, the late revision 5 does not replace it
+    expect(name(2)).toHaveValue('Lint')
+  })
+
+  it('remembers a rejection that arrives after the dialog was reopened', async () => {
+    const pending = deferred<{ scope_id: number; revision: number; policy: DeliveryPolicy }>()
+    vi.mocked(updateTeamGithubDeliveryPolicy).mockReturnValue(pending.promise)
+    const { user } = await openEditor()
+    await user.click(screen.getByRole('button', { name: 'Remove check 2' }))
+    await type(user, reason(), 'Drop lint')
+    await user.click(save())
+    await user.keyboard('{Escape}')
+    await user.click(screen.getByRole('button', { name: 'Edit required checks for example/project' }))
+    await screen.findByText('History')
+    await flush()
+    expect(name(1)).toBeEnabled()
+    await act(async () => { pending.reject(new ApiHttpError('delivery_policy_revision_changed', 409)) })
+    await flush()
+    expect(screen.getByText(/The current policy is not available yet/)).toBeInTheDocument()
+    expect(name(1)).toBeDisabled()
+  })
+
+  it('keeps the rejected revision obsolete when the dialog is closed and opened again', async () => {
+    vi.mocked(updateTeamGithubDeliveryPolicy).mockRejectedValue(new ApiHttpError('delivery_policy_revision_changed', 409))
+    const { user, rerender } = await openEditor()
     await user.click(screen.getByRole('button', { name: 'Remove check 2' }))
     await type(user, reason(), 'Drop lint')
     await user.click(save())
@@ -365,6 +438,9 @@ describe('answers that arrive late or out of order (V1 review 106)', () => {
     await user.click(screen.getByRole('button', { name: 'Edit required checks for example/project' }))
     await screen.findByText('History')
     await flush()
+    expect(screen.getByText(/The current policy is not available yet/)).toBeInTheDocument()
+    expect(name(1)).toBeDisabled()
+    rerender({ delivery_policy: policy([check('Other')]), delivery_policy_revision: 5 })
     await type(user, name(1), 'Renamed tests')
     await type(user, reason(), 'Rename')
     expect(save()).toBeEnabled()

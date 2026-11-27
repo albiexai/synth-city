@@ -77,8 +77,8 @@ export function RequiredChecksDialog({ scope, open, onOpenChange, refresh, onRet
   const [draft, setDraft] = useState<{ base: number; rows: Row[] } | null>(null)
   // The policy that the last confirmed save returned. It stands in until the repository read catches up with it.
   const [confirmed, setConfirmed] = useState<{ revision: number; policy: DeliveryPolicy } | null>(null)
-  // A 409 proves that the draft is stale, whatever revision the repository read still shows.
-  const [conflict, setConflict] = useState(false)
+  // The highest revision that a 409 proved obsolete. A read that still shows it, or an older one, is not current.
+  const [obsolete, setObsolete] = useState(0)
   const confirmedNewer = confirmed !== null && (scope.delivery_policy_revision === undefined || confirmed.revision > scope.delivery_policy_revision)
   const policy = confirmedNewer ? confirmed.policy : scope.delivery_policy
   const revision = confirmedNewer ? confirmed.revision : scope.delivery_policy_revision
@@ -93,7 +93,8 @@ export function RequiredChecksDialog({ scope, open, onOpenChange, refresh, onRet
 
   const serverRows: Row[] = (policy?.required_checks ?? []).map((check, index) => ({ key: -(index + 1), name: check.name, app: check.app_slug }))
   const rows = draft?.rows ?? serverRows
-  const stale = draft !== null && (draft.base !== revision || conflict)
+  const locked = revision !== undefined && revision <= obsolete // the current policy has not been read yet
+  const stale = draft !== null && (draft.base !== revision || draft.base <= obsolete)
   const reasonTooLong = length(reason.trim()) > MAX_REASON
   const check = validate(rows, policy?.broad_checks === 'hosted')
   const edit = (change: (current: Row[]) => Row[]) => setDraft((current) => ({ base: current?.base ?? revision ?? 0, rows: change(current?.rows ?? serverRows) }))
@@ -129,7 +130,7 @@ export function RequiredChecksDialog({ scope, open, onOpenChange, refresh, onRet
       return
     }
     queueMicrotask(() => {
-      setDraft(null); setReason(''); setEvents([]); setHistoryState('loading'); setError(null); setSaving(false); setConflict(false) // the confirmed policy stays: the repository read may still lag
+      setDraft(null); setReason(''); setEvents([]); setHistoryState('loading'); setError(null); setSaving(false) // the confirmed policy and the obsolete revision stay: the repository read may still lag
       void loadHistory()
     })
   }, [open, loadHistory])
@@ -151,18 +152,20 @@ export function RequiredChecksDialog({ scope, open, onOpenChange, refresh, onRet
     try {
       const saved = await withOperatorToken((token) => updateTeamGithubDeliveryPolicy(
         scope.id, { expected_revision: draft.base, policy: { ...policy, required_checks: normalized }, reason: reason.trim() }, token))
-      if (mine !== session.current) return
-      // The confirmed policy and revision stand in until the repository read shows them.
-      setConfirmed({ revision: saved.revision, policy: saved.policy })
+      // The confirmed policy and revision belong to the repository, so they count even when the dialog was reopened.
+      // They stand in until the repository read shows them.
+      setConfirmed((current) => (current && current.revision >= saved.revision ? current : { revision: saved.revision, policy: saved.policy }))
+      if (mine !== session.current) { void refresh().catch(() => undefined); return }
       setDraft(null); setReason('')
       await refresh()
       if (mine !== session.current) return
       await loadHistory()
       toast.success('Required checks saved')
     } catch (failure) {
+      const rejected = failure instanceof ApiHttpError && failure.status === 409
+      if (rejected) setObsolete((current) => Math.max(current, draft.base)) // a fact about the repository, not about this opening
       if (mine !== session.current) return
-      if (failure instanceof ApiHttpError && failure.status === 409) {
-        setConflict(true)
+      if (rejected) {
         setError('The policy changed on the server, so nothing was saved. Discard your changes to see the current list.')
         void refresh().catch(() => undefined)
       } else {
@@ -187,7 +190,13 @@ export function RequiredChecksDialog({ scope, open, onOpenChange, refresh, onRet
         {stale && (
           <div role="alert" className="flex flex-wrap items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm">
             <span>{draft?.base !== revision ? `The policy changed on the server (revision ${draft?.base} to ${revision}). ` : 'The server refused the save because the policy changed. '}Your changes are not saved.</span>
-            <Button variant="outline" size="sm" onClick={() => { setDraft(null); setConflict(false) }}>Discard my changes</Button>
+            <Button variant="outline" size="sm" onClick={() => setDraft(null)}>Discard my changes</Button>
+          </div>
+        )}
+        {locked && (
+          <div role="alert" className="flex flex-wrap items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm">
+            <span>The policy changed on the server (revision {obsolete} is out of date). The current policy is not available yet, so the list is read-only.</span>
+            <Button variant="outline" size="sm" onClick={() => void refresh().catch(() => undefined)}>Read again</Button>
           </div>
         )}
         <div className="grid gap-4">
@@ -198,14 +207,14 @@ export function RequiredChecksDialog({ scope, open, onOpenChange, refresh, onRet
               return (
                 <li key={row.key} className="space-y-1">
                   <div className="grid gap-2 sm:grid-cols-[1fr_11rem_auto]">
-                    <Input aria-label={`Check ${index + 1} name`} aria-describedby={problems.length ? errorId : undefined} aria-invalid={problems.length > 0} placeholder="Check name" value={row.name} disabled={saving || !policy}
+                    <Input aria-label={`Check ${index + 1} name`} aria-describedby={problems.length ? errorId : undefined} aria-invalid={problems.length > 0} placeholder="Check name" value={row.name} disabled={saving || locked || !policy}
                       onChange={(event) => setField(row.key, 'name', event.target.value)} />
-                    <Input aria-label={`Check ${index + 1} app`} aria-describedby={problems.length ? errorId : undefined} aria-invalid={problems.length > 0} placeholder={DEFAULT_APP} value={row.app} disabled={saving || !policy}
+                    <Input aria-label={`Check ${index + 1} app`} aria-describedby={problems.length ? errorId : undefined} aria-invalid={problems.length > 0} placeholder={DEFAULT_APP} value={row.app} disabled={saving || locked || !policy}
                       onChange={(event) => setField(row.key, 'app', event.target.value)} />
                     <div className="flex gap-1">
-                      <Button variant="outline" size="icon" aria-label={`Move check ${index + 1} up`} disabled={saving || index === 0} onClick={() => move(index, -1)}><ArrowUp className="size-4" /></Button>
-                      <Button variant="outline" size="icon" aria-label={`Move check ${index + 1} down`} disabled={saving || index === rows.length - 1} onClick={() => move(index, 1)}><ArrowDown className="size-4" /></Button>
-                      <Button variant="outline" size="icon" aria-label={`Remove check ${index + 1}`} disabled={saving} onClick={() => edit((current) => current.filter((item) => item.key !== row.key))}><Trash2 className="size-4" /></Button>
+                      <Button variant="outline" size="icon" aria-label={`Move check ${index + 1} up`} disabled={saving || locked || index === 0} onClick={() => move(index, -1)}><ArrowUp className="size-4" /></Button>
+                      <Button variant="outline" size="icon" aria-label={`Move check ${index + 1} down`} disabled={saving || locked || index === rows.length - 1} onClick={() => move(index, 1)}><ArrowDown className="size-4" /></Button>
+                      <Button variant="outline" size="icon" aria-label={`Remove check ${index + 1}`} disabled={saving || locked} onClick={() => edit((current) => current.filter((item) => item.key !== row.key))}><Trash2 className="size-4" /></Button>
                     </div>
                   </div>
                   {problems.length > 0 && <p id={errorId} className="text-xs text-destructive">{problems.join(' ')}</p>}
@@ -216,14 +225,14 @@ export function RequiredChecksDialog({ scope, open, onOpenChange, refresh, onRet
           {rows.length === 0 && <p className="text-sm text-muted-foreground">No required checks. A head with no check runs is not green.</p>}
           {check.list.map((message) => <p key={message} className="text-xs text-destructive">{message}</p>)}
           <div>
-            <Button variant="outline" size="sm" disabled={saving || !policy || rows.length >= MAX_CHECKS}
+            <Button variant="outline" size="sm" disabled={saving || locked || !policy || rows.length >= MAX_CHECKS}
               onClick={() => edit((current) => [...current, { key: nextKey.current++, name: '', app: DEFAULT_APP }])}>
               <Plus className="size-4" /> Add a check
             </Button>
           </div>
           <div className="grid gap-2">
             <Label htmlFor="checks-reason">Reason</Label>
-            <Input id="checks-reason" aria-invalid={reasonTooLong} value={reason} disabled={saving || !policy} onChange={(event) => setReason(event.target.value)} />
+            <Input id="checks-reason" aria-invalid={reasonTooLong} value={reason} disabled={saving || locked || !policy} onChange={(event) => setReason(event.target.value)} />
             <p className={reasonTooLong ? 'text-xs text-destructive' : 'text-xs text-muted-foreground'}>{reasonTooLong ? `The reason has at most ${MAX_REASON} characters.` : 'The reason is required. It is kept in the history with the new list.'}</p>
           </div>
           <Button onClick={() => void submit()} disabled={saving || !policy || !draft || stale}>Save</Button>
