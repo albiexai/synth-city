@@ -721,3 +721,41 @@ async def test_a_replacement_team_during_the_read_never_adds_to_the_old_campaign
     monkeypatch.setattr(campaigns, "members", replaced_during_the_read)
     by_name = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False))
     assert (by_name["merged"].value, by_name["closed_without_delivery"].value) == (1, 1)
+
+
+# #1252: the issue count of each repository
+async def test_a_snapshot_counts_the_issues_of_each_repository(db, world):
+    campaign = await _campaign(db, world)
+    snapshot = await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False)
+    assert [(r.repo, r.issues, r.complete, r.reason) for r in snapshot.repositories] == [
+        ("o/a1", 2, True, None), ("o/a2", 1, True, None)]
+    assert sum(r.issues for r in snapshot.repositories) == _measures(snapshot)["issues_in_scope"].value
+
+
+async def test_a_repository_that_could_not_be_read_has_an_unknown_count(db, world):
+    campaign = await _campaign(db, world)
+    snapshot = await snapshots.build_snapshot(db, campaign, _client(broken=("a2",)), as_of=AS_OF, cached=False)
+    by_repo = {r.repo: r for r in snapshot.repositories}
+    assert (by_repo["o/a1"].issues, by_repo["o/a1"].complete) == (2, True)
+    assert (by_repo["o/a2"].issues, by_repo["o/a2"].complete) == (None, False) and by_repo["o/a2"].reason
+
+
+async def test_a_snapshot_stored_before_repository_counts_still_reads(db, world):
+    campaign = await _campaign(db, world)
+    payload = (await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False)).model_dump(mode="json")
+    del payload["repositories"]
+    assert snapshots.Snapshot.model_validate(payload).repositories == []
+
+
+async def test_the_cached_snapshot_is_read_without_building_one(db, world):
+    campaign = await _campaign(db, world)
+    assert snapshots.cached_snapshot(campaign.id) is None
+    built = await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF)
+    assert snapshots.cached_snapshot(campaign.id) == built
+
+
+async def test_a_cutoff_gap_leaves_every_repository_count_unknown_in_the_snapshot(db, world):
+    campaign = await _campaign(db, world)
+    snapshot = await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, observed_at=AS_OF + timedelta(days=1), cached=False)
+    assert [(r.issues, r.complete, r.cutoff_gaps) for r in snapshot.repositories] == [
+        (None, True, ["membership_read_after_cutoff"])] * 2
