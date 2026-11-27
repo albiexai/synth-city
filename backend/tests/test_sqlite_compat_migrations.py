@@ -1121,6 +1121,25 @@ async def test_compat_migrations_add_pr2_github_auth_columns_idempotently():
 
 
 @pytest.mark.asyncio
+async def test_legacy_scope_timing_defaults_preserve_custom_settings_on_repeat_migration():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("CREATE TABLE team_github_scopes (id INTEGER PRIMARY KEY)"))
+            await conn.execute(text("INSERT INTO team_github_scopes VALUES (1)"))
+            values = text("SELECT id, merge_check_wait_minutes, effort_extension_cap_minutes, "
+                          "effort_extension_cap_percent FROM team_github_scopes")
+            await _run_sqlite_compat_migrations(conn)
+            assert (await conn.execute(values)).one() == (1, 60, 30, 25)
+            await conn.execute(text("UPDATE team_github_scopes SET merge_check_wait_minutes=12, "
+                                    "effort_extension_cap_minutes=7, effort_extension_cap_percent=10"))
+            await _run_sqlite_compat_migrations(conn)
+            assert (await conn.execute(values)).one() == (1, 12, 7, 10)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_pr2_base_migration_does_not_invent_historical_attempt_identity():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     try:

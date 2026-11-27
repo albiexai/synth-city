@@ -398,10 +398,50 @@ async def test_scope_patch_rolls_back_settings_and_history_on_audit_error(client
     monkeypatch.setattr(audit, "record_event", fail_after_insert)
     with pytest.raises(RuntimeError, match="synthetic settings audit failure"):
         await client.patch(f"/api/v1/agent-teams/github-scopes/{scope_id}", headers=OPERATOR_HEADERS,
-                           json={"max_item_effort_minutes": 45, "reason": "Change budget"})
+                           json={"max_item_effort_minutes": 45, "reason": "Change budget",
+                                 "merge_check_wait_minutes": 12, "effort_extension_cap_minutes": 7,
+                                 "effort_extension_cap_percent": 10})
     await db.refresh(scope)
     assert scope.max_item_effort_minutes == 120
+    assert (scope.merge_check_wait_minutes, scope.effort_extension_cap_minutes,
+            scope.effort_extension_cap_percent) == (60, 30, 25)
     assert await db.scalar(select(FactoryAuditEvent.id).where(FactoryAuditEvent.scope_id == scope_id)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "default", "minimum", "maximum", "custom"), [
+    ("merge_check_wait_minutes", 60, 1, 1440, 12),
+    ("effort_extension_cap_minutes", 30, 0, 1440, 7),
+    ("effort_extension_cap_percent", 25, 0, 100, 10),
+])
+async def test_scope_timing_settings_validate_and_record_history(
+    client, db, tmp_path, field, default, minimum, maximum, custom,
+):
+    preset, scope = await _scope(db, tmp_path / "timing-settings")
+    path = f"/api/v1/agent-teams/github-scopes/{scope.id}"
+    create_url = f"/api/v1/agent-teams/presets/{preset.id}/github-scopes"
+    payload = {"repo_owner": "owner", "repo_name": "new-timing", "repo_path": scope.repo_path, "enabled": False}
+    initial = (await client.get(f"{path}/settings", headers=OPERATOR_HEADERS)).json()
+    definition = initial["definitions"][field]
+    assert (definition["type"], definition["default"], definition["minimum"], definition["maximum"]) == (
+        "integer", default, minimum, maximum,
+    )
+    assert getattr(scope, field) == default
+    for invalid in (minimum - 1, maximum + 1, True):
+        assert (await client.post(create_url, headers=OPERATOR_HEADERS, json={**payload, field: invalid})).status_code == 422
+        assert (await client.patch(path, headers=OPERATOR_HEADERS, json={field: invalid})).status_code == 422
+    assert (await client.get(f"{path}/settings", headers=OPERATOR_HEADERS)).json()["history"] == []
+
+    created = await client.post(create_url, headers=OPERATOR_HEADERS, json={**payload, field: custom})
+    assert created.status_code == 200 and created.json()[field] == custom
+    changed = await client.patch(path, headers=OPERATOR_HEADERS, json={field: custom, "reason": "Tune scope limits"})
+    assert changed.status_code == 200 and changed.json()[field] == custom
+    record, = (await client.get(f"{path}/settings", headers=OPERATOR_HEADERS)).json()["history"]
+    assert record["changes"] == {field: {"before": default, "after": custom}}
+    assert (record["actor_kind"], record["via"], record["reason"]) == ("operator", "api", "Tune scope limits")
+    assert record["occurred_at"]
+    await db.refresh(scope)
+    assert getattr(scope, field) == custom
 
 
 class ApiGitRunner:

@@ -43,6 +43,7 @@ SAFE_VALUE_FIELDS = {
     "max_approval_rounds", "max_concurrent_dispatched", "max_verification_retries",
     "max_auto_merges_per_day", "max_build_parallelism", "builds_out_of_tree",
     "max_item_effort_minutes", "max_plan_estimate_minutes", "initial_paths_required", "review_hold_label", "github_auth_mode",
+    "merge_check_wait_minutes", "effort_extension_cap_minutes", "effort_extension_cap_percent",
     "supervisor_actor_id", "supervisor_grace_seconds", "supervisor_status",
     "mail_request_unanswered_seconds", "github_team_idle_timeout_seconds", "github_publish_summaries_enabled",
     "github_owner_idle_timeout_seconds", "github_nudge_grace_seconds",

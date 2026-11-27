@@ -263,6 +263,12 @@ The effort monitor sends its usual advisory notice at the limit. A defaulted lim
 - At approval an estimate over the ceiling is refused with `effort_estimate_exceeds_ceiling`, and an unreadable estimate with `effort_estimate_invalid`.
 - The repository scope setting is `max_item_effort_minutes`, changed with `PATCH /api/v1/agent-teams/github-scopes/{scope_id}` (operator token). It accepts 15 to 1440 and defaults to 120.
 
+Repository scope settings control the Leader's extension step. The smaller of `effort_extension_cap_minutes`
+and `effort_extension_cap_percent` of the original limit applies, rounded down to whole minutes. Either bound
+can be set to zero to disable extensions. The scope ceiling still limits the total. Use
+`PATCH /api/v1/agent-teams/github-scopes/{scope_id}` to change a scope setting with the Director key
+and `GET /api/v1/agent-teams/github-scopes/{scope_id}/settings` to read its limits and audit history.
+
 ## Healthy work item scope amendments and submitted review settlement
 
 These routes use the `/api/v1/agent-teams` prefix and current member session authentication.

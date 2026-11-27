@@ -73,7 +73,6 @@ _INCONCLUSIVE_CONCLUSIONS = {"cancelled", "timed_out"}
 _STATUS_SUCCESS_STATES = {"success"}
 _STATUS_FAILURE_STATES = {"failure", "error"}
 _TRANSIENT_MERGE_STATES = {"unstable", "blocked"}
-_MERGE_CHECK_WAIT_LIMIT = timedelta(minutes=60)
 _HUMAN_MERGE_NOTE_PREFIXES = (
     "Auto-merge blocked",
     "Auto-merge budget exhausted",
@@ -3780,11 +3779,12 @@ class GithubVerificationService:
             item.merge_wait_head_sha = head_sha
             item.merge_wait_started_at = now
         names = ", ".join(pending)
-        if now - item.merge_wait_started_at >= _MERGE_CHECK_WAIT_LIMIT:
+        wait_minutes = scope.merge_check_wait_minutes
+        if now - item.merge_wait_started_at >= timedelta(minutes=wait_minutes):
             await self._fallback_to_human_merge(
                 db,
                 item,
-                f"Auto-merge blocked: GitHub checks stalled for 60 minutes on head {head_sha}. "
+                f"Auto-merge blocked: GitHub checks stalled for {wait_minutes} minutes on head {head_sha}. "
                 f"Pending checks: {names}.",
             )
         else:
