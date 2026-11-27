@@ -6,7 +6,7 @@ The words that the Synth City pages use, in alphabetical order. Each term links 
 |---|---|---|
 | **Amendment** | Adding files to an approved plan while the item is healthy. The Leader approves it. | [Autonomous GitHub Dispatch](/autonomy) |
 | **Approval** | The Leader's decision on a plan. A prose reply is not an approval. | [Agent Mail](/features/agent-mail) |
-| **Area label** | A GitHub label on an issue. Routing gives the issue to the first enabled slot whose area labels include it. | [Teams](/features/agent-teams) |
+| **Area label** | A GitHub label on an issue. Routing gives the issue to the first eligible builder, in roster order, whose area labels include it. | [Teams](/features/agent-teams) |
 | **Attempt** | One try at an issue, from dispatch to merge or stop. A retry is a new attempt. | [Autonomous GitHub Dispatch](/autonomy) |
 | **Backend** | The Synth City server process. It polls GitHub, keeps the database, prepares folders and sends messages. It never writes code. | [Architecture](/guide/architecture) |
 | **Builder** | An agent in a slot with the implementer role. It writes the plan and the code. | [Teams](/features/agent-teams) |
@@ -24,10 +24,10 @@ The words that the Synth City pages use, in alphabetical order. Each term links 
 | **Plan** | The list of files, commands and actions that a builder proposes for an attempt. The Leader approves it. | [Supervised Factory Playbook](/guide/supervised-factory-playbook) |
 | **Queue** | The issues that have the dispatch label and wait for a builder and a workspace. | [Work](/features/work) |
 | **Repository scope** | One watched repository and the rules for working on it, for one team. | [Repositories](/features/repositories) |
-| **Required check** | A CI job that must succeed on the exact head before merge. The delivery policy names it. | [Repositories](/features/repositories) |
+| **Required check** | A CI job that must succeed on the exact head before merge. The delivery policy names it. Other checks on the head must not fail or stay pending either. | [Repositories](/features/repositories) |
 | **Review** | A verifier's check of one exact head: the acceptance items, the tests and the agreed plan. | [Supervised Factory Playbook](/guide/supervised-factory-playbook) |
 | **Review hold** | A GitHub label that blocks automatic merge until the accepting verifier removes it. | [Repositories](/features/repositories) |
-| **Routing** | Choosing the slot for an issue, by area label, in roster order. | [Teams](/features/agent-teams) |
+| **Routing** | Choosing the builder for an issue. Only builders whose capability tier allows the difficulty of the issue are eligible. The first eligible builder, in roster order, whose area labels match gets it. | [Teams](/features/agent-teams) |
 | **Scope revision** | One version of the approved plan of an attempt. Revision 0 is the first plan. Continuations are revisions 1, 2 and so on. | [Teams](/features/agent-teams) |
 | **Slot** | One seat in a team: its harness, model, folder, role and charter. The agent in the slot is the member. | [Teams](/features/agent-teams) |
 | **Supervisor** | A person or agent outside the team who watches it and handles incidents. | [Teams](/features/agent-teams#supervisor-binding) |
