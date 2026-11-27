@@ -86,26 +86,27 @@ def read_claude_usage(start: datetime, end: datetime, members: list[ClaudeMember
     pricing = PricingService()
     # Each transcript folder once, however its workspace is spelled. A Codex member's workspace is listed too: an
     # earlier Claude Code session there is unattributed usage.
+    resolved = {member.workspace: _resolve(member.workspace) for member in members}
     folders: dict[Path, Path] = {}
-    for member in members:
-        workspace = Path(member.workspace).resolve()
-        folders.setdefault(root / convert_path_to_folder_name(str(workspace)), workspace)
+    for workspace in resolved.values():
+        if workspace is not None:
+            folders.setdefault(root / convert_path_to_folder_name(str(workspace)), workspace)
     claims: dict[tuple[Path, str], list[str]] = {}
     for member in members:
-        if member.provider == "claude-code" and _canonical(member.session_id):
-            claims.setdefault((_folder(root, member), member.session_id), []).append(member.member)
+        if member.provider == "claude-code" and _canonical(member.session_id) and resolved[member.workspace]:
+            claims.setdefault((_folder(root, resolved[member.workspace]), member.session_id), []).append(member.member)
     results = []
     for member in members:
         if member.provider != "claude-code":
             reason = "harness_not_read"
-        elif not _canonical(member.session_id):
+        elif not _canonical(member.session_id) or resolved[member.workspace] is None:
             reason = "binding_unverified"
-        elif len(claims[(_folder(root, member), member.session_id)]) > 1:
+        elif len(claims[(_folder(root, resolved[member.workspace]), member.session_id)]) > 1:
             reason = "competing_binding"  # the session is shown once, unattributed
         else:
             try:
-                models = _read(_folder(root, member) / f"{member.session_id}.jsonl", member.session_id,
-                               Path(member.workspace).resolve(), uid, max_bytes, start, end, pricing)
+                models = _read(_folder(root, resolved[member.workspace]) / f"{member.session_id}.jsonl",
+                               member.session_id, resolved[member.workspace], uid, max_bytes, start, end, pricing)
             except _Unknown as unknown:
                 reason = unknown.reason
             else:
@@ -140,8 +141,16 @@ def _canonical(session_id: str | None) -> bool:
         return False
 
 
-def _folder(root: Path, member: ClaudeMember) -> Path:
-    return root / convert_path_to_folder_name(str(Path(member.workspace).resolve()))
+def _folder(root: Path, workspace: Path) -> Path:
+    return root / convert_path_to_folder_name(str(workspace))
+
+
+def _resolve(path: str) -> Path | None:
+    """The canonical path, or None when the file system can't resolve it (a loop or an I/O error)."""
+    try:
+        return Path(path).resolve()
+    except (OSError, RuntimeError):
+        return None
 
 
 def _price_reasons(models: list[ModelUsage]) -> list[str]:
@@ -193,8 +202,8 @@ def _read(path: Path, session_id: str, workspace: Path, uid: int, max_bytes: int
             continue  # a user turn, a system notice or a summary carries no usage
         message_id, model, at, tokens = _message(row)
         cwd = row.get("cwd")
-        if (row.get("sessionId") != session_id or not isinstance(cwd, str) or not Path(cwd).is_absolute()
-                or not Path(cwd).resolve().is_relative_to(workspace)):
+        place = _resolve(cwd) if isinstance(cwd, str) and Path(cwd).is_absolute() else None
+        if row.get("sessionId") != session_id or place is None or not place.is_relative_to(workspace):
             raise _Unknown("session_mismatch")
         if message_id in seen:
             continue  # one message is written as one row per content block: count it once, at its first row

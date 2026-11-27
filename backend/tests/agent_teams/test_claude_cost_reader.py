@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -291,6 +292,38 @@ def test_two_members_claiming_one_session_are_unknown_and_it_is_unattributed_onc
     assert by_member["B2"].unknown_reasons == []
     claimed = [u for u in report.unattributed if u.session_id == SA]
     assert len(claimed) == 1 and claimed[0].messages == 2 and claimed[0].unknown_reasons == ["competing_binding"]
+
+
+def _failing_resolve(monkeypatch, bad, error):
+    resolve = Path.resolve
+
+    def fail(self, *args, **kwargs):
+        if str(self) == bad:
+            raise error("cannot resolve")
+        return resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail)
+
+
+@pytest.mark.parametrize("error", [OSError, RuntimeError])
+def test_a_row_cwd_that_cannot_be_resolved_is_unknown_for_that_member_only(team, monkeypatch, error):
+    home, members = team
+    workspace = Path(members[0].workspace)
+    (workspace / "sub").mkdir()
+    _session(home, workspace, SA, [{**_row("m3", START + timedelta(hours=1)), "cwd": str(workspace / "sub")}])
+    _failing_resolve(monkeypatch, str(workspace / "sub"), error)
+    by_member = {m.member: m for m in _read(home, members).members}
+    assert by_member["B1"].cost_usd is None and by_member["B1"].unknown_reasons == ["session_mismatch"]
+    assert by_member["B2"].cost_usd == pytest.approx(_price((500, 0, 1000, 50)))
+
+
+@pytest.mark.parametrize("error", [OSError, RuntimeError])
+def test_a_workspace_that_cannot_be_resolved_is_unknown_for_that_member_only(team, monkeypatch, error):
+    home, members = team
+    _failing_resolve(monkeypatch, members[1].workspace, error)
+    by_member = {m.member: m for m in _read(home, members).members}
+    assert by_member["B2"].cost_usd is None and by_member["B2"].unknown_reasons == ["binding_unverified"]
+    assert by_member["B1"].cost_usd == pytest.approx(_price((1000, 200, 50, 10)) + _price((2000, 0, 0, 100)))
 
 
 # Each transcript counts once
