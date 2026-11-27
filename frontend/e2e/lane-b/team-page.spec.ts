@@ -17,6 +17,45 @@ const MEMBERS = ['D2 Docs lead', 'D3 Writer', 'D4 Editor', 'D5 Reviewer']
 test.use({ viewport: { width: 1440, height: 900 } })
 
 for (const width of [1440, 390]) {
+  for (const shared of [true, false]) {
+    test(`@active the shared-user warning follows the install at ${width}px (shared: ${shared})`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 900 })
+      await page.route('**/api/v1/providers', async route => {
+        const response = await route.fetch()
+        const registry = await response.json()
+        await route.fulfill({ response, json: { ...registry, installation_search: {
+          controller_user: 'controller', agent_user: shared ? null : 'agent', path: '',
+        } } })
+      })
+      await page.route('**/api/v1/agent-mail/authentication-status', route => route.fulfill({
+        json: { director_key_configured: true },
+      }))
+      const scopeLoaded = page.waitForResponse('**/api/v1/providers')
+      await page.goto(TEAM)
+      await scopeLoaded
+      const warning = /agents running as the controller can read the Director key/i
+      if (shared) await expect(page.locator('main').getByText(warning)).toBeVisible()
+      else await expect(page.locator('main').getByText(warning)).toHaveCount(0)
+      expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width)
+
+      await page.getByRole('button', { name: 'From Mail' }).click()
+      const prompt = page.getByRole('dialog', { name: 'Director key' })
+      await expect(prompt).toBeVisible()
+      if (shared) await expect(prompt.getByText(warning)).toBeVisible()
+      else await expect(prompt.getByText(warning)).toHaveCount(0)
+      expect((await prompt.boundingBox())?.width).toBeLessThanOrEqual(width)
+
+      await page.goto('/agent-bridge')
+      await page.getByRole('button', { name: 'More actions for B1 Backend' }).click()
+      await page.getByRole('menuitem', { name: /Kill session/ }).click()
+      const killPrompt = page.getByRole('dialog', { name: /^Kill / })
+      await expect(killPrompt.getByLabel('Director key')).toBeVisible()
+      if (shared) await expect(killPrompt.getByText(warning)).toBeVisible()
+      else await expect(killPrompt.getByText(warning)).toHaveCount(0)
+      await killPrompt.getByRole('button', { name: 'Cancel' }).click()
+    })
+  }
+
   test(`@active shows a queued handoff on the team and its work item at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 900 })
     const now = Date.now()

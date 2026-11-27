@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -17,10 +18,14 @@ from fastapi import Depends, FastAPI
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.api.v1 import factory_maintenance
 from app.config import settings
 from app.database import Base, get_db
 from app.main import app
-from app.models.database import AgentTeamPreset, FactoryAuditEvent, MailAgentSession
+from app.models.database import (
+    AgentTeamPreset, FactoryAuditEvent, GithubApprovalRequest, GithubWorkItem, GithubWorkspace, MailAgentSession,
+    TeamGithubScope,
+)
 from app.models.schemas import MailAgentRegisterRequest
 from app.services import factory_audit_service as audit
 from app.services.agent_mail_service import agent_mail_service
@@ -85,6 +90,128 @@ async def _events(db, preset, kind="policy_change"):
 
 async def _campaign(client, preset, milestone="v4.2", **headers):
     return await client.patch(f"{PATH}/{preset.id}", json={"backlog_milestone": milestone}, headers=headers)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method,path,body,event_kind",
+    [
+        ("PUT", "agent-teams/presets/{preset}/supervisor", {"actor_id": None}, "policy_change"),
+        ("PUT", "agent-teams/presets/{preset}/dispatch-pause", {"paused": True, "reason": "test"}, "policy_change"),
+        ("PUT", "agent-teams/presets/{preset}/leader", {
+            "leader_slot_id": 99, "expected_updated_at": "2026-01-01T00:00:00Z", "reason": "test",
+        }, "leader_assignment"),
+        ("PATCH", "agent-teams/github-scopes/{scope}", {"base_ref": "origin/new-base"}, "policy_change"),
+        ("PATCH", "agent-teams/github-scopes/{scope}/continuation-policy", {
+            "continuation_enabled": True, "max_continuation_revisions": 2, "max_continuation_failed_heads": 3,
+            "max_failed_heads_per_revision": 1, "max_scope_paths": 8, "max_scope_commands": 4,
+        }, "policy_change"),
+        ("POST", "agent-teams/github-scopes/{scope}/workspaces/{workspace}/force-release", {
+            "force": True, "expected_leased_at": "2026-01-01T00:00:00Z", "reason": "test",
+        }, "workspace_release"),
+        ("POST", "agent-teams/github-work-items/{item}/abandon", {"reason": "test"}, "operator_escalation"),
+        ("POST", "agent-teams/presets/{preset}/work-items/{item}/resume-attempt",
+         {"resume": True}, "prepared_attempt_resume"),
+        ("POST", "agent-teams/github-work-items/{item}/approval-requests/{request}/cancel",
+         {"cancel": True, "dispatch_nonce": "test-nonce", "reason": "test"}, "recovery_cancellation"),
+        ("POST", "agent-teams/github-work-items/{item}/continuation-requests/{request}/cancel",
+         {}, "request_cancellation"),
+        ("POST", "agent-teams/github-work-items/{item}/scope-revisions/1/checkpoint-release",
+         {"release": True, "dispatch_nonce": "test-nonce", "approval_request_id": 1, "stage": "ack"},
+         "recovery_checkpoint_release"),
+        ("POST", "agent-teams/github-work-items/{item}/scope-revisions/1/cancel",
+         {"cancel": True, "dispatch_nonce": "test-nonce", "reason": "test"}, "recovery_cancellation"),
+        ("POST", "factory/review-acceptances", {
+            "declaration_id": "via-test-review", "work_item_id": 999,
+            "attempt": "item:999:launch:None:revision:None", "artifact": "example/audit/pull/1",
+            "version": "a" * 40, "reviewer": "Independent reviewer", "reviewer_kind": "human",
+            "independent": True, "decision": "accepted", "occurred_at": "2026-01-01T00:00:00Z",
+            "source_kind": "operator_attested", "source_ref": "test",
+        }, "review_acceptance_declared"),
+    ],
+)
+async def test_operator_route_audit_event_has_the_request_access_path(
+    client, db, preset, tmp_path, method, path, body, event_kind,
+):
+    scope = TeamGithubScope(preset_id=preset.id, repo_owner="example", repo_name="audit", repo_path="/tmp/audit")
+    db.add(scope)
+    await db.flush()
+    item = GithubWorkItem(scope_id=scope.id, issue_number=1, issue_title="Audit", issue_url="https://example.invalid/1",
+                          github_updated_at=datetime(2026, 1, 1), dispatch_status="pending")
+    workspace = GithubWorkspace(scope_id=scope.id, path="/tmp/audit-ws", kind="primary")
+    db.add_all((item, workspace))
+    await db.commit()
+    request_id = None
+    if "{request}" in path:
+        member = (await _session(db, tmp_path)).member_id
+        request = GithubApprovalRequest(
+            work_item_id=item.id, dispatch_nonce="test-nonce", approval_round=1, request_fingerprint="test",
+            owner_member_id=member, leader_member_id=member,
+            request_kind="initial_plan" if "/approval-requests/" in path else "continuation",
+        )
+        db.add(request)
+        await db.commit()
+        request_id = request.id
+    url = path.format(preset=preset.id, scope=scope.id, item=item.id, workspace=workspace.id, request=request_id)
+    response = await client.request(method, f"/api/v1/{url}", json=body, headers={"Origin": UI_ORIGIN})
+    assert response.status_code in (200, 201, 409), response.text
+    events = (await db.scalars(select(FactoryAuditEvent).where(FactoryAuditEvent.event_kind == event_kind))).all()
+    assert events
+    if url.endswith("/dispatch-pause"):
+        assert response.status_code == 200
+        assert [event.action_outcome for event in events] == ["applied"]
+    assert {(event.actor_kind, event.via, event.actor_session_id) for event in events} == {("operator", "ui", None)}
+
+
+@pytest.mark.asyncio
+async def test_force_release_records_the_validated_mail_path_on_success(client, db, preset, tmp_path):
+    session = await _session(db, tmp_path)
+    scope = TeamGithubScope(preset_id=preset.id, repo_owner="example", repo_name="audit", repo_path=str(tmp_path))
+    db.add(scope)
+    await db.flush()
+    leased_at = datetime(2026, 1, 1)
+    item = GithubWorkItem(scope_id=scope.id, issue_number=1, issue_title="Audit", issue_url="https://example.invalid/1",
+                          github_updated_at=leased_at, dispatch_status="merged")
+    db.add(item)
+    await db.flush()
+    workspace = GithubWorkspace(scope_id=scope.id, path=str(tmp_path), kind="primary",
+                                leased_item_id=item.id, leased_at=leased_at, lease_token="synthetic-lease")
+    db.add(workspace)
+    await db.commit()
+    response = await client.post(
+        f"/api/v1/agent-teams/github-scopes/{scope.id}/workspaces/{workspace.id}/force-release",
+        json={"force": True, "expected_leased_at": "2026-01-01T00:00:00Z", "reason": "test"},
+        headers={"Origin": UI_ORIGIN, "X-Synth-City-Session-Token": SESSION_TOKEN},
+    )
+    assert response.status_code == 200, response.text
+    (event,) = (await db.scalars(select(FactoryAuditEvent).where(FactoryAuditEvent.event_kind == "workspace_release"))).all()
+    assert (event.action_outcome, event.actor_kind, event.via, event.actor_session_id) == (
+        "applied", "operator", "mail_tool", session.id,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint,service,body",
+    [
+        ("end-stopped", "end_stopped_item", {
+            "operation_id": "test", "expected_dispatch_generation": None, "expected_scope_revision": 0,
+            "outcome": "deferred", "target_milestone": "v4.5", "reason": "test",
+        }),
+        ("terminal-revisions/1/reconcile", "reconcile_terminal_revision", {
+            "operation_id": "test", "expected_context_sha256": "a" * 64, "reason": "test",
+        }),
+        ("resume-observation", "resume_observation_pause", {"pause_id": 1, "reason": "test"}),
+    ],
+)
+async def test_maintenance_operator_routes_forward_the_audit_actor(client, preset, monkeypatch, endpoint, service, body):
+    monkeypatch.setattr(factory_maintenance, "context", AsyncMock(return_value=(None, None)))
+    handler = AsyncMock(return_value={"ok": True})
+    monkeypatch.setattr(factory_maintenance, service, handler)
+    response = await client.post(f"{PATH}/{preset.id}/work-items/1/{endpoint}", json=body)
+    assert response.status_code == 200, response.text
+    handler.assert_awaited_once()
+    assert handler.await_args.kwargs["actor"] == audit.derive_actor(actor_kind="operator", via="api")
 
 
 # --- derive_actor ---------------------------------------------------------------------------------------------------------

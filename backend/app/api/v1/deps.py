@@ -218,6 +218,15 @@ async def operator_write_context(
             "member_id": session.member_id if session is not None else None, "session_invalid": invalid}
 
 
+def operator_audit_actor(context: dict | None) -> dict:
+    """Attribute an authorized operator write using the request dependency."""
+    from app.services import factory_audit_service as audit
+
+    if not isinstance(context, dict):
+        return audit.derive_actor(actor_kind="operator")
+    return audit.derive_actor(actor_kind="operator", via=context["via"], session_id=context["session_id"])
+
+
 async def enforce_director_access_path(
     db: AsyncSession, context: dict, *, operator_token: str | None, source: str,
     preset_id: int | None = None,

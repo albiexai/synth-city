@@ -20,6 +20,7 @@ from sqlalchemy.orm import aliased
 from app.api.v1.deps import (
     enforce_director_access_path,
     mail_session,
+    operator_audit_actor as _write_actor,
     require_mail_session_or_operator,
     operator_write_context,
     require_director_action,
@@ -144,24 +145,6 @@ _CONTINUATION_POLICY_FIELDS = (
 
 
 
-def _operator_actor() -> dict:
-    """C08: the shared operator credential is a role, never a named person."""
-    from app.services import factory_audit_service as _audit
-    return _audit.derive_actor(actor_kind="operator")
-
-
-def _write_actor(context: dict | None) -> dict:
-    """#945: the operator key authorized the write; the context says how it arrived (server-derived, see deps).
-
-    Only the dependency supplies a context. A direct call of the route function has none, and records the plain operator.
-    """
-    from app.services import factory_audit_service as _audit
-    if not isinstance(context, dict):
-        return _audit.derive_actor(actor_kind="operator")
-    return _audit.derive_actor(
-        actor_kind="operator", via=context["via"], session_id=context["session_id"])
-
-
 def _session_actor(session) -> dict:
     """C08: an authenticated Mail session acts as its member and session.
 
@@ -239,25 +222,25 @@ def _policy_event_snapshot(scope, request) -> dict:
     }
 
 
-async def _observe_policy_rejection(db, code: str, *, scope_id: int | None) -> None:
+async def _observe_policy_rejection(db, code: str, *, scope_id: int | None, actor: dict) -> None:
     """C09: an optimistic-concurrency policy refusal with its scope."""
     await _observe_refusal(
         db,
         event_kind="policy_change",
         source="agent_teams.update_github_scope",
-        actor=_operator_actor(),
+        actor=actor,
         code=code,
         scope_id=scope_id,
     )
 
 
-async def _observe_resume_rejection(db, item_id: int, code: str) -> None:
+async def _observe_resume_rejection(db, item_id: int, code: str, *, actor: dict) -> None:
     """C09: an operator resume refusal on the operator-protected route."""
     await _observe_refusal(
         db,
         event_kind="prepared_attempt_resume",
         source="agent_teams.resume_github_work_item_attempt",
-        actor=_operator_actor(),
+        actor=actor,
         code=code,
         item_id=item_id,
     )
@@ -391,13 +374,14 @@ async def read_supervisor(preset_id: int, db: AsyncSession = Depends(get_db)):
 @router.put("/presets/{preset_id}/supervisor", response_model=SupervisorObservation,
             dependencies=[Depends(require_director_action())])
 async def update_supervisor(preset_id: int, request: SupervisorBindingRequest,
-                            db: AsyncSession = Depends(get_db)):
+                            db: AsyncSession = Depends(get_db),
+                            write_context: dict | None = Depends(operator_write_context)):
     from app.services.agent_team_supervisor_service import bind_supervisor
     try:
         return await bind_supervisor(db, preset_id, actor_id=request.actor_id,
             grace_seconds=request.grace_seconds, set_grace="grace_seconds" in request.model_fields_set,
             expected_binding_version=request.expected_binding_version,
-            expected_team_context_key=request.expected_team_context_key)
+            expected_team_context_key=request.expected_team_context_key, recording_actor=_write_actor(write_context))
     except ValueError as exc:
         code = str(exc)
         raise HTTPException(status_code=409 if code == "supervisor_binding_changed" else 404,
@@ -777,7 +761,7 @@ async def _scope_residual_workspace_authority(db: AsyncSession, scope_id: int) -
     return residual is not None
 
 
-async def _reserve_scope_writer(db: AsyncSession, scope_id: int) -> TeamGithubScope:
+async def _reserve_scope_writer(db: AsyncSession, scope_id: int, *, actor: dict | None = None) -> TeamGithubScope:
     """Acquire the SQLite writer before authoritative scope-use checks."""
     if db.get_bind().dialect.name != "sqlite":
         raise HTTPException(status_code=503, detail="scope_update_serialization_unavailable")
@@ -791,7 +775,7 @@ async def _reserve_scope_writer(db: AsyncSession, scope_id: int) -> TeamGithubSc
     except OperationalError as exc:
         await db.rollback()
         await _observe_policy_rejection(
-            db, "scope_changed_during_update", scope_id=scope_id)
+            db, "scope_changed_during_update", scope_id=scope_id, actor=actor or _write_actor(None))
         raise HTTPException(status_code=409, detail="scope_changed_during_update") from exc
     if result.rowcount != 1:
         raise HTTPException(status_code=404, detail="GitHub scope not found")
@@ -1930,6 +1914,7 @@ async def cancel_github_work_item_initial_approval(
     request: GithubInitialApprovalCancelRequest,
     _operator: None = Depends(require_operator),
     db: AsyncSession = Depends(get_db),
+    write_context: dict | None = Depends(operator_write_context),
 ):
     try:
         # C09: the service records the applied fact with its guarded
@@ -1940,7 +1925,7 @@ async def cancel_github_work_item_initial_approval(
             request_id=request_id,
             dispatch_nonce=request.dispatch_nonce,
             reason=request.reason,
-            actor=_operator_actor(),
+            actor=_write_actor(write_context),
         )
         return _approval_authority_response(approval)
     except GithubApprovalError as exc:
@@ -1950,7 +1935,7 @@ async def cancel_github_work_item_initial_approval(
                 db,
                 event_kind="recovery_cancellation",
                 source="agent_teams.cancel_github_work_item_initial_approval",
-                actor=_operator_actor(),
+                actor=_write_actor(write_context),
                 code=exc.detail,
                 item_id=item_id,
                 request_id=request_id,
@@ -1967,6 +1952,7 @@ async def cancel_github_work_item_continuation_request(
     request_id: int,
     principal: MailAgentSession | None = Depends(require_mail_session_or_operator),
     db: AsyncSession = Depends(get_db),
+    write_context: dict | None = Depends(operator_write_context),
 ):
     approval = await db.get(GithubApprovalRequest, request_id)
     if (
@@ -1977,7 +1963,7 @@ async def cancel_github_work_item_continuation_request(
         raise HTTPException(status_code=404, detail="approval_request_not_found")
     # C08: the operator route and the authenticated requester act as
     # themselves. The service records one fact only for a changed request.
-    actor = _operator_actor() if principal is None else _session_actor(principal)
+    actor = _write_actor(write_context) if principal is None else _session_actor(principal)
     try:
         if principal is None:
             cancelled, _changed = await github_approval_service._cancel_authorized(
@@ -2016,6 +2002,7 @@ async def release_github_recovery_checkpoint(
     request: GithubRecoveryCheckpointReleaseRequest,
     _operator: None = Depends(require_operator),
     db: AsyncSession = Depends(get_db),
+    write_context: dict | None = Depends(operator_write_context),
 ):
     item = await db.get(GithubWorkItem, item_id)
     if item is None:
@@ -2028,7 +2015,7 @@ async def release_github_recovery_checkpoint(
             dispatch_nonce=request.dispatch_nonce,
             approval_request_id=request.approval_request_id,
             stage=request.stage,
-            actor=_operator_actor(),
+            actor=_write_actor(write_context),
         )
     except GithubApprovalError as exc:
         # C09: stale stage, lease, approval and CAS refusals are recorded;
@@ -2037,7 +2024,7 @@ async def release_github_recovery_checkpoint(
             db,
             event_kind="recovery_checkpoint_release",
             source="agent_teams.release_github_recovery_checkpoint",
-            actor=_operator_actor(),
+            actor=_write_actor(write_context),
             code=exc.detail,
             item_id=item_id,
         )
@@ -2055,6 +2042,7 @@ async def cancel_active_github_work_item_scope_revision(
     request: GithubActiveContinuationCancelRequest,
     _operator: None = Depends(require_operator),
     db: AsyncSession = Depends(get_db),
+    write_context: dict | None = Depends(operator_write_context),
 ):
     item = await db.get(GithubWorkItem, item_id)
     if item is None:
@@ -2070,7 +2058,7 @@ async def cancel_active_github_work_item_scope_revision(
             revision_number=revision_number,
             dispatch_nonce=request.dispatch_nonce,
             reason=request.reason,
-            actor=_operator_actor(),
+            actor=_write_actor(write_context),
         )
     except ActiveCancellationNoticeError as exc:
         # The cancellation is committed; only its notice failed and the
@@ -2081,7 +2069,7 @@ async def cancel_active_github_work_item_scope_revision(
             db,
             event_kind="recovery_cancellation",
             source="agent_teams.cancel_active_github_work_item_scope_revision",
-            actor=_operator_actor(),
+            actor=_write_actor(write_context),
             code=exc.detail,
             item_id=item_id,
         )
@@ -2689,6 +2677,7 @@ async def set_preset_leader(
     request: AgentTeamLeaderUpdateRequest,
     _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
+    write_context: dict | None = Depends(operator_write_context),
 ):
     try:
         return await agent_team_service.set_leader(
@@ -2698,6 +2687,7 @@ async def set_preset_leader(
             expected_leader_slot_id=request.expected_leader_slot_id,
             expected_updated_at=request.expected_updated_at,
             reason=request.reason,
+            actor=_write_actor(write_context),
         )
     except ValueError as exc:
         code = str(exc)
@@ -2709,7 +2699,7 @@ async def set_preset_leader(
                 db,
                 event_kind="leader_assignment",
                 source="agent_teams.set_preset_leader",
-                actor=_operator_actor(),
+                actor=_write_actor(write_context),
                 code=code,
                 team_preset_id=preset_id,
             )
@@ -2896,7 +2886,7 @@ async def update_github_scope(
             installation_id = await _resolve_app_installation_for_repository(proposed_owner, proposed_repo)
         compatible_checkout = await dispatch_worktrees_match_checkout(worktree_bindings, proposed_repo_path)
 
-        scope = await _reserve_scope_writer(db, scope_id)
+        scope = await _reserve_scope_writer(db, scope_id, actor=_write_actor(write_context))
         if _scope_configuration(scope) != observed_configuration:
             raise HTTPException(status_code=409, detail="scope_changed_during_app_lookup")
         bounds = request.model_dump(include=set(TeamGithubScopeSafetyBounds.model_fields), exclude_none=True)
@@ -2989,7 +2979,7 @@ async def update_github_scope(
         # C09: guarded CAS and authority refusals record their rejected
         # outcome. _reserve_scope_writer already observed its own refusal.
         if exc.status_code == 409 and exc.detail != "scope_changed_during_update":
-            await _observe_policy_rejection(db, str(exc.detail), scope_id=scope_id)
+            await _observe_policy_rejection(db, str(exc.detail), scope_id=scope_id, actor=_write_actor(write_context))
         raise
     except IntegrityError as exc:
         await db.rollback()
@@ -2997,7 +2987,7 @@ async def update_github_scope(
     except OperationalError as exc:
         await db.rollback()
         await _observe_policy_rejection(
-            db, "scope_changed_during_update", scope_id=scope_id)
+            db, "scope_changed_during_update", scope_id=scope_id, actor=_write_actor(write_context))
         raise HTTPException(status_code=409, detail="scope_changed_during_update") from exc
     except ValueError as exc:
         await db.rollback()
@@ -3024,6 +3014,7 @@ async def update_github_scope_continuation_policy(
     request: TeamGithubContinuationPolicyUpdate,
     _operator: None = Depends(require_director_action()),
     db: AsyncSession = Depends(get_db),
+    write_context: dict | None = Depends(operator_write_context),
 ):
     scope = await db.get(TeamGithubScope, scope_id)
     if scope is None:
@@ -3049,7 +3040,7 @@ async def update_github_scope_continuation_policy(
         event_kind="policy_change",
         source="agent_teams.update_github_scope_continuation_policy",
         occurred_at=datetime.now(timezone.utc),
-        actor=_operator_actor(),
+        actor=_write_actor(write_context),
         scope_id=scope.id,
         before_values=before_values,
         after_values=after_values,
@@ -3277,6 +3268,7 @@ async def force_release_github_workspace(
     request: GithubWorkspaceForceReleaseRequest,
     _operator: None = Depends(require_operator),
     db: AsyncSession = Depends(get_db),
+    write_context: dict | None = Depends(operator_write_context),
 ):
     scope = await db.get(TeamGithubScope, scope_id)
     if scope is None:
@@ -3284,6 +3276,7 @@ async def force_release_github_workspace(
     workspace = await db.get(GithubWorkspace, workspace_id)
     if workspace is None or workspace.scope_id != scope_id:
         raise HTTPException(status_code=404, detail="GitHub workspace not found")
+    actor = _write_actor(write_context)
     if workspace.leased_item_id is None:
         # C09: an authenticated operator refusal is recorded for the scope;
         # no item lease exists to bind.
@@ -3291,7 +3284,7 @@ async def force_release_github_workspace(
             db,
             event_kind="workspace_release",
             source="agent_teams.force_release_github_workspace",
-            actor=_operator_actor(),
+            actor=actor,
             code="workspace_not_leased",
             scope_id=scope_id,
         )
@@ -3313,6 +3306,8 @@ async def force_release_github_workspace(
         released = await github_workspace_service.force_release_acquisition(
             db,
             actor_kind="operator",
+            actor_session_id=actor["actor_session_id"],
+            actor_via=actor.get("via"),
             workspace_id=workspace_id,
             scope_id=scope_id,
             item_id=released_item_id,
@@ -3499,6 +3494,7 @@ async def resume_github_work_item_attempt(
     request: GithubWorkItemResumeAttemptRequest,
     _operator: None = Depends(require_operator),
     db: AsyncSession = Depends(get_db),
+    write_context: dict | None = Depends(operator_write_context),
 ):
     try:
         await agent_team_service.require_preset_row(db, preset_id)
@@ -3524,9 +3520,10 @@ async def resume_github_work_item_attempt(
             scope,
             list(slots),
             reassign_to_slot_id=request.reassign_to_slot_id,
+            actor=_write_actor(write_context),
         )
     except ResumeAttemptError as exc:
-        await _observe_resume_rejection(db, item_id, exc.block_code)
+        await _observe_resume_rejection(db, item_id, exc.block_code, actor=_write_actor(write_context))
         raise _conflict(str(exc), exc.block_code) from exc
     return await _reload_work_item_response(db, item.id)
 
@@ -3540,6 +3537,7 @@ async def abandon_github_work_item(
     request: GithubWorkItemAbandonRequest | None = None,
     db: AsyncSession = Depends(get_db),
     _operator: None = Depends(require_operator),
+    write_context: dict | None = Depends(operator_write_context),
 ):
     item = await db.get(GithubWorkItem, work_item_id)
     if item is None:
@@ -3559,7 +3557,7 @@ async def abandon_github_work_item(
             db,
             event_kind="operator_escalation",
             source="agent_teams.abandon_github_work_item",
-            actor=_operator_actor(),
+            actor=_write_actor(write_context),
             code="work_item_not_abandonable",
             scope_id=item.scope_id,
             item_id=item.id,
@@ -3582,7 +3580,7 @@ async def abandon_github_work_item(
     # outcome and later retries never inflate non-delivery counts.
     abandoned_item_id = item.id
     await github_dispatch_service.abandon_by_operator(
-        db, item, note, actor=_operator_actor())
+        db, item, note, actor=_write_actor(write_context))
     return await _reload_work_item_response(db, abandoned_item_id)
 
 
