@@ -282,6 +282,9 @@ export function RepositorySetupPage() {
     baseRef: currentPreflight?.checks.base_branch?.status === "ready" ? draft.baseRef : undefined,
     dispatchLabel: currentPreflight?.checks.dispatch_label?.status === "ready" ? draft.dispatch : undefined,
     areaLabels: workerName ? parseAreaLabels(slotRouting[workerName]?.areaLabels ?? "") : undefined,
+    // A saved scope states its own plan limit. A scope that is not saved yet keeps the documented default.
+    maxItemEffortMinutes: scope?.max_item_effort_minutes,
+    maxPlanEstimateMinutes: scope?.max_plan_estimate_minutes,
   });
   // The key is a worker name, LEADER_KEY or VERIFIER_KEY.
   const charterField = (key: string, role: CharterRole) => <CharterField

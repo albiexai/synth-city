@@ -187,6 +187,8 @@ export type SafeWorkItem = {
   retry_count: number;
   scope_id: number;
   scope_default_effort_limit_minutes?: number | null;
+  plan_estimate_minutes?: number | null;
+  plan_limit_minutes?: number | null;
   updated_at: string;
 };
 

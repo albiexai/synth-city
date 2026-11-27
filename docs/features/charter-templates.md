@@ -12,7 +12,7 @@ Each template holds the same eight rules. Each rule has a one-line reason, so a 
 
 A plan must fit in the limit. The limit is `{{plan_size_limit}}` active minutes. The Leader decides each plan. If the work is bigger, the Leader asks for numbered split issues. A reviewer flags oversized work to the Leader and does not reject a plan.
 
-Synth City checks the upper estimate at initial plan submission. An estimate above the repository scope's plan limit returns `plan_estimate_exceeds_limit` and suggests splitting the work into smaller issues. The limit defaults to 60 active minutes, capped by the scope's item effort ceiling.
+Synth City checks the upper estimate at initial plan submission. An estimate above the repository scope's plan limit returns `plan_estimate_exceeds_limit` and suggests splitting the work into smaller issues. The limit defaults to 60 active minutes, capped by the scope's item effort ceiling. The Work page shows the accepted estimate next to this limit for each work item that has an estimate. It shows no warning.
 
 Why: a plan that is too big hides scope and cannot be reviewed in one pass.
 
@@ -68,7 +68,7 @@ A template has six placeholders. A value is filled in only when its source state
 | `{{ready_label}}` | The label that marks an issue ready | The scope's dispatch label. |
 | `{{hold_label}}` | The label that holds a PR | The scope's `review_hold_label`. It has no value when the scope sets none. |
 | `{{lane_label}}` | The builder's lane | The area labels of the builder's slot, joined by commas. It has no value when the slot has none. |
-| `{{plan_size_limit}}` | The plan limit in active minutes | The documented default of 60 minutes, clamped to the scope's `max_item_effort_minutes` when that is lower. |
+| `{{plan_size_limit}}` | The plan limit in active minutes | The scope's own plan limit (`max_plan_estimate_minutes`) when the scope is saved. Otherwise the documented default of 60 minutes, clamped to the scope's `max_item_effort_minutes` when that is lower. |
 | `{{supervisor_address}}` | Who to escalate to | The bound supervisor, as its display name and key. It has no value when no supervisor is bound. |
 
 Repository operators can set `max_plan_estimate_minutes` from 15 minutes up to `max_item_effort_minutes`. A scope settings PATCH with `null` restores the inherited limit. The scope's settings history records changes. Existing charter text stays editable, and the charter template presentation has its own follow-up (#1363).

@@ -892,6 +892,46 @@ describe("work item page", () => {
     expect(screen.getByText("Limit: scope ceiling (no estimate) · 75 min")).toBeInTheDocument();
   });
 
+  it("shows the accepted estimate and the plan limit on Work", async () => {
+    const response = structuredClone(first);
+    Object.assign(response.items[0].item, { plan_estimate_minutes: 40, plan_limit_minutes: 45 });
+    fixtureFetch((path) => path === "factory/work-items" ? jsonResponse(response) : standard(path));
+    renderRoute(<WorkPage />);
+    await settle();
+    expect(screen.getAllByText("Plan estimate: 40 min · plan limit: 45 min")).toHaveLength(1);
+  });
+
+  it("shows the accepted estimate and the plan limit on the work detail", async () => {
+    const response = structuredClone(detail.completed.response);
+    Object.assign(response.work_item.item, { plan_estimate_minutes: 40, plan_limit_minutes: 45 });
+    itemFor(response);
+    renderRoute(<WorkDetailPage />, "/work/9", "/work/:workItemId");
+    await settle();
+    expect(screen.getByText("Plan estimate: 40 min · plan limit: 45 min")).toBeInTheDocument();
+  });
+
+  it("shows no plan line without an accepted estimate", async () => {
+    itemFor(detail.completed.response);
+    renderRoute(<WorkDetailPage />, "/work/9", "/work/:workItemId");
+    await settle();
+    expect(screen.queryByText(/Plan estimate/)).not.toBeInTheDocument();
+  });
+
+  it("shows a plan at or under its limit, and an older plan over it, with no warning", async () => {
+    for (const [estimate, limit] of [[45, 45], [30, 45], [80, 60]]) {
+      const response = structuredClone(detail.completed.response);
+      Object.assign(response.work_item.item, { plan_estimate_minutes: estimate, plan_limit_minutes: limit });
+      itemFor(response);
+      const { unmount } = renderRoute(<WorkDetailPage />, "/work/9", "/work/:workItemId");
+      await settle();
+      const line = screen.getByText(`Plan estimate: ${estimate} min · plan limit: ${limit} min`);
+      expect(line).not.toHaveAttribute("role");
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.queryByText(/exceed|warning|near/i)).not.toBeInTheDocument();
+      unmount();
+    }
+  });
+
   it("links back to Work from a breadcrumb and titles the page with the issue", async () => {
     itemFor(detail.completed.response);
     renderRoute(<WorkDetailPage />, "/work/9", "/work/:workItemId");

@@ -14,6 +14,8 @@ from app.services import factory_projection_service as projection
 
 NOW = datetime(2026, 9, 30, 12, tzinfo=timezone.utc)
 PRIVATE = "synthetic-private-forbidden"
+# Effort fields that the wire leaves out when they are empty.
+OPTIONAL_EFFORT_FIELDS = {"scope_default_effort_limit_minutes", "plan_estimate_minutes", "plan_limit_minutes"}
 
 pytestmark = pytest.mark.asyncio
 
@@ -71,6 +73,36 @@ async def test_only_defaulted_effort_limit_is_exposed_on_work_list_and_detail(fa
             assert item[field] == 75
         else:
             assert field not in item
+
+
+async def test_accepted_estimate_shows_with_the_scope_plan_limit_on_work_list_and_detail(factory_client, factory_store):
+    estimated = factory_store.ids.by_status["dispatched"]
+    plain = factory_store.ids.by_status["verifying"]
+    async with factory_store.maker() as db:
+        scope_id = await db.scalar(select(GithubWorkItem.scope_id).where(GithubWorkItem.id == estimated))
+        await db.execute(update(TeamGithubScope).where(TeamGithubScope.id == scope_id).values(
+            max_item_effort_minutes=120, max_plan_estimate_minutes=45))
+        await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == estimated).values(
+            effort_estimate_minutes=40, effort_limit_minutes=40))
+        await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == plain).values(
+            effort_estimate_minutes=None, effort_limit_minutes=75))
+        await db.commit()
+
+    listing = await get_ok(factory_client, "work-items", category="active", limit=100)
+    rows = {row["item"]["id"]: row["item"] for row in listing["items"]}
+    item = (await get_ok(factory_client, f"work-items/{estimated}"))["work_item"]["item"]
+    assert rows[estimated] == item
+    assert (item["plan_estimate_minutes"], item["plan_limit_minutes"]) == (40, 45)
+    # The plan limit is the smaller of the plan limit and the item ceiling, as the plan check reads it.
+    async with factory_store.maker() as db:
+        await db.execute(update(TeamGithubScope).where(TeamGithubScope.id == scope_id).values(max_item_effort_minutes=30))
+        await db.commit()
+    capped = (await get_ok(factory_client, f"work-items/{estimated}"))["work_item"]["item"]
+    assert capped["plan_limit_minutes"] == 30
+    # An item without an accepted estimate shows neither value.
+    without = (await get_ok(factory_client, f"work-items/{plain}"))["work_item"]["item"]
+    assert "plan_estimate_minutes" not in without and "plan_limit_minutes" not in without
+    assert rows[plain] == without
 
 
 async def test_complete_counts_and_timestamp_id_pagination(factory_client, factory_store):
@@ -256,7 +288,7 @@ async def test_redaction_list_detail_overview_and_repository(factory_client, fac
         assert PRIVATE not in response.text
     result = await get_ok(factory_client, f"work-items/{factory_store.ids.by_status['escalated']}")
     item = result["work_item"]
-    assert set(item["item"]) == set(wire.SafeWorkItem.model_fields) - {"scope_default_effort_limit_minutes"}
+    assert set(item["item"]) == set(wire.SafeWorkItem.model_fields) - OPTIONAL_EFFORT_FIELDS
     assert set(item["team"]) == set(wire.TeamReference.model_fields)
     assert "parent_issue_url" not in item["item"]
     assert "outcome" not in item["item"]

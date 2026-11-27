@@ -6,9 +6,12 @@ import { expect, test } from '../support/guard'
 // another or leaves the viewport, whatever the status state. The container
 // warning stays reachable by touch and keyboard when its text is hidden.
 
-type StatusState = 'loaded' | 'long-name' | 'cli-warning' | 'unloaded'
+type StatusState = 'loaded' | 'long-name' | 'cli-warning' | 'unloaded' | 'legacy-default' | 'configured'
 
 const LONG_NAME = 'a-very-long-instance-name-for-this-host-01'
+const SHORT_HOST = 'studio-mac'
+const INSTANCE_HOST = 'studio-mac.example'
+const CONFIGURED_NAME = 'Studio Mac'
 const WARNING_LABEL = 'Container cannot see host agent CLIs'
 const WARNING = 'Host agent CLIs are not visible from this container. Run Albiex Synth City on the host.'
 
@@ -23,7 +26,14 @@ async function serveStatus(page: Page, state: StatusState): Promise<() => void> 
     const response = await route.fetch()
     const body = await response.json()
     if (state === 'long-name' || state === 'cli-warning') {
-      body.instance = { ...body.instance, name: LONG_NAME }
+      body.instance = { ...body.instance, name: LONG_NAME, name_configured: true }
+    }
+    if (state === 'legacy-default' || state === 'configured') {
+      const configured = state === 'configured'
+      body.instance = {
+        ...body.instance, hostname: INSTANCE_HOST, short_hostname: SHORT_HOST,
+        name: configured ? CONFIGURED_NAME : 'This machine', name_configured: configured,
+      }
     }
     if (state === 'cli-warning') {
       body.environment = { ...body.environment, agent_cli_warning: WARNING }
@@ -96,6 +106,31 @@ async function openHeader(page: Page, state: StatusState): Promise<void> {
 
 const STATES: StatusState[] = ['loaded', 'long-name', 'cli-warning', 'unloaded']
 
+for (const width of [1280, 390]) {
+  for (const theme of ['light', 'dark']) {
+    for (const state of ['legacy-default', 'configured'] as const) {
+      test(`@active shows the ${state} instance at ${width} px in ${theme}`, async ({ page }) => {
+        await page.setViewportSize({ width, height: 844 })
+        await page.addInitScript(value => localStorage.setItem('theme', value), theme)
+        await serveStatus(page, state)
+        await openHeader(page, state)
+
+        const name = state === 'configured' ? CONFIGURED_NAME : SHORT_HOST
+        const hint = state === 'configured' ? '' : ' (name not configured; set SYNTH_CITY_INSTANCE_NAME)'
+        const label = `Albiex Synth City instance: ${name} (host ${INSTANCE_HOST})${hint}`
+        const badge = page.getByRole('group', { name: label })
+        await expect(page.locator('html')).toHaveClass(theme)
+        await expect(badge).toHaveText(name)
+        await expect(badge).toHaveAttribute('title', label)
+        await expect(page.locator('header').getByText('This machine', { exact: true })).toHaveCount(0)
+        const nameFits = await badge.locator('span.truncate').evaluate(text => text.scrollWidth <= text.clientWidth)
+        expect(nameFits, 'the short example name fits without clipping').toBe(true)
+        await expectOneRowWithoutOverlap(page, width)
+      })
+    }
+  }
+}
+
 for (const width of [390, 320]) {
   test.describe(`at ${width} px`, () => {
     test.use({ viewport: { width, height: 844 } })
@@ -106,12 +141,6 @@ for (const width of [390, 320]) {
         try {
           await openHeader(page, state)
           await expectOneRowWithoutOverlap(page, width)
-          if (state === 'loaded' && width === 390) {
-            // The default instance name fits at 390 px. Only a long name may truncate.
-            const clipped = await page.locator('header [title^="Albiex Synth City instance"] span.truncate')
-              .evaluate(name => name.scrollWidth > name.clientWidth)
-            expect(clipped, 'the default instance name is clipped').toBe(false)
-          }
         } finally {
           release()
         }

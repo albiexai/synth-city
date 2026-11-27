@@ -128,6 +128,8 @@ The dashboard and native pages start with the code defaults in `backend/app/conf
 
 For remote access, install and run Synth City natively on the remote host where the agents, credentials, repositories, and tmux sessions exist. Then connect from your browser over a trusted tunnel or network route.
 
+The header shows the backend host's short name by default. Set `SYNTH_CITY_INSTANCE_NAME` when starting a shared or remote factory so visitors can identify the instance.
+
 ## Separate controller and agent users
 
 If the controller and the agents run as different operating-system users, the operator must set up one `sudoers` rule for the cross-user terminal attach: turn `use_pty` off for the agent `tmux` command only. Synth City does not change `sudoers`. See [What you must set up: a command-scoped `!use_pty`](/features/agent-bridge#what-you-must-set-up-a-command-scoped-use-pty) and, for the rest of this layout, [Deployment with separate controller and agent users](/features/agent-teams#deployment-with-separate-controller-and-agent-users).

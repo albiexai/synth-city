@@ -3,7 +3,7 @@ import type { WorkProjection } from "@/types/factory";
 import { stateLabel } from "../filterHelpers";
 import { GithubLink } from "./GithubLink";
 import { RelativeTime } from "./RelativeTime";
-import { ScopeEffortLimit } from "./ScopeEffortLimit";
+import { PlanEstimate, ScopeEffortLimit } from "./ScopeEffortLimit";
 import { anchor } from "./styles";
 import { waitingActorLabel } from "../waitingActor";
 
@@ -91,6 +91,7 @@ export function WorkTable({ rows }: { rows: WorkProjection[] }) {
                     )}
                   </div>
                   <ScopeEffortLimit minutes={work.item.scope_default_effort_limit_minutes} />
+                  <PlanEstimate estimate={work.item.plan_estimate_minutes} limit={work.item.plan_limit_minutes} />
                 </td>
                 <td
                   className="truncate px-3 py-2"
