@@ -31,7 +31,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 from sqlalchemy.orm import aliased
 
 from app.models.database import (
@@ -189,7 +189,7 @@ async def collect_team_attempts(db, preset_id: int, *, campaign_start: datetime,
         out.unattributed = [u for u in out.unattributed if u.item_id not in out.unstable_items]
         every = [a for a in every if a.item_id not in out.unstable_items]
     team_key = team_context_key or await audit.current_context_key(db, "team", preset_id)
-    events = (await db.scalars(select(FactoryAuditEvent).where(
+    events = (await db.execute(_columns(FactoryAuditEvent).where(
         FactoryAuditEvent.team_context_key == team_key, FactoryAuditEvent.team_context_key.is_not(None),
         FactoryAuditEvent.event_kind.in_([f"{f}_wait_{s}" for f in TEAM_WAITS for s in ("started", "ended")]))
         .order_by(FactoryAuditEvent.occurred_at, FactoryAuditEvent.id))).all()
@@ -209,6 +209,14 @@ async def collect_team_attempts(db, preset_id: int, *, campaign_start: datetime,
     return out
 
 
+def _columns(model):
+    """A select of the model's mapped columns. Its rows carry the entity's attribute names but are read as the rows are
+    now: a session already holding one of them would get its cached, possibly stale attributes back from an entity
+    select, and the snapshot cache keys on current values (V1 reviews 123 and 464). No entity is loaded or refreshed,
+    so a caller's pending edit is untouched."""
+    return select(*(getattr(model, column.key) for column in inspect(model).column_attrs))
+
+
 @dataclass(frozen=True)
 class _ItemRow:
     """The item fields the collector reads, as one row read them: no ORM entity is loaded or refreshed."""
@@ -224,7 +232,7 @@ async def _collect_item(db, item: _ItemRow, out: TeamAttempts, period, item_key:
     campaign_start, as_of = period
     if item_key is None:
         return []
-    events = (await db.scalars(select(FactoryAuditEvent).where(FactoryAuditEvent.item_context_key == item_key)
+    events = (await db.execute(_columns(FactoryAuditEvent).where(FactoryAuditEvent.item_context_key == item_key)
                                .order_by(FactoryAuditEvent.occurred_at, FactoryAuditEvent.id))).all()
 
     def lifecycle(event, status):
@@ -257,7 +265,7 @@ async def _collect_item(db, item: _ItemRow, out: TeamAttempts, period, item_key:
     by_key = {a.launch_attempt: a for a in attempts}
 
     # Nonce to launch, on persisted evidence only
-    revisions = (await db.scalars(select(GithubAttemptScopeRevision)
+    revisions = (await db.execute(_columns(GithubAttemptScopeRevision)
                                   .where(GithubAttemptScopeRevision.work_item_id == item.id))).all()
     revision_nonce = {r.id: r.dispatch_nonce for r in revisions}
     claims: dict[str, set[str]] = defaultdict(set)
@@ -283,13 +291,13 @@ async def _collect_item(db, item: _ItemRow, out: TeamAttempts, period, item_key:
         attempt = by_key.get(next(iter(found)))
         return attempt, "attempt_not_recorded"
 
-    requests = (await db.scalars(select(GithubApprovalRequest).where(GithubApprovalRequest.work_item_id == item.id)
+    requests = (await db.execute(_columns(GithubApprovalRequest).where(GithubApprovalRequest.work_item_id == item.id)
                                  .order_by(GithubApprovalRequest.created_at, GithubApprovalRequest.id))).all()
-    reviews = (await db.scalars(select(GithubHeadReview).where(GithubHeadReview.work_item_id == item.id)
+    reviews = (await db.execute(_columns(GithubHeadReview).where(GithubHeadReview.work_item_id == item.id)
                                 .order_by(GithubHeadReview.created_at, GithubHeadReview.id))).all()
-    watches = (await db.scalars(select(GithubRequiredCheckWatch)
+    watches = (await db.execute(_columns(GithubRequiredCheckWatch)
                                 .where(GithubRequiredCheckWatch.work_item_id == item.id))).all()
-    verdicts = (await db.scalars(select(GithubRevisionReview).where(GithubRevisionReview.work_item_id == item.id)
+    verdicts = (await db.execute(_columns(GithubRevisionReview).where(GithubRevisionReview.work_item_id == item.id)
                                  .order_by(GithubRevisionReview.created_at, GithubRevisionReview.id))).all()
     rows: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
     for source, table, span in (("approval_request", requests, lambda r: (r.created_at, r.decided_at)),
@@ -371,23 +379,24 @@ async def _collect_item(db, item: _ItemRow, out: TeamAttempts, period, item_key:
 
 async def _repository(db, item: _ItemRow) -> str | None:
     """The scope's repository as the check history records it; history outlives its scope, whose id can be reused."""
-    scope = await db.get(TeamGithubScope, item.scope_id)
+    scope = (await db.execute(select(TeamGithubScope.repo_owner, TeamGithubScope.repo_name)
+                              .where(TeamGithubScope.id == item.scope_id))).first()
     return f"{scope.repo_owner}/{scope.repo_name}".lower() if scope is not None else None
 
 
 async def _required_runs(db, item: _ItemRow, repository: str | None,
-                         pairs: set[tuple[int, str]]) -> list[GithubCheckRunHistory]:
+                         pairs: set[tuple[int, str]]) -> list:
     """The required check runs of the watched (PR, SHA) pairs in the scope's own repository."""
     if not pairs or repository is None:
         return []
-    runs = (await db.scalars(select(GithubCheckRunHistory).where(
+    runs = (await db.execute(_columns(GithubCheckRunHistory).where(
         GithubCheckRunHistory.scope_id == item.scope_id, GithubCheckRunHistory.repository == repository,
         GithubCheckRunHistory.required.is_(True),
         GithubCheckRunHistory.head_sha.in_({sha for _, sha in pairs})))).all()
     return [run for run in runs if (run.pr_number, run.head_sha) in pairs]
 
 
-async def _reviews(db, watch: GithubRequiredCheckWatch, head_reviews, revision_verdicts):
+async def _reviews(db, watch, head_reviews, revision_verdicts):
     """Each verifier's (member, notice, first verdict at or after it) on a watch whose checks succeeded."""
     if watch.completion_kind != "success":
         return []
@@ -423,7 +432,7 @@ async def _head_times(db, item: _ItemRow, repository: str | None,
     if not pairs or repository is None:
         return {}
     firsts: dict[tuple[int, str], datetime] = {}
-    for run in (await db.scalars(select(GithubCheckRunHistory).where(
+    for run in (await db.execute(_columns(GithubCheckRunHistory).where(
             GithubCheckRunHistory.scope_id == item.scope_id, GithubCheckRunHistory.repository == repository,
             GithubCheckRunHistory.head_sha.in_({sha for _, sha in pairs})))).all():
         pair = (run.pr_number, run.head_sha)

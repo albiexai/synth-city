@@ -12,7 +12,7 @@ from datetime import timedelta
 from itertools import count
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.models.database import (
@@ -573,6 +573,91 @@ async def test_a_pending_edit_survives_the_snapshot_read(db, world):
     finally:
         await caller.rollback()
         await caller.close()
+
+
+# V1 review 464: evidence another connection changed is read as it is now, also by a reader holding the old rows
+def _wall(went, stage):
+    return sum(row.wall_seconds or 0 for row in went.stages if row.stage == stage)
+
+
+async def _three_reads(db, world, stage):
+    """The holding reader with the cache on, then a separate reader's cache hit, then a separate uncached read."""
+    held = (await _build(db, world, [10], cached=True)).time_went
+    walls = [_wall(held, stage)]
+    for cached in (True, False):
+        other = async_sessionmaker(db.bind, expire_on_commit=False)()
+        try:
+            walls.append(_wall((await _build(other, world, [10], cached=cached)).time_went, stage))
+        finally:
+            await other.close()
+    return walls
+
+
+async def test_a_watch_completed_elsewhere_counts_its_review_for_every_reader(db, world):
+    """The reader holds the pending watch; another connection completes it, then the verifier's notice and verdict."""
+    await _recording(db)
+    item = await _item(db, world, 10, nonce="nonce-a", launch=True)
+    await _dispatch(db, item.id, 0, launch=item.launch_id)
+    watch = await _watch(db, item, "nonce-a", "h1", reviewer=57)
+    await _run(db, world, "h1", "e2e", 10, 20)
+    assert _wall((await _build(db, world, [10], cached=True)).time_went, "review") == 0  # warm, nothing to review yet
+    writer = async_sessionmaker(db.bind, expire_on_commit=False)()
+    try:
+        await writer.execute(text("UPDATE github_required_check_watches SET completion_kind = 'success', "
+                                  "completed_at = :t WHERE id = :i"), {"t": _m(80), "i": watch.id})
+        await _review(writer, item, "nonce-a", watch, 85, 95)
+        await writer.commit()
+    finally:
+        await writer.close()
+    assert await _three_reads(db, world, "review") == [10 * MIN] * 3
+    assert (watch.completion_kind, watch in db.dirty) == (None, False)  # the held entity is not refreshed
+
+
+async def test_a_check_run_corrected_elsewhere_counts_its_new_time_for_every_reader(db, world):
+    """The reader holds the check run; another connection corrects its recorded completion time."""
+    await _recording(db)
+    item = await _item(db, world, 10, nonce="nonce-a", launch=True)
+    await _dispatch(db, item.id, 0, launch=item.launch_id)
+    await _watch(db, item, "nonce-a", "h1")
+    await _run(db, world, "h1", "e2e", 10, 20)
+    run = (await db.scalars(select(GithubCheckRunHistory))).one()
+    assert _wall((await _build(db, world, [10], cached=True)).time_went, "required_check") == 10 * MIN
+    writer = async_sessionmaker(db.bind, expire_on_commit=False)()
+    try:
+        await writer.execute(text("UPDATE github_check_run_history SET completed_at = :t WHERE check_run_id = :i"),
+                             {"t": _m(40), "i": run.check_run_id})
+        await writer.commit()
+    finally:
+        await writer.close()
+    assert await _three_reads(db, world, "required_check") == [30 * MIN] * 3
+    assert (run.completed_at, run in db.dirty) == (_m(20), False)
+
+
+async def test_the_collector_reads_no_entity_so_no_held_row_can_be_stale(db, world):
+    """Every evidence read, not only the watch and check runs above: a fresh session (an empty identity map, so a
+    ``get`` must query too) sees each statement the collector issues, and none of them loads an ORM entity."""
+    from sqlalchemy import event
+
+    from app.services import retro_attempt_collector as collector
+
+    await _two_items(db, world)
+    campaign = await _build(db, world, [10, 11, 12]) and await campaigns.current(db, world.team)
+    reader = async_sessionmaker(db.bind, expire_on_commit=False)()
+    entities: list[str] = []
+
+    def record(state):
+        if state.is_select:
+            entities.extend(d["name"] for d in state.statement.column_descriptions
+                            if d.get("entity") is not None and d.get("expr") is d.get("entity"))
+
+    event.listen(reader.sync_session, "do_orm_execute", record)
+    try:
+        collected = await collector.collect_team_attempts(reader, campaign.preset_id, campaign_start=T0, as_of=AS_OF,
+                                                          team_context_key=campaign.team_context_key)
+        assert collected.attempts and entities == []
+        assert not reader.identity_map
+    finally:
+        await reader.close()
 
 
 # The cache: inserts, updates and deletions with no audit event
