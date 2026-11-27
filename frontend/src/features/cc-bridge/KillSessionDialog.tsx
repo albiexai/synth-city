@@ -14,6 +14,7 @@ import { Input } from '@/components/ui/input'
 import { MODAL_SIZES } from '@/lib/constants'
 import { ApiHttpError } from '@/lib/api'
 import { clearOperatorToken, getOperatorToken, setOperatorToken } from '@/features/agent-teams/operatorAuth'
+import { SharedOperatorUserWarning } from '@/features/agent-teams/SharedOperatorUserWarning'
 import { killSession } from './api'
 import type { CCSession } from './types'
 import type { InstanceIdentity } from '@/types/status'
@@ -121,6 +122,7 @@ export function KillSessionDialog({
               onChange={(event) => setOperatorTokenInput(event.target.value)}
             />
             <p className="text-xs text-muted-foreground">Use the token configured in the <a className="underline" href="https://github.com/albiexai/synth-city/blob/master/docs/guide/installation.md#configuration" target="_blank" rel="noreferrer">backend environment file</a>; an agent session token cannot terminate another session.</p>
+            <SharedOperatorUserWarning />
           </div>
         )}
 

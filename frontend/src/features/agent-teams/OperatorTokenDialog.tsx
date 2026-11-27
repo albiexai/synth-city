@@ -9,6 +9,7 @@ import {
 } from '@/components/ui/dialog'
 import { SecretField } from '@/components/shared/SecretField'
 import { MODAL_SIZES } from '@/lib/constants'
+import { SharedOperatorUserWarning } from './SharedOperatorUserWarning'
 
 const INSTALLATION_GUIDE_URL = 'https://github.com/albiexai/synth-city/blob/master/docs/guide/installation.md#configuration'
 
@@ -38,6 +39,7 @@ export function OperatorTokenDialog({
             Paste the Director key for this Albiex Synth City installation. It is the value of <code>OPERATOR_TOKEN</code> on the server. Synth City keeps it in this browser tab only.
           </DialogDescription>
         </DialogHeader>
+        <SharedOperatorUserWarning />
         {reason && <p className="text-sm">Synth City needs the key {reason}.</p>}
         <details className="text-sm text-muted-foreground">
           <summary className="cursor-pointer text-foreground">First time? Set up the key on the server</summary>

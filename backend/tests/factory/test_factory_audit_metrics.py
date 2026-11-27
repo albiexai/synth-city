@@ -1140,6 +1140,7 @@ import httpx as _httpx
 
 _OPERATOR = "synthetic-c08-operator"
 _OPERATOR_HEADERS = {"X-Synth-City-Operator-Token": _OPERATOR}
+_UI_OPERATOR_HEADERS = {**_OPERATOR_HEADERS, "Origin": "http://localhost:5173"}
 _LEADER = {"slot": 11, "member": 21, "session": 31, "token": "synthetic-leader-session"}
 _OWNER = {"slot": 12, "member": 22, "session": 32, "token": "synthetic-owner-session"}
 _OTHER = {"slot": 13, "member": 23, "session": 33, "token": "synthetic-other-session"}
@@ -1288,7 +1289,7 @@ async def _facts(maker, **where) -> list[dict]:
         rows = (await db.execute(text(
             "SELECT event_kind, source, actor_kind, actor_member_id, actor_session_id,"
             " actor_reference, scope_id, item_id, revision_id, request_id, team_preset_id,"
-            " action_outcome, operation_id, sanitized_reason, before_values, after_values"
+            " action_outcome, operation_id, sanitized_reason, before_values, after_values, via"
             f" FROM factory_audit_events WHERE {clause} ORDER BY id"), where)).mappings().all()
     return [dict(row) for row in rows]
 
@@ -1958,7 +1959,7 @@ async def test_c09_prepared_resume_route_records_actual_outcome(
         monkeypatch.setattr(_audit, "record_event", failing)
 
     response = await client.post("/api/v1/agent-teams/presets/7/work-items/87/resume-attempt",
-                                 headers=_OPERATOR_HEADERS, json=body)
+                                 headers=_UI_OPERATOR_HEADERS, json=body)
 
     assert response.status_code == status_code, response.text
     facts = await _facts(store, event_kind="prepared_attempt_resume")
@@ -1969,6 +1970,7 @@ async def test_c09_prepared_resume_route_records_actual_outcome(
         return
     assert [(f["action_outcome"], f["actor_kind"], f["item_id"]) for f in facts] == [
         (outcome, "operator", 87)]
+    assert [f["via"] for f in facts] == ["ui"]
     if outcome == "applied":
         assert after["item"]["dispatch_status"] == "pending"
         changed = ("dispatch_status", "escalation_reason", "pending_reason")
@@ -2045,7 +2047,7 @@ async def test_c09_scope_writer_reservation_contention_is_refused_and_recorded(s
     # Begin a competing write transaction and keep its lock.
     await holder.execute(text("UPDATE agent_team_presets SET name = name WHERE id = 7"))
     patch = asyncio.create_task(client.patch(
-        "/api/v1/agent-teams/github-scopes/5", headers=_OPERATOR_HEADERS,
+        "/api/v1/agent-teams/github-scopes/5", headers=_UI_OPERATOR_HEADERS,
         json={"dispatch_label": "contended-label"}))
     try:
         # The reservation waits for the 5 s busy timeout; release after it.
@@ -2058,6 +2060,7 @@ async def test_c09_scope_writer_reservation_contention_is_refused_and_recorded(s
     assert response.status_code == 409
     assert response.json()["detail"] == "scope_changed_during_update"
     facts = await _facts(store, event_kind="policy_change")
+    assert [f["via"] for f in facts] == ["ui"]
     assert [(f["action_outcome"], f["scope_id"], f["actor_kind"], f["sanitized_reason"])
             for f in facts] == [("rejected", 5, "operator", "scope_changed_during_update")]
     async with store() as db:
@@ -2419,12 +2422,13 @@ async def test_r05_scope_route_records_every_finite_policy_value(store, client):
            "max_build_parallelism": 3, "builds_out_of_tree": True}
 
     response = await client.patch(
-        "/api/v1/agent-teams/github-scopes/5", headers=_OPERATOR_HEADERS,
+        "/api/v1/agent-teams/github-scopes/5", headers=_UI_OPERATOR_HEADERS,
         json={**new, "build_command_hint": "make -j{parallelism} -C {build_dir}"})
 
     assert response.status_code == 200, response.text
     facts = await _facts(store, event_kind="policy_change", action_outcome="applied")
     assert len(facts) == 1
+    assert facts[0]["via"] == "ui"
     before = _json.loads(facts[0]["before_values"])
     after = _json.loads(facts[0]["after_values"])
     for field in fields:
@@ -2529,9 +2533,9 @@ async def test_c09_active_cancellation_records_one_action_and_its_notice(store, 
     url = "/api/v1/agent-teams/github-work-items/50/scope-revisions/1/cancel"
     body = {"cancel": True, "dispatch_nonce": _NONCE, "reason": "fixture cancel"}
 
-    first = await client.post(url, headers=_OPERATOR_HEADERS, json=body)
-    replay = await client.post(url, headers=_OPERATOR_HEADERS, json=body)
-    conflict = await client.post(url, headers=_OPERATOR_HEADERS,
+    first = await client.post(url, headers=_UI_OPERATOR_HEADERS, json=body)
+    replay = await client.post(url, headers=_UI_OPERATOR_HEADERS, json=body)
+    conflict = await client.post(url, headers=_UI_OPERATOR_HEADERS,
                                  json={**body, "reason": "a different reason"})
 
     assert (first.status_code, replay.status_code, conflict.status_code) == (200, 200, 409)
@@ -2545,6 +2549,7 @@ async def test_c09_active_cancellation_records_one_action_and_its_notice(store, 
     assert actions[1]["sanitized_reason"] == "active_continuation_cancel_conflict"
     assert {f["actor_kind"] for f in actions} == {"operator"}
     notices = await _facts(store, event_kind="recovery_cancellation_notification")
+    assert [f["via"] for f in [*actions, *notices]] == ["ui", "ui", "ui"]
     assert [(f["action_outcome"], f["operation_id"]) for f in notices] == [
         ("applied", f"active_cancellation_notice:revision:{ids['revision']}:applied")]
     assert await _messages_with_key(store, f"github-scope:{ids['revision']}:cancelled") == 1
@@ -2616,9 +2621,9 @@ async def test_c09_initial_cancellation_records_one_fact_and_refusals(store, cli
     url = f"/api/v1/agent-teams/github-work-items/56/approval-requests/{request_id}/cancel"
     body = {"cancel": True, "dispatch_nonce": _NONCE, "reason": "stranded"}
 
-    first = await client.post(url, headers=_OPERATOR_HEADERS, json=body)
-    replay = await client.post(url, headers=_OPERATOR_HEADERS, json=body)
-    stale = await client.post(url, headers=_OPERATOR_HEADERS,
+    first = await client.post(url, headers=_UI_OPERATOR_HEADERS, json=body)
+    replay = await client.post(url, headers=_UI_OPERATOR_HEADERS, json=body)
+    stale = await client.post(url, headers=_UI_OPERATOR_HEADERS,
                               json={**body, "dispatch_nonce": "fedcba9876543210"})
 
     assert (first.status_code, replay.status_code, stale.status_code) == (200, 200, 409)
@@ -2630,6 +2635,7 @@ async def test_c09_initial_cancellation_records_one_fact_and_refusals(store, cli
         ("rejected", request_id, None, "stale_nonce"),
     ]
     assert {f["actor_kind"] for f in facts} == {"operator"}
+    assert [f["via"] for f in facts] == ["ui", "ui"]
     protected = await _protected(store, 56)
     assert protected[3] == [(request_id, "superseded")]
     assert protected[0][:6] == ("escalated", "plan_blocked", _OWNER["slot"], 2, 3, 1)
@@ -2873,21 +2879,22 @@ async def test_c09_recovery_holds_and_checkpoint_releases_record_real_actors(
         return {"release": True, "dispatch_nonce": _NONCE,
                 "approval_request_id": request_id, "stage": stage}
 
-    released = await client.post(release_url, headers=_OPERATOR_HEADERS,
+    released = await client.post(release_url, headers=_UI_OPERATOR_HEADERS,
                                  json=release_body("decision"))
-    stale = await client.post(release_url, headers=_OPERATOR_HEADERS,
+    stale = await client.post(release_url, headers=_UI_OPERATOR_HEADERS,
                               json=release_body("decision"))
     decided = await client.post(
         "/api/v1/agent-mail/continuation-decisions", headers=_session_headers(_LEADER),
         json={"approval_request_id": request_id, "work_item_id": 81,
               "dispatch_nonce": _NONCE, "decision": "approved", "reason": "bounded"})
-    ack_released = await client.post(release_url, headers=_OPERATOR_HEADERS,
+    ack_released = await client.post(release_url, headers=_UI_OPERATOR_HEADERS,
                                      json=release_body("ack"))
 
     assert (released.status_code, stale.status_code, decided.status_code,
             ack_released.status_code) == (200, 409, 200, 200), (stale.text, decided.text)
     facts = [f for f in await _facts(store) if f["event_kind"] in {
         "recovery_hold", "recovery_checkpoint_release"}]
+    assert [f["via"] for f in facts if f["actor_kind"] == "operator"] == ["ui"] * 3
     assert [(f["event_kind"], f["action_outcome"], f["actor_kind"], f["actor_member_id"],
              f["actor_session_id"], f["before_values"], f["after_values"]) for f in facts] == [
         ("recovery_hold", "applied", "member", _OWNER["member"], _OWNER["session"],
@@ -5192,7 +5199,7 @@ async def test_r07_abandon_records_action_then_notice(store, client, monkeypatch
         monkeypatch.setattr(_audit, "record_event", failing)
 
     response = await client.post(
-        "/api/v1/agent-teams/github-work-items/126/abandon", headers=_OPERATOR_HEADERS,
+        "/api/v1/agent-teams/github-work-items/126/abandon", headers=_UI_OPERATOR_HEADERS,
         json={"reason": "operator stop"})
 
     actions = await _facts(store, event_kind="operator_escalation")
@@ -5212,6 +5219,7 @@ async def test_r07_abandon_records_action_then_notice(store, client, monkeypatch
         return
     assert response.status_code == 200, response.text
     assert [f["action_outcome"] for f in actions] == ["applied"]
+    assert [f["via"] for f in [*actions, *notices]] == ["ui", "ui"]
     assert [f["action_outcome"] for f in notices] == (
         ["applied"] if case == "success" else ["uncertain"])
     assert status == "escalated"

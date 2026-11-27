@@ -1911,6 +1911,7 @@ class GithubDispatchService:
         preset_slots: list[AgentTeamSlot],
         *,
         reassign_to_slot_id: int | None,
+        actor: dict | None = None,
     ) -> None:
         if (
             item.dispatch_status != "escalated"
@@ -2005,7 +2006,7 @@ class GithubDispatchService:
             event_kind="prepared_attempt_resume",
             source="github_dispatch_service.resume_prepared_attempt",
             occurred_at=datetime.utcnow(),
-            actor=_audit.derive_actor(actor_kind="operator"),
+            actor=actor or _audit.derive_actor(actor_kind="operator"),
             item_id=item.id,
             after_values={"dispatch_status": item.dispatch_status,
                           "owner_slot_id": item.owner_slot_id},

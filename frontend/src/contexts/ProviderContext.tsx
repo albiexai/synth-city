@@ -74,9 +74,11 @@ export function ProviderProvider({ children }: { children: ReactNode }) {
 
 // Context consumers share this hook with the provider and route scope.
 // eslint-disable-next-line react-refresh/only-export-components
-export function useProviderContext() {
+export function useProviderContext(): ProviderContextValue
+export function useProviderContext(required: false): ProviderContextValue | undefined
+export function useProviderContext(required = true) {
   const context = useContext(ProviderContext)
-  if (!context) {
+  if (!context && required) {
     throw new Error('useProviderContext must be used within ProviderProvider')
   }
   return context

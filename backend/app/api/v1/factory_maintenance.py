@@ -7,7 +7,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.deps import require_operator
+from app.api.v1.deps import operator_audit_actor, operator_write_context, require_operator
 from app.database import get_db
 from app.models.api_model import format_utc_time
 from app.models.database import GithubAcceptedSourceImport, GithubMaintenanceEvent, GithubOwnerObservationPause, GithubWorkItem, TeamGithubScope
@@ -18,7 +18,6 @@ from app.services.github_terminal_revision_service import (
 from app.services.accepted_source_imports import SourceImportRequest, register_source_import
 from app.services.github_client import GithubClientResponseError
 from app.services.github_check_observation import GithubCheckObservationError
-from app.services.factory_audit_service import derive_actor
 from app.services.github_end_stopped_item_service import EndStoppedItemRequest, end_stopped_item
 from app.services.owner_observation_pause import resume_observation_pause
 from app.services.maintenance_operations import digest
@@ -52,11 +51,12 @@ async def context(db, preset_id, item_id):
 
 @router.post("/presets/{preset_id}/work-items/{item_id}/end-stopped")
 async def end_stopped_route(preset_id: int, item_id: int, request: EndStoppedItemRequest,
-                            response: Response, _operator=Depends(require_operator), db: AsyncSession = Depends(get_db)):
+                            response: Response, _operator=Depends(require_operator), db: AsyncSession = Depends(get_db),
+                            write_context: dict | None = Depends(operator_write_context)):
     response.headers["Cache-Control"] = "no-store"
     item, scope = await context(db, preset_id, item_id)
     try:
-        return await end_stopped_item(db, item, scope, request, actor=derive_actor(actor_kind="operator"))
+        return await end_stopped_item(db, item, scope, request, actor=operator_audit_actor(write_context))
     except ValueError as exc:
         await db.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from None
@@ -75,12 +75,14 @@ async def terminal_revisions(preset_id: int, response: Response,
 @router.post("/presets/{preset_id}/work-items/{item_id}/terminal-revisions/{revision_id}/reconcile")
 async def terminal_revision_reconcile(preset_id: int, item_id: int, revision_id: int,
                                       request: TerminalRevisionReconcileRequest, response: Response,
-                                      _operator=Depends(require_operator), db: AsyncSession = Depends(get_db)):
+                                      _operator=Depends(require_operator), db: AsyncSession = Depends(get_db),
+                                      write_context: dict | None = Depends(operator_write_context)):
     response.headers["Cache-Control"] = "no-store"
     item, _scope = await context(db, preset_id, item_id)
     try:
         return await reconcile_terminal_revision(db, item, revision_id, request.expected_context_sha256,
-                                                 request.operation_id, request.reason)
+                                                 request.operation_id, request.reason,
+                                                 actor=operator_audit_actor(write_context))
     except ValueError as error:
         await db.rollback()
         raise HTTPException(status_code=409, detail=str(error)) from None
@@ -151,12 +153,13 @@ async def observation_pauses(preset_id: int, item_id: int, response: Response,
 
 @router.post("/presets/{preset_id}/work-items/{item_id}/resume-observation")
 async def resume_observation(preset_id: int, item_id: int, request: ObservationResume, response: Response,
-                             _operator=Depends(require_operator), db: AsyncSession = Depends(get_db)):
+                             _operator=Depends(require_operator), db: AsyncSession = Depends(get_db),
+                             write_context: dict | None = Depends(operator_write_context)):
     response.headers["Cache-Control"] = "no-store"
     item, scope = await context(db, preset_id, item_id)
     try:
         return await resume_observation_pause(db, item, scope, request.pause_id, request.reason,
-                                              actor=derive_actor(actor_kind="operator"))
+                                              actor=operator_audit_actor(write_context))
     except ValueError as error:
         await db.rollback()
         raise HTTPException(status_code=409, detail=str(error)) from None

@@ -129,7 +129,7 @@ The event list uses the operator token for this browser tab. If no token is stor
 
 ## How a settings change was made
 
-The operator key is still the only authority for a settings change. A recorded event now also says how the change reached the server. The field is `via`, and it is stored on the event. It is not part of the factory API response.
+The operator key authorizes the write. Audit events from operator writes record the request's access path in `via`. The factory API does not expose this field.
 
 | `via` | Meaning |
 | --- | --- |
@@ -137,11 +137,11 @@ The operator key is still the only authority for a settings change. A recorded e
 | `ui` | No usable Mail session. The request had a browser `Origin` header that matches a configured CORS origin. |
 | `api` | Anything else: no `Origin` header, or an origin that is not configured. |
 
-Only `mail_tool` is a fact the server derives. `ui` and `api` are labels from a header that the caller sets. They do not prove who called. A caller that holds the operator key and sends no session token is recorded as `ui` or `api`. Treat the field as attribution for the honest path, not as a control against a determined key holder.
+The server validates the session for `mail_tool`. The `ui` and `api` labels describe the request's `Origin` header, which callers can set. The labels supply attribution context. They grant no access and identify no person.
 
-A Mail session token that is unknown, closed or stale does not refuse the write. Stale means an offline mailbox or, for a session bound to a team slot, a pane that is not alive. This attribution check applies whatever the Mail token enforcement setting is. The operator key authorizes it as before. The event is recorded as unattributed: it keeps the `ui` or `api` label, stores no session, and carries `session_invalid` in its context. The token itself is never stored.
+An unknown, closed or stale Mail session token leaves attribution at `ui` or `api` with no session ID. An offline mailbox or a missing live pane for a slot-bound session counts as stale. This attribution check applies regardless of the Mail token enforcement setting. The campaign settings audit also flags an invalid session in its context. Audit events omit the token itself.
 
-Slice 1 applies this to `PATCH /api/v1/agent-teams/presets/{id}`. That route now also records one `policy_change` event for a campaign change (the milestone title and the number of planned decisions, never the decision text). Other operator routes keep their current actor until a later change. The event kind `external_actor` exists and records an external actor by its actor id, but no route uses it yet.
+On a Quick start installation, the controller and agents share an OS user. Agents running as that user can read the operator token. The Teams page and Director key prompt show this warning. Dedicated installations run the controller and agents under separate OS users.
 
 ## Limits
 

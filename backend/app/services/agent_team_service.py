@@ -189,6 +189,7 @@ class AgentTeamService:
         expected_leader_slot_id: int | None,
         expected_updated_at: datetime,
         reason: str,
+        actor: dict | None = None,
     ) -> AgentTeamPresetResponse:
         """Change Leader authority only while the team is stopped and quiescent."""
         preset = await self._lock_preset_for_mutation(db, preset_id)
@@ -251,7 +252,7 @@ class AgentTeamService:
             event_kind="leader_assignment",
             source="agent_team_service.set_leader",
             occurred_at=datetime.utcnow(),
-            actor=_audit.derive_actor(actor_kind="operator"),
+            actor=actor or _audit.derive_actor(actor_kind="operator"),
             team_preset_id=preset.id,
             before_values={"leader_slot_id": expected_leader_slot_id},
             after_values={"leader_slot_id": slot.id},

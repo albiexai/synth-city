@@ -656,6 +656,7 @@ class GithubWorkspaceService:
         actor_member_id: int | None = None,
         actor_session_id: int | None = None,
         actor_scheduler: str | None = None,
+        actor_via: str | None = None,
         expected_leased_at: datetime | None,
         lease_token: str | None,
         owner_slot_id: int | None = None,
@@ -725,6 +726,7 @@ class GithubWorkspaceService:
                 member_id=actor_member_id,
                 session_id=actor_session_id,
                 scheduler=actor_scheduler,
+                via=actor_via,
             )
             acquisition = (
                 f"workspace:{workspace_id}:leased_at:"
@@ -932,6 +934,7 @@ class GithubWorkspaceService:
         actor_member_id: int | None = None,
         actor_session_id: int | None = None,
         actor_scheduler: str | None = None,
+        actor_via: str | None = None,
         expected_leased_at: datetime,
         lease_token: str | None,
         before_commit=None,
@@ -949,6 +952,7 @@ class GithubWorkspaceService:
             actor_member_id=actor_member_id,
             actor_session_id=actor_session_id,
             actor_scheduler=actor_scheduler,
+            actor_via=actor_via,
             workspace_id=workspace_id,
             scope_id=scope_id,
             item_id=item_id,
