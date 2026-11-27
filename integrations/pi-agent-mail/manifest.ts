@@ -50,7 +50,7 @@ export const manifest = [
   },
   {
     "name": "synth_city_approve_work_item",
-    "description": "Approve or reject a normalized initial-plan request as its designated Leader.\n\n    Pass approval_request_id from synth_city_request_work_item_approval. A rejection opens\n    the next round automatically when one remains.\n    ",
+    "description": "Approve or reject a normalized initial-plan request as its designated Leader.\n\n    Pass approval_request_id from synth_city_request_work_item_approval. A rejection opens\n    the next round automatically when one remains. To reroute a pending plan, reject it\n    with reassign_to_slot_id set to an eligible slot. The target accepts the handoff\n    before submitting its own plan.\n    ",
     "inputSchema": {
       "properties": {
         "work_item_id": {
@@ -72,6 +72,18 @@ export const manifest = [
         "approval_request_id": {
           "title": "Approval Request Id",
           "type": "integer"
+        },
+        "reassign_to_slot_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reassign To Slot Id"
         }
       },
       "required": [

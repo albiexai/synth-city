@@ -652,11 +652,14 @@ def synth_city_approve_work_item(
     decision: str,
     reason: str,
     approval_request_id: int,
+    reassign_to_slot_id: Optional[int] = None,
 ) -> dict:
     """Approve or reject a normalized initial-plan request as its designated Leader.
 
     Pass approval_request_id from synth_city_request_work_item_approval. A rejection opens
-    the next round automatically when one remains.
+    the next round automatically when one remains. To reroute a pending plan, reject it
+    with reassign_to_slot_id set to an eligible slot. The target accepts the handoff
+    before submitting its own plan.
     """
     if decision not in {"approved", "rejected"}:
         return {
@@ -678,6 +681,7 @@ def synth_city_approve_work_item(
             "approval_request_id": approval_request_id,
             "decision": decision,
             "reason": reason,
+            **({"reassign_to_slot_id": reassign_to_slot_id} if reassign_to_slot_id is not None else {}),
         },
     )
     if not result["ok"]:
