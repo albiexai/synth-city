@@ -38,9 +38,9 @@
   <path d="M220,84 L261,84" stroke="#57534e" stroke-width="2" marker-end="url(#a4)"/>
   <path d="M475,84 L516,84" stroke="#57534e" stroke-width="2" marker-end="url(#a4)"/>
   <path d="M735,84 L776,84" stroke="#57534e" stroke-width="2" marker-end="url(#a4)"/>
-  <rect x="265" y="136" width="470" height="30" rx="6" fill="#ede9fe" stroke="#6d28d9" stroke-width="1.5" stroke-dasharray="6 3"/>
-  <use href="#i-agent" x="274" y="142" width="18" height="18" fill="#6d28d9"/>
-  <text x="298" y="156" font-size="12" fill="#4c1d95">Optional supervisor (AI agent): reads the same signals, fixes routine blockers</text>
+  <rect x="225" y="136" width="550" height="30" rx="6" fill="#ede9fe" stroke="#6d28d9" stroke-width="1.5" stroke-dasharray="6 3"/>
+  <use href="#i-agent" x="256" y="142" width="18" height="18" fill="#6d28d9"/>
+  <text x="280" y="156" font-size="12" fill="#4c1d95">Optional supervisor (AI agent): reads the same signals, fixes routine blockers</text>
 
   <line x1="20" y1="192" x2="980" y2="192" stroke="#d6d3d1" stroke-width="1.5"/>
   <use href="#i-human" x="20" y="172" width="14" height="14" fill="#b45309"/>
@@ -91,5 +91,5 @@
   <text x="510" y="375" text-anchor="middle" font-size="13" font-weight="700" fill="#1e293b">GitHub (outside the factory) keeps running: the parent issue is the only live status surface while the controller is down.</text>
   <use href="#i-human" x="300" y="402" width="16" height="16" fill="#b45309"/>
   <text x="322" y="415" font-size="11.5" fill="#78350f">The Director acts in maintenance only for a genuine security HOLD.</text>
-  <text x="500" y="442" text-anchor="middle" font-size="12" font-weight="700" fill="#4c1d95">Team sessions keep running through the restart; the upgrade is refused if a session changes. Resume re-enables autonomy; it relaunches no agent.</text>
+  <text x="500" y="442" text-anchor="middle" font-size="11" font-weight="700" fill="#4c1d95">Team sessions keep running through the restart; the upgrade is refused if a session changes. Resume re-enables autonomy; it relaunches no agent.</text>
 </svg>
