@@ -2681,6 +2681,8 @@ class TeamWorkSettings(BaseModel):
     mail_request_unanswered_seconds: int | None = Field(default=None, strict=True, ge=60, le=86400)
     github_team_idle_timeout_seconds: int | None = Field(default=None, strict=True, ge=30, le=86400)
     github_publish_summaries_enabled: bool | None = Field(default=None, strict=True)
+    github_owner_idle_timeout_seconds: int | None = Field(default=None, strict=True, ge=60, le=86400)
+    github_nudge_grace_seconds: int | None = Field(default=None, strict=True, ge=30, le=3600)
 
 
 class AgentTeamPresetUpdate(CampaignPresetFields, TeamWorkSettings):
@@ -2907,7 +2909,7 @@ class TeamGithubScopeSettingsResponse(BaseModel):
 
 class TeamWorkSettingsResponse(BaseModel):
     overrides: TeamWorkSettings
-    defaults: TeamWorkSettings
+    defaults: dict[str, int | bool]
     history: list[ScopeSettingsHistoryEntry]
     next_before_id: int | None = None
 

@@ -9,13 +9,12 @@ from sqlalchemy import exists, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from app.config import settings
 from app.models.database import (
-    AgentPaneBinding, AgentTeamSlot, GithubAttemptScopeRevision, GithubWorkItem,
+    AgentPaneBinding, AgentTeamPreset, AgentTeamSlot, GithubAttemptScopeRevision, GithubWorkItem,
     GithubWorkspace, MailAgentSession, MailPaneLifecycle, MailTeamMember, TeamGithubScope,
 )
 from app.services import agent_activity_service as activity
-from app.services.factory_delivery_policy import effective_policy
+from app.services.factory_delivery_policy import effective_policy, owner_contact_windows
 from app.services.github_approval_service import github_approval_service
 
 _NATIVE_RESPONSE_SECONDS = 2.0
@@ -80,9 +79,18 @@ async def renew_native_owner_contact(db: AsyncSession, scope: TeamGithubScope,
     if not anchors:
         return False
     anchor = max(anchors)
+    preset = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
+    if preset is None:
+        return False
+    idle, grace = owner_contact_windows(preset, policy)
+    current_timers = exists(select(AgentTeamPreset.id).join(
+        TeamGithubScope, TeamGithubScope.preset_id == AgentTeamPreset.id,
+    ).where(
+        TeamGithubScope.id == scope.id, AgentTeamPreset.id == preset.id,
+        AgentTeamPreset.github_owner_idle_timeout_seconds == preset.github_owner_idle_timeout_seconds,
+        AgentTeamPreset.github_nudge_grace_seconds == preset.github_nudge_grace_seconds,
+    ))
     now = datetime.utcnow()
-    idle = policy.owner_idle_seconds or settings.github_owner_idle_timeout_seconds
-    grace = policy.owner_nudge_grace_seconds or settings.github_nudge_grace_seconds
     # A new event cannot revive work that already passed its idle and grace limit.
     if now - anchor > timedelta(seconds=idle + grace) or (
         nudge is not None and nudge >= anchor and now - nudge > timedelta(seconds=grace)
@@ -208,7 +216,7 @@ async def renew_native_owner_contact(db: AsyncSession, scope: TeamGithubScope,
         GithubWorkspace.path == workspace_path, GithubWorkspace.lease_token == lease[1],
         GithubWorkspace.leased_at == lease[2], GithubWorkspace.leased_owner_pid == lease[3],
         GithubWorkspace.leased_owner_proc_start == lease[4], GithubWorkspace.lease_last_owner_contact_at == lease[5],
-        current_item, owner_current, session_current,
+        current_item, owner_current, session_current, current_timers,
         exists(select(AgentTeamSlot.id).where(
             AgentTeamSlot.id == slot.id, AgentTeamSlot.preset_id == scope.preset_id,
             AgentTeamSlot.enabled.is_(True), AgentTeamSlot.provider == provider,

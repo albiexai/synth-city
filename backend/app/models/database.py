@@ -165,6 +165,8 @@ class AgentTeamPreset(Base):
     mail_request_unanswered_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     github_team_idle_timeout_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     github_publish_summaries_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    github_owner_idle_timeout_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    github_nudge_grace_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     parent_issue_url: Mapped[str | None] = mapped_column(String, nullable=True)
     backlog_milestone: Mapped[str | None] = mapped_column(String, nullable=True)
     planned_decisions: Mapped[list | None] = mapped_column(JSON, nullable=True)
