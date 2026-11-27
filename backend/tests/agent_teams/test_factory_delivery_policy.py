@@ -2,12 +2,15 @@ import asyncio
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import select, text, update
+from sqlalchemy import event, select, text, update
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.database import Base, configure_sqlite_connection
 from app.models.database import (
     AgentPaneBinding, AgentTeamPreset, AgentTeamSlot, GithubAttemptScopeRevision,
     GithubDeliveryPolicyEvent, GithubWorkItem, GithubWorkspace, MailAgentSession,
@@ -444,6 +447,88 @@ async def test_native_read_has_a_response_deadline(db, monkeypatch, tmp_path):
         result = "native_read_has_no_response_deadline"
     assert result is False
     assert workspace.lease_last_owner_contact_at == before
+
+
+@pytest.mark.asyncio
+async def test_continuation_poll_survives_cancelled_native_sqlite_read(monkeypatch, tmp_path, caplog):
+    entered, release = Event(), Event()
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'contact.db'}")
+
+    def delayed_read():
+        entered.set()
+        release.wait(2)
+        return 1
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def configure(connection, _record):
+        configure_sqlite_connection(connection)
+        connection.create_function("delayed_native_read", 0, delayed_read)
+
+    async def let_query_finish():
+        assert await asyncio.to_thread(entered.wait, 2)
+        await asyncio.sleep(0.35)
+        release.set()
+
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+        async with sessions() as db:
+            scope, item, workspace, revision, slot, *_ = await native_fixture(db, monkeypatch, tmp_path)
+            before = workspace.lease_last_owner_contact_at
+            item_id = item.id
+            await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == item_id)
+                             .values(status_note="staged before native observation"))
+
+            async def observe(reader, *_args, **_kwargs):
+                await reader.execute(text("SELECT delayed_native_read()"))
+                return {}
+
+            monkeypatch.setattr(native, "_NATIVE_RESPONSE_SECONDS", 0.15)
+            monkeypatch.setattr(native.activity, "observe_private_team", observe)
+            complete_query = asyncio.create_task(let_query_finish())
+            try:
+                # The real continuation monitor refreshes the item and lease on
+                # its poll session immediately after the timed-out observation.
+                await github_dispatch_service.monitor_continuation(db, scope, [slot])
+                await db.refresh(workspace)
+                await db.refresh(revision)
+                assert workspace.lease_last_owner_contact_at == before
+                assert revision.status == "active"
+                await db.commit()
+            finally:
+                await complete_query
+        async with sessions() as verification_db:
+            saved = await verification_db.get(GithubWorkItem, item_id)
+            assert saved.status_note == "staged before native observation"
+    finally:
+        release.set()
+        await engine.dispose()
+
+    failures = [record.getMessage() for record in caplog.records
+                if record.getMessage().startswith("native_team_observation_failed")]
+    assert len(failures) == 1
+    assert "error_type=TimeoutError" in failures[0]
+    assert "delayed_native_read" not in failures[0]
+
+
+@pytest.mark.asyncio
+async def test_poll_observation_propagates_external_cancellation(db, monkeypatch, caplog):
+    started = asyncio.Event()
+
+    async def observe(*_args, **_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(native.activity, "observe_private_team", observe)
+    task = asyncio.create_task(native.activity.observe_poll_team(db, 1, timeout=2, source="owner_contact"))
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await db.scalar(text("SELECT 1")) == 1
+    assert not any("native_team_observation_failed" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.parametrize("race", ["policy", "terminal", "revision"])

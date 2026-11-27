@@ -25,8 +25,8 @@ from pathlib import Path
 from uuid import UUID
 
 from sqlalchemy import JSON, and_, exists, or_, select, update
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
 from app.models.database import (
     AgentPaneBinding, AgentTeamPreset, AgentTeamSlot, MailAgentSession, MailMessage, MailReceipt, MailPaneLifecycle, MailTeamMember,
@@ -1020,3 +1020,24 @@ async def observe_private_team(db: AsyncSession, preset_id: int,
     await _save_codex_identities(db, inputs, captured, current)
     await _record_input_waits(db, preset_id, inputs, captured, current, now=now)
     return values
+
+
+async def observe_poll_team(db: AsyncSession, preset_id: int, *, timeout: float,
+                            source: str) -> dict[int, PrivateActivity] | None:
+    """A deadline may invalidate a connection. Keep that transaction off the poll session."""
+    bind = db.bind
+    if isinstance(bind, AsyncConnection):
+        bind = bind.engine
+    sessions = async_sessionmaker(bind, expire_on_commit=False, autoflush=False)
+    try:
+        async with sessions() as observation_db:
+            async with asyncio.timeout(timeout):
+                observed = await observe_private_team(observation_db, preset_id, max_input_rows=256)
+                # Keep the usual fenced identity and input-wait writes on a successful observation.
+                await observation_db.commit()
+                return observed
+    except (TimeoutError, OSError, ValueError, SQLAlchemyError) as error:
+        # The isolated context has discarded its transaction. Leave the poll's
+        # transaction and original error details out of the observation failure.
+        logger.warning("native_team_observation_failed source=%s error_type=%s", source, type(error).__name__)
+        return None
