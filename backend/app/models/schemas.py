@@ -2410,6 +2410,8 @@ class MailExternalActorResponse(BaseModel):
     description: Optional[str] = None
     created_at: datetime
     last_used_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+    revoked_by: Optional[str] = None
 
 
 class MailExternalActorCreateResponse(BaseModel):

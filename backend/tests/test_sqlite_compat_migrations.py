@@ -1122,6 +1122,24 @@ async def test_compat_migrations_add_pr2_github_auth_columns_idempotently():
 
 
 @pytest.mark.asyncio
+async def test_legacy_external_actor_credentials_are_preserved_on_migration():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("CREATE TABLE mail_external_actors (id INTEGER PRIMARY KEY, token_hash TEXT)"))
+            await conn.execute(text("INSERT INTO mail_external_actors VALUES (1, 'fixture-digest')"))
+            row = text("SELECT token_hash, revoked_at, revoked_by FROM mail_external_actors")
+            await _run_sqlite_compat_migrations(conn)
+            assert (await conn.execute(row)).one() == ("fixture-digest", None, None)
+            await conn.execute(text(
+                "UPDATE mail_external_actors SET revoked_at='2026-11-27 12:00:00', revoked_by='fixture-operator'"))
+            await _run_sqlite_compat_migrations(conn)
+            assert (await conn.execute(row)).one() == ("fixture-digest", "2026-11-27 12:00:00", "fixture-operator")
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_legacy_scope_defaults_preserve_custom_settings_on_repeat_migration():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     try:

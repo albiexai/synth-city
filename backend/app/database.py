@@ -847,6 +847,11 @@ async def _run_sqlite_compat_migrations(conn) -> None:
             )
         )
 
+    external_actor_columns = await _sqlite_columns(conn, "mail_external_actors")
+    for column, sql_type in (("revoked_at", "DATETIME"), ("revoked_by", "VARCHAR")):
+        if external_actor_columns and column not in external_actor_columns:
+            await conn.execute(text(f"ALTER TABLE mail_external_actors ADD COLUMN {column} {sql_type}"))
+
     result = await conn.execute(text("PRAGMA table_info(mail_agent_sessions)"))
     session_columns = {row[1] for row in result.fetchall()}
     if session_columns and "closed_at" not in session_columns:

@@ -1,10 +1,11 @@
 """External local Agent Mail orchestration endpoints."""
-from typing import Optional
+from typing import Annotated, Literal, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.agent_mail import require_mail_director
+from app.api.v1.deps import enforce_director_access_path, operator_audit_actor, operator_write_context, require_director_action, require_operator
 from app.database import get_db
 from app.models.database import MailExternalActor
 from app.models.schemas import (
@@ -26,15 +27,19 @@ from app.models.schemas import (
 )
 from app.services.external_agent_mail_service import (
     ExternalAgentMailAuthError,
+    ExternalAgentMailCredentialError,
     ExternalAgentMailRateLimitError,
     external_agent_mail_service,
 )
+from app.services.factory_audit_service import AuditWriteError
 from app.services.mail_redaction import redact_lease_thread
+from app.services.sqlite_busy_retry import SqliteBusyExhausted
 
 from app.services.github_coordination_service import CoordinationError
 from app.services.github_issue_difficulty_service import set_issue_difficulty
 
 router = APIRouter()
+ActorId = Annotated[int, Path(gt=0, le=2**63 - 1)]
 
 
 def _bearer_token(authorization: Optional[str]) -> Optional[str]:
@@ -63,6 +68,8 @@ async def external_actor(
         )
     except ExternalAgentMailAuthError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except SqliteBusyExhausted as exc:
+        raise HTTPException(status_code=503, detail="external_actor_busy") from exc
 
 
 def _rate_limit_response(exc: ExternalAgentMailRateLimitError) -> HTTPException:
@@ -77,20 +84,79 @@ def _rate_limit_response(exc: ExternalAgentMailRateLimitError) -> HTTPException:
     )
 
 
+async def _change_actor_credential(
+    db: AsyncSession, actor_id: int, action: Literal["revoke", "rotate", "restore"],
+    write_context: dict, profile_request: MailExternalActorCreate | None = None,
+):
+    try:
+        return await external_agent_mail_service.change_actor_credential(
+            db, actor_id, action, operator_audit_actor(write_context), profile_request)
+    except ExternalAgentMailCredentialError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    except SqliteBusyExhausted as exc:
+        raise HTTPException(status_code=503, detail="external_actor_busy") from exc
+    except AuditWriteError as exc:
+        raise HTTPException(status_code=503, detail="external_actor_audit_unavailable") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/actors", response_model=MailExternalActorCreateResponse,
              dependencies=[Depends(require_mail_director)])
 async def create_external_actor(
     request: Request,
     actor_request: MailExternalActorCreate,
+    response: Response,
+    x_synth_city_operator_token: str | None = Header(default=None),
     db: AsyncSession = Depends(get_db),
+    write_context: dict = Depends(operator_write_context),
 ):
-    """Create or rotate a local external actor token."""
+    """Preserve local registration while requiring direct authority for any existing key."""
     if not _is_loopback_request(request):
         raise HTTPException(status_code=403, detail="External actor tokens can only be created locally")
+    response.headers["Cache-Control"] = "no-store"
+    actor_id = await external_agent_mail_service.actor_id_for_key(db, actor_request.actor_key)
+    if actor_id is not None:
+        await enforce_director_access_path(db, write_context, operator_token=x_synth_city_operator_token,
+                                           source="director_action.create_external_actor")
+        await require_operator(x_synth_city_operator_token)
+        return await _change_actor_credential(db, actor_id, "rotate", write_context, actor_request)
     try:
         return await external_agent_mail_service.create_actor(db, actor_request)
+    except ExternalAgentMailCredentialError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    except SqliteBusyExhausted as exc:
+        raise HTTPException(status_code=503, detail="external_actor_busy") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/actors/{actor_id}/revoke", response_model=MailExternalActorResponse,
+             dependencies=[Depends(require_director_action())])
+async def revoke_external_actor(
+    actor_id: ActorId, db: AsyncSession = Depends(get_db), write_context: dict = Depends(operator_write_context),
+):
+    return await _change_actor_credential(db, actor_id, "revoke", write_context)
+
+
+@router.post("/actors/{actor_id}/rotate", response_model=MailExternalActorCreateResponse,
+             dependencies=[Depends(require_director_action())])
+async def rotate_external_actor(
+    actor_id: ActorId, response: Response, db: AsyncSession = Depends(get_db),
+    write_context: dict = Depends(operator_write_context),
+):
+    response.headers["Cache-Control"] = "no-store"
+    return await _change_actor_credential(db, actor_id, "rotate", write_context)
+
+
+@router.post("/actors/{actor_id}/restore", response_model=MailExternalActorCreateResponse,
+             dependencies=[Depends(require_director_action())])
+async def restore_external_actor(
+    actor_id: ActorId, response: Response, db: AsyncSession = Depends(get_db),
+    write_context: dict = Depends(operator_write_context),
+):
+    response.headers["Cache-Control"] = "no-store"
+    return await _change_actor_credential(db, actor_id, "restore", write_context)
 
 
 @router.get("/actors/me", response_model=MailExternalActorResponse)
