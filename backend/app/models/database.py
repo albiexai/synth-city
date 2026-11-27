@@ -501,6 +501,7 @@ class GithubMilestoneWait(Base):
     issue_number: Mapped[int] = mapped_column(Integer, primary_key=True)
     milestone_title: Mapped[str | None] = mapped_column(String)
     github_updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    repository: Mapped[str | None] = mapped_column(String)
 
 
 class GithubIssueClosure(Base):

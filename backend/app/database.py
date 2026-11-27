@@ -4,8 +4,7 @@ import json
 import logging
 import re
 
-from sqlalchemy import event
-from sqlalchemy import text
+from sqlalchemy import event, select, text
 from sqlalchemy.exc import OperationalError
 from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
@@ -720,6 +719,69 @@ async def _sqlite_rebuild_agent_team_slots(conn, columns: set[str]) -> None:
     await conn.commit()
 
 
+_COMPLETE_REPOSITORY_NAME = re.compile(r"[A-Za-z0-9_.-]{1,100}")
+
+
+def _scope_event_changes_repository(snapshot, before, after) -> bool:
+    """Treat a redacted identity as a change unless the ledger proves it was unchanged."""
+    changed_fields = (snapshot or {}).get("scope_changed_fields") or []
+    for name in ("repo_owner", "repo_name"):
+        old, new = str((before or {}).get(name) or ""), str((after or {}).get(name) or "")
+        if old.lower() != new.lower():
+            return True
+        if old != new and not (_COMPLETE_REPOSITORY_NAME.fullmatch(old) and _COMPLETE_REPOSITORY_NAME.fullmatch(new)):
+            return True
+        if old == new and name in changed_fields:
+            return True
+    return False
+
+
+async def _sqlite_migrate_wait_repositories(conn) -> None:
+    columns = await _sqlite_columns(conn, "github_milestone_waits")
+    if not columns or "repository" in columns:
+        return
+
+    from app.models.database import FactoryAuditEvent, GithubMilestoneWait, TeamGithubScope
+
+    # The new column records completion. Roll its DDL back with the backfill
+    # if either step fails, including with SQLite's legacy transaction mode.
+    async with conn.begin_nested():
+        await conn.execute(text("ALTER TABLE github_milestone_waits ADD COLUMN repository VARCHAR"))
+        wait_scopes = select(GithubMilestoneWait.scope_id).distinct().subquery()
+        scopes = (await conn.execute(
+            select(TeamGithubScope.id, TeamGithubScope.repo_owner, TeamGithubScope.repo_name)
+            .join(wait_scopes, TeamGithubScope.id == wait_scopes.c.scope_id)
+        )).all()
+        if not scopes:
+            return
+
+        from app.services.factory_projection_service import FactoryReadError, github_identity
+
+        events = (await conn.execute(
+            select(FactoryAuditEvent.scope_id, FactoryAuditEvent.context_snapshot, FactoryAuditEvent.before_values,
+                   FactoryAuditEvent.after_values)
+            .join(wait_scopes, FactoryAuditEvent.scope_id == wait_scopes.c.scope_id)
+            .where(FactoryAuditEvent.event_kind == "policy_change",
+                   FactoryAuditEvent.source == "agent_teams.update_github_scope",
+                   FactoryAuditEvent.action_outcome == "applied")
+        )).all()
+        # A legacy observation time belongs to GitHub and cannot date the wait relative to a scope move.
+        moved = {scope_id for scope_id, snapshot, before, after in events
+                 if _scope_event_changes_repository(snapshot, before, after)}
+        stamps = []
+        for scope in scopes:
+            if scope.id in moved:
+                continue
+            try:
+                identity = github_identity(scope)
+            except FactoryReadError:
+                continue
+            stamps.append({"scope_id": scope.id, "repository": f"{identity.owner}/{identity.name}"})
+        if stamps:
+            await conn.execute(text("UPDATE github_milestone_waits SET repository = :repository "
+                                    "WHERE scope_id = :scope_id AND repository IS NULL"), stamps)
+
+
 async def _run_sqlite_compat_migrations(conn) -> None:
     reconcile_historical_approvals = (
         await _sqlite_approval_reconciliation_pending(conn)
@@ -1323,6 +1385,7 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         from app.services.factory_audit_service import install_forward_coverage
 
         await install_forward_coverage(conn)
+    await _sqlite_migrate_wait_repositories(conn)
     await conn.commit()
 
 

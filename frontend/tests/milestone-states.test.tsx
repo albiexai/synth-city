@@ -200,6 +200,30 @@ describe('the pages', () => {
     expect(requests.find((r) => r.path === 'factory/milestone-states')?.query.get('team_id')).toBe('1')
   })
 
+  it('the Work page links each stamped repository and leaves an unstamped row unlinked', async () => {
+    const second = { scope_id: 5, display_name: 'second/project', github: { owner: 'second', name: 'project' } }
+    fixtureFetch((path) => {
+      if (path === 'factory/milestone-states') return jsonResponse(body({ waiting: [
+        waiting(), waiting({ repository: second }), waiting({ repository: null }),
+      ] }))
+      if (path === 'factory/work-items') return jsonResponse(listing)
+      return jsonResponse({ detail: 'x' }, 404)
+    })
+    render(<MemoryRouter initialEntries={['/work']}>
+      <Routes><Route path="/work" element={<WorkPage />} /></Routes>
+    </MemoryRouter>)
+
+    const section = await screen.findByRole('region', { name: 'Milestone moves' })
+    const items = within(section).getAllByRole('listitem')
+    expect(items).toHaveLength(3)
+    expect(within(items[0]).getByRole('link', { name: 'albiexai/synth-city#1400' }))
+      .toHaveAttribute('href', 'https://github.com/albiexai/synth-city/issues/1400')
+    expect(within(items[1]).getByRole('link', { name: 'second/project#1400' }))
+      .toHaveAttribute('href', 'https://github.com/second/project/issues/1400')
+    expect(within(items[2]).getByText('#1400')).toBeInTheDocument()
+    expect(within(items[2]).queryByRole('link')).not.toBeInTheDocument()
+  })
+
   it('the Teams page shows the list on the Autonomy tab for the selected team', async () => {
     const stampTeam = '2026-10-12T12:00:00Z'
     const team = {

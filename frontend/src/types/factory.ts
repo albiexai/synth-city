@@ -282,7 +282,7 @@ export type WaitingIssue = {
   issue_number: number;
   milestone: string;
   observed_at: string;
-  // null: the repository of the wait is not recorded, so the issue has no link (#1372 adds the stamp).
+  // A wait without a repository stamp has no issue link.
   repository: WorkRepository | null;
 };
 
