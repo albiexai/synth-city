@@ -100,6 +100,7 @@ from app.models.schemas import (
     TeamGithubContinuationPolicyUpdate,
     TeamGithubScopeListResponse,
     TeamGithubScopeResponse,
+    TeamGithubScopeSafetyBounds,
     TeamGithubScopeSettingsResponse,
     TeamGithubScopeUpdate,
     TeamWorkSettings,
@@ -548,6 +549,10 @@ def _scope_response(
         max_failed_heads_per_revision=scope.max_failed_heads_per_revision,
         max_scope_paths=scope.max_scope_paths,
         max_scope_commands=scope.max_scope_commands,
+        max_scope_amendments=scope.max_scope_amendments,
+        max_scope_amendment_requests=scope.max_scope_amendment_requests,
+        max_amendment_added_paths=scope.max_amendment_added_paths,
+        max_companion_paths=scope.max_companion_paths,
         enabled=scope.enabled,
         last_polled_at=scope.last_polled_at,
         created_at=scope.created_at,
@@ -737,6 +742,7 @@ async def _scope_identity_in_use(db: AsyncSession, scope_id: int) -> bool:
 
 
 _SCOPE_CONFIGURATION_FIELDS = (
+    *TeamGithubScopeSafetyBounds.model_fields,
     "merge_check_wait_minutes", "effort_extension_cap_minutes", "effort_extension_cap_percent",
     "preset_id", "repo_owner", "repo_name", "repo_path", "dispatch_label", "design_label",
     "merge_policy", "review_hold_label", "max_approval_rounds", "max_concurrent_dispatched", "max_verification_retries",
@@ -2840,7 +2846,8 @@ async def read_github_scope_settings(
             history.append(dict(event_id=record.id, occurred_at=record.occurred_at,
                 actor_kind=record.actor_kind, actor_reference=record.actor_reference,
                 via=record.via, reason=record.sanitized_reason, changes=changes, redacted_fields=redacted_fields))
-    return dict(definitions=definition["properties"], required=definition["required"], history=history,
+    definitions = definition["properties"] | TeamGithubScopeSafetyBounds.model_json_schema()["properties"]
+    return dict(definitions=definitions, required=definition["required"], history=history,
                 next_before_id=records[limit - 1].id if len(records) > limit else None)
 
 
@@ -2892,6 +2899,19 @@ async def update_github_scope(
         scope = await _reserve_scope_writer(db, scope_id)
         if _scope_configuration(scope) != observed_configuration:
             raise HTTPException(status_code=409, detail="scope_changed_during_app_lookup")
+        bounds = request.model_dump(include=set(TeamGithubScopeSafetyBounds.model_fields), exclude_none=True)
+        increases = {
+            name: {"before": getattr(scope, name), "after": value}
+            for name, value in bounds.items() if value > getattr(scope, name)
+        }
+        if increases and request.confirm != "safety_bounds":
+            raise HTTPException(status_code=400, detail={
+                "code": "director_confirmation_required", "confirm": "safety_bounds", "increases": increases,
+            })
+        scope.max_scope_amendments = bounds.get("max_scope_amendments", scope.max_scope_amendments)
+        scope.max_scope_amendment_requests = bounds.get("max_scope_amendment_requests", scope.max_scope_amendment_requests)
+        scope.max_amendment_added_paths = bounds.get("max_amendment_added_paths", scope.max_amendment_added_paths)
+        scope.max_companion_paths = bounds.get("max_companion_paths", scope.max_companion_paths)
         if identity_change and await _scope_identity_in_use(db, scope_id):
             raise HTTPException(status_code=409, detail="scope_identity_in_use")
         if auth_change and await _scope_identity_in_use(db, scope_id):
@@ -2946,7 +2966,7 @@ async def update_github_scope(
             context_snapshot={
                 **_policy_event_snapshot(scope, request),
                 "scope_changed_fields": [
-                    name for name in TeamGithubScopeCreate.model_fields
+                    name for name in (*TeamGithubScopeCreate.model_fields, *TeamGithubScopeSafetyBounds.model_fields)
                     if _policy_before.get(name) != _policy_after.get(name)
                 ],
             },

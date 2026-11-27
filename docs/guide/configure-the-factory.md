@@ -250,6 +250,8 @@ A repository scope is one team's watch on one GitHub repository. Add it on the [
 
 The Repositories page edits the review hold label, the effort ceiling and `initial_paths_required` (the **Review hold and effort limit** dialog), and the continuation policy. The other fields change with `PATCH /api/v1/agent-teams/github-scopes/{scope_id}` and the Director key. See the [Agent Teams API](/api/agent-teams).
 
+The **Review hold and effort limit** dialog also includes the four amendment safety bounds. It shows what each increase permits before asking the Director to type `safety_bounds`. Decreases save with the Director key alone.
+
 ::: tip Why limits on the scope?
 Each limit stops a different kind of runaway.
 

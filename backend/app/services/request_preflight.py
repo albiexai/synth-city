@@ -324,10 +324,10 @@ def companion_limit_problems(paths, scope) -> list:
         extras = companion_paths.companions_for(paths)
     except Exception:
         return []
-    if len(set(extras) - set(paths)) > companion_paths.MAX_COMPANION_PATHS:
+    if extras and len(set(extras) - set(paths)) > scope.max_companion_paths:
         return [problem("continuation_path_limit_exceeded",
                         message=f"The companion paths the server adds are over their own bound of "
-                                f"{companion_paths.MAX_COMPANION_PATHS}.")]
+                                f"{scope.max_companion_paths}.")]
     return []
 
 

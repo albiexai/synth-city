@@ -7,7 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { MODAL_SIZES } from '@/lib/constants'
 import { formatServerTime } from '@/lib/serverTime'
-import type { ScopeSettingDefinition, ScopeSettingsHistoryEntry, TeamGithubScope, TeamGithubScopeUpdate } from '@/types/agentTeams'
+import type { ScopeSettingDefinition, ScopeSettingsHistoryEntry, TeamGithubScope, TeamGithubScopeSafetyBounds, TeamGithubScopeUpdate } from '@/types/agentTeams'
 import { fetchScopeSettings, updateTeamGithubScope } from './api'
 import { useOperatorTokenFlow } from './useOperatorTokenFlow'
 
@@ -15,7 +15,19 @@ const NAMES: Record<string, string> = {
   review_hold_label: 'Review hold label',
   max_item_effort_minutes: 'Effort ceiling',
   initial_paths_required: 'First-plan paths required',
+  max_scope_amendments: 'Approved amendments',
+  max_scope_amendment_requests: 'Amendment requests',
+  max_amendment_added_paths: 'Named paths added by amendments',
+  max_companion_paths: 'Companion paths',
 }
+const SAFETY_EFFECTS: Record<keyof TeamGithubScopeSafetyBounds, string> = {
+  max_scope_amendments: 'approved amendments per attempt',
+  max_scope_amendment_requests: 'amendment requests per attempt',
+  max_amendment_added_paths: 'distinct named paths added by amendments per attempt',
+  max_companion_paths: 'companion paths per amendment',
+}
+const SAFETY_KEYS = Object.keys(SAFETY_EFFECTS) as Array<keyof TeamGithubScopeSafetyBounds>
+const SAFETY_CONFIRMATION = 'safety_bounds'
 const show = (value: unknown) => (value === null || value === undefined ? 'none' : String(value))
 
 /**
@@ -35,7 +47,10 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
   const [next, setNext] = useState<number | null>(null)
   const [historyState, setHistoryState] = useState<'loading' | 'ready' | 'failed'>('loading')
   // A field the user has not touched is undefined and follows the server, so a background refresh never erases a draft.
-  const [draft, setDraft] = useState<{ label?: string; clear?: boolean; minutes?: string; requirePaths?: boolean; reason: string }>({ reason: '' })
+  const [draft, setDraft] = useState<{
+    label?: string; clear?: boolean; minutes?: string; requirePaths?: boolean; reason: string
+    bounds?: Partial<Record<keyof TeamGithubScopeSafetyBounds, string>>; confirm?: string
+  }>({ reason: '' })
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const generation = useRef(0) // a newer first load, or closing the dialog, makes older answers obsolete
@@ -47,6 +62,15 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
   const pathsRequired = scope.initial_paths_required ?? false
   const requirePaths = draft.requirePaths ?? pathsRequired
   const reason = draft.reason
+  const bounds = SAFETY_KEYS.filter((key) => definitions[key]?.type === 'integer').map((key) => {
+    const definition = definitions[key]
+    const previous = scope[key] ?? Number(definition.default)
+    return { key, definition, previous, value: draft.bounds?.[key] ?? String(previous) }
+  })
+  const increases = bounds.filter(({ definition, previous, value }) => {
+    const number = Number(value)
+    return Number.isInteger(number) && number > previous && number <= (definition.maximum ?? -1)
+  })
 
   const load = useCallback(async (beforeId?: number) => {
     const key = beforeId ?? 0
@@ -107,6 +131,23 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
     if (value !== scope.max_item_effort_minutes) update.max_item_effort_minutes = value
     if (requirePaths !== pathsRequired) update.initial_paths_required = requirePaths
     if (clear ? scope.review_hold_label != null : label.trim() !== scope.review_hold_label) update.review_hold_label = clear ? null : label.trim()
+    for (const { key, definition, previous, value } of bounds) {
+      const number = Number(value)
+      const { minimum, maximum } = definition
+      if (!value.trim() || !Number.isInteger(number) || minimum === undefined || maximum === undefined
+        || number < minimum || number > maximum) {
+        setError(`${NAMES[key]} must be a whole number from ${minimum} to ${maximum}.`)
+        return
+      }
+      if (number !== previous) update[key] = number
+    }
+    if (increases.length > 0) {
+      if (draft.confirm !== SAFETY_CONFIRMATION) {
+        setError(`Type ${SAFETY_CONFIRMATION} to confirm the increases.`)
+        return
+      }
+      update.confirm = draft.confirm
+    }
     if (Object.keys(update).length === 0) {
       setError('No value changed.')
       return
@@ -155,6 +196,28 @@ export function ScopeLimitsDialog({ scope, open, onOpenChange, refresh, onReturn
               <Checkbox id="limits-require-paths" checked={requirePaths} disabled={saving}
                 onCheckedChange={(checked) => setDraft((current) => ({ ...current, requirePaths: checked === true }))} />
               <Label htmlFor="limits-require-paths">Require paths in the first plan</Label>
+            </div>
+          )}
+          {bounds.map(({ key, value, definition }) => (
+            <div key={key} className="grid gap-2">
+              <Label htmlFor={`limits-${key}`}>{NAMES[key]}</Label>
+              <Input id={`limits-${key}`} inputMode="numeric" value={value} disabled={saving}
+                onChange={(event) => setDraft((current) => ({
+                  ...current, bounds: { ...current.bounds, [key]: event.target.value }, confirm: '',
+                }))} />
+              <p className="text-xs text-muted-foreground">{definition.minimum} to {definition.maximum}, default {String(definition.default)}.</p>
+            </div>
+          ))}
+          {increases.length > 0 && (
+            <div className="grid gap-2 rounded-md border border-destructive/40 p-3">
+              <ul className="list-disc pl-4 text-sm">
+                {increases.map(({ key, previous, value }) => (
+                  <li key={key}>Allows up to {Number(value)} {SAFETY_EFFECTS[key]}. The current limit is {previous}.</li>
+                ))}
+              </ul>
+              <Label htmlFor="limits-confirm">Type {SAFETY_CONFIRMATION} to confirm</Label>
+              <Input id="limits-confirm" value={draft.confirm ?? ''} disabled={saving}
+                onChange={(event) => setDraft((current) => ({ ...current, confirm: event.target.value }))} />
             </div>
           )}
           <div className="grid gap-2">

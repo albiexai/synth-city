@@ -400,11 +400,12 @@ async def test_scope_patch_rolls_back_settings_and_history_on_audit_error(client
         await client.patch(f"/api/v1/agent-teams/github-scopes/{scope_id}", headers=OPERATOR_HEADERS,
                            json={"max_item_effort_minutes": 45, "reason": "Change budget",
                                  "merge_check_wait_minutes": 12, "effort_extension_cap_minutes": 7,
-                                 "effort_extension_cap_percent": 10})
+                                 "effort_extension_cap_percent": 10, "max_scope_amendments": 2})
     await db.refresh(scope)
     assert scope.max_item_effort_minutes == 120
     assert (scope.merge_check_wait_minutes, scope.effort_extension_cap_minutes,
             scope.effort_extension_cap_percent) == (60, 30, 25)
+    assert scope.max_scope_amendments == 3
     assert await db.scalar(select(FactoryAuditEvent.id).where(FactoryAuditEvent.scope_id == scope_id)) is None
 
 
@@ -442,6 +443,60 @@ async def test_scope_timing_settings_validate_and_record_history(
     assert record["occurred_at"]
     await db.refresh(scope)
     assert getattr(scope, field) == custom
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,default,maximum", [
+    ("max_scope_amendments", 3, 32), ("max_scope_amendment_requests", 8, 128),
+    ("max_amendment_added_paths", 16, 256), ("max_companion_paths", 32, 128),
+])
+async def test_scope_safety_bound_only_requires_confirmation_for_increase(client, db, tmp_path, field, default, maximum):
+    _, scope = await _scope(db, tmp_path / "safety-bounds")
+    path = f"/api/v1/agent-teams/github-scopes/{scope.id}"
+    settings_path = f"{path}/settings"
+    settings = (await client.get(settings_path, headers=OPERATOR_HEADERS)).json()
+    definition = settings["definitions"][field]
+    assert (definition["type"], definition["minimum"], definition["maximum"], definition["default"]) == (
+        "integer", 0, maximum, default,
+    )
+    for invalid in (-1, maximum + 1, True, "2"):
+        assert (await client.patch(path, headers=OPERATOR_HEADERS, json={field: invalid})).status_code == 422
+    for confirm in ({}, {"confirm": "Safety_Bounds"}):
+        refused = await client.patch(path, headers=OPERATOR_HEADERS, json={field: default + 1, **confirm})
+        assert refused.status_code == 400
+        assert refused.json()["detail"] == {
+            "code": "director_confirmation_required", "confirm": "safety_bounds",
+            "increases": {field: {"before": default, "after": default + 1}},
+        }
+    assert (await client.get(settings_path, headers=OPERATOR_HEADERS)).json()["history"] == []
+
+    tight = await client.patch(path, headers=OPERATOR_HEADERS, json={field: 0})
+    assert tight.status_code == 200 and tight.json()[field] == 0
+    loose = await client.patch(path, headers=OPERATOR_HEADERS, json={field: default, "confirm": "safety_bounds"})
+    assert loose.status_code == 200 and loose.json()[field] == default
+    history = (await client.get(settings_path, headers=OPERATOR_HEADERS)).json()["history"]
+    assert [event["changes"] for event in history] == [
+        {field: {"before": 0, "after": default}}, {field: {"before": default, "after": 0}},
+    ]
+    assert all(event["via"] == "api" and event["actor_kind"] == "operator" for event in history)
+
+
+@pytest.mark.asyncio
+async def test_scope_safety_bound_refuses_mail_even_with_operator_token(client, db, tmp_path, monkeypatch):
+    from app.utils import peer_process
+    from tests.agent_mail.test_api import _dispatch_approval_fixture
+
+    monkeypatch.setattr(settings, "mail_capability_tokens_required", True)
+    monkeypatch.setattr(peer_process, "pane_is_alive", lambda *_args: True)
+    _, _, tokens = await _dispatch_approval_fixture(db)
+    _, scope = await _scope(db, tmp_path / "director-only")
+    path = f"/api/v1/agent-teams/github-scopes/{scope.id}"
+    refused = await client.patch(path, headers={**OPERATOR_HEADERS, "X-Synth-City-Session-Token": tokens[1]},
+                                 json={"max_scope_amendments": 2})
+    assert refused.status_code == 403 and refused.json()["detail"]["code"] == "director_action_not_via_mail"
+    await db.refresh(scope)
+    assert scope.max_scope_amendments == 3
+    assert (await client.get(f"{path}/settings", headers=OPERATOR_HEADERS)).json()["history"] == []
 
 
 class ApiGitRunner:

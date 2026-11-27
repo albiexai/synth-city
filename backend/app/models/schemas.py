@@ -2866,6 +2866,17 @@ DEFAULT_PLAN_ESTIMATE_MINUTES = 60
 DEFAULT_MERGE_CHECK_WAIT_MINUTES = 60
 DEFAULT_EFFORT_EXTENSION_CAP_MINUTES = 30
 DEFAULT_EFFORT_EXTENSION_CAP_PERCENT = 25
+_ScopeAmendmentCount = Annotated[int, Field(strict=True, ge=0, le=32)]
+_ScopeAmendmentRequests = Annotated[int, Field(strict=True, ge=0, le=128)]
+_ScopeAmendmentAddedPaths = Annotated[int, Field(strict=True, ge=0, le=256)]
+_ScopeCompanionPaths = Annotated[int, Field(strict=True, ge=0, le=128)]
+
+
+class TeamGithubScopeSafetyBounds(BaseModel):
+    max_scope_amendments: _ScopeAmendmentCount = 3
+    max_scope_amendment_requests: _ScopeAmendmentRequests = 8
+    max_amendment_added_paths: _ScopeAmendmentAddedPaths = 16
+    max_companion_paths: _ScopeCompanionPaths = 32
 
 
 class TeamGithubScopeCreate(BaseModel):
@@ -2916,6 +2927,11 @@ class TeamGithubScopeUpdate(BaseModel):
     effort_extension_cap_percent: _ScopeExtensionPercent | None = None
     max_plan_estimate_minutes: _ScopeEffortMinutes | None = None
     initial_paths_required: bool | None = None
+    max_scope_amendments: _ScopeAmendmentCount | None = None
+    max_scope_amendment_requests: _ScopeAmendmentRequests | None = None
+    max_amendment_added_paths: _ScopeAmendmentAddedPaths | None = None
+    max_companion_paths: _ScopeCompanionPaths | None = None
+    confirm: str | None = None
     base_ref: Optional[str] = None
     github_auth_mode: Optional[Literal["unknown", "ambient", "app"]] = None
     builds_out_of_tree: Optional[bool] = None
@@ -2965,7 +2981,7 @@ class GithubRateLimitStatus(BaseModel):
     observed_at: datetime
 
 
-class TeamGithubScopeResponse(BaseModel):
+class TeamGithubScopeResponse(TeamGithubScopeSafetyBounds):
     id: int
     preset_id: int
     repo_owner: str

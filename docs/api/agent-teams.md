@@ -460,6 +460,19 @@ remain under their existing repository workflows.
 
 Responses from the maintenance routes use `Cache-Control: no-store`. An item outside the named team returns 404.
 
+### Amendment safety settings
+
+The Director can update these fields on `PATCH /api/v1/agent-teams/github-scopes/{scope_id}`.
+
+| Field | Default | Range |
+| --- | ---: | ---: |
+| `max_scope_amendments` | 3 | 0–32 |
+| `max_scope_amendment_requests` | 8 | 0–128 |
+| `max_amendment_added_paths` | 16 | 0–256 |
+| `max_companion_paths` | 32 | 0–128 |
+
+An increase requires `"confirm": "safety_bounds"`. The API returns `director_confirmation_required` with the proposed increases when the phrase is missing or incorrect. Decreases save with Director authentication. `GET /api/v1/agent-teams/github-scopes/{scope_id}/settings` returns the ranges and attributed history.
+
 ### Activation, workspace, coordination and recovery routes
 
 These routes need the operator token, unless a row says otherwise.
