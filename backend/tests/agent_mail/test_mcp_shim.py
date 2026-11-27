@@ -579,7 +579,8 @@ def test_request_work_item_approval_uses_agent_mail_authority_route(monkeypatch)
     }
 
 
-def test_approve_work_item_sends_required_request_id(monkeypatch):
+@pytest.mark.parametrize("target", [None, 7])
+def test_approve_work_item_sends_required_request_id(monkeypatch, target):
     import mcp_shim.agent_mail_server as shim
 
     requests = []
@@ -598,9 +599,10 @@ def test_approve_work_item_sends_required_request_id(monkeypatch):
     result = shim.synth_city_approve_work_item(
         19,
         "nonce-19",
-        "approved",
+        "rejected" if target is not None else "approved",
         "Safe to proceed.",
         approval_request_id=41,
+        reassign_to_slot_id=target,
     )
 
     assert requests[0] == (
@@ -611,8 +613,9 @@ def test_approve_work_item_sends_required_request_id(monkeypatch):
                 "work_item_id": 19,
                 "dispatch_nonce": "nonce-19",
                 "approval_request_id": 41,
-                "decision": "approved",
+                "decision": "rejected" if target is not None else "approved",
                 "reason": "Safe to proceed.",
+                **({"reassign_to_slot_id": target} if target is not None else {}),
             }
         },
     )

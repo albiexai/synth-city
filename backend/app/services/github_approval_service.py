@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
@@ -47,6 +48,9 @@ from app.services.github_plan_refusal_service import (
 )
 from app.services.github_recovery_gate import configured_recovery_only_attempt
 from app.services.sqlite_busy_retry import SqliteBusyExhausted, retry_when_busy
+
+
+logger = logging.getLogger(__name__)
 
 
 CONTINUABLE_ESCALATIONS = frozenset(
@@ -2284,6 +2288,7 @@ class GithubApprovalService:
                 GithubWorkItem.approval_round_count == item.approval_round_count,
                 GithubWorkItem.owner_slot_id == owner.team_slot_id,
                 GithubWorkItem.dispatch_status != "escalated",
+                _settled_handoff_condition(),
             )
             .values(updated_at=GithubWorkItem.updated_at)
             .execution_options(synchronize_session=False)
@@ -2310,6 +2315,8 @@ class GithubApprovalService:
             raise GithubApprovalError("approval_round_not_open", status_code=409)
         if item.dispatch_status == "escalated":
             raise GithubApprovalError("item_escalated", status_code=409)
+        if item.handoff_state not in _SETTLED_HANDOFF_STATES:
+            raise GithubApprovalError("approval_handoff_pending")
         owner, leader = await self._current_participants(db, item)
         if owner.id != authenticated_owner_member_id:
             raise GithubApprovalError("not_item_owner", status_code=403)
@@ -2413,6 +2420,7 @@ class GithubApprovalService:
                 GithubWorkItem.dispatch_nonce == item.dispatch_nonce,
                 GithubWorkItem.approval_round_count == item.approval_round_count,
                 GithubWorkItem.owner_slot_id == owner.team_slot_id,
+                _settled_handoff_condition(),
                 ~terminal_exists,
             )
             .values(updated_at=GithubWorkItem.updated_at, effort_estimate_minutes=effort_limit,
@@ -2476,13 +2484,14 @@ class GithubApprovalService:
         return request
 
     @staticmethod
-    def initial_decision_message(request):
+    def initial_decision_message(request, reassign_to_slot_id=None):
         return MailMessageCreate(kind="answer", sender_member_id=request.leader_member_id,
             thread_root_id=request.request_message_id, body_markdown=request.reason, decision=request.status,
             payload={"approval_request_id": request.id, "request_kind": request.request_kind,
-                "work_item_id": request.work_item_id})
+                "work_item_id": request.work_item_id,
+                **({"reassign_to_slot_id": reassign_to_slot_id} if reassign_to_slot_id is not None else {})})
 
-    async def _escalated_initial_rejection_conditions(self, db, item, request, owner, leader, actor):
+    async def _fenced_initial_decision_conditions(self, db, item, request, owner, leader, actor):
         scope = await db.get(TeamGithubScope, item.scope_id, populate_existing=True)
         if scope is None:
             raise GithubApprovalError("scope_not_found", status_code=404)
@@ -2496,7 +2505,7 @@ class GithubApprovalService:
                 request, root, delivery_key=f"github-approval:{request.id}:request"):
             raise GithubApprovalError("approval_request_link_mismatch")
         return (
-            GithubWorkItem.dispatch_status == "escalated",
+            GithubWorkItem.dispatch_status == item.dispatch_status,
             GithubWorkItem.scope_id == scope.id,
             GithubWorkItem.escalation_reason == item.escalation_reason,
             GithubWorkItem.launch_id == item.launch_id,
@@ -2518,6 +2527,9 @@ class GithubApprovalService:
             *self._attempt_actor_conditions(context),
         )
 
+    async def _escalated_initial_rejection_conditions(self, db, item, request, owner, leader, actor):
+        return await self._fenced_initial_decision_conditions(db, item, request, owner, leader, actor)
+
     async def decide(
         self,
         db: AsyncSession,
@@ -2528,6 +2540,7 @@ class GithubApprovalService:
         reason: str,
         request_id: int,
         actor: dict | None = None,
+        reassign_to_slot_id: int | None = None,
     ) -> tuple[GithubApprovalRequest, bool]:
         """Decide one initial-plan request as its designated Leader.
 
@@ -2538,6 +2551,21 @@ class GithubApprovalService:
 
         decision_item_id = item.id
         decision_scope_id = item.scope_id
+        reroute = reassign_to_slot_id is not None
+        if reroute:
+            from app.services.github_dispatch_service import _lock_dispatch_team, github_dispatch_service
+
+            if decision != "rejected":
+                raise GithubApprovalError("reroute_requires_rejection", status_code=400)
+            scope = await db.get(TeamGithubScope, decision_scope_id)
+            if scope is None:
+                raise GithubApprovalError("scope_not_found", status_code=404)
+            nonce, preset_id = item.dispatch_nonce, scope.preset_id
+            await _lock_dispatch_team(db, preset_id)
+            await db.refresh(scope)
+            await db.refresh(item, with_for_update=True)
+            if item.scope_id != decision_scope_id or scope.preset_id != preset_id or item.dispatch_nonce != nonce:
+                raise GithubApprovalError("stale_approval_context")
         request = await self.resolve_for_decision(
             db,
             item,
@@ -2556,9 +2584,11 @@ class GithubApprovalService:
         if request.request_message_id is None:
             raise GithubApprovalError("approval_request_delivery_pending")
         escalated_rejection = item.dispatch_status == "escalated" and decision == "rejected"
-        if escalated_rejection and (stop := hold_code()):
+        if (escalated_rejection or reroute) and (stop := hold_code()):
             raise GithubApprovalError(stop)
         if request.status != "pending":
+            if reroute:
+                raise GithubApprovalError("request_not_pending")
             if request.status not in {"approved", "rejected"}:
                 raise GithubApprovalError("request_not_pending")
             if request.status == decision and request.reason == reason:
@@ -2591,9 +2621,9 @@ class GithubApprovalService:
             GithubApprovalRequest.owner_member_id == owner.id,
             GithubApprovalRequest.leader_member_id == leader.id,
         )
-        if escalated_rejection:
-            item_conditions += await self._escalated_initial_rejection_conditions(
-                db, item, request, owner, leader, actor)
+        if escalated_rejection or reroute:
+            fence = self._fenced_initial_decision_conditions if reroute else self._escalated_initial_rejection_conditions
+            item_conditions += await fence(db, item, request, owner, leader, actor)
             request_conditions += (
                 GithubApprovalRequest.scope_revision_id.is_(None),
                 GithubApprovalRequest.request_message_id == request.request_message_id,
@@ -2603,6 +2633,14 @@ class GithubApprovalService:
             )
         else:
             item_conditions += (GithubWorkItem.dispatch_status != "escalated",)
+        if reroute:
+            item_conditions += (
+                GithubWorkItem.dispatch_status == "dispatched",
+                GithubWorkItem.active_scope_revision == 0,
+                GithubWorkItem.pr_number.is_(None),
+                GithubWorkItem.retry_requested_at.is_(None),
+                GithubWorkItem.ack_received_at.is_(None),
+            )
         item_guard = await db.execute(
             update(GithubWorkItem)
             .where(*item_conditions)
@@ -2611,7 +2649,7 @@ class GithubApprovalService:
         )
         if item_guard.rowcount != 1:
             await db.rollback()
-            if escalated_rejection:
+            if escalated_rejection or reroute:
                 raise GithubApprovalError("stale_approval_context")
             await db.refresh(item)
             if item.dispatch_status == "escalated":
@@ -2634,6 +2672,7 @@ class GithubApprovalService:
             )
             .execution_options(synchronize_session=False)
         )
+        handoff_notice = None
         try:
             if result.rowcount == 1 and decision == "approved":
                 paths_required = await db.scalar(select(TeamGithubScope.initial_paths_required)
@@ -2677,27 +2716,41 @@ class GithubApprovalService:
                 await decision_waits.record_wait_ended(
                     db, [request_id], outcome=decision, answered_by_member_id=authenticated_leader_member_id,
                     ended_at=request.decided_at, source="github_approval_service.decide")
-            if escalated_rejection and result.rowcount == 1:
+            if (escalated_rejection or reroute) and result.rowcount == 1:
                 # Keep retry blocked until the decision and its linked Mail answer are both durable.
                 await db.refresh(request)
-                message = await agent_mail_service._send_message(db, self.initial_decision_message(request),
+                message = await agent_mail_service._send_message(
+                    db, self.initial_decision_message(request, reassign_to_slot_id),
                     auto_nudge=False, authenticated_sender_member_id=leader.id,
                     authoritative_approval_round=request.approval_round,
                     delivery_key=f"github-approval:{request.id}:decision", commit=False)
                 request.decision_message_id = message.id
-            if escalated_rejection and (stop := hold_code()):
+                if reroute:
+                    handoff_notice = await github_dispatch_service.stage_plan_reroute(
+                        db, item, scope, reassign_to_slot_id, actor=actor, request_id=request_id,
+                    )
+            if (escalated_rejection or reroute) and (stop := hold_code()):
                 raise GithubApprovalError(stop)
             await db.commit()
         except Exception:
-            if escalated_rejection or (result.rowcount == 1 and decision == "approved"):
+            if reroute or escalated_rejection or (result.rowcount == 1 and decision == "approved"):
                 await db.rollback()
             raise
+        if handoff_notice is not None:
+            target, notice = handoff_notice
+            try:
+                await github_dispatch_service._notify_handoff(db, decision_item_id, target, notice)
+            except Exception:
+                await db.rollback()
+                # The audit records an unsettled notice separately from the committed reroute.
+                logger.warning("plan_reroute_notice_unsettled work_item_id=%s request_id=%s",
+                               decision_item_id, request_id)
         await db.refresh(request)
         if result.rowcount == 1:
             return request, True
         if request.status == decision and request.reason == reason:
             return request, False
-        if escalated_rejection:
+        if escalated_rejection or reroute:
             raise GithubApprovalError("stale_approval_context")
         await db.refresh(item)
         if item.dispatch_status == "escalated":

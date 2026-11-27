@@ -150,6 +150,7 @@ def _eligible_handoff_target(target_id: int, preset_id: int):
         AgentTeamSlot.id == target_id,
         AgentTeamSlot.preset_id == preset_id,
         AgentTeamSlot.enabled.is_(True),
+        _eligible_owner_condition(preset_id),
         tier_allows_difficulty_sql(AgentTeamSlot.capability_tier, GithubWorkItem.issue_difficulty),
     ).correlate(GithubWorkItem))
 
@@ -2641,14 +2642,17 @@ class GithubDispatchService:
         if item.owner_slot_id != initiating_slot_id:
             raise ResumeAttemptError("not_item_owner", "Only the current owner may initiate a handoff")
         target = await db.get(AgentTeamSlot, target_slot_id, populate_existing=True)
+        leader_slot_id = await db.scalar(select(AgentTeamPreset.leader_slot_id).where(
+            AgentTeamPreset.id == scope.preset_id))
         if (
             target is None
             or target.preset_id != scope.preset_id
             or not target.enabled
+            or _ineligible_owner(target, leader_slot_id)
         ):
             raise ResumeAttemptError(
                 "invalid_handoff_target",
-                "Handoff target must be an enabled slot in the same preset",
+                "Handoff target must be an eligible build slot in the same team",
             )
         _require_handoff_tier(target.capability_tier, item.issue_difficulty)
         busy = await self.slot_is_busy(db, target_slot_id, exclude_item_id=item.id)
@@ -2657,22 +2661,51 @@ class GithubDispatchService:
                 and item.handoff_expires_at is not None and item.handoff_expires_at > now):
             await db.commit()
             return
-        item.handoff_state = "queued" if busy else "pending"
-        item.handoff_target_slot_id = target_slot_id
-        item.handoff_expires_at = now + HANDOFF_QUEUE_TTL if busy else None
-        item.updated_at = now
         item_id = item.id
-        notice_fields = None
-        if actor is not None:
-            notice_fields = await self._record_handoff_reassignment(
-                db, item, actor=actor, source="github_dispatch_service.initiate_handoff",
-            )
+        notice_fields = await self._stage_handoff(
+            db, item, target_slot_id, busy, now, actor=actor, source="github_dispatch_service.initiate_handoff",
+        )
         await db.commit()
         if not busy:
             await self._notify_handoff(db, item_id, target, notice_fields)
 
+    async def stage_plan_reroute(self, db, item, scope, target_slot_id, *, actor, request_id):
+        """Stage a Leader's handoff in the locked initial-decision transaction."""
+        preset = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
+        if preset is None or not scope.enabled or preset.dispatch_paused:
+            raise GithubApprovalError("dispatch_paused")
+        if item.approval_round_count >= scope.max_approval_rounds:
+            raise GithubApprovalError("approval_rounds_exhausted")
+        target = await db.get(AgentTeamSlot, target_slot_id, populate_existing=True, with_for_update=True)
+        if (target is None or target.id == item.owner_slot_id or target.preset_id != preset.id
+                or not target.enabled or _ineligible_owner(target, preset.leader_slot_id)):
+            raise GithubApprovalError("invalid_handoff_target")
+        if not tier_allows_difficulty(target.capability_tier, item.issue_difficulty):
+            raise GithubApprovalError("handoff_target_below_difficulty")
+        workspace = await github_workspace_service.get_leased_workspace(db, item.id)
+        if workspace is None or workspace.scope_id != scope.id or workspace.lease_token is None:
+            raise GithubApprovalError("lease_not_current")
+        busy = await self.slot_is_busy(db, target_slot_id, exclude_item_id=item.id)
+        item.approval_round_count += 1
+        item.last_nudge_at = None
+        notice = await self._stage_handoff(
+            db, item, target_slot_id, busy, datetime.utcnow(), actor=actor,
+            source="github_dispatch_service.stage_plan_reroute", request_id=request_id,
+        )
+        return (target, notice) if not busy else None
+
+    async def _stage_handoff(self, db, item, target_slot_id, busy, now, *, actor, source, request_id=None):
+        item.handoff_state = "queued" if busy else "pending"
+        item.handoff_target_slot_id = target_slot_id
+        item.handoff_expires_at = now + HANDOFF_QUEUE_TTL if busy else None
+        item.updated_at = now
+        if actor is not None:
+            return await self._record_handoff_reassignment(db, item, actor=actor, source=source, request_id=request_id)
+
     @staticmethod
-    async def _record_handoff_reassignment(db: AsyncSession, item: GithubWorkItem, *, actor: dict, source: str) -> dict:
+    async def _record_handoff_reassignment(
+        db: AsyncSession, item: GithubWorkItem, *, actor: dict, source: str, request_id: int | None = None,
+    ) -> dict:
         from app.services import factory_audit_service as audit
 
         handoff = (
@@ -2687,6 +2720,7 @@ class GithubDispatchService:
             actor=actor,
             scope_id=item.scope_id,
             item_id=item.id,
+            request_id=request_id,
             before_values={"owner_slot_id": item.owner_slot_id},
             after_values={"owner_slot_id": item.owner_slot_id},
             action_outcome="applied",
@@ -3135,6 +3169,7 @@ class GithubDispatchService:
                     GithubWorkItem.dispatch_status == "dispatched",
                     GithubWorkItem.pr_number.is_(None),
                     GithubWorkItem.active_scope_revision == 0,
+                    or_(GithubWorkItem.handoff_state.is_(None), GithubWorkItem.handoff_state == "accepted"),
                 )
             )
         ).scalars().all()

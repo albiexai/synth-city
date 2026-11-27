@@ -207,6 +207,19 @@ External broadcasts require `audience_type` and `audience_id`. Supported scoped 
 
 Receipt recipients are snapshotted when the message is stored. A keyed replay uses those receipts, not current membership. Existing messages retain their historical receipts and have no inferred audience.
 
+## Reroute a pending initial plan
+
+The designated Leader can send a `rejected` decision with `reassign_to_slot_id` through
+`synth_city_approve_work_item` or `POST /api/v1/agent-mail/decisions`. Supply the current
+approval request ID, dispatch nonce, and reason. Choose a different enabled build slot on
+the same team whose capability tier covers the issue's current difficulty.
+
+The decision, next approval round, and audited handoff are recorded together. A busy target
+uses the normal handoff queue. The target accepts before taking ownership and submits its
+own plan for approval. The current workspace and lease stay with the item. A refusal,
+including a lower-tier target, a paused dispatch, a HOLD, or an exhausted approval round,
+leaves the request pending and ownership unchanged.
+
 ## Check a request before submitting it
 
 `POST /api/v1/agent-mail/preflight-request` (MCP tool `synth_city_preflight_request`) reports every mechanical problem of a plan, work item scope amendment or continuation request. It is read-only: it creates no request, Mail, nudge or audit row. It needs the owner's member session, and only the item's owner may ask (`403 not_item_owner` otherwise).
