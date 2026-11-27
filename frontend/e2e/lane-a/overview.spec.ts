@@ -1,6 +1,8 @@
+import type { AgentTeamSummary } from '../../src/types/agentTeams'
 import { contrastFailures, useTheme, type Theme } from '../support/contrast'
 import { expect, test } from '../support/guard'
 import { expectKeyboardReachable } from '../support/keyboard'
+import { localClockPattern, seedAgo } from '../support/time'
 
 // #508: the Overview answers the Director's three questions. In the idle
 // state the page fits one viewport and states "idle and paused" once; with
@@ -106,5 +108,57 @@ for (const theme of ['light', 'dark'] as Theme[]) {
     const failures = await contrastFailures(page.locator('main'))
     expect(failures, JSON.stringify(failures)).toEqual([])
     await expectKeyboardReachable(page, page.locator('main'), 3)
+  })
+}
+
+for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
+  test(`@active the document stays fixed at the end of main at ${viewport.width}px`, async ({ page }) => {
+    await page.setViewportSize(viewport)
+    const finished = Array.from({ length: 3 }, (_, index) => seedAgo({ days: index + 1, minutes: 22 }))
+    // Fill the three recent-finish positions for each seeded campaign.
+    await page.route('**/api/v1/agent-teams/presets/*/summary', async route => {
+      const response = await route.fetch()
+      const summary: AgentTeamSummary = await response.json()
+      if (summary.campaign) {
+        summary.campaign.done_count = finished.length
+        summary.campaign.latest_done = finished.map((moment, index) => ({
+          title: `Completed release task ${index + 1}`,
+          merged_at: moment.toISOString(),
+        }))
+      }
+      await route.fulfill({ response, json: summary })
+    })
+
+    const main = page.getByRole('main')
+    const pages = [
+      { path: '/', title: 'Overview', loaded: 'Completed release task 1' },
+      { path: '/work', title: 'Work', loaded: 'Add the CSV export button' },
+      { path: '/teams', title: 'Teams', loaded: 'Quiet team' },
+    ]
+    for (const { path, title, loaded } of pages) {
+      await page.goto(path)
+      await expect(main.getByRole('heading', { name: title, exact: true })).toBeVisible()
+      await expect(main.getByText(loaded, { exact: false }).first()).toBeVisible()
+      if (title === 'Overview') {
+        const timestamps = main.getByRole('article', { name: /^Progress:/ }).locator('time[datetime]')
+        await expect.poll(() => timestamps.count()).toBeGreaterThanOrEqual(9)
+        const firstFinish = main.locator(`time[datetime="${finished[0].toISOString()}"]`).first()
+        expect(await firstFinish.ariaSnapshot()).toMatch(localClockPattern(finished[0]))
+      }
+      const layout = await main.evaluate(element => {
+        element.scrollTop = element.scrollHeight
+        window.scrollTo(0, document.documentElement.scrollHeight)
+        return {
+          documentHeight: document.documentElement.scrollHeight,
+          documentScroll: window.scrollY,
+          mainScroll: element.scrollTop,
+          mainEnd: element.scrollHeight - element.clientHeight,
+        }
+      })
+      expect(layout.documentHeight, title).toBe(viewport.height)
+      expect(layout.documentScroll, title).toBe(0)
+      expect(layout.mainScroll, title).toBeCloseTo(layout.mainEnd, 0)
+      if (title === 'Overview') expect(layout.mainScroll).toBeGreaterThan(0)
+    }
   })
 }

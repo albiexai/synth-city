@@ -15,7 +15,7 @@ export function MainLayout() {
         <Header />
         <div className="flex flex-1 overflow-hidden">
           <Sidebar />
-          <main id="main-content" tabIndex={-1} className="min-w-0 flex-1 overflow-y-auto p-3 md:p-6">
+          <main id="main-content" tabIndex={-1} className="relative min-w-0 flex-1 overflow-y-auto p-3 md:p-6">
             <Outlet />
           </main>
         </div>
