@@ -1,6 +1,7 @@
 """Provider abstraction for local agent CLIs."""
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -14,6 +15,17 @@ from app.services.providers.capabilities import capability_flags, normalize_capa
 
 _MAX_TREE_DEPTH = 4
 _CLI_NOT_FOUND = re.compile(r"\b(?:CLI|command|executable) (?:was )?not found\b", re.IGNORECASE)
+
+
+def cli_search_path() -> str:
+    """Return the effective controller PATH used to locate provider binaries."""
+    path = os.environ.get("PATH")
+    if path is not None:
+        return path
+    try:
+        return os.confstr("CS_PATH") or os.defpath
+    except (AttributeError, ValueError):
+        return os.defpath
 
 
 @dataclass(frozen=True)
@@ -183,9 +195,9 @@ class AgentProvider(ABC):
 
     def get_status(self) -> dict[str, Any]:
         """Return install/version status suitable for the API."""
-        binary_path = shutil.which(self.binary_name)
+        binary_path = shutil.which(self.binary_name, path=cli_search_path())
         installed, version = self._probe_version(binary_path) if binary_path else (False, None)
-        return {
+        status = {
             "id": self.id,
             "display_name": self.display_name,
             "binary_name": self.binary_name,
@@ -198,3 +210,6 @@ class AgentProvider(ABC):
             "config_paths": self.get_config_paths(),
             "backup_policy": self.get_backup_policy(),
         }
+        if binary_path and not installed:
+            status["unavailable_code"] = "launcher_cli_missing"
+        return status

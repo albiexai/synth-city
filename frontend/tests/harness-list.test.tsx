@@ -24,16 +24,16 @@ const catalogs = fixture.providers as unknown as Record<AgentProviderId, Provide
 const ids = Object.keys(catalogs) as AgentProviderId[]
 const TECHNICAL = /\bunknown\b|\badapter\b|\bbinding\b|\b[a-z]+(?:_[a-z]+)+\b|write capable|read only/i
 
-function statusesWith(overrides: Partial<Record<AgentProviderId, { installed: boolean }>> = {}) {
-  return ids.map(id => ({ id, display_name: id, installed: overrides[id]?.installed ?? true, version: '1.2.3', config_paths: {}, binary_path: null, capabilities: { config: true, plugins: true, usage: true }, capability_matrix: { ...catalogs[id].native_capabilities, config: { state: 'write_capable', reason: 'fixture' } } }))
+function statusesWith(overrides: Partial<Record<AgentProviderId, { installed: boolean; unavailable_code?: string }>> = {}) {
+  return ids.map(id => ({ id, display_name: id, installed: overrides[id]?.installed ?? true, unavailable_code: overrides[id]?.unavailable_code, version: '1.2.3', config_paths: {}, binary_path: null, capabilities: { config: true, plugins: true, usage: true }, capability_matrix: { ...catalogs[id].native_capabilities, config: { state: 'write_capable', reason: 'fixture' } } }))
 }
 
-function open(overrides: Partial<Record<AgentProviderId, { installed: boolean }>> = {}, catalogFor?: (id: string) => ProviderOperations) {
+function open(overrides: Partial<Record<AgentProviderId, { installed: boolean; unavailable_code?: string }>> = {}, catalogFor?: (id: string) => ProviderOperations) {
   const statuses = statusesWith(overrides)
   fixtureFetch(path => {
     const match = /^providers\/([^/]+)\/operations$/.exec(path)
     if (match && catalogFor) return jsonResponse(catalogFor(match[1]))
-    return operationsFixtureResponse(path) ?? jsonResponse(path === 'providers' ? { providers: statuses } : {})
+    return operationsFixtureResponse(path) ?? jsonResponse(path === 'providers' ? { providers: statuses, installation_search: { controller_user: 'fixture-controller', agent_user: 'fixture-agent', path: '/fixture/tools:/usr/bin' } } : {})
   })
   function Where() { return <output aria-label="route">{useLocation().pathname}</output> }
   renderRoute(<ProviderProvider><Where /><HarnessesPage /></ProviderProvider>, '/harnesses', '*')
@@ -58,6 +58,7 @@ describe('compact harness list', () => {
     expect(screen.getAllByRole('article')).toHaveLength(7)
     const claude = card('Claude Code')
     expect(within(claude).getByText('Ready')).toBeInTheDocument()
+    expect(within(claude).getByText('Installed', { exact: true })).toBeInTheDocument()
     expect(within(claude).getByText('v1.2.3')).toBeInTheDocument()
     expect(within(claude).getByText(/settings pages · used by 2 teams/)).toBeInTheDocument()
     expect(within(card('Codex CLI')).getByText(/used by 1 team$/)).toBeInTheDocument()
@@ -72,15 +73,31 @@ describe('compact harness list', () => {
     expect(screen.queryByText(/used by/)).toBeNull()
   })
 
-  it('shows Not installed in neutral grey with an install link, not an error colour', async () => {
+  it('shows Not found in neutral grey with an install link, not an error colour', async () => {
     open({ 'copilot-cli': { installed: false } }); await settle()
 
     const copilot = card('Copilot CLI')
-    const badge = within(copilot).getByText('Not installed')
+    const badge = within(copilot).getByText('Not found')
     expect(badge.className).toContain('text-muted-foreground')
     expect(badge.className).not.toMatch(/red|destructive|amber/)
     expect(within(copilot).getByText('Install it to use it in a team.')).toBeInTheDocument()
     expect(within(copilot).getByRole('link', { name: /How to install/ })).toHaveAttribute('href', '/harnesses/copilot-cli')
+  })
+
+  it('shows the split-user search and distinguishes a launcher from an installed CLI', async () => {
+    open({ 'copilot-cli': { installed: false, unavailable_code: 'launcher_cli_missing' },
+      'opencode-cli': { installed: false } }); await settle()
+
+    expect(screen.getByText('5 installed · 7 supported')).toBeInTheDocument()
+    expect(within(card('Copilot CLI')).getByText('Found a launcher, CLI missing')).toBeInTheDocument()
+    expect(within(card('Copilot CLI')).queryByText('Installed', { exact: true })).toBeNull()
+    expect(within(card('OpenCode')).getByText('Not found')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Where Synth City looked', { exact: true }))
+    expect(screen.getByText('fixture-controller', { exact: true }).parentElement).toHaveTextContent(
+      'Controller fixture-controller searched PATH /fixture/tools:/usr/bin',
+    )
+    expect(screen.getByText(/Configured agent user/)).toHaveTextContent('fixture-agent')
+    expect(screen.getByText(/Installed for another account/)).toHaveTextContent("Install it for the factory's users, or put it on their PATH.")
   })
 
   it('shows Needs setup in amber with the reason in one line', async () => {

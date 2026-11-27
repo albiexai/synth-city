@@ -47,7 +47,7 @@ def annotate_provider_statuses(
         for status in status_list:
             if not status.get("installed"):
                 status["unavailable_reason"] = warning
-                status["unavailable_code"] = "container_agent_clis_missing"
+                status.setdefault("unavailable_code", "container_agent_clis_missing")
     return status_list, {
         "containerized": is_containerized(),
         "agent_cli_warning": warning,

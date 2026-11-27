@@ -2,6 +2,7 @@
 import stat
 
 import pytest
+from pydantic_settings import EnvSettingsSource
 
 from app.services.providers import get_provider
 
@@ -25,6 +26,7 @@ def test_missing_copilot_binary_reports_not_installed(isolated_path):
     assert status["installed"] is False
     assert status["version"] is None
     assert status["binary_path"] is None
+    assert status.get("unavailable_code") != "launcher_cli_missing"
 
 
 def test_copilot_not_found_message_reports_not_installed(isolated_path):
@@ -39,6 +41,7 @@ def test_copilot_not_found_message_reports_not_installed(isolated_path):
     assert status["installed"] is False
     assert status["version"] is None
     assert status["binary_path"] is None
+    assert status["unavailable_code"] == "launcher_cli_missing"
 
 
 def test_installed_copilot_reports_its_version(isolated_path):
@@ -58,3 +61,49 @@ def test_failed_probe_without_not_found_message_keeps_binary_installed(isolated_
 
     assert status["installed"] is True
     assert status["binary_path"] == str(isolated_path / "copilot")
+
+
+@pytest.mark.parametrize("agent_user", [None, "fixture-agent"])
+def test_registry_reports_the_controller_search_and_configured_agent(isolated_path, monkeypatch, agent_user):
+    from app.api.v1 import providers as providers_api
+    from app.config import Settings, settings
+    from app.utils.path_utils import controller_user_name
+
+    if agent_user:
+        monkeypatch.setenv("HARNESS_AGENT_USER", f" {agent_user} ")
+    else:
+        monkeypatch.delenv("HARNESS_AGENT_USER", raising=False)
+    monkeypatch.setattr(settings, "harness_agent_user", EnvSettingsSource(Settings)().get("harness_agent_user"))
+
+    response = providers_api.list_providers()
+
+    assert response["installation_search"] == {
+        "controller_user": controller_user_name(), "agent_user": agent_user, "path": str(isolated_path),
+    }
+    assert all(not provider["installed"] for provider in response["providers"])
+
+
+def test_registry_reports_an_empty_path_without_searching_default_directories(monkeypatch):
+    from app.api.v1 import providers as providers_api
+
+    monkeypatch.setenv("PATH", "")
+
+    response = providers_api.list_providers()
+
+    assert response["installation_search"]["path"] == ""
+    assert all(not provider["installed"] for provider in response["providers"])
+
+
+def test_container_registry_preserves_the_launcher_state(isolated_path, monkeypatch):
+    from app.api.v1 import providers as providers_api
+    from app.services import runtime_environment
+
+    _fake_cli(isolated_path, "copilot", 'echo "GitHub Copilot CLI was not found." >&2\nexit 1')
+    monkeypatch.setattr(runtime_environment, "is_containerized", lambda: True)
+
+    response = providers_api.list_providers()
+
+    assert response["environment"]["agent_cli_warning"] == runtime_environment.CONTAINER_AGENT_CLI_WARNING
+    copilot = next(p for p in response["providers"] if p["id"] == "copilot-cli")
+    assert copilot["installed"] is False
+    assert copilot["unavailable_code"] == "launcher_cli_missing"

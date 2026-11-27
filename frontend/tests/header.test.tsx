@@ -7,13 +7,13 @@ import { Header } from "../src/components/layout/Header";
 const WARNING = "Host agent CLIs are not visible from this container.";
 const LABEL = "Container cannot see host agent CLIs";
 
-const mocks = vi.hoisted(() => ({ status: null as unknown }));
+const mocks = vi.hoisted(() => ({ status: null as unknown, providers: [] as { id: string; installed: boolean; display_name: string }[] }));
 
 vi.mock("../src/contexts/ThemeContext", () => ({ useTheme: () => ({ theme: "dark" }) }));
 vi.mock("../src/hooks/useSystemStatus", () => ({ useSystemStatus: () => mocks.status }));
 vi.mock("../src/hooks/useInstanceDocumentTitle", () => ({ useInstanceDocumentTitle: () => undefined }));
 vi.mock("../src/contexts/ProviderContext", () => ({
-  useProviderContext: () => ({ providers: [], selectedProviderId: "", selectedProvider: null }),
+  useProviderContext: () => ({ providers: mocks.providers, selectedProviderId: "copilot-cli", selectedProvider: null }),
 }));
 
 function renderHeader() {
@@ -36,6 +36,7 @@ function statusWithWarning(warning: string | null) {
 
 beforeEach(() => {
   mocks.status = null;
+  mocks.providers = [];
 });
 
 describe("Header", () => {
@@ -68,6 +69,19 @@ describe("Header", () => {
     expect(row?.lastElementChild).toHaveClass("min-w-0", "gap-1", "sm:gap-2");
     expect(screen.getByAltText("Albiex Synth City")).toHaveClass("shrink-0");
     expect(screen.getByRole("button", { name: "Toggle theme" }).parentElement).toHaveClass("shrink-0");
+  });
+
+  it("counts installed harnesses from the complete registry, even with a stale status or selected missing harness", () => {
+    const claude = { id: "claude-code", installed: true, display_name: "Claude Code" };
+    const copilot = { id: "copilot-cli", installed: false, display_name: "GitHub Copilot CLI" };
+    mocks.providers = [claude, copilot];
+    mocks.status = { ...statusWithWarning(null), providers: { "copilot-cli": { ...copilot, installed: true } } };
+
+    renderHeader();
+
+    const link = screen.getByRole("link", { name: "1 installed. Open Harnesses" });
+    expect(link).toHaveAttribute("href", "/harnesses");
+    expect(link).toHaveAttribute("title", expect.stringContaining("1 of 2 supported harnesses installed for this factory"));
   });
 
   it("shows no container warning when the status has none", () => {

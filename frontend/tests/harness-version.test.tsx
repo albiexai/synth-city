@@ -103,7 +103,7 @@ describe('the harness page shows the chosen user\'s Claude Code version', () => 
     await openPage({ ...AGENT_KNOWN, installed: false })
 
     expect(screen.getAllByText('Version 2.1.326 (agentuser)').length).toBeGreaterThan(0)
-    expect(screen.getByText('Install it on this machine to use it in a team.')).toBeInTheDocument()
+    expect(screen.getByText('Where Synth City looked', { exact: true })).toBeInTheDocument()
   })
 
   it('shows the exact unknown message in the page header and in Technical details, installed or not', async () => {

@@ -17,7 +17,7 @@ import { HarnessBreadcrumb } from "@/features/harnesses/HarnessNav";
 import { ScopeSelector } from "@/features/projects/ScopeSelector";
 import { availablePages, focusRing, useDocumentTitle } from "@/features/harnesses/harnessPages";
 import { scopedVersionBadge, scopedVersionLine } from "@/features/harnesses/versionLine";
-import { providerOperationKeys, type AgentProviderId, type AgentProviderStatus, type ProviderOperations } from "@/types/providers";
+import { providerOperationKeys, type AgentProviderId, type AgentProviderStatus, type ProviderInstallationSearch, type ProviderOperations } from "@/types/providers";
 
 
 // A card shows no "unknown" or "unavailable" while the registry or its own operating catalog still loads.
@@ -39,7 +39,9 @@ function HarnessCardSkeleton({ id }: { id: AgentProviderId }) {
 type HarnessStatus = { kind: "ready" | "setup" | "missing" | "unchecked"; label: string; reason?: string };
 
 function harnessStatus(metadata: AgentProviderStatus | undefined, catalog: ProviderOperations | null): HarnessStatus | null {
-  if (metadata && !metadata.installed) return { kind: "missing", label: "Not installed" };
+  if (metadata && !metadata.installed) {
+    return { kind: "missing", label: metadata.unavailable_code === "launcher_cli_missing" ? "Found a launcher, CLI missing" : "Not found" };
+  }
   const configuration = catalog?.readiness.configuration;
   if (configuration?.state === "ready") return { kind: "ready", label: "Ready" };
   if (configuration?.state === "blocked") return { kind: "setup", label: "Needs setup", reason: configuration.checks.find(check => check.state !== "ready")?.reason };
@@ -56,7 +58,7 @@ function usePendingObservationRetry(catalog: ProviderOperations | null, refresh:
   }, [catalog, refresh]);
 }
 
-// Green for ready, amber only for needs setup, neutral grey for not installed. Each colour has a light and a dark value.
+// Green for ready, amber only for needs setup, neutral grey for a missing CLI. Each colour has a light and a dark value.
 const statusClass: Record<HarnessStatus["kind"], string> = {
   ready: "border-emerald-600/40 text-emerald-700 dark:text-emerald-400",
   setup: "border-amber-600/40 text-amber-700 dark:text-amber-400",
@@ -69,6 +71,22 @@ function StatusBadge({ status }: { status: HarnessStatus }) {
     <span className={cn("inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium", statusClass[status.kind])}>
       <span aria-hidden="true">{status.kind === "missing" ? "○" : "●"}</span>{status.label}
     </span>
+  );
+}
+
+
+function InstallationSearchDetails({ search }: { search?: ProviderInstallationSearch }) {
+  return (
+    <details className="space-y-1 rounded-lg border bg-card p-3 text-sm">
+      <summary className="cursor-pointer font-medium">Where Synth City looked</summary>
+      {search && (
+        <>
+          <p>Controller <code>{search.controller_user}</code> searched PATH <code className="break-all">{search.path || "(empty)"}</code>.</p>
+          {search.agent_user && <p>Configured agent user <code>{search.agent_user}</code>.</p>}
+        </>
+      )}
+      <p>Installed for another account? Install it for the factory&apos;s users, or put it on their PATH.</p>
+    </details>
   );
 }
 
@@ -161,7 +179,9 @@ function Tiles({ id, metadata, catalog, withCounts }: { id: AgentProviderId; met
   );
 }
 
-function HarnessPage({ id, metadata, registryLoading }: { id: AgentProviderId; metadata?: AgentProviderStatus; registryLoading: boolean }) {
+function HarnessPage({ id, metadata, registryLoading, installationSearch }: {
+  id: AgentProviderId; metadata?: AgentProviderStatus; registryLoading: boolean; installationSearch?: ProviderInstallationSearch;
+}) {
   const { state, catalog, refresh } = useProviderOperations(id);
   const mail = useAgentMailSetup();
   useDocumentTitle(`${harnesses[id]} · Albiex Synth City`);
@@ -176,12 +196,13 @@ function HarnessPage({ id, metadata, registryLoading }: { id: AgentProviderId; m
         <header className="space-y-1">
           <div className="flex flex-wrap items-center gap-3">
             <h2 className="text-2xl font-semibold">{harnesses[id]}</h2>
+            {metadata?.installed && <span className="text-xs text-muted-foreground">Installed</span>}
             {status && <StatusBadge status={status} />}
           </div>
           {scopedVersionLine(metadata)
             ? <p className="text-sm text-muted-foreground">{scopedVersionLine(metadata)}</p>
             : metadata?.installed && metadata.version && <p className="text-sm text-muted-foreground">Version {metadata.version}</p>}
-          {metadata && !metadata.installed && <p className="text-sm text-muted-foreground">Install it on this machine to use it in a team.</p>}
+          {metadata && !metadata.installed && <InstallationSearchDetails search={installationSearch} />}
         </header>
         {state === "error" && <p role="alert">Operating catalog unavailable. Readiness is unknown and native pages are unavailable.</p>}
         <HarnessMailSetup providerId={id} harnessInstalled={metadata?.installed !== false} setup={mail} />
@@ -230,6 +251,7 @@ function HarnessCard({ id, metadata, registryLoading, teamCount }: { id: AgentPr
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="flex flex-wrap items-center gap-2 text-lg font-semibold">
             {harnesses[id]}
+            {metadata?.installed && <span className="text-xs font-medium text-muted-foreground">Installed</span>}
             {status && <StatusBadge status={status} />}
           </h3>
           {versionBadge && <span className="font-mono text-xs text-muted-foreground">{versionBadge}</span>}
@@ -265,7 +287,7 @@ function useTeamCounts() {
 
 export function HarnessesPage() {
   const { providerId } = useParams();
-  const { providers, loading, error } = useProviderContext();
+  const { providers, installationSearch, loading, error } = useProviderContext();
   const ids = Object.keys(harnesses).filter(id => !providerId || providerId === id) as AgentProviderId[];
   const teamCounts = useTeamCounts();
   const single = providerId && ids.length === 1 ? ids[0] : null;
@@ -273,11 +295,14 @@ export function HarnessesPage() {
   return <section className="space-y-5">
     {!single && <HarnessBreadcrumb />}
     {!single && <h2 className="text-2xl font-semibold">Harnesses{providerId ? ` · ${harnesses[providerId as AgentProviderId] ?? providerId}` : ""}</h2>}
-    {!single && <p>The agent tools on this machine. Open one to see its settings pages.</p>}
+    {!single && !loading && !error && providers.length > 0 && (
+      <p>{providers.filter(provider => provider.installed).length} installed · {providers.length} supported</p>
+    )}
+    {!single && !loading && !error && providers.some(provider => !provider.installed) && <InstallationSearchDetails search={installationSearch} />}
     {loading && <p role="status">Loading harness registry…</p>}
     {error && <p role="alert">{error}</p>}
     {!ids.length && <p>Unknown harness. <Link to="/harnesses">Show all harnesses</Link></p>}
-    {!error && single && <HarnessPage id={single} metadata={providers.find(p => p.id === single)} registryLoading={loading} />}
+    {!error && single && <HarnessPage id={single} metadata={providers.find(p => p.id === single)} registryLoading={loading} installationSearch={installationSearch} />}
     {!error && !single && <div className="grid gap-4 lg:grid-cols-2">{ids.map(id => <HarnessCard key={id} id={id} metadata={providers.find(p => p.id === id)} registryLoading={loading} teamCount={teamCounts?.[id] ?? null} />)}</div>}
   </section>;
 }
