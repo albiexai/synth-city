@@ -3137,6 +3137,17 @@ class RequiredCIUnreadableSignal(BaseModel):
     ])
 
 
+class IssueDifficultyWrite(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    difficulty: CapabilityTier
+
+
+class IssueDifficultyProvenance(BaseModel):
+    difficulty: CapabilityTier
+    source: Literal["leader", "director", "supervisor", "github"]
+    actor_reference: str | None
+
+
 class GithubWorkItemResponse(BaseModel):
     id: int
     scope_id: int
@@ -3150,6 +3161,7 @@ class GithubWorkItemResponse(BaseModel):
     github_updated_at: datetime
     issue_type: str
     dispatch_status: str
+    difficulty_provenance: IssueDifficultyProvenance | None = Field(default=None, exclude_if=lambda value: value is None)
     pending_reason: Optional[str] = None
     workspace_wait_reason: str | None = None
     launch_id: Optional[int] = None

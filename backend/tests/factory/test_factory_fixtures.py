@@ -220,7 +220,9 @@ async def test_v13_frozen_responses_enforce_explicit_field_allowlist():
     assertions here also cover the live read routes.
     """
     safe_item_keys = set(wire.SafeWorkItem.model_fields) - {
-        "scope_default_effort_limit_minutes", "plan_estimate_minutes", "plan_limit_minutes", "plan_refusal"}
+        "scope_default_effort_limit_minutes", "plan_estimate_minutes", "plan_limit_minutes", "plan_refusal",
+        "difficulty_provenance",
+    }
     summary = json.loads((FIXTURES / "schema.json").read_text())["models"]["AgentTeamSummaryResponse"]
     assert set(summary["properties"]) == set(wire.AgentTeamSummaryResponse.model_fields)
     assert not (set(summary["properties"]) & V13_FORBIDDEN_FIELDS)

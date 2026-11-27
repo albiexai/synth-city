@@ -17,7 +17,10 @@ from app.services.github_plan_refusal_service import record_plan_refusal
 NOW = datetime(2026, 9, 30, 12, tzinfo=timezone.utc)
 PRIVATE = "synthetic-private-forbidden"
 # Effort fields that the wire leaves out when they are empty.
-OPTIONAL_PLAN_FIELDS = {"scope_default_effort_limit_minutes", "plan_estimate_minutes", "plan_limit_minutes", "plan_refusal"}
+OPTIONAL_WORK_ITEM_FIELDS = {
+    "scope_default_effort_limit_minutes", "plan_estimate_minutes", "plan_limit_minutes", "plan_refusal",
+    "difficulty_provenance",
+}
 
 pytestmark = pytest.mark.asyncio
 
@@ -397,7 +400,7 @@ async def test_redaction_list_detail_overview_and_repository(factory_client, fac
         assert PRIVATE not in response.text
     result = await get_ok(factory_client, f"work-items/{factory_store.ids.by_status['escalated']}")
     item = result["work_item"]
-    assert set(item["item"]) == set(wire.SafeWorkItem.model_fields) - OPTIONAL_PLAN_FIELDS
+    assert set(item["item"]) == set(wire.SafeWorkItem.model_fields) - OPTIONAL_WORK_ITEM_FIELDS
     assert set(item["team"]) == set(wire.TeamReference.model_fields)
     assert "parent_issue_url" not in item["item"]
     assert "outcome" not in item["item"]

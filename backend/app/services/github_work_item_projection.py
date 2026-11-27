@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.database import GithubApprovalRequest, GithubAttemptScopeRevision, GithubWorkItem, GithubWorkspace, TeamGithubScope
 from app.models.schemas import GithubWorkItemResponse, InitialPathComparison
 from app.services.github_approval_service import CONTINUABLE_ESCALATIONS
+from app.services.github_dispatch_difficulty import project_issue_difficulty
 from app.services.github_dispatch_service import HANDOFF_QUEUE_TTL, github_dispatch_service
 from app.services.github_effort_limit_service import effort_limit_service
 from app.services.github_rate_limit_service import github_rate_limit_service
@@ -103,6 +104,7 @@ def _work_item_response(
         issue_url=item.issue_url,
         github_updated_at=item.github_updated_at,
         issue_type=item.issue_type,
+        difficulty_provenance=project_issue_difficulty(item),
         dispatch_status=item.dispatch_status,
         pending_reason=item.pending_reason,
         workspace_wait_reason=work_item_workspace_wait_reason(item),

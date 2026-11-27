@@ -461,3 +461,24 @@ Next) that the owner publishes. Only the current Leader may read it.
   returns `409 progress_context_unavailable`.
 - **No GitHub write.** The tool and the route write nothing to GitHub. The owner publishes the block, or the
   system-owned PR comment shows the generated summary.
+
+### Set issue difficulty during triage
+
+Send `{"difficulty":"low"}` with any one of `low`, `medium`, or `high` to the route
+for your authenticated role.
+
+| Role | PUT route |
+| --- | --- |
+| Current Leader, using the active Mail session | `/api/v1/agent-mail/work-items/{id}/difficulty` |
+| Director, using the shared operator credential through a direct access path | `/api/v1/agent-teams/github-work-items/{id}/difficulty` |
+| Team's bound Supervisor, using an external actor bearer token | `/api/v1/external/agent-mail/work-items/{id}/difficulty` |
+
+The Leader can use `synth_city_set_issue_difficulty(work_item_id, difficulty)`.
+A successful write returns `difficulty`, `source`, and `actor_reference`.
+The server derives attribution from the authenticated role. The Leader receives
+`difficulty_override_protected` when the current choice is protected. Paused or
+held work and items past triage refuse difficulty writes. GitHub App mode uses a
+repository-scoped token with Issues write permission. A response of
+`difficulty_write_uncertain` means GitHub may have changed the labels and the
+Factory could not confirm the result. Read the issue and its recorded provenance
+before attempting another write.

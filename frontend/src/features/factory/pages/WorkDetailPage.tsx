@@ -131,6 +131,23 @@ export function WorkDetailPage() {
               {comparison.note && <p className="break-all font-mono text-sm">{comparison.note}</p>}
             </section>
           )}
+          {w.item.difficulty_provenance && (
+            <p>
+              Difficulty {w.item.difficulty_provenance.difficulty} ·{" "}
+              {w.item.difficulty_provenance.source === "github" ? (
+                "GitHub · author not recorded"
+              ) : (
+                <span className="capitalize">
+                  {w.item.difficulty_provenance.source}
+                  {w.item.difficulty_provenance.actor_reference && (
+                    <span className="normal-case">
+                      {" "}({w.item.difficulty_provenance.actor_reference})
+                    </span>
+                  )}
+                </span>
+              )}
+            </p>
+          )}
           <ContextLinks work={w} />
           {w.item.dispatch_status === "merged" ? (
             <section className={panel}>

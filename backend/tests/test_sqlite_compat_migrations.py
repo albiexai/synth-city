@@ -1178,7 +1178,11 @@ async def test_pr2_base_migration_does_not_invent_historical_attempt_identity():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("table", "column"),
-    [("agent_team_slots", "capability_tier"), ("github_work_items", "issue_difficulty")],
+    [
+        ("agent_team_slots", "capability_tier"),
+        ("github_work_items", "issue_difficulty"),
+        ("github_work_items", "issue_difficulty_provenance"),
+    ],
 )
 async def test_difficulty_fields_are_added_to_legacy_tables(table, column):
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")

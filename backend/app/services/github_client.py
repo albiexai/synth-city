@@ -399,6 +399,28 @@ class GithubClient:
             if self._http is None:
                 await client.aclose()
 
+    async def update_issue_difficulty_labels(
+        self, owner: str, repo: str, number: int, *,
+        previous: set[str], requested: str, token: str | None = None,
+    ) -> None:
+        """Change only the difficulty labels observed on the exact issue."""
+        endpoint = f"/repos/{owner}/{repo}/issues/{number}/labels"
+        headers = self._headers(token)
+        client = self._client()
+        try:
+            if requested not in previous:
+                response = await client.post(endpoint, headers=headers, json={"labels": [requested]})
+                response.raise_for_status()
+                self._require_expected_response(response, endpoint=endpoint, label="issue labels")
+            for name in sorted(previous - {requested}):
+                label_endpoint = f"{endpoint}/{quote(name, safe='')}"
+                response = await client.delete(label_endpoint, headers=headers)
+                response.raise_for_status()
+                self._require_expected_response(response, endpoint=label_endpoint, label="issue label removal")
+        finally:
+            if self._http is None:
+                await client.aclose()
+
     async def close_issue(self, owner: str, repo: str, number: int) -> None:
         """Close the exact repository issue as completed."""
         endpoint = f"/repos/{owner}/{repo}/issues/{number}"

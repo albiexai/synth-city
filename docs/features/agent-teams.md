@@ -26,7 +26,15 @@ Area-label matches and classifier candidates must meet the issue difficulty. Whe
 the work item records `difficulty_above_tier`. The scheduler rechecks eligibility when it claims the item and
 before launching the owner.
 
-Separate issues track authenticated difficulty writes and plan-time rerouting. [Difficulty writes](https://github.com/albiexai/synth-city/issues/1404) · [Plan-time rerouting](https://github.com/albiexai/synth-city/issues/1405)
+During triage, the current Leader can set difficulty with `synth_city_set_issue_difficulty`.
+The Director and the team's bound Supervisor can replace that choice, including with a lower tier.
+The Leader receives `difficulty_override_protected` for an existing Director, Supervisor, or
+external GitHub selection. Factory work detail shows the authenticated source and actor reference.
+A direct GitHub selection uses the label for routing and displays GitHub as the source with no
+recorded author. Provenance reflects the last confirmed Factory choice while its difficulty labels
+still match the latest observation. The audit trail retains the original event.
+
+Plan-time rerouting is tracked in [#1405](https://github.com/albiexai/synth-city/issues/1405).
 
 ### Work item scope of a continuation
 

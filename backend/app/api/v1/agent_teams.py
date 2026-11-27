@@ -52,6 +52,8 @@ from app.services.github_leader_recovery_service import (
 )
 from app.services.github_end_stopped_item_service import EndStoppedItemRequest
 from app.models.schemas import (
+    IssueDifficultyProvenance,
+    IssueDifficultyWrite,
     GithubScopeAmendmentCreate, GithubRevisionReviewCreate, GithubRevisionReviewWithdraw,
     GithubSubmittedRevisionEnd, GithubRevisionReviewResponse,
     GithubHeadReviewCreate, GithubHeadReviewResponse, GithubReviewBindingResponse,
@@ -368,6 +370,9 @@ from app.services.github_work_item_projection import (
 )
 from app.api.v1.factory_delivery import router as delivery_router
 from app.services.factory_delivery_policy import scope_policy
+
+from app.services.github_coordination_service import CoordinationError
+from app.services.github_issue_difficulty_service import set_issue_difficulty
 
 router = APIRouter()
 
@@ -3322,6 +3327,20 @@ async def force_release_github_workspace(
         discarded_paths=discarded_paths,
         unpushed_commits=unpushed_commits,
     )
+
+
+@router.put("/github-work-items/{work_item_id}/difficulty", response_model=IssueDifficultyProvenance,
+            dependencies=[Depends(require_director_action())])
+async def set_director_issue_difficulty(
+    work_item_id: int,
+    request: IssueDifficultyWrite,
+    write_context: dict = Depends(operator_write_context),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await set_issue_difficulty(db, work_item_id, request.difficulty, source="director", via=write_context["via"])
+    except CoordinationError as exc:
+        raise HTTPException(exc.status, detail=exc.code) from exc
 
 
 @router.get(

@@ -418,6 +418,26 @@ describe("cursor browsing V26/V27", () => {
 });
 
 describe("work details and protected controls", () => {
+  it.each([
+    ["supervisor", "external_actor:6", "external_actor:6"],
+    ["github", null, "GitHub · author not recorded"],
+  ])("shows difficulty and the %s source", async (source, actor_reference, attribution) => {
+    const response = detail.completed.response;
+    fixtureFetch(path => path === "factory/work-items/9" ? jsonResponse({
+      ...response,
+      work_item: {
+        ...response.work_item,
+        item: {
+          ...response.work_item.item,
+          difficulty_provenance: { difficulty: "high", source, actor_reference },
+        },
+      },
+    }) : standard(path));
+    renderRoute(<WorkDetailPage />, "/work/9", "/work/:workItemId");
+    expect(await screen.findByText(/Difficulty high/)).toBeInTheDocument();
+    expect(screen.getByText(attribution, { exact: false })).toBeInTheDocument();
+  });
+
   it("shows the compared files and outside-scope note only when the comparison is present", async () => {
     const comparison = {
       head_sha: "a".repeat(40),

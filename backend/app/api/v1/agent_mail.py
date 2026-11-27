@@ -41,6 +41,8 @@ from app.models.database import (
     TeamGithubScope,
 )
 from app.models.schemas import (
+    IssueDifficultyProvenance,
+    IssueDifficultyWrite,
     AgentMailInstallStatus,
     AgentMailSnippets,
     GithubApprovalRequestResponse,
@@ -77,6 +79,9 @@ from app.services.github_approval_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+from app.services.github_coordination_service import CoordinationError
+from app.services.github_issue_difficulty_service import set_issue_difficulty
 
 router = APIRouter()
 
@@ -542,6 +547,20 @@ async def preflight_request(
             result.problems.insert(0, request_preflight.problem("lease_token_mismatch", 403))
     # The recorded estimate and effort limit (#968): read-only numbers, beside the findings and never part of them.
     return {**result.as_dict(), "effort": effort_limit_service.effort_view(item, scope)}
+
+
+@router.put("/work-items/{work_item_id}/difficulty", response_model=IssueDifficultyProvenance)
+async def set_leader_issue_difficulty(
+    work_item_id: int,
+    request: IssueDifficultyWrite,
+    session: MailAgentSession = Depends(require_mail_session),
+    db: AsyncSession = Depends(get_db),
+):
+    require_current_mail_session(session)
+    try:
+        return await set_issue_difficulty(db, work_item_id, request.difficulty, source="leader", session=session)
+    except CoordinationError as exc:
+        raise HTTPException(exc.status, detail=exc.code) from exc
 
 
 @router.post(
