@@ -50,6 +50,37 @@ async def test_handoff_deadline_migration_preserves_existing_pending_handoff():
 
 
 @pytest.mark.asyncio
+async def test_dispatch_attempt_migration_preserves_legacy_ref_and_binding():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    legacy_nonce = "0123456789abcdef"
+    legacy_ref = f"deck/slot-1/issue-7-{legacy_nonce}"
+    try:
+        async with engine.connect() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            await conn.commit()
+            async with AsyncSession(bind=conn, expire_on_commit=False) as session:
+                preset = AgentTeamPreset(name="Existing team")
+                session.add(preset)
+                await session.flush()
+                scope = TeamGithubScope(preset_id=preset.id, repo_owner="o", repo_name="r", repo_path="/tmp/r")
+                session.add(scope)
+                await session.flush()
+                session.add(GithubWorkItem(scope_id=scope.id, issue_number=7, issue_title="Existing attempt",
+                    issue_url="url", github_updated_at=datetime.utcnow(),
+                    dispatch_nonce=legacy_nonce, dispatch_head_ref=legacy_ref))
+                await session.commit()
+            await conn.execute(text("ALTER TABLE github_work_items DROP COLUMN dispatch_attempt"))
+            await conn.commit()
+            for _ in range(2):
+                await _run_sqlite_compat_migrations(conn)
+            assert (await conn.execute(text(
+                "SELECT dispatch_attempt, dispatch_nonce, dispatch_head_ref FROM github_work_items"
+            ))).one() == (0, legacy_nonce, legacy_ref)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_work_item_admission_migration_preserves_history_and_current_uniqueness():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     try:

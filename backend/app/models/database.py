@@ -433,6 +433,7 @@ class GithubWorkItem(Base):
     ack_approver_member_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     ack_evidence_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     dispatch_nonce: Mapped[str | None] = mapped_column(String, nullable=True)
+    dispatch_attempt: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     ack_enforcement_epoch: Mapped[int | None] = mapped_column(Integer, nullable=True)
     ack_approval_round: Mapped[int | None] = mapped_column(Integer, nullable=True)
     dispatch_head_ref: Mapped[str | None] = mapped_column(String, nullable=True)

@@ -5,12 +5,13 @@ import enum
 import asyncio
 import hmac
 import logging
+import re
 import secrets
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 
-from sqlalchemy import String, and_, cast, exists, func, or_, select, update
+from sqlalchemy import String, and_, cast, exists, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -75,15 +76,21 @@ _LAUNCH_FAILED_STATUSES = {
     "skipped_disabled",
 }
 _ATTEMPT_MARKERS = ("dispatch_nonce", "dispatch_head_ref", "dispatch_base_ref")
+_LEGACY_HEAD_REF = re.compile(r"deck/slot-[0-9]+/issue-[0-9]+-[0-9a-f]{16}")
 _START_IDENTITY_FIELDS = (
     "id", "scope_id", "dispatch_status", "owner_slot_id", "routing_method",
-    "dispatch_nonce", "dispatch_head_ref", "dispatch_base_ref", "dispatched_at",
+    "dispatch_nonce", "dispatch_attempt", "dispatch_head_ref", "dispatch_base_ref", "dispatched_at",
     "created_at", "handoff_state", "handoff_target_slot_id",
 )
 
 
 def _item_identity(item: GithubWorkItem) -> tuple:
     return tuple(getattr(item, field) for field in _START_IDENTITY_FIELDS)
+
+
+def dispatch_ref_contains_private_binding(ref: str | None, nonce: str | None) -> bool:
+    """Recognize legacy public refs even after the private binding changes."""
+    return bool(ref and ((nonce and nonce in ref) or _LEGACY_HEAD_REF.fullmatch(ref)))
 
 
 def _identity_value_clause(column, value):
@@ -340,16 +347,6 @@ def attempt_state(item: GithubWorkItem) -> AttemptState:
         f"base={markers[2] is not None} "
         f"round={item.approval_round_count} owner={item.owner_slot_id} "
         f"routing={item.routing_method!r}",
-    )
-
-
-def attempt_head_ref(item: GithubWorkItem, owner_slot_id: int, *, nonce: str | None = None) -> str:
-    nonce = nonce if nonce is not None else item.dispatch_nonce
-    if nonce is None:
-        raise PartiallyPreparedAttempt(item.id, "head requested before nonce mint")
-    return (
-        f"deck/slot-{owner_slot_id}/issue-{item.issue_number}-"
-        f"{nonce}"
     )
 
 
@@ -937,20 +934,30 @@ class GithubDispatchService:
         scope = await db.get(TeamGithubScope, item.scope_id)
         if scope is None:
             raise ValueError("Dispatch scope is missing")
+        # Allocate in the guarded writer statement so retries and replacement
+        # rows for this repository issue cannot reuse a published generation.
+        next_attempt = (
+            select(func.coalesce(func.max(GithubWorkItem.dispatch_attempt), 0) + 1)
+            .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
+            .where(
+                func.lower(TeamGithubScope.repo_owner) == scope.repo_owner.lower(),
+                func.lower(TeamGithubScope.repo_name) == scope.repo_name.lower(),
+                GithubWorkItem.issue_number == item.issue_number,
+            )
+            .correlate(None)
+            .scalar_subquery()
+        )
         values = dict(
             owner_slot_id=owner_slot_id, routing_method=routing_method, dispatch_nonce=nonce,
             delivery_policy=scope_policy(scope).model_dump(mode="json"),
             delivery_policy_revision=scope.delivery_policy_revision,
-            dispatch_head_ref=attempt_head_ref(item, owner_slot_id, nonce=nonce),
+            dispatch_attempt=next_attempt,
+            dispatch_head_ref=literal(f"deck/slot-{owner_slot_id}/issue-{item.issue_number}-g") + cast(next_attempt, String),
             dispatch_base_ref=base_ref, approval_round_count=1,
         )
-        if expected_identity is not None:
-            if not await self._update_current_item(db, item, expected_identity, **values):
-                return None
-        else:
-            for field, value in values.items():
-                setattr(item, field, value)
-            item.updated_at = datetime.utcnow()
+        identity = _item_identity(item) if expected_identity is None else expected_identity
+        if not await self._update_current_item(db, item, identity, **values):
+            return None
         await db.commit()
         return prepared_attempt_from_row(item)
 

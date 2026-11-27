@@ -26,6 +26,7 @@ from app.models.github_work_progress_schemas import (
 from mcp_shim.work_remaining_protocol import RemainingReport, ReportContext, parse_report, public_generation, report_reason
 from app.services.github_client import GithubClientResponseError, github_client
 from app.services.github_coordination_service import hold_code
+from app.services.github_dispatch_service import dispatch_ref_contains_private_binding
 from app.services.github_stopped_attempt_actor import StoppedAttemptStep, stopped_attempt_policy, stopped_attempt_step
 from app.services.github_work_item_projection import _load_work_item_authority
 from app.services.github_work_progress_observation import (
@@ -466,6 +467,12 @@ class GithubWorkProgressService:
             valid_until = min(valid_until, _utc(publication.observed_at) + timedelta(seconds=validity_seconds))
         if continuation_deadline is not None:
             valid_until = min(valid_until, _utc(continuation_deadline))
+        # Filter against the identity that produced the observation, including
+        # when the current attempt changed during an awaited check read.
+        if publication.destination_url and dispatch_ref_contains_private_binding(
+            started_identity["head_ref"], started_identity["dispatch_nonce"],
+        ):
+            publication = publication.model_copy(update={"destination_url": None})
         return GithubWorkProgressResponse(
             work_item_id=item_id, dispatch_nonce=item.dispatch_nonce,
             owner_slot_id=item.owner_slot_id, checked_at=datetime.now(timezone.utc),
