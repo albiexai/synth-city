@@ -131,8 +131,8 @@
 
   <!-- Arrows: system -->
   <path d="M550,236 L586,236" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#ms)" marker-start="url(#ms)"/>
-  <text x="553" y="228" font-size="9.5" fill="#334155">Mail</text>
-  <text x="553" y="252" font-size="9.5" fill="#334155">dispatch</text>
+  <text x="570" y="228" text-anchor="middle" font-size="8" fill="#334155">Mail</text>
+  <text x="570" y="252" text-anchor="middle" font-size="8" fill="#334155">dispatch</text>
   <path d="M796,450 L554,450" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#ms)"/>
   <text x="690" y="443" font-size="11" fill="#334155">controller polls</text>
 </svg>
