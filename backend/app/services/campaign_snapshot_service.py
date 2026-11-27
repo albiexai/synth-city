@@ -6,11 +6,13 @@ calculation that produced it. A snapshot is built from the campaign, its live me
 ``as_of``; it reads no clock, so the same inputs give the same snapshot. A partial history is unknown with a reason,
 never zero. Later measures (#1245-#1250) add their samples here.
 
-#1246 split 1 adds a structured section, the item time from first dispatch to merge by size band. Bands are by lines
-changed (additions plus deletions, from #1238's PR facts): 0-100, 101-400 and over 400, per L1's answer of 2026-11-27;
-"R2" in the issue stays undefined. A first dispatch counts only where lifecycle recording provably covers the item:
-the C12 forward-coverage marker is at or before the item's creation, so no earlier dispatch can be missing. The first
-recorded event never stands in for that. The median is the middle value; p85 is the nearest rank (the smallest time
+#1246 split 1 adds a structured section, the item time from the first dispatch in the campaign to a sourced merge in
+the campaign, by size band. Bands are by lines changed (additions plus deletions) in R2, the PR facts recorded at
+merge (#1238): 0-100, 101-400 and over 400 (the Supervisor's answers on #1246, 2026-11-27). Only a recorded PR merge
+time (or a legacy automatic merge time) ends an interval. The dispatch is read from the item lifetime that recorded
+the merge, between the later of campaign start and item creation and the merge, and only where the C12
+forward-coverage marker is at or before that window's start, so no earlier dispatch in it can be missing; the first
+recorded event never stands in for that (V1 review 448). The median is the middle value; p85 is the nearest rank (the smallest time
 with at least 85% of times at or below it). Fewer than five timed items is a small sample, shown with its value and n.
 """
 from __future__ import annotations
@@ -24,6 +26,7 @@ from statistics import median
 from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 
 from app.models.database import (
     Campaign,
@@ -46,6 +49,7 @@ BANDS = (("0-100", 100), ("101-400", 400), ("over-400", None))  # by lines chang
 CACHE_SECONDS = 30.0  # the Overview panel polls
 _clock = time.monotonic
 _cache: dict[int, tuple[float, tuple, Snapshot]] = {}
+_item_keys = aliased(FactoryContextKey)
 
 
 class MeasureCoverageEntry(BaseModel):
@@ -125,8 +129,10 @@ async def _fingerprint(db, campaign: Campaign) -> tuple:
     markers = tuple((entry.measure, entry.started_at) for entry in await upgrade.recorded_coverage(db, campaign))
     # Retiring the team ends the cache even with no repositories or work items (V1 review 6080664549).
     live = await audit.current_context_key(db, "team", campaign.preset_id) == campaign.team_context_key
+    # #1246: installing the lifecycle coverage marker changes item time without any new event (V1 review 448).
+    lifecycle = await audit.instrumentation_start(db)
     return (campaign.id, campaign.team_context_key, campaign.selector, campaign.status, campaign.started_at,
-            campaign.finished_at, live, events, scopes, items, markers)
+            campaign.finished_at, live, events, scopes, items, markers, lifecycle)
 
 
 async def build_snapshot(db, campaign: Campaign, client, *, as_of: datetime, observed_at: datetime | None = None,
@@ -222,8 +228,9 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
     ]
     coverage = await upgrade.recorded_coverage(db, campaign)
     metrics.append(await _rate_limited(db, coverage, started, as_of))
+    # Missing delivery history the counts already know of makes item time partial too (V1 review 448).
     item_time = await _item_time(db, campaign, list(members), facts, coverage, as_of,
-                                 gaps if not known else [], label)
+                                 gaps if not known else ([reason] if unknown else []), label)
     return Snapshot(
         campaign_id=campaign.id, selector=campaign.selector, started_at=started, as_of=as_of,
         calculation_version=CALCULATION_VERSION, metrics=sorted(metrics, key=lambda sample: sample.name),
@@ -247,11 +254,16 @@ async def _item_time(db, campaign: Campaign, members: list[tuple[str, int]], fac
     marker = marker and _naive_utc(marker)
     facts_entry = next(c for c in coverage if c.measure == "pull_request_facts")
     facts_from = facts_entry.started_at and _naive_utc(facts_entry.started_at)
-    live = {_identity(f"{row.repo_owner}/{row.repo_name}", row.issue_number): row for row in (await db.execute(
-        select(GithubWorkItem.id, GithubWorkItem.created_at, GithubWorkItem.issue_number, TeamGithubScope.repo_owner,
-               TeamGithubScope.repo_name)
+    began = _naive_utc(campaign.started_at)
+    # The live items of the team lifetime by their current item key: a merge's own lifetime finds its row, and a
+    # replacement row (a new key) never stands in for an old merge (V1 review 448).
+    live = {row.context_key: row for row in (await db.execute(
+        select(GithubWorkItem.id, GithubWorkItem.created_at, FactoryContextKey.context_key)
         .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
-        .join(FactoryContextKey, _lifetime(campaign.team_context_key)))).all()}
+        .join(FactoryContextKey, _lifetime(campaign.team_context_key))
+        .join(_item_keys, (_item_keys.key_kind == "item") & (_item_keys.numeric_id == GithubWorkItem.id)
+              & _item_keys.retired_at.is_(None))
+        .with_only_columns(GithubWorkItem.id, GithubWorkItem.created_at, _item_keys.context_key))).all()}
     sizes = {}
     for row in (await db.execute(select(FactoryAuditEvent.context_snapshot, FactoryAuditEvent.after_values).where(
             FactoryAuditEvent.event_kind == audit.PULL_FACTS_KIND,
@@ -262,19 +274,29 @@ async def _item_time(db, campaign: Campaign, members: list[tuple[str, int]], fac
     rows: dict[str, list[tuple[float | None, list[str]]]] = {name: [] for name, _ in BANDS}
     rows["unknown"] = []
     for key in members:
-        merges = sorted((at, artifact) for at, artifact in facts.merges.get(key, ()) if at <= as_of)
-        ends = [at for at in facts.delivered.get(key, ()) if at <= as_of]
-        if not ends:
+        delivered = [at for at in facts.delivered.get(key, ()) if began <= at <= as_of]
+        if not delivered:
+            continue  # not delivered in the campaign by the cutoff
+        merges = [merge for merge in facts.merges.get(key, ()) if began <= merge[0] <= as_of]
+        if not merges:  # delivered, but no recorded merge time
+            rows["unknown"].append((None, ["merge_time_not_recorded"]))
             continue
-        end = min(ends)
-        artifact = next((artifact for at, artifact in merges if at == end), None)
-        start, reasons = await _first_dispatch(db, live.get(key), marker)
-        size = sizes.get((artifact or "").lower())
-        if facts_from is None:
+        end = min(at for at, _, _ in merges)
+        tied = [merge for merge in merges if merge[0] == end]
+        artifacts = {artifact.lower() for _, artifact, _ in tied if artifact}
+        lifetimes = {lifetime for _, _, lifetime in tied}
+        if len(lifetimes) > 1:
+            start, reasons = None, ["ambiguous_tracking"]
+        else:
+            start, reasons = await _first_dispatch(db, live, next(iter(lifetimes)), marker, began, end)
+        size = sizes.get(next(iter(artifacts))) if len(artifacts) == 1 else None
+        if len(artifacts) > 1:
+            band, why = "unknown", "conflicting_artifacts"
+        elif facts_from is None:
             band, why = "unknown", "pull_facts_recording_not_installed"
         elif end < facts_from:
             band, why = "unknown", "merged_before_pull_facts_recording"
-        elif artifact is None:
+        elif not artifacts:
             band, why = "unknown", "artifact_not_recorded"
         elif size is None:
             band, why = "unknown", "pull_request_facts_missing"
@@ -302,25 +324,30 @@ async def _item_time(db, campaign: Campaign, members: list[tuple[str, int]], fac
     return ItemTimeSection(items=items, timed=timed, coverage=label, unknown_reasons=reasons, bands=bands)
 
 
-async def _first_dispatch(db, item, marker: datetime | None) -> tuple[datetime | None, list[str]]:
-    """The item's first dispatch, only where lifecycle recording covers its whole lifetime; else unknown and why."""
+async def _first_dispatch(db, live: dict, lifetime: str | None, marker: datetime | None, began: datetime,
+                          end: datetime) -> tuple[datetime | None, list[str]]:
+    """The first dispatch in the campaign of the lifetime that merged, only where the coverage marker spans the whole
+    search window, from the later of campaign start and item creation to the merge; else unknown and why."""
     if marker is None:
         return None, ["no_forward_coverage_marker"]
-    if item is None:
-        return None, ["dispatch_not_recorded"]
-    if marker > _naive_utc(item.created_at):
+    item = live.get(lifetime) if lifetime is not None else None
+    if item is None:  # a lifetime without its live row: its creation, and so the window, is unknown
+        return None, ["item_lifetime_unknown"]
+    window = max(began, _naive_utc(item.created_at))
+    if marker > window:
         return None, ["dispatch_before_instrumentation"]
-    key = await audit.current_context_key(db, "item", item.id)
-    first = key and await db.scalar(select(func.min(FactoryAuditEvent.occurred_at)).where(
-        FactoryAuditEvent.event_kind == "work_lifecycle", FactoryAuditEvent.item_context_key == key,
-        FactoryAuditEvent.after_values["dispatch_status"].as_string() == "dispatched"))
+    first = await db.scalar(select(func.min(FactoryAuditEvent.occurred_at)).where(
+        FactoryAuditEvent.event_kind == "work_lifecycle", FactoryAuditEvent.item_context_key == lifetime,
+        FactoryAuditEvent.after_values["dispatch_status"].as_string() == "dispatched",
+        FactoryAuditEvent.occurred_at >= window, FactoryAuditEvent.occurred_at <= end))
     return (_naive_utc(first), []) if first is not None else (None, ["dispatch_not_recorded"])
 
 
 @dataclass
 class _Deliveries:
     delivered: dict[tuple[str, int], list[datetime]] = field(default_factory=dict)
-    merges: dict[tuple[str, int], list[tuple[datetime, str | None]]] = field(default_factory=dict)  # with its PR
+    # #1246: each sourced merge with its PR artifact and the item lifetime that recorded it
+    merges: dict[tuple[str, int], list[tuple[datetime, str | None, str | None]]] = field(default_factory=dict)
     undelivered: dict[tuple[str, int], list[datetime]] = field(default_factory=dict)
     unidentified: bool = False  # a recorded delivery whose issue can't be derived
 
@@ -349,7 +376,8 @@ async def _deliveries(db, campaign: Campaign) -> _Deliveries:
                   FactoryAuditEvent.team_preset_id.in_(team)]
     rows = (await db.execute(
         select(FactoryAuditEvent.delivery_outcome, FactoryAuditEvent.fact_time, FactoryAuditEvent.occurred_at,
-               FactoryAuditEvent.context_snapshot, GithubWorkItem.issue_number, TeamGithubScope.repo_owner,
+               FactoryAuditEvent.context_snapshot, FactoryAuditEvent.fact_source, FactoryAuditEvent.item_context_key,
+               GithubWorkItem.issue_number, TeamGithubScope.repo_owner,
                TeamGithubScope.repo_name)
         .outerjoin(GithubWorkItem, GithubWorkItem.id == FactoryAuditEvent.item_id)
         .outerjoin(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
@@ -370,17 +398,20 @@ async def _deliveries(db, campaign: Campaign) -> _Deliveries:
         outcomes = facts.delivered if delivered else facts.undelivered
         at = _naive_utc(row.fact_time or row.occurred_at)
         outcomes.setdefault(_identity(f"{owner}/{name}", number), []).append(at)
-        if delivered:
-            facts.merges.setdefault(_identity(f"{owner}/{name}", number), []).append((at, recorded.get("artifact")))
+        if delivered and row.fact_source == "github_pull_request_merged" and row.fact_time is not None:
+            facts.merges.setdefault(_identity(f"{owner}/{name}", number), []).append(
+                (at, recorded.get("artifact") or None, row.item_context_key))
     legacy = (await db.execute(
         select(TeamGithubScope.repo_owner, TeamGithubScope.repo_name, GithubWorkItem.issue_number,
-               GithubWorkItem.auto_merged_at)
+               GithubWorkItem.auto_merged_at, GithubWorkItem.id)
         .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
         .join(FactoryContextKey, _lifetime(key))
         .where(GithubWorkItem.auto_merged_at.is_not(None)))).all()
     for row in legacy:
-        facts.delivered.setdefault(_identity(f"{row.repo_owner}/{row.repo_name}", row.issue_number), []).append(
-            _naive_utc(row.auto_merged_at))
+        key = _identity(f"{row.repo_owner}/{row.repo_name}", row.issue_number)
+        facts.delivered.setdefault(key, []).append(_naive_utc(row.auto_merged_at))
+        facts.merges.setdefault(key, []).append(
+            (_naive_utc(row.auto_merged_at), None, await audit.current_context_key(db, "item", row.id)))
     return facts
 
 
