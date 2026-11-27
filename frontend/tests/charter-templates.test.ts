@@ -179,6 +179,23 @@ describe("charter template values", () => {
     expect(planSizeLimit(15)).toBe(15);
   });
 
+  it("plan_size_limit is the scope's own plan limit when the scope states one", () => {
+    expect(planSizeLimit(120, 45)).toBe(45);
+    expect(planSizeLimit(undefined, 90)).toBe(90);
+    expect(planSizeLimit(30, 45)).toBe(30);
+    expect(charterTemplateValues({ maxPlanEstimateMinutes: 45 }).plan_size_limit).toBe("45");
+  });
+
+  it("plan_size_limit ignores a plan limit that is not a positive whole number", () => {
+    for (const bad of [0, -5, 12.5, Number.NaN, null, undefined]) expect(planSizeLimit(45, bad)).toBe(45);
+  });
+
+  it("the template text shows the scope's plan limit", () => {
+    const text = resolveCharterTemplate("builder", charterTemplateValues({ maxPlanEstimateMinutes: 45 })).text;
+    expect(text).toContain("at most 45 active minutes");
+    expect(resolveCharterTemplate("builder", charterTemplateValues({})).text).toContain("at most 60 active minutes");
+  });
+
   it("plan_size_limit ignores a maximum that is not a positive whole number", () => {
     for (const bad of [0, -5, 12.5, Number.NaN, Number.POSITIVE_INFINITY]) expect(planSizeLimit(bad)).toBe(60);
   });

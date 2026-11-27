@@ -174,6 +174,9 @@ class SafeWorkItem(FactoryModel):
     checks_unavailable_reason: Literal["permission_missing", "workflow_missing", "api_error", "unknown"] | None = None
     required_ci_unreadable: RequiredCIUnreadableSignal | None = None
     scope_default_effort_limit_minutes: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    # The accepted plan estimate and the scope's plan limit. Both are left out when the item has no estimate.
+    plan_estimate_minutes: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    plan_limit_minutes: int | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class WorkProjection(FactoryModel):

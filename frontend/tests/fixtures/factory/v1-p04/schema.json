@@ -3046,6 +3046,30 @@
               ],
               "title": "Pending Approval Status"
             },
+            "plan_estimate_minutes": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Plan Estimate Minutes"
+            },
+            "plan_limit_minutes": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Plan Limit Minutes"
+            },
             "pr_number": {
               "anyOf": [
                 {
@@ -4073,6 +4097,30 @@
                 }
               ],
               "title": "Pending Approval Status"
+            },
+            "plan_estimate_minutes": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Plan Estimate Minutes"
+            },
+            "plan_limit_minutes": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Plan Limit Minutes"
             },
             "pr_number": {
               "anyOf": [

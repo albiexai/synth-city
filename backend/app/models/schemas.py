@@ -3158,6 +3158,8 @@ class GithubWorkItemResponse(BaseModel):
     checks_unavailable_reason: Optional[str] = None
     required_ci_unreadable: Optional[RequiredCIUnreadableSignal] = None
     scope_default_effort_limit_minutes: int | None = Field(default=None, exclude=True)
+    plan_estimate_minutes: int | None = Field(default=None, exclude=True)
+    plan_limit_minutes: int | None = Field(default=None, exclude=True)
     auto_merged_at: Optional[datetime] = None
     active_scope_revision: int
     active_scope_summary: Optional[str] = None

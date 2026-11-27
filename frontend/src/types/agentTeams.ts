@@ -415,6 +415,7 @@ export interface TeamGithubScope {
   max_scope_commands: number
   review_hold_label?: string | null
   max_item_effort_minutes?: number
+  max_plan_estimate_minutes?: number
   initial_paths_required?: boolean
   enabled: boolean
   last_polled_at?: string | null
