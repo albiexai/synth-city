@@ -1224,7 +1224,7 @@ def test_upgrade_probe_refuses_actual_dispatch_including_direct_http_tools(monke
             types.CallToolRequest(method="tools/call", params=types.CallToolRequestParams(
                 name=name, arguments=arguments)))
         assert wire.root.structuredContent == denied
-        assert len(tools) == 52
+        assert len(tools) == 53
         # Every published tool is refused before validation or execution.
         for tool in tools:
             assert await shim.mcp.call_tool(tool.name, {}) == denied
@@ -1254,7 +1254,7 @@ def test_upgrade_probe_lists_tools_without_registration_and_cannot_call_member_t
     spec.loader.exec_module(shim)
     calls = []
     monkeypatch.setattr(shim, "_request", lambda *args, **kwargs: calls.append((args, kwargs)))
-    assert len(asyncio.run(shim.mcp.list_tools())) == 52
+    assert len(asyncio.run(shim.mcp.list_tools())) == 53
     assert shim._ensure_registered() == {"ok": False, "error": {"code": "upgrade_probe_read_only"}}
     assert shim._state["member_id"] is None and shim._state["capability_token"] is None
     assert calls == []
@@ -1534,3 +1534,13 @@ def test_the_leader_extension_tool_posts_one_request_and_changes_nothing_else(mo
     assert "effort limit once" not in doc and "up to the scope ceiling" in doc  # #1101
     assert "notifies the Supervisor once per attempt" in doc  # #1102
     assert "not the owner's reported active effort" in " ".join(shim.synth_city_extend_effort_limit.__doc__.split())
+
+def test_leader_issue_difficulty_tool_uses_the_mail_write_route(monkeypatch):
+    import mcp_shim.agent_mail_server as shim
+
+    calls = []
+    monkeypatch.setattr(shim, "_guard", lambda: None)
+    monkeypatch.setattr(shim, "_request", lambda method, path, **kwargs:
+        calls.append((method, path, kwargs)) or {"ok": True})
+    assert shim.synth_city_set_issue_difficulty(19, "medium") == {"ok": True}
+    assert calls == [("PUT", "/work-items/19/difficulty", {"json": {"difficulty": "medium"}})]

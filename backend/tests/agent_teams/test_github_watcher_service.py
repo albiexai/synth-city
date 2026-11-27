@@ -3,7 +3,7 @@ import asyncio
 import json
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import httpx
 import pytest
@@ -609,7 +609,7 @@ async def test_milestone_wait_clears_when_team_admits_issue(db, monkeypatch, des
     refused_upsert = AsyncMock(return_value=False)
     monkeypatch.setattr(skipped, "_upsert_item", refused_upsert)
     await skipped.poll_scope(db, destination, client)
-    refused_upsert.assert_awaited_once_with(db, destination, issue)
+    refused_upsert.assert_awaited_once_with(db, destination, issue, read_started_at=ANY)
     assert await db.scalar(select(GithubWorkItem)) is None
     assert await _milestone_wait_titles(db) == {home.id: "V9", destination.id: "V9"}
 
@@ -1540,6 +1540,28 @@ async def test_watcher_records_the_highest_difficulty_and_clears_it_when_removed
     await db.commit()
     await db.refresh(item)
     assert item.issue_difficulty is None and item.dispatch_status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_stale_difficulty_poll_preserves_factory_provenance(db):
+    scope = await _make_scope(db)
+    issue = _issue(795, [scope.dispatch_label, "difficulty:low"])
+    await github_watcher_service._upsert_item(db, scope, issue)
+    await db.commit()
+    item = await db.scalar(select(GithubWorkItem).where(GithubWorkItem.issue_number == 795))
+    item.issue_difficulty = "high"
+    item.issue_difficulty_provenance = {
+        "difficulty": "high", "source": "director", "actor_reference": "shared-operator-credential",
+        "confirmed_at": "2026-11-27T14:00:00",
+    }
+    await db.commit()
+
+    await github_watcher_service._upsert_item(db, scope, issue, read_started_at=datetime(2026, 11, 27, 13))
+    assert item.issue_difficulty == "high"
+    assert item.issue_difficulty_provenance["source"] == "director"
+    await github_watcher_service._upsert_item(db, scope, issue, read_started_at=datetime(2026, 11, 27, 15))
+    assert item.issue_difficulty == "low"
+    assert item.issue_difficulty_provenance is None
 
 
 # #1337, review 6074331482: a poll that began before its scope changed repository must not write for the scope.

@@ -52,7 +52,7 @@ from app.services.github_approval_service import (
 )
 from app.services.github_client import github_client
 from app.services.github_dispatch_difficulty import (
-    difficulty_from_labels, tier_allows_difficulty, tier_allows_difficulty_sql,
+    difficulty_from_labels, observe_issue_difficulty, tier_allows_difficulty, tier_allows_difficulty_sql,
 )
 from app.services.github_dispatch_priority import dispatch_order_key, priority_from_labels
 from app.services.github_recovery_gate import GithubRecoveryOnlyAttempt
@@ -1339,12 +1339,19 @@ class GithubDispatchService:
                 await self._update_current_item(db, item, _item_identity(item), pending_reason="leader_unavailable")
             await db.commit()
             return
+        # Serialize this cache refresh with Factory difficulty writes using the repository lock.
+        from app.services.github_watcher_service import _lock_repository
+
+        if not await _lock_repository(db, scope):
+            await db.rollback()
+            return
         pending = (
             await db.execute(
                 select(GithubWorkItem).where(
                     GithubWorkItem.scope_id == scope.id,
                     GithubWorkItem.dispatch_status == "pending",
                 ).order_by(GithubWorkItem.issue_number, GithubWorkItem.id)
+                .execution_options(populate_existing=True)
             )
         ).scalars().all()
 
@@ -1353,7 +1360,9 @@ class GithubDispatchService:
         for item in pending:
             if item.issue_number in issue_labels_by_number:
                 item.dispatch_priority = priority_from_labels(issue_labels_by_number[item.issue_number])
-                item.issue_difficulty = difficulty_from_labels(issue_labels_by_number[item.issue_number])
+                observe_issue_difficulty(
+                    item, issue_labels_by_number[item.issue_number], read_started_at=scope.last_polled_at,
+                )
         pending.sort(key=dispatch_order_key)
         await db.commit()
 
