@@ -137,15 +137,17 @@ async def test_healthy_amendment_before_pr_is_a_new_pending_round_and_replays(db
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("count,allowed", [(16, True), (17, False)])
-async def test_added_path_cap_is_enforced_on_unique_normalized_paths(db, healthy_attempt, count, allowed):
+@pytest.mark.parametrize("limit,count,allowed", [(16, 16, True), (16, 17, False), (1, 1, True), (1, 2, False)])
+async def test_added_path_cap_is_enforced_on_unique_normalized_paths(db, healthy_attempt, limit, count, allowed):
     a = healthy_attempt
+    a.scope.max_amendment_added_paths = limit
+    await db.commit()
     paths = ["src/base.py"] + [f"src/add-{n}.py" for n in range(count)]
     paths += paths  # Duplicate spellings consume no extra path budget.
     if allowed:
         revision, _, _ = await github_approval_service.create_scope_amendment_request(
             db, a.item, a.scope, **amendment(a, paths))
-        assert len(revision.allowed_paths) == 17
+        assert len(revision.allowed_paths) == limit + 1
     else:
         with pytest.raises(GithubApprovalError, match="amendment_added_path_limit"):
             await github_approval_service.create_scope_amendment_request(db, a.item, a.scope, **amendment(a, paths))
@@ -630,17 +632,19 @@ async def prior_amendment(a, db, number, added, *, status="rejected", approved=F
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("prior,allowed", [(2, True), (3, False)])
+@pytest.mark.parametrize("limit,prior,allowed", [(3, 2, True), (3, 3, False), (1, 0, True), (1, 1, False)])
 async def test_per_attempt_amendment_count_has_an_exact_limit_and_no_replay_charge(
-    db, healthy_attempt, prior, allowed
+    db, healthy_attempt, limit, prior, allowed
 ):
     a = healthy_attempt
+    a.scope.max_scope_amendments = limit
+    await db.commit()
     for number in range(1, prior + 1):
         await prior_amendment(a, db, number, [], status="completed", approved=True)
     if allowed:
         revision, approval, _ = await github_approval_service.create_scope_amendment_request(
             db, a.item, a.scope, **amendment(a))
-        assert revision.revision == 3
+        assert revision.revision == limit
         replay = await github_approval_service.create_scope_amendment_request(db, a.item, a.scope, **amendment(a))
         assert not replay[2] and replay[1].id == approval.id
     else:
@@ -2409,11 +2413,12 @@ async def test_amendments_that_were_never_approved_are_not_charged(db, healthy_a
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("limit,prior,allowed", [(8, 7, True), (8, 8, False), (2, 1, True), (2, 2, False)])
+@pytest.mark.parametrize("limit,prior,allowed", [(8, 7, True), (8, 8, False), (1, 0, True), (1, 1, False)])
 async def test_the_total_request_cap_is_separate_named_and_leaves_its_final_slot(db, healthy_attempt, limit, prior, allowed):
     a = healthy_attempt
     a.scope.max_continuation_revisions = 10  # the production scope budget; the request cap is under test
     a.scope.max_scope_amendment_requests = limit
+    await db.commit()
     for number in range(1, prior + 1):
         await prior_amendment(a, db, number, [])
     if allowed:
@@ -2466,6 +2471,28 @@ async def test_the_decision_time_budget_charges_the_candidate_once(db, healthy_a
     await db.commit()
     with pytest.raises(GithubApprovalError, match="amendment_count_limit"):
         await github_approval_service.validate_amendment_budget(db, a.item, a.scope, revision)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,approved,code", [
+    ("max_scope_amendments", True, "amendment_count_limit"),
+    ("max_scope_amendment_requests", False, "amendment_request_limit"),
+])
+async def test_approval_rechecks_tightened_amendment_count_and_request_caps(db, healthy_attempt, field, approved, code):
+    a = healthy_attempt
+    await prior_amendment(a, db, 1, [], status="completed" if approved else "rejected", approved=approved)
+    revision, request, _ = await github_approval_service.create_scope_amendment_request(db, a.item, a.scope, **amendment(a))
+    await github_approval_service.ensure_continuation_request_message(db, a.item, request, revision)
+    setattr(a.scope, field, 1)
+    await db.commit()
+    with pytest.raises(GithubApprovalError) as refused:
+        await github_approval_service.decide_continuation(
+            db, a.item, authenticated_leader_member_id=a.leader.id,
+            decision="approved", reason="Review the amendment", request_id=request.id)
+    assert refused.value.detail == code
+    await db.refresh(request)
+    await db.refresh(revision)
+    assert request.status == "pending" and revision.status == "proposed"
 
 
 @pytest.mark.asyncio
