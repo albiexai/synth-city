@@ -26,9 +26,10 @@ def pull(number=1, **changes):
 
 
 class GitHub:
-    def __init__(self, *rows, current=None):
+    def __init__(self, *rows, current=None, added_labels=("keep-me", "review-hold")):
         self.rows = list(rows)
         self.current = current
+        self.added_labels = added_labels
         self.writes = []
         self.pages = []
         self.reads = []
@@ -43,7 +44,7 @@ class GitHub:
         self.reads.append((verb, target.path))
         if verb == "POST":
             self.writes.append((target.path, json.loads(input)))
-            value = ["keep-me", "review-hold"]
+            value = self.added_labels
         elif target.path == "repos/o/r":
             value = BASE
         elif target.path == "repos/o/r/pulls":
@@ -230,3 +231,57 @@ def test_invalid_arguments_are_reported_without_echoing_them(evidence, capsys):
     captured = capsys.readouterr()
     assert code == 2 and not out and "invalid arguments" in err
     assert not captured.out and not captured.err
+
+
+def test_ambiguous_work_item_cannot_prove_acceptance_or_restore_hold(evidence):
+    change(evidence, "INSERT INTO github_work_items VALUES (5, 1, 1, 21, 'other-attempt')")
+    merged = GitHub(pull())
+    code, out, err = run(evidence, merged)
+    assert code == 1 and "lacks a unique work item" in out and not err
+    open_ = GitHub(open_pull(), current=open_pull())
+    code, out, err = run(evidence, open_, "--restore-hold")
+    assert code == 1 and "lacks a unique work item" in out and not err
+    assert open_.reads == [("GET", "repos/o/r/pulls")] and open_.writes == []
+
+
+@pytest.mark.parametrize("changes", [{}, {"base": "other"}, {"repo": "another/repo"}],
+                         ids=["duplicate", "wrong-base", "wrong-repository"])
+def test_invalid_listing_cannot_start_restoration(evidence, changes):
+    change(evidence, "UPDATE github_head_reviews SET status = 'superseded'")
+    row = open_pull()
+    gh = GitHub(row, open_pull(number=1 if not changes else 2, **changes), current=row)
+    code, out, err = run(evidence, gh, "--restore-hold")
+    assert code == 2 and not out and "listing" in err and gh.writes == []
+
+
+@pytest.mark.parametrize("setting", ["repo_owner = 'o/other'", "repo_name = 'r?query'", "repo_name = '..'"])
+def test_invalid_repository_is_rejected_before_github_access(evidence, setting):
+    change(evidence, f"UPDATE team_github_scopes SET {setting}")
+    gh = GitHub()
+    code, out, err = run(evidence, gh, "--restore-hold")
+    assert code == 2 and not out and "valid GitHub repository" in err and gh.reads == []
+
+
+@pytest.mark.parametrize("base", ["HEAD", "refs/heads/main"])
+def test_invalid_base_is_rejected_before_listing(evidence, base):
+    change(evidence, f"UPDATE team_github_scopes SET base_ref = '{base}'")
+    gh = GitHub()
+    code, out, err = run(evidence, gh, "--restore-hold")
+    assert code == 2 and not out and "valid GitHub base branch" in err and gh.reads == []
+
+
+def test_unconfirmed_label_add_reports_an_error(evidence):
+    change(evidence, "UPDATE github_head_reviews SET status = 'superseded'")
+    row = open_pull()
+    gh = GitHub(row, current=row, added_labels=["keep-me"])
+    code, out, err = run(evidence, gh, "--restore-hold")
+    assert code == 2 and "hold restored" not in out and "did not confirm" in err
+    assert gh.writes == [("repos/o/r/issues/1/labels", {"labels": ["review-hold"]})]
+
+
+def test_oversized_response_is_rejected_before_audit(evidence, monkeypatch):
+    row = pull()
+    monkeypatch.setattr(audit.common, "MAX_BYTES", len(json.dumps([row])) - 1)
+    gh = GitHub(row)
+    code, out, err = run(evidence, gh)
+    assert code == 2 and not out and "response is too large" in err and gh.writes == []
