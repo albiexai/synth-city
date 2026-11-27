@@ -30,6 +30,10 @@ const definitions = {
   review_hold_label: { type: 'string' },
   max_item_effort_minutes: { type: 'integer', minimum: 20, maximum: 600, default: 90 },
   initial_paths_required: { type: 'boolean', default: false },
+  max_scope_amendments: { type: 'integer', minimum: 0, maximum: 32, default: 3 },
+  max_scope_amendment_requests: { type: 'integer', minimum: 0, maximum: 128, default: 8 },
+  max_amendment_added_paths: { type: 'integer', minimum: 0, maximum: 256, default: 16 },
+  max_companion_paths: { type: 'integer', minimum: 0, maximum: 128, default: 32 },
 }
 const entry = (id: number, changes: Record<string, { before: unknown; after: unknown }>, extra = {}) => ({
   event_id: id, occurred_at: '2026-11-26T08:00:00Z', actor_kind: 'operator', actor_reference: 'director', via: null,
@@ -112,6 +116,33 @@ describe('the review hold and effort limit editors', () => {
     await user.type(screen.getByLabelText('Reason (optional)'), 'Shorter items')
     await user.click(save())
     await waitFor(() => expect(updateTeamGithubScope).toHaveBeenCalledWith(2, { max_item_effort_minutes: 90, reason: 'Shorter items' }, 'director-key'))
+  })
+
+  it('shows the effect of each safety bound increase before requiring typed confirmation', async () => {
+    const { user } = await openEditor()
+    const amendments = screen.getByLabelText('Approved amendments')
+    const companions = screen.getByLabelText('Companion paths')
+    await user.clear(amendments); await user.type(amendments, '4')
+    await user.clear(companions); await user.type(companions, '40')
+    expect(screen.getByText(/Allows up to 4 approved amendments per attempt/)).toBeInTheDocument()
+    expect(screen.getByText(/Allows up to 40 companion paths per amendment/)).toBeInTheDocument()
+    await user.click(save())
+    expect(updateTeamGithubScope).not.toHaveBeenCalled()
+    await user.type(screen.getByLabelText('Type safety_bounds to confirm'), 'safety_bounds')
+    await user.click(save())
+    await waitFor(() => expect(updateTeamGithubScope).toHaveBeenCalledWith(2,
+      { max_scope_amendments: 4, max_companion_paths: 40, confirm: 'safety_bounds' }, 'director-key'))
+  })
+
+  it('saves a lower safety bound without a confirmation', async () => {
+    const { user } = await openEditor({ max_scope_amendment_requests: 5 })
+    const requests = screen.getByLabelText('Amendment requests')
+    expect(requests).toHaveValue('5')
+    await user.clear(requests); await user.type(requests, '0')
+    expect(screen.queryByLabelText('Type safety_bounds to confirm')).not.toBeInTheDocument()
+    await user.click(save())
+    await waitFor(() => expect(updateTeamGithubScope).toHaveBeenCalledWith(2,
+      { max_scope_amendment_requests: 0 }, 'director-key'))
   })
 
   it('edits the first-plan path requirement and shows it in history', async () => {

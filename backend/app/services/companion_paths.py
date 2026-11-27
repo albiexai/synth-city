@@ -21,9 +21,6 @@ _DIGEST_LABEL = "Companion digest:"
 _TRAILER = re.compile(
     r"\n\n" + re.escape(TRAILER_HEADER) + r"\n((?:- [^\n]+\n)+)" + re.escape(_DIGEST_LABEL) + r" ([0-9a-f]{64})\Z")
 _GLOB_CHARACTERS = frozenset("*?[]{}")
-# #1039: companions travel with a named file, so they are counted on this bound of their own, per request, and not
-# against the scope's path limit, which is meant for new scope.
-MAX_COMPANION_PATHS = 32
 
 
 class CompanionMapError(ValueError):

@@ -395,7 +395,7 @@ async def withdraw_revision_review(db, item, *, review_id, reviewer_member_id, d
 async def end_submitted_revision(db, item, *, review_id, leader_member_id, dispatch_nonce, reason, actor=None):
     from app.models.database import GithubRevisionReview
     from app.services.github_approval_service import (
-        GithubApprovalError, MAX_SCOPE_AMENDMENTS, MAX_SCOPE_AMENDMENT_REQUESTS,
+        GithubApprovalError,
         github_approval_service as approval,
     )
     fact = await db.get(GithubRevisionReview, review_id, populate_existing=True)
@@ -435,6 +435,8 @@ async def end_submitted_revision(db, item, *, review_id, leader_member_id, dispa
     capped = False
     if revision.origin_kind == 'scope_amendment' and revision.approved_at is not None:
         # Compare both proposal caps under the existing attempt writer.
+        await db.refresh(scope, attribute_names=("max_scope_amendments", "max_scope_amendment_requests"),
+                         with_for_update=True)
         approved_count, request_count = (await db.execute(select(
             func.count(GithubAttemptScopeRevision.approved_at), func.count(),
         ).select_from(GithubAttemptScopeRevision).where(
@@ -442,7 +444,7 @@ async def end_submitted_revision(db, item, *, review_id, leader_member_id, dispa
             GithubAttemptScopeRevision.dispatch_nonce == context['dispatch_nonce'],
             GithubAttemptScopeRevision.origin_kind == 'scope_amendment',
         ))).one()
-        capped = approved_count >= MAX_SCOPE_AMENDMENTS or request_count >= MAX_SCOPE_AMENDMENT_REQUESTS
+        capped = approved_count >= scope.max_scope_amendments or request_count >= scope.max_scope_amendment_requests
     consumed = await db.execute(update(GithubRevisionReview).where(*(
         _same(getattr(GithubRevisionReview, key), value) for key, value in fact_values.items()))
         .values(status='consumed', ended_at=datetime.utcnow(), settled_by_member_id=leader_member_id,
