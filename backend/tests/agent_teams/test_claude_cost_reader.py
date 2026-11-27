@@ -244,7 +244,8 @@ def test_a_failing_file_operation_is_unknown_and_the_file_is_closed(tmp_path, mo
         closed.append(descriptor)
         os.close(descriptor)
 
-    shim = SimpleNamespace(**{name: getattr(os, name) for name in ("O_RDONLY", "O_NOFOLLOW", "O_NONBLOCK", "fdopen")},
+    shim = SimpleNamespace(**{name: getattr(os, name) for name in ("O_RDONLY", "O_NOFOLLOW", "O_NONBLOCK", "fdopen",
+                                                                 "listdir")},
                            open=track, fstat=fail, close=close)
     monkeypatch.setattr(reader, "os", shim)
     (member,) = _read(home, [reader.ClaudeMember("B1", str(workspace), S1)]).members
@@ -390,3 +391,91 @@ def test_the_dated_price_is_an_exact_lookup():
     assert pricing.get_model_pricing("claude-sonnet-5-5") == PricingService.MODEL_PRICING["claude-sonnet-5"]
     assert pricing.dated_price("claude-fable-5-1") is None
     assert pricing.dated_price("opus-4-8") is None  # the family prefix is part of the id
+
+
+# #1410: workspaces that share an encoded project folder, and folders that can't be listed
+@pytest.fixture
+def shared(tmp_path):
+    """``project.alpha`` and ``project-alpha`` encode to one project folder; each has its member and session, and
+    an earlier one-message session of the dash workspace is in the same folder."""
+    home = tmp_path / "home"
+    dot, dash = tmp_path / "work" / "project.alpha", tmp_path / "work" / "project-alpha"
+    dot.mkdir(parents=True)
+    dash.mkdir(parents=True)
+    _session(home, dot, SA, [_row("a1", START + timedelta(hours=1))])
+    _session(home, dash, SB, [_row("b1", START + timedelta(hours=2), tokens=(500, 0, 0, 5))])
+    _session(home, dash, SZ, [_row("z1", START + timedelta(hours=3), tokens=(300, 0, 0, 30))])
+    members = [reader.ClaudeMember("B1", str(dot), SA), reader.ClaudeMember("B2", str(dash), SB)]
+    return home, dot, dash, members
+
+
+@pytest.mark.parametrize("order", [1, -1], ids=["dot_first", "dash_first"])
+def test_a_shared_folder_attributes_each_transcript_by_its_own_working_directory(shared, order):
+    home, _dot, dash, members = shared
+    report = _read(home, members[::order])
+    by_member = {m.member: m for m in report.members}
+    assert by_member["B1"].cost_usd == pytest.approx(_price((1000, 200, 50, 10)))
+    assert by_member["B2"].cost_usd == pytest.approx(_price((500, 0, 0, 5)))
+    (other,) = report.unattributed
+    assert (other.workspace, other.session_id, other.messages, other.unknown_reasons) == (str(dash), SZ, 1, [])
+    assert report.unlisted == []
+
+
+@pytest.mark.parametrize("cwds", [("elsewhere",), ("project.alpha", "project-alpha")],
+                         ids=["fits_neither", "fits_both_across_rows"])
+def test_a_shared_folder_transcript_that_cannot_be_placed_is_unattributed_with_a_reason(shared, cwds):
+    home, dot, _dash, members = shared
+    base = dot.parent
+    (base / "elsewhere").mkdir()
+    rows = [{**_row(f"q{n}", START + timedelta(hours=4, minutes=n)), "sessionId": S2, "cwd": str(base / cwd)}
+            for n, cwd in enumerate(cwds)]
+    _session(home, dot, S2, rows)
+    report = _read(home, members)
+    placed = {u.session_id: u for u in report.unattributed}[S2]
+    assert (placed.messages, placed.unknown_reasons) == (0, ["session_mismatch"])
+    assert {m.member: m.unknown_reasons for m in report.members} == {"B1": [], "B2": []}
+
+
+def test_a_folder_that_cannot_be_listed_is_a_coverage_gap_and_keeps_known_results(team):
+    home, members = team
+    folder = home / ".claude" / "projects" / convert_path_to_folder_name(members[0].workspace)
+    folder.chmod(0o300)  # files still open by name; the folder can't be listed
+    try:
+        if os.access(folder, os.R_OK):
+            pytest.skip("running with privileges that list any directory")
+        report = _read(home, members)
+    finally:
+        folder.chmod(0o700)
+    by_member = {m.member: m for m in report.members}
+    assert by_member["B1"].cost_usd == pytest.approx(_price((1000, 200, 50, 10)) + _price((2000, 0, 0, 100)))
+    assert [(u.workspaces, u.reason) for u in report.unlisted] == [([members[0].workspace], "native_log_unlisted")]
+    assert all(u.session_id != SZ for u in report.unattributed)  # unknown, not shown as no usage
+
+
+def test_an_empty_or_missing_folder_is_no_gap(tmp_path):
+    home = tmp_path / "home"
+    empty, missing = tmp_path / "w-empty", tmp_path / "w-missing"
+    empty.mkdir()
+    missing.mkdir()
+    (home / ".claude" / "projects" / convert_path_to_folder_name(str(empty))).mkdir(parents=True)
+    report = _read(home, [reader.ClaudeMember("C1", str(empty), "t", provider="codex-cli"),
+                          reader.ClaudeMember("C2", str(missing), "t", provider="codex-cli")])
+    assert (report.unattributed, report.unlisted) == ([], [])
+
+
+def test_only_session_files_in_a_folder_are_read(team):
+    """A subdirectory or another file beside the transcripts is not a session (the folder holds more than sessions)."""
+    home, members = team
+    folder = home / ".claude" / "projects" / convert_path_to_folder_name(members[0].workspace)
+    (folder / SB).mkdir()
+    (folder / "notes.txt").write_text("not a transcript\n")
+    report = _read(home, members)
+    assert [u.session_id for u in report.unattributed] == [SZ]
+
+
+def test_a_bound_session_in_a_shared_folder_is_checked_against_its_own_workspace_only(shared):
+    """B1's recorded session whose rows ran in the other workspace of the folder is not B1's to be charged."""
+    home, dot, dash, members = shared
+    _session(home, dot, SA, [{**_row("a1", START + timedelta(hours=1)), "cwd": str(dash)}])
+    by_member = {m.member: m for m in _read(home, members).members}
+    assert by_member["B1"].cost_usd is None and by_member["B1"].unknown_reasons == ["session_mismatch"]
