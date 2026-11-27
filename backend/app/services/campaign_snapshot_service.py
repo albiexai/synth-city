@@ -68,8 +68,10 @@ def _sample(name: str, unit: str, value: float | None, sample_count: int, *, sou
 
 
 def _lifetime(key: str):
+    """The team lifetime's own scopes, while it is current: a replacement team reusing the preset id never joins the
+    old campaign, even when it arrives during a read (V1 review 6086713296)."""
     return ((FactoryContextKey.key_kind == "team") & (FactoryContextKey.numeric_id == TeamGithubScope.preset_id)
-            & (FactoryContextKey.context_key == key))
+            & (FactoryContextKey.context_key == key) & FactoryContextKey.retired_at.is_(None))
 
 
 async def _fingerprint(db, campaign: Campaign) -> tuple:
@@ -220,10 +222,10 @@ async def _deliveries(db, campaign: Campaign) -> _Deliveries:
     lifetime = (select(GithubWorkItem.id).join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
                 .join(FactoryContextKey, _lifetime(key)))
     scopes = select(TeamGithubScope.id).join(FactoryContextKey, _lifetime(key))
-    # A retired team's campaign reads its membership measures unknown (``team_retired``), so the team reference is
-    # read only while it names this lifetime's team.
+    team = select(FactoryContextKey.numeric_id).where(  # the team reference counts only while this lifetime is current
+        FactoryContextKey.key_kind == "team", FactoryContextKey.context_key == key, FactoryContextKey.retired_at.is_(None))
     references = [FactoryAuditEvent.item_id.in_(lifetime), FactoryAuditEvent.scope_id.in_(scopes),
-                  FactoryAuditEvent.team_preset_id == campaign.preset_id]
+                  FactoryAuditEvent.team_preset_id.in_(team)]
     rows = (await db.execute(
         select(FactoryAuditEvent.delivery_outcome, FactoryAuditEvent.fact_time, FactoryAuditEvent.occurred_at,
                FactoryAuditEvent.context_snapshot, GithubWorkItem.issue_number, TeamGithubScope.repo_owner,

@@ -691,3 +691,33 @@ async def test_a_fact_that_names_another_team_never_counts_here_through_a_live_i
     await db.commit()
     by_name = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False))
     assert (by_name["merged"].value, by_name["closed_without_delivery"].value) == (1, 1)
+
+
+# V1 review 6086713296
+@pytest.mark.parametrize("evidence", ["legacy_auto_merge", "keyless_row"])
+async def test_a_replacement_team_during_the_read_never_adds_to_the_old_campaign(db, world, monkeypatch, evidence):
+    """The team is retired and replaced under the same preset id after its membership was read: the replacement's
+    merge of a2#3 (closed without delivery for the old team) must not count for the old campaign."""
+    from app.models.database import FactoryContextKey
+
+    campaign = await _campaign(db, world)
+    read = campaigns.members
+
+    async def replaced_during_the_read(db, campaign, client):
+        membership = await read(db, campaign, client)
+        await db.execute(text("UPDATE factory_context_keys SET retired_at = :at WHERE context_key = :key"),
+                         {"at": AS_OF, "key": campaign.team_context_key})
+        db.add(FactoryContextKey(key_kind="team", numeric_id=world.team, context_key="team:replacement"))
+        if evidence == "legacy_auto_merge":
+            await db.execute(text("UPDATE github_work_items SET auto_merged_at = :at WHERE id = :id"),
+                             {"at": T0 + timedelta(days=3), "id": world.items[("a2", 3)]})
+        else:  # a row with no team key that names the reused preset id
+            await _deliver(db, world.items[("a2", 3)], T0 + timedelta(days=3))
+            await db.execute(text("UPDATE factory_audit_events SET team_context_key = NULL, scope_id = NULL, "
+                                  "item_id = NULL WHERE id = (SELECT max(id) FROM factory_audit_events)"))
+        await db.commit()
+        return membership
+
+    monkeypatch.setattr(campaigns, "members", replaced_during_the_read)
+    by_name = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False))
+    assert (by_name["merged"].value, by_name["closed_without_delivery"].value) == (1, 1)
