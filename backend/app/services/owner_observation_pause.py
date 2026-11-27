@@ -1,7 +1,6 @@
 """Preserve approved work during a bounded observation gap. Never infer progress."""
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -240,12 +239,10 @@ async def handle_observation_gap(db, scope, item):
     try:
         expected, _workspace, _session = await bound_authority(db, scope, item)
         inspected = True
-        try:
-            values = await asyncio.wait_for(activity.observe_private_team(db, scope.preset_id, 256), timeout=2)
-            observed = values.get(item.owner_slot_id)
-            gap = observed is not None and observed.state == "unknown" and observed.reason in _GAPS
-        except (TimeoutError, OSError, ValueError):
-            gap = True  # Identity must still pass the independent bound checks below.
+        values = await activity.observe_poll_team(db, scope.preset_id, timeout=2, source="owner_observation_gap")
+        observed = values.get(item.owner_slot_id) if values is not None else None
+        # An unavailable read still needs the independent bound checks below.
+        gap = values is None or (observed is not None and observed.state == "unknown" and observed.reason in _GAPS)
         await _lock_item(db, item)
         current, _workspace, session = await bound_authority(db, scope, item)
         if current != expected or item.dispatch_status != "dispatched":
