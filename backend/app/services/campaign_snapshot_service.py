@@ -27,7 +27,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from statistics import median
 
 from pydantic import BaseModel
@@ -59,7 +59,7 @@ from app.services.factory_metrics_service import _coverage, _naive_utc
 from app.services.github_rate_limit_history import campaign_rate_limit_time
 
 # v2 (#1395): missing delivery history is unknown; v3 (#1246): item time; v4 (#1419): where the time went
-CALCULATION_VERSION = "campaign-snapshot-v4"
+CALCULATION_VERSION = "campaign-snapshot-v5"
 SMALL_SAMPLE = 5
 BANDS = (("0-100", 100), ("101-400", 400), ("over-400", None))  # by lines changed, upper bound inclusive
 CACHE_SECONDS = 30.0  # the Overview panel polls
@@ -132,6 +132,39 @@ class TimeWentSection(BaseModel):
     unknown_reasons: list[str]
 
 
+class WeekRow(BaseModel):
+    week_start: date  # the Monday of a UTC ISO week
+    merges: int
+    partial: bool  # the campaign start or the cutoff falls inside the week
+
+
+class MarkerSide(BaseModel):
+    items: int  # timed items wholly on this side of the marker
+    median_seconds: float | None
+    small_sample: bool
+
+
+class ChangeMarker(BaseModel):
+    """An applied configuration change, with the item time on each side of it. Never a verdict (design §8)."""
+    at: datetime
+    source: str
+    fields: list[str]  # the changed field names, never their values
+    before: MarkerSide  # dispatched and merged before the marker
+    after: MarkerSide  # dispatched at or after it
+    straddling: int  # dispatched before it, merged at or after it: excluded (design answer Q3)
+    unknown: int  # merged in the campaign with an unknown item time: excluded
+
+
+class FlowSection(BaseModel):
+    """#1453: merges per week and the change markers. Absent in snapshots frozen before v5."""
+    merges: int  # members whose first merge in the campaign has a time
+    unknown_merges: int  # PR merges GitHub gave no time: never placed in a week
+    weeks: list[WeekRow]
+    markers: list[ChangeMarker]
+    coverage: str
+    unknown_reasons: list[str]
+
+
 class Snapshot(BaseModel):
     campaign_id: int
     selector: str
@@ -144,6 +177,7 @@ class Snapshot(BaseModel):
     repositories: list[SnapshotRepository] = []
     item_time: ItemTimeSection | None = None  # additive (#1246): an older frozen payload reads back unchanged
     time_went: TimeWentSection | None = None  # additive (#1419)
+    flow: FlowSection | None = None  # additive (#1453)
 
 
 def clear_cache() -> None:
@@ -338,15 +372,17 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
     coverage = await upgrade.recorded_coverage(db, campaign)
     metrics.append(await _rate_limited(db, coverage, started, as_of))
     # Missing delivery history the counts already know of makes item time partial too (V1 review 448).
+    spans: list[tuple[datetime | None, datetime | None]] = []
     item_time = await _item_time(db, campaign, list(members), facts, coverage, as_of,
-                                 gaps + ([reason] if unknown else []), label)  # both kept (V1 review 115)
+                                 gaps + ([reason] if unknown else []), label, spans)  # both kept (V1 review 115)
     time_went = await _time_went(db, campaign, list(members), coverage, as_of, gaps)
+    flow = await _flow(db, campaign, spans, as_of, gaps + ([reason] if unknown else []), label)
     return Snapshot(
         campaign_id=campaign.id, selector=campaign.selector, started_at=started, as_of=as_of,
         calculation_version=CALCULATION_VERSION, metrics=sorted(metrics, key=lambda sample: sample.name),
         recorded_coverage=[MeasureCoverageEntry(measure=c.measure, started_at=c.started_at, covered=c.covered,
                                                 reason=c.reason) for c in coverage], item_time=item_time,
-        time_went=time_went,
+        time_went=time_went, flow=flow,
         repositories=_repositories(membership, members, [gap for gap in gaps if gap in _CUTOFF_GAPS]))
 
 
@@ -473,8 +509,10 @@ def _band_of(lines: int) -> str:
 
 
 async def _item_time(db, campaign: Campaign, members: list[tuple[str, int]], facts: _Deliveries, coverage,
-                     as_of: datetime, gaps: list[str], membership: str) -> ItemTimeSection:
-    """Each member delivered by the cutoff, from its evidenced first dispatch to its earliest merge, by size band."""
+                     as_of: datetime, gaps: list[str], membership: str,
+                     spans: list | None = None) -> ItemTimeSection:
+    """Each member delivered by the cutoff, from its evidenced first dispatch to its earliest merge, by size band.
+    ``spans`` receives each merged member's (first dispatch or None, first merge or None when GitHub gave no time)."""
     marker = await audit.instrumentation_start(db)
     marker = marker and _naive_utc(marker)
     facts_entry = next(c for c in coverage if c.measure == "pull_request_facts")
@@ -504,6 +542,8 @@ async def _item_time(db, campaign: Campaign, members: list[tuple[str, int]], fac
             # A PR merge GitHub gave no time is unknown; a non-merge delivery is outside this metric (V1 review 115).
             if any(began <= at <= as_of for at in facts.untimed.get(key, ())):
                 rows["unknown"].append((None, ["merge_time_not_recorded"]))
+                if spans is not None:
+                    spans.append((None, None))
             continue
         end = min(at for at, _, _ in merges)
         tied = [merge for merge in merges if merge[0] == end]
@@ -530,6 +570,8 @@ async def _item_time(db, campaign: Campaign, members: list[tuple[str, int]], fac
             band, why = _band_of(size[0] + size[1]), None
         rows[band].append(((end - start).total_seconds() if start is not None else None,
                            reasons + ([why] if why else [])))
+        if spans is not None:
+            spans.append((start, end))
     bands = []
     for band, entries in rows.items():
         times = [seconds for seconds, _ in entries if seconds is not None]
@@ -546,6 +588,64 @@ async def _item_time(db, campaign: Campaign, members: list[tuple[str, int]], fac
     label = "full" if complete and items else ("unavailable" if not timed or membership == "unavailable"
                                                else "partial")
     return ItemTimeSection(items=items, timed=timed, coverage=label, unknown_reasons=reasons, bands=bands)
+
+
+# #1453: the configuration sources of ``policy_change`` (the Supervisor's answers on #1246). The Supervisor's clock and
+# registration transitions share the kind but are not settings, and a dispatch pause is an operator intervention.
+_MARKER_SOURCES = ("agent_teams.update_github_scope", "agent_teams.update_github_scope_continuation_policy",
+                   "agent_team_service.update_preset", "agent_team_service.update_work_settings")
+
+
+async def _flow(db, campaign: Campaign, spans: list, as_of: datetime, gaps: list[str], membership: str) -> FlowSection:
+    """Merges per UTC ISO week, each member once in its first merge's week, and before-and-after at each marker."""
+    began = _naive_utc(campaign.started_at)
+    ends = [end for _, end in spans if end is not None]
+    unknown_merges = len(spans) - len(ends)
+    weeks, monday = [], (began - timedelta(days=began.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    while monday <= as_of:
+        following = monday + timedelta(days=7)
+        weeks.append(WeekRow(week_start=monday.date(), merges=sum(monday <= end < following for end in ends),
+                             partial=began > monday or as_of < following))
+        monday = following
+    timed = [(start, end) for start, end in spans if start is not None and end is not None]
+    markers = []
+    for at, source, fields in await _markers(db, campaign, began, as_of):
+        before = [(end - start).total_seconds() for start, end in timed if end < at]
+        after = [(end - start).total_seconds() for start, end in timed if start >= at]
+        markers.append(ChangeMarker(at=at, source=source, fields=fields, before=_side(before), after=_side(after),
+                                    straddling=sum(start < at <= end for start, end in timed),
+                                    unknown=len(spans) - len(timed)))
+    reasons = sorted(set(gaps) | ({"merge_time_not_recorded"} if unknown_merges else set()))
+    label = "unavailable" if membership == "unavailable" else ("partial" if reasons else "full")
+    return FlowSection(merges=len(ends), unknown_merges=unknown_merges, weeks=weeks, markers=markers, coverage=label,
+                       unknown_reasons=reasons)
+
+
+def _side(seconds: list[float]) -> MarkerSide:
+    return MarkerSide(items=len(seconds), median_seconds=median(seconds) if seconds else None,
+                      small_sample=0 < len(seconds) < SMALL_SAMPLE)
+
+
+async def _markers(db, campaign: Campaign, began: datetime, as_of: datetime) -> list[tuple[datetime, str, list[str]]]:
+    """The team lifetime's applied configuration changes in the campaign, with the names of the fields they changed.
+    A save that changed nothing is not a change."""
+    found = []
+    for row in (await db.execute(
+            select(FactoryAuditEvent.occurred_at, FactoryAuditEvent.source, FactoryAuditEvent.context_snapshot,
+                   FactoryAuditEvent.before_values, FactoryAuditEvent.after_values)
+            .where(FactoryAuditEvent.event_kind == "policy_change", FactoryAuditEvent.action_outcome == "applied",
+                   FactoryAuditEvent.source.in_(_MARKER_SOURCES),
+                   FactoryAuditEvent.team_context_key == campaign.team_context_key)
+            .order_by(FactoryAuditEvent.occurred_at, FactoryAuditEvent.id))).all():
+        at = _naive_utc(row.occurred_at)
+        if not began <= at <= as_of:
+            continue
+        named = (row.context_snapshot or {}).get("scope_changed_fields")
+        before, after = row.before_values or {}, row.after_values or {}
+        fields = sorted(named) if named is not None else sorted(k for k in after if before.get(k) != after.get(k))
+        if fields:
+            found.append((at, row.source, fields))
+    return found
 
 
 async def _first_dispatch(db, live: dict, lifetime: str | None, marker: datetime | None, began: datetime,
