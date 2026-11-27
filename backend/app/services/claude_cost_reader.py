@@ -64,12 +64,20 @@ class UnattributedUsage:
 
 
 @dataclass
+class UnlistedFolder:
+    """A team project folder whose sessions couldn't be listed: its unattributed usage is unknown, not none (#1410)."""
+    workspaces: list[str]
+    reason: str
+
+
+@dataclass
 class CostReport:
     prices_as_of: date
     members: list[MemberCost]
     unattributed: list[UnattributedUsage]
     members_priced: int
     members_total: int
+    unlisted: list[UnlistedFolder] = field(default_factory=list)
 
 
 class _Unknown(Exception):
@@ -85,17 +93,24 @@ def read_claude_usage(start: datetime, end: datetime, members: list[ClaudeMember
     root = (config_dir or home / ".claude") / "projects"
     pricing = PricingService()
     # Each transcript folder once, however its workspace is spelled. A Codex member's workspace is listed too: an
-    # earlier Claude Code session there is unattributed usage.
+    # earlier Claude Code session there is unattributed usage. Two workspaces can encode to one folder
+    # (``project.alpha`` and ``project-alpha``): the folder keeps both, and a transcript's own working directory
+    # decides which is its workspace (#1410).
     resolved = {member.workspace: _resolve(member.workspace) for member in members}
-    folders: dict[Path, Path] = {}
+    candidates: dict[Path, set[Path]] = {}
     for workspace in resolved.values():
         if workspace is not None:
-            folders.setdefault(root / convert_path_to_folder_name(str(workspace)), workspace)
+            candidates.setdefault(root / convert_path_to_folder_name(str(workspace)), set()).add(workspace)
+    folders = {folder: tuple(sorted(workspaces)) for folder, workspaces in candidates.items()}
     claims: dict[tuple[Path, str], list[str]] = {}
     for member in members:
         if member.provider == "claude-code" and _canonical(member.session_id) and resolved[member.workspace]:
             claims.setdefault((_folder(root, resolved[member.workspace]), member.session_id), []).append(member.member)
     results = []
+    reached: set[Path] = set()  # folders a member read found, so a later listing that finds none is a gap
+    # Bindings settled on their member: charged, or unknown for a reason the folder can't change. A binding refused as
+    # another workspace's (session_mismatch) is classified with the folder's candidates (V1 review 6088836613).
+    settled: set[tuple[Path, str]] = set()
     for member in members:
         if member.provider != "claude-code":
             reason = "harness_not_read"
@@ -104,33 +119,50 @@ def read_claude_usage(start: datetime, end: datetime, members: list[ClaudeMember
         elif len(claims[(_folder(root, resolved[member.workspace]), member.session_id)]) > 1:
             reason = "competing_binding"  # the session is shown once, unattributed
         else:
+            folder = _folder(root, resolved[member.workspace])
             try:
-                models = _read(_folder(root, resolved[member.workspace]) / f"{member.session_id}.jsonl",
-                               member.session_id, resolved[member.workspace], uid, max_bytes, start, end, pricing)
+                models, _ = _read(folder / f"{member.session_id}.jsonl", member.session_id,
+                                  (resolved[member.workspace],), uid, max_bytes, start, end, pricing)
             except _Unknown as unknown:
                 reason = unknown.reason
+                if reason != "no_native_session":
+                    reached.add(folder)
+                if reason != "session_mismatch":
+                    settled.add((folder, member.session_id))
             else:
+                reached.add(folder)
+                settled.add((folder, member.session_id))
                 results.append(_member(member.member, models))
                 continue
         results.append(MemberCost(member.member, unknown_reasons=[reason]))
-    unattributed = []
-    for folder, workspace in sorted(folders.items()):
-        for path in sorted(folder.glob("*.jsonl")) if folder.is_dir() else ():
-            claimants = claims.get((folder, path.stem), [])
-            if len(claimants) == 1:
+    unattributed, unlisted = [], []
+    for folder, workspaces in sorted(folders.items()):
+        named = ", ".join(str(workspace) for workspace in workspaces)  # until a transcript says which
+        try:
+            names = os.listdir(folder)
+        except OSError as error:
+            if isinstance(error, FileNotFoundError) and folder not in reached:
+                names = []  # no session was ever written here
+            else:  # permissions, not a directory, a race: the folder's unattributed usage is unknown
+                unlisted.append(UnlistedFolder([str(workspace) for workspace in workspaces], "native_log_unlisted"))
                 continue
-            reasons = ["competing_binding"] if claimants else []
+        for path in sorted(folder / name for name in names if name.endswith(".jsonl")):
+            claimants = claims.get((folder, path.stem), [])
+            if (folder, path.stem) in settled:
+                continue
+            reasons = ["competing_binding"] if len(claimants) > 1 else []
             try:
-                models = _read(path, path.stem, workspace, uid, max_bytes, start, end, pricing)
+                models, workspace = _read(path, path.stem, workspaces, uid, max_bytes, start, end, pricing)
             except _Unknown as unknown:
-                unattributed.append(UnattributedUsage(str(workspace), path.stem, unknown_reasons=[*reasons,
-                                                                                                   unknown.reason]))
+                unattributed.append(UnattributedUsage(named, path.stem, unknown_reasons=[*reasons, unknown.reason]))
                 continue
             if models or claimants:
-                unattributed.append(UnattributedUsage(str(workspace), path.stem, sum(m.messages for m in models),
-                                                      models, reasons + _price_reasons(models)))
+                unattributed.append(UnattributedUsage(str(workspace) if workspace else named, path.stem,
+                                                      sum(m.messages for m in models), models,
+                                                      reasons + _price_reasons(models)))
     return CostReport(prices_as_of=PricingService.PRICES_AS_OF, members=results, unattributed=unattributed,
-                      members_priced=sum(1 for m in results if m.cost_usd is not None), members_total=len(results))
+                      members_priced=sum(1 for m in results if m.cost_usd is not None), members_total=len(results),
+                      unlisted=unlisted)
 
 
 def _canonical(session_id: str | None) -> bool:
@@ -163,9 +195,14 @@ def _member(name: str, models: list[ModelUsage]) -> MemberCost:
     return MemberCost(name, sum(m.messages for m in models), models, cost, unpriced)
 
 
-def _read(path: Path, session_id: str, workspace: Path, uid: int, max_bytes: int, start: datetime, end: datetime,
-          pricing: PricingService) -> list[ModelUsage]:
-    """One session's window usage by model, from a bounded read of its own file. Every row must be this session's."""
+def _read(path: Path, session_id: str, workspaces: tuple[Path, ...], uid: int, max_bytes: int, start: datetime,
+          end: datetime, pricing: PricingService) -> tuple[list[ModelUsage], Path | None]:
+    """One session's window usage by model, from a bounded read of its own file, and the workspace it ran in.
+
+    Every row must be this session's, with a working directory inside one of ``workspaces``, the same one for every
+    row: a transcript in a folder two workspaces share is never charged to both, nor to whichever came first.
+    """
+    owner: Path | None = None
     try:
         descriptor: int | None = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -203,8 +240,11 @@ def _read(path: Path, session_id: str, workspace: Path, uid: int, max_bytes: int
         message_id, model, at, tokens = _message(row)
         cwd = row.get("cwd")
         place = _resolve(cwd) if isinstance(cwd, str) and Path(cwd).is_absolute() else None
-        if row.get("sessionId") != session_id or place is None or not place.is_relative_to(workspace):
+        # Workspaces sharing a folder are never nested (a nested path encodes longer), so at most one contains it.
+        inside = next((w for w in workspaces if place is not None and place.is_relative_to(w)), None)
+        if row.get("sessionId") != session_id or inside is None or owner not in (None, inside):
             raise _Unknown("session_mismatch")
+        owner = inside
         if message_id in seen:
             continue  # one message is written as one row per content block: count it once, at its first row
         seen.add(message_id)
@@ -223,7 +263,7 @@ def _read(path: Path, session_id: str, workspace: Path, uid: int, max_bytes: int
             prompt = tokens["input"] + tokens["cache_creation"] + tokens["cache_read"]
             tier = "_above_200k" if prompt > PricingService.TIERED_THRESHOLD else ""
             usage.cost_usd += sum(tokens[name] * price.get(f"{name}{tier}", price[name]) for name in _FIELDS)
-    return sorted(by_model.values(), key=lambda usage: usage.model)
+    return sorted(by_model.values(), key=lambda usage: usage.model), owner
 
 
 def _message(row: dict) -> tuple[str, str, datetime, dict[str, int]]:
