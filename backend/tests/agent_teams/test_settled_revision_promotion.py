@@ -20,7 +20,9 @@ from app.config import settings
 from app.models.database import (
     GithubAttemptScopeRevision, GithubHeadReview, GithubRequiredCheckWatch, GithubRevisionReview, MailTeamMember,
 )
+from app.services import github_head_acceptance_service as acceptance
 from app.services.github_approval_service import github_approval_service
+from app.services.github_check_observation import GithubCheckObservationError
 from app.services.github_verification_service import github_verification_service as service
 from tests.agent_teams.test_github_verification_service import (  # noqa: F401  (fixtures and helpers shared)
     _HoldClient, _implementation_revision, _item, _owner, _scope, db,
@@ -88,12 +90,16 @@ async def test_an_accepted_green_ready_unheld_item_is_promoted_and_auto_merged(d
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case_kind", ["accepted", "red", "withdrawn", "old_head", "former_verifier", "head_rejected"])
+@pytest.mark.parametrize("case_kind", [
+    "accepted", "red", "withdrawn", "old_head", "submitted_head", "negative_verdict",
+    "watch_head", "former_verifier", "head_rejected",
+])
 async def test_settled_revision_review_can_supply_exact_head_acceptance(db, case_kind):
     checks = GREEN
     if case_kind == "red":
         checks = [{"name": "ci", "status": "completed", "conclusion": "failure"}]
-    case = await settled_case(db, accepted_head=None, checks=checks)
+    case = await settled_case(
+        db, accepted_head=None, checks=checks, settled_head=OTHER if case_kind == "submitted_head" else HEAD)
     case.revision.owner_slot_id = case.item.owner_slot_id
     case.revision.owner_member_id = await db.scalar(
         _select(MailTeamMember.id).where(MailTeamMember.team_slot_id == case.item.owner_slot_id)
@@ -102,9 +108,10 @@ async def test_settled_revision_review_can_supply_exact_head_acceptance(db, case
     if case_kind == "former_verifier":
         slot.role = "builder"
     review_head = OTHER if case_kind == "old_head" else HEAD
+    watched_head = OTHER if case_kind == "watch_head" else review_head
     watch = GithubRequiredCheckWatch(
         work_item_id=case.item.id, dispatch_nonce=case.item.dispatch_nonce, scope_revision=case.revision.revision,
-        pr_number=case.item.pr_number, owner_slot_id=case.item.owner_slot_id, head_sha=review_head,
+        pr_number=case.item.pr_number, owner_slot_id=case.item.owner_slot_id, head_sha=watched_head,
         policy_digest="fixture", reviewer_member_id=reviewer.id, checks=[],
         observed_at=SETTLED_AT, changed_at=SETTLED_AT,
     )
@@ -113,7 +120,8 @@ async def test_settled_revision_review_can_supply_exact_head_acceptance(db, case
     db.add(GithubRevisionReview(
         work_item_id=case.item.id, revision_id=case.revision.id, watch_id=watch.id,
         dispatch_nonce=case.item.dispatch_nonce, head_sha=review_head, reviewer_member_id=reviewer.id,
-        expected_lease_token_hash=case.revision.expected_lease_token_hash, verdict="accepted",
+        expected_lease_token_hash=case.revision.expected_lease_token_hash,
+        verdict="changes_required" if case_kind == "negative_verdict" else "accepted",
         status="withdrawn" if case_kind == "withdrawn" else "consumed",
         settled_by_member_id=case.item.ack_approver_member_id, summary="Reviewed the submitted revision",
         evidence_url=EVIDENCE,
@@ -126,6 +134,10 @@ async def test_settled_revision_review_can_supply_exact_head_acceptance(db, case
             summary="New blocking finding", evidence_url=EVIDENCE,
         ))
     await db.commit()
+    if case_kind in ("submitted_head", "negative_verdict", "watch_head"):
+        # Read the gate directly so the promotion step cannot mask a missing predicate.
+        note = await acceptance.gate_note(db, case.scope, case.item, HEAD)
+        assert note == f"Waiting for reviewer acceptance at {HEAD[:7]}."
     await case.tick()
     if case_kind == "accepted":
         assert case.item.dispatch_status == "merged", case.item.status_note
@@ -159,6 +171,37 @@ async def test_settled_poll_clears_unreadable_ci_on_green_or_changed_head(db, st
     if changed_head:
         assert "scope amendment" in case.item.status_note
         assert case.revision.submitted_head_sha == HEAD
+
+
+@pytest.mark.asyncio
+async def test_settled_promotion_clears_unreadable_ci(db):
+    case = await settled_case(db, policy="human")
+    case.item.checks_unavailable_since = datetime.utcnow() - timedelta(minutes=20)
+    case.item.checks_unavailable_reason = "api_error"
+    case.item.checks_unavailable_head_sha = HEAD
+    await db.commit()
+
+    await case.tick()
+
+    assert case.item.dispatch_status == "ready_for_review"
+    assert case.item.last_verified_sha == HEAD
+    assert case.item.checks_unavailable_since is None
+    assert case.item.checks_unavailable_reason is None
+    assert case.item.checks_unavailable_head_sha is None
+
+
+@pytest.mark.asyncio
+async def test_settled_check_error_is_bound_to_the_observed_head(db):
+    case = await settled_case(db)
+    case.client.list_check_runs_for_ref = AsyncMock(side_effect=GithubCheckObservationError("workflow_missing"))
+
+    await case.tick()
+
+    assert case.item.dispatch_status == "verifying"
+    assert case.item.checks_unavailable_head_sha == HEAD
+    assert case.item.checks_unavailable_reason == "workflow_missing"
+    assert case.item.checks_unavailable_since is not None
+    assert case.item.retry_count == case.client.merge_calls == 0
 
 
 @pytest.mark.asyncio

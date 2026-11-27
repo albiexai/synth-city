@@ -21,6 +21,7 @@ from app.models.database import (
     GithubApprovalRequest,
     GithubAttemptScopeRevision,
     GithubIssueClosure,
+    GithubRequiredCheckWatch,
     GithubWorkItem,
     GithubWorkspace,
     MailMessage,
@@ -28,6 +29,7 @@ from app.models.database import (
     TeamGithubScope,
 )
 from app.services.agent_mail_service import agent_mail_service
+from app.services.github_ci_watch_service import github_ci_watch_service
 from app.services.github_verification_service import github_verification_service
 from app.services.github_check_observation import GithubCheckObservationError
 from app.services.github_work_item_projection import _work_item_response
@@ -3679,6 +3681,149 @@ async def test_policy_adoption_during_check_read_cannot_accept_old_requirements(
 class _UnavailableChecksClient(_Client):
     async def list_check_runs_for_ref(self, owner, repo, ref):
         raise GithubCheckObservationError("observation_changed")
+
+
+def _unreadable_ci_fields(head="sha"):
+    return {
+        "checks_unavailable_since": datetime.utcnow() - timedelta(minutes=20),
+        "checks_unavailable_reason": "api_error",
+        "checks_unavailable_head_sha": head,
+    }
+
+
+def _assert_unreadable_ci_cleared(item):
+    assert item.checks_unavailable_since is None
+    assert item.checks_unavailable_reason is None
+    assert item.checks_unavailable_head_sha is None
+
+
+@pytest.mark.asyncio
+async def test_new_draft_head_clears_stale_ci_without_reading_checks(db):
+    scope = await _scope(db, merge_policy="auto")
+    item = await _item(db, scope, dispatch_status="ready_for_review", pr_number=5,
+                       last_verified_sha="sha", **_unreadable_ci_fields())
+    client = _Client()
+    client.pull["head"]["sha"] = "new-head"
+    client.pull["draft"] = True
+    client.list_check_runs_for_ref = AsyncMock()
+
+    await github_verification_service.process_scope(db, scope, client=client)
+    await db.refresh(item)
+
+    client.list_check_runs_for_ref.assert_not_awaited()
+    assert "draft" in item.status_note
+    assert item.last_verified_sha == "sha"
+    _assert_unreadable_ci_cleared(item)
+
+
+@pytest.mark.asyncio
+async def test_active_unsubmitted_revision_clears_stale_ci_on_open_head(db):
+    scope = await _scope(db)
+    slot, member = await _owner(db, scope)
+    item = await _item(db, scope, dispatch_status="dispatched", pr_number=5,
+                       dispatch_nonce="fixture-active", owner_slot_id=slot.id, active_scope_revision=1,
+                       attempt_phase="implementation", ack_received_at=datetime.utcnow(),
+                       **_unreadable_ci_fields())
+    revision, _ = await _implementation_revision(db, scope, item, slot, member, status="active")
+    client = _Client()
+    client.pull["head"]["sha"] = "new-head"
+    client.list_check_runs_for_ref = AsyncMock()
+
+    await github_verification_service.process_scope(db, scope, client=client)
+    await db.refresh(item)
+    await db.refresh(revision)
+
+    client.list_check_runs_for_ref.assert_not_awaited()
+    assert revision.status == "active" and item.dispatch_status == "dispatched"
+    _assert_unreadable_ci_cleared(item)
+
+
+@pytest.mark.asyncio
+async def test_old_check_error_cannot_replace_a_new_head_warning(db):
+    scope = await _scope(db)
+    item = await _item(db, scope, dispatch_status="verifying", pr_number=5)
+    item_id = item.id
+    newer = datetime.utcnow()
+
+    class HeadChangesDuringCheck(_Client):
+        async def list_check_runs_for_ref(self, owner, repo, ref):
+            assert ref == "sha"
+            await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == item_id)
+                .values(verification_head_sha="new-head", checks_unavailable_head_sha="new-head",
+                        checks_unavailable_since=newer, checks_unavailable_reason="permission_missing")
+                .execution_options(synchronize_session=False))
+            await db.commit()
+            raise GithubCheckObservationError("observation_changed")
+
+    await github_verification_service.process_scope(db, scope, client=HeadChangesDuringCheck())
+    await db.refresh(item)
+
+    assert item.checks_unavailable_head_sha == "new-head"
+    assert item.checks_unavailable_since == newer
+    assert item.checks_unavailable_reason == "permission_missing"
+    assert "will poll again" not in (item.status_note or "")
+
+
+@pytest.mark.asyncio
+async def test_retry_reset_clears_previous_attempt_ci_warning(db):
+    scope = await _scope(db)
+    item = await _item(db, scope, dispatch_status="escalated", pr_number=5,
+                       **_unreadable_ci_fields())
+
+    await github_dispatch_service.reset_for_retry(db, item)
+    await db.commit()
+    await db.refresh(item)
+
+    assert item.dispatch_status == "pending"
+    _assert_unreadable_ci_cleared(item)
+
+
+@pytest.mark.asyncio
+async def test_readable_pending_checks_clear_warning_during_merge_fallback(db):
+    scope = await _scope(db, merge_policy="auto")
+    note = "Auto-merge blocked: GitHub checks stalled on this head."
+    item = await _item(db, scope, dispatch_status="ready_for_review", pr_number=5,
+                       last_verified_sha="sha", merge_wait_head_sha="sha", status_note=note,
+                       **_unreadable_ci_fields())
+    client = _Client(check_runs=[{"name": "ci", "status": "in_progress", "conclusion": None}])
+
+    await github_verification_service.process_scope(db, scope, client=client)
+    await db.refresh(item)
+
+    assert item.status_note == note
+    assert client.merge_calls == 0
+    _assert_unreadable_ci_cleared(item)
+
+
+@pytest.mark.asyncio
+async def test_successful_human_review_watch_clears_warning(db, monkeypatch):
+    scope = await _scope(db, merge_policy="human")
+    preset = await db.get(AgentTeamPreset, scope.preset_id)
+    preset.autonomy_enabled = True
+    slot, _ = await _owner(db, scope)
+    head = "a" * 40
+    item = await _item(db, scope, dispatch_status="ready_for_review", pr_number=5,
+                       dispatch_nonce="fixture-watch", owner_slot_id=slot.id,
+                       last_verified_sha=head, verification_head_sha=head,
+                       delivery_policy={"required_checks": [{"name": "ci", "app_slug": "github-actions"}]},
+                       **_unreadable_ci_fields(head))
+    db.add(GithubWorkspace(scope_id=scope.id, path="/fixture/watch", leased_item_id=item.id,
+                           lease_token="fixture-lease", leased_at=datetime.utcnow()))
+    await db.commit()
+    wake = AsyncMock(return_value=True)
+    monkeypatch.setattr(github_ci_watch_service, "_wake", wake)
+    client = _Client(check_runs=[{"name": "ci", "status": "completed", "conclusion": "success",
+                                 "head_sha": head, "app": {"slug": "github-actions"}}])
+    client.pull["head"]["sha"] = head
+
+    await github_verification_service.process_scope(db, scope, client=client)
+    await db.refresh(item)
+
+    watch = await db.scalar(select(GithubRequiredCheckWatch).where(GithubRequiredCheckWatch.work_item_id == item.id))
+    wake.assert_awaited_once()
+    assert watch.head_sha == head and watch.completion_kind == "success"
+    assert item.dispatch_status == "ready_for_review" and client.merge_calls == 0
+    _assert_unreadable_ci_cleared(item)
 
 
 @pytest.mark.asyncio
