@@ -346,6 +346,20 @@ describe("every combination of known and unknown numbers (V1 review 116)", () =>
     expect(differ).toHaveTextContent("in scope: unknown · not read yet");
   });
 
+  it("keeps the shared coverage, unknown count and every reason on the one line when both are unknown in the same way", async () => {
+    const shared = { value: null, reason: "incomplete_read", coverage: "partial", unknown_count: 1, reasons: ["incomplete_read", "membership_read_after_cutoff"] };
+    const merged = await cell(row({ merged: shared, in_scope: shared }));
+    expect(merged.textContent).toBe("unknown · could not be read, read after the cutoff · partial · 1 unknown");
+  });
+
+  it("does not combine two unknown measures with different coverage", async () => {
+    const part = { value: null, reason: "no_snapshot", coverage: "partial", unknown_count: 1, reasons: ["no_snapshot"] };
+    const merged = await cell(row({ merged: part, in_scope: { ...part, coverage: "unavailable" } }));
+    expect(merged).toHaveTextContent("unknown / unknown");
+    expect(merged).toHaveTextContent("merged: unknown · no snapshot recorded · 1 unknown");
+    expect(merged).toHaveTextContent("in scope: unknown · no snapshot recorded · 1 unknown");
+  });
+
   it("shows two plain known numbers with no note", async () => {
     expect((await cell(row({}))).textContent).toBe("41 / 63");
   });
@@ -358,7 +372,7 @@ describe("a team that watches no repository now", () => {
     open("/insights/retrospectives", () => jsonResponse(reply([EMPTY])));
     await screen.findByRole("table");
     const line = within(table()).getByRole("link", { name: "release:v4.4" }).closest("tr")!;
-    expect(line).toHaveTextContent("None · the team watches no repositories now");
+    expect(line).toHaveTextContent("None · the team watched no repositories");
     expect(line.querySelector('[data-l="Repositories (issues)"]')).not.toHaveTextContent("unknown");
   });
 

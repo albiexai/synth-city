@@ -311,6 +311,61 @@ async def test_a_live_campaign_of_a_retired_team_keeps_its_recorded_repositories
     assert (row.team, _by_repo(row)) == (None, {"o/a1": (2, None), "o/a2": (1, None)})
 
 
+# V1 review 120: a recorded empty list is known, an absent key is old
+async def _frozen_while_the_team_watched_nothing(db, world):
+    campaign = await _start(db, world.team)
+    await db.execute(delete(TeamGithubScope).where(TeamGithubScope.preset_id == world.team))
+    await db.commit()
+    await snapshots.freeze(db, campaign, FakeGithub(), actor=OPERATOR, as_of=AS_OF)
+    await db.execute(update(Campaign).where(Campaign.id == campaign.id).values(status="finished", finished_at=AS_OF))
+    await db.commit()
+    return campaign
+
+
+async def test_a_frozen_explicit_empty_list_with_a_known_zero_is_a_known_empty_not_unknown(db, world):
+    await _frozen_while_the_team_watched_nothing(db, world)
+    row = (await _list(db)).campaigns[0]
+    assert (row.repositories, row.repositories_unknown_reason, row.source.kind) == ([], "no_repositories_watched", "frozen")
+    assert (row.in_scope.value, row.in_scope.coverage) == (0, "full")
+
+
+async def test_a_known_empty_frozen_campaign_is_not_in_the_hidden_tally(db, world):
+    await _frozen_while_the_team_watched_nothing(db, world)
+    other = await _list(db, scope_id=world.scopes["b1"])
+    assert (other.campaigns, other.hidden_unknown_repositories) == ([], 0)
+
+
+async def test_a_frozen_payload_without_the_key_or_with_an_unknown_total_stays_unknown_and_hidden(db, world):
+    base = {"campaign_id": 0, "selector": "x", "started_at": "2026-11-02T09:00:00", "as_of": "2026-11-05T09:00:00",
+            "calculation_version": "campaign-snapshot-v2", "recorded_coverage": []}
+    total = {"name": "issues_in_scope", "value": 0, "coverage": "full", "unknown_count": 0, "unknown_reasons": []}
+    cases = [{**base, "metrics": [total]},  # no repositories key: an old payload
+             {**base, "metrics": [{**total, "value": None}], "repositories": []},  # an unknown total, full coverage
+             {**base, "metrics": [{**total, "coverage": "partial"}], "repositories": []}]  # a zero that is only partial
+    for number, payload in enumerate(cases):
+        campaign = await _start(db, world.team, f"label:old{number}", T0 + timedelta(days=number))
+        db.add(CampaignSnapshot(campaign_id=campaign.id, version=1, calculation_version="campaign-snapshot-v2", payload=payload, created_by="operator"))
+        await db.execute(update(Campaign).where(Campaign.id == campaign.id).values(status="finished", finished_at=AS_OF))
+        await db.commit()
+    await db.execute(delete(TeamGithubScope))
+    await db.commit()
+    assert {row.repositories_unknown_reason for row in (await _list(db)).campaigns} == {"snapshot_without_repository_counts"}
+    probe = TeamGithubScope(preset_id=world.team, repo_owner="o", repo_name="z", repo_path="/private/z", enabled=True)
+    db.add(probe)
+    await db.commit()
+    assert (await _list(db, scope_id=probe.id)).hidden_unknown_repositories == 3
+
+
+async def test_a_scope_added_after_a_snapshot_with_an_explicit_empty_list_has_an_unknown_count(db, world):
+    campaign = await _start(db, world.other)
+    await db.execute(delete(TeamGithubScope).where(TeamGithubScope.preset_id == world.other))
+    await db.commit()
+    await snapshots.build_snapshot(db, campaign, FakeGithub(), as_of=AS_OF)
+    db.add(TeamGithubScope(preset_id=world.other, repo_owner="o", repo_name="new", repo_path="/private/new", enabled=True))
+    await db.commit()
+    assert _by_repo((await _list(db)).campaigns[0]) == {"o/new": (None, "repository_added_after_snapshot")}
+
+
 @pytest_asyncio.fixture
 async def client(db):
     async def override():

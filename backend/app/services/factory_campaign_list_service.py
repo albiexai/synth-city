@@ -182,11 +182,13 @@ async def campaign_list(db, *, team_id: int | None, scope_id: int | None, status
             source = CampaignCountSource(kind="frozen" if stored is not None else "live", as_of=_cutoff(payload, stored or live),
                                          frozen_at=_naive_utc(stored.created_at) if stored is not None else None)
             metrics = payload.get("metrics") or []
-            counts_made = bool(payload.get("repositories"))
+            counts_made = "repositories" in payload  # a recorded empty list is known; only an absent key is old (#1466)
             for item in payload.get("repositories") or []:
                 reason = None if item.get("issues") is not None else (
                     item.get("reason") or (item.get("cutoff_gaps") or [None])[0] or "incomplete_read")
                 counted.setdefault(item["repo"].lower(), CampaignRepositoryCount(repo=item["repo"], issues=item.get("issues"), reason=reason))
+        scope_total = next((m for m in metrics if m.get("name") == "issues_in_scope"), {})
+        recorded_empty = counts_made and scope_total.get("value") == 0 and scope_total.get("coverage") == "full"
         now = is_live and current  # a live campaign of a current team covers exactly the repositories it watches now
         if now:
             # Never the older snapshot's list, even when the team watches none (V1 review 116). A repository that the
@@ -198,8 +200,9 @@ async def campaign_list(db, *, team_id: int | None, scope_id: int | None, status
         else:
             repositories = list(counted.values())
         if not repositories:
-            # An empty current membership is known: the team watches nothing. The other reasons are missing evidence.
-            unknown = ("no_repositories_watched" if now else "snapshot_without_repository_counts" if source is not None
+            # An empty membership is known when it is the current one, or a snapshot recorded an empty list with a known
+            # zero total. The other reasons are missing evidence.
+            unknown = ("no_repositories_watched" if now or recorded_empty else "snapshot_without_repository_counts" if source is not None
                        else "before_recording" if evidenced else "no_snapshot")
         missing = "not_read_yet" if is_live else (unknown or "no_snapshot")
         rows.append(CampaignRow(

@@ -20,7 +20,7 @@ const REASONS: Record<string, string> = {
   snapshot_without_repository_counts: 'the snapshot has no repository counts',
   incomplete_read: 'could not be read',
   repository_added_after_snapshot: 'added after the last count',
-  no_repositories_watched: 'the team watches no repositories now',
+  no_repositories_watched: 'the team watched no repositories',
   membership_read_after_cutoff: 'read after the cutoff',
   departure_after_cutoff: 'a departure after the cutoff',
   delivery_after_cutoff: 'a delivery after the cutoff',
@@ -72,9 +72,14 @@ function Note({ label, measure }: { label: string; measure: CampaignMeasure }) {
 /** Both numbers with what is known of each, also when one is unknown. One line when both are unknown in the same way. */
 function Merged({ merged, scope }: { merged: CampaignMeasure; scope: CampaignMeasure }) {
   const value = (measure: CampaignMeasure) => (measure.value === null ? <em>unknown</em> : measure.value)
-  const same = merged.value === null && scope.value === null && merged.reason === scope.reason
+  const same = merged.value === null && scope.value === null && merged.reason === scope.reason && merged.coverage === scope.coverage
     && (merged.unknown_count ?? 0) === (scope.unknown_count ?? 0) && merged.reasons?.join() === scope.reasons?.join()
-  if (same) return <Unknown reason={merged.reason} />
+  if (same) {
+    // One line, with everything that the two measures share: all reasons, the coverage and the unknown count.
+    const shared = [merged.reasons?.length ? merged.reasons.map(reasonText).join(', ') : reasonText(merged.reason),
+      merged.coverage === 'partial' ? 'partial' : null, (merged.unknown_count ?? 0) > 0 ? `${merged.unknown_count} unknown` : null]
+    return <span className="text-muted-foreground"><em>unknown</em> · {shared.filter(Boolean).join(' · ')}</span>
+  }
   return <>{value(merged)} / {value(scope)}<Note label="merged" measure={merged} /><Note label="in scope" measure={scope} /></>
 }
 
