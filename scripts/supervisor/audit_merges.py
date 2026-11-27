@@ -123,22 +123,23 @@ def list_pulls(api, repo, base):
     raise common.StepError("GitHub pull request listing exceeded the page limit")
 
 
-def held(pull, label):
-    return isinstance(label, str) and label.lower() in {name.lower() for name in pull["labels"]}
+def has_label(labels, label):
+    return label.lower() in {name.lower() for name in labels}
 
 
 def restore(db, api, scope_id, config, repo, pull, out):
     number = pull["number"]
+    label = config[3]
     current = checked_pull(api(f"repos/{repo}/pulls/{number}", PULL_FIELDS))
     if (current["state"] != "open" or current["draft"] or current["merged_at"] is not None
             or any(current[key] != pull[key] for key in ("number", "repo", "base", "head"))
-            or held(current, config[3]) or scope_config(db, scope_id) != config
+            or has_label(current["labels"], label) or scope_config(db, scope_id) != config
             or acceptance(db, scope_id, current) is not False):
         out(f"PR #{number} changed during the audit. Restoration skipped.")
         return
-    label = config[3]
     labels = api(f"repos/{repo}/issues/{number}/labels", "map(.name)", payload={"labels": [label]})
-    if not isinstance(labels, list) or label not in labels:
+    if (not isinstance(labels, list) or not all(isinstance(name, str) for name in labels)
+            or not has_label(labels, label)):
         raise common.StepError("GitHub did not confirm the added hold")
     out(f"PR #{number} hold restored.")
 
@@ -149,8 +150,12 @@ def audit(db, api, scope_id, restore_hold, out):
     if restore_hold and (enabled != 1 or not isinstance(label, str) or not label.strip()):
         raise common.ConfigError("restoration needs an enabled scope with a configured review hold")
     repo = f"{owner}/{repo_name}"
-    base = (api(f"repos/{repo}", ".default_branch") if base_ref == "origin/HEAD"
-            else base_ref.removeprefix("origin/") if isinstance(base_ref, str) else None)
+    base = base_ref
+    if base_ref == "origin/HEAD":
+        repository = api(f"repos/{repo}", "{default_branch}")
+        base = repository.get("default_branch") if isinstance(repository, dict) else None
+    elif isinstance(base_ref, str):
+        base = base_ref.removeprefix("origin/")
     if not isinstance(base, str) or not base or base == "HEAD" or base.startswith("refs/"):
         raise common.ConfigError("scope has no valid GitHub base branch")
     attention = False
@@ -168,7 +173,7 @@ def audit(db, api, scope_id, restore_hold, out):
             out(f"PR #{number} {state} without proven exact-head acceptance.")
             if accepted is None:
                 out(f"PR #{number} lacks a unique work item in the selected scope.")
-            if restore_hold and not merged and accepted is False and not held(pull, label):
+            if restore_hold and not merged and accepted is False and not has_label(pull["labels"], label):
                 restore(db, api, scope_id, config, repo, pull, out)
     return int(attention)
 

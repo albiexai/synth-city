@@ -30,6 +30,7 @@ class GitHub:
         self.rows = list(rows)
         self.current = current
         self.added_labels = added_labels
+        self.repository = {"default_branch": BASE}
         self.writes = []
         self.pages = []
         self.reads = []
@@ -46,7 +47,14 @@ class GitHub:
             self.writes.append((target.path, json.loads(input)))
             value = self.added_labels
         elif target.path == "repos/o/r":
-            value = BASE
+            projection = command[command.index("--jq") + 1]
+            assert projection in (".default_branch", "{default_branch}")
+            if projection == ".default_branch" and isinstance(self.repository, dict):
+                branch = self.repository.get("default_branch")
+                if isinstance(branch, str):
+                    # gh prints a jq string as plain text rather than quoting it as JSON.
+                    return subprocess.CompletedProcess(command, 0, stdout=branch + "\n")
+            value = self.repository
         elif target.path == "repos/o/r/pulls":
             query = parse_qs(target.query)
             assert query["base"] == [BASE] and query["state"] == ["all"]
@@ -270,10 +278,11 @@ def test_invalid_base_is_rejected_before_listing(evidence, base):
     assert code == 2 and not out and "valid GitHub base branch" in err and gh.reads == []
 
 
-def test_unconfirmed_label_add_reports_an_error(evidence):
+@pytest.mark.parametrize("labels", [["keep-me"], ["review-hold", None], {"review-hold": True}])
+def test_unconfirmed_label_add_reports_an_error(evidence, labels):
     change(evidence, "UPDATE github_head_reviews SET status = 'superseded'")
     row = open_pull()
-    gh = GitHub(row, current=row, added_labels=["keep-me"])
+    gh = GitHub(row, current=row, added_labels=labels)
     code, out, err = run(evidence, gh, "--restore-hold")
     assert code == 2 and "hold restored" not in out and "did not confirm" in err
     assert gh.writes == [("repos/o/r/issues/1/labels", {"labels": ["review-hold"]})]
@@ -285,3 +294,22 @@ def test_oversized_response_is_rejected_before_audit(evidence, monkeypatch):
     gh = GitHub(row)
     code, out, err = run(evidence, gh)
     assert code == 2 and not out and "response is too large" in err and gh.writes == []
+
+
+@pytest.mark.parametrize("metadata", [{}, {"default_branch": None}, {"default_branch": 42}, BASE])
+def test_missing_default_base_is_rejected_before_listing(evidence, metadata):
+    change(evidence, "UPDATE team_github_scopes SET base_ref = 'origin/HEAD'")
+    gh = GitHub()
+    gh.repository = metadata
+    code, out, err = run(evidence, gh, "--restore-hold")
+    assert code == 2 and not out and "valid GitHub base branch" in err
+    assert gh.reads == [("GET", "repos/o/r")] and gh.writes == []
+
+
+def test_label_confirmation_accepts_the_github_label_casing(evidence):
+    change(evidence, "UPDATE github_head_reviews SET status = 'superseded'")
+    row = open_pull()
+    gh = GitHub(row, current=row, added_labels=["keep-me", "Review-Hold"])
+    code, out, err = run(evidence, gh, "--restore-hold")
+    assert code == 1 and "PR #1 hold restored." in out and not err
+    assert gh.writes == [("repos/o/r/issues/1/labels", {"labels": ["review-hold"]})]
