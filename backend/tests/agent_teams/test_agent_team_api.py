@@ -13,6 +13,7 @@ from app.config import settings
 from app.main import app
 from app.models.database import (
     AgentTeamPreset,
+    FactoryAuditEvent,
     GithubApprovalRequest,
     GithubAttemptScopeRevision,
     GithubWorkItem,
@@ -1041,6 +1042,7 @@ async def test_leader_assignment_is_explicit_and_survives_reorder(client, db, tm
     leader_slot = preset.slots[1]
     response = await client.put(
         f"/api/v1/agent-teams/presets/{preset.id}/leader",
+        headers={"Origin": "http://localhost:5173"},
         json={
             "leader_slot_id": leader_slot.id,
             "expected_leader_slot_id": None,
@@ -1050,6 +1052,10 @@ async def test_leader_assignment_is_explicit_and_survives_reorder(client, db, tm
     )
     assert response.status_code == 200
     assert response.json()["leader_slot_id"] == leader_slot.id
+    event = (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.team_preset_id == preset.id, FactoryAuditEvent.event_kind == "leader_assignment",
+    ))).one()
+    assert (event.action_outcome, event.actor_kind, event.via) == ("applied", "operator", "ui")
 
     reordered = await agent_team_service.reorder_slots(
         db, preset.id, [leader_slot.id, preset.slots[0].id]

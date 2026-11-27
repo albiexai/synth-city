@@ -299,7 +299,9 @@ async def test_maintenance_routes_require_operator_for_reads_and_writes(db, monk
     async def database():
         yield db
     app.dependency_overrides[get_db] = database
-    headers = {"X-Synth-City-Operator-Token": header} if header else {}
+    headers = {"Origin": "http://localhost:5173"}
+    if header:
+        headers["X-Synth-City-Operator-Token"] = header
     root = f"/api/v1/agent-teams/presets/{scope.preset_id}"
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         report = await client.get(root + "/terminal-revisions", headers=headers)
@@ -313,5 +315,9 @@ async def test_maintenance_routes_require_operator_for_reads_and_writes(db, monk
         if expected == 200:
             assert report.headers["cache-control"] == "no-store"
             assert response.headers["cache-control"] == "no-store"
+            audit = (await db.scalars(select(FactoryAuditEvent).where(
+                FactoryAuditEvent.operation_id == "terminal_revision_reconcile:test-api",
+            ))).one()
+            assert (audit.actor_kind, audit.via) == ("operator", "ui")
         await db.refresh(revision)
         assert revision.status == ("completed" if expected == 200 else "active")

@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AgentTeamsPage } from '../src/features/agent-teams/AgentTeamsPage'
 import { OperatorTokenDialog } from '../src/features/agent-teams/OperatorTokenDialog'
+import { ProviderProvider } from '../src/contexts/ProviderContext'
 import {
   deleteAgentTeamPreset, deleteAgentTeamSlot, duplicateAgentTeamPreset, fetchAgentTeamPresets,
   planAgentTeamLaunch, reorderAgentTeamSlots, updateAgentTeamLeader, updateAgentTeamPreset,
@@ -99,28 +100,38 @@ function open(path = '/teams/1?tab=roster') {
 }
 
 describe('shared OS user warning', () => {
-  it.each([true, false])('follows the installation state on Teams and in the key prompt (%s)', async (shared) => {
-    const users = [{ name: 'controller', is_controller: true, is_default: shared }]
-    if (!shared) users.push({ name: 'agent', is_controller: false, is_default: true })
-    const { requests } = fixtureFetch((path) => path === 'harness-scope'
-      ? jsonResponse({ users, default_user: shared ? 'controller' : 'agent' })
+  it.each(['shared', 'separate', 'unknown'] as const)('uses existing evidence on Teams and in the key prompt (%s)', async (mode) => {
+    const installationSearch = mode === 'unknown' ? undefined : {
+      controller_user: 'controller', agent_user: mode === 'shared' ? null : 'agent', path: '',
+    }
+    const { requests } = fixtureFetch((path) => path === 'providers'
+      ? jsonResponse({ providers: [], count: 0, installation_search: installationSearch })
       : jsonResponse({ detail: 'not needed by this test' }, 404))
-    const warning = /agents running as the controller can read the operator token/i
+    const warning = /agents running as the controller can read the Director key/i
+    const unknown = /could not verify whether the controller and agents share an OS user/i
+    const view = (dialogOpen: boolean) => (
+      <MemoryRouter initialEntries={['/teams/1?tab=roster']}>
+        <ProviderProvider>
+          <Routes><Route path="/teams/:teamId" element={<AgentTeamsPage />} /></Routes>
+          <OperatorTokenDialog open={dialogOpen} value="" error={null} onValueChange={vi.fn()} onSubmit={vi.fn()} onCancel={vi.fn()} />
+        </ProviderProvider>
+      </MemoryRouter>
+    )
+    const { rerender } = render(view(false))
+    await waitFor(() => expect(requests.filter(({ path }) => path === 'providers')).toHaveLength(1))
+    if (mode === 'shared') expect(await screen.findByText(warning)).toBeVisible()
+    else expect(screen.queryByText(warning)).not.toBeInTheDocument()
+    if (mode === 'unknown') expect(await screen.findByText(unknown)).toBeVisible()
+    else expect(screen.queryByText(unknown)).not.toBeInTheDocument()
 
-    open()
-    if (shared) expect(await screen.findByText(warning)).toBeVisible()
-    else {
-      await waitFor(() => expect(requests.filter(({ path }) => path === 'harness-scope')).toHaveLength(1))
-      expect(screen.queryByText(warning)).not.toBeInTheDocument()
-    }
-
-    render(<OperatorTokenDialog open value="" error={null} onValueChange={vi.fn()} onSubmit={vi.fn()} onCancel={vi.fn()} />)
+    rerender(view(true))
     const dialog = screen.getByRole('dialog', { name: 'Director key' })
-    if (shared) expect(await within(dialog).findByText(warning)).toBeVisible()
-    else {
-      await waitFor(() => expect(requests.filter(({ path }) => path === 'harness-scope')).toHaveLength(2))
-      expect(within(dialog).queryByText(warning)).not.toBeInTheDocument()
-    }
+    if (mode === 'shared') expect(await within(dialog).findByText(warning)).toBeVisible()
+    else expect(within(dialog).queryByText(warning)).not.toBeInTheDocument()
+    if (mode === 'unknown') expect(within(dialog).getByText(unknown)).toBeVisible()
+    else expect(within(dialog).queryByText(unknown)).not.toBeInTheDocument()
+    expect(requests.filter(({ path }) => path === 'providers')).toHaveLength(1)
+    expect(requests.some(({ path }) => path === 'harness-scope')).toBe(false)
   })
 })
 

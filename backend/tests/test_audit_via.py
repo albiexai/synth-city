@@ -97,6 +97,7 @@ async def _campaign(client, preset, milestone="v4.2", **headers):
     "method,path,body,event_kind",
     [
         ("PUT", "agent-teams/presets/{preset}/supervisor", {"actor_id": None}, "policy_change"),
+        ("PUT", "agent-teams/presets/{preset}/dispatch-pause", {"paused": True, "reason": "test"}, "policy_change"),
         ("PUT", "agent-teams/presets/{preset}/leader", {
             "leader_slot_id": 99, "expected_updated_at": "2026-01-01T00:00:00Z", "reason": "test",
         }, "leader_assignment"),
@@ -156,6 +157,9 @@ async def test_operator_route_audit_event_has_the_request_access_path(
     assert response.status_code in (200, 201, 409), response.text
     events = (await db.scalars(select(FactoryAuditEvent).where(FactoryAuditEvent.event_kind == event_kind))).all()
     assert events
+    if url.endswith("/dispatch-pause"):
+        assert response.status_code == 200
+        assert [event.action_outcome for event in events] == ["applied"]
     assert {(event.actor_kind, event.via, event.actor_session_id) for event in events} == {("operator", "ui", None)}
 
 
