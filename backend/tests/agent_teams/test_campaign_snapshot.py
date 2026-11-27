@@ -530,9 +530,9 @@ async def test_a_closed_issue_without_any_evidence_is_unknown_not_undelivered(db
 async def test_nothing_known_about_any_closed_issue_is_unknown_not_zero(db, world):
     campaign = await _campaign(db, world, undelivered=False)
     await _delete_item(db, world.items[("a1", 2)])
-    # Nothing left places the merge: no team key, and neither its item nor its scope survives.
-    await db.execute(text("UPDATE factory_audit_events SET team_context_key = NULL, scope_id = NULL "
-                          "WHERE event_kind = 'delivery_evidence'"))
+    # Nothing left places the merge: no team key, and neither its item, its scope nor its team reference survives.
+    await db.execute(text("UPDATE factory_audit_events SET team_context_key = NULL, scope_id = NULL, "
+                          "team_preset_id = NULL WHERE event_kind = 'delivery_evidence'"))
     await db.commit()
     by_name = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False))
     for name in ("merged", "closed_without_delivery"):
@@ -557,8 +557,8 @@ def _strip(*fields):
 async def test_an_upgraded_delivery_row_without_its_identity_is_read_through_its_live_item(db, world):
     campaign = await _campaign(db, world)
     await db.execute(_strip("issue_number", "repo_owner", "repo_name"))
-    await db.execute(text("UPDATE factory_audit_events SET team_context_key = NULL, scope_id = NULL "
-                          "WHERE event_kind = 'delivery_evidence'"))  # the live item alone places it
+    await db.execute(text("UPDATE factory_audit_events SET team_context_key = NULL, scope_id = NULL, "
+                          "team_preset_id = NULL WHERE event_kind = 'delivery_evidence'"))  # the live item alone
     await db.commit()
     by_name = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False))
     assert (by_name["merged"].value, by_name["closed_without_delivery"].value) == (1, 1)
@@ -607,8 +607,8 @@ async def test_an_upgraded_row_whose_item_is_gone_is_placed_by_its_live_scope(db
     """No team key, the item deleted, but the row's scope is the team's own and its snapshot names the issue."""
     campaign = await _campaign(db, world)
     await _close_undelivered(db, world.items[("a1", 2)], T0 + timedelta(hours=12))  # before its merge
-    await db.execute(text("UPDATE factory_audit_events SET team_context_key = NULL "
-                          "WHERE event_kind = 'delivery_evidence' AND delivery_outcome = 'delivered'"))
+    await db.execute(text("UPDATE factory_audit_events SET team_context_key = NULL, team_preset_id = NULL "
+                          "WHERE event_kind = 'delivery_evidence' AND delivery_outcome = 'delivered'"))  # scope alone
     await db.commit()
     await _delete_item(db, world.items[("a1", 2)])
     by_name = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False))
@@ -645,3 +645,49 @@ async def test_a_legacy_merge_time_set_later_misses_the_cache(db, world):
     await db.commit()
     again = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF))
     assert (again["merged"].value, again["merged"].unknown_count) == (2, 0)
+
+
+# V1 review 6086115646
+async def test_a_deleted_scopes_merge_is_placed_by_its_surviving_team_reference(db, world):
+    """No team key, the scope deleted with its items, and the team watching the repository again."""
+    from app.models.database import TeamGithubScope
+
+    campaign = await _campaign(db, world)
+    await _close_undelivered(db, world.items[("a1", 2)], T0 + timedelta(hours=12))  # before its merge
+    await db.execute(text("UPDATE factory_audit_events SET team_context_key = NULL "
+                          "WHERE event_kind = 'delivery_evidence' AND delivery_outcome = 'delivered'"))
+    await db.commit()
+    await db.delete(await db.get(TeamGithubScope, world.scopes["a1"]))
+    await db.commit()
+    db.add(TeamGithubScope(preset_id=world.team, repo_owner="o", repo_name="a1", repo_path="/private/a1-again",
+                           enabled=True))
+    await db.commit()
+    by_name = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False))
+    assert (by_name["merged"].value, by_name["closed_without_delivery"].value) == (1, 1)
+    assert by_name["merged"].unknown_count == 0
+
+
+async def test_one_repository_watched_under_two_spellings_counts_each_issue_once(db, world):
+    from app.models.database import TeamGithubScope
+
+    campaign = await _campaign(db, world)
+    db.add(TeamGithubScope(preset_id=world.team, repo_owner="O", repo_name="a1", repo_path="/private/a1-upper",
+                           enabled=True))
+    await db.commit()
+    by_name = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False))
+    assert (by_name["issues_in_scope"].value, by_name["merged"].value, by_name["closed_without_delivery"].value) == (
+        3, 1, 1)
+
+
+async def test_a_fact_that_names_another_team_never_counts_here_through_a_live_item(db, world):
+    """The reconciliation writer keeps the original attempt's team key; the item and scope are this team's now."""
+    campaign = await _campaign(db, world)
+    other = await audit.context_key_for(db, "team", world.other)
+    await db.commit()
+    await _deliver(db, world.items[("a2", 3)], T0 + timedelta(days=2))
+    await db.execute(text("UPDATE factory_audit_events SET team_context_key = :other WHERE event_kind = "
+                          "'delivery_evidence' AND delivery_outcome = 'delivered' AND item_id = :item"),
+                     {"other": other, "item": world.items[("a2", 3)]})
+    await db.commit()
+    by_name = _measures(await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False))
+    assert (by_name["merged"].value, by_name["closed_without_delivery"].value) == (1, 1)

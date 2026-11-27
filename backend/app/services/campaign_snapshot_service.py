@@ -139,9 +139,12 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
     if membership.unavailable:
         gaps.append(membership.unavailable)
     complete = membership.complete
-    facts = await _deliveries(db, campaign.team_context_key)
-    members = {(m.repo, m.issue_number): m for m in membership.members}
-    delivered = {key: facts.delivered.get(_identity(*key), []) for key in members}
+    facts = await _deliveries(db, campaign)
+    # One member per GitHub issue: two scopes may spell the same repository differently (V1 review 6086115646).
+    members: dict[tuple[str, int], object] = {}
+    for m in membership.members:
+        members.setdefault(_identity(m.repo, m.issue_number), m)
+    delivered = {key: facts.delivered.get(key, []) for key in members}
     # The cutoff (V1 review 6079984028): only facts recorded by ``as_of`` count. GitHub reports today's membership,
     # so a later departure, a later delivery of a member, or a read after the cutoff leaves it unknown.
     if observed > as_of:
@@ -158,7 +161,7 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
     # and so is every closed issue while a delivery can't be placed: it may be that issue's merge.
     closed = [key for key, m in members.items() if m.state == "closed" and key not in done]
     undelivered = [key for key in closed if not facts.unidentified
-                   and any(at <= as_of for at in facts.undelivered.get(_identity(*key), ()))]
+                   and any(at <= as_of for at in facts.undelivered.get(key, ()))]
     unknown = len(closed) - len(undelivered)
     reason = "delivery_identity_unknown" if facts.unidentified else "delivery_history_missing"
 
@@ -203,17 +206,24 @@ def _identity(repo: str, number: int) -> tuple[str, int]:
     return repo.lower(), number  # GitHub's owner and repository names are case-insensitive
 
 
-async def _deliveries(db, key: str) -> _Deliveries:
+async def _deliveries(db, campaign: Campaign) -> _Deliveries:
     """Each issue's recorded delivery outcomes in the campaign team lifetime (#1395).
 
-    A fact is read by the team, repository and issue it recorded (T05), so deleting the work item loses nothing. A row
-    recorded before that snapshot, without its team key or identity, falls back to its live item, and a row without
-    its team key belongs here through its live item or scope; another team lifetime's facts never count. A legacy item's ``auto_merged_at`` is a merge. The time is the fact's own, or its
-    record time when GitHub gave none.
+    A fact is read by the team, repository and issue it recorded (T05), so deleting the work item loses nothing; a row
+    recorded before that snapshot falls back to its live item for the issue. A fact's recorded team key decides its
+    lifetime, so another team's fact never counts here, whatever its item is now (V1 review 6086115646). Only a row
+    without that key is placed by its surviving references: its live item, its live scope, or its team (the foreign
+    keys are ``SET NULL``, so a value names the live resource). A legacy item's ``auto_merged_at`` is a merge. The time
+    is the fact's own, or its record time when GitHub gave none.
     """
+    key = campaign.team_context_key
     lifetime = (select(GithubWorkItem.id).join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
                 .join(FactoryContextKey, _lifetime(key)))
     scopes = select(TeamGithubScope.id).join(FactoryContextKey, _lifetime(key))
+    # A retired team's campaign reads its membership measures unknown (``team_retired``), so the team reference is
+    # read only while it names this lifetime's team.
+    references = [FactoryAuditEvent.item_id.in_(lifetime), FactoryAuditEvent.scope_id.in_(scopes),
+                  FactoryAuditEvent.team_preset_id == campaign.preset_id]
     rows = (await db.execute(
         select(FactoryAuditEvent.delivery_outcome, FactoryAuditEvent.fact_time, FactoryAuditEvent.occurred_at,
                FactoryAuditEvent.context_snapshot, GithubWorkItem.issue_number, TeamGithubScope.repo_owner,
@@ -222,8 +232,8 @@ async def _deliveries(db, key: str) -> _Deliveries:
         .outerjoin(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
         .where(FactoryAuditEvent.event_kind == "delivery_evidence",
                FactoryAuditEvent.delivery_outcome.in_(("delivered", "closed_without_delivery")),
-               or_(FactoryAuditEvent.team_context_key == key, FactoryAuditEvent.item_id.in_(lifetime),
-                   FactoryAuditEvent.scope_id.in_(scopes))))).all()
+               or_(FactoryAuditEvent.team_context_key == key,
+                   FactoryAuditEvent.team_context_key.is_(None) & or_(*references))))).all()
     facts = _Deliveries()
     for row in rows:
         recorded = row.context_snapshot or {}
