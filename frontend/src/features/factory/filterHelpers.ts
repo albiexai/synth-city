@@ -31,7 +31,7 @@ export function factoryQuery(params: URLSearchParams, category = false) {
     "team_id",
     "scope_id",
     "provider",
-    ...(category ? ["category"] : []),
+    ...(category ? ["category", "owner_slot_id"] : []),
   ]) {
     const value = params.get(key);
     if (value) result.set(key, value);

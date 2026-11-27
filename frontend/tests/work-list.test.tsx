@@ -126,6 +126,42 @@ describe("compact Work list", () => {
     expect(screen.getByRole("link", { name: "Reset filters" })).toHaveAttribute("href", "/work");
   });
 
+  it("keeps the owner and other filters in the URL and shows the ranked queue", async () => {
+    const repo = repositories.normal.response.repositories[0];
+    const queued = work.queued.response.items[0];
+    const { requests } = fixtureFetch((path) => {
+      if (path === "factory/repositories") return jsonResponse(repositories.normal.response);
+      if (path === "agent-teams/presets") return jsonResponse({ presets: [
+        { ...repo.team, slots: [{ id: 23, display_name: "Avery", role: "Builder" }] },
+      ] });
+      return jsonResponse({ ...first, items: [
+        { ...queued, owner_queue_position: 1 },
+        { ...queued, item: { ...queued.item, id: 900, issue_number: 900 }, owner_queue_position: 3 },
+      ] });
+    });
+    const initial = `team_id=${repo.team.id}&scope_id=${repo.scope_id}&provider=codex-cli`;
+    renderRoute(<WorkPage />, `/work?${initial}`);
+    await settle();
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "23" } });
+    fireEvent.click(screen.getByRole("button", { name: "Queued" }));
+    await settle();
+    const query = requests.filter((r) => r.path === "factory/work-items").at(-1)!.query;
+    expect(Object.fromEntries(query)).toEqual({
+      team_id: String(repo.team.id), scope_id: String(repo.scope_id), provider: "codex-cli",
+      owner_slot_id: "23", category: "queued",
+    });
+    cleanup();
+    resetFactoryReads();
+    renderRoute(<WorkPage />, `/work?${query}`);
+    await settle();
+    expect(screen.getByRole("combobox", { name: "Owner" })).toHaveValue("23");
+    expect(screen.getByRole("option", { name: "Avery · Builder" })).toBeInTheDocument();
+    expect(screen.getByText(/Expected order, recomputed on each poll/)).toBeInTheDocument();
+    const rows = within(screen.getByRole("table")).getAllByRole("row").slice(1);
+    expect(rows[0]).toHaveTextContent("next");
+    expect(rows[1]).toHaveTextContent("3rd");
+  });
+
   it("uses one plain sentence as the intro", async () => {
     serve(first);
     renderRoute(<WorkPage />, "/work");

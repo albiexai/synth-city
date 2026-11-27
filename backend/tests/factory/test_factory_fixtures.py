@@ -43,6 +43,16 @@ async def test_frontend_backend_fixture_parity():
         assert "explicit_assignment" not in p01_text
 
 
+def _p04_fields(value):
+    """Compare the frozen P04 contract without the additive owner queue fields."""
+    if isinstance(value, dict):
+        return {key: _p04_fields(child) for key, child in value.items()
+                if key != "owner_queue_position"}
+    if isinstance(value, list):
+        return [_p04_fields(child) for child in value]
+    return value
+
+
 async def test_frozen_response_contract(factory_client, factory_store, monkeypatch, request):
     files = {}
     ids = factory_store.ids
@@ -189,7 +199,10 @@ async def test_frozen_response_contract(factory_client, factory_store, monkeypat
             directory.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
         else:
-            assert json.loads(path.read_text()) == value, f"Contract changed: {path.name}"
+            if name == "schema":
+                definitions = value["models"]["WorkListResponse"]["$defs"]
+                definitions["WorkFilters"]["properties"].pop("owner_slot_id", None)
+            assert json.loads(path.read_text()) == _p04_fields(value), f"Contract changed: {path.name}"
 
 
 V13_FORBIDDEN_FIELDS = {

@@ -46,14 +46,17 @@ const CHIPS: [string, string][] = [
 
 function CategoryChips({
   value,
+  showQueued,
   onChange,
 }: {
   value: string;
+  showQueued: boolean;
   onChange: (value: string) => void;
 }) {
-  const chips = CHIPS.some(([id]) => id === value)
-    ? CHIPS
-    : [...CHIPS, [value, categories[value as keyof typeof categories] ?? value]];
+  const choices = showQueued ? [...CHIPS, ["queued", "Queued"]] : CHIPS;
+  const chips = choices.some(([id]) => id === value)
+    ? choices
+    : [...choices, [value, categories[value as keyof typeof categories] ?? value]];
   return (
     <div role="group" aria-label="Category" className="flex items-end gap-2">
       {chips.map(([id, label]) => (
@@ -83,7 +86,8 @@ export function FactoryFilters({
 }) {
   const [raw, setParams] = useSearchParams();
   const location = useLocation();
-  const { params, unknown, teams, repositories } = useFactoryFilters();
+  const { params, unknown, teams, repositories, owners } = useFactoryFilters(work);
+  const owner = params.get("owner_slot_id") ?? "";
   const update = (name: string, value: string) => {
     // Values that name nothing are dropped on any change.
     const next = new URLSearchParams(params);
@@ -94,8 +98,8 @@ export function FactoryFilters({
   };
   const active = ["team_id", "scope_id", "provider"].some((key) =>
     raw.has(key),
-  ) || (raw.has("category") && raw.get("category") !== "open");
-  const names = unknown.map((key) => (key === "team_id" ? "team" : "repository"));
+  ) || (work && raw.has("owner_slot_id")) || (raw.has("category") && raw.get("category") !== "open");
+  const names = unknown.map((key) => ({ team_id: "team", scope_id: "repository", owner_slot_id: "owner" })[key]);
   return (
     <form
       className="flex flex-wrap items-end gap-3 rounded-lg border bg-card p-3"
@@ -136,8 +140,13 @@ export function FactoryFilters({
         </select>
       </label>
       {work && (
+        <NameSelect label="Owner" all="All owners" options={owners} value={owner}
+          onChange={(value) => update("owner_slot_id", value)} />
+      )}
+      {work && (
         <CategoryChips
           value={params.get("category") ?? "open"}
+          showQueued={Boolean(owner)}
           onChange={(value) => update("category", value === "open" ? "" : value)}
         />
       )}

@@ -1,3 +1,4 @@
+import type { WorkListResponse } from '../../src/types/factory'
 import { contrastFailures, useTheme, type Theme } from '../support/contrast'
 import { expect, test } from '../support/guard'
 import { expectKeyboardReachable } from '../support/keyboard'
@@ -54,4 +55,43 @@ for (const theme of ['light', 'dark'] as Theme[]) {
     expect(failures, JSON.stringify(failures)).toEqual([])
     await expectKeyboardReachable(page, page.locator('main'), 3)
   })
+}
+
+
+for (const width of [1280, 390]) {
+  for (const theme of ['light', 'dark'] as Theme[]) {
+    test('@active the owner queue persists and fits at ' + width + ' px in ' + theme, async ({ page }) => {
+      await page.setViewportSize({ width, height: 900 })
+      await useTheme(page, theme)
+      const response = await page.request.get('/api/v1/factory/work-items?category=open')
+      expect(response.ok()).toBe(true)
+      const current: WorkListResponse = await response.json()
+      const sample = current.items.find(item => item.owner)
+      expect(sample?.owner).toBeTruthy()
+      const owner = String(sample!.owner!.slot_id)
+      await page.route(url => url.pathname.endsWith('/factory/work-items') &&
+        url.searchParams.get('category') === 'queued' && url.searchParams.get('owner_slot_id') === owner,
+      route => route.fulfill({ json: {
+        ...current, total: 2, next_cursor: null, has_more: false,
+        items: [1, 2].map(position => ({
+          ...sample!, owner_queue_position: position, category: 'queued',
+          item: { ...sample!.item, id: 900 + position, dispatch_status: 'pending' },
+        })),
+      } }))
+      await page.goto('/work')
+      const select = page.getByRole('combobox', { name: 'Owner', exact: true })
+      await select.selectOption(owner)
+      await page.getByRole('button', { name: 'Queued', exact: true }).click()
+      await expect(page).toHaveURL(/owner_slot_id=\d+/)
+      await page.reload()
+      await expect(select).toHaveValue(owner)
+      const rows = page.locator(ROW)
+      await expect(rows).toHaveCount(2)
+      await expect(rows.nth(0)).toContainText('next')
+      await expect(rows.nth(1)).toContainText('2nd')
+      await expect(page.getByText(/^Expected order, recomputed on each poll/)).toBeVisible()
+      expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width)
+      expect(await contrastFailures(page.locator('main'))).toEqual([])
+    })
+  }
 }

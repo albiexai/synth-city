@@ -8,6 +8,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 
 from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +21,7 @@ from app.models.database import (
 from app.models import factory_schemas as wire
 from app.services.agent_mail_service import MCP_HEARTBEAT_TTL_SECONDS
 from app.services.github_coordination_service import hold_code
+from app.services.github_dispatch_priority import dispatch_order_key
 from app.services.github_dispatch_scheduler import github_dispatch_scheduler
 from app.services.github_dispatch_service import ESCALATION_REASONS
 from app.services.github_plan_refusal_service import current_plan_refusal_id
@@ -150,6 +152,7 @@ def decode_cursor(cursor: str | None, kind: str, filters: wire.FactoryFilters):
 async def validate_filters(db: AsyncSession, filters: wire.FactoryFilters) -> None:
     if filters.provider is not None and filters.provider not in {p.id for p in get_providers()}:
         raise FactoryReadError("invalid_filter", 422)
+    scope = None
     if filters.scope_id is not None:
         scope = await db.get(TeamGithubScope, filters.scope_id)
         if scope is None:
@@ -158,6 +161,14 @@ async def validate_filters(db: AsyncSession, filters: wire.FactoryFilters) -> No
             raise FactoryReadError("invalid_filter", 422)
     if filters.team_id is not None and await db.get(AgentTeamPreset, filters.team_id) is None:
         raise FactoryReadError("resource_not_found", 404)
+
+    if isinstance(filters, wire.WorkFilters) and filters.owner_slot_id is not None:
+        slot = await db.get(AgentTeamSlot, filters.owner_slot_id)
+        if slot is None:
+            raise FactoryReadError("resource_not_found", 404)
+        if ((filters.team_id is not None and slot.preset_id != filters.team_id)
+                or (scope is not None and slot.preset_id != scope.preset_id)):
+            raise FactoryReadError("invalid_filter", 422)
 
 
 def work_query(filters: wire.FactoryFilters):
@@ -172,6 +183,9 @@ def work_query(filters: wire.FactoryFilters):
         query = query.where(TeamGithubScope.id == filters.scope_id)
     if filters.provider is not None:
         query = query.where(AgentTeamSlot.provider == filters.provider)
+    owner_slot_id = getattr(filters, "owner_slot_id", None)
+    if owner_slot_id is not None:
+        query = query.where(AgentTeamSlot.id == owner_slot_id)
     category = getattr(filters, "category", "all")
     if category == "unknown":
         query = query.where(GithubWorkItem.dispatch_status.not_in(tuple(STATUS_CATEGORY)))
@@ -279,11 +293,14 @@ async def actor_evidence(db, team_ids, authority):
         MailTeamMember.team_preset_id.in_(team_ids), MailTeamMember.participant_kind == "team_slot"))).scalars().all()
     member_ids = [m.id for m in members]
     sessions = (await db.execute(select(MailAgentSession).where(MailAgentSession.member_id.in_(member_ids)))).scalars().all()
-    bindings = (await db.execute(select(AgentPaneBinding).where(AgentPaneBinding.preset_id.in_(team_ids)))).scalars().all()
-    retired = (await db.execute(select(MailPaneLifecycle).where(
-        MailPaneLifecycle.pane_pid.in_([b.pane_pid for b in bindings])))).scalars().all()
-    return slots, members, sessions, bindings, {
-        (r.pane_pid, r.pane_proc_start): r.retired_at for r in retired}
+    binding_rows = (await db.execute(
+        select(AgentPaneBinding, MailPaneLifecycle)
+        .outerjoin(MailPaneLifecycle, and_(MailPaneLifecycle.pane_pid == AgentPaneBinding.pane_pid,
+                                          MailPaneLifecycle.pane_proc_start == AgentPaneBinding.pane_proc_start))
+        .where(AgentPaneBinding.preset_id.in_(team_ids))
+    )).all()
+    return slots, members, sessions, [binding for binding, _ in binding_rows], {
+        (life.pane_pid, life.pane_proc_start): life.retired_at for _, life in binding_rows if life is not None}
 
 
 def association(slot, member, sessions, bindings, retired, now):
@@ -363,10 +380,29 @@ def actions(legacy, *, stopped_actor=None):
     return result
 
 
-async def work_projections(db, rows, now):
+async def _owner_queue_positions(db, slot_ids):
+    item = GithubWorkItem
+    queued = (await db.execute(
+        select(item.id, item.owner_slot_id, item.issue_number, item.dispatch_priority)
+        .join(TeamGithubScope, TeamGithubScope.id == item.scope_id)
+        .join(AgentTeamSlot, and_(AgentTeamSlot.id == item.owner_slot_id,
+                                  AgentTeamSlot.preset_id == TeamGithubScope.preset_id))
+        .where(item.dispatch_status == "pending", item.owner_slot_id.in_(slot_ids))
+    )).all()
+    by_owner = defaultdict(list)
+    for row in queued:
+        by_owner[row.owner_slot_id].append(row)
+    return {row.id: position for queue in by_owner.values()
+            for position, row in enumerate(sorted(queue, key=dispatch_order_key), 1)}
+
+
+async def work_projections(db, rows, now, owner_positions=None):
     from app.services.agent_status_service import agent_status_service
     if not rows:
         return []
+    if owner_positions is None:
+        owner_positions = await _owner_queue_positions(db, {item.owner_slot_id for item, _, _ in rows
+                                                           if item.dispatch_status == "pending"})
     authority = await _load_work_item_authority(db, [item for item, _, _ in rows])
     team_ids = {team.id for _, _, team in rows}
     slots, members, sessions, bindings, retired = await actor_evidence(db, team_ids, authority)
@@ -452,6 +488,7 @@ async def work_projections(db, rows, now):
             repository=wire.WorkRepository(scope_id=scope.id, github=identity,
                                             display_name=f"{identity.owner}/{identity.name}"),
             category=STATUS_CATEGORY.get(item.dispatch_status, "unknown"),
+            owner_queue_position=owner_positions.get(item.id),
             owner=wire.OwnerReference(slot_id=slot.id, member_id=member.id if member else None,
                 name=slot.display_name, configured_provider=slot.provider, provider_label=providers.get(slot.provider)) if slot else None,
             approver=wire.ApproverReference(slot_id=leader_slot.id, member_id=leader_member.id if leader_member else None,
@@ -500,19 +537,36 @@ async def overview(db, filters):
 
 async def work_list(db, filters, limit, cursor):
     await validate_filters(db, filters)
-    after = decode_cursor(cursor, "work", filters)
     query = work_query(filters)
-    selected_counts = await counts(db, query)
-    if after:
-        timestamp, row_id = after
-        query = query.where(or_(GithubWorkItem.updated_at < timestamp,
-                               and_(GithubWorkItem.updated_at == timestamp, GithubWorkItem.id < row_id)))
-    rows = (await db.execute(query.order_by(GithubWorkItem.updated_at.desc(), GithubWorkItem.id.desc()).limit(limit + 1))).all()
+    kind, owner_positions = "work", None
+    if filters.owner_slot_id is not None and filters.category == "queued":
+        owner_positions = await _owner_queue_positions(db, [filters.owner_slot_id])
+        selected_ids = (await db.scalars(query.with_only_columns(GithubWorkItem.id))).all()
+        visible = sorted(owner_positions.keys() & set(selected_ids), key=owner_positions.__getitem__)
+        # A cursor cannot cross a changed queue, even if its last item still exists.
+        ordered = [(item_id, owner_positions[item_id]) for item_id in visible]
+        kind = f"owner-queue:{sha256(repr(ordered).encode()).hexdigest()}"
+        after = decode_cursor(cursor, kind, filters)
+        if after and after[1] not in visible:
+            raise FactoryReadError("invalid_cursor", 422)
+        start = visible.index(after[1]) + 1 if after else 0
+        rows = (await db.execute(query.where(GithubWorkItem.id.in_(visible[start:start + limit + 1])))).all()
+        rows.sort(key=lambda row: owner_positions[row[0].id])
+        selected_counts = wire.FactoryCounts(total=len(visible), queued=len(visible))
+    else:
+        after = decode_cursor(cursor, kind, filters)
+        selected_counts = await counts(db, query)
+        if after:
+            timestamp, row_id = after
+            query = query.where(or_(GithubWorkItem.updated_at < timestamp,
+                                   and_(GithubWorkItem.updated_at == timestamp, GithubWorkItem.id < row_id)))
+        rows = (await db.execute(query.order_by(
+            GithubWorkItem.updated_at.desc(), GithubWorkItem.id.desc()).limit(limit + 1))).all()
     has_more, rows = len(rows) > limit, rows[:limit]
     now = utc_now()
     return wire.WorkListResponse(generated_at=now, filters=filters, total=selected_counts.total,
-        has_more=has_more, next_cursor=encode_cursor("work", filters, rows[-1][0]) if has_more else None,
-        counts=selected_counts, items=await work_projections(db, rows, now))
+        has_more=has_more, next_cursor=encode_cursor(kind, filters, rows[-1][0]) if has_more else None,
+        counts=selected_counts, items=await work_projections(db, rows, now, owner_positions))
 
 
 async def work_detail(db, item_id):

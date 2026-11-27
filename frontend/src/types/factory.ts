@@ -230,6 +230,7 @@ export type WorkProjection = {
   item: SafeWorkItem;
   links: LinkHints;
   owner: OwnerReference | null;
+  owner_queue_position?: number;
   policy: WorkPolicy;
   repository: WorkRepository;
   session: SessionAssociation;
@@ -264,6 +265,7 @@ export type WorkDetailResponse = {
 };
 
 export type WorkFilters = {
+  owner_slot_id?: number;
   category:
     | "all"
     | "open"

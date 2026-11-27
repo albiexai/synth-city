@@ -366,6 +366,7 @@ describe("cursor browsing V26/V27", () => {
         return jsonResponse(repositories.normal.response);
       if (path === "factory/milestone-states")
         return jsonResponse(noMilestoneStates);
+      if (path === "agent-teams/presets") return jsonResponse({ presets: [] });
       const cursor = query.get("cursor");
       if (!cursor && ++firstReads === 2)
         return new Promise((resolve) => {

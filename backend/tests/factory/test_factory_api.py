@@ -11,6 +11,7 @@ from app.database import Base
 from app.models.database import AgentTeamPreset, AgentTeamSlot, GithubWorkItem, TeamGithubScope
 from app.models import factory_schemas as wire
 from app.services import factory_projection_service as projection
+from app.services.github_dispatch_priority import dispatch_order_key
 from app.services.github_plan_refusal_service import record_plan_refusal
 
 NOW = datetime(2026, 9, 30, 12, tzinfo=timezone.utc)
@@ -226,6 +227,58 @@ async def test_provider_filter_matches_only_current_owner_and_repo_roster(factor
         await db.commit()
     changed = await get_ok(factory_client, "work-items", provider="codex-cli", limit=100)
     assert 0 < changed["total"] < response["total"]
+
+
+async def test_owner_queue_filters_rank_pagination_and_rejects_stale_cursor(factory_client, factory_store):
+    ids = factory_store.ids
+    owner = ids.leaders[0]
+    scope, second_scope = ids.scopes[0], ids.scopes[2]
+    async with factory_store.maker() as db:
+        queued = [GithubWorkItem(scope_id=s, issue_number=n, issue_title=f"Owner queue {n}",
+                  issue_url=f"https://github.com/fixture/shared/issues/{n}",
+                  github_updated_at=NOW, dispatch_status="pending",
+                  owner_slot_id=owner, dispatch_priority=priority)
+                  for s, n, priority in [(scope, 940, None), (scope, 941, 9),
+                                         (scope, 942, 2), (second_scope, 943, 2)]]
+        active = GithubWorkItem(scope_id=scope, issue_number=945, issue_title="Current work",
+                                issue_url="https://github.com/fixture/shared/issues/945",
+                                github_updated_at=NOW, dispatch_status="dispatched", owner_slot_id=owner)
+        db.add_all([*queued, active])
+        await db.commit()
+        ranked = [(row.id, rank) for rank, row in enumerate(sorted(queued, key=dispatch_order_key), 1)
+                  if row.scope_id == scope]
+
+    selected = dict(owner_slot_id=owner, team_id=ids.teams[0], scope_id=scope, provider="claude-code")
+    current = await get_ok(factory_client, "work-items", **selected)
+    assert {row["item"]["id"] for row in current["items"]} == {active.id, *(item for item, _ in ranked)}
+    assert all(row["owner"]["slot_id"] == owner for row in current["items"])
+    assert "owner_queue_position" not in next(row for row in current["items"] if row["item"]["id"] == active.id)
+    empty = await get_ok(factory_client, "work-items", **(selected | {"provider": "codex-cli"}))
+    assert empty["total"] == 0
+    wrong_team = await factory_client.get("/api/v1/factory/work-items", params={
+        "owner_slot_id": owner, "team_id": ids.teams[1]})
+    assert wrong_team.status_code == 422 and wrong_team.json()["detail"]["code"] == "invalid_filter"
+    queue = dict(selected, category="queued")
+    first = await get_ok(factory_client, "work-items", **queue, limit=1)
+    cursor = first["next_cursor"]
+    assert first["filters"]["owner_slot_id"] == owner
+    assert cursor and first["total"] == len(ranked)
+    second = await get_ok(factory_client, "work-items", **queue, limit=2, cursor=cursor)
+    assert [(r["item"]["id"], r["owner_queue_position"]) for r in first["items"] + second["items"]] == ranked
+
+    async with factory_store.maker() as db:
+        (await db.get(GithubWorkItem, queued[0].id)).dispatch_priority = 1
+        await db.commit()
+    stale = await factory_client.get("/api/v1/factory/work-items", params=dict(queue, cursor=cursor))
+    assert stale.status_code == 422 and stale.json()["detail"]["code"] == "invalid_cursor"
+    priority_changed = await get_ok(factory_client, "work-items", **queue, limit=1)
+    assert priority_changed["items"][0]["item"]["id"] == queued[0].id
+    async with factory_store.maker() as db:
+        (await db.get(GithubWorkItem, queued[1].id)).owner_slot_id = ids.owners[0]
+        await db.commit()
+    refreshed = await get_ok(factory_client, "work-items", **queue)
+    assert [(r["item"]["id"], r["owner_queue_position"]) for r in refreshed["items"]] == [
+        (queued[0].id, 1), (queued[2].id, 2)]
 
 
 async def test_same_repository_retains_scope_and_attempt_identity(factory_client, factory_store):

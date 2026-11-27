@@ -30,6 +30,7 @@ class FactoryFilters(FactoryModel):
 
 
 class WorkFilters(FactoryFilters):
+    owner_slot_id: PositiveId | None = Field(default=None, exclude_if=lambda value: value is None)
     category: Literal["all", "open", "queued", "active", "review", "attention", "finished", "unknown"] = "all"
 
 
@@ -188,6 +189,7 @@ class SafeWorkItem(FactoryModel):
 
 
 class WorkProjection(FactoryModel):
+    owner_queue_position: PositiveId | None = Field(default=None, exclude_if=lambda value: value is None)
     item: SafeWorkItem
     team: TeamReference
     repository: WorkRepository
