@@ -13,6 +13,9 @@ The rules are the Supervisor's design answers on #1245 and the approved plan (20
 - Effort and pause waits carry neither a nonce nor a launch key, so they fall in the attempt containing their start.
 - Mail and input waits (Q4) go to the one open attempt whose owner sent the request; otherwise they are unattributed.
 - Every interval is clipped to its attempt's window, and the part outside it is unattributed.
+- Everything, attributed or not, is clipped to the campaign period ``[campaign_start, as_of]``; what lies wholly
+  outside it is left out, and an attempt that ended before the campaign is not shown (V1 review 431).
+- A head is a (PR, SHA) pair; a changes-required verdict, on the PR or on a revision, ends at a different commit.
 """
 from __future__ import annotations
 
@@ -29,6 +32,7 @@ from app.models.database import (
     GithubCheckRunHistory,
     GithubHeadReview,
     GithubRequiredCheckWatch,
+    GithubRevisionReview,
     GithubWorkItem,
     TeamGithubScope,
 )
@@ -75,18 +79,26 @@ def _when(event: FactoryAuditEvent) -> datetime:
     return _naive(event.fact_time or event.occurred_at)
 
 
-def _place(out: TeamAttempts, attempt: CollectedAttempt, as_of: datetime, group: str, stage: str, actor: str,
+def _lose(out: TeamAttempts, period, source: str, item_id: int | None, start: datetime | None, end: datetime | None,
+          reason: str) -> None:
+    """An unattributed span, clipped to the campaign period; one wholly outside it is left out."""
+    low, high = period
+    start, end = max(start or low, low), high if end is None else min(end, high)
+    if start < end:
+        out.unattributed.append(Unattributed(source, item_id, start, end, reason))
+
+
+def _place(out: TeamAttempts, period, attempt: CollectedAttempt, group: str, stage: str, actor: str,
            start: datetime, end: datetime | None) -> None:
-    """Clip to the attempt's window; an unended interval runs to ``as_of``, and the parts outside are unattributed."""
-    end = as_of if end is None else min(end, as_of)
+    """Clip to the period and the attempt's window; an unended interval runs to ``as_of``, the rest is unattributed."""
+    end = period[1] if end is None else min(end, period[1])  # what precedes the campaign is dropped by _lose
     if end <= start:
         return
     window = attempt.window
     if start < window.start:
-        out.unattributed.append(Unattributed(stage, attempt.item_id, start, min(end, window.start),
-                                             "before_attempt_start"))
+        _lose(out, period, stage, attempt.item_id, start, min(end, window.start), "before_attempt_start")
     if end > window.end:
-        out.unattributed.append(Unattributed(stage, attempt.item_id, max(start, window.end), end, "after_attempt_end"))
+        _lose(out, period, stage, attempt.item_id, max(start, window.end), end, "after_attempt_end")
     if max(start, window.start) < min(end, window.end):
         attempt.intervals.append(StageInterval(group, stage, actor, max(start, window.start), min(end, window.end)))
 
@@ -107,11 +119,11 @@ def _end_of(start: FactoryAuditEvent, family: str, ends: dict[str, datetime]) ->
 async def collect_team_attempts(db, preset_id: int, *, campaign_start: datetime, as_of: datetime) -> TeamAttempts:
     """Every recorded attempt of the team's items, with its window and intervals, and what could not be attributed."""
     campaign_start, as_of = _naive(campaign_start), _naive(as_of)
-    out = TeamAttempts()
+    out, period = TeamAttempts(), (campaign_start, as_of)
     items = (await db.scalars(select(GithubWorkItem).join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
                               .where(TeamGithubScope.preset_id == preset_id).order_by(GithubWorkItem.id))).all()
     for item in items:
-        await _collect_item(db, item, out, campaign_start, as_of)
+        await _collect_item(db, item, out, period)
     team_key = await audit.current_context_key(db, "team", preset_id)
     events = (await db.scalars(select(FactoryAuditEvent).where(
         FactoryAuditEvent.team_context_key == team_key, FactoryAuditEvent.team_context_key.is_not(None),
@@ -124,16 +136,17 @@ async def collect_team_attempts(db, preset_id: int, *, campaign_start: datetime,
         open_ = [a for a in out.attempts
                  if owner is not None and a.owner_member_id == owner and a.dispatched_at <= at < a.window.end]
         if len(open_) != 1:
-            out.unattributed.append(Unattributed(family, None, at, _end_of(start, family, ends),
-                                                 "several_open_attempts" if open_ else "no_open_attempt"))
+            _lose(out, period, family, None, at, _end_of(start, family, ends),
+                  "several_open_attempts" if open_ else "no_open_attempt")
             continue
         actor = (f"member:{values['awaited_member_id']}" if values.get("awaited_member_id") is not None
                  else f"actor:{values['awaited_actor_id']}" if values.get("awaited_actor_id") is not None else "unknown")
-        _place(out, open_[0], as_of, "waiting", family, actor, at, _end_of(start, family, ends))
+        _place(out, period, open_[0], "waiting", family, actor, at, _end_of(start, family, ends))
     return out
 
 
-async def _collect_item(db, item: GithubWorkItem, out: TeamAttempts, campaign_start: datetime, as_of: datetime):
+async def _collect_item(db, item: GithubWorkItem, out: TeamAttempts, period):
+    campaign_start, as_of = period
     item_key = await audit.current_context_key(db, "item", item.id)
     if item_key is None:
         return
@@ -158,12 +171,15 @@ async def _collect_item(db, item: GithubWorkItem, out: TeamAttempts, campaign_st
         key, dispatched = event.context_snapshot["launch_attempt"], _naive(event.occurred_at)
         following = _naive(launches[n + 1].occurred_at) if n + 1 < len(launches) else as_of
         end = max(dispatched, min(following, as_of, boundary.get(key, as_of)))
-        attempt = CollectedAttempt(item.id, key, dispatched, AttemptWindow(start, end, FIRST_LABEL if n == 0 else None))
-        if start < dispatched:
-            attempt.intervals.append(StageInterval("waiting", "dispatch", "dispatch", start, dispatched))
+        shown = max(start, campaign_start)  # an attempt that ended before the campaign keeps its own window, unshown
+        window = AttemptWindow(shown, end, FIRST_LABEL if n == 0 or start < campaign_start else None) if (
+            end > campaign_start or dispatched >= campaign_start) else AttemptWindow(start, end)
+        attempt = CollectedAttempt(item.id, key, dispatched, window)
+        if shown < dispatched:
+            attempt.intervals.append(StageInterval("waiting", "dispatch", "dispatch", window.start, dispatched))
         attempts.append(attempt)
         start = end
-    out.attempts.extend(attempts)
+    out.attempts.extend(a for a in attempts if a.window.end > campaign_start or a.dispatched_at >= campaign_start)
     by_key = {a.launch_attempt: a for a in attempts}
 
     # Nonce to launch, on persisted evidence only
@@ -199,6 +215,8 @@ async def _collect_item(db, item: GithubWorkItem, out: TeamAttempts, campaign_st
                                 .order_by(GithubHeadReview.created_at, GithubHeadReview.id))).all()
     watches = (await db.scalars(select(GithubRequiredCheckWatch)
                                 .where(GithubRequiredCheckWatch.work_item_id == item.id))).all()
+    verdicts = (await db.scalars(select(GithubRevisionReview).where(GithubRevisionReview.work_item_id == item.id)
+                                 .order_by(GithubRevisionReview.created_at, GithubRevisionReview.id))).all()
     rows: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
     for source, table, span in (("approval_request", requests, lambda r: (r.created_at, r.decided_at)),
                                 ("head_review", reviews, lambda r: (r.created_at, r.ended_at)),
@@ -206,27 +224,45 @@ async def _collect_item(db, item: GithubWorkItem, out: TeamAttempts, campaign_st
         for row in table:
             attempt, reason = mapped(row.dispatch_nonce)
             if attempt is None:
-                out.unattributed.append(Unattributed(source, item.id, *map(_naive, span(row)), reason))
+                _lose(out, period, source, item.id, *map(_naive, span(row)), reason)
             else:
                 rows[attempt.launch_attempt][source].append(row)
-                rows[attempt.launch_attempt]["nonces"].append(row.dispatch_nonce)
+    # A revision verdict counts through its bound revision and watch, which must name the same nonce and head.
+    watch_by_id = {w.id: w for w in watches}
+    for verdict in verdicts:
+        attempt, reason = mapped(verdict.dispatch_nonce)
+        watch = watch_by_id.get(verdict.watch_id)
+        if attempt is not None and (watch is None or verdict.revision_id not in revision_nonce):
+            attempt, reason = None, "attempt_unproven"
+        elif attempt is not None and (revision_nonce[verdict.revision_id] != verdict.dispatch_nonce
+                                      or watch.dispatch_nonce != verdict.dispatch_nonce
+                                      or watch.head_sha != verdict.head_sha):
+            attempt, reason = None, "attempt_conflict"
+        if attempt is None:
+            _lose(out, period, "revision_review", item.id, _naive(verdict.created_at), _naive(verdict.ended_at), reason)
+        else:
+            rows[attempt.launch_attempt]["revision_review"].append((watch.pr_number, verdict))
 
     # Active: planning and building, from recorded times only
     for attempt in attempts:
         mine = rows[attempt.launch_attempt]
         owners = ({r.owner_member_id for r in mine["approval_request"]}
-                  | {r.owner_member_id for r in revisions if r.dispatch_nonce in mine["nonces"]})
+                  | {r.owner_member_id for r in revisions if mapped(r.dispatch_nonce)[0] is attempt})
         attempt.owner_member_id = owners.pop() if len(owners) == 1 else None
         plans = [r for r in mine["approval_request"] if r.request_kind == "initial_plan"]
         if plans:
-            _place(out, attempt, as_of, "active", "planning", "owner", attempt.dispatched_at, _naive(plans[0].created_at))
-        heads = await _head_times(db, item, mine["head_review"] + mine["check_watch"])
+            _place(out, period, attempt, "active", "planning", "owner", attempt.dispatched_at,
+                   _naive(plans[0].created_at))
+        heads = await _head_times(db, item, {(r.pr_number, r.head_sha) for r in mine["head_review"] + mine["check_watch"]}
+                                  | {(pr, v.head_sha) for pr, v in mine["revision_review"]})
         approved = next((r for r in plans if r.status == "approved" and r.decided_at), None)
-        starts = ([_naive(approved.decided_at)] if approved else []) + [
-            _naive(r.created_at) for r in mine["head_review"] if r.verdict == "changes_required"]
-        for begun in starts:
-            if (head := next((t for t in heads if t > begun), None)) is not None:
-                _place(out, attempt, as_of, "active", "building", "owner", begun, head)
+        starts = ([(_naive(approved.decided_at), None)] if approved else []) + [
+            (_naive(r.created_at), r.head_sha) for r in mine["head_review"] + [v for _, v in mine["revision_review"]]
+            if r.verdict == "changes_required"]
+        for begun, rejected in starts:  # a verdict's successor is another commit
+            following = [t for (_, sha), t in heads.items() if t > begun and sha != rejected]
+            if following:
+                _place(out, period, attempt, "active", "building", "owner", begun, min(following))
 
     # Waiting on someone, by who had to answer
     by_request = {r.id: r for r in requests}
@@ -242,22 +278,22 @@ async def _collect_item(db, item: GithubWorkItem, out: TeamAttempts, campaign_st
             attempt = next((a for a in attempts if a.window.start <= at < a.window.end), None)
             reason = "outside_attempts"
         if attempt is None:
-            out.unattributed.append(Unattributed(family, item.id, at, _end_of(start, family, ends), reason))
+            _lose(out, period, family, item.id, at, _end_of(start, family, ends), reason)
             continue
         actor = (start.after_values or {}).get("awaited_role") or "unknown"
-        _place(out, attempt, as_of, "waiting", family, actor, at, _end_of(start, family, ends))
+        _place(out, period, attempt, "waiting", family, actor, at, _end_of(start, family, ends))
 
 
-async def _head_times(db, item: GithubWorkItem, rows) -> list[datetime]:
-    """Each head's first check run on the attempt's PR, ascending."""
-    shas, prs = {r.head_sha for r in rows}, {r.pr_number for r in rows}
-    if not shas:
-        return []
-    firsts: dict[str, datetime] = {}
+async def _head_times(db, item: GithubWorkItem, pairs: set[tuple[int, str]]) -> dict[tuple[int, str], datetime]:
+    """Each observed (PR, SHA) pair's first check run; a run of the same commit on another PR is not that head."""
+    if not pairs:
+        return {}
+    firsts: dict[tuple[int, str], datetime] = {}
     for run in (await db.scalars(select(GithubCheckRunHistory).where(
-            GithubCheckRunHistory.scope_id == item.scope_id, GithubCheckRunHistory.head_sha.in_(shas),
-            GithubCheckRunHistory.pr_number.in_(prs)))).all():
+            GithubCheckRunHistory.scope_id == item.scope_id,
+            GithubCheckRunHistory.head_sha.in_({sha for _, sha in pairs})))).all():
+        pair = (run.pr_number, run.head_sha)
         for at in (run.job_created_at, run.started_at):
-            if at is not None:
-                firsts[run.head_sha] = min(firsts.get(run.head_sha, _naive(at)), _naive(at))
-    return sorted(firsts.values())
+            if pair in pairs and at is not None:
+                firsts[pair] = min(firsts.get(pair, _naive(at)), _naive(at))
+    return firsts

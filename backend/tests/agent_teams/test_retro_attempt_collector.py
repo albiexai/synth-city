@@ -24,6 +24,8 @@ from app.models.database import (
     GithubAttemptScopeRevision,
     GithubCheckRunHistory,
     GithubHeadReview,
+    GithubRequiredCheckWatch,
+    GithubRevisionReview,
     GithubWorkItem,
     TeamGithubScope,
 )
@@ -145,9 +147,25 @@ async def _head(db, item, nonce, sha, pushed, *, verdict=None, reviewed=None, pr
     await db.flush()
 
 
-async def _collect(db, team, as_of=120):
+async def _watch(db, item, nonce, sha, at, *, pr=5):
+    row = GithubRequiredCheckWatch(work_item_id=item.id, dispatch_nonce=nonce, scope_revision=0, pr_number=pr,
+                                   head_sha=sha, owner_slot_id=item.owner_slot_id, policy_digest="p", observed_at=at,
+                                   changed_at=at)
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def _revision_verdict(db, item, revision, watch, at, *, nonce="nonce-a", verdict="changes_required"):
+    db.add(GithubRevisionReview(work_item_id=item.id, revision_id=revision.id, watch_id=watch.id, dispatch_nonce=nonce,
+                                head_sha=watch.head_sha, reviewer_member_id=57, expected_lease_token_hash="h",
+                                verdict=verdict, summary="s", evidence_url="u", created_at=at))
+    await db.flush()
+
+
+async def _collect(db, team, as_of=120, start=-10):
     await db.commit()
-    return await collect_team_attempts(db, team.id, campaign_start=_at(-10), as_of=_at(as_of))
+    return await collect_team_attempts(db, team.id, campaign_start=_at(start), as_of=_at(as_of))
 
 
 def _spans(attempt):
@@ -320,6 +338,20 @@ async def test_a_nonce_with_conflicting_launch_evidence_is_unattributed(db):
     assert all(s[1] != "planning" for a in result.attempts for s in _spans(a))
 
 
+async def test_a_nonce_bound_to_two_launches_maps_to_neither(db):
+    """No other nonce claims either launch: the nonce's own two claims are the conflict."""
+    team, (item,) = await _team(db)
+    await _dispatch(db, item, 1, _at(0))
+    revision = await _revision(db, item, "nonce-a")
+    await _bound(db, item, 1, revision, _at(30))
+    await _dispatch(db, item, 2, _at(60))
+    await _bound(db, item, 2, revision, _at(65))
+    await _request(db, item, "nonce-a", _at(10))
+    result = await _collect(db, team, as_of=90)
+    assert _lost(result) == [("approval_request", "attempt_conflict")]
+    assert all(s[1] != "planning" for a in result.attempts for s in _spans(a))
+
+
 async def test_an_effort_wait_past_its_attempts_end_is_split(db):
     team, item = await _redispatched(db)
     await _wait(db, "effort", "message:1", _at(50), _at(70), item=item, after={"awaited_role": "leader"})
@@ -333,8 +365,9 @@ async def test_an_effort_wait_past_its_attempts_end_is_split(db):
 
 async def test_a_wait_outside_every_attempt_is_unattributed(db):
     team, (item,) = await _team(db)
+    item.created_at = _at(-5)  # the item joined after the campaign started: its first window starts then
     await _dispatch(db, item, 1, _at(0), current_nonce="nonce-a")
-    await _wait(db, "pause", "pause:1", _at(-40), _at(-35), item=item, after={"awaited_role": "operator"})
+    await _wait(db, "pause", "pause:1", _at(-9), _at(-7), item=item, after={"awaited_role": "operator"})
     assert _lost(await _collect(db, team, as_of=30)) == [("pause", "outside_attempts")]
 
 
@@ -355,6 +388,99 @@ async def test_a_failed_event_of_the_launch_ends_its_attempt(db):
               snapshot={"launch_attempt": _key(item, 1)})
     (attempt,) = (await _collect(db, team, as_of=60)).attempts
     assert attempt.window.end == _at(20)
+
+
+# V1 review 431: the campaign period, revision verdicts and head pairs
+async def test_the_period_runs_from_the_campaign_start_and_drops_what_lies_wholly_before_it(db):
+    """An attempt that ended before the campaign is not shown; its nonce's later wait is not the next attempt's."""
+    team, (item,) = await _team(db)
+    await _dispatch(db, item, 1, _at(-40))
+    await _bound(db, item, 1, await _revision(db, item, "nonce-a"), _at(-35))
+    old = await _request(db, item, "nonce-a", _at(-30), _at(20), status="rejected")
+    await _wait(db, "decision", f"request:{old.id}", _at(-30), _at(20), item=item, request_id=old.id,
+                after={"awaited_role": "leader"})
+    await _dispatch(db, item, 2, _at(0), current_nonce="nonce-b")
+    await _request(db, item, "nonce-b", _at(5))
+    result = await _collect(db, team, as_of=60, start=10)
+    (attempt,) = result.attempts
+    assert (attempt.window.start, attempt.window.end, attempt.window.start_label) == (_at(10), _at(60), LABEL)
+    assert _spans(attempt) == []  # dispatch at 0 and planning to 5 both precede the campaign
+    assert [(u.source, u.reason, u.start, u.end) for u in result.unattributed] == [
+        ("decision", "after_attempt_end", _at(10), _at(20))]
+
+
+async def test_unattributed_spans_are_clipped_to_the_cutoff_and_later_ones_left_out(db):
+    team, (item,) = await _team(db)
+    await _dispatch(db, item, 1, _at(0), current_nonce="nonce-a")
+    for message, start, end in ((9, 25, 40), (10, 40, 45), (11, -30, -20)):
+        await _wait(db, "mail", f"message:{message}", _at(start), _at(end), team=team.id,
+                    after={"owner_member_id": OTHER, "awaited_member_id": 60})
+    result = await _collect(db, team, as_of=30)
+    assert [(u.source, u.reason, u.start, u.end) for u in result.unattributed] == [
+        ("mail", "no_open_attempt", _at(25), _at(30))]
+
+
+async def test_a_proven_revision_alone_names_the_attempts_owner(db):
+    team, (item,) = await _team(db)
+    await _dispatch(db, item, 1, _at(0), current_nonce="nonce-a")
+    await _bound(db, item, 1, await _revision(db, item, "nonce-a"), _at(2))
+    await _wait(db, "mail", "message:9", _at(10), _at(15), team=team.id,
+                after={"owner_member_id": OWNER, "awaited_member_id": 60})
+    result = await _collect(db, team, as_of=30)
+    assert ("waiting", "mail", "member:60", 10, 15) in _spans(result.attempts[0])
+    assert result.unattributed == []
+
+
+@pytest.mark.parametrize("proof", ["proven", "unproven", "conflicting"])
+async def test_a_revision_verdict_to_the_next_head_is_building_only_with_proof(db, proof):
+    team, (item,) = await _team(db)
+    await _dispatch(db, item, 1, _at(0), current_nonce="nonce-a" if proof != "unproven" else "nonce-z")
+    revision = await _revision(db, item, "nonce-a" if proof != "conflicting" else "nonce-x")
+    rejected = await _watch(db, item, "nonce-a", "h1", _at(5))
+    await _head(db, item, "nonce-a", "h1", _at(5))
+    await _revision_verdict(db, item, revision, rejected, _at(10))
+    await _watch(db, item, "nonce-a", "h2", _at(25))
+    await _head(db, item, "nonce-a", "h2", _at(25))
+    result = await _collect(db, team, as_of=60)
+    building = [s for s in _spans(result.attempts[0]) if s[1] == "building"]
+    if proof == "proven":
+        assert (building, result.unattributed) == ([("active", "building", "owner", 10, 25)], [])
+    else:
+        assert building == []
+        reason = "attempt_unproven" if proof == "unproven" else "attempt_conflict"
+        assert ("revision_review", reason) in _lost(result)
+
+
+async def test_overlapping_head_and_revision_verdicts_count_their_building_once(db):
+    team, (item,) = await _team(db)
+    await _dispatch(db, item, 1, _at(0), current_nonce="nonce-a")
+    revision = await _revision(db, item, "nonce-a")
+    rejected = await _watch(db, item, "nonce-a", "h1", _at(5))
+    await _head(db, item, "nonce-a", "h1", _at(5), verdict="changes_required", reviewed=_at(12))
+    await _revision_verdict(db, item, revision, rejected, _at(10))
+    await _watch(db, item, "nonce-a", "h2", _at(25))
+    await _head(db, item, "nonce-a", "h2", _at(25))
+    (attempt,) = (await _collect(db, team, as_of=30)).attempts
+    assert breakdown(attempt.window, attempt.intervals).groups["active"] == 900  # 10 to 25, once
+
+
+async def test_a_late_first_check_on_the_rejected_commit_is_not_its_successor(db):
+    team, (item,) = await _team(db)
+    await _dispatch(db, item, 1, _at(0), current_nonce="nonce-a")
+    await _head(db, item, "nonce-a", "h1", _at(15), verdict="changes_required", reviewed=_at(10))
+    (attempt,) = (await _collect(db, team, as_of=60)).attempts
+    assert all(s[1] != "building" for s in _spans(attempt))
+
+
+async def test_a_check_of_the_same_commit_on_another_pr_is_not_this_pairs_head(db):
+    team, (item,) = await _team(db)
+    await _dispatch(db, item, 1, _at(0), current_nonce="nonce-a")
+    await _head(db, item, "nonce-a", "h1", _at(5), verdict="changes_required", reviewed=_at(10))
+    await _head(db, item, "nonce-a", "h2", _at(35), verdict="accepted", reviewed=_at(40))
+    await _watch(db, item, "nonce-a", "h9", _at(1), pr=6)  # the attempt also watched PR 6
+    await _head(db, item, "nonce-a", "h2", _at(15), pr=6)  # the same commit, checked earlier on PR 6
+    (attempt,) = (await _collect(db, team, as_of=60)).attempts
+    assert [s for s in _spans(attempt) if s[1] == "building"] == [("active", "building", "owner", 10, 35)]
 
 
 # Mail and input waits (Q4)
