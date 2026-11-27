@@ -305,7 +305,7 @@ def _failing_resolve(monkeypatch, bad, error):
     monkeypatch.setattr(Path, "resolve", fail)
 
 
-@pytest.mark.parametrize("error", [OSError, RuntimeError])
+@pytest.mark.parametrize("error", [OSError, RuntimeError, ValueError])
 def test_a_row_cwd_that_cannot_be_resolved_is_unknown_for_that_member_only(team, monkeypatch, error):
     home, members = team
     workspace = Path(members[0].workspace)
@@ -317,7 +317,7 @@ def test_a_row_cwd_that_cannot_be_resolved_is_unknown_for_that_member_only(team,
     assert by_member["B2"].cost_usd == pytest.approx(_price((500, 0, 1000, 50)))
 
 
-@pytest.mark.parametrize("error", [OSError, RuntimeError])
+@pytest.mark.parametrize("error", [OSError, RuntimeError, ValueError])
 def test_a_workspace_that_cannot_be_resolved_is_unknown_for_that_member_only(team, monkeypatch, error):
     home, members = team
     _failing_resolve(monkeypatch, members[1].workspace, error)

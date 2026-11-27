@@ -146,10 +146,10 @@ def _folder(root: Path, workspace: Path) -> Path:
 
 
 def _resolve(path: str) -> Path | None:
-    """The canonical path, or None when the file system can't resolve it (a loop or an I/O error)."""
+    """The canonical path, or None when it can't be resolved (a loop, an I/O error or an invalid path)."""
     try:
         return Path(path).resolve()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         return None
 
 
