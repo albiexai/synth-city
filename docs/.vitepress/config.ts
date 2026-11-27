@@ -35,6 +35,7 @@ export default defineConfig({
           items: [
             { text: 'Introduction', link: '/guide/' },
             { text: 'Start here: how Synth City works', link: '/guide/how-it-works' },
+            { text: 'Configure the factory', link: '/guide/configure-the-factory' },
             { text: 'Installation', link: '/guide/installation' },
             { text: 'Quick Start', link: '/guide/quick-start' },
             { text: 'Moving to v4.0.0', link: '/guide/migration-v4' },
