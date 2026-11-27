@@ -1316,7 +1316,7 @@ async def test_amendment_entry_point_retains_authority_guards(db, healthy_attemp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["lease", "scope", "round", "head"])
+@pytest.mark.parametrize("change", ["lease", "scope", "round", "head", "cap"])
 async def test_scope_amendment_fences_changes_during_remote_read(db, healthy_attempt, monkeypatch, change):
     a = healthy_attempt
     a.item.pr_number = 5
@@ -1325,6 +1325,9 @@ async def test_scope_amendment_fences_changes_during_remote_read(db, healthy_att
         if change == "lease": a.workspace.lease_token = "replacement"
         elif change == "scope": a.scope.enabled = False
         elif change == "round": a.item.approval_round_count += 1
+        elif change == "cap":
+            await db.execute(update(TeamGithubScope).where(TeamGithubScope.id == a.scope.id)
+                .values(max_scope_amendments=0).execution_options(synchronize_session=False))
         else:
             (a.repo / "src/base.py").write_text("BASE = 'raced'\n")
             subprocess.run(["git", "-C", str(a.repo), "add", "."], check=True)
@@ -1334,7 +1337,7 @@ async def test_scope_amendment_fences_changes_during_remote_read(db, healthy_att
         return a.pull
     monkeypatch.setattr(github_client, "get_pull", mutate)
     item_id = a.item.id
-    with pytest.raises(GithubApprovalError):
+    with pytest.raises(GithubApprovalError, match="amendment_count_limit" if change == "cap" else None):
         await github_approval_service.create_scope_amendment_request(db, a.item, a.scope, **amendment(a))
     assert not await db.scalar(select(GithubApprovalRequest.id).where(
         GithubApprovalRequest.work_item_id == item_id, GithubApprovalRequest.request_kind == 'continuation'))
@@ -2406,16 +2409,17 @@ async def test_amendments_that_were_never_approved_are_not_charged(db, healthy_a
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("prior,allowed", [(7, True), (8, False)])
-async def test_the_total_request_cap_is_separate_named_and_leaves_its_final_slot(db, healthy_attempt, prior, allowed):
+@pytest.mark.parametrize("limit,prior,allowed", [(8, 7, True), (8, 8, False), (2, 1, True), (2, 2, False)])
+async def test_the_total_request_cap_is_separate_named_and_leaves_its_final_slot(db, healthy_attempt, limit, prior, allowed):
     a = healthy_attempt
     a.scope.max_continuation_revisions = 10  # the production scope budget; the request cap is under test
+    a.scope.max_scope_amendment_requests = limit
     for number in range(1, prior + 1):
         await prior_amendment(a, db, number, [])
     if allowed:
         revision, _, created = await github_approval_service.create_scope_amendment_request(
             db, a.item, a.scope, **amendment(a))
-        assert created and revision.revision == 8
+        assert created and revision.revision == limit
     else:
         with pytest.raises(GithubApprovalError, match="amendment_request_limit"):
             await github_approval_service.create_scope_amendment_request(db, a.item, a.scope, **amendment(a))
@@ -2434,8 +2438,21 @@ async def test_the_two_limits_name_themselves_differently(db, healthy_attempt):
     with pytest.raises(GithubApprovalError) as refused:
         await github_approval_service.create_scope_amendment_request(db, a.item, a.scope, **amendment(a))
     assert refused.value.detail in {"amendment_count_limit", "amendment_request_limit"}
-    from app.services import github_approval_service as approval_module
-    assert approval_module.MAX_SCOPE_AMENDMENTS == 3 and approval_module.MAX_SCOPE_AMENDMENT_REQUESTS == 8
+    assert (a.scope.max_scope_amendments, a.scope.max_scope_amendment_requests) == (3, 8)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["max_scope_amendments", "max_scope_amendment_requests"])
+async def test_revision_settlement_reads_current_scope_caps(db, submitted_attempt, field):
+    from app.services.github_terminal_revision_service import end_submitted_revision
+
+    a = submitted_attempt
+    setattr(a.scope, field, 1)
+    await db.commit()
+    fact = await record_changes(db, a)
+    await end_submitted_revision(db, a.item, review_id=fact.id, leader_member_id=a.leader.id,
+        dispatch_nonce=a.item.dispatch_nonce, reason="Settle at the scope's changed cap")
+    assert a.item.dispatch_status == "escalated" and a.item.escalation_reason == "amendment_budget_exhausted"
 
 
 @pytest.mark.asyncio
@@ -2445,8 +2462,8 @@ async def test_the_decision_time_budget_charges_the_candidate_once(db, healthy_a
     await prior_amendment(a, db, 2, [])
     revision, _, _ = await github_approval_service.create_scope_amendment_request(db, a.item, a.scope, **amendment(a))
     await github_approval_service.validate_amendment_budget(db, a.item, a.scope, revision)
-    await prior_amendment(a, db, 4, [], status="completed", approved=True)
-    await prior_amendment(a, db, 5, [], status="completed", approved=True)
+    a.scope.max_scope_amendments = 1
+    await db.commit()
     with pytest.raises(GithubApprovalError, match="amendment_count_limit"):
         await github_approval_service.validate_amendment_budget(db, a.item, a.scope, revision)
 
@@ -2463,16 +2480,19 @@ async def test_the_activation_time_budget_does_not_charge_an_approved_revision_t
 
 
 @pytest.mark.asyncio
-async def test_the_decision_time_request_cap_names_itself_and_keeps_the_final_slot(db, healthy_attempt):
+@pytest.mark.parametrize("limit", [2, 8])
+async def test_the_decision_time_request_cap_names_itself_and_keeps_the_final_slot(db, healthy_attempt, limit):
     a = healthy_attempt
     a.scope.max_continuation_revisions = 10
-    for number in range(1, 7):
+    a.scope.max_scope_amendment_requests = limit
+    await db.commit()
+    for number in range(1, limit - 1):
         await prior_amendment(a, db, number, [])
     revision, _, _ = await github_approval_service.create_scope_amendment_request(db, a.item, a.scope, **amendment(a))
-    await github_approval_service.validate_amendment_budget(db, a.item, a.scope, revision)  # the 7th request
-    await prior_amendment(a, db, 8, [])
-    await github_approval_service.validate_amendment_budget(db, a.item, a.scope, revision)  # the 8th: still valid
-    await prior_amendment(a, db, 9, [])
+    await github_approval_service.validate_amendment_budget(db, a.item, a.scope, revision)
+    await prior_amendment(a, db, limit, [])
+    await github_approval_service.validate_amendment_budget(db, a.item, a.scope, revision)
+    await prior_amendment(a, db, limit + 1, [])
     with pytest.raises(GithubApprovalError, match="amendment_request_limit"):
         await github_approval_service.validate_amendment_budget(db, a.item, a.scope, revision)
 

@@ -247,7 +247,7 @@ leaves the request pending and ownership unchanged.
 Rules, each with a code the server also uses:
 
 - **Phase and actions:** `continuation_phase_invalid`; an amendment must be implementation (`amendment_diagnostic_restoration_required`); `execution_target_invalid`; unknown actions (`allowed_actions_invalid`); an implementation needs `push_pr_head` and `request_verification` (`implementation_completion_actions_required`); a diagnostic needs `revert_diagnostic_changes` (`diagnostic_revert_required`) and, when hosted-only, no local build command; `install_hosted_ci_tool` and `tool_fallbacks` go together (`hosted_tool_fallback_required`, `tool_fallbacks_invalid`, `hosted_tool_target_required`).
-- **Paths:** repo-relative, no `..`, no absolute or backslash form, no glob characters (`allowed_paths_invalid`, `allowed_paths_required`); an amendment names closed files (`amendment_closed_file_paths_required`). Companion paths from the checked-in map that the request omits are listed as a warning (`companion_paths_added`). They are counted on their own bound of 32 per request (`continuation_path_limit_exceeded` when over it), not against the repository scope's path limit, which counts only the named paths, and they never count toward an amendment's added-path cap. Only companions recorded in the amendment's digest-verified trailer are counted this way; any other path counts as named.
+- **Paths:** repo-relative, no `..`, absolute paths, backslashes or globs (`allowed_paths_invalid`, `allowed_paths_required`). An amendment names closed files (`amendment_closed_file_paths_required`). Preflight lists omitted companion paths in `companion_paths_added`. The repository’s `max_companion_paths` setting, which defaults to 32, limits companions separately and returns `continuation_path_limit_exceeded` on overflow. The named-path limit and cumulative added-path cap count named paths. The amendment’s digest-verified trailer records which paths count as companions.
 - **Submit schema:** the limits the real submit routes enforce with a 422 are reported as problems too (`request_schema_invalid`, with the field and the constraint, never the value you sent): `max_failed_heads` of at least 1, a summary of at most 12000 characters, a tool-fallback package of at most 200 characters, and the field types. The submit responses are unchanged.
 - **Field types:** a value of the wrong type for any field, such as a list or object given as `phase`, `execution_target` or `summary`, is a problem on that field (never a server error), and the other fields are still checked.
 - **Independent fields:** each field is judged on its own, so one bad field does not hide another field's problem, including the path and command limits and the companion bound.
@@ -295,13 +295,14 @@ The corresponding MCP tool is `synth_city_request_scope_amendment`.
 A healthy amendment works before a PR exists. It reads the assigned branch's committed head
 and tree without discarding held edits. Its path baseline must come from structured approved
 initial-plan metadata or the preceding approved implementation revision. Legacy plans without
-verifiable structured paths are refused; prose does not establish authority. Each attempt allows
-at most three approved amendments (`amendment_count_limit`), eight amendment requests of any
+verifiable structured paths are refused; prose does not establish authority. By default, each attempt allows
+three approved amendments (`amendment_count_limit`), eight amendment requests of any
 outcome (`amendment_request_limit`) and sixteen cumulative normalized unique added file paths
 (`amendment_added_path_limit`). Only an amendment the Leader approved counts toward the three, so a
 rejected proposal does not spend the owner's correction budget; it does count toward the eight
 requests, and its added paths and removed paths do not refund the path limit. Existing stricter
-path, command, revision and failed-head limits still apply. Exact current-round replays consume no
+path, command, revision and failed-head limits still apply. The repository's Director can change those
+defaults and the companion-path bound in the scope settings. Exact current-round replays consume no
 additional unit.
 
 Amendments reuse `synth_city_decide_continuation` and `synth_city_ack_continuation` for the

@@ -31,7 +31,7 @@ from app.models.database import (
     MailTeamMember,
     TeamGithubScope,
 )
-from app.models.schemas import MailMessageCreate
+from app.models.schemas import MailMessageCreate, TeamGithubScopeSafetyBounds
 from app.services import companion_paths, request_preflight
 from app.services import decision_wait_service as decision_waits
 from app.services import factory_audit_service as audit
@@ -99,11 +99,6 @@ _HOSTED_ONLY_LOCAL_BUILD = re.compile(
 _TOOL_FALLBACK_KEYS = frozenset(
     {"target", "if_missing", "package", "revert_required"}
 )
-# Only amendments the Leader approved count toward the first limit; a rejected request does not spend the owner's
-# correction budget. The second limit caps requests of any outcome so a flood still stops.
-MAX_SCOPE_AMENDMENTS = 3
-MAX_SCOPE_AMENDMENT_REQUESTS = 8
-MAX_AMENDMENT_ADDED_PATHS = 16
 
 
 class GithubApprovalError(ValueError):
@@ -775,13 +770,14 @@ class GithubApprovalService:
         # older plain summary that mentions it still recovers its own revision above.
         if companion_paths.TRAILER_HEADER in owner_summary:
             raise GithubApprovalError("continuation_summary_reserved", status_code=400)
+        await db.refresh(scope, attribute_names=tuple(TeamGithubScopeSafetyBounds.model_fields), with_for_update=True)
         # The proposal shows the companions of every path it names, so the Leader approves them with it. The
         # expansion is recorded in the stored summary, bound by a digest.
         extras = [path for path in companion_paths.companions_for(named) if path not in named]
         if extras:
             paths = self._canonical_paths([*named, *extras])
             # #1039: the named paths keep the scope's limit (checked above); their companions have a bound of their own.
-            if len(extras) > companion_paths.MAX_COMPANION_PATHS:
+            if len(extras) > scope.max_companion_paths:
                 raise GithubApprovalError("continuation_path_limit_exceeded")
         # #1154: against the named paths with their companions, the set this revision will allow.
         self.check_withdrawals(base_paths, paths, proposal.get("withdrawn_paths") or [])
@@ -802,11 +798,11 @@ class GithubApprovalService:
         ))).all())
         amendments = [row for row in prior if row.origin_kind == "scope_amendment"]
         previous_added = {path for row in amendments for path in self._named_added(item, row)}
-        if sum(1 for row in amendments if row.approved_at is not None) >= MAX_SCOPE_AMENDMENTS:
+        if sum(1 for row in amendments if row.approved_at is not None) >= scope.max_scope_amendments:
             raise GithubApprovalError("amendment_count_limit")
-        if len(amendments) >= MAX_SCOPE_AMENDMENT_REQUESTS:
+        if len(amendments) >= scope.max_scope_amendment_requests:
             raise GithubApprovalError("amendment_request_limit")
-        if len(previous_added | (set(added) - set(extras))) > MAX_AMENDMENT_ADDED_PATHS:
+        if len(previous_added | (set(added) - set(extras))) > scope.max_amendment_added_paths:
             raise GithubApprovalError("amendment_added_path_limit")
         if len(prior) >= scope.max_continuation_revisions or (
                 sum(row.failed_head_count for row in prior) + max_failures > scope.max_continuation_failed_heads):
@@ -883,6 +879,7 @@ class GithubApprovalService:
             raise GithubApprovalError("amendment_origin_unverifiable")
 
     async def validate_amendment_budget(self, db, item, scope, revision):
+        await db.refresh(scope, attribute_names=tuple(TeamGithubScopeSafetyBounds.model_fields), with_for_update=True)
         rows = list((await db.scalars(select(GithubAttemptScopeRevision).where(
             GithubAttemptScopeRevision.work_item_id == item.id,
             GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce))).all())
@@ -890,18 +887,18 @@ class GithubApprovalService:
         # Every amendment ever approved counts once, and the revision being decided or activated counts once even
         # though its own approved_at is already set when it is activated.
         counted = {row.id for row in amendments if row.approved_at is not None} | {revision.id}
-        if len(counted) > MAX_SCOPE_AMENDMENTS:
+        if len(counted) > scope.max_scope_amendments:
             raise GithubApprovalError("amendment_count_limit")
-        if len(amendments) > MAX_SCOPE_AMENDMENT_REQUESTS:
+        if len(amendments) > scope.max_scope_amendment_requests:
             raise GithubApprovalError("amendment_request_limit")
-        if len({path for row in amendments for path in self._named_added(item, row)}) > MAX_AMENDMENT_ADDED_PATHS:
+        if len({path for row in amendments for path in self._named_added(item, row)}) > scope.max_amendment_added_paths:
             raise GithubApprovalError("amendment_added_path_limit")
         named, companions = self._counted_paths(item, revision)
         if (len(rows) > scope.max_continuation_revisions
                 or sum(row.failed_head_count for row in rows) + revision.max_failed_heads > scope.max_continuation_failed_heads
                 or revision.max_failed_heads > scope.max_failed_heads_per_revision
                 or len(named) > scope.max_scope_paths
-                or len(companions) > companion_paths.MAX_COMPANION_PATHS
+                or len(companions) > scope.max_companion_paths
                 or len(revision.allowed_commands) > scope.max_scope_commands):
             raise GithubApprovalError("continuation_budget_exhausted")
 

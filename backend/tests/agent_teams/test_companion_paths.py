@@ -566,7 +566,6 @@ def test_the_plan_path_helper_returns_one_unambiguous_list_or_nothing(stored, ex
 
 # --- #1039: companions are counted on their own bound, not against the scope's path limit -------------------
 
-from app.services import github_approval_service as approval_module  # noqa: E402
 from app.services.github_dispatch_service import github_dispatch_service  # noqa: E402
 
 NEW = {**MAPPED, "src/new.py": [{"path": "tests/test_new.py", "kind": "test"}, {"path": "docs/new.md", "kind": "doc"}]}
@@ -600,11 +599,11 @@ async def test_named_paths_within_the_limit_are_not_refused_for_their_companions
 
 
 @pytest.mark.asyncio
-async def test_companions_of_a_new_source_do_not_use_up_the_added_path_cap(db, companion_map, healthy_attempt,
-                                                                           monkeypatch):
+async def test_companions_of_a_new_source_do_not_use_up_the_added_path_cap(db, companion_map, healthy_attempt):
     a = healthy_attempt
     companion_map["map"] = dict(NEW)
-    monkeypatch.setattr(approval_module, "MAX_AMENDMENT_ADDED_PATHS", 1)  # room for the one named new source
+    a.scope.max_amendment_added_paths = 1  # room for the one named new source
+    await db.commit()
     revision, approval, _ = await github_approval_service.create_scope_amendment_request(
         db, a.item, a.scope, **amendment(a, NAMED))
     assert revision.amendment_added_paths == ["docs/new.md", "src/new.py", "tests/test_new.py"]
@@ -612,13 +611,29 @@ async def test_companions_of_a_new_source_do_not_use_up_the_added_path_cap(db, c
 
 
 @pytest.mark.asyncio
-async def test_companions_over_their_own_bound_are_still_refused(db, companion_map, healthy_attempt, monkeypatch):
+async def test_companions_over_their_own_bound_are_still_refused(db, companion_map, healthy_attempt):
     a = healthy_attempt
     companion_map["map"] = dict(NEW)
-    monkeypatch.setattr(companion_paths, "MAX_COMPANION_PATHS", 2)  # three companions: one too many
+    a.scope.max_companion_paths = 2  # three companions: one too many
+    await db.commit()
     with pytest.raises(GithubApprovalError) as refused:
         await github_approval_service.create_scope_amendment_request(db, a.item, a.scope, **amendment(a, NAMED))
     assert refused.value.detail == "continuation_path_limit_exceeded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,cap,code", [
+    ("max_amendment_added_paths", 0, "amendment_added_path_limit"),
+    ("max_companion_paths", 2, "continuation_budget_exhausted"),
+])
+async def test_stored_amendment_respects_tightened_path_caps(db, companion_map, healthy_attempt, field, cap, code):
+    a = healthy_attempt
+    companion_map["map"] = dict(NEW)
+    revision, _, _ = await github_approval_service.create_scope_amendment_request(db, a.item, a.scope, **amendment(a, NAMED))
+    setattr(a.scope, field, cap)
+    await db.commit()
+    with pytest.raises(GithubApprovalError, match=code):
+        await github_approval_service.validate_amendment_budget(db, a.item, a.scope, revision)
 
 
 @pytest.mark.asyncio

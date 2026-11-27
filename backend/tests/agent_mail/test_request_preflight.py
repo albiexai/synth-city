@@ -29,7 +29,7 @@ from tests.agent_teams.test_scope_amendments import amendment, healthy_attempt  
 
 URL = "/api/v1/agent-mail/preflight-request"
 SCOPE = SimpleNamespace(max_scope_paths=32, max_scope_commands=16, max_failed_heads_per_revision=2,
-                        max_item_effort_minutes=60)
+                        max_item_effort_minutes=60, max_companion_paths=32)
 IMPLEMENTATION = ["edit_production", "push_pr_head", "request_verification"]
 FALLBACK = {"target": "hosted_ci", "if_missing": "install_temporarily", "package": "ruff", "revert_required": True}
 
@@ -162,9 +162,9 @@ def test_companions_the_server_adds_are_warned_and_counted_on_their_own_bound(mo
     assert [w.code for w in result.warnings] == ["companion_paths_added"]
     assert "docs/guide.md" in result.warnings[0].message
     # #1039: companions do not use up the scope's path limit; room for the one named path is enough.
-    tight = SimpleNamespace(max_scope_paths=1, max_scope_commands=16, max_failed_heads_per_revision=2)
+    tight = SimpleNamespace(**(vars(SCOPE) | {"max_scope_paths": 1, "max_companion_paths": 2}))
     assert request_preflight.preflight("continuation", **continuation(scope=tight)).ok
-    monkeypatch.setattr(request_preflight.companion_paths, "MAX_COMPANION_PATHS", 1)  # their own bound still holds
+    tight.max_companion_paths = 1
     over = request_preflight.preflight("continuation", **continuation(scope=tight))
     assert "continuation_path_limit_exceeded" in codes(over)
 
@@ -658,8 +658,7 @@ COMPANION = lambda paths, mapping=None: ["docs/guide.md"]  # noqa: E731
 
 def test_a_bad_action_list_does_not_hide_the_companion_path_limit(monkeypatch):
     monkeypatch.setattr(request_preflight.companion_paths, "companions_for", COMPANION)
-    monkeypatch.setattr(request_preflight.companion_paths, "MAX_COMPANION_PATHS", 0)  # #1039: the companion bound
-    tight = SimpleNamespace(max_scope_paths=1, max_scope_commands=16, max_failed_heads_per_revision=2)
+    tight = SimpleNamespace(**(vars(SCOPE) | {"max_scope_paths": 1, "max_companion_paths": 0}))
     for kind, values in (("continuation", continuation(allowed_actions=["edit_production"], scope=tight)),
                          ("scope_amendment", amendment_values(allowed_actions=["edit_tests"], scope=tight))):
         found = codes(request_preflight.preflight(kind, **values))

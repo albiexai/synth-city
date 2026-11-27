@@ -1002,6 +1002,10 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         ("merge_check_wait_minutes", 60),
         ("effort_extension_cap_minutes", 30),
         ("effort_extension_cap_percent", 25),
+        ("max_scope_amendments", 3),
+        ("max_scope_amendment_requests", 8),
+        ("max_amendment_added_paths", 16),
+        ("max_companion_paths", 32),
     ):
         if scope_columns and column not in scope_columns:
             await conn.execute(text(f"ALTER TABLE team_github_scopes ADD COLUMN {column} INTEGER DEFAULT {default} NOT NULL"))
