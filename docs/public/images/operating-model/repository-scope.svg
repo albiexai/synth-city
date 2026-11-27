@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 390" width="1000" height="390">
+<style>text{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}</style>
+<defs>
+  <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#334155"/></marker>
+</defs>
+<rect width="100%" height="100%" rx="12" fill="#ffffff"/>
+
+  <!-- Team A: two repository scopes -->
+  <rect x="30" y="30" width="430" height="170" rx="10" fill="#ede9fe" stroke="#6d28d9" stroke-width="2.5"/>
+  <text x="48" y="56" font-size="16" font-weight="700" fill="#4c1d95">Team A</text>
+  <text x="48" y="76" font-size="11.5" fill="#4c1d95">its slots work for all of its repository scopes</text>
+  <rect x="60" y="96" width="200" height="40" rx="8" fill="#ffffff" stroke="#6d28d9" stroke-width="2"/>
+  <text x="76" y="121" font-size="13" font-weight="700" fill="#4c1d95">repository scope: Y</text>
+  <rect x="60" y="148" width="200" height="40" rx="8" fill="#ffffff" stroke="#6d28d9" stroke-width="2"/>
+  <text x="76" y="173" font-size="13" font-weight="700" fill="#4c1d95">repository scope: X</text>
+
+  <!-- Team B: one repository scope -->
+  <rect x="30" y="220" width="430" height="120" rx="10" fill="#ede9fe" stroke="#6d28d9" stroke-width="2.5"/>
+  <text x="48" y="246" font-size="16" font-weight="700" fill="#4c1d95">Team B</text>
+  <text x="48" y="266" font-size="11.5" fill="#4c1d95">its slots work for all of its repository scopes</text>
+  <rect x="60" y="282" width="200" height="40" rx="8" fill="#ffffff" stroke="#6d28d9" stroke-width="2"/>
+  <text x="76" y="307" font-size="13" font-weight="700" fill="#4c1d95">repository scope: X</text>
+
+  <!-- GitHub repositories -->
+  <rect x="700" y="60" width="270" height="86" rx="10" fill="#f1f5f9" stroke="#334155" stroke-width="2.5"/>
+  <text x="716" y="88" font-size="15" font-weight="700" fill="#1e293b">GitHub repository Y</text>
+  <text x="716" y="110" font-size="11.5" fill="#334155">watched by one team: one scope</text>
+  <text x="716" y="128" font-size="11.5" fill="#57534e">base branch · labels · PRs · CI</text>
+  <rect x="700" y="196" width="270" height="110" rx="10" fill="#f1f5f9" stroke="#334155" stroke-width="2.5"/>
+  <text x="716" y="224" font-size="15" font-weight="700" fill="#1e293b">GitHub repository X</text>
+  <text x="716" y="246" font-size="11.5" fill="#334155">watched by two teams: two scopes</text>
+  <text x="716" y="264" font-size="11.5" fill="#57534e">base branch · labels · PRs · CI</text>
+
+  <!-- Each scope watches one repository -->
+  <path d="M262,116 L698,103" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#ar)"/>
+  <path d="M262,168 L698,236" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#ar)"/>
+  <path d="M262,302 L698,272" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#ar)"/>
+  <text x="480" y="104" font-size="11" fill="#57534e">watches</text>
+
+  <text x="500" y="368" text-anchor="middle" font-size="12" fill="#1c1917">A team has at most one repository scope for each repository. Teams can share a repository.</text>
+</svg>

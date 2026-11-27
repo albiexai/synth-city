@@ -1,6 +1,12 @@
 # Repositories
 
-Repositories lists watched scopes across teams. The same GitHub repository can appear in more than one scope; keep the team and scope identity when opening details or related work. Provider filtering here means a configured harness in the team's roster, while Work filtering means an assigned owner's harness.
+A **repository scope** is one team's watch on one GitHub repository. It holds the repository, the base branch, the dispatch label, the primary checkout (the existing local clone), the dispatch workspaces, the required checks and the delivery policy. A team has at most one repository scope for each repository. Different teams can watch the same repository, so one repository can have several scopes. All slots of a team work for all of its scopes.
+
+[![Two teams and their repository scopes: team A watches repositories Y and X, team B watches repository X, and each team's slots work for all of its scopes](/images/operating-model/repository-scope.svg)](/images/operating-model/repository-scope.svg)
+
+The API calls repository scopes `github-scopes`, for example `/api/v1/agent-teams/github-scopes/{scope_id}`. A repository scope is not a work item scope (the files that one work item may change) and not a configuration scope (user, project or local). The [Glossary](/guide/glossary) defines all three.
+
+Repositories lists repository scopes across teams. The same GitHub repository can appear in more than one scope, one for each team that watches it; keep the team and scope identity when opening details or related work. Provider filtering here means a configured harness in the team's roster, while Work filtering means an assigned owner's harness.
 
 Read configured enablement separately from effective intake. A team and scope can both be enabled while normal intake is blocked by recovery-only mode, a stopped scheduler or a missing scheduled job. Unavailable runtime evidence stays unknown. A runtime timestamp is separate from the stored last-poll time.
 

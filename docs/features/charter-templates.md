@@ -14,7 +14,7 @@ A plan must fit in the limit. The limit is `{{plan_size_limit}}` active minutes.
 
 Synth City checks the upper estimate at initial plan submission. An estimate above the repository scope's plan limit returns `plan_estimate_exceeds_limit` and suggests splitting the work into smaller issues. The limit defaults to 60 active minutes, capped by the scope's item effort ceiling. The Work page shows the accepted estimate next to this limit for each work item that has an estimate. It shows no warning.
 
-Why: a plan that is too big hides scope and cannot be reviewed in one pass.
+Why: a plan that is too big hides its real size and cannot be reviewed in one pass.
 
 ### Light review tier
 

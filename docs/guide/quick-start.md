@@ -25,7 +25,7 @@ To stop or restart the dev servers for this checkout:
 
 ## Observe existing work
 
-Overview is the home page for tracking counts and automation observations across this backend. Use team, scope and harness filters on factory pages; native harness/project preferences do not filter work. Open [Work](/features/work) for an owner, waiting reason or PR. Open [Repositories](/features/repositories) to distinguish configured enablement from effective intake. An empty workload does not require enabling autonomy, and a read failure is not an empty factory.
+Overview is the home page for tracking counts and automation observations across this backend. Use team, repository scope and harness filters on factory pages; native harness/project preferences do not filter work. Open [Work](/features/work) for an owner, waiting reason or PR. Open [Repositories](/features/repositories) to distinguish configured enablement from effective intake. An empty workload does not require enabling autonomy, and a read failure is not an empty factory.
 
 ## Launch manually or inspect configuration
 
@@ -39,7 +39,7 @@ Open Repositories and select **Set up a repository** for [guided configuration](
 
 The Leader is the team's explicit `leader_slot_id`. Guided setup names it for a new team; for an existing team, use **Set Leader** in the roster while automation is off. Slot order and Role text do not select it. Configure GitHub polling access on the host and dispatch/design/area labels on GitHub, as described in [Autonomous GitHub dispatch](/autonomy). Choose merge policy and finite budgets; review the enable confirmation only when ready.
 
-The operator credential uses the existing per-tab flow, separately from GitHub polling access and authenticated agent sessions. No cookie login is included. Team/scope pause controls intake; inspect existing attempts separately rather than assuming processes stopped.
+The operator credential uses the existing per-tab flow, separately from GitHub polling access and authenticated agent sessions. No cookie login is included. A team pause or a repository scope pause controls intake; inspect existing attempts separately rather than assuming processes stopped.
 
 ## Identify the Backend Instance
 
@@ -62,7 +62,7 @@ The instance name appears in the header, Agent Bridge terminal panes, and kill-s
 | --- | --- |
 | [Overview](/features/dashboard) | Tracking counts and automation observations |
 | [Work](/features/work) | Mixed-team details and current remedies |
-| [Repositories](/features/repositories) | Watched scopes, intake, polling and overlaps |
+| [Repositories](/features/repositories) | Repository scopes, intake, polling and overlaps |
 | [Harnesses](/features/harnesses) | Guarded native settings and manual entry points |
 | [Teams](/features/agent-teams) | Rosters, launch plans and current repository/autonomy configuration |
 | [Live sessions](/features/agent-bridge) | Standalone sessions and explicit terminal interaction |

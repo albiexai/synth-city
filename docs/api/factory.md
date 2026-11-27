@@ -33,8 +33,8 @@ All paths below begin with `/api/v1/factory`. These GET routes read local factor
 | GET `/overview` | Selected work counts, configured automation and observed intake |
 | GET `/work-items` | Paginated safe work projections and complete filtered counts |
 | GET `/work-items/{item_id}` | One safe work projection |
-| GET `/repositories` | Paginated watched scopes with intake, poll and overlap observations |
-| GET `/repositories/{scope_id}` | One watched scope observation |
+| GET `/repositories` | Paginated repository scopes with intake, poll and overlap observations |
+| GET `/repositories/{scope_id}` | One repository scope observation |
 
 ## Filters and pagination
 
@@ -69,7 +69,7 @@ Successful responses include `schema_version: 1` and UTC ISO-8601 `generated_at`
 
 Work projections contain an allowlisted `item`, team/repository context, category, nullable owner/approver/waiting/workspace, separate owner and approver session associations, policy, action observations and typed link hints. Dispatch nonces, assigned branch refs, host workspace paths, credentials/hashes, private commands and freeform recovery summaries are omitted. Last verified SHA is nullable and belongs only to the displayed PR; it is null for diagnostic execution. Treat titles and raw statuses as display text.
 
-Work detail includes `initial_path_comparison` when a complete first-plan comparison is current. It contains the PR head and base SHAs, changed repository-relative files grouped as `in_scope`, `approved_companions`, and `outside_scope`, and an outside-scope note when applicable.
+Work detail includes `initial_path_comparison` when a complete first-plan comparison is current. It contains the PR head and base SHAs, changed repository-relative files grouped as `in_scope`, `approved_companions`, and `outside_scope`, and an outside-scope note when applicable. Inside and outside refer to the work item scope.
 
 ## Status and action meaning
 
@@ -96,11 +96,11 @@ The legacy association state and protected action predicates retain their separa
 
 ## Repository intake and overlap
 
-Each repository projection is one scope. Team automation and scope enablement determine configured enablement. Effective intake is eligible, blocked or unknown based on that configuration plus normal/recovery-only/unknown runtime mode, running/stopped/unknown scheduler state and whether its job is scheduled. Runtime has its own observation timestamp, distinct from response generation. Configuration alone does not prove intake is running.
+Each repository projection is one repository scope. Team automation and scope enablement determine configured enablement. Effective intake is eligible, blocked or unknown based on that configuration plus normal/recovery-only/unknown runtime mode, running/stopped/unknown scheduler state and whether its job is scheduled. Runtime has its own observation timestamp, distinct from response generation. Configuration alone does not prove intake is running.
 
 Polling freshness is fresh, stale, never_polled, suspended or unknown. Stale means an eligible scope's last poll is older than twice the configured interval. Blocked or paused intake suspends freshness; unknown runtime remains unknown. Overview stale/never-polled counts include eligible intake only.
 
-Overlap warns when enabled teams/scopes share a normalized GitHub repository and dispatch label. It checks local scopes outside the selected filters and returns safe other scope IDs. A warning neither merges work records nor arbitrates dispatch ownership.
+Overlap warns when enabled repository scopes of different teams share a normalized GitHub repository and dispatch label. It checks local scopes outside the selected filters and returns safe other scope IDs. A warning neither merges work records nor arbitrates dispatch ownership.
 
 ## Errors
 
