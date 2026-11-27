@@ -85,6 +85,7 @@ import type { MailMemberResponse } from '@/types/agentMail'
 import { AgentTeamsHelpDialog } from './AgentTeamsHelpDialog'
 import { ProviderLaunchOptionsFields } from '@/features/providers/ProviderLaunchOptionsFields'
 import { AutonomyPanel, OperatorTokenDialog } from './AutonomyPanel'
+import { MilestoneStates } from '@/features/factory/components/MilestoneStates'
 import { HumanActionSummary } from './HumanActionSummary'
 import { TeamSummaryCard } from './TeamSummaryCard'
 import { useAgentActivity } from './useAgentActivity'
@@ -1509,7 +1510,8 @@ export function AgentTeamsPage() {
                       </div>
                     </details>
                 </TabsContent>
-                <TabsContent value="autonomy" className="mt-5">
+                <TabsContent value="autonomy" className="mt-5 space-y-5">
+                  <MilestoneStates key={`milestones-${selectedPreset.id}`} teamId={selectedPreset.id} />
                   <AutonomyPanel
                     key={selectedPreset.id}
                     preset={selectedPreset}

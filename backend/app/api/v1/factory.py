@@ -24,6 +24,7 @@ from app.models.schemas import (
 from app.services.github_client import github_client, GithubClientResponseError
 from app.services.github_app_auth_service import GithubAppAuthError, github_app_auth_service
 from app.services import factory_projection_service as projections
+from app.services import milestone_state_service
 from app.utils.repo_utils import is_primary_github_checkout
 
 
@@ -344,6 +345,17 @@ async def work_item(item_id: int, db=Depends(read_snapshot)):
     if not 0 < item_id < 2**63:
         raise projections.FactoryReadError("invalid_filter", 422)
     return await projections.work_detail(db, item_id)
+
+
+@router.get("/milestone-states", response_model=wire.MilestoneStatesResponse)
+async def milestone_states(
+    team_id: int | None = Query(None, ge=1, le=2**63 - 1),
+    scope_id: int | None = Query(None, ge=1, le=2**63 - 1),
+    db=Depends(read_snapshot),
+):
+    selected = wire.FactoryFilters(team_id=team_id, scope_id=scope_id)
+    await projections.validate_filters(db, selected)
+    return await milestone_state_service.milestone_states(db, selected)
 
 
 @router.get("/repositories", response_model=wire.RepositoryListResponse)

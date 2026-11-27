@@ -265,6 +265,39 @@ class WorkDetailResponse(FactoryEnvelope):
     work_item: WorkProjection
 
 
+class WaitingIssue(FactoryModel):
+    """A ready issue whose milestone has no team. The wait stores no issue title.
+
+    `repository` is None when the repository of the wait cannot be proven from stored data (#1372 adds it).
+    """
+
+    repository: WorkRepository | None
+    issue_number: PositiveId
+    milestone: str
+    observed_at: Timestamp
+
+
+class DeferredIssue(FactoryModel):
+    """An issue whose work item ended because its milestone moved to another team."""
+
+    repository: WorkRepository
+    team: TeamReference
+    work_item_id: PositiveId
+    issue_number: PositiveId
+    issue_title: str
+    target_milestone: str | None
+    deferred_at: Timestamp
+    previous_branch: str | None
+
+
+class MilestoneStatesResponse(FactoryEnvelope):
+    filters: FactoryFilters
+    waiting: list[WaitingIssue]
+    waiting_truncated: bool
+    deferred: list[DeferredIssue]
+    deferred_truncated: bool
+
+
 class RepositoryListResponse(FactoryEnvelope):
     filters: FactoryFilters
     total: int

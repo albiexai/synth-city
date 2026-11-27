@@ -2,12 +2,13 @@
 import asyncio
 import json
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.models.database  # noqa: F401
@@ -1495,3 +1496,83 @@ async def test_watcher_records_the_highest_difficulty_and_clears_it_when_removed
     await db.commit()
     await db.refresh(item)
     assert item.issue_difficulty is None and item.dispatch_status == "pending"
+
+
+# #1337, review 6074331482: a poll that began before its scope changed repository must not write for the scope.
+@pytest_asyncio.fixture
+async def maker(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'paused.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield async_sessionmaker(engine, expire_on_commit=False)
+    await engine.dispose()
+
+
+class _PausedClient(_FakeClient):
+    """Holds the remote read until the test releases it, as a slow GitHub answer does."""
+
+    def __init__(self, labeled):
+        super().__init__(labeled=labeled)
+        self.entered, self.release = asyncio.Event(), asyncio.Event()
+
+    async def list_issues_with_label(self, owner, repo, label):
+        self.entered.set()
+        await self.release.wait()
+        return list(self._labeled)
+
+
+async def _poll_while(maker, change, *, milestone="V1"):
+    """Poll a scope; run `change` on the scope row while the remote read waits. Return the stored state."""
+    async with maker() as db, maker() as other:
+        old = await _make_scope(db, preset_name="Old", milestone=milestone)
+        twin = await _make_scope(db, preset_name="Twin", milestone="V9")  # another scope of the old repository
+        old_id, twin_id = old.id, twin.id
+        client = _PausedClient([_milestone_issue(old, "V1")])
+        task = asyncio.create_task(github_watcher_service.poll_scope(db, old, client))
+        await client.entered.wait()
+        await change(other, old_id)
+        client.release.set()
+        await task
+    async with maker() as check:
+        stored = await check.get(TeamGithubScope, old_id)
+        return SimpleNamespace(
+            items=(await check.scalars(select(GithubWorkItem))).all(),
+            waits=await _milestone_wait_titles(check),
+            polled=stored.last_polled_at if stored else None,
+            twin_polled=(await check.get(TeamGithubScope, twin_id)).last_polled_at,
+        )
+
+
+async def _move(other, scope_id):
+    await other.execute(update(TeamGithubScope).where(TeamGithubScope.id == scope_id).values(repo_name="moved"))
+    await other.commit()
+
+
+async def _remove(other, scope_id):
+    await other.execute(delete(TeamGithubScope).where(TeamGithubScope.id == scope_id))
+    await other.commit()
+
+
+async def _same_repository_other_case(other, scope_id):
+    await other.execute(update(TeamGithubScope).where(TeamGithubScope.id == scope_id).values(repo_owner="O"))
+    await other.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_poll_that_began_before_the_scope_moved_writes_nothing(maker):
+    state = await _poll_while(maker, _move)
+    assert state.items == [] and state.waits == {}
+    assert state.polled is None and state.twin_polled is None
+
+
+@pytest.mark.asyncio
+async def test_a_poll_that_began_before_the_scope_was_removed_writes_nothing(maker):
+    state = await _poll_while(maker, _remove)
+    assert state.items == [] and state.waits == {}
+
+
+@pytest.mark.asyncio
+async def test_a_poll_goes_on_when_only_the_case_of_the_repository_changed(maker):
+    state = await _poll_while(maker, _same_repository_other_case)
+    assert [item.issue_number for item in state.items] == [1]
+    assert state.polled is not None

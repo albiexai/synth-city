@@ -452,6 +452,23 @@ The Supervisor line of a team page has an **Edit** button. It opens the supervis
 - **Older server:** If the server does not report a binding version and a team key, or the team has no key yet, the editor is read-only. Update the server to edit the supervisor.
 - **API:** `PUT /api/v1/agent-teams/presets/{preset_id}/supervisor` accepts the optional `expected_binding_version` and `expected_team_context_key`. They come together (one alone gives `422`). Without them, the write is not checked. With them, a different stored version, or a key that is not the active context key of the team, gives `409 supervisor_binding_changed` and changes nothing. Every binding write adds 1 to `binding_version`; check-ins do not. Every team created through the API gets its context key at once, and a deleted team's key is retired, so a number is never reused for another team.
 
+## Milestone Moves
+
+A team admits the issues that have its backlog milestone. When an issue gets a different milestone, two states can follow. The Teams page (Autonomy tab) and the Work page show both. Each row links to the GitHub issue, except a waiting row whose repository is not recorded (see below).
+
+- **Deferred by a milestone move:** the team ended its work item because the issue now has another milestone. The row shows the new milestone, the team, and when it happened. If the milestone was not recorded, the row says so.
+- **Waiting for a team:** the issue has the ready label, and no team has its milestone. The row shows the milestone. A wait stores no issue title, so the row shows the issue number only.
+
+A deferral shows only while it is the newest item of its issue in the repository. An issue that another team admits, or that was merged, does not show as deferred. A cleared wait does not show.
+
+A row keeps the repository it was recorded for. A deferral takes it from the GitHub issue URL that its work item stored, and a deferral whose URL does not name its issue is not shown. A wait stores no repository, so changing the repository of a scope deletes the waits of that scope. The next poll records the waits of the new repository. A poll that began before such a change writes nothing for that scope.
+
+A wait stores no repository, and the GitHub update time of a wait does not say where the watcher saw the issue. So the waits of a scope that has any applied repository change have no provable repository. This includes waits that an earlier version left in the database. Every wait stays in the list. A waiting row whose repository cannot be proven shows the issue number as plain text with the words "repository not recorded". It has no link and names no repository. The same holds when the identity of the scope is not valid. The scope-change audit event tells which scopes changed repository: its receipt names `repo_owner` or `repo_name`, or the stored values differ. A change of case only is not a change of repository, but only two complete names can show it. The audit ledger redacts credential-like parts of a value. When the stored values cannot show a change of case, the repository counts as changed. Rows without a proven repository stay separate rows and are never merged with another scope's row. Rows of a scope with no repository change keep their link. The repository stamp (#1372) will let the waits of a changed scope show a link again.
+
+The Teams page shows the rows of the selected team. The Work page follows the team and repository filters of its URL. The view is read-only. It shows at most 100 rows of each kind and says when a list is cut. It shows nothing when both lists are empty.
+
+API: `GET /api/v1/factory/milestone-states` with the optional filters `team_id` and `scope_id`. It needs no operator key. Waits and deferrals come from the watcher; this view only reads them.
+
 ## External Local Agents
 
 Local external agents can use the JSON API:
