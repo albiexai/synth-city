@@ -9,12 +9,12 @@ never zero. Later measures (#1245-#1250) add their samples here.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import aliased
 
 from app.models.database import (
     Campaign,
@@ -31,7 +31,7 @@ from app.services import factory_audit_service as audit
 from app.services.factory_metrics_service import _coverage, _naive_utc
 from app.services.github_rate_limit_history import campaign_rate_limit_time
 
-CALCULATION_VERSION = "campaign-snapshot-v1"
+CALCULATION_VERSION = "campaign-snapshot-v2"  # v2 (#1395): missing delivery history is unknown
 CACHE_SECONDS = 30.0  # the Overview panel polls
 _clock = time.monotonic
 _cache: dict[int, tuple[float, tuple, Snapshot]] = {}
@@ -59,10 +59,11 @@ def clear_cache() -> None:
 
 
 def _sample(name: str, unit: str, value: float | None, sample_count: int, *, source: str,
-            reasons: list[str] | None = None, coverage: str = "full") -> FactoryMetricSample:
+            reasons: list[str] | None = None, coverage: str = "full", unknown: int | None = None) -> FactoryMetricSample:
     reasons = sorted(reasons or [])
+    unknown = unknown if unknown is not None else (1 if value is None else 0)
     return FactoryMetricSample(name=name, counting_unit=unit, value=value, sample_count=sample_count,
-                               unknown_count=1 if value is None else 0, unknown_reasons=reasons, source=source,
+                               unknown_count=unknown, unknown_reasons=reasons, source=source,
                                coverage=coverage, calculation_version=CALCULATION_VERSION)
 
 
@@ -137,32 +138,48 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
     if membership.unavailable:
         gaps.append(membership.unavailable)
     complete = membership.complete
-    delivered = await _delivered(db, campaign.team_context_key)
+    facts = await _deliveries(db, campaign.team_context_key)
     members = {(m.repo, m.issue_number): m for m in membership.members}
+    delivered = {key: facts.delivered.get(key, []) for key in members}
     # The cutoff (V1 review 6079984028): only facts recorded by ``as_of`` count. GitHub reports today's membership,
     # so a later departure, a later delivery of a member, or a read after the cutoff leaves it unknown.
     if observed > as_of:
         gaps.append("membership_read_after_cutoff")
     if any(_naive_utc(d.at) > as_of for d in membership.departures):
         gaps.append("departure_after_cutoff")
-    if any(at > as_of for key in members for at in delivered.get(key, ())):
+    if any(at > as_of for times in delivered.values() for at in times):
         gaps.append("delivery_after_cutoff")
     known = complete and len(gaps) == 0
     label = "full" if known else ("partial" if any(r.complete for r in membership.repositories) else "unavailable")
-    done = set(delivered)  # a member delivered after the cutoff has already made these measures unknown
-    merged = sum(1 for key in members if key in done)
-    closed = sum(1 for key, m in members.items() if m.state == "closed" and key not in done)
+    done = {key for key, times in delivered.items() if times}  # a delivery after the cutoff made these unknown
+    merged = len(done)
+    # #1395: a closed issue is undelivered only on a recorded non-delivery by the cutoff. Missing history is unknown,
+    # and so is every closed issue while a delivery can't be placed: it may be that issue's merge.
+    closed = [key for key, m in members.items() if m.state == "closed" and key not in done]
+    undelivered = [key for key in closed if not facts.unidentified
+                   and any(at <= as_of for at in facts.undelivered.get(key, ()))]
+    unknown = len(closed) - len(undelivered)
+    reason = "delivery_identity_unknown" if facts.unidentified else "delivery_history_missing"
 
     def membership_sample(name: str, value: int) -> FactoryMetricSample:
         return _sample(name, "issue", value if known else None, len(members), source="github_membership",
                        reasons=gaps, coverage=label)
 
+    def delivery_sample(name: str, value: int) -> FactoryMetricSample:
+        if not known or not unknown:
+            return membership_sample(name, value)
+        if unknown == sum(1 for m in members.values() if m.state == "closed"):  # nothing known about any of them
+            return _sample(name, "issue", None, len(members), source="github_membership", reasons=[reason],
+                           coverage="unavailable", unknown=unknown)
+        return _sample(name, "issue", value, len(members), source="github_membership", reasons=[reason],
+                       coverage="partial", unknown=unknown)
+
     deferred = sum(1 for departure in membership.departures
                    if departure.outcome == "deferred" and _naive_utc(departure.at) <= as_of)
     metrics = [
         membership_sample("issues_in_scope", len(members)),
-        membership_sample("merged", merged),
-        membership_sample("closed_without_delivery", closed),
+        delivery_sample("merged", merged),
+        delivery_sample("closed_without_delivery", len(undelivered)),
         _sample("deferred", "issue", deferred, deferred, source="factory_audit_events"),
     ]
     coverage = await upgrade.recorded_coverage(db, campaign)
@@ -174,25 +191,55 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
                                                 reason=c.reason) for c in coverage])
 
 
-async def _delivered(db, key: str) -> dict[tuple[str, int], list[datetime]]:
-    """When each issue in the campaign team lifetime's own repositories was delivered, from the recorded delivery
-    facts of its current work item (V1 review 6079984028): the fact's time, or its record time when GitHub gave none."""
-    item_key = aliased(FactoryContextKey)
-    rows = (await db.execute(select(TeamGithubScope.repo_owner, TeamGithubScope.repo_name,
-                                    GithubWorkItem.issue_number, FactoryAuditEvent.fact_time,
-                                    FactoryAuditEvent.occurred_at)
-        .join(GithubWorkItem, GithubWorkItem.scope_id == TeamGithubScope.id)
-        .join(FactoryContextKey, _lifetime(key))
-        .join(item_key, (item_key.key_kind == "item") & (item_key.numeric_id == GithubWorkItem.id)
-              & item_key.retired_at.is_(None))
-        .join(FactoryAuditEvent, (FactoryAuditEvent.item_context_key == item_key.context_key)
-              & (FactoryAuditEvent.event_kind == "delivery_evidence")
-              & (FactoryAuditEvent.delivery_outcome == "delivered")))).all()
-    delivered: dict[tuple[str, int], list[datetime]] = {}
+@dataclass
+class _Deliveries:
+    delivered: dict[tuple[str, int], list[datetime]] = field(default_factory=dict)
+    undelivered: dict[tuple[str, int], list[datetime]] = field(default_factory=dict)
+    unidentified: bool = False  # a recorded delivery whose issue can't be derived
+
+
+async def _deliveries(db, key: str) -> _Deliveries:
+    """Each issue's recorded delivery outcomes in the campaign team lifetime (#1395).
+
+    A fact is read by the team, repository and issue it recorded (T05), so deleting the work item loses nothing. A row
+    recorded before that snapshot, without its team key or identity, falls back to its live item; another team
+    lifetime's facts never count. A legacy item's ``auto_merged_at`` is a merge. The time is the fact's own, or its
+    record time when GitHub gave none.
+    """
+    lifetime = (select(GithubWorkItem.id).join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
+                .join(FactoryContextKey, _lifetime(key)))
+    rows = (await db.execute(
+        select(FactoryAuditEvent.delivery_outcome, FactoryAuditEvent.fact_time, FactoryAuditEvent.occurred_at,
+               FactoryAuditEvent.context_snapshot, GithubWorkItem.issue_number, TeamGithubScope.repo_owner,
+               TeamGithubScope.repo_name)
+        .outerjoin(GithubWorkItem, GithubWorkItem.id == FactoryAuditEvent.item_id)
+        .outerjoin(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
+        .where(FactoryAuditEvent.event_kind == "delivery_evidence",
+               FactoryAuditEvent.delivery_outcome.in_(("delivered", "closed_without_delivery")),
+               or_(FactoryAuditEvent.team_context_key == key, FactoryAuditEvent.item_id.in_(lifetime))))).all()
+    facts = _Deliveries()
     for row in rows:
-        delivered.setdefault((f"{row.repo_owner}/{row.repo_name}", row.issue_number), []).append(
+        recorded = row.context_snapshot or {}
+        owner, name, number = (recorded.get("repo_owner"), recorded.get("repo_name"), recorded.get("issue_number"))
+        if not (owner and name and isinstance(number, int)):
+            owner, name, number = row.repo_owner, row.repo_name, row.issue_number
+        delivered = row.delivery_outcome == "delivered"
+        if not (owner and name and isinstance(number, int)):
+            facts.unidentified = facts.unidentified or delivered
+            continue
+        outcomes = facts.delivered if delivered else facts.undelivered
+        outcomes.setdefault((f"{owner}/{name}", number), []).append(
             _naive_utc(row.fact_time or row.occurred_at))
-    return delivered
+    legacy = (await db.execute(
+        select(TeamGithubScope.repo_owner, TeamGithubScope.repo_name, GithubWorkItem.issue_number,
+               GithubWorkItem.auto_merged_at)
+        .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
+        .join(FactoryContextKey, _lifetime(key))
+        .where(GithubWorkItem.auto_merged_at.is_not(None)))).all()
+    for row in legacy:
+        facts.delivered.setdefault((f"{row.repo_owner}/{row.repo_name}", row.issue_number), []).append(
+            _naive_utc(row.auto_merged_at))
+    return facts
 
 
 async def _rate_limited(db, coverage, started: datetime, as_of: datetime) -> FactoryMetricSample:
