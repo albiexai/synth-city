@@ -63,6 +63,7 @@ class CollectedAttempt:
     window: AttemptWindow
     intervals: list[StageInterval] = field(default_factory=list)
     owner_member_id: int | None = None
+    opened_at: datetime | None = None  # the window's start before the campaign clip, for lookups at a wait's start
 
 
 @dataclass
@@ -122,8 +123,9 @@ async def collect_team_attempts(db, preset_id: int, *, campaign_start: datetime,
     out, period = TeamAttempts(), (campaign_start, as_of)
     items = (await db.scalars(select(GithubWorkItem).join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
                               .where(TeamGithubScope.preset_id == preset_id).order_by(GithubWorkItem.id))).all()
+    every: list[CollectedAttempt] = []  # shown or not: who was open when a wait began (V1 review 434)
     for item in items:
-        await _collect_item(db, item, out, period)
+        every += await _collect_item(db, item, out, period)
     team_key = await audit.current_context_key(db, "team", preset_id)
     events = (await db.scalars(select(FactoryAuditEvent).where(
         FactoryAuditEvent.team_context_key == team_key, FactoryAuditEvent.team_context_key.is_not(None),
@@ -133,7 +135,7 @@ async def collect_team_attempts(db, preset_id: int, *, campaign_start: datetime,
     for start in (e for e in events if e.event_kind.endswith("_wait_started")):
         family, values, at = start.event_kind.removesuffix("_wait_started"), start.after_values or {}, _when(start)
         owner = values.get("owner_member_id")
-        open_ = [a for a in out.attempts
+        open_ = [a for a in every
                  if owner is not None and a.owner_member_id == owner and a.dispatched_at <= at < a.window.end]
         if len(open_) != 1:
             _lose(out, period, family, None, at, _end_of(start, family, ends),
@@ -149,7 +151,7 @@ async def _collect_item(db, item: GithubWorkItem, out: TeamAttempts, period):
     campaign_start, as_of = period
     item_key = await audit.current_context_key(db, "item", item.id)
     if item_key is None:
-        return
+        return []
     events = (await db.scalars(select(FactoryAuditEvent).where(FactoryAuditEvent.item_context_key == item_key)
                                .order_by(FactoryAuditEvent.occurred_at, FactoryAuditEvent.id))).all()
 
@@ -174,7 +176,7 @@ async def _collect_item(db, item: GithubWorkItem, out: TeamAttempts, period):
         shown = max(start, campaign_start)  # an attempt that ended before the campaign keeps its own window, unshown
         window = AttemptWindow(shown, end, FIRST_LABEL if n == 0 or start < campaign_start else None) if (
             end > campaign_start or dispatched >= campaign_start) else AttemptWindow(start, end)
-        attempt = CollectedAttempt(item.id, key, dispatched, window)
+        attempt = CollectedAttempt(item.id, key, dispatched, window, opened_at=start)
         if shown < dispatched:
             attempt.intervals.append(StageInterval("waiting", "dispatch", "dispatch", window.start, dispatched))
         attempts.append(attempt)
@@ -275,13 +277,14 @@ async def _collect_item(db, item: GithubWorkItem, out: TeamAttempts, period):
         elif family == "ceiling":
             attempt, reason = by_key.get((start.context_snapshot or {}).get("launch_attempt")), "attempt_not_recorded"
         else:
-            attempt = next((a for a in attempts if a.window.start <= at < a.window.end), None)
+            attempt = next((a for a in attempts if a.opened_at <= at < a.window.end), None)
             reason = "outside_attempts"
         if attempt is None:
             _lose(out, period, family, item.id, at, _end_of(start, family, ends), reason)
             continue
         actor = (start.after_values or {}).get("awaited_role") or "unknown"
         _place(out, period, attempt, "waiting", family, actor, at, _end_of(start, family, ends))
+    return attempts
 
 
 async def _head_times(db, item: GithubWorkItem, pairs: set[tuple[int, str]]) -> dict[tuple[int, str], datetime]:

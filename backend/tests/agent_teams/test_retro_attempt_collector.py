@@ -483,6 +483,19 @@ async def test_a_check_of_the_same_commit_on_another_pr_is_not_this_pairs_head(d
     assert [s for s in _spans(attempt) if s[1] == "building"] == [("active", "building", "owner", 10, 35)]
 
 
+@pytest.mark.parametrize("family", ["effort", "pause", "ceiling"])
+async def test_a_wait_begun_before_the_campaign_keeps_its_attempt_and_is_clipped(db, family):
+    """V1 review 434: the attempt is chosen at the wait's own start, then the span is clipped to the campaign."""
+    team, (item,) = await _team(db)
+    await _dispatch(db, item, 1, _at(-40), current_nonce="nonce-a")
+    await _wait(db, family, "x:1", _at(-30), _at(-5), item=item, after={"awaited_role": "leader"},
+                snapshot={"launch_attempt": _key(item, 1)})
+    result = await _collect(db, team, as_of=30, start=-20)
+    (attempt,) = result.attempts
+    assert [s for s in _spans(attempt) if s[1] == family] == [("waiting", family, "leader", -20, -5)]
+    assert result.unattributed == []
+
+
 # Mail and input waits (Q4)
 async def test_mail_and_input_waits_follow_the_owner_of_the_one_open_attempt(db):
     team, (mine, theirs) = await _team(db, items=2)
@@ -518,6 +531,23 @@ async def test_a_mail_wait_with_no_or_several_open_attempts_is_shown_once_unattr
     result = await _collect(db, team, as_of=30)
     assert _lost(result) == [("mail", "no_open_attempt"), ("mail", "several_open_attempts")]
     assert all(s[1] != "mail" for a in result.attempts for s in _spans(a))
+
+
+async def test_a_mail_wait_ambiguous_when_sent_stays_ambiguous_after_one_attempt_ends_before_the_campaign(db):
+    """V1 review 434: ambiguity is decided among the attempts open at the send, not the ones shown."""
+    team, (one, two) = await _team(db, items=2)
+    await _dispatch(db, one, 1, _at(-40), current_nonce="nonce-a")
+    await _request(db, one, "nonce-a", _at(-38))
+    await _bound(db, one, 1, await _revision(db, one, "nonce-a"), _at(-15), merged=True)
+    await _dispatch(db, two, 1, _at(-40), current_nonce="nonce-b")
+    await _request(db, two, "nonce-b", _at(-38))
+    await _wait(db, "mail", "message:9", _at(-20), _at(5), team=team.id,
+                after={"owner_member_id": OWNER, "awaited_member_id": 60})
+    result = await _collect(db, team, as_of=30, start=-10)
+    assert [a.item_id for a in result.attempts] == [two.id]
+    assert [(u.source, u.reason, u.start, u.end) for u in result.unattributed] == [
+        ("mail", "several_open_attempts", _at(-10), _at(5))]
+    assert all(s[1] != "mail" for s in _spans(result.attempts[0]))
 
 
 # The real producers, and reading only
