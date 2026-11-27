@@ -8,7 +8,7 @@ import { Label } from '@/components/ui/label'
 import { ApiHttpError } from '@/lib/api'
 import { MODAL_SIZES } from '@/lib/constants'
 import { formatServerTime } from '@/lib/serverTime'
-import type { DeliveryPolicyEvent, DeliveryRequiredCheck, TeamGithubScope } from '@/types/agentTeams'
+import type { DeliveryPolicy, DeliveryPolicyEvent, DeliveryRequiredCheck, TeamGithubScope } from '@/types/agentTeams'
 import { fetchDeliveryPolicyHistory, updateTeamGithubDeliveryPolicy } from './api'
 import { useOperatorTokenFlow } from './useOperatorTokenFlow'
 
@@ -20,6 +20,8 @@ const MAX_REASON = 1000
 const APP_PATTERN = /^[a-z0-9-]+$/
 
 type Row = { key: number; name: string; app: string }
+// The server counts characters (Unicode code points), not UTF-16 units, so an emoji counts once.
+const length = (value: string) => Array.from(value).length
 const same = (a: DeliveryRequiredCheck, b: DeliveryRequiredCheck) => a.name === b.name && a.app_slug === b.app_slug
 const label = (check: DeliveryRequiredCheck) => `${check.name} (${check.app_slug})`
 
@@ -31,9 +33,9 @@ function validate(rows: Row[], hosted: boolean) {
     const problems: string[] = []
     const name = row.name.trim(), app = row.app.trim()
     if (!name) problems.push('Enter a check name.')
-    else if (name.length > MAX_NAME) problems.push(`A check name has at most ${MAX_NAME} characters.`)
+    else if (length(name) > MAX_NAME) problems.push(`A check name has at most ${MAX_NAME} characters.`)
     if (!app) problems.push('Enter an app.')
-    else if (app.length > MAX_APP) problems.push(`An app has at most ${MAX_APP} characters.`)
+    else if (length(app) > MAX_APP) problems.push(`An app has at most ${MAX_APP} characters.`)
     else if (!APP_PATTERN.test(app)) problems.push('An app uses lowercase letters, digits and hyphens only.')
     const identity = `${name}\u0000${app}`
     if (name && app && seen.has(identity)) problems.push('This name and app are already in the list.')
@@ -71,10 +73,15 @@ export function RequiredChecksDialog({ scope, open, onOpenChange, refresh, onRet
   onReturnFocus: () => void
 }) {
   const { withOperatorToken, tokenDialog } = useOperatorTokenFlow('to read or change the required checks')
-  const policy = scope.delivery_policy
-  const revision = scope.delivery_policy_revision
   // A list the user has not touched is undefined and follows the server, so a background refresh never erases a draft.
   const [draft, setDraft] = useState<{ base: number; rows: Row[] } | null>(null)
+  // The policy that the last confirmed save returned. It stands in until the repository read catches up with it.
+  const [confirmed, setConfirmed] = useState<{ revision: number; policy: DeliveryPolicy } | null>(null)
+  // A 409 proves that the draft is stale, whatever revision the repository read still shows.
+  const [conflict, setConflict] = useState(false)
+  const confirmedNewer = confirmed !== null && (scope.delivery_policy_revision === undefined || confirmed.revision > scope.delivery_policy_revision)
+  const policy = confirmedNewer ? confirmed.policy : scope.delivery_policy
+  const revision = confirmedNewer ? confirmed.revision : scope.delivery_policy_revision
   const [reason, setReason] = useState('')
   const [events, setEvents] = useState<DeliveryPolicyEvent[]>([])
   const [historyState, setHistoryState] = useState<'loading' | 'ready' | 'failed'>('loading')
@@ -86,7 +93,8 @@ export function RequiredChecksDialog({ scope, open, onOpenChange, refresh, onRet
 
   const serverRows: Row[] = (policy?.required_checks ?? []).map((check, index) => ({ key: -(index + 1), name: check.name, app: check.app_slug }))
   const rows = draft?.rows ?? serverRows
-  const stale = draft !== null && draft.base !== revision
+  const stale = draft !== null && (draft.base !== revision || conflict)
+  const reasonTooLong = length(reason.trim()) > MAX_REASON
   const check = validate(rows, policy?.broad_checks === 'hosted')
   const edit = (change: (current: Row[]) => Row[]) => setDraft((current) => ({ base: current?.base ?? revision ?? 0, rows: change(current?.rows ?? serverRows) }))
   const setField = (key: number, field: 'name' | 'app', value: string) => edit((current) => current.map((row) => (row.key === key ? { ...row, [field]: value } : row)))
@@ -121,7 +129,7 @@ export function RequiredChecksDialog({ scope, open, onOpenChange, refresh, onRet
       return
     }
     queueMicrotask(() => {
-      setDraft(null); setReason(''); setEvents([]); setHistoryState('loading'); setError(null); setSaving(false)
+      setDraft(null); setReason(''); setEvents([]); setHistoryState('loading'); setError(null); setSaving(false); setConflict(false) // the confirmed policy stays: the repository read may still lag
       void loadHistory()
     })
   }, [open, loadHistory])
@@ -137,19 +145,24 @@ export function RequiredChecksDialog({ scope, open, onOpenChange, refresh, onRet
       return
     }
     if (!reason.trim()) { setError('Enter a reason for the change.'); return }
+    if (reasonTooLong) { setError(`The reason has at most ${MAX_REASON} characters.`); return }
     const mine = session.current
     setSaving(true)
     try {
-      await withOperatorToken((token) => updateTeamGithubDeliveryPolicy(
+      const saved = await withOperatorToken((token) => updateTeamGithubDeliveryPolicy(
         scope.id, { expected_revision: draft.base, policy: { ...policy, required_checks: normalized }, reason: reason.trim() }, token))
+      if (mine !== session.current) return
+      // The confirmed policy and revision stand in until the repository read shows them.
+      setConfirmed({ revision: saved.revision, policy: saved.policy })
+      setDraft(null); setReason('')
       await refresh()
       if (mine !== session.current) return
-      setDraft(null); setReason('')
       await loadHistory()
       toast.success('Required checks saved')
     } catch (failure) {
       if (mine !== session.current) return
       if (failure instanceof ApiHttpError && failure.status === 409) {
+        setConflict(true)
         setError('The policy changed on the server, so nothing was saved. Discard your changes to see the current list.')
         void refresh().catch(() => undefined)
       } else {
@@ -173,8 +186,8 @@ export function RequiredChecksDialog({ scope, open, onOpenChange, refresh, onRet
         {!policy && <p role="alert" className="text-sm text-destructive">This server did not send the delivery policy, so the checks cannot be edited.</p>}
         {stale && (
           <div role="alert" className="flex flex-wrap items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm">
-            <span>The policy changed on the server (revision {draft?.base} to {revision}). Your changes are not saved.</span>
-            <Button variant="outline" size="sm" onClick={() => setDraft(null)}>Discard my changes</Button>
+            <span>{draft?.base !== revision ? `The policy changed on the server (revision ${draft?.base} to ${revision}). ` : 'The server refused the save because the policy changed. '}Your changes are not saved.</span>
+            <Button variant="outline" size="sm" onClick={() => { setDraft(null); setConflict(false) }}>Discard my changes</Button>
           </div>
         )}
         <div className="grid gap-4">
@@ -210,8 +223,8 @@ export function RequiredChecksDialog({ scope, open, onOpenChange, refresh, onRet
           </div>
           <div className="grid gap-2">
             <Label htmlFor="checks-reason">Reason</Label>
-            <Input id="checks-reason" maxLength={MAX_REASON} value={reason} disabled={saving || !policy} onChange={(event) => setReason(event.target.value)} />
-            <p className="text-xs text-muted-foreground">The reason is required. It is kept in the history with the new list.</p>
+            <Input id="checks-reason" aria-invalid={reasonTooLong} value={reason} disabled={saving || !policy} onChange={(event) => setReason(event.target.value)} />
+            <p className={reasonTooLong ? 'text-xs text-destructive' : 'text-xs text-muted-foreground'}>{reasonTooLong ? `The reason has at most ${MAX_REASON} characters.` : 'The reason is required. It is kept in the history with the new list.'}</p>
           </div>
           <Button onClick={() => void submit()} disabled={saving || !policy || !draft || stale}>Save</Button>
         </div>

@@ -116,6 +116,15 @@ describe('the server rules, shown before a save', () => {
     expect(screen.getByText(/at most 100 characters/)).toBeInTheDocument()
   })
 
+  it('judges an app by its characters, not by UTF-16 units', async () => {
+    await openEditor()
+    fireEvent.change(app(1), { target: { value: '\u{1F9EA}'.repeat(60) } }) // 120 UTF-16 units, 60 characters
+    expect(screen.getByText(/lowercase letters, digits and hyphens/)).toBeInTheDocument()
+    expect(screen.queryByText(/at most 100 characters/)).not.toBeInTheDocument()
+    fireEvent.change(app(1), { target: { value: 'a'.repeat(101) } })
+    expect(screen.getByText(/at most 100 characters/)).toBeInTheDocument()
+  })
+
   it('refuses a duplicate name and app, but accepts the same name with another app', async () => {
     const { user } = await openEditor()
     await type(user, name(2), 'Unit tests')
@@ -299,5 +308,120 @@ describe('the history', () => {
     expect(screen.queryByText('No changes recorded yet.')).not.toBeInTheDocument()
     expect(screen.getByText(/Could not read the history: boom/)).toBeInTheDocument()
     expect(name(1)).toBeEnabled() // the list can still be edited
+  })
+})
+
+describe('answers that arrive late or out of order (V1 review 106)', () => {
+  it('keeps the confirmed list and revision when the repository read still shows the old policy', async () => {
+    vi.mocked(updateTeamGithubDeliveryPolicy).mockResolvedValue({ scope_id: 2, revision: 5, policy: policy([check('Unit tests')]) })
+    const { user, refresh, rerender } = await openEditor() // revision 4: Unit tests, Lint
+    await user.click(screen.getByRole('button', { name: 'Remove check 2' }))
+    await type(user, reason(), 'Drop lint')
+    await user.click(save())
+    await waitFor(() => expect(refresh).toHaveBeenCalled())
+    // the refresh answered with the old scope, so the dialog still gets revision 4 and the removed check
+    expect(name(1)).toHaveValue('Unit tests')
+    expect(screen.queryByLabelText('Check 2 name')).not.toBeInTheDocument()
+    // the next edit starts from the confirmed revision, not from the old one
+    await user.click(screen.getByRole('button', { name: 'Add a check' }))
+    await type(user, name(2), 'End-to-end tests')
+    await type(user, reason(), 'Add e2e')
+    await user.click(save())
+    await waitFor(() => expect(updateTeamGithubDeliveryPolicy).toHaveBeenCalledTimes(2))
+    expect(vi.mocked(updateTeamGithubDeliveryPolicy).mock.calls[1][1].expected_revision).toBe(5)
+    // when the repository read catches up, the repository's own policy is used again
+    rerender({ delivery_policy: policy([check('Unit tests'), check('End-to-end tests')]), delivery_policy_revision: 6 })
+    expect(name(2)).toHaveValue('End-to-end tests')
+  })
+
+  it('keeps a draft blocked after a 409 while the repository read still shows the old revision', async () => {
+    vi.mocked(updateTeamGithubDeliveryPolicy).mockRejectedValue(new ApiHttpError('delivery_policy_revision_changed', 409))
+    const { user, refresh } = await openEditor() // the mocked refresh changes nothing: revision 4 stays
+    await user.click(screen.getByRole('button', { name: 'Remove check 2' }))
+    await type(user, reason(), 'Drop lint')
+    await user.click(save())
+    expect(await screen.findByText(/The server refused the save because the policy changed/)).toBeInTheDocument()
+    await waitFor(() => expect(refresh).toHaveBeenCalled())
+    expect(save()).toBeDisabled()
+    expect(screen.queryByLabelText('Check 2 name')).not.toBeInTheDocument() // the draft is still there
+    await user.click(screen.getByRole('button', { name: 'Discard my changes' }))
+    expect(name(2)).toHaveValue('Lint')
+    expect(screen.queryByText(/The server refused the save/)).not.toBeInTheDocument()
+    // a new draft is not blocked by the old conflict
+    await type(user, name(1), 'Renamed tests')
+    await type(user, reason(), 'Rename')
+    expect(save()).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Discard my changes' })).not.toBeInTheDocument()
+  })
+
+  it('does not carry a conflict into the next opening of the dialog', async () => {
+    vi.mocked(updateTeamGithubDeliveryPolicy).mockRejectedValue(new ApiHttpError('delivery_policy_revision_changed', 409))
+    const { user } = await openEditor()
+    await user.click(screen.getByRole('button', { name: 'Remove check 2' }))
+    await type(user, reason(), 'Drop lint')
+    await user.click(save())
+    await screen.findByRole('button', { name: 'Discard my changes' })
+    await user.keyboard('{Escape}')
+    await user.click(screen.getByRole('button', { name: 'Edit required checks for example/project' }))
+    await screen.findByText('History')
+    await flush()
+    await type(user, name(1), 'Renamed tests')
+    await type(user, reason(), 'Rename')
+    expect(save()).toBeEnabled()
+  })
+
+  it('keeps the confirmed list when the dialog is closed and opened again before the read catches up', async () => {
+    vi.mocked(updateTeamGithubDeliveryPolicy).mockResolvedValue({ scope_id: 2, revision: 5, policy: policy([check('Unit tests')]) })
+    const { user, refresh } = await openEditor()
+    await user.click(screen.getByRole('button', { name: 'Remove check 2' }))
+    await type(user, reason(), 'Drop lint')
+    await user.click(save())
+    await waitFor(() => expect(refresh).toHaveBeenCalled())
+    await flush()
+    await user.keyboard('{Escape}')
+    await user.click(screen.getByRole('button', { name: 'Edit required checks for example/project' }))
+    await screen.findByText('History')
+    await flush()
+    expect(screen.queryByLabelText('Check 2 name')).not.toBeInTheDocument()
+  })
+
+  it('keeps the draft blocked after a 409 when the refresh fails too', async () => {
+    vi.mocked(updateTeamGithubDeliveryPolicy).mockRejectedValue(new ApiHttpError('delivery_policy_revision_changed', 409))
+    const { user, refresh } = await openEditor({}, vi.fn().mockRejectedValue(new Error('offline')))
+    await user.click(screen.getByRole('button', { name: 'Remove check 2' }))
+    await type(user, reason(), 'Drop lint')
+    await user.click(save())
+    expect(await screen.findByRole('button', { name: 'Discard my changes' })).toBeInTheDocument()
+    await waitFor(() => expect(refresh).toHaveBeenCalled())
+    expect(save()).toBeDisabled()
+  })
+})
+
+describe('the length limits count characters, as the server does', () => {
+  const tubes = (count: number) => '\u{1F9EA}'.repeat(count) // one code point, two UTF-16 units
+
+  it('accepts a check name of 200 emoji and refuses 201', async () => {
+    await openEditor()
+    fireEvent.change(name(1), { target: { value: tubes(101) } }) // 202 UTF-16 units, 101 characters
+    expect(screen.queryByText(/at most 200 characters/)).not.toBeInTheDocument()
+    fireEvent.change(name(1), { target: { value: tubes(200) } })
+    expect(screen.queryByText(/at most 200 characters/)).not.toBeInTheDocument()
+    fireEvent.change(name(1), { target: { value: tubes(201) } })
+    expect(screen.getByText(/at most 200 characters/)).toBeInTheDocument()
+  })
+
+  it('accepts a reason of 1000 emoji, sends it whole, and refuses 1001', async () => {
+    const { user } = await openEditor()
+    await user.click(screen.getByRole('button', { name: 'Remove check 2' }))
+    fireEvent.change(reason(), { target: { value: tubes(1001) } })
+    expect(screen.getByText(/The reason has at most 1000 characters/)).toBeInTheDocument()
+    await user.click(save())
+    expect(await screen.findAllByText(/The reason has at most 1000 characters/)).not.toHaveLength(0)
+    expect(updateTeamGithubDeliveryPolicy).not.toHaveBeenCalled()
+    fireEvent.change(reason(), { target: { value: tubes(1000) } })
+    expect(screen.getByText('The reason is required. It is kept in the history with the new list.')).toBeInTheDocument() // the live message is back to normal
+    await user.click(save())
+    await waitFor(() => expect(updateTeamGithubDeliveryPolicy).toHaveBeenCalledTimes(1))
+    expect(vi.mocked(updateTeamGithubDeliveryPolicy).mock.calls[0][1].reason).toBe(tubes(1000))
   })
 })
