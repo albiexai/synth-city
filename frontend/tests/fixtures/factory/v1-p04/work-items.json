@@ -1799,6 +1799,7 @@
             "provider_label": "Codex",
             "slot_id": 4
           },
+          "owner_queue_position": 5,
           "policy": {
             "continuation_enabled": true,
             "max_approval_rounds": 3,

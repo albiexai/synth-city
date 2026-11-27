@@ -62,9 +62,11 @@ export function WorkTable({ rows, showOwnerQueue = false }: { rows: WorkProjecti
                     <Link className={anchor} to={`/work/${work.item.id}`}>
                       #{work.item.issue_number} {work.item.issue_title}
                     </Link>{" "}
-                    <span className="text-muted-foreground">
-                      {work.repository.display_name}
-                    </span>
+                    {!position && (
+                      <span className="text-muted-foreground">
+                        {work.repository.display_name}
+                      </span>
+                    )}
                   </p>
                 </td>
                 <td className="truncate px-3 py-2" title={work.team.name}>
@@ -78,8 +80,8 @@ export function WorkTable({ rows, showOwnerQueue = false }: { rows: WorkProjecti
                       {stateLabel(work)}
                     </span>
                     {position && (
-                      <span className="shrink-0 text-xs font-medium">
-                        {position === 1 ? "next" : position + (suffix[ordinals.select(position)] ?? "th")}
+                      <span className="truncate text-xs font-medium" title={work.repository.display_name}>
+                        {position === 1 ? "next" : position + (suffix[ordinals.select(position)] ?? "th")} · {work.repository.display_name}
                       </span>
                     )}
                     {work.item.required_ci_unreadable && (

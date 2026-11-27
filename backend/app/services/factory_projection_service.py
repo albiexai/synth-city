@@ -293,14 +293,11 @@ async def actor_evidence(db, team_ids, authority):
         MailTeamMember.team_preset_id.in_(team_ids), MailTeamMember.participant_kind == "team_slot"))).scalars().all()
     member_ids = [m.id for m in members]
     sessions = (await db.execute(select(MailAgentSession).where(MailAgentSession.member_id.in_(member_ids)))).scalars().all()
-    binding_rows = (await db.execute(
-        select(AgentPaneBinding, MailPaneLifecycle)
-        .outerjoin(MailPaneLifecycle, and_(MailPaneLifecycle.pane_pid == AgentPaneBinding.pane_pid,
-                                          MailPaneLifecycle.pane_proc_start == AgentPaneBinding.pane_proc_start))
-        .where(AgentPaneBinding.preset_id.in_(team_ids))
-    )).all()
-    return slots, members, sessions, [binding for binding, _ in binding_rows], {
-        (life.pane_pid, life.pane_proc_start): life.retired_at for _, life in binding_rows if life is not None}
+    bindings = (await db.execute(select(AgentPaneBinding).where(AgentPaneBinding.preset_id.in_(team_ids)))).scalars().all()
+    retired = (await db.execute(select(MailPaneLifecycle).where(
+        MailPaneLifecycle.pane_pid.in_([b.pane_pid for b in bindings])))).scalars().all()
+    return slots, members, sessions, bindings, {
+        (r.pane_pid, r.pane_proc_start): r.retired_at for r in retired}
 
 
 def association(slot, member, sessions, bindings, retired, now):
@@ -383,16 +380,16 @@ def actions(legacy, *, stopped_actor=None):
 async def _owner_queue_positions(db, slot_ids):
     item = GithubWorkItem
     queued = (await db.execute(
-        select(item.id, item.owner_slot_id, item.issue_number, item.dispatch_priority)
+        select(item.id, item.scope_id, item.owner_slot_id, item.issue_number, item.dispatch_priority)
         .join(TeamGithubScope, TeamGithubScope.id == item.scope_id)
         .join(AgentTeamSlot, and_(AgentTeamSlot.id == item.owner_slot_id,
                                   AgentTeamSlot.preset_id == TeamGithubScope.preset_id))
         .where(item.dispatch_status == "pending", item.owner_slot_id.in_(slot_ids))
     )).all()
-    by_owner = defaultdict(list)
+    by_scope_owner = defaultdict(list)
     for row in queued:
-        by_owner[row.owner_slot_id].append(row)
-    return {row.id: position for queue in by_owner.values()
+        by_scope_owner[(row.scope_id, row.owner_slot_id)].append(row)
+    return {row.id: (row.scope_id, position) for queue in by_scope_owner.values()
             for position, row in enumerate(sorted(queue, key=dispatch_order_key), 1)}
 
 
@@ -482,13 +479,14 @@ async def work_projections(db, rows, now, owner_positions=None):
         if (item.pr_number is None or item.attempt_phase == "diagnostic"
                 or not re.fullmatch(r"[0-9a-fA-F]{40}", item.last_verified_sha or "")):
             safe["last_verified_sha"] = None
+        queue_order = owner_positions.get(item.id)
         identity = github_identity(scope)
         result.append(wire.WorkProjection(
             item=wire.SafeWorkItem(**safe), team=wire.TeamReference(id=team.id, name=team.name),
             repository=wire.WorkRepository(scope_id=scope.id, github=identity,
                                             display_name=f"{identity.owner}/{identity.name}"),
             category=STATUS_CATEGORY.get(item.dispatch_status, "unknown"),
-            owner_queue_position=owner_positions.get(item.id),
+            owner_queue_position=queue_order[1] if queue_order else None,
             owner=wire.OwnerReference(slot_id=slot.id, member_id=member.id if member else None,
                 name=slot.display_name, configured_provider=slot.provider, provider_label=providers.get(slot.provider)) if slot else None,
             approver=wire.ApproverReference(slot_id=leader_slot.id, member_id=leader_member.id if leader_member else None,

@@ -248,8 +248,8 @@ async def test_owner_queue_filters_rank_pagination_and_rejects_stale_cursor(fact
                                 github_updated_at=NOW, dispatch_status="dispatched", owner_slot_id=owner)
         db.add_all([*queued, active])
         await db.commit()
-        ranked = [(row.id, rank) for rank, row in enumerate(sorted(queued, key=dispatch_order_key), 1)
-                  if row.scope_id == scope]
+        ranked = [(row.id, rank) for rank, row in enumerate(
+            sorted((row for row in queued if row.scope_id == scope), key=dispatch_order_key), 1)]
 
     selected = dict(owner_slot_id=owner, team_id=ids.teams[0], scope_id=scope, provider="claude-code")
     current = await get_ok(factory_client, "work-items", **selected)
@@ -258,10 +258,10 @@ async def test_owner_queue_filters_rank_pagination_and_rejects_stale_cursor(fact
     assert "owner_queue_position" not in next(row for row in current["items"] if row["item"]["id"] == active.id)
     empty = await get_ok(factory_client, "work-items", **(selected | {"provider": "codex-cli"}))
     assert empty["total"] == 0
-    wrong_team = await factory_client.get("/api/v1/factory/work-items", params={
-        "owner_slot_id": owner, "team_id": ids.teams[1]})
-    assert wrong_team.status_code == 422 and wrong_team.json()["detail"]["code"] == "invalid_filter"
     queue = dict(selected, category="queued")
+    all_queues = await get_ok(factory_client, "work-items", owner_slot_id=owner, category="queued")
+    assert [(row["repository"]["scope_id"], row["owner_queue_position"]) for row in all_queues["items"]] == [
+        (scope, 1), (scope, 2), (scope, 3), (second_scope, 1)]
     first = await get_ok(factory_client, "work-items", **queue, limit=1)
     cursor = first["next_cursor"]
     assert first["filters"]["owner_slot_id"] == owner
@@ -282,6 +282,18 @@ async def test_owner_queue_filters_rank_pagination_and_rejects_stale_cursor(fact
     refreshed = await get_ok(factory_client, "work-items", **queue)
     assert [(r["item"]["id"], r["owner_queue_position"]) for r in refreshed["items"]] == [
         (queued[0].id, 1), (queued[2].id, 2)]
+
+
+@pytest.mark.parametrize(("key", "missing", "status", "code"), [
+    ("scope_id", True, 404, "resource_not_found"), ("scope_id", False, 422, "invalid_filter"),
+    ("team_id", False, 422, "invalid_filter"),
+])
+async def test_owner_filter_rejects_unknown_or_foreign_slot(factory_client, factory_store, key, missing, status, code):
+    ids = factory_store.ids
+    incompatible_id = ids.scopes[1] if key == "scope_id" else ids.teams[1]
+    response = await factory_client.get("/api/v1/factory/work-items", params={
+        key: incompatible_id, "owner_slot_id": 999999 if missing else ids.owners[0]})
+    assert response.status_code == status and response.json()["detail"]["code"] == code
 
 
 async def test_same_repository_retains_scope_and_attempt_identity(factory_client, factory_store):
@@ -459,7 +471,8 @@ async def test_sql_query_count_bounded_between_one_and_hundred_rows(factory_clie
         assert len(response["items"]) == limit
         measured.append(len(factory_store.statements))
     assert measured[0] == measured[1]
-    assert measured[1] <= 12
+    # Work uses one bulk read for the displayed owner queues.
+    assert measured[1] <= 13
     record_property("query_counts_one_hundred", measured)
 
 
