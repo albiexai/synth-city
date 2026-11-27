@@ -47,6 +47,8 @@ vi.mock("../src/features/agent-teams/api", async (importOriginal) => {
 vi.mock("../src/features/agent-teams/BacklogCoordination", () => ({ BacklogCoordination: () => null }));
 // The summary card has its own tests. Its network read would change the timing of these route tests.
 vi.mock("../src/features/agent-teams/TeamSummaryCard", () => ({ TeamSummaryCard: () => null, TeamSummaries: () => null }));
+// The milestone list has its own tests (#1337). Its read would add a second alert to the refresh test.
+vi.mock("../src/features/factory/components/MilestoneStates", () => ({ MilestoneStates: () => null }));
 
 vi.mock("../src/hooks/useProviders", async (importOriginal) => {
   const actual =
