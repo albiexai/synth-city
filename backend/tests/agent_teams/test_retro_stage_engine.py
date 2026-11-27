@@ -65,6 +65,14 @@ def test_two_parallel_checks_share_their_time_and_report_their_own_wall_time():
     assert result.overlap_seconds == 600
 
 
+def test_the_overlap_is_the_time_covered_by_more_than_one_stage():
+    """Three checks over the same 10 minutes overlap for 10 minutes, not 20 (V1 review 6088363261)."""
+    result = breakdown(_window(15), [_iv("process", "required_check", name, 0, 10) for name in ("a", "b", "c")]
+                       + [_iv("active", "building", "B3", 10, 15)])
+    assert (result.overlap_seconds, result.groups["process"], result.groups["active"]) == (600, 600, 300)
+    assert [s.share_seconds for s in result.stages if s.stage == "required_check"] == [200, 200, 200]
+
+
 @pytest.mark.parametrize(("winner", "loser"), [("waiting", "process"), ("process", "active"), ("waiting", "active")])
 def test_a_higher_group_takes_the_instant(winner, loser):
     result = breakdown(_window(10), [_iv(loser, "low", "x", 0, 10), _iv(winner, "high", "y", 0, 10)])

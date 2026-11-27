@@ -70,7 +70,7 @@ def breakdown(window: AttemptWindow, intervals: list[StageInterval]) -> AttemptS
     keys = sorted({key for _, _, key in clipped}, key=lambda key: (GROUPS.index(key[0]), key[1], key[2]))
     shares = {key: StageShare(*key) for key in keys}
     groups = dict.fromkeys(GROUPS, 0.0)
-    unaccounted = covered = 0.0
+    unaccounted = overlap = 0.0
     edges = sorted({window.start, window.end, *(t for start, end, _ in clipped for t in (start, end))})
     for left, right in pairwise(edges):
         seconds = (right - left).total_seconds()
@@ -80,7 +80,8 @@ def breakdown(window: AttemptWindow, intervals: list[StageInterval]) -> AttemptS
         if not present:
             unaccounted += seconds
             continue
-        covered += seconds
+        if len(present) > 1:
+            overlap += seconds
         top = min(GROUPS.index(key[0]) for key in present)
         sharing = [key for key in present if GROUPS.index(key[0]) == top]
         groups[GROUPS[top]] += seconds
@@ -89,4 +90,4 @@ def breakdown(window: AttemptWindow, intervals: list[StageInterval]) -> AttemptS
     return AttemptStages(
         total_seconds=(window.end - window.start).total_seconds(), start_label=window.start_label, groups=groups,
         stages=[shares[key] for key in keys], unaccounted_seconds=unaccounted,
-        overlap_seconds=sum(share.wall_seconds for share in shares.values()) - covered)
+        overlap_seconds=overlap)
