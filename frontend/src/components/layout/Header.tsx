@@ -20,11 +20,11 @@ export function Header() {
   const status = useSystemStatus();
   const instance = status?.instance ?? null;
   const accentClasses = getInstanceAccentClasses(instance?.accent);
-  const { providers } = useProviderContext();
+  const { providers, selectedProvider } = useProviderContext();
   const summary = harnessSummary(providers.map(provider => withRegistryVersion({
     ...provider,
     version: status?.providers?.[provider.id]?.version ?? provider.version,
-  }, provider)));
+  }, provider)), selectedProvider);
   useInstanceDocumentTitle(instance);
 
   const instanceName = instance?.name_configured ? instance.name : instance?.short_hostname;

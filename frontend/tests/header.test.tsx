@@ -7,13 +7,17 @@ import { Header } from "../src/components/layout/Header";
 const WARNING = "Host agent CLIs are not visible from this container.";
 const LABEL = "Container cannot see host agent CLIs";
 
-const mocks = vi.hoisted(() => ({ status: null as unknown, providers: [] as { id: string; installed: boolean; display_name: string }[] }));
+const mocks = vi.hoisted(() => ({ status: null as unknown, selectedProviderId: "claude-code", providers: [] as { id: string; installed: boolean; display_name: string }[] }));
 
 vi.mock("../src/contexts/ThemeContext", () => ({ useTheme: () => ({ theme: "dark" }) }));
 vi.mock("../src/hooks/useSystemStatus", () => ({ useSystemStatus: () => mocks.status }));
 vi.mock("../src/hooks/useInstanceDocumentTitle", () => ({ useInstanceDocumentTitle: () => undefined }));
 vi.mock("../src/contexts/ProviderContext", () => ({
-  useProviderContext: () => ({ providers: mocks.providers, selectedProviderId: "copilot-cli", selectedProvider: null }),
+  useProviderContext: () => ({
+    providers: mocks.providers,
+    selectedProviderId: mocks.selectedProviderId,
+    selectedProvider: mocks.providers.find(provider => provider.id === mocks.selectedProviderId) ?? null,
+  }),
 }));
 
 function renderHeader() {
@@ -37,6 +41,7 @@ function statusWithWarning(warning: string | null) {
 beforeEach(() => {
   mocks.status = null;
   mocks.providers = [];
+  mocks.selectedProviderId = "claude-code";
 });
 
 describe("Header", () => {
@@ -71,18 +76,26 @@ describe("Header", () => {
     expect(screen.getByRole("button", { name: "Toggle theme" }).parentElement).toHaveClass("shrink-0");
   });
 
-  it("counts installed harnesses from the complete registry, even with a stale status or selected missing harness", () => {
-    const claude = { id: "claude-code", installed: true, display_name: "Claude Code" };
-    const copilot = { id: "copilot-cli", installed: false, display_name: "GitHub Copilot CLI" };
-    mocks.providers = [claude, copilot];
-    mocks.status = { ...statusWithWarning(null), providers: { "copilot-cli": { ...copilot, installed: true } } };
+  it.each([
+    { selectedProviderId: "claude-code", problem: false },
+    { selectedProviderId: "copilot-cli", problem: true },
+  ])(
+    "uses the complete installed count and the $selectedProviderId selection for badge severity",
+    ({ selectedProviderId, problem }) => {
+      const installed = ["claude-code", "codex-cli", "pi-cli", "muse-cli"];
+      const missing = ["copilot-cli", "opencode-cli", "antigravity-cli"];
+      mocks.providers = [...installed, ...missing].map(id => ({ id, display_name: id, installed: installed.includes(id) }));
+      mocks.selectedProviderId = selectedProviderId;
+      mocks.status = { ...statusWithWarning(null), providers: { "copilot-cli": { id: "copilot-cli", installed: true } } };
 
-    renderHeader();
+      renderHeader();
 
-    const link = screen.getByRole("link", { name: "1 installed. Open Harnesses" });
-    expect(link).toHaveAttribute("href", "/harnesses");
-    expect(link).toHaveAttribute("title", expect.stringContaining("1 of 2 supported harnesses installed for this factory"));
-  });
+      const link = screen.getByRole("link", { name: "4 installed. Open Harnesses" });
+      expect(link).toHaveAttribute("href", "/harnesses");
+      expect(link).toHaveAttribute("title", expect.stringContaining("4 of 7 supported harnesses installed for this factory"));
+      expect(link.firstElementChild?.classList.contains("border-destructive/40")).toBe(problem);
+    },
+  );
 
   it("shows no container warning when the status has none", () => {
     mocks.status = statusWithWarning(null);

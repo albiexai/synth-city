@@ -15,7 +15,8 @@ describe('header harness summary', () => {
   })
 
   it('names a missing harness as a problem', () => {
-    const summary = harnessSummary([harness('Claude Code', true, '2.1.0'), harness('Pi', false, null, 'pi not found on PATH')])
+    const missing = harness('Pi', false, null, 'pi not found on PATH')
+    const summary = harnessSummary([harness('Claude Code', true, '2.1.0'), missing], missing)
     expect(summary.label).toBe('1 installed')
     expect(summary.problem).toBe(true)
     expect(summary.title).toContain('1 of 2 supported harnesses installed for this factory')
@@ -41,7 +42,8 @@ describe('header harness summary with a chosen user\'s Claude Code version', () 
   })
 
   it('names the version and its user when the controller has NO claude, and still counts the controller binary as missing', () => {
-    const summary = harnessSummary([scoped(false, { version: '2.1.326', version_user: 'agentuser' })])
+    const missing = scoped(false, { version: '2.1.326', version_user: 'agentuser' })
+    const summary = harnessSummary([missing], missing)
     expect(summary.title.split('\n').at(1)).toBe('Claude Code v2.1.326 (agentuser); controller binary missing')
     expect(summary.label).toBe('0 installed')
     expect(summary.problem).toBe(true)

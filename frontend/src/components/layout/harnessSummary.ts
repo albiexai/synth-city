@@ -6,12 +6,12 @@ type HarnessStatus = {
 };
 
 /** One header badge for every harness, so the header keeps one row as harnesses are added. */
-export function harnessSummary(harnesses: HarnessStatus[]) {
+export function harnessSummary(harnesses: HarnessStatus[], selected?: Pick<HarnessStatus, "installed"> | null) {
   const installed = harnesses.filter((harness) => harness.installed).length;
   const noun = harnesses.length === 1 ? "harness" : "harnesses";
   return {
     label: `${installed} installed`,
-    problem: installed < harnesses.length,
+    problem: selected?.installed === false,
     title: [`${installed} of ${harnesses.length} supported ${noun} installed for this factory`,
       ...harnesses.map((harness) => {
         // A chosen user's version (or its unknown message) is named whether or not the controller has a claude of its own.

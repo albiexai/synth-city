@@ -54,8 +54,14 @@ function mount() {
   return render(<BrowserRouter><ThemeProvider><ProviderProvider><Header /></ProviderProvider></ThemeProvider></BrowserRouter>)
 }
 
-/** The header's harness badge title: one line per harness, with its version. */
+/** The header tooltip starts with the count, then shows one version line per harness. */
 const title = () => screen.getByRole('link', { name: /Open Harnesses/ }).getAttribute('title') ?? ''
+
+function versionLine() {
+  const [count, version] = title().split('\n')
+  expect(count).toBe('1 of 1 supported harness installed for this factory')
+  return version
+}
 
 function go(url: string) {
   act(() => { window.history.pushState({}, '', url); window.dispatchEvent(new PopStateEvent('popstate')) })
@@ -68,7 +74,7 @@ describe('the provider registry follows the selected scope', () => {
   it('fetches again at once under the new scope and shows no Claude version while it loads', async () => {
     const server = install(['controller'])
     mount(); await settle()
-    expect(title()).toBe('Claude Code v2.1.326 (agentuser)')
+    expect(versionLine()).toBe('Claude Code v2.1.326 (agentuser)')
 
     go('/harnesses?scope_user=controller'); await settle()
 
@@ -76,7 +82,7 @@ describe('the provider registry follows the selected scope', () => {
     expect(lastRegistryRequest?.scope).toBe('controller')                        // a request for the new scope, with its header
     expect(title()).not.toMatch(/agentuser|2\.1\.326|9\.9\.9/)                   // neither the old user's version nor the controller's
     server.release('controller'); await settle()
-    expect(title()).toBe('Claude Code v9.9.9')                                   // the controller's own scope, once it has arrived
+    expect(versionLine()).toBe('Claude Code v9.9.9')                                   // the controller's own scope, once it has arrived
   })
 
   it('ignores a slow answer for the scope the user has already left', async () => {
@@ -84,10 +90,10 @@ describe('the provider registry follows the selected scope', () => {
     mount(); await settle()
 
     go('/harnesses?scope_user=controller'); await settle()
-    expect(title()).toBe('Claude Code v9.9.9')
+    expect(versionLine()).toBe('Claude Code v9.9.9')
     server.release('agent'); await settle()                                      // the late answer for the old scope arrives now
 
-    expect(title()).toBe('Claude Code v9.9.9')
+    expect(versionLine()).toBe('Claude Code v9.9.9')
     expect(title()).not.toMatch(/agentuser|2\.1\.326/)
   })
 
@@ -95,13 +101,13 @@ describe('the provider registry follows the selected scope', () => {
     const server = install(['agent'])
     mount(); server.release('agent'); await settle()
     go('/harnesses?scope_user=controller'); await settle()
-    expect(title()).toBe('Claude Code v9.9.9')
+    expect(versionLine()).toBe('Claude Code v9.9.9')
 
     go('/harnesses'); await settle()                                             // the agent registry is held again: still loading
 
     expect(title()).not.toMatch(/agentuser|2\.1\.326|9\.9\.9/)
     server.release('agent'); await settle()
-    expect(title()).toBe('Claude Code v2.1.326 (agentuser)')
+    expect(versionLine()).toBe('Claude Code v2.1.326 (agentuser)')
   })
 })
 
@@ -111,7 +117,7 @@ describe('the header takes Claude Code\'s version from the registry, never from 
 
     mount(); await settle()
 
-    expect(title()).toBe("Claude Code version unknown (cannot read the agent user's install)")
+    expect(versionLine()).toBe("Claude Code version unknown (cannot read the agent user's install)")
     expect(title()).not.toContain('9.9.9')
   })
 })
