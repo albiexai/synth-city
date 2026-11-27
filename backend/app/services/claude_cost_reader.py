@@ -107,6 +107,10 @@ def read_claude_usage(start: datetime, end: datetime, members: list[ClaudeMember
         if member.provider == "claude-code" and _canonical(member.session_id) and resolved[member.workspace]:
             claims.setdefault((_folder(root, resolved[member.workspace]), member.session_id), []).append(member.member)
     results = []
+    reached: set[Path] = set()  # folders a member read found, so a later listing that finds none is a gap
+    # Bindings settled on their member: charged, or unknown for a reason the folder can't change. A binding refused as
+    # another workspace's (session_mismatch) is classified with the folder's candidates (V1 review 6088836613).
+    settled: set[tuple[Path, str]] = set()
     for member in members:
         if member.provider != "claude-code":
             reason = "harness_not_read"
@@ -115,12 +119,19 @@ def read_claude_usage(start: datetime, end: datetime, members: list[ClaudeMember
         elif len(claims[(_folder(root, resolved[member.workspace]), member.session_id)]) > 1:
             reason = "competing_binding"  # the session is shown once, unattributed
         else:
+            folder = _folder(root, resolved[member.workspace])
             try:
-                models, _ = _read(_folder(root, resolved[member.workspace]) / f"{member.session_id}.jsonl",
-                                  member.session_id, (resolved[member.workspace],), uid, max_bytes, start, end, pricing)
+                models, _ = _read(folder / f"{member.session_id}.jsonl", member.session_id,
+                                  (resolved[member.workspace],), uid, max_bytes, start, end, pricing)
             except _Unknown as unknown:
                 reason = unknown.reason
+                if reason != "no_native_session":
+                    reached.add(folder)
+                if reason != "session_mismatch":
+                    settled.add((folder, member.session_id))
             else:
+                reached.add(folder)
+                settled.add((folder, member.session_id))
                 results.append(_member(member.member, models))
                 continue
         results.append(MemberCost(member.member, unknown_reasons=[reason]))
@@ -129,16 +140,17 @@ def read_claude_usage(start: datetime, end: datetime, members: list[ClaudeMember
         named = ", ".join(str(workspace) for workspace in workspaces)  # until a transcript says which
         try:
             names = os.listdir(folder)
-        except FileNotFoundError:
-            names = []  # no session was ever written here
-        except OSError:  # permissions, not a directory, a race: the folder's unattributed usage is unknown
-            unlisted.append(UnlistedFolder([str(workspace) for workspace in workspaces], "native_log_unlisted"))
-            continue
+        except OSError as error:
+            if isinstance(error, FileNotFoundError) and folder not in reached:
+                names = []  # no session was ever written here
+            else:  # permissions, not a directory, a race: the folder's unattributed usage is unknown
+                unlisted.append(UnlistedFolder([str(workspace) for workspace in workspaces], "native_log_unlisted"))
+                continue
         for path in sorted(folder / name for name in names if name.endswith(".jsonl")):
             claimants = claims.get((folder, path.stem), [])
-            if len(claimants) == 1:
+            if (folder, path.stem) in settled:
                 continue
-            reasons = ["competing_binding"] if claimants else []
+            reasons = ["competing_binding"] if len(claimants) > 1 else []
             try:
                 models, workspace = _read(path, path.stem, workspaces, uid, max_bytes, start, end, pricing)
             except _Unknown as unknown:

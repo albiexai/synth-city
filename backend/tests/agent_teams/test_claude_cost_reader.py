@@ -477,5 +477,27 @@ def test_a_bound_session_in_a_shared_folder_is_checked_against_its_own_workspace
     """B1's recorded session whose rows ran in the other workspace of the folder is not B1's to be charged."""
     home, dot, dash, members = shared
     _session(home, dot, SA, [{**_row("a1", START + timedelta(hours=1)), "cwd": str(dash)}])
-    by_member = {m.member: m for m in _read(home, members).members}
+    report = _read(home, members)
+    by_member = {m.member: m for m in report.members}
     assert by_member["B1"].cost_usd is None and by_member["B1"].unknown_reasons == ["session_mismatch"]
+    # The rejected binding doesn't hide the transcript: it is classified once, by where its rows ran (V1 6088836613).
+    rejected = [u for u in report.unattributed if u.session_id == SA]
+    assert [(u.workspace, u.messages, u.unknown_reasons) for u in rejected] == [(str(dash), 1, [])]
+
+
+def test_a_folder_that_vanishes_after_a_member_read_is_a_coverage_gap(team, monkeypatch):
+    """Its bound transcript was just read, so a listing that finds no folder is a gap, not "never written"."""
+    home, members = team
+    folder = home / ".claude" / "projects" / convert_path_to_folder_name(members[0].workspace)
+    listdir = os.listdir
+
+    def moved(path):
+        if Path(path) == folder:
+            raise FileNotFoundError(path)
+        return listdir(path)
+
+    monkeypatch.setattr(reader.os, "listdir", moved)
+    report = _read(home, members)
+    by_member = {m.member: m for m in report.members}
+    assert by_member["B1"].cost_usd == pytest.approx(_price((1000, 200, 50, 10)) + _price((2000, 0, 0, 100)))
+    assert [(u.workspaces, u.reason) for u in report.unlisted] == [([members[0].workspace], "native_log_unlisted")]
