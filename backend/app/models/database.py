@@ -206,6 +206,7 @@ class AgentTeamSlot(Base):
     launch_options: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     area_labels: Mapped[list | None] = mapped_column(JSON, nullable=True)
     expertise: Mapped[str | None] = mapped_column(String, nullable=True)
+    capability_tier: Mapped[str | None] = mapped_column(String, nullable=True)
     workspace_trust_status: Mapped[str | None] = mapped_column(String, nullable=True)
     workspace_trust_target: Mapped[str | None] = mapped_column(String, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -396,6 +397,7 @@ class GithubWorkItem(Base):
     pending_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     workspace_wait_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     dispatch_priority: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    issue_difficulty: Mapped[str | None] = mapped_column(String, nullable=True)
     launch_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("agent_team_launches.id", ondelete="SET NULL"), nullable=True
     )

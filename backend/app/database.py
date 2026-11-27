@@ -626,6 +626,7 @@ async def _sqlite_rebuild_agent_team_slots(conn, columns: set[str]) -> None:
     launch_options_expr = "launch_options" if "launch_options" in columns else "NULL"
     trust_status_expr = "workspace_trust_status" if "workspace_trust_status" in columns else "NULL"
     trust_target_expr = "workspace_trust_target" if "workspace_trust_target" in columns else "NULL"
+    capability_expr = "capability_tier" if "capability_tier" in columns else "NULL"
     enabled_expr = "COALESCE(enabled, 1)" if "enabled" in columns else "1"
 
     await conn.execute(text("DROP TABLE IF EXISTS agent_team_slots_new"))
@@ -649,6 +650,7 @@ async def _sqlite_rebuild_agent_team_slots(conn, columns: set[str]) -> None:
                 launch_options JSON,
                 workspace_trust_status VARCHAR,
                 workspace_trust_target VARCHAR,
+                capability_tier VARCHAR,
                 enabled BOOLEAN NOT NULL,
                 created_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL,
@@ -677,6 +679,7 @@ async def _sqlite_rebuild_agent_team_slots(conn, columns: set[str]) -> None:
                 launch_options,
                 workspace_trust_status,
                 workspace_trust_target,
+                capability_tier,
                 enabled,
                 created_at,
                 updated_at
@@ -698,6 +701,7 @@ async def _sqlite_rebuild_agent_team_slots(conn, columns: set[str]) -> None:
                 {launch_options_expr},
                 {trust_status_expr},
                 {trust_target_expr},
+                {capability_expr},
                 {enabled_expr},
                 created_at,
                 updated_at
@@ -845,7 +849,7 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         await conn.execute(text("ALTER TABLE agent_team_slots ADD COLUMN area_labels JSON"))
     if slot_columns and "expertise" not in slot_columns:
         await conn.execute(text("ALTER TABLE agent_team_slots ADD COLUMN expertise VARCHAR"))
-    for column in ("workspace_trust_status", "workspace_trust_target"):
+    for column in ("workspace_trust_status", "workspace_trust_target", "capability_tier"):
         if slot_columns and column not in slot_columns:
             await conn.execute(text(f"ALTER TABLE agent_team_slots ADD COLUMN {column} VARCHAR"))
 
@@ -1004,6 +1008,8 @@ async def _run_sqlite_compat_migrations(conn) -> None:
     work_item_columns = {row[1] for row in result.fetchall()}
     if work_item_columns and "dispatch_priority" not in work_item_columns:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN dispatch_priority INTEGER"))
+    if work_item_columns and "issue_difficulty" not in work_item_columns:
+        await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN issue_difficulty VARCHAR"))
     if work_item_columns and "status_note" not in work_item_columns:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN status_note VARCHAR"))
     if work_item_columns and "initial_paths_readiness" not in work_item_columns:

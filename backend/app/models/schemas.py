@@ -2553,6 +2553,9 @@ AgentTeamLaunchStatus = Literal[
 ]
 
 
+CapabilityTier = Literal["low", "medium", "high"]
+
+
 class AgentTeamSlotCreate(BaseModel):
     """A desired agent slot in a saved team roster."""
 
@@ -2573,6 +2576,7 @@ class AgentTeamSlotCreate(BaseModel):
         return self
     area_labels: Optional[List[str]] = None
     expertise: Optional[str] = None
+    capability_tier: CapabilityTier | None = None
     enabled: bool = True
     position: Optional[int] = None
 
@@ -2590,6 +2594,7 @@ class AgentTeamSlotUpdate(BaseModel):
     launch_options: Optional[Dict[str, Any]] = None
     area_labels: Optional[List[str]] = None
     expertise: Optional[str] = None
+    capability_tier: CapabilityTier | None = None
     enabled: Optional[bool] = None
     position: Optional[int] = None
 
@@ -2612,6 +2617,7 @@ class AgentTeamSlotResponse(BaseModel):
     launch_options: Dict[str, Any] = Field(default_factory=dict)
     area_labels: Optional[List[str]] = None
     expertise: Optional[str] = None
+    capability_tier: CapabilityTier | None = None
     warnings: List[str] = Field(default_factory=list)
     workspace_trust_status: str | None = None
     enabled: bool

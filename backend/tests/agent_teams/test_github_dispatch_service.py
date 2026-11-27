@@ -8630,6 +8630,98 @@ async def test_route_keeps_label_order_and_ignores_disabled_slots(db):
 
 
 @pytest.mark.asyncio
+async def test_difficulty_labels_filter_area_and_classifier_candidates(db):
+    preset, slots, scope = await _team(db)
+    _, low = slots
+    low.capability_tier = "low"
+    high = await _slot(db, preset, 2, "High default", area_labels=["area:backend"], expertise="backend")
+    item = await _pending_item(db, scope, 45)
+    candidates = [*slots, high]
+    route = github_dispatch_service.route_item
+    leader_id = preset.leader_slot_id
+    assert await route(db, item, candidates, ["area:backend", "difficulty:low", "difficulty:high"],
+                       leader_slot_id=leader_id) == (high.id, "label")
+    assert await route(db, item, candidates, ["area:backend", "Difficulty:high"],
+                       leader_slot_id=leader_id) == (low.id, "label")
+    assert await route(db, item, candidates, ["area:backend", "difficulty:low"],
+                       leader_slot_id=leader_id) == (low.id, "label")
+
+    async def classify(_item, offered):
+        assert [slot.id for slot in offered] == [high.id]
+        return low.id
+
+    assert await route(db, item, candidates, ["difficulty:medium"], classify=classify,
+                       leader_slot_id=leader_id) == (None, "difficulty_above_tier")
+    low.expertise = None
+    assert await route(db, item, candidates, ["difficulty:medium"], classify=classify,
+                       leader_slot_id=leader_id) == (None, "difficulty_above_tier")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_records_difficulty_refusal_before_acquiring_a_workspace(db, monkeypatch):
+    _preset, slots, scope = await _team(db)
+    slots[1].capability_tier = "low"
+    item = await _pending_item(db, scope, 45)
+    labels = ["area:backend", "difficulty:medium"]
+    acquire = AsyncMock(side_effect=AssertionError("a blocked issue must not acquire a workspace"))
+    monkeypatch.setattr(github_workspace_service, "acquire", acquire)
+    await github_dispatch_service.dispatch_pending(
+        db, scope, slots, client=_LabelsClient(labels), launcher=_never_launch, issue_labels_by_number={45: labels})
+    await db.refresh(item)
+    assert item.dispatch_status == "pending" and item.pending_reason == "difficulty_above_tier"
+    assert item.issue_difficulty == "medium" and item.owner_slot_id is None
+    acquire.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_claim_boundary_refuses_a_prepared_owner_below_the_difficulty(db):
+    _preset, slots, scope = await _team(db)
+    owner = slots[1]
+    owner.capability_tier = "medium"
+    item = await _pending_item(db, scope, 45)
+    item.issue_difficulty = "high"
+    await github_dispatch_service.prepare_attempt(db, item, owner_slot_id=owner.id, routing_method="label",
+                                                  base_ref="origin/master")
+    claimed = await github_dispatch_service._claim_dispatch_start(
+        db, scope, item, owner_slot_id=owner.id, routing_method="label", require_autonomy=False)
+    assert not claimed and item.dispatch_status == "pending"
+    assert item.pending_reason == "difficulty_above_tier" and item.dispatch_nonce
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["tier_before_brief", "difficulty_after_brief"])
+async def test_difficulty_is_rechecked_at_the_final_start_fence(db, monkeypatch, change):
+    _preset, slots, scope = await _team(db)
+    owner = slots[1]
+    owner.capability_tier = "medium"
+    item = await _pending_item(db, scope, 45)
+    dispatch = github_dispatch_service
+    authorized = dispatch._dispatch_authorized
+
+    async def change_tier_after_read(db_, scope_, **kwargs):
+        allowed = await authorized(db_, scope_, **kwargs)
+        if change == "tier_before_brief" and kwargs.get("owner_slot_id") == owner.id:
+            owner.capability_tier = "low"
+            await db_.flush()
+        return allowed
+
+    async def change_difficulty_after_brief(db_, item_, **_kwargs):
+        item_.issue_difficulty = "high"
+        await db_.flush()
+
+    brief = AsyncMock(side_effect=change_difficulty_after_brief)
+    monkeypatch.setattr(dispatch, "_dispatch_authorized", change_tier_after_read)
+    monkeypatch.setattr(dispatch, "_send_dispatch_brief_to_slot", brief)
+    labels = ["area:backend", "difficulty:medium"]
+    await dispatch.dispatch_pending(
+        db, scope, slots, client=_LabelsClient(labels), launcher=_never_launch, issue_labels_by_number={45: labels})
+    await db.refresh(item)
+    assert item.pending_reason == "difficulty_above_tier" and item.dispatch_nonce
+    assert item.dispatch_status == ("pending" if change == "tier_before_brief" else "dispatched")
+    assert brief.await_count == (0 if change == "tier_before_brief" else 1)
+
+
+@pytest.mark.asyncio
 async def test_item_without_an_area_label_stays_pending_and_never_goes_to_the_leader(db):
     preset, slots, scope = await _team(db)
     item = await _pending_item(db, scope, 45)

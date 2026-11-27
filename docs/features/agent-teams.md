@@ -16,6 +16,18 @@ Team/scope enablement controls intake. Pausing retains configuration; inspect cu
 
 Build directory, command and parallelism fields are hints in the owner's brief; Albiex Synth City does not run those build commands. Editable numeric drafts validate on save; clearing a field does not silently increase a budget or authorize recovery.
 
+### Capability tiers and issue difficulty
+
+The Director can set a slot's capability tier to low, medium or high in the roster. An unset tier is treated as high.
+Autonomous dispatch reads the exact GitHub labels `difficulty:low`, `difficulty:medium` and `difficulty:high`.
+When several are present, the highest one applies. An issue without a difficulty label follows the usual routing.
+
+Area-label matches and classifier candidates must meet the issue difficulty. When the tier blocks dispatch,
+the work item records `difficulty_above_tier`. The scheduler rechecks eligibility when it claims the item and
+before launching the owner.
+
+Separate issues track authenticated difficulty writes and plan-time rerouting. [Difficulty writes](https://github.com/albiexai/synth-city/issues/1404) · [Plan-time rerouting](https://github.com/albiexai/synth-city/issues/1405)
+
 ### Continuation path scope
 
 A continuation request must list its allowed paths explicitly. `README.md` permits changes to that exact file. `docs/` permits changes below that directory, including nested files. It does not permit changes below `docs-old/`. It does not permit replacement of the directory itself with a file.

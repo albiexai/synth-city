@@ -592,6 +592,7 @@ class AgentTeamService:
                 launch_options=slot.launch_options or {},
                 area_labels=slot.area_labels,
                 expertise=slot.expertise,
+                capability_tier=slot.capability_tier,
                 enabled=slot.enabled,
             )
             await self._provision_slot_workspace_trust(cloned_slot)
@@ -773,6 +774,8 @@ class AgentTeamService:
             updates["area_labels"] = self._clean_area_labels(request.area_labels)
         if request.expertise is not None:
             updates["expertise"] = self._clean_optional(request.expertise)
+        if "capability_tier" in request.model_fields_set:
+            updates["capability_tier"] = request.capability_tier
         if request.launch_mode is not None:
             updates["launch_mode"] = request.launch_mode.strip() or "plain"
         if request.launch_options is not None:
@@ -2050,6 +2053,7 @@ class AgentTeamService:
             launch_options=slot.launch_options or {},
             area_labels=slot.area_labels,
             expertise=slot.expertise,
+            capability_tier=slot.capability_tier,
             warnings=self._slot_launch_warnings(slot.provider, slot.launch_options or {}),
             workspace_trust_status=slot.workspace_trust_status if uses_agent_config(slot.provider) else None,
             enabled=slot.enabled,
@@ -2211,6 +2215,7 @@ class AgentTeamService:
             "launch_options": launch_options,
             "area_labels": self._clean_area_labels(slot.area_labels),
             "expertise": self._clean_optional(slot.expertise),
+            "capability_tier": slot.capability_tier,
             "enabled": slot.enabled,
         }
 
