@@ -403,7 +403,7 @@ describe('Progress', () => {
     return options
   }
   const finishedOnly = { under_way_count: 0, under_way: [], queued_count: 0, queued: [], not_started_count: 0,
-    not_started_groups: [], decisions_ahead: [], campaign_status: 'finished' as const }
+    not_started_groups: [], decisions_ahead: [], campaign_status: 'finished' as const, finished_campaign_count: 1 }
 
   it('shows only the active campaign and one line for the finished ones', async () => {
     serveTeams([team(1, 'synth-city-v4.4', { campaign_status: 'active' }), team(2, 'synth-city-v4.3', finishedOnly),
@@ -412,7 +412,38 @@ describe('Progress', () => {
     expect(screen.getAllByRole('article', { name: /^Progress:/ })).toHaveLength(1)
     expect(screen.getByRole('article', { name: /Progress: synth-city-v4.4/ })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: /^Progress/ })).toHaveTextContent('1 campaign')
-    expect(screen.getByRole('link', { name: '3 finished campaigns ›' })).toHaveAttribute('href', '/work?category=finished')
+    // Work filters one team at a time, so each contributing team gets its own link to its finished work.
+    const history = screen.getByTestId('finished-campaigns')
+    expect(history).toHaveTextContent(/^3 finished campaigns:/)
+    for (const [id, name] of [[2, 'synth-city-v4.3'], [3, 'synth-city-v4.2'], [4, 'major-release-v3']] as const) {
+      expect(within(history).getByRole('link', { name: `${name} ›` })).toHaveAttribute('href', `/work?team_id=${id}&category=finished`)
+    }
+  })
+
+  it('counts every recorded finish, and a new campaign never hides an earlier one', async () => {
+    serveTeams([team(1, 'synth-city-v4.4', { campaign_status: 'active', finished_campaign_count: 1 }),
+      team(2, 'synth-city-v4.3', { ...finishedOnly, finished_campaign_count: 2 })])
+    await open()
+    expect(screen.getByRole('article', { name: /Progress: synth-city-v4.4/ })).toBeInTheDocument()
+    expect(screen.getByTestId('finished-campaigns')).toHaveTextContent(/^3 finished campaigns:/)
+    expect(screen.getByRole('link', { name: 'synth-city-v4.4 ›' })).toHaveAttribute('href', '/work?team_id=1&category=finished')
+  })
+
+  it('keeps the page filters on the finished-work link', async () => {
+    // Teams with a Codex CLI slot, so the Assigned-harness filter keeps them (#1142).
+    const codex = (entry: ReturnType<typeof team>) => ({ ...entry, preset: { ...entry.preset, slots: [
+      { id: entry.preset.id * 10, display_name: 'B1', provider: 'codex-cli' } as unknown as AgentTeamPreset['slots'][number]] } })
+    serveTeams([codex(team(1, 'synth-city-v4.4', { campaign_status: 'active' })), codex(team(2, 'synth-city-v4.3', finishedOnly))])
+    await open('/?provider=codex-cli')
+    expect(screen.getByRole('link', { name: '1 finished campaign ›' }))
+      .toHaveAttribute('href', '/work?team_id=2&provider=codex-cli&category=finished')
+  })
+
+  it('hides a team without a campaign record whose only decision is already done', async () => {
+    serveTeams([team(2, 'old-team', { ...finishedOnly, campaign_status: null, finished_campaign_count: 0,
+      decisions_ahead: [{ text: 'Review the design', state: 'done' }] })])
+    await open()
+    expect(screen.queryByRole('article', { name: /Progress: old-team/ })).not.toBeInTheDocument()
   })
 
   it("links one finished campaign to its team's finished work", async () => {
@@ -432,7 +463,7 @@ describe('Progress', () => {
 
   it('shows a team without a campaign record while it has work under way, but not for done work alone', async () => {
     serveTeams([team(1, 'synth-city-v4.4', { campaign_status: null }),
-      team(2, 'old-team', { ...finishedOnly, campaign_status: null })])
+      team(2, 'old-team', { ...finishedOnly, campaign_status: null, finished_campaign_count: 0 })])
     await open()
     expect(screen.getByRole('article', { name: /Progress: synth-city-v4.4/ })).toBeInTheDocument()
     expect(screen.queryByRole('article', { name: /Progress: old-team/ })).not.toBeInTheDocument()

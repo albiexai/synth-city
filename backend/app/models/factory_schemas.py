@@ -427,6 +427,9 @@ class TeamCampaignSummary(FactoryModel):
     # The team's recorded campaign in its current lifetime: the open one, else the latest finished one, else None when
     # there is no record (#1415). Overview reads it instead of inferring "finished" from the counts.
     campaign_status: Literal["active", "finishing", "finished"] | None = None
+    # Every recorded finish in the current lifetime, for the "N finished campaigns" line: a new campaign never hides an
+    # earlier finish, and a team with two finishes counts two (V1 review 6089398890).
+    finished_campaign_count: int = Field(default=0, ge=0)
 
 
 class TeamRequiredCIUnreadable(RequiredCIUnreadableSignal):

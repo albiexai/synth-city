@@ -12,8 +12,9 @@ export function campaignShown(campaign: TeamCampaignSummary | undefined) {
     (campaign.dispatch_order?.length ?? 0) > 0;
 }
 
-export function campaignFinished(campaign: TeamCampaignSummary | undefined) {
-  return campaign?.campaign_status === "finished";
+/** How many of the team's campaigns have finished: each finish counts, whatever runs now (#1415). */
+export function finishedCampaigns(campaign: TeamCampaignSummary | undefined) {
+  return campaign?.finished_campaign_count ?? 0;
 }
 
 export function campaignBarLabel(c: TeamCampaignSummary) {

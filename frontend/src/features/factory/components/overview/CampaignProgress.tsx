@@ -1,9 +1,10 @@
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { formatServerTime } from "@/lib/serverTime";
 import type { AgentTeamPreset, AgentTeamSummary, CampaignUnderWayItem } from "@/types/agentTeams";
 import { RelativeTime } from "../RelativeTime";
 import { anchor } from "../styles";
-import { campaignFinished, campaignShown } from "./campaign";
+import { workLink } from "../../filterHelpers";
+import { campaignShown, finishedCampaigns } from "./campaign";
 import { CampaignBar } from "./CampaignBar";
 
 function parentLabel(url: string | null) {
@@ -203,9 +204,18 @@ export function CampaignProgress({
     const summary = summaries[index];
     return summary && campaignShown(summary.campaign) ? [{ preset, summary }] : [];
   });
-  const finished = presets.filter((_, index) => campaignFinished(summaries[index]?.campaign ?? undefined));
+  const [params] = useSearchParams();
+  // Work filters one team at a time, so each team with finished campaigns gets its own link, with the page's filters.
+  const finished = presets.flatMap((preset, index) => {
+    const count = finishedCampaigns(summaries[index]?.campaign);
+    if (count === 0) return [];
+    const query = new URLSearchParams(params);
+    query.set("team_id", String(preset.id));
+    return [{ preset, count, href: workLink(query, "finished") }];
+  });
+  const finishedTotal = finished.reduce((total, team) => total + team.count, 0);
+  const finishedLabel = `${finishedTotal} finished ${finishedTotal === 1 ? "campaign" : "campaigns"}`;
   if (cards.length === 0 && finished.length === 0) return null;
-  const history = finished.length === 1 ? `/work?team_id=${finished[0].id}&category=finished` : "/work?category=finished";
   return (
     <section aria-labelledby="progress-heading" className="space-y-2">
       <div className="flex items-baseline justify-between gap-3">
@@ -221,11 +231,17 @@ export function CampaignProgress({
           ))}
         </div>
       )}
-      {finished.length > 0 && (
-        <p className="text-sm">
-          <Link className={anchor} to={history}>
-            {finished.length} finished {finished.length === 1 ? "campaign" : "campaigns"} ›
-          </Link>
+      {finished.length === 1 && (
+        <p className="text-sm" data-testid="finished-campaigns">
+          <Link className={anchor} to={finished[0].href}>{finishedLabel} ›</Link>
+        </p>
+      )}
+      {finished.length > 1 && (
+        <p className="flex flex-wrap gap-x-3 gap-y-1 text-sm" data-testid="finished-campaigns">
+          <span>{finishedLabel}:</span>
+          {finished.map(({ preset, href }) => (
+            <Link key={preset.id} className={anchor} to={href}>{preset.name} ›</Link>
+          ))}
         </p>
       )}
     </section>

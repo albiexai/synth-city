@@ -555,6 +555,12 @@
               "title": "Done On Other Branch Count",
               "type": "integer"
             },
+            "finished_campaign_count": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Finished Campaign Count",
+              "type": "integer"
+            },
             "latest_done": {
               "items": {
                 "$ref": "#/$defs/CampaignDoneItem"

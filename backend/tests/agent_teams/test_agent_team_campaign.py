@@ -432,3 +432,29 @@ async def test_a_team_outside_the_filter_reports_no_campaign_status(db, monkeypa
     team, _scope, _items, summary = await fixed_campaign(db, monkeypatch)
     await _record_campaigns(db, team.id, ("active",))
     assert (await summary.summary(db, team.id, provider="no-such-harness")).campaign.campaign_status is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("statuses", "status", "finished"), [
+    ((), None, 0), (("finished", "finished"), "finished", 2), (("finished", "active"), "active", 1),
+    (("finished", "finished", "finishing"), "finishing", 2),
+], ids=["none", "two_finishes", "finish_then_new_active", "two_finishes_then_finishing"])
+async def test_the_summary_counts_every_recorded_finish(db, monkeypatch, statuses, status, finished):
+    """The history line counts finished campaigns, not teams: a new campaign never hides an earlier finish (V1)."""
+    team, _scope, _items, summary = await fixed_campaign(db, monkeypatch)
+    await _record_campaigns(db, team.id, statuses)
+    campaign = (await summary.summary(db, team.id)).campaign
+    assert (campaign.campaign_status, campaign.finished_campaign_count) == (status, finished)
+
+
+@pytest.mark.asyncio
+async def test_finishes_of_another_lifetime_or_outside_the_filter_are_not_counted(db, monkeypatch):
+    from app.services import factory_audit_service as audit
+
+    team, _scope, _items, summary = await fixed_campaign(db, monkeypatch)
+    await audit.context_key_for(db, "team", team.id)
+    await _record_campaigns(db, team.id, ("finished",), key="team:an-earlier-lifetime")
+    assert (await summary.summary(db, team.id)).campaign.finished_campaign_count == 0
+    await _record_campaigns(db, team.id, ("finished",))
+    assert (await summary.summary(db, team.id)).campaign.finished_campaign_count == 1
+    assert (await summary.summary(db, team.id, provider="no-such-harness")).campaign.finished_campaign_count == 0
