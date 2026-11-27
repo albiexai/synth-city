@@ -455,6 +455,9 @@ TeamSummaryActivityReason = Literal[
     "session_identity_unavailable", "native_identity_unavailable", "native_log_unavailable", "native_log_unreadable",
     "binding_changed", "session_mismatch", "observation_unavailable", "history_window_exceeded",
     "no_current_binding", "ambiguous_binding", "duplicate_native_identity",
+    "native_event_before_process", "native_event_stale", "native_event_unsupported", "native_history_limit",
+    "native_identity_mismatch", "native_progress_without_start", "native_session_ended", "native_wait_unconfirmed",
+    "observation_incomplete", "observation_invalid", "provider_unsupported",
 ]
 
 

@@ -63,6 +63,27 @@ def test_claude_duration_deduplicates_completion(native):
     assert second["event_source"] == "claude_end_turn"
 
 
+@pytest.mark.parametrize("process_state,matching,state,reason", [
+    ("S", True, "idle", "native_turn_completed"),
+    ("T", True, "stopped", "process_stopped"),
+    ("S", False, "unknown", "session_mismatch"),
+])
+def test_claude_old_completion_requires_a_live_bound_process(
+    native, monkeypatch, process_state, matching, state, reason,
+):
+    completion_at = native["now"] - timedelta(minutes=30)
+    for row in native["records"]:
+        row["timestamp"] = (datetime.fromisoformat(row["timestamp"]) - timedelta(minutes=30)
+                            + timedelta(seconds=1)).isoformat()
+    native["write"]()
+    monkeypatch.setattr(activity, "_process_started_at", lambda start: completion_at - timedelta(minutes=5))
+    monkeypatch.setattr(activity, "_process", lambda pid: (process_state, "1000"))
+    result = native["observe"](identity=native["session"] if matching else str(uuid4()))
+    assert (result.state, result.reason) == (state, reason)
+    if state == "idle":
+        assert result.observed_at == completion_at
+
+
 @pytest.mark.parametrize("field,value", [("sessionId",str(uuid4())),("cwd","/different"),("timestamp","2099-01-01T00:00:00Z")])
 def test_claude_invalid_record_is_unknown(native, field, value):
     native["end"][field] = value; native["write"]()
