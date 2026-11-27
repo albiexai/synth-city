@@ -14,6 +14,7 @@ import stat
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
+from uuid import UUID
 
 from app.services.pricing_service import PricingService
 from app.utils.path_utils import convert_path_to_folder_name
@@ -83,61 +84,98 @@ def read_claude_usage(start: datetime, end: datetime, members: list[ClaudeMember
     start, end = _utc(start), _utc(end)
     root = (config_dir or home / ".claude") / "projects"
     pricing = PricingService()
-    folders = {member.workspace: root / convert_path_to_folder_name(str(Path(member.workspace).resolve()))
-               for member in members if member.provider == "claude-code"}
-    bound = {(member.workspace, member.session_id) for member in members
-             if member.provider == "claude-code" and member.session_id}
+    # Each transcript folder once, however its workspace is spelled. A Codex member's workspace is listed too: an
+    # earlier Claude Code session there is unattributed usage.
+    folders: dict[Path, Path] = {}
+    for member in members:
+        workspace = Path(member.workspace).resolve()
+        folders.setdefault(root / convert_path_to_folder_name(str(workspace)), workspace)
+    claims: dict[tuple[Path, str], list[str]] = {}
+    for member in members:
+        if member.provider == "claude-code" and _canonical(member.session_id):
+            claims.setdefault((_folder(root, member), member.session_id), []).append(member.member)
     results = []
     for member in members:
         if member.provider != "claude-code":
-            results.append(MemberCost(member.member, unknown_reasons=["harness_not_read"]))
-        elif not member.session_id:
-            results.append(MemberCost(member.member, unknown_reasons=["binding_unverified"]))
+            reason = "harness_not_read"
+        elif not _canonical(member.session_id):
+            reason = "binding_unverified"
+        elif len(claims[(_folder(root, member), member.session_id)]) > 1:
+            reason = "competing_binding"  # the session is shown once, unattributed
         else:
-            path = folders[member.workspace] / f"{member.session_id}.jsonl"
-            if not path.exists() and not path.is_symlink():
-                results.append(MemberCost(member.member, unknown_reasons=["no_native_session"]))
-                continue
             try:
-                models = _read(path, uid, max_bytes, start, end, pricing)
+                models = _read(_folder(root, member) / f"{member.session_id}.jsonl", member.session_id,
+                               Path(member.workspace).resolve(), uid, max_bytes, start, end, pricing)
             except _Unknown as unknown:
-                results.append(MemberCost(member.member, unknown_reasons=[unknown.reason]))
+                reason = unknown.reason
+            else:
+                results.append(_member(member.member, models))
                 continue
-            results.append(_member(member.member, models))
+        results.append(MemberCost(member.member, unknown_reasons=[reason]))
     unattributed = []
-    for workspace, folder in sorted(folders.items()):
+    for folder, workspace in sorted(folders.items()):
         for path in sorted(folder.glob("*.jsonl")) if folder.is_dir() else ():
-            if (workspace, path.stem) in bound:
+            claimants = claims.get((folder, path.stem), [])
+            if len(claimants) == 1:
                 continue
+            reasons = ["competing_binding"] if claimants else []
             try:
-                models = _read(path, uid, max_bytes, start, end, pricing)
+                models = _read(path, path.stem, workspace, uid, max_bytes, start, end, pricing)
             except _Unknown as unknown:
-                unattributed.append(UnattributedUsage(workspace, path.stem, unknown_reasons=[unknown.reason]))
+                unattributed.append(UnattributedUsage(str(workspace), path.stem, unknown_reasons=[*reasons,
+                                                                                                   unknown.reason]))
                 continue
-            if models:
-                unattributed.append(UnattributedUsage(workspace, path.stem, sum(m.messages for m in models), models))
+            if models or claimants:
+                unattributed.append(UnattributedUsage(str(workspace), path.stem, sum(m.messages for m in models),
+                                                      models, reasons + _price_reasons(models)))
     return CostReport(prices_as_of=PricingService.PRICES_AS_OF, members=results, unattributed=unattributed,
                       members_priced=sum(1 for m in results if m.cost_usd is not None), members_total=len(results))
 
 
+def _canonical(session_id: str | None) -> bool:
+    """A recorded session is a canonical UUID, so it names one file in the member's own folder."""
+    try:
+        return isinstance(session_id, str) and str(UUID(session_id)) == session_id
+    except ValueError:
+        return False
+
+
+def _folder(root: Path, member: ClaudeMember) -> Path:
+    return root / convert_path_to_folder_name(str(Path(member.workspace).resolve()))
+
+
+def _price_reasons(models: list[ModelUsage]) -> list[str]:
+    return sorted(f"price_unknown:{m.model}" for m in models if m.cost_usd is None)
+
+
 def _member(name: str, models: list[ModelUsage]) -> MemberCost:
-    unpriced = sorted(f"price_unknown:{m.model}" for m in models if m.cost_usd is None)
+    unpriced = _price_reasons(models)
     cost = None if unpriced else sum(m.cost_usd for m in models)
     return MemberCost(name, sum(m.messages for m in models), models, cost, unpriced)
 
 
-def _read(path: Path, uid: int, max_bytes: int, start: datetime, end: datetime,
+def _read(path: Path, session_id: str, workspace: Path, uid: int, max_bytes: int, start: datetime, end: datetime,
           pricing: PricingService) -> list[ModelUsage]:
-    """One session's window usage by model, from a bounded read of its own file."""
+    """One session's window usage by model, from a bounded read of its own file. Every row must be this session's."""
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        descriptor: int | None = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        raise _Unknown("no_native_session") from None
     except OSError:
         raise _Unknown("native_log_unreadable") from None
-    with os.fdopen(descriptor, "rb") as stream:
-        info = os.fstat(stream.fileno())
+    try:
+        info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise _Unknown("native_log_unreadable")
-        data = stream.read(max_bytes + 1)  # one byte past the bound shows the file is over it
+        stream = os.fdopen(descriptor, "rb")
+        descriptor = None  # the stream closes it now
+        with stream:
+            data = stream.read(max_bytes + 1)  # one byte past the bound shows the file is over it
+    except OSError:
+        raise _Unknown("native_log_unreadable") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     if len(data) > max_bytes:
         raise _Unknown("native_log_unreadable")
     seen: set[str] = set()
@@ -149,9 +187,15 @@ def _read(path: Path, uid: int, max_bytes: int, start: datetime, end: datetime,
             row = json.loads(line)
         except ValueError:
             raise _Unknown("format_unknown") from None
-        if not isinstance(row, dict) or row.get("type") != "assistant":
-            continue
+        if not isinstance(row, dict) or not isinstance(row.get("type"), str):
+            raise _Unknown("format_unknown")
+        if row["type"] != "assistant":
+            continue  # a user turn, a system notice or a summary carries no usage
         message_id, model, at, tokens = _message(row)
+        cwd = row.get("cwd")
+        if (row.get("sessionId") != session_id or not isinstance(cwd, str) or not Path(cwd).is_absolute()
+                or not Path(cwd).resolve().is_relative_to(workspace)):
+            raise _Unknown("session_mismatch")
         if message_id in seen:
             continue  # one message is written as one row per content block: count it once, at its first row
         seen.add(message_id)
@@ -166,9 +210,10 @@ def _read(path: Path, uid: int, max_bytes: int, start: datetime, end: datetime,
         price = pricing.dated_price(model)
         if price is None or usage.cost_usd is None:
             usage.cost_usd = None
-        else:  # per message, as a request's tokens decide its tier
-            usage.cost_usd += sum(pricing.calculate_tiered_cost(
-                tokens[name], price.get(name), price.get(f"{name}_above_200k")) for name in _FIELDS)
+        else:  # the request's whole prompt picks its tier, and that tier prices every class, output included
+            prompt = tokens["input"] + tokens["cache_creation"] + tokens["cache_read"]
+            tier = "_above_200k" if prompt > PricingService.TIERED_THRESHOLD else ""
+            usage.cost_usd += sum(tokens[name] * price.get(f"{name}{tier}", price[name]) for name in _FIELDS)
     return sorted(by_model.values(), key=lambda usage: usage.model)
 
 
