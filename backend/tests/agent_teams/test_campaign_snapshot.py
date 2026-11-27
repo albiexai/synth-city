@@ -752,3 +752,10 @@ async def test_the_cached_snapshot_is_read_without_building_one(db, world):
     assert snapshots.cached_snapshot(campaign.id) is None
     built = await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF)
     assert snapshots.cached_snapshot(campaign.id) == built
+
+
+async def test_a_cutoff_gap_leaves_every_repository_count_unknown_in_the_snapshot(db, world):
+    campaign = await _campaign(db, world)
+    snapshot = await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, observed_at=AS_OF + timedelta(days=1), cached=False)
+    assert [(r.issues, r.complete, r.cutoff_gaps) for r in snapshot.repositories] == [
+        (None, True, ["membership_read_after_cutoff"])] * 2

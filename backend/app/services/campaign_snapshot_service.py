@@ -51,6 +51,7 @@ class SnapshotRepository(BaseModel):
     issues: int | None
     complete: bool
     reason: str | None = None
+    cutoff_gaps: list[str] = []  # why the count is unknown although the read was complete
 
 
 class Snapshot(BaseModel):
@@ -213,12 +214,16 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
         calculation_version=CALCULATION_VERSION, metrics=sorted(metrics, key=lambda sample: sample.name),
         recorded_coverage=[MeasureCoverageEntry(measure=c.measure, started_at=c.started_at, covered=c.covered,
                                                 reason=c.reason) for c in coverage],
-        repositories=_repositories(membership, members))
+        repositories=_repositories(membership, members, [gap for gap in gaps if gap in _CUTOFF_GAPS]))
 
 
-def _repositories(membership, members) -> list[SnapshotRepository]:
+_CUTOFF_GAPS = ("membership_read_after_cutoff", "departure_after_cutoff", "delivery_after_cutoff")
+
+
+def _repositories(membership, members, cutoff: list[str]) -> list[SnapshotRepository]:
     """Each repository once (the spelling is not case-sensitive) with its issue count, unknown while any read of it
-    is incomplete (#1252). The counts use the same members as ``issues_in_scope``."""
+    is incomplete (#1252). The counts use the same members as ``issues_in_scope``. A gap at the cutoff leaves every
+    count unknown, as it does the total (V1 review 114): today's membership is not the membership at ``as_of``."""
     per_repository: dict[str, int] = {}
     for repo, _number in members:
         per_repository[repo] = per_repository.get(repo, 0) + 1
@@ -228,9 +233,11 @@ def _repositories(membership, members) -> list[SnapshotRepository]:
         known = rows.get(key)
         complete = coverage.complete and (known is None or known.complete)
         reason = known.reason if known is not None and known.reason else coverage.reason
+        counted = complete and not cutoff
         rows[key] = SnapshotRepository(repo=known.repo if known else coverage.repo,
-                                       issues=per_repository.get(key, 0) if complete else None,
-                                       complete=complete, reason=None if complete else reason)
+                                       issues=per_repository.get(key, 0) if counted else None,
+                                       complete=complete, reason=None if complete else reason,
+                                       cutoff_gaps=cutoff)
     return list(rows.values())
 
 

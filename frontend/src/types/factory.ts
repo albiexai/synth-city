@@ -327,7 +327,14 @@ export type WorkListResponse = {
 
 // #1252: the campaigns list (GET /factory/campaigns). A count that is not recorded is null with a reason, never 0.
 export type CampaignStatus = "active" | "finishing" | "finished";
-export type CampaignMeasure = { value: number | null; reason: string | null };
+// ``coverage``, ``unknown_count`` and ``reasons`` are the snapshot's own: a known value can still be partial.
+export type CampaignMeasure = {
+  value: number | null;
+  reason: string | null;
+  coverage?: string | null;
+  unknown_count?: number | null;
+  reasons?: string[];
+};
 export type CampaignRepositoryCount = { repo: string; issues: number | null; reason: string | null };
 export type CampaignRow = {
   id: number;
@@ -340,7 +347,8 @@ export type CampaignRow = {
   in_scope: CampaignMeasure;
   repositories: CampaignRepositoryCount[];
   repositories_unknown_reason: string | null;
-  source: { kind: "frozen" | "live"; as_of: string } | null;
+  // ``as_of`` is the cutoff that the counts describe. ``frozen_at`` is when a frozen version was stored.
+  source: { kind: "frozen" | "live"; as_of: string; frozen_at?: string | null } | null;
 };
 export type CampaignListResponse = {
   schema_version: 1;

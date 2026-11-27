@@ -43,12 +43,17 @@ class CampaignRepositoryCount(BaseModel):
 
 class CampaignCountSource(BaseModel):
     kind: Literal["frozen", "live"]
-    as_of: datetime
+    as_of: datetime  # the cutoff that the counts describe (the snapshot's own ``as_of``)
+    frozen_at: datetime | None = None  # when the frozen version was stored
 
 
 class CampaignMeasure(BaseModel):
     value: int | None
     reason: str | None = None
+    # The snapshot's own coverage of this number (V1 review 114): a value with unknown outcomes stays partial.
+    coverage: str | None = None
+    unknown_count: int | None = None
+    reasons: list[str] = []
 
 
 class CampaignRow(BaseModel):
@@ -89,12 +94,29 @@ class CampaignListResponse(BaseModel):
 def _measure(metrics: list[dict], name: str, missing: str) -> CampaignMeasure:
     for metric in metrics:
         if metric.get("name") == name:
+            reasons = list(metric.get("unknown_reasons") or [])
             value = metric.get("value")
-            if value is None:
-                reasons = metric.get("unknown_reasons") or []
-                return CampaignMeasure(value=None, reason=reasons[0] if reasons else "unknown")
-            return CampaignMeasure(value=int(value))
+            return CampaignMeasure(
+                value=None if value is None else int(value), reason=(reasons[0] if reasons else "unknown") if value is None else None,
+                coverage=metric.get("coverage"), unknown_count=metric.get("unknown_count"), reasons=reasons)
     return CampaignMeasure(value=None, reason=missing)
+
+
+def _cutoff(payload: dict, stored) -> datetime:
+    """The cutoff that a snapshot's counts describe. A payload without one falls back to its storage time."""
+    value = payload.get("as_of")
+    try:
+        return _naive_utc(datetime.fromisoformat(value)) if value else _naive_utc(stored.created_at)
+    except (TypeError, ValueError):
+        return _naive_utc(stored.created_at)
+
+
+def _once(names: list[str]) -> list[str]:
+    """Each repository once: the spelling of an owner or name is not case-sensitive."""
+    seen: dict[str, str] = {}
+    for name in names:
+        seen.setdefault(name.lower(), name)
+    return list(seen.values())
 
 
 async def _latest_frozen(db, ids: list[int]) -> dict[int, CampaignSnapshot]:
@@ -137,8 +159,8 @@ async def campaign_list(db, *, team_id: int | None, scope_id: int | None, status
     marker = _naive_utc(marker) if marker is not None else None
 
     query = select(Campaign).order_by(Campaign.started_at.desc(), Campaign.id.desc())
-    if team_id is not None:
-        query = query.where(Campaign.preset_id == team_id)
+    if team_id is not None:  # the selected team lifetime only: a retired one with the same id is another team
+        query = query.where(Campaign.preset_id == team_id, Campaign.team_context_key == (keys.get(team_id) or ""))
     campaigns = list((await db.scalars(query)).all())
     frozen = await _latest_frozen(db, [campaign.id for campaign in campaigns])
 
@@ -150,28 +172,33 @@ async def campaign_list(db, *, team_id: int | None, scope_id: int | None, status
         live = None if stored is not None else snapshots.cached_snapshot(campaign.id)
         evidenced = marker is not None and _naive_utc(campaign.started_at) < marker
         is_live = campaign.status in LIVE
-        repositories: list[CampaignRepositoryCount] = []
         unknown: str | None = None
         source = None
         metrics: list[dict] = []
+        counted: dict[str, CampaignRepositoryCount] = {}
+        counts_made = False
         if stored is not None or live is not None:
             payload = stored.payload if stored is not None else live.model_dump(mode="json")
-            source = CampaignCountSource(
-                kind="frozen" if stored is not None else "live",
-                as_of=_naive_utc(stored.created_at) if stored is not None else _naive_utc(live.as_of))
+            source = CampaignCountSource(kind="frozen" if stored is not None else "live", as_of=_cutoff(payload, stored or live),
+                                         frozen_at=_naive_utc(stored.created_at) if stored is not None else None)
             metrics = payload.get("metrics") or []
-            counted = payload.get("repositories") or []
-            repositories = [CampaignRepositoryCount(repo=item["repo"], issues=item.get("issues"),
-                                                    reason=None if item.get("complete") else (item.get("reason") or "incomplete_read"))
-                            for item in counted]
-            if not repositories:
-                unknown = "snapshot_without_repository_counts"
-        elif is_live and current:
-            repositories = [CampaignRepositoryCount(repo=name, issues=None, reason="not_read_yet")
-                            for name in scopes_by_team.get(campaign.preset_id, [])]
-            unknown = None if repositories else "not_read_yet"
+            counts_made = bool(payload.get("repositories"))
+            for item in payload.get("repositories") or []:
+                reason = None if item.get("issues") is not None else (
+                    item.get("reason") or (item.get("cutoff_gaps") or [None])[0] or "incomplete_read")
+                counted.setdefault(item["repo"].lower(), CampaignRepositoryCount(repo=item["repo"], issues=item.get("issues"), reason=reason))
+        names = _once(scopes_by_team.get(campaign.preset_id, [])) if is_live and current else []
+        if names:
+            # A live campaign covers the repositories that its team watches now. A repository that the snapshot does
+            # not list proves inclusion with an unknown count: it was added after the snapshot, or none was read yet.
+            absent = ("not_read_yet" if source is None else
+                      "repository_added_after_snapshot" if counts_made else "snapshot_without_repository_counts")
+            repositories = [counted.get(name.lower()) or CampaignRepositoryCount(repo=name, issues=None, reason=absent) for name in names]
         else:
-            unknown = "before_recording" if evidenced else "no_snapshot"
+            repositories = list(counted.values())
+        if not repositories:
+            unknown = ("snapshot_without_repository_counts" if source is not None else "not_read_yet") if (
+                source is not None or (is_live and current)) else ("before_recording" if evidenced else "no_snapshot")
         missing = "not_read_yet" if is_live else (unknown or "no_snapshot")
         rows.append(CampaignRow(
             id=campaign.id, team=CampaignTeam(id=team.id, name=team.name) if team is not None else None,
@@ -180,23 +207,25 @@ async def campaign_list(db, *, team_id: int | None, scope_id: int | None, status
             merged=_measure(metrics, "merged", missing), in_scope=_measure(metrics, "issues_in_scope", missing),
             repositories=repositories, repositories_unknown_reason=unknown, source=source))
 
-    hidden = 0
+    def shown(row: CampaignRow) -> bool:
+        return status == "all" or (row.status in LIVE) == (status == "live")
+
+    unknown_rows: list[CampaignRow] = []
     if wanted_repository is not None:
         kept = []
         for row in rows:
             if any(item.repo.lower() == wanted_repository for item in row.repositories):
                 kept.append(row)
             elif not row.repositories:
-                hidden += 1
+                unknown_rows.append(row)
         rows = kept
+    # The tallies count the campaigns that the repository and team filters keep; the status filter only picks the rows.
+    hidden = sum(1 for row in unknown_rows if shown(row))
     counts = CampaignStatusCounts(live=sum(1 for row in rows if row.status in LIVE),
                                   finished=sum(1 for row in rows if row.status == "finished"))
     before = sum(1 for row in rows if row.status == "finished" and marker is not None and row.finished_at is not None
                  and row.finished_at < marker)
-    if status == "live":
-        rows = [row for row in rows if row.status in LIVE]
-    elif status == "finished":
-        rows = [row for row in rows if row.status == "finished"]
+    rows = [row for row in rows if shown(row)]
     page = rows[offset:offset + limit]
     more = offset + limit < len(rows)
     return CampaignListResponse(

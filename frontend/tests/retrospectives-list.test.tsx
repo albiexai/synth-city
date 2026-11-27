@@ -32,15 +32,15 @@ const reply = (rows: CampaignRow[], over: Partial<CampaignListResponse> = {}): C
     finished: rows.filter((r) => r.status === "finished").length }, hidden_unknown_repositories: 0, finished_before_recording: 0, has_more: false, next_cursor: null, ...over,
 });
 
-let answer: () => Response = () => jsonResponse(reply([]));
+let answer: (query: URLSearchParams) => Response = () => jsonResponse(reply([]));
 function Probe() {
   const location = useLocation();
   return <div data-testid="url">{location.search}</div>;
 }
-function open(url = "/insights/retrospectives", body: () => Response = () => jsonResponse(reply([LIVE, FROZEN, NO_SNAPSHOT, RETIRED]))) {
+function open(url = "/insights/retrospectives", body: (query: URLSearchParams) => Response = () => jsonResponse(reply([LIVE, FROZEN, NO_SNAPSHOT, RETIRED]))) {
   answer = body;
-  const fixture = fixtureFetch((path) => {
-    if (path === "factory/campaigns") return answer();
+  const fixture = fixtureFetch((path, query) => {
+    if (path === "factory/campaigns") return answer(query);
     if (path === "factory/repositories") return jsonResponse({ repositories: REPOSITORIES, has_more: false });
     return jsonResponse({});
   });
@@ -74,8 +74,8 @@ describe("the rows", () => {
   it("says where the counts come from and how old they are", async () => {
     open();
     await screen.findByRole("table");
-    expect(screen.getByText(/Counts frozen/)).toBeInTheDocument();
-    expect(screen.getByText(/Counts read/)).toBeInTheDocument();
+    expect(screen.getByText(/Counts as of .*, frozen /)).toBeInTheDocument();
+    expect(screen.getAllByText(/Counts as of/)).toHaveLength(2);
   });
 
   it("links each campaign to its page", async () => {
@@ -129,10 +129,6 @@ describe("the summary line", () => {
     expect(await screen.findByText(/2 campaigns have unknown repositories, so the repository filter does not show them\./)).toBeInTheDocument();
   });
 
-  it("says when only the first page is shown", async () => {
-    open("/insights/retrospectives", () => jsonResponse(reply([LIVE], { has_more: true, next_cursor: "100" })));
-    expect(await screen.findByText("Showing the first 1 campaigns.")).toBeInTheDocument();
-  });
 });
 
 describe("the filters and the URL", () => {
@@ -243,5 +239,71 @@ describe("empty, loading and failed reads", () => {
     expect(await screen.findByRole("alert")).toBeInTheDocument();
     expect(screen.queryByText(/No campaigns yet/)).not.toBeInTheDocument();
     expect(screen.queryByText(/No campaign matches/)).not.toBeInTheDocument();
+  });
+});
+
+describe("coverage, identity and paging (V1 review 114)", () => {
+  it("keeps a partial value and says how many outcomes are unknown and why", async () => {
+    open("/insights/retrospectives", () => jsonResponse(reply([row({ merged: { value: 41, reason: null, coverage: "partial", unknown_count: 2, reasons: ["delivery_history_missing"] } })])));
+    await screen.findByRole("table");
+    const live = within(table()).getByRole("link", { name: "release:v4.4" }).closest("tr")!;
+    expect(live).toHaveTextContent("41 / 63");
+    expect(live).toHaveTextContent("partial · 2 unknown · delivery history missing");
+  });
+
+  it("says why a repository count is unknown when the read came after the cutoff", async () => {
+    open("/insights/retrospectives", () => jsonResponse(reply([row({ repositories: [{ repo: "o/a1", issues: null, reason: "membership_read_after_cutoff" }] })])));
+    await screen.findByRole("table");
+    expect(screen.getByText("o/a1 (", { exact: false })).toHaveTextContent("o/a1 (unknown · read after the cutoff)");
+  });
+
+  it("names the freeze time apart from the cutoff of the frozen counts", async () => {
+    open("/insights/retrospectives", () => jsonResponse(reply([row({ status: "finished", finished_at: "2026-11-18T09:00:00",
+      source: { kind: "frozen", as_of: "2026-11-18T09:00:00", frozen_at: "2026-11-25T10:00:00" } })])));
+    await screen.findByRole("table");
+    expect(screen.getByText(/Counts as of Nov 18, 2026, frozen Nov 25, 2026/)).toBeInTheDocument();
+  });
+
+  it("keeps two teams with one name apart, and groups one repository under one heading whatever its spelling", async () => {
+    open("/insights/retrospectives", () => jsonResponse(reply([
+      row({ id: 1, team: { id: 5, name: "Same" }, repositories: [{ repo: "O/A1", issues: 1, reason: null }, { repo: "o/a1", issues: 1, reason: null }] }),
+      row({ id: 2, team: { id: 6, name: "Same" }, repositories: [{ repo: "o/a1", issues: 2, reason: null }] }),
+    ])));
+    await screen.findByRole("table");
+    expect(within(table()).getAllByRole("columnheader").map((h) => h.textContent).filter((t) => t?.startsWith("Team"))).toEqual(["Team Same", "Team Same"]);
+    expect(within(table()).getAllByRole("link", { name: "release:v4.4" })[0].closest("tr")!.querySelectorAll("li")).toHaveLength(1); // listed once
+    cleanup(); resetFactoryReads();
+    open("/insights/retrospectives?group=repository", () => jsonResponse(reply([
+      row({ id: 1, repositories: [{ repo: "O/A1", issues: 1, reason: null }] }), row({ id: 2, repositories: [{ repo: "o/a1", issues: 2, reason: null }] })])));
+    await screen.findByRole("table");
+    expect(within(table()).getAllByRole("columnheader").map((h) => h.textContent).filter((t) => t?.toLowerCase() === "o/a1")).toEqual(["O/A1"]);
+  });
+
+  it("reaches every campaign with Show more, follows the cursor, and starts again when a filter changes", async () => {
+    const pages = (query: URLSearchParams) => query.get("cursor") === "100"
+      ? jsonResponse(reply([row({ id: 101, selector: "label:last" })], { total: 101 }))
+      : jsonResponse(reply([LIVE, FROZEN], { total: 101, has_more: true, next_cursor: "100" }));
+    const fixture = open("/insights/retrospectives", pages);
+    await screen.findByRole("table");
+    expect(screen.getByText("Showing 2 of 101 campaigns.")).toBeInTheDocument();
+    expect(within(table()).queryByRole("link", { name: "last" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show more campaigns" }));
+    expect(await within(table()).findByRole("link", { name: "last" })).toBeInTheDocument();
+    expect(sent(fixture).get("cursor")).toBe("100");
+    expect(screen.queryByRole("button", { name: "Show more campaigns" })).not.toBeInTheDocument();
+    choose("Status", "live");
+    await waitFor(() => expect(sent(fixture).get("status")).toBe("live"));
+    expect(sent(fixture).get("cursor")).toBeNull();
+    expect(await screen.findByRole("button", { name: "Show more campaigns" })).toBeInTheDocument();
+  });
+
+  it("carries the selected repository in the link to a campaign, and nothing when none is selected", async () => {
+    open("/insights/retrospectives?scope_id=11", () => jsonResponse(reply([LIVE])));
+    await screen.findByRole("table");
+    expect(within(table()).getByRole("link", { name: "release:v4.4" })).toHaveAttribute("href", "/insights/retrospectives/1?scope_id=11");
+    cleanup(); resetFactoryReads();
+    open("/insights/retrospectives", () => jsonResponse(reply([LIVE])));
+    await screen.findByRole("table");
+    expect(within(table()).getByRole("link", { name: "release:v4.4" })).toHaveAttribute("href", "/insights/retrospectives/1");
   });
 });

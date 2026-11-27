@@ -27,7 +27,7 @@ from app.services import campaign_snapshot_service as snapshots
 from app.services.factory_campaign_list_service import campaign_list
 from app.services.factory_projection_service import FactoryReadError
 from tests.agent_teams.test_campaign_record import FakeGithub, _issue, db, world  # noqa: F401  (fixtures)
-from tests.agent_teams.test_campaign_snapshot import AS_OF, OPERATOR, T0, _client
+from tests.agent_teams.test_campaign_snapshot import AS_OF, OPERATOR, T0, _campaign, _client
 
 pytestmark = pytest.mark.asyncio
 
@@ -112,7 +112,7 @@ async def test_a_snapshot_made_before_repository_counts_is_unknown_not_empty(db,
                             payload=payload, created_by="operator"))
     await db.commit()
     row = (await _list(db)).campaigns[0]
-    assert (row.repositories, row.repositories_unknown_reason) == ([], "snapshot_without_repository_counts")
+    assert _by_repo(row) == {"o/a1": (None, "snapshot_without_repository_counts"), "o/a2": (None, "snapshot_without_repository_counts")}
     assert row.source.kind == "frozen" and row.in_scope.value == 3
 
 
@@ -201,6 +201,68 @@ async def test_bad_arguments_are_refused(db, world):
     with pytest.raises(FactoryReadError) as missing:
         await _list(db, scope_id=999999)
     assert missing.value.status == 404
+
+
+# V1 review 114
+async def test_a_cutoff_gap_leaves_every_repository_count_unknown(db, world):
+    campaign = await _start(db, world.team)
+    await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, observed_at=AS_OF + timedelta(days=1))
+    row = (await _list(db)).campaigns[0]
+    assert _by_repo(row) == {"o/a1": (None, "membership_read_after_cutoff"), "o/a2": (None, "membership_read_after_cutoff")}
+    assert row.in_scope.value is None and "membership_read_after_cutoff" in row.in_scope.reasons
+
+
+async def test_a_partial_measure_keeps_its_value_coverage_unknown_count_and_reason(db, world):
+    campaign = await _campaign(db, world, undelivered=False)  # one proven merge and one closed issue with no outcome
+    await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF)
+    row = (await _list(db)).campaigns[0]
+    assert (row.merged.value, row.merged.coverage, row.merged.unknown_count) == (1, "partial", 1)
+    assert row.merged.reasons == ["delivery_history_missing"] and row.in_scope.coverage == "full"
+
+
+async def test_the_age_of_frozen_counts_is_the_snapshot_cutoff_and_the_freeze_time_is_separate(db, world):
+    campaign = await _start(db, world.team)
+    await snapshots.freeze(db, campaign, _client(), actor=OPERATOR, as_of=AS_OF)
+    source = (await _list(db)).campaigns[0].source
+    assert (source.kind, source.as_of) == ("frozen", AS_OF)
+    assert source.frozen_at is not None and source.frozen_at != AS_OF
+
+
+async def test_a_team_filter_excludes_a_retired_lifetime_with_the_same_id(db, world):
+    current = await _start(db, world.team)
+    db.add(Campaign(team_context_key="team:old-lifetime", preset_id=world.team, selector="label:old", status="finished",
+                    started_at=T0 - timedelta(days=30), finished_at=T0 - timedelta(days=20)))
+    await db.commit()
+    assert len((await _list(db)).campaigns) == 2
+    assert [row.id for row in (await _list(db, team_id=world.team)).campaigns] == [current.id]
+
+
+async def test_a_live_campaign_stays_under_a_repository_added_after_its_snapshot_with_an_unknown_count(db, world):
+    campaign = await _start(db, world.team)
+    await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF)
+    added = TeamGithubScope(preset_id=world.team, repo_owner="o", repo_name="a3", repo_path="/private/a3", enabled=True)
+    db.add(added)
+    await db.commit()
+    kept = await _list(db, scope_id=added.id)
+    assert [row.id for row in kept.campaigns] == [campaign.id]
+    assert _by_repo(kept.campaigns[0])["o/a3"] == (None, "repository_added_after_snapshot")
+    assert _by_repo(kept.campaigns[0])["o/a1"] == (2, None)
+
+
+async def test_the_hidden_tally_counts_only_campaigns_that_the_status_filter_shows(db, world):
+    await _start(db, world.team)
+    done = await _start(db, world.other, "label:b")
+    await _finish_without_snapshot(db, done, T0 + timedelta(days=2))
+    assert (await _list(db, scope_id=world.scopes["a1"], status="live")).hidden_unknown_repositories == 0
+    assert (await _list(db, scope_id=world.scopes["a1"], status="finished")).hidden_unknown_repositories == 1
+    assert (await _list(db, scope_id=world.scopes["a1"])).hidden_unknown_repositories == 1
+
+
+async def test_two_spellings_of_one_repository_are_listed_once(db, world):
+    await _start(db, world.team)
+    db.add(TeamGithubScope(preset_id=world.team, repo_owner="O", repo_name="A1", repo_path="/private/a1x", enabled=True))
+    await db.commit()
+    assert [item.repo.lower() for item in (await _list(db)).campaigns[0].repositories] == ["o/a1", "o/a2"]
 
 
 @pytest_asyncio.fixture
