@@ -21,17 +21,17 @@ Each actor is one of three kinds.
 | Kind | Actors | Job |
 |---|---|---|
 | **Human** | The Director | Owns the outcome and the backlog. Makes the retained decisions. |
-| **AI agent** | Supervisor, Leader, implementers, verifiers, optional grooming helper | Work that needs judgment: supervision, planning, implementation and review. |
+| **AI agent** | Supervisor, Leader, implementers, verifiers, optional refinement helper | Work that needs judgment: supervision, planning, implementation and review. |
 | **Non-agent system** | Synth City controller, maintenance script, GitHub | Work that a rule can do: dispatch, leases, Mail, attention signals, the maintenance operation and the record. |
 
 When a rule can do a job, the job belongs in the controller, not in an agent prompt.
 
 ## Hierarchy of roles
 
-[![Hierarchy of roles: the Director at the top; the supervisor and the grooming helper as optional staff roles; the Leader; implementers and verifiers; the Synth City controller and GitHub as non-agent systems, not ranks](/images/operating-model/hierarchy.svg)](/images/operating-model/hierarchy.svg)
+[![Hierarchy of roles: the Director at the top; the supervisor and the refinement helper as optional staff roles; the Leader; implementers and verifiers; the Synth City controller and GitHub as non-agent systems, not ranks](/images/operating-model/hierarchy.svg)](/images/operating-model/hierarchy.svg)
 
 - The line of command is Director → Leader → implementers and verifiers.
-- The supervisor and the grooming helper are **staff roles** beside that line. Both are optional. Without a supervisor, the Leader reports directly to the Director.
+- The supervisor and the refinement helper are **staff roles** beside that line. Both are optional. Without a supervisor, the Leader reports directly to the Director.
 - The supervisor uses the Director's powers only within the recorded delegation. It does not take the Leader's authority over plans and backlog assessments.
 - Each team has one Leader, selected by `leader_slot_id`. The Director chooses the number of implementers and verifiers. Scope limits such as `max_concurrent_dispatched` limit concurrent work, not team size.
 - The Synth City controller and GitHub are not ranks. The controller enforces the hierarchy with tokens, leases, limits and Mail identity. GitHub holds the backlog and the record.
@@ -39,7 +39,7 @@ When a rule can do a job, the job belongs in the controller, not in an agent pro
 
 ## The factory
 
-[![The factory: the Synth City controller and the team inside the factory boundary; the Director, the supervisor, the grooming helper and GitHub outside it](/images/operating-model/factory.svg)](/images/operating-model/factory.svg)
+[![The factory: the Synth City controller and the team inside the factory boundary; the Director, the supervisor, the refinement helper and GitHub outside it](/images/operating-model/factory.svg)](/images/operating-model/factory.svg)
 
 The **factory** is the Synth City controller and the AI teams, working together on the Director's backlog. The Director, the supervisor, the AI helpers and GitHub work with the factory from outside it.
 
@@ -52,17 +52,17 @@ Test: if the Director must start, stop, upgrade or repair a part, the part is in
 | Team (AI agents) | Yes | Synth City launches its sessions. The Director chooses the roster. |
 | GitHub (non-agent) | No | It keeps running when the factory stops. It holds the backlog, and the result goes out there. |
 | Director (human) | No | The Director owns the factory and the backlog and keeps the retained decisions. |
-| Grooming helper (AI agent) | No | It is optional. It works for the Director, not for the factory. |
+| Refinement helper (AI agent) | No | It is optional. It works for the Director, not for the factory. |
 
 ### The Director owns the backlog
 
-The Director owns and grooms the GitHub backlog:
+The Director owns and refines the GitHub backlog:
 
 - Write and order the issues.
 - Set the acceptance conditions.
 - Apply the dispatch label. The dispatch label is the Director's "ready" signal.
 
-An optional AI agent can help. It drafts or splits issues for the Director, and the Director decides. The Leader assesses the groomed backlog and selects the next eligible work. The Leader does not own the backlog.
+An optional AI agent can help. It drafts or splits issues for the Director, and the Director decides. The Leader assesses the refined backlog and selects the next eligible work. The Leader does not own the backlog.
 
 ## Two operating modes
 
@@ -90,17 +90,17 @@ The supervisor works on the factory from outside it, and it does not run inside 
 
 | Duty | Owner | Kind |
 |---|---|---|
-| Own and groom the backlog | Director, optionally helped by an agent | Human |
+| Own and refine the backlog | Director, optionally helped by an agent | Human |
 | Detect stalls, stopped attempts, holds and required decisions | Synth City controller | Non-agent |
-| Assess the groomed backlog, approve plans, select the next eligible work | Team Leader | AI agent |
+| Assess the refined backlog, approve plans, select the next eligible work | Team Leader | AI agent |
 | Repair, upgrade and roll back the factory | Supervisor, with the maintenance script | AI agent and non-agent |
 | Retained decisions: publication, budgets, models, security HOLD | Director | Human |
 
 ## One campaign, start to finish
 
-| Actor | Groom | Prepare | Run | Decision | Maintenance | Finish |
+| Actor | Refine | Prepare | Run | Decision | Maintenance | Finish |
 |---|---|---|---|---|---|---|
-| **Director** (human) | Write and order issues; apply the dispatch label | Write the outcome and delegation; authorize the start | Groom at any time; read the summary | Approve or decide on GitHub | Only for a security HOLD | Approve publication |
+| **Director** (human) | Write and order issues; apply the dispatch label | Write the outcome and delegation; authorize the start | Refine at any time; read the summary | Approve or decide on GitHub | Only for a security HOLD | Approve publication |
 | **Supervisor** (AI agent, optional) | Draft issues for the Director | Run startup checks | Fix routine blockers within delegation | Prepare the exact request and evidence | Fix, hand off, run the reviewed upgrade | Reconcile records; disable dispatch |
 | **Synth City controller** (non-agent) | Poll labelled issues | Store scopes, leases and Mail identity | Dispatch; bound attempts; show signals | List the human action | Record the operation; preserve authority and leases | Show the result |
 | **Leader and team** (AI agents) | Optional readiness assessment | Mail canary | Assess, plan, implement, verify | Independent work continues | Owner checkpoint, then hold | Report results |

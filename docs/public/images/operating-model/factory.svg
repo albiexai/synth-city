@@ -87,10 +87,10 @@
   </g>
   <text x="675" y="370" text-anchor="middle" font-size="10.5" fill="#78716c">size set by the Director</text>
 
-  <!-- Grooming helper (agent, outside the factory, works for the Director) -->
+  <!-- Refinement helper (agent, outside the factory, works for the Director) -->
   <rect x="790" y="146" width="160" height="94" rx="9" fill="#ede9fe" stroke="#6d28d9" stroke-width="2" stroke-dasharray="6 3"/>
   <use href="#i-agent" x="799" y="154" width="20" height="20" fill="#6d28d9"/>
-  <text x="824" y="169" font-size="13" font-weight="700" fill="#4c1d95">Grooming helper</text>
+  <text x="824" y="169" font-size="11.5" font-weight="700" fill="#4c1d95">Refinement helper</text>
   <text x="800" y="189" font-size="10" font-weight="700" fill="#6d28d9" letter-spacing=".4">AI AGENT · OPTIONAL</text>
   <text x="800" y="206" font-size="11" fill="#4c1d95">drafts and splits issues;</text>
   <text x="800" y="222" font-size="11" fill="#4c1d95">the Director decides</text>
@@ -113,7 +113,7 @@
   <path d="M500,74 L500,141" stroke="#b45309" stroke-width="2.2" fill="none" marker-end="url(#mh)"/>
   <text x="508" y="94" font-size="12" fill="#78350f">reads one card</text>
   <path d="M650,43 L968,43 L968,266" stroke="#b45309" stroke-width="2.6" fill="none" marker-end="url(#mh)"/>
-  <text x="668" y="35" font-size="12" font-weight="700" fill="#78350f">owns + grooms the backlog · decides</text>
+  <text x="668" y="35" font-size="12" font-weight="700" fill="#78350f">owns + refines the backlog · decides</text>
   <path d="M350,43 C200,43 100,90 100,176" stroke="#b45309" stroke-width="2.2" fill="none" marker-end="url(#mh)"/>
   <text x="135" y="40" text-anchor="end" font-size="12" fill="#78350f">delegates</text>
   <text x="135" y="55" text-anchor="end" font-size="11" fill="#78350f">(text in parent issue)</text>
@@ -131,8 +131,8 @@
 
   <!-- Arrows: system -->
   <path d="M550,236 L586,236" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#ms)" marker-start="url(#ms)"/>
-  <text x="553" y="228" font-size="9.5" fill="#334155">Mail</text>
-  <text x="553" y="252" font-size="9.5" fill="#334155">dispatch</text>
+  <text x="570" y="228" text-anchor="middle" font-size="8" fill="#334155">Mail</text>
+  <text x="570" y="252" text-anchor="middle" font-size="8" fill="#334155">dispatch</text>
   <path d="M796,450 L554,450" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#ms)"/>
   <text x="690" y="443" font-size="11" fill="#334155">controller polls</text>
 </svg>
