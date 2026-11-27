@@ -366,6 +366,27 @@ async def test_an_audited_move_with_equal_sanitized_names_is_still_a_move(factor
     assert [(r["issue_number"], r["repository"]) for r in rows] == [(9741, None)]
 
 
+async def test_a_partly_sanitized_case_change_is_not_proof_of_a_case_only_edit(factory_client, factory_store):
+    """The ledger can redact a part of each name. What is left may differ in case only while the names differ."""
+    prior = "Build-" + sha256(b"old build").hexdigest()
+    current = "build-" + sha256(b"new build").hexdigest()
+    scope = await idle_scope(factory_store.maker, 0, prior, factory_store.ids)
+    await add_wait(factory_store.maker, scope, 9744, "v4.5", at=MOMENT)
+    await move_scope(factory_client, scope, repo_name=current)
+    async with factory_store.maker() as db:
+        event = await db.scalar(select(FactoryAuditEvent).where(
+            FactoryAuditEvent.scope_id == scope, FactoryAuditEvent.event_kind == "policy_change"))
+        before, after = event.before_values["repo_name"], event.after_values["repo_name"]
+        # The fixture holds only if the stored values differ in case alone and are not the whole names.
+        assert "repo_name" in event.context_snapshot["scope_changed_fields"]
+        assert before != after and before.lower() == after.lower() and before != prior and after != current
+        await db.execute(GithubMilestoneWait.__table__.delete().where(GithubMilestoneWait.scope_id == scope))
+        db.add(GithubMilestoneWait(scope_id=scope, issue_number=9744, milestone_title="v4.5", github_updated_at=MOMENT))
+        await db.commit()
+    rows = (await get_states(factory_client, scope_id=scope))["waiting"]
+    assert [(r["issue_number"], r["repository"]) for r in rows] == [(9744, None)]
+
+
 async def test_an_unproven_wait_does_not_collapse_into_a_proven_wait_of_the_same_issue(factory_client, factory_store):
     old = await idle_scope(factory_store.maker, 0, "twin-old", factory_store.ids)
     current = await idle_scope(factory_store.maker, 1, "twin-new", factory_store.ids)
@@ -396,11 +417,14 @@ async def test_two_proven_waits_of_the_same_repository_and_issue_still_show_once
     assert [r["issue_number"] for r in (await get_states(factory_client))["waiting"]] == [9742]
 
 
-async def test_a_newer_blank_observation_does_not_hide_a_valid_wait(factory_client, factory_store):
+@pytest.mark.parametrize("blank", ["  \t ", "\u00a0", "\u2003", "\u2028", " \u3000\n\u202f"])
+async def test_a_newer_blank_observation_does_not_hide_a_valid_wait(factory_client, factory_store, blank):
+    # The view and the ranking call the same titles blank, Unicode whitespace included.
+    assert not blank.strip()
     first = await idle_scope(factory_store.maker, 0, "blank-twin", factory_store.ids)
     second = await idle_scope(factory_store.maker, 1, "blank-twin", factory_store.ids)
     await add_wait(factory_store.maker, first, 9760, "v4.5", at=MOMENT)
-    await add_wait(factory_store.maker, second, 9760, "  \t ", at=MOMENT + timedelta(seconds=1))
+    await add_wait(factory_store.maker, second, 9760, blank, at=MOMENT + timedelta(seconds=1))
     assert [(r["issue_number"], r["milestone"]) for r in (await get_states(factory_client))["waiting"]] == [(9760, "v4.5")]
 
 

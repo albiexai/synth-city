@@ -61,23 +61,31 @@ def _recorded_repository(scope_id: int, issue_url: str, number: int) -> wire.Wor
 
 
 _REPOSITORY_FIELDS = ("repo_owner", "repo_name")
-# The characters that make a milestone title blank. SQL and Python use the same set, so the database and
-# the view agree on which wait rows can be shown.
-_BLANK = " \t\r\n\x0b\x0c"
+# The characters that make a milestone title blank: exactly those that Python's str.strip() removes. The query
+# leaves out a wait with a blank title before the ranking, so such a row never takes the place of one that can be shown.
+_BLANK = "".join(char for char in map(chr, range(0x3001)) if char.isspace())
+# A repository name or owner as the factory reads it. A value with redacted parts is not a complete name.
+_COMPLETE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,100}")
 
 
 def _changes_repository(changed_fields, before: dict, after: dict) -> bool:
     """Whether one applied scope-change event changed the repository of its scope.
 
-    A change of case only is not a change of repository. The ledger stores sanitized values, so two
-    different names can look the same. When the receipt names the field and the values cannot tell,
-    the repository is unknown, and the event counts as a change.
+    A change of case only is not a change of repository, but only two complete names can show it. The
+    ledger stores sanitized values, so two different names can look the same, or differ in case alone
+    while parts of them are redacted. When the stored values cannot show that the edit was a change of
+    case, the repository is unknown, and the event counts as a change.
     """
-    named = [name for name in _REPOSITORY_FIELDS if name in (changed_fields or [])]
+    named = changed_fields or []
     for name in _REPOSITORY_FIELDS:
-        if str(before.get(name) or "").lower() != str(after.get(name) or "").lower():
+        old, new = str(before.get(name) or ""), str(after.get(name) or "")
+        if old.lower() != new.lower():
             return True
-    return any(before.get(name) == after.get(name) for name in named)
+        if old != new and not (_COMPLETE_NAME.fullmatch(old) and _COMPLETE_NAME.fullmatch(new)):
+            return True
+        if old == new and name in named:
+            return True
+    return False
 
 
 async def _unproven_scopes(db: AsyncSession, filters: wire.FactoryFilters) -> set[int]:
@@ -158,8 +166,6 @@ async def _waiting(db: AsyncSession, filters: wire.FactoryFilters):
     ).subquery()
 
     def build(row):
-        if not row.milestone.strip(_BLANK):
-            return None
         # A scope with a repository change, and a scope whose identity the factory refuses, prove no
         # repository for its waits. Those rows name none.
         repository = None if row.id in unproven else _repository(row)
