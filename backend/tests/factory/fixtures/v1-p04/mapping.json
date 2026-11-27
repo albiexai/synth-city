@@ -103,6 +103,7 @@
     "continuation_not_escalated": "Recovery requires an escalated attempt.",
     "continuation_pr_required": "Recovery requires the preserved PR.",
     "continuation_reason_not_allowed": "The existing recovery route does not permit this reason.",
+    "dispatch_paused": "New dispatch is paused. Work in flight continues.",
     "human_review": "Ready for human review.",
     "intake_eligible": "Configured intake is available; work eligibility still applies.",
     "job_not_scheduled": "Repository intake is not scheduled.",

@@ -223,6 +223,44 @@ async def test_dispatch_pause_is_a_director_action_and_records_history(client, d
 
 
 @pytest.mark.asyncio
+async def test_dispatch_pause_locks_preset_before_reading_state(db, monkeypatch):
+    team = AgentTeamPreset(name="Locked dispatch pause")
+    db.add(team)
+    await db.commit()
+    team_id = team.id
+    record = audit.record_event
+    steps = []
+    writer_transaction = None
+
+    def observe_preset_queries(_conn, _cursor, statement, *_):
+        nonlocal writer_transaction
+        if statement.startswith("UPDATE agent_team_presets SET id=agent_team_presets.id "):
+            steps.append("writer claim")
+            writer_transaction = db.sync_session.get_transaction()
+        elif statement.startswith("SELECT") and "FROM agent_team_presets" in statement:
+            steps.append("preset read")
+
+    async def record_locked_change(session, **kwargs):
+        assert steps == ["writer claim", "preset read"]
+        assert writer_transaction is not None
+        assert session.sync_session.get_transaction() is writer_transaction
+        assert kwargs["after_values"] == {"dispatch_paused": True}
+        steps.append("audit")
+        return await record(session, **kwargs)
+
+    monkeypatch.setattr(audit, "record_event", record_locked_change)
+    engine = db.bind.sync_engine
+    event.listen(engine, "before_cursor_execute", observe_preset_queries)
+    try:
+        response = await agent_team_service.set_dispatch_pause(db, team_id, paused=True, reason="Drain queue")
+    finally:
+        event.remove(engine, "before_cursor_execute", observe_preset_queries)
+
+    assert response.dispatch_paused is True
+    assert steps[:3] == ["writer claim", "preset read", "audit"]
+
+
+@pytest.mark.asyncio
 async def test_dispatch_pause_rolls_back_when_audit_write_fails(db, monkeypatch):
     team = AgentTeamPreset(name="Audit unavailable")
     db.add(team)
