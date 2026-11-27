@@ -165,6 +165,11 @@ export type OwnerReference = {
 };
 
 export type SafeWorkItem = {
+  difficulty_provenance?: {
+    difficulty: "low" | "medium" | "high";
+    source: "leader" | "director" | "supervisor" | "github";
+    actor_reference: string | null;
+  };
   active_scope_revision: number;
   active_scope_status: string | null;
   approval_round_count: number;

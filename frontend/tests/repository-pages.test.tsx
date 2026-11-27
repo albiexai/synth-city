@@ -184,6 +184,7 @@ describe("Repository page", () => {
     for (const name of [
       "Edit labels and routing for fixture/shared",
       "Edit merging and limits for fixture/shared",
+      "Edit required checks for fixture/shared",
       "Edit recovery policy for fixture/shared",
     ]) expect(screen.getByRole("button", { name })).toBeInTheDocument();
   });

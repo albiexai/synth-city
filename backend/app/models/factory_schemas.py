@@ -5,7 +5,8 @@ from typing import Annotated, Literal
 from pydantic import AfterValidator, ConfigDict, Field, model_validator
 from app.models.api_model import ApiModel as BaseModel
 from app.models.schemas import (
-    AgentStatus, InitialPathComparison, RequiredCIUnreadableSignal, SupervisorObservation, UnansweredRequestReason, wait_label_from_reason,
+    AgentStatus, InitialPathComparison, IssueDifficultyProvenance, RequiredCIUnreadableSignal,
+    SupervisorObservation, UnansweredRequestReason, wait_label_from_reason,
 )
 
 
@@ -158,6 +159,7 @@ class PlanRefusal(FactoryModel):
 
 
 class SafeWorkItem(FactoryModel):
+    difficulty_provenance: IssueDifficultyProvenance | None = Field(default=None, exclude_if=lambda value: value is None)
     id: PositiveId
     scope_id: PositiveId
     issue_number: PositiveId

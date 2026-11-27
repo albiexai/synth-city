@@ -12,6 +12,9 @@ import type {
   AgentTeamPresetUpdate,
   AgentTeamSlotInput,
   AgentTeamSlotUpdate,
+  DeliveryPolicy,
+  DeliveryPolicyHistoryResponse,
+  DeliveryPolicyUpdate,
   GithubWorkItem,
   GithubWorkItemListResponse,
   GithubApprovalRequest,
@@ -247,6 +250,26 @@ export function fetchScopeSettings(scopeId: number, operatorToken: string, befor
     `agent-teams/github-scopes/${scopeId}/settings${beforeId === undefined ? '' : `?before_id=${beforeId}`}`,
     { headers: operatorHeaders(operatorToken) },
   )
+}
+
+/** Replace the whole delivery policy of one repository. The server refuses a stale `expected_revision` with 409 (#1345). */
+export function updateTeamGithubDeliveryPolicy(
+  scopeId: number,
+  input: DeliveryPolicyUpdate,
+  operatorToken: string
+): Promise<{ scope_id: number; revision: number; policy: DeliveryPolicy }> {
+  return apiClient(`agent-teams/github-scopes/${scopeId}/delivery-policy`, {
+    method: 'PATCH',
+    headers: operatorHeaders(operatorToken),
+    body: JSON.stringify(input),
+  })
+}
+
+/** The latest 100 policy changes of one repository, newest first. Operator-protected. */
+export function fetchDeliveryPolicyHistory(scopeId: number, operatorToken: string): Promise<DeliveryPolicyHistoryResponse> {
+  return apiClient<DeliveryPolicyHistoryResponse>(`agent-teams/github-scopes/${scopeId}/delivery-policy/history`, {
+    headers: operatorHeaders(operatorToken),
+  })
 }
 
 export function deleteTeamGithubScope(scopeId: number, operatorToken: string): Promise<Record<string, never>> {

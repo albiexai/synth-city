@@ -8,6 +8,8 @@ from app.api.v1.agent_mail import require_mail_director
 from app.database import get_db
 from app.models.database import MailExternalActor
 from app.models.schemas import (
+    IssueDifficultyProvenance,
+    IssueDifficultyWrite,
     ExternalAgentMailContextRequest,
     ExternalAgentMailHandoffRequest,
     ExternalAgentMailMessageRequest,
@@ -28,6 +30,9 @@ from app.services.external_agent_mail_service import (
     external_agent_mail_service,
 )
 from app.services.mail_redaction import redact_lease_thread
+
+from app.services.github_coordination_service import CoordinationError
+from app.services.github_issue_difficulty_service import set_issue_difficulty
 
 router = APIRouter()
 
@@ -206,6 +211,19 @@ async def reply_external_agent_mail_thread(
         raise _rate_limit_response(exc) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/work-items/{work_item_id}/difficulty", response_model=IssueDifficultyProvenance)
+async def set_supervisor_issue_difficulty(
+    work_item_id: int,
+    request: IssueDifficultyWrite,
+    actor: MailExternalActor = Depends(external_actor),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await set_issue_difficulty(db, work_item_id, request.difficulty, source="supervisor", external_actor=actor)
+    except CoordinationError as exc:
+        raise HTTPException(exc.status, detail=exc.code) from exc
 
 
 @router.get("/threads/{message_id}", response_model=MailThreadResponse)

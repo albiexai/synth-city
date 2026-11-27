@@ -532,6 +532,19 @@ def synth_city_reply(thread_root_id: int, body: str) -> dict:
 
 
 @mcp.tool()
+def synth_city_set_issue_difficulty(work_item_id: int, difficulty: Literal["low", "medium", "high"]) -> dict:
+    """Set the GitHub issue difficulty during triage as the current Leader.
+
+    A Director, bound Supervisor, or direct GitHub selection is protected.
+    Successful writes return the difficulty and its Factory actor provenance.
+    """
+    err = _guard()
+    if err:
+        return err
+    return _request("PUT", f"/work-items/{work_item_id}/difficulty", json={"difficulty": difficulty})
+
+
+@mcp.tool()
 def synth_city_watch_required_checks(work_item_id: int, dispatch_nonce: str, scope_revision: int,
                                     head_sha: str, reviewer_member_id: Optional[int]) -> dict:
     """Register or clear the current head's independent reviewer for scheduled CI notices.

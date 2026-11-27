@@ -1877,6 +1877,33 @@ export const manifest = [
     }
   },
   {
+    "name": "synth_city_set_issue_difficulty",
+    "description": "Set the GitHub issue difficulty during triage as the current Leader.\n\n    A Director, bound Supervisor, or direct GitHub selection is protected.\n    Successful writes return the difficulty and its Factory actor provenance.\n    ",
+    "inputSchema": {
+      "properties": {
+        "work_item_id": {
+          "title": "Work Item Id",
+          "type": "integer"
+        },
+        "difficulty": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Difficulty",
+          "type": "string"
+        }
+      },
+      "required": [
+        "work_item_id",
+        "difficulty"
+      ],
+      "title": "synth_city_set_issue_difficultyArguments",
+      "type": "object"
+    }
+  },
+  {
     "name": "synth_city_settle_accepted_revision",
     "description": "Current Leader completes a submitted revision from a current independent ACCEPTED review.\n\n    Every required job must be successful at the exact head with GitHub Actions provenance.\n    This does not mark the PR ready, merge, lift a pause or HOLD, waive a prohibition,\n    change policy or budgets, release a lease or approve source.\n    ",
     "inputSchema": {

@@ -394,6 +394,35 @@ export interface AgentTeamLaunchRequest {
 
 export type TeamGithubMergePolicy = 'human' | 'auto'
 
+/** One CI check that a merge needs. The identity is the name and the app together (#1345). */
+export interface DeliveryRequiredCheck { name: string; app_slug: string }
+/** The delivery policy of a repository. The server replaces the whole policy on every save. */
+export interface DeliveryPolicy {
+  required_checks: DeliveryRequiredCheck[]
+  owner_contact: 'reports' | 'native'
+  owner_idle_seconds: number | null
+  owner_nudge_grace_seconds: number | null
+  owner_observation_wait_seconds: number | null
+  owner_observation_resume_seconds: number
+  accepted_base_update: 'disabled' | 'fast_forward' | 'merge'
+  broad_checks: 'local' | 'hosted'
+  checkpoint_delay_report_seconds: number | null
+  caller_inventory_required: boolean
+  regression_proof_required: boolean
+}
+export interface DeliveryPolicyUpdate { expected_revision: number; policy: DeliveryPolicy; reason: string }
+export interface DeliveryPolicyEvent {
+  id: number
+  scope_id: number
+  work_item_id: number | null
+  revision: number
+  policy: DeliveryPolicy
+  reason: string | null
+  actor: string | null
+  created_at: string
+}
+export interface DeliveryPolicyHistoryResponse { events: DeliveryPolicyEvent[] }
+
 export interface TeamGithubScope {
   id: number
   preset_id: number
@@ -426,6 +455,8 @@ export interface TeamGithubScope {
   max_item_effort_minutes?: number
   max_plan_estimate_minutes?: number
   initial_paths_required?: boolean
+  delivery_policy?: DeliveryPolicy
+  delivery_policy_revision?: number
   enabled: boolean
   last_polled_at?: string | null
   created_at: string

@@ -22,7 +22,7 @@ from app.models.database import (
     TeamGithubScope,
 )
 from app.services.github_client import GithubClient, GithubClientResponseError, github_client
-from app.services.github_dispatch_difficulty import difficulty_from_labels
+from app.services.github_dispatch_difficulty import difficulty_from_labels, observe_issue_difficulty
 from app.services.github_dispatch_priority import priority_from_labels
 from app.services.github_dispatch_service import github_dispatch_service
 from app.services.agent_team_campaign_service import agent_team_campaign_service
@@ -412,6 +412,7 @@ class GithubWatcherService:
         client = client or github_client
         # #1337: the repository this poll reads. A scope PATCH can change it while the remote read waits.
         scope_id, polled_owner, polled_name = scope.id, scope.repo_owner, scope.repo_name
+        label_read_started = datetime.utcnow()
         labeled = await client.list_issues_with_label(
             polled_owner, polled_name, scope.dispatch_label
         )
@@ -458,7 +459,7 @@ class GithubWatcherService:
                         or scope.dispatch_label not in {label["name"] for label in current.get("labels", [])}):
                     continue
             admission_candidates.add(number)
-            if await self._upsert_item(db, scope, issue):
+            if await self._upsert_item(db, scope, issue, read_started_at=label_read_started):
                 admitted.add(number)
         await _reconcile_milestone_waits(db, scope, routes, wait_observations, confirmed_wait_issues, admitted,
                                          repository=f"{polled_owner}/{polled_name}")
@@ -508,7 +509,9 @@ class GithubWatcherService:
             logger.info("Campaign backlog unavailable for scope %s", scope_id)
             await db.refresh(scope)
 
-    async def _upsert_item(self, db: AsyncSession, scope: TeamGithubScope, issue: dict) -> bool:
+    async def _upsert_item(
+        self, db: AsyncSession, scope: TeamGithubScope, issue: dict, *, read_started_at: datetime | None = None,
+    ) -> bool:
         label_names = {label["name"] for label in issue.get("labels", [])}
         issue_type = "design" if scope.design_label in label_names else "code"
         github_updated_at = _parse_gh_ts(issue["updated_at"])
@@ -522,7 +525,7 @@ class GithubWatcherService:
                     GithubWorkItem.scope_id == scope.id,
                     GithubWorkItem.issue_number == issue["number"],
                     GithubWorkItem.milestone_replaced_at.is_(None),
-                )
+                ).execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
 
@@ -564,7 +567,7 @@ class GithubWatcherService:
         if existing.dispatch_status == "pending":
             existing.issue_type = issue_type
         existing.dispatch_priority = priority_from_labels(label_names)
-        existing.issue_difficulty = difficulty_from_labels(label_names)
+        observe_issue_difficulty(existing, label_names, read_started_at=read_started_at)
         existing.github_updated_at = github_updated_at
         existing.issue_title = issue["title"]
         existing.updated_at = datetime.utcnow()

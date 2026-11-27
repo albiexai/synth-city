@@ -405,6 +405,7 @@ class GithubWorkItem(Base):
     workspace_wait_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     dispatch_priority: Mapped[int | None] = mapped_column(Integer, nullable=True)
     issue_difficulty: Mapped[str | None] = mapped_column(String, nullable=True)
+    issue_difficulty_provenance: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     launch_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("agent_team_launches.id", ondelete="SET NULL"), nullable=True
     )

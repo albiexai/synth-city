@@ -43,6 +43,7 @@ _SUFFIXES = {
     "watch_required_checks", "whoami",
     "request_scope_amendment", "record_revision_review", "withdraw_revision_review",
     "end_submitted_revision", "settle_accepted_revision", "record_head_review", "preflight_request",
+    "set_issue_difficulty",
     "get_review_binding",
     "extend_effort_limit", "render_pull_summary", "publish_pull_summary",
     "leader_cancel_revision", "leader_end_stopped", "leader_finalize_merged", "leader_release_workspace",
