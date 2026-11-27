@@ -42,6 +42,7 @@ export default defineConfig({
             { text: 'Autonomous GitHub Dispatch', link: '/autonomy' },
             { text: 'Factory Operating Model', link: '/guide/operating-model' },
             { text: 'Supervised Factory Playbook', link: '/guide/supervised-factory-playbook' },
+            { text: 'Supervisor guide', link: '/guide/supervisor-guide' },
             { text: 'Architecture', link: '/guide/architecture' },
             { text: 'Multi-Provider & Codex CLI', link: '/guide/multi-provider-codex-v2' },
             { text: 'Factory Audit & Metrics', link: '/guide/factory-audit-and-metrics' },
