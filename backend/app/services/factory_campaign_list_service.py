@@ -187,18 +187,20 @@ async def campaign_list(db, *, team_id: int | None, scope_id: int | None, status
                 reason = None if item.get("issues") is not None else (
                     item.get("reason") or (item.get("cutoff_gaps") or [None])[0] or "incomplete_read")
                 counted.setdefault(item["repo"].lower(), CampaignRepositoryCount(repo=item["repo"], issues=item.get("issues"), reason=reason))
-        names = _once(scopes_by_team.get(campaign.preset_id, [])) if is_live and current else []
-        if names:
-            # A live campaign covers the repositories that its team watches now. A repository that the snapshot does
-            # not list proves inclusion with an unknown count: it was added after the snapshot, or none was read yet.
+        now = is_live and current  # a live campaign of a current team covers exactly the repositories it watches now
+        if now:
+            # Never the older snapshot's list, even when the team watches none (V1 review 116). A repository that the
+            # snapshot does not list proves inclusion with an unknown count: added after it, or none was read yet.
+            names = _once(scopes_by_team.get(campaign.preset_id, []))
             absent = ("not_read_yet" if source is None else
                       "repository_added_after_snapshot" if counts_made else "snapshot_without_repository_counts")
             repositories = [counted.get(name.lower()) or CampaignRepositoryCount(repo=name, issues=None, reason=absent) for name in names]
         else:
             repositories = list(counted.values())
         if not repositories:
-            unknown = ("snapshot_without_repository_counts" if source is not None else "not_read_yet") if (
-                source is not None or (is_live and current)) else ("before_recording" if evidenced else "no_snapshot")
+            # An empty current membership is known: the team watches nothing. The other reasons are missing evidence.
+            unknown = ("no_repositories_watched" if now else "snapshot_without_repository_counts" if source is not None
+                       else "before_recording" if evidenced else "no_snapshot")
         missing = "not_read_yet" if is_live else (unknown or "no_snapshot")
         rows.append(CampaignRow(
             id=campaign.id, team=CampaignTeam(id=team.id, name=team.name) if team is not None else None,
@@ -216,8 +218,8 @@ async def campaign_list(db, *, team_id: int | None, scope_id: int | None, status
         for row in rows:
             if any(item.repo.lower() == wanted_repository for item in row.repositories):
                 kept.append(row)
-            elif not row.repositories:
-                unknown_rows.append(row)
+            elif not row.repositories and row.repositories_unknown_reason != "no_repositories_watched":
+                unknown_rows.append(row)  # only unknown membership is hidden; an empty one is known
         rows = kept
     # The tallies count the campaigns that the repository and team filters keep; the status filter only picks the rows.
     hidden = sum(1 for row in unknown_rows if shown(row))

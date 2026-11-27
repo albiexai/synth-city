@@ -307,3 +307,64 @@ describe("coverage, identity and paging (V1 review 114)", () => {
     expect(within(table()).getByRole("link", { name: "release:v4.4" })).toHaveAttribute("href", "/insights/retrospectives/1");
   });
 });
+
+describe("every combination of known and unknown numbers (V1 review 116)", () => {
+  const cell = (r: CampaignRow) => {
+    open("/insights/retrospectives", () => jsonResponse(reply([r])));
+    return screen.findByRole("table").then(() => within(table()).getByRole("link", { name: "release:v4.4" }).closest("tr")!.querySelector('[data-l="Merged / in scope"]')!);
+  };
+  const unknownMerged = { value: null, reason: "delivery_history_missing", coverage: "partial", unknown_count: 2, reasons: ["delivery_history_missing"] };
+
+  it("keeps the known denominator, the unknown count and the reason when the numerator is unknown", async () => {
+    const merged = await cell(row({ merged: unknownMerged, in_scope: { value: 3, reason: null, coverage: "full", unknown_count: 0, reasons: [] } }));
+    expect(merged).toHaveTextContent("unknown / 3");
+    expect(merged).toHaveTextContent("merged: unknown · delivery history missing · 2 unknown");
+    expect(merged).not.toHaveTextContent("in scope:");
+  });
+
+  it("keeps the known numerator when the denominator is unknown", async () => {
+    const merged = await cell(row({ merged: measure(5), in_scope: { value: null, reason: "membership_read_after_cutoff", reasons: ["membership_read_after_cutoff"] } }));
+    expect(merged).toHaveTextContent("5 / unknown");
+    expect(merged).toHaveTextContent("in scope: unknown · read after the cutoff");
+  });
+
+  it("shows both known values with the partial coverage of each", async () => {
+    const part = (n: number) => ({ value: n, reason: null, coverage: "partial", unknown_count: 1, reasons: ["delivery_history_missing"] });
+    const merged = await cell(row({ merged: part(4), in_scope: part(9) }));
+    expect(merged).toHaveTextContent("4 / 9");
+    expect(merged).toHaveTextContent("merged: partial · 1 unknown · delivery history missing");
+    expect(merged).toHaveTextContent("in scope: partial · 1 unknown · delivery history missing");
+  });
+
+  it("keeps one line when both are unknown in the same way, and two notes when they differ", async () => {
+    const both = await cell(row({ merged: measure(null, "no_snapshot"), in_scope: measure(null, "no_snapshot") }));
+    expect(both.textContent).toBe("unknown · no snapshot recorded");
+    cleanup(); resetFactoryReads();
+    const differ = await cell(row({ merged: measure(null, "no_snapshot"), in_scope: measure(null, "not_read_yet") }));
+    expect(differ).toHaveTextContent("unknown / unknown");
+    expect(differ).toHaveTextContent("merged: unknown · no snapshot recorded");
+    expect(differ).toHaveTextContent("in scope: unknown · not read yet");
+  });
+
+  it("shows two plain known numbers with no note", async () => {
+    expect((await cell(row({}))).textContent).toBe("41 / 63");
+  });
+});
+
+describe("a team that watches no repository now", () => {
+  const EMPTY = row({ repositories: [], repositories_unknown_reason: "no_repositories_watched" });
+
+  it("says that it watches none, and does not call that unknown", async () => {
+    open("/insights/retrospectives", () => jsonResponse(reply([EMPTY])));
+    await screen.findByRole("table");
+    const line = within(table()).getByRole("link", { name: "release:v4.4" }).closest("tr")!;
+    expect(line).toHaveTextContent("None · the team watches no repositories now");
+    expect(line.querySelector('[data-l="Repositories (issues)"]')).not.toHaveTextContent("unknown");
+  });
+
+  it("has its own group when grouped by repository, apart from unknown repositories", async () => {
+    open("/insights/retrospectives?group=repository", () => jsonResponse(reply([EMPTY, NO_SNAPSHOT])));
+    await screen.findByRole("table");
+    expect(within(table()).getAllByRole("columnheader").map((h) => h.textContent).filter((t) => /^(No repositories|Repositories unknown)/.test(t ?? ""))).toEqual(["No repositories watched", "Repositories unknown"]);
+  });
+});

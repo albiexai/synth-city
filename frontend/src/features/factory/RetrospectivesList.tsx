@@ -20,6 +20,7 @@ const REASONS: Record<string, string> = {
   snapshot_without_repository_counts: 'the snapshot has no repository counts',
   incomplete_read: 'could not be read',
   repository_added_after_snapshot: 'added after the last count',
+  no_repositories_watched: 'the team watches no repositories now',
   membership_read_after_cutoff: 'read after the cutoff',
   departure_after_cutoff: 'a departure after the cutoff',
   delivery_after_cutoff: 'a delivery after the cutoff',
@@ -59,26 +60,30 @@ function nameOf(selector: string) {
   return at < 0 ? { kind: 'selector', name: selector } : { kind: selector.slice(0, at), name: selector.slice(at + 1) }
 }
 
-/** A number that the snapshot knows only in part says so: its value stays, with the count of unknown outcomes and why. */
-function Partial({ measure }: { measure: CampaignMeasure }) {
+/** What a measure adds to its value: a partial number says how many outcomes are unknown and why. An unknown one says why. */
+function Note({ label, measure }: { label: string; measure: CampaignMeasure }) {
   const unknown = measure.unknown_count ?? 0
+  const reasons = measure.reasons?.length ? measure.reasons.map(reasonText).join(', ') : reasonText(measure.reason)
+  if (measure.value === null) return <span className="block text-xs text-muted-foreground">{label}: unknown · {reasons}{unknown > 0 ? ` · ${unknown} unknown` : ''}</span>
   if (measure.coverage !== 'partial' && unknown === 0) return null
-  return (
-    <span className="block text-xs text-muted-foreground">
-      partial{unknown > 0 ? ` · ${unknown} unknown` : ''}{measure.reasons?.length ? ` · ${measure.reasons.map(reasonText).join(', ')}` : ''}
-    </span>
-  )
+  return <span className="block text-xs text-muted-foreground">{label}: partial{unknown > 0 ? ` · ${unknown} unknown` : ''}{measure.reasons?.length ? ` · ${reasons}` : ''}</span>
 }
 
+/** Both numbers with what is known of each, also when one is unknown. One line when both are unknown in the same way. */
 function Merged({ merged, scope }: { merged: CampaignMeasure; scope: CampaignMeasure }) {
-  if (merged.value === null || scope.value === null) return <Unknown reason={merged.value === null ? merged.reason : scope.reason} />
-  return <>{merged.value} / {scope.value}<Partial measure={merged} /><Partial measure={scope} /></>
+  const value = (measure: CampaignMeasure) => (measure.value === null ? <em>unknown</em> : measure.value)
+  const same = merged.value === null && scope.value === null && merged.reason === scope.reason
+    && (merged.unknown_count ?? 0) === (scope.unknown_count ?? 0) && merged.reasons?.join() === scope.reasons?.join()
+  if (same) return <Unknown reason={merged.reason} />
+  return <>{value(merged)} / {value(scope)}<Note label="merged" measure={merged} /><Note label="in scope" measure={scope} /></>
 }
 
 function Repositories({ row }: { row: CampaignRow }) {
   return (
     <>
-      {row.repositories.length === 0 ? <Unknown reason={row.repositories_unknown_reason} /> : (
+      {row.repositories.length === 0 ? (row.repositories_unknown_reason === 'no_repositories_watched'
+        ? <span className="text-muted-foreground">None · {reasonText('no_repositories_watched')}</span>
+        : <Unknown reason={row.repositories_unknown_reason} />) : (
         <ul>
           {once(row.repositories).map((item) => (
             <li key={item.repo} className="break-words">
@@ -132,7 +137,10 @@ function groups(rows: CampaignRow[], by: string): [string, string, CampaignRow[]
   const add = (key: string, label: string, row: CampaignRow) => found.set(key, [found.get(key)?.[0] ?? label, [...(found.get(key)?.[1] ?? []), row]])
   for (const row of rows) {
     if (by === 'team') add(row.team ? `team:${row.team.id}` : 'retired', row.team ? `Team ${row.team.name}` : 'Retired team', row)
-    else if (row.repositories.length === 0) add('unknown', 'Repositories unknown', row)
+    else if (row.repositories.length === 0) {
+      if (row.repositories_unknown_reason === 'no_repositories_watched') add('none', 'No repositories watched', row)
+      else add('unknown', 'Repositories unknown', row)
+    }
     else for (const item of once(row.repositories)) add(item.repo.toLowerCase(), item.repo, row)
   }
   return [...found.entries()].map(([key, [label, list]]) => [key, label, list] as [string, string, CampaignRow[]])

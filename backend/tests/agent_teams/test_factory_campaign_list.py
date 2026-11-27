@@ -11,7 +11,7 @@ from datetime import timedelta
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import update
+from sqlalchemy import delete, update
 
 from app.database import get_db
 from app.main import app
@@ -263,6 +263,52 @@ async def test_two_spellings_of_one_repository_are_listed_once(db, world):
     db.add(TeamGithubScope(preset_id=world.team, repo_owner="O", repo_name="A1", repo_path="/private/a1x", enabled=True))
     await db.commit()
     assert [item.repo.lower() for item in (await _list(db)).campaigns[0].repositories] == ["o/a1", "o/a2"]
+
+
+# V1 review 116: the membership of a live campaign is the current one, also when it is empty
+async def _snapshotted_campaign_whose_team_then_watches_nothing(db, world):
+    campaign = await _start(db, world.team)
+    await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF)
+    await db.execute(delete(TeamGithubScope).where(TeamGithubScope.preset_id == world.team))
+    await db.commit()
+    return campaign
+
+
+async def test_a_live_team_that_watches_nothing_lists_nothing_not_the_old_snapshot(db, world):
+    await _snapshotted_campaign_whose_team_then_watches_nothing(db, world)
+    row = (await _list(db)).campaigns[0]
+    assert (row.repositories, row.repositories_unknown_reason, row.source.kind) == ([], "no_repositories_watched", "live")
+
+
+async def test_an_empty_current_membership_is_neither_kept_nor_hidden_by_a_repository_filter(db, world):
+    await _snapshotted_campaign_whose_team_then_watches_nothing(db, world)
+    other = TeamGithubScope(preset_id=world.other, repo_owner="o", repo_name="a1", repo_path="/private/a1b", enabled=True)
+    db.add(other)
+    await db.commit()
+    kept = await _list(db, scope_id=other.id)
+    assert (kept.campaigns, kept.hidden_unknown_repositories) == ([], 0)
+    assert len((await _list(db)).campaigns) == 1
+
+
+async def test_a_finishing_campaign_follows_its_current_scopes_too(db, world):
+    campaign = await _start(db, world.team)
+    await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF)
+    await db.execute(update(Campaign).where(Campaign.id == campaign.id).values(status="finishing"))
+    await db.execute(delete(TeamGithubScope).where(TeamGithubScope.repo_name == "a2"))
+    await db.commit()
+    assert _by_repo((await _list(db)).campaigns[0]) == {"o/a1": (2, None)}
+
+
+async def test_a_live_campaign_of_a_retired_team_keeps_its_recorded_repositories(db, world):
+    await _start(db, world.team)
+    campaign = (await _list(db)).campaigns[0]
+    await snapshots.build_snapshot(db, await db.get(Campaign, campaign.id), _client(), as_of=AS_OF)
+    await db.execute(update(FactoryContextKey).where(FactoryContextKey.key_kind == "team", FactoryContextKey.numeric_id == world.team)
+                     .values(retired_at=T0 + timedelta(days=1)))
+    await db.execute(delete(TeamGithubScope).where(TeamGithubScope.preset_id == world.team))
+    await db.commit()
+    row = (await _list(db)).campaigns[0]
+    assert (row.team, _by_repo(row)) == (None, {"o/a1": (2, None), "o/a2": (1, None)})
 
 
 @pytest_asyncio.fixture
