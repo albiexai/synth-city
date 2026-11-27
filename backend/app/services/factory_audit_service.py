@@ -46,6 +46,7 @@ SAFE_VALUE_FIELDS = {
     "supervisor_actor_id", "supervisor_grace_seconds", "supervisor_status",
     "mail_request_unanswered_seconds", "github_team_idle_timeout_seconds", "github_publish_summaries_enabled",
     "github_owner_idle_timeout_seconds", "github_nudge_grace_seconds",
+    "wake_followup_enabled", "wake_followup_delay_seconds",
     "origin_kind", "previous_scope_revision", "review_id", "reviewer_member_id",
     "head_sha", "verdict", "outcome",
     "target_milestone", "superseding_pr_number", "merge_commit_sha",

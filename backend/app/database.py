@@ -872,6 +872,8 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         ("github_publish_summaries_enabled", "BOOLEAN"),
         ("github_owner_idle_timeout_seconds", "INTEGER"),
         ("github_nudge_grace_seconds", "INTEGER"),
+        ("wake_followup_enabled", "BOOLEAN"),
+        ("wake_followup_delay_seconds", "INTEGER"),
         ("supervisor_actor_id", "INTEGER REFERENCES mail_external_actors(id) ON DELETE SET NULL"),
         ("supervisor_checked_at", "DATETIME"), ("supervisor_next_check_at", "DATETIME"),
         ("supervisor_note", "VARCHAR"), ("supervisor_grace_seconds", "INTEGER"),

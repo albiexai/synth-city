@@ -70,8 +70,6 @@ class WakeFollowupService:
 
     async def tick(self, db: AsyncSession, now: datetime | None = None) -> list[int]:
         """Re-wake the members that stayed silent. Returns their ids. Never raises."""
-        if not settings.wake_followup_enabled:
-            return []
         try:
             async with self._sweep_lock():
                 return await self._tick(db, _naive_utc(now) if now else datetime.utcnow())
@@ -85,8 +83,28 @@ class WakeFollowupService:
         await self._notify_silent_rewakes(db, now)
         return woken
 
+    @staticmethod
+    async def _due_members(
+        db: AsyncSession, attempts: dict[int, MailWakeAttempt], now: datetime,
+    ) -> dict[int, MailTeamMember]:
+        if not attempts:
+            return {}
+        # Read the policy columns directly so the delivery check sees changes made during a native read.
+        rows = await db.execute(
+            select(MailTeamMember, AgentTeamPreset.wake_followup_enabled, AgentTeamPreset.wake_followup_delay_seconds)
+            .outerjoin(AgentTeamPreset, MailTeamMember.team_preset_id == AgentTeamPreset.id)
+            .where(MailTeamMember.id.in_(attempts))
+            .execution_options(populate_existing=True)
+        )
+        due = {}
+        for member, team_enabled, team_delay in rows:
+            enabled = settings.wake_followup_enabled if team_enabled is None else team_enabled
+            delay = settings.wake_followup_delay_seconds if team_delay is None else team_delay
+            if enabled and now - attempts[member.id].created_at >= timedelta(seconds=delay):
+                due[member.id] = member
+        return due
+
     async def _rewake(self, db: AsyncSession, now: datetime) -> list[int]:
-        delay = timedelta(seconds=settings.wake_followup_delay_seconds)
         attempts = (await db.scalars(select(MailWakeAttempt).where(
             MailWakeAttempt.result == "delivered",
             MailWakeAttempt.source.in_(WAKE_SOURCES),
@@ -97,8 +115,8 @@ class WakeFollowupService:
         # The newest delivered wake of a member decides, then the delay applies to it. An older
         # unanswered wake must not trigger a follow-up while a newer wake is still inside its delay.
         newest = {attempt.member_id: attempt for attempt in attempts}
-        latest = {member_id: attempt for member_id, attempt in newest.items()
-                  if attempt.created_at <= now - delay}
+        members = await self._due_members(db, newest, now)
+        latest = {member_id: attempt for member_id, attempt in newest.items() if member_id in members}
         if not latest:
             return []
         done = set((await db.scalars(select(MailWakeAttempt.reason_code).where(
@@ -110,10 +128,8 @@ class WakeFollowupService:
                   if not await self._mail_activity_since(db, member_id, attempt.created_at)]
         if not silent:
             return []
-        members = {member.id: member for member in (await db.scalars(
-            select(MailTeamMember).where(MailTeamMember.id.in_(silent)))).all()}
         try:
-            statuses = await agent_status_service.for_members(db, list(members.values()))
+            statuses = await agent_status_service.for_members(db, [members[member_id] for member_id in silent])
         except (OSError, ValueError):
             logger.warning("Wake follow-up could not read native activity; no member was woken")
             return []
@@ -130,7 +146,7 @@ class WakeFollowupService:
             try:
                 await agent_mail_service._wake_member(
                     db, member_id, now, source=REWAKE_SOURCE, reason_code=f"rewake:{attempt.id}",
-                    delivery_guard=self._still_silent(db, members[member_id], attempt.created_at))
+                    delivery_guard=self._still_silent(db, members[member_id], attempt, now))
             except MailWakeError as error:
                 # The wake records its own refusal. The claim stays, so the refusal is not repeated.
                 if error.code == "wake_session_mismatch":
@@ -151,7 +167,6 @@ class WakeFollowupService:
         native idle state from before it. Unknown stays unknown and sends nothing. A notice wakes
         nobody, so it cannot start another follow-up and chain.
         """
-        delay = timedelta(seconds=settings.wake_followup_delay_seconds)
         rows = (await db.scalars(select(MailWakeAttempt).where(
             MailWakeAttempt.source == REWAKE_SOURCE,
             MailWakeAttempt.result == "delivered",
@@ -159,10 +174,11 @@ class WakeFollowupService:
             MailWakeAttempt.created_at >= now - timedelta(seconds=MAX_AGE_SECONDS),
         ).order_by(MailWakeAttempt.created_at, MailWakeAttempt.id))).all()
         newest = {row.member_id: row for row in rows}
+        members = await self._due_members(db, newest, now)
         due = {}
         for member_id, row in newest.items():
             _, _, original = (row.reason_code or "").partition(":")
-            if original.isdigit() and row.created_at <= now - delay:
+            if member_id in members and original.isdigit():
                 due[member_id] = (row, int(original))
         if not due:
             return
@@ -177,22 +193,20 @@ class WakeFollowupService:
                   if not await self._mail_activity_since(db, member_id, row.created_at)]
         if not silent:
             return
-        members = {member.id: member for member in (await db.scalars(
-            select(MailTeamMember).where(MailTeamMember.id.in_(silent)))).all()}
         try:
-            statuses = await agent_status_service.for_members(db, list(members.values()))
+            statuses = await agent_status_service.for_members(db, [members[member_id] for member_id in silent])
         except (OSError, ValueError):
             logger.warning("Wake follow-up could not read native activity; no notice was sent")
             return
         for member_id in silent:
             row, original = todo[member_id]
-            member = members.get(member_id)
-            if member is None or not self._known_idle_before(statuses.get(member_id), row.created_at):
+            if not self._known_idle_before(statuses.get(member_id), row.created_at):
                 continue
-            # The native read awaited. A member that read Mail meanwhile gets no notice.
-            if await self._mail_activity_since(db, member_id, row.created_at):
+            # Refresh policy and Mail after observing native activity.
+            current = await self._due_members(db, {member_id: row}, now)
+            if member_id not in current or await self._mail_activity_since(db, member_id, row.created_at):
                 continue
-            await self._send_notices(db, member, row, original, sent)
+            await self._send_notices(db, current[member_id], row, original, sent)
 
     async def _send_notices(self, db: AsyncSession, member: MailTeamMember, rewake: MailWakeAttempt,
                             original: int, sent: set[str]) -> None:
@@ -262,8 +276,10 @@ class WakeFollowupService:
         await db.commit()
         return result.rowcount == 1
 
-    def _still_silent(self, db: AsyncSession, member: MailTeamMember, since: datetime):
-        """The check made just before the transport: the member still shows no activity."""
+    def _still_silent(self, db: AsyncSession, member: MailTeamMember, attempt: MailWakeAttempt, now: datetime):
+        """Recheck policy and evidence just before transport."""
+        since = attempt.created_at
+
         async def guard() -> bool:
             if await self._mail_activity_since(db, member.id, since):
                 return False
@@ -272,6 +288,8 @@ class WakeFollowupService:
             except (OSError, ValueError):
                 return False
             if not self._known_idle_before(fresh.get(member.id), since):
+                return False
+            if not await self._due_members(db, {member.id: attempt}, now):
                 return False
             # The native read awaited. The member can have read or acked Mail meanwhile, so the last
             # word before the transport is the Mail check. Nothing awaits between this and the send.
