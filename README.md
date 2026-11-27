@@ -44,7 +44,7 @@ Developers and small teams who already use coding-agent CLIs and want them to wo
 
 You are the **Director**: you own the backlog and make the decisions that matter. Each **team** has one **Leader**, who approves plans and coordinates, plus the number of **builders** and **reviewers** you choose. An optional **Supervisor** agent can act for you within the limits you set. Rule-based work (dispatch, workspace leases, Mail delivery, merge gates) is done by Synth City itself, not by an agent. GitHub holds the issues, pull requests and record.
 
-![Roles: the Director at the top; an optional supervisor and grooming helper; the Leader; implementers and verifiers; Synth City and GitHub as non-agent systems](docs/public/images/operating-model/hierarchy.svg)
+![Roles: the Director at the top; an optional supervisor and refinement helper; the Leader; implementers and verifiers; Synth City and GitHub as non-agent systems](docs/public/images/operating-model/hierarchy.svg)
 
 Read more in the [Factory operating model](docs/guide/operating-model.md), [Autonomous GitHub dispatch](docs/autonomy.md) and the [Supervised factory playbook](docs/guide/supervised-factory-playbook.md).
 

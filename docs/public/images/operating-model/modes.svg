@@ -44,7 +44,7 @@
 
   <line x1="20" y1="192" x2="980" y2="192" stroke="#d6d3d1" stroke-width="1.5"/>
   <use href="#i-human" x="20" y="172" width="14" height="14" fill="#b45309"/>
-  <text x="38" y="183" font-size="11.5" fill="#78350f">The Director grooms the backlog at any time. The dispatch label is the Director’s “ready” signal.</text>
+  <text x="38" y="183" font-size="11.5" fill="#78350f">The Director refines the backlog at any time. The dispatch label is the Director’s “ready” signal.</text>
   <text x="500" y="207" text-anchor="middle" font-size="11.5" fill="#78716c">a defect in Synth City itself blocks the work ↓</text>
 
   <text x="20" y="236" font-size="15" font-weight="700">B · Factory maintenance</text>
