@@ -2696,6 +2696,64 @@
           "title": "GithubIdentity",
           "type": "object"
         },
+        "InitialPathComparison": {
+          "additionalProperties": false,
+          "description": "Changed repository paths compared at one PR head and base.",
+          "properties": {
+            "approved_companions": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Approved Companions",
+              "type": "array"
+            },
+            "base_sha": {
+              "pattern": "^[0-9a-f]{40}$",
+              "title": "Base Sha",
+              "type": "string"
+            },
+            "head_sha": {
+              "pattern": "^[0-9a-f]{40}$",
+              "title": "Head Sha",
+              "type": "string"
+            },
+            "in_scope": {
+              "items": {
+                "type": "string"
+              },
+              "title": "In Scope",
+              "type": "array"
+            },
+            "note": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Note"
+            },
+            "outside_scope": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Outside Scope",
+              "type": "array"
+            }
+          },
+          "required": [
+            "head_sha",
+            "base_sha",
+            "in_scope",
+            "approved_companions",
+            "outside_scope",
+            "note"
+          ],
+          "title": "InitialPathComparison",
+          "type": "object"
+        },
         "LaunchPlanHint": {
           "additionalProperties": false,
           "properties": {
@@ -3436,6 +3494,17 @@
           "format": "date-time",
           "title": "Generated At",
           "type": "string"
+        },
+        "initial_path_comparison": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InitialPathComparison"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "schema_version": {
           "const": 1,

@@ -406,6 +406,33 @@ describe("cursor browsing V26/V27", () => {
 });
 
 describe("work details and protected controls", () => {
+  it("shows the compared files and outside-scope note only when the comparison is present", async () => {
+    const comparison = {
+      head_sha: "a".repeat(40),
+      base_sha: "b".repeat(40),
+      in_scope: ["src/in.py"],
+      approved_companions: ["tests/test_in.py"],
+      outside_scope: ["src/out.py"],
+      note: "initial_paths_out_of_scope: 'src/out.py'",
+    };
+    fixtureFetch(path => jsonResponse(path.endsWith("/9")
+      ? { ...detail.completed.response, initial_path_comparison: comparison }
+      : detail.completed.response));
+    const view = renderRoute(<WorkDetailPage />, "/work/9", "/work/:workItemId");
+    const region = within(await screen.findByRole("region", { name: "First-plan path comparison" }));
+    for (const [heading, path] of [
+      ["In scope", "src/in.py"], ["Approved companions", "tests/test_in.py"], ["Outside scope", "src/out.py"],
+    ]) {
+      expect(region.getByRole("heading", { name: heading })).toBeInTheDocument();
+      expect(region.getByText(path)).toBeInTheDocument();
+    }
+    expect(region.getByText(comparison.note)).toBeInTheDocument();
+    view.unmount();
+    renderRoute(<WorkDetailPage />, "/work/4", "/work/:workItemId");
+    await settle();
+    expect(screen.queryByRole("region", { name: "First-plan path comparison" })).not.toBeInTheDocument();
+  });
+
   it("does not prompt for safe detail, distinguishes completed and preserves offline actor slot links", async () => {
     const record = detail.completed.response.work_item.item;
     const { requests } = fixtureFetch((path) =>

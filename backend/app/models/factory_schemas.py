@@ -5,7 +5,7 @@ from typing import Annotated, Literal
 from pydantic import AfterValidator, ConfigDict, Field, model_validator
 from app.models.api_model import ApiModel as BaseModel
 from app.models.schemas import (
-    AgentStatus, RequiredCIUnreadableSignal, SupervisorObservation, UnansweredRequestReason, wait_label_from_reason,
+    AgentStatus, InitialPathComparison, RequiredCIUnreadableSignal, SupervisorObservation, UnansweredRequestReason, wait_label_from_reason,
 )
 
 
@@ -263,6 +263,7 @@ class WorkListResponse(FactoryEnvelope):
 
 class WorkDetailResponse(FactoryEnvelope):
     work_item: WorkProjection
+    initial_path_comparison: InitialPathComparison | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class RepositoryListResponse(FactoryEnvelope):

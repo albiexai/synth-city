@@ -2159,12 +2159,25 @@ class GithubHeadReviewCreate(BaseModel):
     evidence_url: str = Field(min_length=1, max_length=2000)
 
 
+class InitialPathComparison(BaseModel):
+    """Changed repository paths compared at one PR head and base."""
+
+    model_config = ConfigDict(extra="forbid")
+    head_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    base_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    in_scope: list[str]
+    approved_companions: list[str]
+    outside_scope: list[str]
+    note: str | None
+
+
 class GithubReviewBindingResponse(BaseModel):
-    """#999: only what a current reviewer needs to record a head or revision review. Never a lease token."""
+    """Current reviewer binding and optional first-plan comparison. Never a lease token."""
     work_item_id: int
     pr_number: int
     dispatch_nonce: str
     active_scope_revision: int
+    initial_path_comparison: InitialPathComparison | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class GithubHeadReviewResponse(BaseModel):

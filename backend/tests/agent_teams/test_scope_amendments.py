@@ -270,6 +270,34 @@ async def test_pr_registration_shows_initial_paths_next_to_ci(db, healthy_attemp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("healthy_attempt", ["with_companion"], indirect=True)
+async def test_registration_groups_changed_files_by_approved_first_plan(db, healthy_attempt, monkeypatch):
+    a = healthy_attempt
+    client, base = await initial_path_merge_case(db, a, monkeypatch, extra_file=True)
+    read_tree = client.get_recursive_tree.side_effect
+    outside = GithubTreeEntry("src/outside.py", "100644", "blob", "c" * 40)
+
+    def tree_with_outside(owner, repo, sha, **kwargs):
+        tree = read_tree(owner, repo, sha, **kwargs)
+        return {**tree, outside.path: outside} if sha == a.tree else tree
+
+    client.get_recursive_tree.side_effect = tree_with_outside
+    await register_initial_pull(db, a, client, monkeypatch, "pr_opened")
+    expected = {
+        "head_sha": a.head, "base_sha": base, "in_scope": ["src/base.py"],
+        "approved_companions": ["src/added.py"], "outside_scope": ["src/outside.py"],
+        "note": "initial_paths_out_of_scope: 'src/outside.py'",
+    }
+    assert a.item.initial_paths_readiness["comparison"] == expected
+    # A record written before comparisons were stored must refresh at the same head.
+    a.item.initial_paths_readiness = {"head": a.head, "base": base, "note": expected["note"]}
+    await db.commit()
+    await github_verification_service.process_scope(db, a.scope, client=client)
+    await db.refresh(a.item)
+    assert a.item.initial_paths_readiness["comparison"] == expected
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("side", ["head", "base"])
 async def test_pr_registration_reports_an_inconclusive_comparison_if_the_pr_changes(
     db, healthy_attempt, monkeypatch, side,
@@ -282,6 +310,7 @@ async def test_pr_registration_reports_an_inconclusive_comparison_if_the_pr_chan
     assert _work_item_response(a.item, a.scope).status_note == (
         "initial_paths_inconclusive: the PR changed during the comparison."
     )
+    assert a.item.initial_paths_readiness.get("comparison") is None
 
 
 @pytest.mark.asyncio
@@ -360,7 +389,11 @@ async def test_verification_rechecks_a_moved_base_at_the_same_head(db, healthy_a
     client.get_merge_base.return_value = a.head
     await github_verification_service.process_scope(db, a.scope, client=client)
     await db.refresh(a.item)
-    assert a.item.initial_paths_readiness == {"head": a.head, "base": "1" * 40, "note": None}
+    assert a.item.initial_paths_readiness == {
+        "head": a.head, "base": "1" * 40, "note": None,
+        "comparison": {"head_sha": a.head, "base_sha": "1" * 40, "note": None,
+                       "in_scope": [], "approved_companions": [], "outside_scope": []},
+    }
     assert "initial_paths_out_of_scope" not in (_work_item_response(a.item, a.scope).status_note or "")
 
 
@@ -1976,7 +2009,7 @@ async def test_review_records_accepted_at_a_submitted_continuation_head(db, subm
         assert a.item.escalation_reason == "plan_blocked"
         with pytest.raises(GithubApprovalError):
             await settle_accepted(db, a, fact)
-    binding = await _named_reviewer_binding(db, a.item, a.scope, a.reviewer.id)
+    binding, _ = await _named_reviewer_binding(db, a.item, a.scope, a.reviewer.id)
     assert binding.pr_number == a.item.pr_number and binding.active_scope_revision == a.revision.revision
 
 

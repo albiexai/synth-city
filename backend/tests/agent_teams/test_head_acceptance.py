@@ -547,6 +547,26 @@ async def test_the_current_verifier_reads_exactly_the_review_binding(db, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_the_verifier_gets_the_current_first_plan_comparison(db, monkeypatch):
+    case = await make_case(db, monkeypatch)
+    item = case.item
+    base = "b" * 40
+    comparison = {"head_sha": HEAD_A, "base_sha": base, "in_scope": ["src/in.py"],
+                  "approved_companions": ["tests/test_in.py"], "outside_scope": [],
+                  "note": None}
+    item.initial_paths_readiness = {"head": HEAD_A, "base": base, "comparison": comparison}
+    item.verification_head_sha = HEAD_A
+    await db.commit()
+    session = FakeSession(case.verifier)
+    binding = await _binding(item.id, session, db)
+    assert set(binding) == BINDING_KEYS | {"initial_path_comparison"}
+    assert binding["initial_path_comparison"] == comparison
+    item.verification_head_sha = "c" * 40
+    await db.commit()
+    assert set(await _binding(item.id, session, db)) == BINDING_KEYS
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("who,status,detail", [
     ("owner", 403, "current_independent_reviewer_required"),
     ("leader", 403, "current_independent_reviewer_required"),

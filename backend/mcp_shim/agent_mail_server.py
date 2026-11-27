@@ -1780,7 +1780,8 @@ def synth_city_get_review_binding(work_item_id: int) -> dict:
     """Assigned reviewer reads the binding needed to record a head or revision review for one item (#999).
 
     Allowed for the team's current verifier, or the reviewer named on the item's required-check watch for the
-    PR's exact current head. Returns only work_item_id, pr_number, dispatch_nonce and active_scope_revision.
+    PR's exact current head. Returns work_item_id, pr_number, dispatch_nonce, active_scope_revision, and
+    the optional current first-plan path comparison for the observed PR head and base.
     The nonce is private: use it only in synth_city_record_head_review or synth_city_record_revision_review,
     and never publish it.
     """

@@ -28,6 +28,7 @@ from app.models.database import (
     MailTeamMember,
     TeamGithubScope,
 )
+from app.models.schemas import InitialPathComparison
 from app.services.github_app_auth_service import GithubAppAuthError, github_app_auth_service
 from app.services.agent_mail_service import agent_mail_service
 from app.services.accepted_source_imports import matching_imported_paths, source_import_claim_conditions
@@ -223,7 +224,7 @@ class GithubVerificationService:
         }
 
     @staticmethod
-    async def _initial_merge_paths(db: AsyncSession, item: GithubWorkItem) -> list[str] | None:
+    async def _initial_plan_path_groups(db: AsyncSession, item: GithubWorkItem) -> tuple[list[str], list[str]] | None:
         """Read the current acknowledged first plan. Older attempts may have no normalized plan or file list."""
         row = (await db.execute(select(GithubApprovalRequest, _latest_member(item.owner_slot_id)).where(
             GithubApprovalRequest.work_item_id == item.id,
@@ -243,13 +244,21 @@ class GithubVerificationService:
         if root is None or not github_approval_service.matches_linked_request_message(
                 request, root, delivery_key=f"github-approval:{request.id}:request"):
             raise GithubApprovalError("initial_plan_unverifiable")
-        paths = github_approval_service.linked_initial_plan_paths(root)
-        return github_approval_service._canonical_paths(paths) if paths is not None else None
+        groups = github_approval_service.linked_initial_plan_path_groups(root)
+        if groups is None:
+            return None
+        paths, companions = groups
+        normalize = github_approval_service._canonical_paths
+        return normalize(paths), normalize(companions) if companions else []
 
-    async def _initial_path_hold(
+    async def _initial_merge_paths(self, db: AsyncSession, item: GithubWorkItem) -> list[str] | None:
+        groups = await self._initial_plan_path_groups(db, item)
+        return sorted(set(groups[0]) | set(groups[1])) if groups is not None else None
+
+    async def _compare_initial_paths(
         self, scope: TeamGithubScope, client: GithubClient, base_sha: str | None,
-        head_sha: str, allowed_paths: list[str],
-    ) -> str | None:
+        head_sha: str, allowed_paths: list[str], companions: list[str],
+    ) -> InitialPathComparison | str:
         if not base_sha:
             return "initial_paths_inconclusive: the PR base SHA could not be read."
         try:
@@ -265,11 +274,26 @@ class GithubVerificationService:
         except (GithubApprovalError, GithubAppAuthError, GithubClientResponseError, httpx.HTTPError):
             return "initial_paths_inconclusive: complete GitHub tree evidence could not be verified."
         # The head's merge base excludes changes only inherited from the PR's base branch.
-        outside = sorted(path for path in self._changed_tree_paths(common_tree, head_tree)
-                         if not github_approval_service.path_is_allowed(path, allowed_paths))
-        if outside:
-            return "initial_paths_out_of_scope: " + ", ".join(repr(path) for path in outside)
-        return None
+        in_scope, companion_files, outside = [], [], []
+        for path in sorted(self._changed_tree_paths(common_tree, head_tree)):
+            if github_approval_service.path_is_allowed(path, allowed_paths):
+                in_scope.append(path)
+            elif github_approval_service.path_is_allowed(path, companions):
+                companion_files.append(path)
+            else:
+                outside.append(path)
+        note = "initial_paths_out_of_scope: " + ", ".join(repr(path) for path in outside) if outside else None
+        return InitialPathComparison(
+            head_sha=head_sha, base_sha=base_sha, in_scope=in_scope,
+            approved_companions=companion_files, outside_scope=outside, note=note,
+        )
+
+    async def _initial_path_hold(
+        self, scope: TeamGithubScope, client: GithubClient, base_sha: str | None,
+        head_sha: str, allowed_paths: list[str],
+    ) -> str | None:
+        outcome = await self._compare_initial_paths(scope, client, base_sha, head_sha, allowed_paths, [])
+        return outcome if isinstance(outcome, str) else outcome.note
 
     async def _refresh_initial_path_readiness(
         self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem, pull: dict, client: GithubClient,
@@ -279,21 +303,24 @@ class GithubVerificationService:
             return True
         base = (pull.get("base") or {}).get("sha")
         prior = item.initial_paths_readiness or {}
-        if prior.get("head") == head and prior.get("base") == base:
+        if prior.get("head") == head and prior.get("base") == base and "comparison" in prior:
             return True
         context = {key: getattr(item, key) for key in (
             *_MERGE_FENCE_ITEM, "ack_received_at", "handoff_state", "verification_head_sha",
         )}
+        comparison = None
         try:
-            paths = await self._initial_merge_paths(db, item)
+            groups = await self._initial_plan_path_groups(db, item)
         except GithubApprovalError:
             note = _INITIAL_PLAN_UNVERIFIABLE
         else:
-            if paths is None:
+            if groups is None:
                 return True
             try:
-                note = await self._initial_path_hold(scope, client, base, head, paths)
-                if note is None or note.startswith("initial_paths_out_of_scope:"):
+                outcome = await self._compare_initial_paths(scope, client, base, head, *groups)
+                if isinstance(outcome, str):
+                    note = outcome
+                else:
                     read_auth = ({"token": await github_approval_service.github_read_token(scope)}
                                  if scope.github_auth_mode == "app" else {})
                     fresh = await client.get_pull(scope.repo_owner, scope.repo_name, item.pr_number, **read_auth)
@@ -303,11 +330,14 @@ class GithubVerificationService:
                     if (self._classify_pull(fresh) != "open" or fresh.get("number") != item.pr_number
                             or self._head_sha(fresh) != head or fresh["base"].get("sha") != base):
                         note = "initial_paths_inconclusive: the PR changed during the comparison."
+                    else:
+                        note = outcome.note
+                        comparison = outcome.model_dump()
             except (ValueError, GithubApprovalError, GithubAppAuthError, GithubClientResponseError, httpx.HTTPError):
                 note = "initial_paths_inconclusive: the PR could not be rechecked."
         claim = await db.execute(update(GithubWorkItem).where(*(
             _same_value(getattr(GithubWorkItem, key), value) for key, value in context.items()
-        )).values(initial_paths_readiness={"head": head, "base": base, "note": note})
+        )).values(initial_paths_readiness={"head": head, "base": base, "note": note, "comparison": comparison})
             .execution_options(synchronize_session=False))
         if claim.rowcount != 1:
             await db.rollback()
