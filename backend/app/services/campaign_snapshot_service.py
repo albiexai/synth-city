@@ -14,6 +14,13 @@ the merge, between the later of campaign start and item creation and the merge, 
 forward-coverage marker is at or before that window's start, so no earlier dispatch in it can be missing; the first
 recorded event never stands in for that (V1 review 448). The median is the middle value; p85 is the nearest rank (the smallest time
 with at least 85% of times at or below it). Fewer than five timed items is a small sample, shown with its value and n.
+
+#1419 (#1245 part 4) adds "where the time went". Its item time is Q1's, recorded on #1245: per attempt, from waiting
+for dispatch to the merge, or ``as_of`` while open, and before the first attempt from campaign membership. That
+differs from #1246's dispatch-to-merge median. One item's attempt windows are contiguous (each starts where the last
+ended), so their sum is the item's campaign time; the stage engine splits each into waiting on someone, process,
+active and an explicit unaccounted remainder, so the stages plus unaccounted equal item time. A member with no
+recorded attempt is unknown, never zero time.
 """
 from __future__ import annotations
 
@@ -33,7 +40,15 @@ from app.models.database import (
     CampaignSnapshot,
     FactoryAuditEvent,
     FactoryContextKey,
+    GithubApprovalRequest,
+    GithubAttemptScopeRevision,
+    GithubCheckRunHistory,
+    GithubHeadReview,
+    GithubRequiredCheckRecipient,
+    GithubRequiredCheckWatch,
+    GithubRevisionReview,
     GithubWorkItem,
+    MailMessage,
     TeamGithubScope,
 )
 from app.models.schemas import FactoryMetricSample
@@ -43,7 +58,8 @@ from app.services import factory_audit_service as audit
 from app.services.factory_metrics_service import _coverage, _naive_utc
 from app.services.github_rate_limit_history import campaign_rate_limit_time
 
-CALCULATION_VERSION = "campaign-snapshot-v3"  # v2 (#1395): missing delivery history is unknown; v3 (#1246): item time
+# v2 (#1395): missing delivery history is unknown; v3 (#1246): item time; v4 (#1419): where the time went
+CALCULATION_VERSION = "campaign-snapshot-v4"
 SMALL_SAMPLE = 5
 BANDS = (("0-100", 100), ("101-400", 400), ("over-400", None))  # by lines changed, upper bound inclusive
 CACHE_SECONDS = 30.0  # the Overview panel polls
@@ -89,6 +105,33 @@ class ItemTimeSection(BaseModel):
     bands: list[BandRow]
 
 
+class StageRow(BaseModel):
+    group: str
+    stage: str
+    actor: str
+    share_seconds: float  # its part of item time
+    wall_seconds: float  # its own time, whatever else ran (Q2)
+    attempts: int = 0  # the attempts it was recorded in
+    coverage: str = "full"  # its group's recording coverage
+    basis: str | None = None  # e.g. waiting for dispatch from campaign membership, when ready time was not recorded
+
+
+class TimeWentSection(BaseModel):
+    """#1419: where the campaign's item time went. Absent in snapshots frozen before v4."""
+    items: int  # campaign members with at least one attempt
+    attempts: int
+    unknown_items: int  # members with no recorded attempt: unknown, never zero time
+    unattributed: int  # recorded evidence the collector could not place in an attempt
+    total_seconds: float | None
+    groups: dict[str, float | None]
+    group_coverage: dict[str, str] = {}  # per group: full, partial (a lower bound) or unavailable
+    unaccounted_seconds: float | None
+    overlap_seconds: float | None
+    stages: list[StageRow]
+    coverage: str
+    unknown_reasons: list[str]
+
+
 class Snapshot(BaseModel):
     campaign_id: int
     selector: str
@@ -100,6 +143,7 @@ class Snapshot(BaseModel):
     # Added by #1252. A snapshot stored before it has no such field and reads as an empty list.
     repositories: list[SnapshotRepository] = []
     item_time: ItemTimeSection | None = None  # additive (#1246): an older frozen payload reads back unchanged
+    time_went: TimeWentSection | None = None  # additive (#1419)
 
 
 def clear_cache() -> None:
@@ -151,7 +195,53 @@ async def _fingerprint(db, campaign: Campaign) -> tuple:
     # #1246: installing the lifecycle coverage marker changes item time without any new event (V1 review 448).
     lifecycle = await audit.instrumentation_start(db)
     return (campaign.id, campaign.team_context_key, campaign.selector, campaign.status, campaign.started_at,
-            campaign.finished_at, live, events, scopes, items, markers, lifecycle)
+            campaign.finished_at, live, events, scopes, items, markers, lifecycle, await _retro_rows(db, campaign))
+
+
+async def _retro_rows(db, campaign: Campaign) -> tuple:
+    """#1419: every row "where the time went" reads that can change without an audit event, with its mutable fields,
+    so an insert, update or deletion misses the cache (row by row, as for scopes and items above)."""
+    items = (select(GithubWorkItem.id).join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
+             .join(FactoryContextKey, _lifetime(campaign.team_context_key)))
+    scopes = select(TeamGithubScope.id).join(FactoryContextKey, _lifetime(campaign.team_context_key))
+    watches = select(GithubRequiredCheckWatch.id).where(GithubRequiredCheckWatch.work_item_id.in_(items))
+    reads = [
+        select(GithubCheckRunHistory.repository, GithubCheckRunHistory.check_run_id, GithubCheckRunHistory.head_sha,
+               GithubCheckRunHistory.pr_number, GithubCheckRunHistory.check_name, GithubCheckRunHistory.required,
+               GithubCheckRunHistory.job_created_at,
+               GithubCheckRunHistory.started_at, GithubCheckRunHistory.completed_at)
+        .where(GithubCheckRunHistory.scope_id.in_(scopes))
+        .order_by(GithubCheckRunHistory.repository, GithubCheckRunHistory.check_run_id),
+        select(GithubHeadReview.id, GithubHeadReview.verdict, GithubHeadReview.status, GithubHeadReview.created_at,
+               GithubHeadReview.ended_at, GithubHeadReview.head_sha, GithubHeadReview.pr_number,
+               GithubHeadReview.scope_revision, GithubHeadReview.reviewer_member_id)
+        .where(GithubHeadReview.work_item_id.in_(items)).order_by(GithubHeadReview.id),
+        select(GithubRevisionReview.id, GithubRevisionReview.verdict, GithubRevisionReview.status,
+               GithubRevisionReview.created_at, GithubRevisionReview.ended_at, GithubRevisionReview.watch_id,
+               GithubRevisionReview.revision_id, GithubRevisionReview.reviewer_member_id)
+        .where(GithubRevisionReview.work_item_id.in_(items)).order_by(GithubRevisionReview.id),
+        select(GithubRequiredCheckWatch.id, GithubRequiredCheckWatch.head_sha, GithubRequiredCheckWatch.pr_number,
+               GithubRequiredCheckWatch.reviewer_member_id, GithubRequiredCheckWatch.completion_kind,
+               GithubRequiredCheckWatch.changed_at, GithubRequiredCheckWatch.completed_at,
+               GithubRequiredCheckWatch.scope_revision)
+        .where(GithubRequiredCheckWatch.work_item_id.in_(items)).order_by(GithubRequiredCheckWatch.id),
+        select(GithubRequiredCheckRecipient.id, GithubRequiredCheckRecipient.watch_id,
+               GithubRequiredCheckRecipient.member_id, GithubRequiredCheckRecipient.message_id,
+               MailMessage.recipient_member_id, MailMessage.delivery_key, MailMessage.created_at)
+        .outerjoin(MailMessage, MailMessage.id == GithubRequiredCheckRecipient.message_id)
+        .where(GithubRequiredCheckRecipient.watch_id.in_(watches)).order_by(GithubRequiredCheckRecipient.id),
+        select(GithubApprovalRequest.id, GithubApprovalRequest.request_kind, GithubApprovalRequest.status,
+               GithubApprovalRequest.created_at, GithubApprovalRequest.decided_at,
+               GithubApprovalRequest.owner_member_id)
+        .where(GithubApprovalRequest.work_item_id.in_(items)).order_by(GithubApprovalRequest.id),
+        select(GithubAttemptScopeRevision.id, GithubAttemptScopeRevision.dispatch_nonce,
+               GithubAttemptScopeRevision.owner_member_id)
+        .where(GithubAttemptScopeRevision.work_item_id.in_(items)).order_by(GithubAttemptScopeRevision.id),
+    ]
+    rows = []
+    for read in reads:
+        rows.append(tuple((await db.execute(read)).all()))
+    return tuple(rows)
 
 
 async def build_snapshot(db, campaign: Campaign, client, *, as_of: datetime, observed_at: datetime | None = None,
@@ -250,11 +340,13 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
     # Missing delivery history the counts already know of makes item time partial too (V1 review 448).
     item_time = await _item_time(db, campaign, list(members), facts, coverage, as_of,
                                  gaps + ([reason] if unknown else []), label)  # both kept (V1 review 115)
+    time_went = await _time_went(db, campaign, list(members), coverage, as_of, gaps)
     return Snapshot(
         campaign_id=campaign.id, selector=campaign.selector, started_at=started, as_of=as_of,
         calculation_version=CALCULATION_VERSION, metrics=sorted(metrics, key=lambda sample: sample.name),
         recorded_coverage=[MeasureCoverageEntry(measure=c.measure, started_at=c.started_at, covered=c.covered,
                                                 reason=c.reason) for c in coverage], item_time=item_time,
+        time_went=time_went,
         repositories=_repositories(membership, members, [gap for gap in gaps if gap in _CUTOFF_GAPS]))
 
 
@@ -282,6 +374,95 @@ def _repositories(membership, members, cutoff: list[str]) -> list[SnapshotReposi
     return list(rows.values())
 
 
+_LOST_GROUP = {source: "waiting" for source in ("dispatch", "decision", "effort", "ceiling", "hold", "pause", "mail",
+                                                 "input")} | {
+    source: "process" for source in ("required_check", "review", "check_watch", "head_review", "revision_review")} | {
+    source: "active" for source in ("planning", "building", "approval_request")}
+
+
+async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], coverage, as_of: datetime,
+                     gaps: list[str]) -> TimeWentSection:
+    """The campaign members' attempt time, split by the stage engine and summed; it reconciles with item time.
+
+    A member whose attempts come from two overlapping item lifetimes (two rows tracking one issue) is ambiguous and
+    unknown, never counted twice. Each group carries its recorder's coverage: a recorder not installed makes the group
+    unknown, one that began inside the measured windows makes it a lower bound (V1 review 118)."""
+    from app.services.retro_attempt_collector import FIRST_LABEL, collect_team_attempts
+    from app.services.retro_stage_engine import GROUPS, breakdown
+
+    started = _naive_utc(campaign.started_at)
+    wanted = set(members)
+    collected = await collect_team_attempts(db, campaign.preset_id, campaign_start=started, as_of=as_of,
+                                            team_context_key=campaign.team_context_key)
+    # Members come from the collector's own lifetime-bound item read, never a separate one (V1 review 119).
+    member_items = collected.item_identity
+    by_member: dict[tuple[str, int], list] = {}
+    for attempt in collected.attempts:
+        if member_items.get(attempt.item_id) in wanted:
+            by_member.setdefault(member_items[attempt.item_id], []).append(attempt)
+    reasons = set(gaps)
+    attempts = []
+    for found in by_member.values():
+        if any(a.item_id != b.item_id and min(a.window.end, b.window.end) > max(a.window.start, b.window.start)
+               for a in found for b in found):  # a shared positive duration, not a zero-length window
+            reasons.add("ambiguous_tracking")  # two lifetimes track one issue at once: neither is counted
+            continue
+        attempts.extend(found)
+    lost = [u for u in collected.unattributed if u.item_id is None or member_items.get(u.item_id) in wanted]
+    unstable = {member_items[i] for i in collected.unstable_items if member_items.get(i) in wanted}
+    if unstable:  # their lifetime changed during the read: unknown, never another lifetime's time (V1 review 121)
+        reasons.add("item_lifetime_changed_during_read")
+    timed = {member_items[a.item_id] for a in attempts}
+    groups = dict.fromkeys(GROUPS, 0.0)
+    total = unaccounted = overlap = 0.0
+    stages: dict[tuple[str, str, str], list] = {}
+    for attempt in attempts:
+        result = breakdown(attempt.window, attempt.intervals)
+        total, unaccounted, overlap = (total + result.total_seconds, unaccounted + result.unaccounted_seconds,
+                                       overlap + result.overlap_seconds)
+        for group, seconds in result.groups.items():
+            groups[group] += seconds
+        for row in result.stages:
+            sums = stages.setdefault((row.group, row.stage, row.actor), [0.0, 0.0, 0, False])
+            sums[0], sums[1], sums[2] = sums[0] + row.share_seconds, sums[1] + row.wall_seconds, sums[2] + 1
+            sums[3] = sums[3] or (row.stage == "dispatch" and attempt.window.start_label == FIRST_LABEL)
+    reasons |= {u.reason for u in lost}
+    if wanted - set(by_member) - unstable:  # members with no recorded attempt; ambiguous or unstable ones say so
+        reasons.add("no_attempt_recorded")
+    earliest = min((a.window.start for a in attempts), default=None)
+    marker = await audit.instrumentation_start(db)
+    if marker is None:
+        reasons.add("no_forward_coverage_marker")
+    elif earliest is not None and _naive_utc(marker) > earliest:
+        reasons.add("dispatch_before_instrumentation")  # an earlier dispatch in the windows may be missing
+    recorders = {c.measure: c for c in coverage}
+    group_coverage = dict.fromkeys(GROUPS, "full")
+    for group, measure in (("process", "check_runs"), ("waiting", "decision_waits")):
+        entry = recorders.get(measure)
+        if entry is None or entry.started_at is None:
+            group_coverage[group] = "unavailable"
+            reasons.add(f"{measure}: {entry.reason if entry else 'recording_not_installed'}")
+        elif earliest is not None and _naive_utc(entry.started_at) > earliest:
+            group_coverage[group] = "partial"  # what was recorded is kept, as a lower bound
+            reasons.add(f"{measure}: recording_started_late")
+    # Evidence the collector couldn't place makes the group it would have fed a lower bound (V1 review 119).
+    for group in sorted({_LOST_GROUP[u.source] for u in lost if u.source in _LOST_GROUP}):
+        if group_coverage[group] == "full":
+            group_coverage[group] = "partial"
+        reasons.add(f"{group}: unattributed_evidence")
+    known = bool(attempts)
+    if not known:
+        group_coverage = dict.fromkeys(GROUPS, "unavailable")
+    return TimeWentSection(
+        items=len(timed), attempts=len(attempts), unknown_items=len(wanted) - len(timed), unattributed=len(lost),
+        total_seconds=total if known else None,
+        groups={g: (v if group_coverage[g] != "unavailable" else None) for g, v in groups.items()},  # all with none
+        group_coverage=group_coverage, unaccounted_seconds=unaccounted if known else None,
+        overlap_seconds=overlap if known else None,
+        stages=[StageRow(group=g, stage=st, actor=a, share_seconds=v[0], wall_seconds=v[1], attempts=v[2],
+                         coverage=group_coverage[g], basis=FIRST_LABEL if v[3] else None)
+                for (g, st, a), v in sorted(stages.items(), key=lambda kv: (GROUPS.index(kv[0][0]), kv[0][1:]))],
+        coverage="unavailable" if not known else ("partial" if reasons else "full"), unknown_reasons=sorted(reasons))
 def _p85(values: list[float]) -> float:
     ordered = sorted(values)
     return ordered[math.ceil(0.85 * len(ordered)) - 1]
