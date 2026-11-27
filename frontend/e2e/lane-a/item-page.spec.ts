@@ -30,6 +30,7 @@ test('@active a merged item shows no recovery remedies and no "unknown"', async 
   await page.goto('/work/4')
   await expect(page.getByRole('heading', { name: /#104/ }).first()).toBeVisible()
   await expect(page.locator('main').getByRole('button', { name: /retry|recover|resume|escalate/i })).toHaveCount(0)
+  await expect(page.getByRole('region', { name: 'First-plan path comparison' })).toHaveCount(0)
   const text = await textOutsideTechnical(page)
   expect(text).not.toMatch(/\bunknown\b/i)
   expect(text).not.toMatch(/Protected recovery|Existing attempt recovery/i)
@@ -66,4 +67,32 @@ for (const theme of ['light', 'dark'] as Theme[]) {
     expect(failures, JSON.stringify(failures)).toEqual([])
     await expectKeyboardReachable(page, page.locator('main'), 3)
   })
+
+  for (const width of [1280, 390]) {
+    test(`@active first-plan paths fit at ${width} px in the ${theme} theme`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 844 })
+      await useTheme(page, theme)
+      const outside = `src/${'very-long-path-'.repeat(9)}outside.py`
+      await page.route('**/api/v1/factory/work-items/1', async route => {
+        const response = await route.fetch()
+        await route.fulfill({ response, json: {
+          ...await response.json(),
+          initial_path_comparison: {
+            head_sha: 'a'.repeat(40), base_sha: 'b'.repeat(40),
+            in_scope: ['src/in.py'], approved_companions: ['tests/test_in.py'],
+            outside_scope: [outside], note: `initial_paths_out_of_scope: '${outside}'`,
+          },
+        } })
+      })
+      await page.goto('/work/1')
+      const region = page.getByRole('region', { name: 'First-plan path comparison' })
+      for (const path of ['src/in.py', 'tests/test_in.py', outside]) {
+        await expect(region.getByText(path, { exact: true })).toBeVisible()
+      }
+      await expect(region.getByText(/initial_paths_out_of_scope/)).toBeVisible()
+      expect(await region.evaluate(section => section.scrollWidth <= section.clientWidth)).toBe(true)
+      const failures = await contrastFailures(region)
+      expect(failures, JSON.stringify(failures)).toEqual([])
+    })
+  }
 }

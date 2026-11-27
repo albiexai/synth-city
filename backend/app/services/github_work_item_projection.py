@@ -6,18 +6,34 @@ apply their separately reviewed field allowlist in factory_projection_service.
 from __future__ import annotations
 from typing import NamedTuple
 from fastapi import HTTPException
+from pydantic import ValidationError
 from app.services.factory_delivery_policy import effective_policy
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.database import GithubApprovalRequest, GithubAttemptScopeRevision, GithubWorkItem, GithubWorkspace, TeamGithubScope
-from app.models.schemas import GithubWorkItemResponse
+from app.models.schemas import GithubWorkItemResponse, InitialPathComparison
 from app.services.github_approval_service import CONTINUABLE_ESCALATIONS
 from app.services.github_dispatch_service import HANDOFF_QUEUE_TTL, github_dispatch_service
 from app.services.github_effort_limit_service import effort_limit_service
 from app.services.github_rate_limit_service import github_rate_limit_service
 from app.services.github_workspace_readiness import work_item_workspace_wait_reason
 from app.services import required_ci_attention
+
+
+def work_item_path_comparison(item: GithubWorkItem) -> InitialPathComparison | None:
+    """Read the last complete comparison if its observed head still applies."""
+    readiness = item.initial_paths_readiness or {}
+    if (item.active_scope_revision or item.pr_number is None or not isinstance(readiness, dict)
+            or readiness.get("head") != item.verification_head_sha):
+        return None
+    data = readiness.get("comparison")
+    if not isinstance(data, dict) or data.get("head_sha") != readiness.get("head") or data.get("base_sha") != readiness.get("base"):
+        return None
+    try:
+        return InitialPathComparison.model_validate(data)
+    except ValidationError:
+        return None
 
 
 def _work_item_status_note(item: GithubWorkItem) -> str | None:

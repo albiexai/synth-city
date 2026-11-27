@@ -396,7 +396,7 @@ prompt use this wording:
 
 ### Reviewer binding (#999)
 
-`synth_city_get_review_binding`, or `GET /github-work-items/{id}/review-binding`, gives an assigned reviewer exactly what it needs to record a head or revision review, and nothing more: `work_item_id`, `pr_number`, `dispatch_nonce` and `active_scope_revision`. It never returns the lease token, the owner binding, the plan, the workspace or Mail history. The nonce is private: use it only in the review tools and never publish it.
+`synth_city_get_review_binding`, or `GET /github-work-items/{id}/review-binding`, gives an assigned reviewer `work_item_id`, `pr_number`, `dispatch_nonce` and `active_scope_revision`. A complete comparison for the current first-plan PR adds `initial_path_comparison`, with the compared head and base, changed files in scope, approved companions, files outside scope, and any outside-scope note. The nonce is private and only belongs in the review tools. The comparison grants no review or merge authority.
 
 The caller comes from the authenticated session (no session: 401 `session_token_required`; a session without a team slot: 403 `session_not_slot_bound`). Exactly two callers are allowed, and every check reads fresh values:
 
