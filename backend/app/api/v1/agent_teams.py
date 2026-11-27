@@ -2917,8 +2917,12 @@ async def update_github_scope(
             raise HTTPException(status_code=400, detail={
                 "code": "director_confirmation_required", "confirm": "safety_bounds", "increases": increases,
             })
-        for name, value in bounds.items():
-            setattr(scope, name, value)
+        scope.max_scope_amendments = bounds.get("max_scope_amendments", scope.max_scope_amendments)
+        scope.max_scope_amendment_requests = bounds.get("max_scope_amendment_requests", scope.max_scope_amendment_requests)
+        scope.max_amendment_added_paths = bounds.get("max_amendment_added_paths", scope.max_amendment_added_paths)
+        scope.max_companion_paths = bounds.get("max_companion_paths", scope.max_companion_paths)
+        scope.continuation_allowed_reasons = bounds.get("continuation_allowed_reasons", scope.continuation_allowed_reasons)
+        scope.verifier_roles = bounds.get("verifier_roles", scope.verifier_roles)
         if identity_change and await _scope_identity_in_use(db, scope_id):
             raise HTTPException(status_code=409, detail="scope_identity_in_use")
         if auth_change and await _scope_identity_in_use(db, scope_id):

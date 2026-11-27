@@ -639,8 +639,6 @@ class GithubDispatchService:
             raise ValueError("continuation_pr_required")
 
         await db.refresh(scope, attribute_names=["continuation_enabled", "continuation_allowed_reasons"])
-        if not scope.continuation_enabled:
-            raise ValueError("continuation_disabled")
         if item.escalation_reason not in continuation_reasons(scope):
             raise ValueError("continuation_reason_not_allowed")
         policy_matches = continuation_policy_matches(scope)

@@ -8,6 +8,7 @@ import subprocess
 import pytest
 import pytest_asyncio
 from sqlalchemy import event, select, update
+from sqlalchemy.sql.dml import Update
 
 from app.api.v1 import agent_mail
 from app.config import settings
@@ -903,15 +904,33 @@ async def record_changes(db, a, **overrides):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["admission", "approval", "activation"])
-async def test_tightened_continuation_reasons_are_enforced_at_each_grant(db, healthy_attempt, monkeypatch, stage):
+@pytest.mark.parametrize("during_write", [False, True], ids=["before_read", "at_write"])
+async def test_tightened_continuation_reasons_are_enforced_at_each_grant(
+    db, healthy_attempt, monkeypatch, stage, during_write,
+):
     a = healthy_attempt
     a.item.pr_number = 5
     await github_dispatch_service.escalate_without_notification(db, a.item, "plan_blocked")
     monkeypatch.setattr(github_client, "get_recursive_tree", AsyncMock(return_value={}))
 
+    refusal = "stale_continuation_context" if during_write else "continuation_reason_not_allowed"
+
     async def tighten():
-        a.scope.continuation_allowed_reasons = ["retry_count_exhausted"]
-        await db.commit()
+        reasons = ["retry_count_exhausted"]
+        if not during_write:
+            a.scope.continuation_allowed_reasons = reasons
+            await db.commit()
+            return
+        execute = db.execute
+        scope_id = a.scope.id
+
+        async def execute_with_policy_change(statement, *args, **kwargs):
+            if isinstance(statement, Update) and statement.table.name == GithubWorkItem.__tablename__:
+                await execute(update(TeamGithubScope).where(TeamGithubScope.id == scope_id)
+                    .values(continuation_allowed_reasons=reasons).execution_options(synchronize_session=False))
+            return await execute(statement, *args, **kwargs)
+
+        monkeypatch.setattr(db, "execute", execute_with_policy_change)
 
     async def request():
         return await github_approval_service.create_continuation_request(
@@ -919,7 +938,7 @@ async def test_tightened_continuation_reasons_are_enforced_at_each_grant(db, hea
 
     if stage == "admission":
         await tighten()
-        with pytest.raises(GithubApprovalError, match="continuation_reason_not_allowed"):
+        with pytest.raises(GithubApprovalError, match=refusal):
             await request()
         return
     revision, approval, _ = await request()
@@ -932,14 +951,14 @@ async def test_tightened_continuation_reasons_are_enforced_at_each_grant(db, hea
 
     if stage == "approval":
         await tighten()
-        with pytest.raises(GithubApprovalError, match="continuation_reason_not_allowed"):
+        with pytest.raises(GithubApprovalError, match=refusal):
             await approve()
         return
     await approve()
     await github_approval_service.ensure_continuation_decision_message(db, a.item, approval, revision)
     await github_approval_service.deliver_approved_continuation(db, a.item, approval, revision)
     await tighten()
-    with pytest.raises(ValueError, match="continuation_reason_not_allowed"):
+    with pytest.raises(ValueError, match=refusal):
         await github_dispatch_service.activate_continuation_revision(
             db, a.item, a.scope, revision, authenticated_owner_member_id=a.owner.id,
             authenticated_owner_slot_id=a.owner.team_slot_id, dispatch_nonce=a.item.dispatch_nonce,

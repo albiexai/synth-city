@@ -60,7 +60,7 @@ def continuation_reasons(scope):
 
 def continuation_policy_matches(scope):
     return exists(select(TeamGithubScope.id).where(
-        TeamGithubScope.id == scope.id, TeamGithubScope.continuation_enabled.is_(True),
+        TeamGithubScope.id == scope.id, TeamGithubScope.continuation_enabled == scope.continuation_enabled,
         TeamGithubScope.continuation_allowed_reasons == scope.continuation_allowed_reasons,
     ))
 
@@ -2852,8 +2852,6 @@ class GithubApprovalService:
         policy_conditions = []
         if decision == "approved":
             scope = await db.get(TeamGithubScope, item.scope_id, populate_existing=True)
-            if not scope.continuation_enabled:
-                raise GithubApprovalError("continuation_disabled")
             if item.escalation_reason not in continuation_reasons(scope):
                 raise GithubApprovalError("continuation_reason_not_allowed")
             policy_conditions.append(continuation_policy_matches(scope))
