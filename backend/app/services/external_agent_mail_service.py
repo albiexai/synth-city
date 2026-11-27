@@ -6,9 +6,10 @@ import re
 import secrets
 from collections import deque
 from datetime import datetime, timedelta
-from typing import Deque
+from typing import Deque, Literal
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import MailExternalActor, MailMessage, MailTeamMember
@@ -27,7 +28,9 @@ from app.models.schemas import (
     TeamListResponse,
 )
 from app.services import decision_wait_service as decision_waits
+from app.services import factory_audit_service as audit
 from app.services.agent_mail_service import agent_mail_service
+from app.services.sqlite_busy_retry import retry_when_busy
 
 ACTOR_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{2,80}$")
 EXTERNAL_RATE_LIMIT_MAX_MESSAGES = 30
@@ -39,6 +42,12 @@ _REQUEST_RECIPIENT = object()
 
 class ExternalAgentMailAuthError(ValueError):
     """Raised when a bearer token cannot be mapped to an external actor."""
+
+
+class ExternalAgentMailCredentialError(ValueError):
+    def __init__(self, code: str, status_code: int) -> None:
+        super().__init__(code)
+        self.status_code = status_code
 
 
 class ExternalAgentMailRateLimitError(ValueError):
@@ -67,13 +76,12 @@ class ExternalAgentMailService:
             description=actor.description,
             created_at=actor.created_at,
             last_used_at=actor.last_used_at,
+            revoked_at=actor.revoked_at,
+            revoked_by=actor.revoked_by,
         )
 
-    async def create_actor(
-        self,
-        db: AsyncSession,
-        request: MailExternalActorCreate,
-    ) -> MailExternalActorCreateResponse:
+    @staticmethod
+    def _actor_profile(request: MailExternalActorCreate) -> dict:
         actor_key = request.actor_key.strip()
         display_name = request.display_name.strip()
         kind = request.kind.strip() or "external_tool"
@@ -84,41 +92,89 @@ class ExternalAgentMailService:
             raise ValueError("display_name is required")
         if len(kind) > 80:
             raise ValueError("kind must be 80 chars or less")
+        return dict(actor_key=actor_key, display_name=display_name, kind=kind, description=description)
 
+    async def actor_id_for_key(self, db: AsyncSession, key: str) -> int | None:
+        return await db.scalar(select(MailExternalActor.id).where(MailExternalActor.actor_key == key.strip()))
+
+    async def create_actor(self, db: AsyncSession, request: MailExternalActorCreate) -> MailExternalActorCreateResponse:
+        """Insert a fresh identity. A competing insert never grants rotation authority."""
+        profile = self._actor_profile(request)
         token = secrets.token_urlsafe(32)
-        result = await db.execute(
-            select(MailExternalActor).where(MailExternalActor.actor_key == actor_key)
-        )
-        actor = result.scalar_one_or_none()
-        if actor is None:
-            actor = MailExternalActor(
-                actor_key=actor_key,
-                display_name=display_name,
-                kind=kind,
-                description=description,
-                token_hash=self._hash_token(token),
-            )
+
+        async def insert_actor():
+            actor = MailExternalActor(**profile, token_hash=self._hash_token(token))
             db.add(actor)
-        else:
-            actor.display_name = display_name
-            actor.kind = kind
-            actor.description = description
-            actor.token_hash = self._hash_token(token)
+            await db.flush()
+            return actor
+
+        try:
+            actor = await retry_when_busy(db, insert_actor, route="external_actor_create")
+        except IntegrityError:
+            await db.rollback()
+            if await self.actor_id_for_key(db, profile["actor_key"]) is not None:
+                raise ExternalAgentMailCredentialError("external_actor_key_exists", 409) from None
+            raise
+        response = MailExternalActorCreateResponse(actor=self.actor_response(actor), token=token)
         await db.commit()
-        await db.refresh(actor)
-        return MailExternalActorCreateResponse(actor=self.actor_response(actor), token=token)
+        return response
+
+    async def change_actor_credential(
+        self, db: AsyncSession, actor_id: int, action: Literal["revoke", "rotate", "restore"],
+        director: dict, profile_request: MailExternalActorCreate | None = None,
+    ) -> MailExternalActorResponse | MailExternalActorCreateResponse:
+        now = datetime.utcnow()
+        restore = action == "restore"
+        revoke = action == "revoke"
+        conditions = [MailExternalActor.id == actor_id,
+                      MailExternalActor.revoked_at.is_not(None) if restore else MailExternalActor.revoked_at.is_(None)]
+        values = self._actor_profile(profile_request) if profile_request is not None else {}
+        if profile_request is not None:
+            conditions.append(MailExternalActor.actor_key == values.pop("actor_key"))
+        token = None if revoke else secrets.token_urlsafe(32)
+        if token is not None:
+            values["token_hash"] = self._hash_token(token)
+        if revoke or restore:
+            values.update(revoked_at=now if revoke else None, revoked_by=director["actor_reference"] if revoke else None)
+
+        statement = (update(MailExternalActor).where(*conditions).values(**values)
+            .returning(MailExternalActor).execution_options(populate_existing=True))
+        # The decision and audit insert share the credential writer's transaction.
+        try:
+            actor = await retry_when_busy(db, lambda: db.scalar(statement), route="external_actor_credential")
+            if actor is None:
+                if await db.get(MailExternalActor, actor_id) is None:
+                    raise ExternalAgentMailCredentialError("external_actor_not_found", 404)
+                raise ExternalAgentMailCredentialError("external_actor_state_conflict", 409)
+            await audit.record_event(db, event_kind="policy_change", source=f"external_agent_mail.{action}_actor",
+                occurred_at=now, actor=director, context_snapshot={"external_actor_id": actor.id},
+                before_values={"status": "revoked" if restore else "active"},
+                after_values={"status": "revoked" if revoke else "active"}, action_outcome="applied")
+            response = self.actor_response(actor)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        return MailExternalActorCreateResponse(actor=response, token=token) if token is not None else response
 
     async def authenticate_actor(self, db: AsyncSession, token: str | None) -> MailExternalActor:
         if not token:
             raise ExternalAgentMailAuthError("Missing bearer token")
         hashed = self._hash_token(token)
-        result = await db.execute(select(MailExternalActor))
-        for actor in result.scalars().all():
-            if hmac.compare_digest(actor.token_hash, hashed):
-                actor.last_used_at = datetime.utcnow()
+        result = await db.execute(select(MailExternalActor.id, MailExternalActor.token_hash)
+            .where(MailExternalActor.revoked_at.is_(None)))
+        actor_id = next((row.id for row in result if hmac.compare_digest(row.token_hash, hashed)), None)
+        if actor_id is not None:
+            # The last-use write must see the same live credential after any concurrent change.
+            statement = update(MailExternalActor).where(
+                MailExternalActor.id == actor_id, MailExternalActor.token_hash == hashed,
+                MailExternalActor.revoked_at.is_(None),
+            ).values(last_used_at=datetime.utcnow()).returning(MailExternalActor).execution_options(populate_existing=True)
+            actor = await retry_when_busy(db, lambda: db.scalar(statement), route="external_actor_authenticate")
+            if actor is not None:
                 await db.commit()
-                await db.refresh(actor)
                 return actor
+            await db.rollback()
         raise ExternalAgentMailAuthError("Invalid bearer token")
 
     def check_send_rate_limit(self, actor_id: int) -> None:
