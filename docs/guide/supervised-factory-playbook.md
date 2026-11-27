@@ -153,7 +153,7 @@ Add the integration branch to the `pull_request` and `push` triggers of every re
 
 Begin with human or delegated supervisor merges. Enable automatic integration only after the current-head checks and independent review have an enforceable gate. A review comment or label alone does not establish enforcement. Design-labelled work retains Synth City’s human-review pipeline.
 
-For several repositories, configure one repository scope for each repository in the same team. A team cannot have two repository scopes for one repository. Each scope has its own checkout, base branch, labels, checks and delivery policy. The team shares slot capacity. Cross-repository dependencies still need explicit evidence and Leader assessment.
+For several repositories, configure one repository scope for each repository in the same team. A team cannot have two repository scopes for the same owner and name of a repository. Use the same spelling every time, because the server keeps the case. Each scope has its own checkout, base branch, labels, checks and delivery policy. The team shares slot capacity. Cross-repository dependencies still need explicit evidence and Leader assessment.
 
 The Leader keeps the eligible queue current. A PR awaiting human merge does not automatically block unrelated work. Continue another item only when its dependencies, gates, owner capacity and workspace are ready. Do not route a dependent item around an unmet milestone.
 

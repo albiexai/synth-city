@@ -100,7 +100,7 @@ Each repository projection is one repository scope. Team automation and scope en
 
 Polling freshness is fresh, stale, never_polled, suspended or unknown. Stale means an eligible scope's last poll is older than twice the configured interval. Blocked or paused intake suspends freshness; unknown runtime remains unknown. Overview stale/never-polled counts include eligible intake only.
 
-Overlap warns when enabled repository scopes of different teams share a normalized GitHub repository and dispatch label. It checks local scopes outside the selected filters and returns safe other scope IDs. A warning neither merges work records nor arbitrates dispatch ownership.
+Overlap warns when other enabled repository scopes, in any team, have the same GitHub repository (owner and name, case ignored) and the same dispatch label. It checks local scopes outside the selected filters and returns safe other scope IDs. A warning neither merges work records nor arbitrates dispatch ownership.
 
 ## Errors
 

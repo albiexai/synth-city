@@ -27,7 +27,7 @@ If a first start is interrupted (power loss, killed process), simply start again
 | MCP server `claude-deck-mail` | `albiex-synth-city-mail` |
 | `claude_registry.db` | `synth_city.db` |
 | `~/.claude-registry/` | `~/.albiex-synth-city/` |
-| Labels `claude-deck-ready` / `claude-deck-design` (defaults for new scopes) | `albiex-synth-city-ready` / `albiex-synth-city-design` — existing scopes keep matching their existing labels; nothing to rename |
+| Labels `claude-deck-ready` / `claude-deck-design` (defaults for new repository scopes) | `albiex-synth-city-ready` / `albiex-synth-city-design` — existing scopes keep matching their existing labels; nothing to rename |
 | Release files `claude-deck-frontend-v…` | `albiex-synth-city-frontend-v…` |
 | `claudedeck.org`, `adrirubio/claude-deck` links | `albiex.org`, `albiexai/synth-city` (old links redirect) |
 

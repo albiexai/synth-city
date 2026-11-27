@@ -1,6 +1,6 @@
 # Repositories
 
-A **repository scope** is one team's watch on one GitHub repository. It holds the repository, the base branch, the dispatch label, the primary checkout (the existing local clone), the dispatch workspaces, the required checks and the delivery policy. A team has at most one repository scope for each repository. Different teams can watch the same repository, so one repository can have several scopes. All slots of a team work for all of its scopes.
+A **repository scope** is one team's watch on one GitHub repository. It holds the repository, the base branch, the dispatch label, the primary checkout (the existing local clone), the dispatch workspaces, the required checks and the delivery policy. A team has one repository scope for each owner and name of a repository. Use the same spelling every time: the server keeps the case, so `example/repo` and `EXAMPLE/repo` count as two. A different base branch or label does not make a second scope. Different teams can watch the same repository, so one repository can have several scopes. All slots of a team work for all of its scopes.
 
 [![Two teams and their repository scopes: team A watches repositories Y and X, team B watches repository X, and each team's slots work for all of its scopes](/images/operating-model/repository-scope.svg)](/images/operating-model/repository-scope.svg)
 
