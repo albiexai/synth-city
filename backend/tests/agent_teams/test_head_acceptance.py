@@ -634,6 +634,42 @@ async def test_the_reviewer_named_on_the_current_watch_reads_exactly_the_binding
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stale", [None, "head", "base"], ids=["matching", "stale-head", "stale-base"])
+async def test_the_named_reviewer_gets_the_first_plan_comparison_only_for_the_observed_pull(
+    db, healthy_attempt, stale
+):
+    from app.services.factory_delivery_policy import effective_policy
+    from app.services.github_ci_watch_service import _digest
+
+    a = healthy_attempt
+    item = a.item
+    _, a.reviewer = await slot_member(db, a.scope, role="builder", name="Named reviewer")
+    a.pull["base"]["sha"] = HEAD_B
+    compared_head = HEAD_A if stale == "head" else a.head
+    compared_base = "c" * 40 if stale == "base" else HEAD_B
+    comparison = {"head_sha": compared_head, "base_sha": compared_base, "in_scope": ["src/base.py"],
+                  "approved_companions": [], "outside_scope": [], "note": None}
+    item.pr_number = 5
+    item.dispatch_status = "verifying"
+    item.verification_head_sha = compared_head
+    item.initial_paths_readiness = {"head": compared_head, "base": compared_base, "comparison": comparison}
+    db.add(GithubRequiredCheckWatch(
+        work_item_id=item.id, dispatch_nonce=item.dispatch_nonce, scope_revision=0, pr_number=5,
+        head_sha=a.head, owner_slot_id=item.owner_slot_id, reviewer_member_id=a.reviewer.id,
+        policy_digest=_digest(effective_policy(item, a.scope)), checks=[],
+        observed_at=item.created_at, changed_at=item.created_at,
+    ))
+    await db.commit()
+
+    binding = await _binding(item.id, _reviewer_session(a), db)
+    expected = {"work_item_id": item.id, "pr_number": 5, "dispatch_nonce": item.dispatch_nonce,
+                "active_scope_revision": 0}
+    if stale is None:
+        expected["initial_path_comparison"] = comparison
+    assert binding == expected
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("change,status", [
     ("old_head", 403), ("stale_policy", 403), ("reassigned", 403), ("rebound", 403), ("disabled", 403),
     ("leader_named", 403), ("owner_named", 403), ("old_revision", 403), ("old_nonce", 403),
