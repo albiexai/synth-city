@@ -1099,6 +1099,28 @@ async def test_pr2_base_migration_does_not_invent_historical_attempt_identity():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("table", "column"),
+    [("agent_team_slots", "capability_tier"), ("github_work_items", "issue_difficulty")],
+)
+async def test_difficulty_fields_are_added_to_legacy_tables(table, column):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, legacy_value VARCHAR)"))
+            await conn.execute(text(f"INSERT INTO {table} VALUES (1, 'preserved')"))
+
+            assert column not in await _sqlite_columns(conn, table)
+            for _ in range(2):
+                await _run_sqlite_compat_migrations(conn)
+            assert column in await _sqlite_columns(conn, table)
+            rows = await conn.execute(text(f"SELECT id, legacy_value, {column} FROM {table}"))
+            assert rows.all() == [(1, "preserved", None)]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_pr2_workspace_migration_adds_push_token_expiry_idempotently():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     try:
@@ -1125,7 +1147,8 @@ async def test_pr2_workspace_migration_adds_push_token_expiry_idempotently():
 
 
 @pytest.mark.asyncio
-async def test_rebuild_agent_team_slots_removes_legacy_same_repo_unique_constraint():
+@pytest.mark.parametrize("stored_tier", [None, "medium"])
+async def test_rebuild_agent_team_slots_removes_legacy_same_repo_unique_constraint(stored_tier):
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     try:
         async with engine.connect() as conn:
@@ -1197,6 +1220,9 @@ async def test_rebuild_agent_team_slots_removes_legacy_same_repo_unique_constrai
                     """
                 )
             )
+            if stored_tier is not None:
+                await conn.execute(text("ALTER TABLE agent_team_slots ADD COLUMN capability_tier VARCHAR"))
+                await conn.execute(text("UPDATE agent_team_slots SET capability_tier = :tier"), {"tier": stored_tier})
             await conn.commit()
 
             assert await _sqlite_agent_team_slots_has_unique_preset_repo_index(conn)
@@ -1205,6 +1231,7 @@ async def test_rebuild_agent_team_slots_removes_legacy_same_repo_unique_constrai
             await _sqlite_rebuild_agent_team_slots(conn, columns)
 
             assert not await _sqlite_agent_team_slots_has_unique_preset_repo_index(conn)
+            assert await conn.scalar(text("SELECT capability_tier FROM agent_team_slots")) == stored_tier
             await conn.execute(
                 text(
                     """

@@ -1480,3 +1480,18 @@ async def test_priority_watcher_observes_labels_and_clears_removed_values(db, la
     await db.refresh(item)
     assert item.dispatch_priority is None and item.dispatch_status == "pending"
     assert item.dispatch_nonce is None and item.retry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_watcher_records_the_highest_difficulty_and_clears_it_when_removed(db):
+    scope = await _make_scope(db)
+    await github_watcher_service._upsert_item(db, scope,
+        _issue(795, [scope.dispatch_label, "difficulty:low", "Difficulty:high", "difficulty:medium"]))
+    await db.commit()
+    item = await db.scalar(select(GithubWorkItem).where(GithubWorkItem.issue_number == 795))
+    assert item.issue_difficulty == "medium"
+    await github_watcher_service._upsert_item(db, scope,
+        _issue(795, [scope.dispatch_label], updated="2026-07-06T00:00:00Z"))
+    await db.commit()
+    await db.refresh(item)
+    assert item.issue_difficulty is None and item.dispatch_status == "pending"

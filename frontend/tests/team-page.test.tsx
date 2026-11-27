@@ -294,6 +294,19 @@ describe('members', () => {
     open()
     await user.click(await screen.findByRole('button', { name: 'Add member' }))
     expect(await screen.findByRole('dialog')).toBeInTheDocument()
+    expect(screen.getByRole('combobox', { name: 'Capability tier' })).toHaveTextContent('Default (high)')
+  })
+
+  it('opens the role edit form with the saved capability tier', async () => {
+    const user = userEvent.setup()
+    vi.mocked(fetchAgentTeamPresets).mockResolvedValue({
+      presets: [{ ...team, slots: team.slots.map((member) => member.id === 12
+        ? { ...member, capability_tier: 'medium' } : member) }],
+    })
+    open()
+    await user.click(await screen.findByRole('button', { name: 'Actions for R2 implementer' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Edit' }))
+    expect(await screen.findByRole('combobox', { name: 'Capability tier' })).toHaveTextContent('Medium')
   })
 })
 

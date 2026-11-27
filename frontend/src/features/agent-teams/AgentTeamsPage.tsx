@@ -183,6 +183,7 @@ function slotToInput(slot: AgentTeamSlot): AgentTeamSlotInput {
     launch_options: slot.launch_options ?? {},
     area_labels: slot.area_labels ?? [],
     expertise: slot.expertise ?? '',
+    capability_tier: slot.capability_tier ?? null,
     enabled: slot.enabled,
     position: slot.position,
   }
@@ -594,6 +595,23 @@ function SlotDialog({
               <p className="text-xs text-muted-foreground">
                 Mechanical match checked first against incoming GitHub issue labels.
               </p>
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="slot-capability-tier">Capability tier</Label>
+              <Select
+                value={form.capability_tier ?? 'default'}
+                onValueChange={(tier) => update({
+                  capability_tier: tier === 'default' ? null : tier as AgentTeamSlotInput['capability_tier'],
+                })}
+              >
+                <SelectTrigger id="slot-capability-tier"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="default">Default (high)</SelectItem>
+                  <SelectItem value="low">Low</SelectItem>
+                  <SelectItem value="medium">Medium</SelectItem>
+                  <SelectItem value="high">High</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
             <div className="grid gap-2">
               <Label htmlFor="slot-expertise">Expertise</Label>

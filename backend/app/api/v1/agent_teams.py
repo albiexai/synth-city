@@ -298,6 +298,7 @@ async def _record_notice(
 
 _HANDOFF_ACCEPTANCE_CODES = (
     ("cannot accept a handoff targeted", "not_handoff_target"),
+    ("handoff_target_below_difficulty", "handoff_target_below_difficulty"),
     ("is unavailable", "handoff_context_unavailable"),
     ("continuation authority changed", "handoff_authority_changed"),
     ("state changed before acceptance", "handoff_state_changed"),

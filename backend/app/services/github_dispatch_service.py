@@ -51,6 +51,9 @@ from app.services.github_approval_service import (
     github_approval_service,
 )
 from app.services.github_client import github_client
+from app.services.github_dispatch_difficulty import (
+    difficulty_from_labels, tier_allows_difficulty, tier_allows_difficulty_sql,
+)
 from app.services.github_dispatch_priority import dispatch_order_key, priority_from_labels
 from app.services.github_recovery_gate import GithubRecoveryOnlyAttempt
 from app.services.session_recovery import recover_session
@@ -142,6 +145,21 @@ def _live_queued_handoffs(now: datetime):
     )
 
 
+def _eligible_handoff_target(target_id: int, preset_id: int):
+    return exists(select(AgentTeamSlot.id).where(
+        AgentTeamSlot.id == target_id,
+        AgentTeamSlot.preset_id == preset_id,
+        AgentTeamSlot.enabled.is_(True),
+        tier_allows_difficulty_sql(AgentTeamSlot.capability_tier, GithubWorkItem.issue_difficulty),
+    ).correlate(GithubWorkItem))
+
+
+def _require_handoff_tier(tier: str | None, difficulty: str | None) -> None:
+    if not tier_allows_difficulty(tier, difficulty):
+        code = "handoff_target_below_difficulty"
+        raise ResumeAttemptError(code, code)
+
+
 async def _lock_dispatch_team(db: AsyncSession, preset_id: int) -> None:
     # Close the read transaction before taking the SQLite writer / PostgreSQL row lock.
     await db.commit()
@@ -209,6 +227,7 @@ PENDING_REASONS = frozenset(
         "queued_no_workspace",
         "queued_auth_mode_unresolved",
         "no_eligible_owner",
+        "difficulty_above_tier",
     }
 )
 
@@ -216,6 +235,7 @@ NO_ELIGIBLE_OWNER_NOTE = (
     "No eligible owner: no enabled implementer slot matches this issue. "
     "The Leader and coordinator slots never own an item."
 )
+DIFFICULTY_ABOVE_TIER_NOTE = "Issue difficulty exceeds the capability tier of the available routing candidates."
 
 
 _ROLE_TRIM = " \t\r\n"
@@ -1013,17 +1033,28 @@ class GithubDispatchService:
             return None, "no_eligible_owner"
 
         issue_label_set = set(issue_labels)
-        for slot in enabled:
+        difficulty = difficulty_from_labels(issue_labels) if issue_labels else item.issue_difficulty
+        eligible = [slot for slot in enabled if tier_allows_difficulty(slot.capability_tier, difficulty)]
+        for slot in eligible:
             slot_areas = set(slot.area_labels or [])
             if slot_areas & issue_label_set:
                 return slot.id, "label"
 
-        classifiable = [slot for slot in enabled if slot.expertise]
+        classifiable = [slot for slot in eligible if slot.expertise]
         if classifiable and classify is not None:
             chosen = await classify(item, classifiable)
             if chosen is not None:
-                return chosen, "classified"
+                if difficulty is None or any(slot.id == chosen for slot in eligible):
+                    return chosen, "classified"
+                if any(slot.id == chosen for slot in enabled):
+                    return None, "difficulty_above_tier"
 
+        if not eligible or any(
+            slot not in eligible and (set(slot.area_labels or []) & issue_label_set
+                                      or (classify is not None and slot.expertise))
+            for slot in enabled
+        ):
+            return None, "difficulty_above_tier"
         return None, "no_eligible_owner"
 
     async def slot_is_busy(
@@ -1103,6 +1134,10 @@ class GithubDispatchService:
         await db.execute(update(AgentTeamPreset).where(
             AgentTeamPreset.id == scope.preset_id,
         ).values(updated_at=AgentTeamPreset.updated_at))
+        difficulty_refusal = exists(select(AgentTeamSlot.id).where(
+            AgentTeamSlot.id == identity[3], AgentTeamSlot.preset_id == scope.preset_id,
+            ~tier_allows_difficulty_sql(AgentTeamSlot.capability_tier, GithubWorkItem.issue_difficulty),
+        ).correlate(GithubWorkItem))
         authority = exists(select(TeamGithubScope.id).join(
             AgentTeamPreset, AgentTeamPreset.id == TeamGithubScope.preset_id,
         ).join(AgentTeamSlot, AgentTeamSlot.id == AgentTeamPreset.leader_slot_id).where(
@@ -1120,8 +1155,15 @@ class GithubDispatchService:
             GithubWorkspace.lease_token == acquisition[3],
         ))
         result = await db.execute(update(GithubWorkItem).where(
-            _item_identity_clause(identity), authority,
+            _item_identity_clause(identity), authority, ~difficulty_refusal,
         ).values(updated_at=GithubWorkItem.updated_at).execution_options(synchronize_session=False))
+        if result.rowcount != 1:
+            refused = await db.execute(update(GithubWorkItem).where(
+                _item_identity_clause(identity), difficulty_refusal,
+            ).values(pending_reason="difficulty_above_tier", status_note=DIFFICULTY_ABOVE_TIER_NOTE)
+                .execution_options(synchronize_session=False))
+            if refused.rowcount == 1:
+                await db.refresh(item)
         await db.commit()
         if require_autonomy:
             from app.services.github_coordination_service import hold_code
@@ -1164,6 +1206,11 @@ class GithubDispatchService:
         if _ineligible_owner(owner, preset.leader_slot_id if preset else None):
             item.pending_reason = "no_eligible_owner"
             item.status_note = NO_ELIGIBLE_OWNER_NOTE
+            await db.commit()
+            return False
+        if not tier_allows_difficulty(owner.capability_tier, item.issue_difficulty):
+            item.pending_reason = "difficulty_above_tier"
+            item.status_note = DIFFICULTY_ABOVE_TIER_NOTE
             await db.commit()
             return False
         if await self.slot_is_busy(db, owner_slot_id, exclude_item_id=item_id):
@@ -1306,6 +1353,7 @@ class GithubDispatchService:
         for item in pending:
             if item.issue_number in issue_labels_by_number:
                 item.dispatch_priority = priority_from_labels(issue_labels_by_number[item.issue_number])
+                item.issue_difficulty = difficulty_from_labels(issue_labels_by_number[item.issue_number])
         pending.sort(key=dispatch_order_key)
         await db.commit()
 
@@ -1388,10 +1436,16 @@ class GithubDispatchService:
                     leader_slot_id=preset.leader_slot_id if preset else None,
                 )
             if owner_slot_id is None:
-                await self._update_current_item(
-                    db, item, pending_identity, pending_reason="no_eligible_owner",
-                    status_note=NO_ELIGIBLE_OWNER_NOTE,
-                )
+                if method == "difficulty_above_tier":
+                    await self._update_current_item(
+                        db, item, pending_identity, pending_reason="difficulty_above_tier",
+                        status_note=DIFFICULTY_ABOVE_TIER_NOTE,
+                    )
+                else:
+                    await self._update_current_item(
+                        db, item, pending_identity, pending_reason="no_eligible_owner",
+                        status_note=NO_ELIGIBLE_OWNER_NOTE,
+                    )
                 await db.commit()
                 continue
             # A prepared attempt may itself be what holds the slot, so it is never locked out of it.
@@ -1501,9 +1555,12 @@ class GithubDispatchService:
                 db, scope, item, prepared_identity, workspace, acquisition,
                 require_autonomy=require_autonomy,
             ):
-                await self._update_current_item(
-                    db, item, prepared_identity, dispatch_status="pending", pending_reason="leader_unavailable",
-                )
+                if item.pending_reason == "difficulty_above_tier":
+                    await self._update_current_item(db, item, prepared_identity, dispatch_status="pending")
+                else:
+                    await self._update_current_item(
+                        db, item, prepared_identity, dispatch_status="pending", pending_reason="leader_unavailable",
+                    )
                 await db.commit()
                 continue
             try:
@@ -2479,9 +2536,23 @@ class GithubDispatchService:
                                                include_queued_handoffs=False)):
                 await db.commit()
                 continue
-            item.handoff_state = "pending"
-            item.handoff_expires_at = None
-            item.updated_at = now
+            promoted = await db.execute(
+                update(GithubWorkItem)
+                .where(
+                    GithubWorkItem.id == item_id,
+                    GithubWorkItem.scope_id == scope.id,
+                    GithubWorkItem.handoff_state == "queued",
+                    GithubWorkItem.handoff_target_slot_id == target_id,
+                    GithubWorkItem.handoff_expires_at > now,
+                    _eligible_handoff_target(target_id, preset_id),
+                )
+                .values(handoff_state="pending", handoff_expires_at=None, updated_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            if promoted.rowcount != 1:
+                await db.commit()
+                continue
+            await db.refresh(item)
             from app.services import factory_audit_service as audit
 
             notice_fields = await self._record_handoff_reassignment(
@@ -2570,6 +2641,7 @@ class GithubDispatchService:
                 "invalid_handoff_target",
                 "Handoff target must be an enabled slot in the same preset",
             )
+        _require_handoff_tier(target.capability_tier, item.issue_difficulty)
         busy = await self.slot_is_busy(db, target_slot_id, exclude_item_id=item.id)
         now = datetime.utcnow()
         if (busy and item.handoff_state == "queued" and item.handoff_target_slot_id == target_slot_id
@@ -2728,8 +2800,10 @@ class GithubDispatchService:
             ).scalar_one_or_none()
             if scope is None:
                 raise ValueError("handoff scope is unavailable")
-            if not target.enabled or target.preset_id != scope.preset_id:
+            target = await db.get(AgentTeamSlot, accepting_slot_id, populate_existing=True)
+            if target is None or not target.enabled or target.preset_id != scope.preset_id:
                 raise ValueError("handoff target is unavailable")
+            _require_handoff_tier(target.capability_tier, item.issue_difficulty)
             if await self.slot_is_busy(db, accepting_slot_id, exclude_item_id=item.id, include_queued_handoffs=False):
                 raise ResumeAttemptError("handoff_target_busy", "The handoff target has other work")
             active_revision = None
@@ -2766,13 +2840,18 @@ class GithubDispatchService:
                 )
             )
             now = datetime.utcnow()
+            pending_handoff = (
+                GithubWorkItem.id == item.id,
+                GithubWorkItem.scope_id == scope.id,
+                GithubWorkItem.owner_slot_id == old_owner_slot_id,
+                GithubWorkItem.handoff_state == "pending",
+                GithubWorkItem.handoff_target_slot_id == accepting_slot_id,
+            )
             item_update = (
                 update(GithubWorkItem)
                 .where(
-                    GithubWorkItem.id == item.id,
-                    GithubWorkItem.owner_slot_id == old_owner_slot_id,
-                    GithubWorkItem.handoff_state == "pending",
-                    GithubWorkItem.handoff_target_slot_id == accepting_slot_id,
+                    *pending_handoff,
+                    _eligible_handoff_target(accepting_slot_id, scope.preset_id),
                 )
                 .values(
                     owner_slot_id=accepting_slot_id,
@@ -2801,6 +2880,21 @@ class GithubDispatchService:
                     ),
                 )
             item_result = await db.execute(item_update)
+            if item_result.rowcount != 1:
+                current_tier = (await db.execute(
+                    select(AgentTeamSlot.capability_tier, GithubWorkItem.issue_difficulty)
+                    .select_from(GithubWorkItem)
+                    .join(AgentTeamSlot, AgentTeamSlot.id == accepting_slot_id)
+                    .where(
+                        *pending_handoff,
+                        AgentTeamSlot.preset_id == scope.preset_id,
+                        AgentTeamSlot.enabled.is_(True),
+                    )
+                )).one_or_none()
+                await db.rollback()
+                if current_tier is not None:
+                    _require_handoff_tier(*current_tier)
+                raise ValueError("handoff state changed before acceptance")
             workspace_result = await db.execute(
                 update(GithubWorkspace)
                 .where(
@@ -2898,10 +2992,7 @@ class GithubDispatchService:
                 if remaining_authority:
                     await db.rollback()
                     raise ValueError("handoff continuation authority changed")
-            if (
-                item_result.rowcount != 1
-                or workspace_result.rowcount != 1
-            ):
+            if workspace_result.rowcount != 1:
                 await db.rollback()
                 raise ValueError("handoff state changed before acceptance")
             if actor is not None:
