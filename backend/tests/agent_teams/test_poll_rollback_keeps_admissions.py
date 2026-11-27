@@ -269,10 +269,10 @@ async def test_an_upsert_that_fails_after_the_first_issue_discards_the_whole_bat
     original = github_watcher_service._upsert_item
     broken = {"once": True}
 
-    async def upsert(db, scope, issue):
+    async def upsert(db, scope, issue, *, read_started_at=None):
         if issue["number"] == 2 and broken.pop("once", False):
             raise LOCKED
-        return await original(db, scope, issue)
+        return await original(db, scope, issue, read_started_at=read_started_at)
 
     monkeypatch.setattr(github_watcher_service, "_upsert_item", upsert)
     await _tick(scheduler)
@@ -341,7 +341,7 @@ async def test_control_a_non_idempotent_admission_fails_the_next_tick_and_the_as
     await _tick(scheduler)
     kept = await _items(maker)
 
-    async def always_insert(db, scope, issue):
+    async def always_insert(db, scope, issue, *, read_started_at=None):
         db.add(GithubWorkItem(scope_id=scope.id, issue_number=issue["number"], issue_title=issue["title"],
                               issue_url=issue["html_url"], github_updated_at=datetime.utcnow(),
                               dispatch_status="pending"))
