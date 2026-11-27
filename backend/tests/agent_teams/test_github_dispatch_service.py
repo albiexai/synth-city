@@ -921,6 +921,34 @@ async def test_prepare_attempt_advances_generation_across_retries_and_milestone_
 
 
 @pytest.mark.asyncio
+async def test_prepare_attempt_shares_generation_across_case_variant_repository_scopes(db):
+    preset, slots, scope = await _team(db)
+    other_scope = TeamGithubScope(
+        preset_id=preset.id,
+        repo_owner=scope.repo_owner.upper(),
+        repo_name=scope.repo_name.upper(),
+        repo_path=scope.repo_path,
+        base_ref=scope.base_ref,
+    )
+    db.add(other_scope)
+    await db.flush()
+    issue = dict(issue_number=42, issue_title="Same repository issue",
+                 issue_url="u", github_updated_at=datetime.utcnow())
+    first_item = GithubWorkItem(scope_id=scope.id, **issue)
+    second_item = GithubWorkItem(scope_id=other_scope.id, **issue)
+    db.add_all([first_item, second_item])
+    await db.commit()
+    arguments = dict(owner_slot_id=slots[1].id, routing_method="label", base_ref=scope.base_ref)
+
+    first = await github_dispatch_service.prepare_attempt(db, first_item, **arguments)
+    second = await github_dispatch_service.prepare_attempt(db, second_item, **arguments)
+
+    assert first.dispatch_head_ref == f"deck/slot-{slots[1].id}/issue-42-g1"
+    assert second.dispatch_head_ref == f"deck/slot-{slots[1].id}/issue-42-g2"
+    assert (first_item.dispatch_attempt, second_item.dispatch_attempt) == (1, 2)
+
+
+@pytest.mark.asyncio
 async def test_reset_for_retry_clears_ack_received_at(db):
     _, _, scope = await _team(db)
     item = GithubWorkItem(
