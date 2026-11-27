@@ -363,7 +363,7 @@ describe('Progress', () => {
   })
 
   it('keeps the known work at 80% of the bar and leaves the rest to the unknown remainder', async () => {
-    run({ ...unavailable, done_count: 4, under_way_count: 0, under_way: [], queued_count: 0, queued: [] })
+    run({ ...unavailable, done_count: 4, under_way_count: 0, under_way: [], queued_count: 0, queued: [], campaign_status: 'active' })
     await open()
     const bar = screen.getByRole('img')
     const done = bar.querySelector('span.bg-primary') as HTMLElement
@@ -381,7 +381,7 @@ describe('Progress', () => {
   })
 
   it('draws no bar when nothing is known and the backlog cannot be read', async () => {
-    run({ ...unavailable, done_count: 0, latest_done: [], under_way_count: 0, under_way: [], queued_count: 0, queued: [] })
+    run({ ...unavailable, done_count: 0, latest_done: [], under_way_count: 0, under_way: [], queued_count: 0, queued: [], campaign_status: 'active' })
     await open()
     expect(screen.queryByRole('img')).not.toBeInTheDocument()
     expect(screen.getByText(/The backlog cannot be read/)).toBeInTheDocument()
@@ -467,6 +467,25 @@ describe('Progress', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('hides a team without a campaign record that has only backlog or planned decisions (the Supervisor, 2026-11-27)', async () => {
+    serveTeams([team(1, 'synth-city-v4.4', { campaign_status: 'active' }),
+      team(2, 'old-team', { ...finishedOnly, campaign_status: null, not_started_count: 4,
+        not_started_groups: [{ area: 'Other', count: 4 }], decisions_ahead: [{ text: 'Approve publication.', state: 'later' }],
+        dispatch_order: [] })])
+    await open()
+    expect(screen.queryByRole('article', { name: /Progress: old-team/ })).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['under way', { under_way_count: 1 }], ['queued', { queued_count: 1 }], ['needing attention', { attention_count: 1 }],
+    ['in the observed dispatch order', { dispatch_order: [{ title: 'Next', scope_id: 1, repository: 'o/r', issue_number: 7,
+      priority: null, dispatch_position: 1 }] }],
+  ])('shows a team without a campaign record while work is %s', async (_, over) => {
+    serveTeams([team(2, 'old-team', { ...finishedOnly, campaign_status: null, ...over })])
+    await open()
+    expect(screen.getByRole('article', { name: /Progress: old-team/ })).toBeInTheDocument()
   })
 
   it('omits a campaign with nothing to show', async () => {

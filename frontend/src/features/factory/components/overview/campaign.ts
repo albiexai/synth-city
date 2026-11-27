@@ -1,14 +1,14 @@
 import type { TeamCampaignSummary } from "@/types/agentTeams";
 
 /** #1415: a team's Progress card shows while its recorded campaign is active or finishing. A finished campaign has
- * no card. A team without a campaign record shows while work is under way, queued, not started or needs attention;
- * finished work alone never brings a card back, and "finished" is never inferred from the counts. */
+ * no card. A team without a campaign record shows only while work is under way, queued or needs attention: done
+ * work, backlog or planned decisions alone never bring a card back, and "finished" is never inferred from counts. */
 export function campaignShown(campaign: TeamCampaignSummary | undefined) {
   if (!campaign) return false;
   if (campaign.campaign_status === "active" || campaign.campaign_status === "finishing") return true;
   if (campaign.campaign_status === "finished") return false;
-  return campaign.under_way_count + (campaign.attention_count ?? 0) + campaign.queued_count +
-    (campaign.not_started_count ?? 0) > 0 || campaign.decisions_ahead.length > 0 ||
+  // The observed dispatch order is queued work too.
+  return campaign.under_way_count + campaign.queued_count + (campaign.attention_count ?? 0) > 0 ||
     (campaign.dispatch_order?.length ?? 0) > 0;
 }
 
