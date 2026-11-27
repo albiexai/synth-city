@@ -365,6 +365,9 @@ async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], cov
             continue
         attempts.extend(found)
     lost = [u for u in collected.unattributed if u.item_id is None or member_items.get(u.item_id) in wanted]
+    unstable = {member_items[i] for i in collected.unstable_items if member_items.get(i) in wanted}
+    if unstable:  # their lifetime changed during the read: unknown, never another lifetime's time (V1 review 121)
+        reasons.add("item_lifetime_changed_during_read")
     timed = {member_items[a.item_id] for a in attempts}
     groups = dict.fromkeys(GROUPS, 0.0)
     total = unaccounted = overlap = 0.0
@@ -380,7 +383,7 @@ async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], cov
             sums[0], sums[1], sums[2] = sums[0] + row.share_seconds, sums[1] + row.wall_seconds, sums[2] + 1
             sums[3] = sums[3] or (row.stage == "dispatch" and attempt.window.start_label == FIRST_LABEL)
     reasons |= {u.reason for u in lost}
-    if wanted - set(by_member):  # members with no recorded attempt at all; ambiguous ones say so instead
+    if wanted - set(by_member) - unstable:  # members with no recorded attempt; ambiguous or unstable ones say so
         reasons.add("no_attempt_recorded")
     earliest = min((a.window.start for a in attempts), default=None)
     marker = await audit.instrumentation_start(db)

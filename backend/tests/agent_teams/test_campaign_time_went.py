@@ -18,6 +18,7 @@ from app.models.database import (
     AgentTeamLaunch,
     CampaignSnapshot,
     CampaignUpgradeCoverage,
+    GithubApprovalRequest,
     GithubCheckRunHistory,
     GithubCheckRunHistoryCoverage,
     GithubHeadReview,
@@ -413,6 +414,90 @@ async def test_stage_rows_carry_their_attempts_coverage_and_the_dispatch_basis(d
         2, "from campaign membership; ready time not recorded", "full")
     assert (rows[("process", "required_check")].attempts, rows[("process", "review")].attempts) == (1, 1)
     assert went.group_coverage == {"waiting": "full", "process": "full", "active": "full"}
+
+
+# V1 review 121: a lifetime replaced after the item read and before the evidence read
+async def _race(db, world, monkeypatch, replace, *, keyed=False, again=None):
+    """Issue 10 (no attempt) is read; then, before its evidence is read, ``replace`` runs and commits. With ``keyed``
+    the row already has a lifetime key (an earlier event); ``again`` runs before its second, first-key read."""
+    from app.services import retro_attempt_collector as collector
+
+    await _recording(db)
+    old = await _item(db, world, 10)
+    if keyed:
+        await _effort(db, old, -50, -45)
+    await _build(db, world, [10])  # the campaign starts before the race
+    snapshots.clear_cache()
+    original, raced = collector._collect_item, []
+
+    async def interleaved(session, item, *args, **kwargs):
+        if item.id == old.id and len(raced) < (2 if again else 1):  # issue 10's own row, after the item read
+            raced.append(True)
+            await (replace if len(raced) == 1 else again)(session, item)
+            await session.commit()
+        return await original(session, item, *args, **kwargs)
+
+    monkeypatch.setattr(collector, "_collect_item", interleaved)
+    return old, (await _build(db, world, [10])).time_went
+
+
+async def _replaced_by_999(session, item, *, dispatch=True, request=False):
+    item_id = item.id
+    session.expunge(item)
+    await session.execute(text("DELETE FROM github_work_items WHERE id = :i"), {"i": item_id})
+    session.add(GithubWorkItem(id=item_id, scope_id=item.scope_id, issue_number=999, issue_title="R", issue_url="u/999",
+                               github_updated_at=T0, dispatch_status="dispatched", created_at=CREATED,
+                               dispatch_nonce="nonce-999"))
+    await session.flush()
+    await _dispatch(session, item_id, 0, launch=0)  # the replacement's own lifetime key
+    if dispatch is False:
+        await session.execute(text("DELETE FROM factory_audit_events WHERE event_kind = 'work_lifecycle' "
+                                   "AND item_id = :i"), {"i": item_id})
+    if request:
+        for member in (60, 61):  # the request's owner and leader Mail identities
+            if await session.get(MailTeamMember, member) is None:
+                session.add(MailTeamMember(id=member, identity_key=f"m{member}", repo_id="r", repo_path="/r",
+                                           repo_name="r", display_name=f"M{member}"))
+        await session.flush()
+        session.add(GithubApprovalRequest(work_item_id=item_id, request_kind="initial_plan", dispatch_nonce="nonce-999",
+                                          approval_round=1, owner_member_id=61, leader_member_id=60,
+                                          request_fingerprint="fp-999", created_at=_m(10)))
+    await session.flush()
+
+
+async def test_a_replacement_committed_after_the_item_read_adds_no_time(db, world, monkeypatch):
+    _, went = await _race(db, world, monkeypatch, _replaced_by_999)
+    assert (went.attempts, went.items, went.unknown_items, went.total_seconds) == (0, 0, 1, None)
+    assert "item_lifetime_changed_during_read" in went.unknown_reasons
+    assert "no_attempt_recorded" not in went.unknown_reasons  # it is unknown for the race, not for a missing attempt
+
+
+async def test_a_replacements_item_owned_rows_add_no_unattributed_evidence(db, world, monkeypatch):
+    async def rows_only(session, item):
+        await _replaced_by_999(session, item, dispatch=False, request=True)
+
+    _, went = await _race(db, world, monkeypatch, rows_only, keyed=True)  # its numeric-id rows are read
+    assert (went.unattributed, went.attempts) == (0, 0)
+    assert "item_lifetime_changed_during_read" in went.unknown_reasons
+
+
+async def test_a_dispatch_on_the_original_lifetime_during_the_same_interleaving_still_counts(db, world, monkeypatch):
+    async def own_dispatch(session, item):
+        await _dispatch(session, item.id, 0, launch=0)
+
+    _, went = await _race(db, world, monkeypatch, own_dispatch)
+    assert (went.attempts, went.items, went.total_seconds) == (1, 1, 180 * MIN)
+    assert "item_lifetime_changed_during_read" not in went.unknown_reasons
+
+
+async def test_a_row_replaced_during_the_first_key_read_is_dropped(db, world, monkeypatch):
+    """The original lifetime's first dispatch arrives, then the row is replaced before that read completes."""
+    async def own_dispatch(session, item):
+        await _dispatch(session, item.id, 0, launch=0)
+
+    _, went = await _race(db, world, monkeypatch, own_dispatch, again=_replaced_by_999)
+    assert (went.attempts, went.total_seconds) == (0, None)
+    assert "item_lifetime_changed_during_read" in went.unknown_reasons
 
 
 # The cache: inserts, updates and deletions with no audit event
