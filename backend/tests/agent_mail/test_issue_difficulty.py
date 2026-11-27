@@ -9,7 +9,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import select, update
 
-from app.models.database import AgentTeamPreset, FactoryAuditEvent, GithubWorkItem, MailAgentSession, TeamGithubScope
+from app.models.database import AgentTeamPreset, FactoryAuditEvent, GithubWorkItem, MailAgentSession, MailExternalActor, TeamGithubScope
 from app.services import github_issue_difficulty_service as difficulty_service
 from app.services.github_app_auth_service import github_app_auth_service
 from app.services.github_client import github_client
@@ -129,6 +129,28 @@ async def test_privileged_override_wins_even_at_a_lower_tier(client, db, difficu
     refused = await write(client, w.mail_path, w.leader_headers, "medium")
     assert refused.status_code == 409 and refused.json()["detail"] == "difficulty_override_protected"
     assert w.writes == before
+
+
+async def test_supervisor_revocation_during_label_read_prevents_the_write(client, db, difficulty_world, monkeypatch):
+    w = difficulty_world
+    token, actor = await _actor_token(client, "difficulty-revoked", "Supervisor")
+    w.team.supervisor_actor_id = actor["id"]
+    await db.commit()
+
+    read_labels = difficulty_service._read_labels
+
+    async def revoke_after_read(*args, **kwargs):
+        labels = await read_labels(*args, **kwargs)
+        await db.execute(update(MailExternalActor).where(MailExternalActor.id == actor["id"]).values(
+            revoked_at=datetime.utcnow(), revoked_by="shared-operator-credential",
+        ))
+        return labels
+
+    monkeypatch.setattr(difficulty_service, "_read_labels", revoke_after_read)
+    response = await write(client, w.supervisor_path, {"Authorization": f"Bearer {token}"}, "low")
+    assert response.status_code == 403
+    assert response.json()["detail"] == "supervisor_actor_not_bound"
+    assert w.writes == []
 
 
 async def test_external_label_is_protected_without_claiming_an_author(client, db, difficulty_world):

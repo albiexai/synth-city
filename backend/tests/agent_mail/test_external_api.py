@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.config import settings
 from app.database import Base, configure_sqlite_connection, get_db
 from app.main import app
-from app.models.database import AgentTeamPreset, AgentTeamSlot, FactoryAuditEvent, MailAgentSession, MailTeamMember
+from app.models.database import AgentTeamPreset, AgentTeamSlot, FactoryAuditEvent, MailAgentSession, MailExternalActor, MailTeamMember
 from app.services.agent_mail_service import agent_mail_service
 from app.services.external_agent_mail_service import ExternalAgentMailAuthError, external_agent_mail_service
 from app.utils import peer_process
@@ -94,6 +94,9 @@ async def test_external_actor_credential_lifecycle_and_audit(client, db):
     revoked = await client.post(f"{path}/revoke", headers=DIRECTOR_HEADERS)
     assert revoked.status_code == 200
     assert revoked.json()["revoked_at"] is not None
+    assert revoked.json()["revoked_by"] == "shared-operator-credential"
+    revoker = select(MailExternalActor.revoked_by).where(MailExternalActor.id == actor["id"])
+    assert await db.scalar(revoker) == "shared-operator-credential"
     assert "token" not in revoked.json()
     assert (await client.get(me, headers=_auth(rotated_token))).status_code == 401
     assert (await client.get("/api/v1/external/agent-mail/supervisor-inbox",
@@ -107,6 +110,8 @@ async def test_external_actor_credential_lifecycle_and_audit(client, db):
     restored = await client.post(f"{path}/restore", headers=DIRECTOR_HEADERS)
     assert restored.status_code == 200
     assert restored.json()["actor"]["id"] == actor["id"]
+    assert restored.json()["actor"]["revoked_by"] is None
+    assert await db.scalar(revoker) is None
     restored_token = restored.json()["token"]
     assert (await client.get(me, headers=_auth(rotated_token))).status_code == 401
     assert (await client.get(me, headers=_auth(restored_token))).status_code == 200

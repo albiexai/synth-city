@@ -69,7 +69,7 @@ async def _actor(
     if source == "supervisor":
         supervisor = await db.get(MailExternalActor, external_id, populate_existing=True) if external_id is not None else None
         if (supervisor is None or supervisor.id != preset.supervisor_actor_id
-                or supervisor.token_hash != external_hash):
+                or supervisor.revoked_at is not None or supervisor.token_hash != external_hash):
             raise CoordinationError("supervisor_actor_not_bound", 403)
         return audit.derive_actor(actor_kind="external_actor", external_actor_id=supervisor.id)
     return audit.derive_actor(actor_kind="operator", via=via)
