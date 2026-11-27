@@ -14,7 +14,10 @@ from sqlalchemy import select, update
 from app.models.database import (
     AgentTeamPreset,
     AgentTeamSlot,
+    GithubAttemptScopeRevision,
     GithubHeadReview,
+    GithubRequiredCheckWatch,
+    GithubRevisionReview,
     GithubWorkItem,
     MailTeamMember,
     TeamGithubScope,
@@ -157,6 +160,41 @@ async def gate_note(db, scope: TeamGithubScope, item: GithubWorkItem, head_sha, 
         if await current_reviewer(db, scope, item, latest.reviewer_member_id) is None:
             return f"The acceptance at head {head} is no longer from a current verifier; a new acceptance is needed."
         return None
+    if fresh.active_scope_revision > 0:
+        # A consumed verdict already passed the exact-head settlement gates.
+        # An active standalone verdict above still takes precedence.
+        settled_reviewer = await db.scalar(
+            select(GithubRevisionReview.reviewer_member_id)
+            .join(GithubAttemptScopeRevision, GithubAttemptScopeRevision.id == GithubRevisionReview.revision_id)
+            .join(GithubRequiredCheckWatch, GithubRequiredCheckWatch.id == GithubRevisionReview.watch_id)
+            .where(
+                GithubAttemptScopeRevision.work_item_id == item.id,
+                GithubAttemptScopeRevision.dispatch_nonce == expected_nonce,
+                GithubAttemptScopeRevision.revision == fresh.active_scope_revision,
+                GithubAttemptScopeRevision.owner_slot_id == fresh.owner_slot_id,
+                GithubAttemptScopeRevision.phase == "implementation",
+                GithubAttemptScopeRevision.status == "completed",
+                GithubAttemptScopeRevision.completed_at.is_not(None),
+                GithubAttemptScopeRevision.submitted_head_sha == head_sha,
+                GithubRevisionReview.work_item_id == item.id,
+                GithubRevisionReview.dispatch_nonce == expected_nonce,
+                GithubRevisionReview.head_sha == head_sha,
+                GithubRevisionReview.status == "consumed",
+                GithubRevisionReview.verdict == "accepted",
+                GithubRevisionReview.settled_by_member_id.is_not(None),
+                GithubRevisionReview.expected_lease_token_hash == GithubAttemptScopeRevision.expected_lease_token_hash,
+                GithubRequiredCheckWatch.work_item_id == item.id,
+                GithubRequiredCheckWatch.dispatch_nonce == expected_nonce,
+                GithubRequiredCheckWatch.scope_revision == fresh.active_scope_revision,
+                GithubRequiredCheckWatch.pr_number == expected_pr,
+                GithubRequiredCheckWatch.owner_slot_id == fresh.owner_slot_id,
+                GithubRequiredCheckWatch.head_sha == head_sha,
+            )
+        )
+        if settled_reviewer is not None:
+            if await current_reviewer(db, scope, item, settled_reviewer) is not None:
+                return None
+            return f"The acceptance at head {head} is no longer from a current verifier; a new acceptance is needed."
     earlier = await db.scalar(select(GithubHeadReview).where(*base, GithubHeadReview.verdict == "accepted")
         .order_by(GithubHeadReview.id.desc()).limit(1).execution_options(populate_existing=True))
     if earlier is not None:

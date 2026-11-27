@@ -3696,6 +3696,7 @@ async def test_unreadable_ci_tracks_first_observation_and_clears_on_pending_read
     assert getattr(item, "checks_unavailable_since", None) is not None
     assert started <= item.checks_unavailable_since <= datetime.utcnow()
     assert item.checks_unavailable_reason == "unknown"
+    assert item.checks_unavailable_head_sha == "sha"
     first_observation = item.checks_unavailable_since
     await github_verification_service.process_scope(db, scope, client=client)
     await db.refresh(item)
@@ -3712,11 +3713,20 @@ async def test_unreadable_ci_tracks_first_observation_and_clears_on_pending_read
     assert signal.reason == "unknown"
     assert item.retry_count == 2 and item.diagnostic_retry_count == 0
 
-    pending = _Client(check_runs=[{"name": "ci", "status": "in_progress", "conclusion": None}])
+    new_head_started = datetime.utcnow()
+    client.pull["head"]["sha"] = "next-sha"
+    await github_verification_service.process_scope(db, scope, client=client)
+    await db.refresh(item)
+    assert item.checks_unavailable_head_sha == "next-sha"
+    assert item.checks_unavailable_since >= new_head_started
+    assert _work_item_response(item, scope).required_ci_unreadable is None
+
+    pending = _Client(pull=client.pull, check_runs=[{"name": "ci", "status": "in_progress", "conclusion": None}])
     await github_verification_service.process_scope(db, scope, client=pending)
     await db.refresh(item)
     assert item.checks_unavailable_since is None
     assert item.checks_unavailable_reason is None
+    assert item.checks_unavailable_head_sha is None
     assert _work_item_response(item, scope).required_ci_unreadable is None
     assert item.dispatch_status == "verifying" and item.retry_count == 2
     assert pending.merge_calls == pending.ready_calls == 0

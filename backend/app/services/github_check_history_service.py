@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionm
 from app.models.database import GithubCheckRunHistory, GithubCheckRunHistoryCoverage, GithubWorkItem, TeamGithubScope
 from app.models.schemas import FactoryDeliveryPolicy
 from app.services.github_check_observation import (
-    ACTIONS_APP_ID, RawCheckObservation, capture_raw_check_observation,
+    ACTIONS_APP_ID, GithubCheckObservationError, RawCheckObservation, capture_raw_check_observation,
 )
 from app.services.github_client import GithubClient
 
@@ -113,6 +113,9 @@ async def observe_tracked_checks(
     try:
         with capture_raw_check_observation() as observation:
             return await client.list_check_runs_for_ref(owner, repo, head_sha)
+    except GithubCheckObservationError as exc:
+        exc.head_sha = head_sha
+        raise
     finally:
         await _persist(db, observation, context, policy)
 

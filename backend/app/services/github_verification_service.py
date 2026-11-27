@@ -1264,22 +1264,21 @@ class GithubVerificationService:
             if item is None or item.dispatch_status not in (
                     "dispatched", "verifying", "ready_for_review", "awaiting_human_review"):
                 continue
-            if item.ack_received_at is None and await db.scalar(select(exists(
-                    select(GithubAttemptScopeRevision.id).where(
-                        GithubAttemptScopeRevision.work_item_id == item.id,
-                        GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce,
-                        GithubAttemptScopeRevision.origin_kind == "scope_amendment")))):
-                # A proposed, rejected or approved-but-unacknowledged amendment
-                # stops the whole round. It cannot advance old source through CI,
-                # but a merged PR is an external fact that the stopped round must not hide.
-                await self._settle_merged_revision(
-                    db, scope, item, client, statuses=("submitted",),
-                    source="github_verification_service._settle_merged_while_round_stopped")
-                if inspect(item).unloaded:  # the merge check rolled back and expired the item
-                    await db.refresh(item)
-                await self._observe_superseded_revision(db, scope, item, client)
-                continue
             try:
+                if item.ack_received_at is None and await db.scalar(select(exists(
+                        select(GithubAttemptScopeRevision.id).where(
+                            GithubAttemptScopeRevision.work_item_id == item.id,
+                            GithubAttemptScopeRevision.dispatch_nonce == item.dispatch_nonce,
+                            GithubAttemptScopeRevision.origin_kind == "scope_amendment")))):
+                    # A stopped amendment cannot advance old source through CI.
+                    # Only an external merge or eligible superseded path is observed.
+                    await self._settle_merged_revision(
+                        db, scope, item, client, statuses=("submitted",),
+                        source="github_verification_service._settle_merged_while_round_stopped")
+                    if inspect(item).unloaded:
+                        await db.refresh(item)
+                    await self._observe_superseded_revision(db, scope, item, client)
+                    continue
                 if item.dispatch_status in ("dispatched", "verifying"):
                     revision = await self._active_scope_revision(db, item)
                     if item.active_scope_revision > 0:
@@ -1335,7 +1334,7 @@ class GithubVerificationService:
                 # Repeated failed-head reads can return without another state write.
                 # Persist the successful read even when that path uses no retry.
                 if any(inspect(item).attrs[name].history.has_changes() for name in (
-                    "checks_unavailable_since", "checks_unavailable_reason"
+                    "checks_unavailable_since", "checks_unavailable_reason", "checks_unavailable_head_sha"
                 )):
                     await db.commit()
             except TerminalRevisionContextChanged:
@@ -1348,7 +1347,18 @@ class GithubVerificationService:
             except GithubCheckObservationError as exc:
                 # Missing or ambiguous CI evidence must not consume a retry or
                 # diagnostic budget. Continue polling the other work items.
-                required_ci_attention.note_unreadable(item, required_ci_attention.error_reason(exc))
+                head = getattr(exc, "head_sha", None)
+                watched_head = item.verification_head_sha
+                if not await claim_policy_context(db, item, policy_context(item)):
+                    await db.refresh(scope)
+                    continue
+                await db.refresh(item, ["checks_unavailable_since", "checks_unavailable_reason",
+                                        "checks_unavailable_head_sha", "verification_head_sha"])
+                if item.verification_head_sha not in (watched_head, head):
+                    await db.commit()
+                    continue
+                required_ci_attention.note_unreadable(
+                    item, required_ci_attention.error_reason(exc), head_sha=head)
                 self._set_failure_note(
                     item, f"GitHub checks are unavailable; will poll again: {exc}"
                 )
@@ -1817,9 +1827,9 @@ class GithubVerificationService:
         """Record a merge on an item whose round does not otherwise read its PR: an unacknowledged amendment stopped
         it, or its active revision is not submitted yet (#1078).
 
-        Only a merged PR changes anything here; an open or closed pull leaves the item as it is. ``statuses`` are the
-        revision states this caller may settle. A failure for this item is logged and isolated, and never stops the
-        other items.
+        Only a merged PR changes dispatch state. A validated different head can
+        discard a stale CI warning. ``statuses`` limits which revisions this caller
+        may settle. A failed read is isolated to the item.
         """
         item_id = item.id
         try:
@@ -1836,6 +1846,10 @@ class GithubVerificationService:
                 return
             pull = await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
             if self._classify_pull(pull) != "merged" or pull.get("merged") is not True:
+                head = self._head_sha(pull)
+                if required_ci_attention.stale_for_head(item, head):
+                    await self._verify_settled_pull(scope, item, client, pull)
+                    await self._clear_stale_ci_signal(db, scope, item, head)
                 return
             expected_base = await self.normalize_base_ref(
                 scope, client, token=None, base_ref=item.dispatch_base_ref)
@@ -1854,12 +1868,13 @@ class GithubVerificationService:
     async def _settled_revision(
         self, db: AsyncSession, item: GithubWorkItem,
     ) -> GithubAttemptScopeRevision | None:
-        """The positively settled implementation revision a verifying item is still on, if it is one.
+        """The positively settled implementation revision an item is still on, if it is one.
 
         Positive settlement completes the revision and leaves the item on it. Such an item waits for its PR to
         merge, so it is not inconsistent. Any other state is.
         """
-        if item.dispatch_status != "verifying" or item.active_scope_revision <= 0 or item.pr_number is None:
+        if (item.dispatch_status not in ("verifying", "ready_for_review", "awaiting_human_review")
+                or item.active_scope_revision <= 0 or item.pr_number is None):
             return None
         revision = (
             await db.execute(
@@ -1912,11 +1927,9 @@ class GithubVerificationService:
     ) -> None:
         """A positively settled revision waits for its PR: record a merge, escalate a closed PR, promote an open one.
 
-        Everything here is contained to this item. A GitHub read that fails changes nothing and logs nothing: the
-        item simply waits for the next poll. A first response that fails the identity check changes nothing and
-        logs one warning per state. Both outcomes then take the same fences: the PR is read again, must pass the
-        identity check again, and the terminal writer is taken before the captured item, scope and revision are
-        compared again.
+        Failed PR reads wait for the next poll. Failed check reads are reported
+        for the observed head. A valid PR identity and current attempt, scope,
+        and revision are required before writing a promotion.
         """
         snapshot = self._state_snapshot(item)  # a rollback expires the item
         try:
@@ -1934,6 +1947,8 @@ class GithubVerificationService:
         except TerminalRevisionContextChanged:
             raise  # the caller rolls back and records that the attempt changed
         except GithubRateLimited:
+            raise
+        except GithubCheckObservationError:
             raise
         except (httpx.HTTPError, GithubClientResponseError):
             # An unreadable or uninterpretable GitHub response is a failed read: nothing changes, nothing is logged.
@@ -2002,6 +2017,8 @@ class GithubVerificationService:
             logger.info("Terminal attempt changed; no promotion recorded")
         except GithubRateLimited:
             raise
+        except GithubCheckObservationError:
+            raise
         except (httpx.HTTPError, GithubClientResponseError):
             await db.rollback()
             await db.refresh(scope)
@@ -2049,28 +2066,36 @@ class GithubVerificationService:
         scope_before = {name: getattr(scope, name) for name in _SETTLEMENT_SCOPE_IDENTITY}
         revision_before = {column.name: getattr(revision, column.name) for column in revision.__table__.columns}
         reason = None
-        if not superseded and head != revision.submitted_head_sha:
+        changed_settled_head = not superseded and head != revision.submitted_head_sha
+        checks_readable = False
+        if changed_settled_head:
             reason = (f"Settled revision not promoted: the PR head {head[:7]} is not the settled head "
-                      f"{str(revision.submitted_head_sha)[:7]}.")
+                      f"{str(revision.submitted_head_sha)[:7]}. "
+                      "A fresh approved scope amendment and owner acknowledgement are required.")
         else:
             from app.services import github_head_acceptance_service as acceptance
 
             acceptance_note = await acceptance.gate_note(db, scope, item, head)
             if acceptance_note is not None:
                 reason = f"{label} revision not promoted: {acceptance_note}"
-            elif not await self._head_is_green(scope, client, head, item=item):
-                failed_statuses = await self._failed_commit_statuses(scope, client, head)
-                reason = (
-                    f"{label} revision not promoted: commit status failed at {head[:7]}: "
-                    f"{', '.join(failed_statuses)}." if failed_statuses else
-                    f"{label} revision not promoted: the required checks are not all green at {head[:7]}.")
-            elif superseded:
-                refusal = await self._capture_superseded_fence(db, scope, item, head)
-                if isinstance(refusal, str):
-                    reason = f"Superseded revision not promoted: {refusal}"
+            else:
+                green = await self._head_is_green(scope, client, head, item=item)
+                checks_readable = True
+                if not green:
+                    failed_statuses = await self._failed_commit_statuses(scope, client, head)
+                    reason = (
+                        f"{label} revision not promoted: commit status failed at {head[:7]}: "
+                        f"{', '.join(failed_statuses)}." if failed_statuses else
+                        f"{label} revision not promoted: the required checks are not all green at {head[:7]}.")
+                elif superseded:
+                    refusal = await self._capture_superseded_fence(db, scope, item, head)
+                    if isinstance(refusal, str):
+                        reason = f"Superseded revision not promoted: {refusal}"
         context = (item_before, scope_before, revision_before)
         if reason is not None:
-            await self._record_settled_note(db, scope, item, revision, context, reason)
+            await self._record_settled_note(
+                db, scope, item, revision, context, reason, head=head, checks_readable=checks_readable,
+                reverify=changed_settled_head)
             return
         policy_guard = policy_context(item)
         if not await claim_policy_context(db, item, policy_guard):
@@ -2080,21 +2105,29 @@ class GithubVerificationService:
             db, scope, item, client, fresh, retry_status=item.dispatch_status,
         ):
             return
-        if self._head_sha(fresh) != head:
+        fresh_head = self._head_sha(fresh)
+        if fresh_head != head:
             await self._record_settled_note(
-                db, scope, item, revision, context, "Head changed before readiness; verifying the current head.")
+                db, scope, item, revision, context, "Head changed before readiness; verifying the current head.",
+                head=fresh_head)
             return
         readiness_note = self._draft_readiness_note(item, fresh)
         if readiness_note is not None:
-            await self._record_settled_note(db, scope, item, revision, context, readiness_note, last_verified=head)
+            await self._record_settled_note(
+                db, scope, item, revision, context, readiness_note, head=head, checks_readable=True,
+                last_verified=head)
             return
         # No network call from here to the commit: the writer is held only for the compare and the write.
+        watched_head = item.verification_head_sha
         await self._fence_settled_context(db, scope, item, revision, context)
+        if item.verification_head_sha not in (watched_head, head):
+            raise TerminalRevisionContextChanged("terminal_revision_context_changed")
         if superseded:
             if revision.status != "superseded" or item.handoff_state is not None:
                 raise TerminalRevisionContextChanged("terminal_revision_context_changed")
         elif revision.status != "completed" or revision.completed_at is None or revision.submitted_head_sha != head:
             raise TerminalRevisionContextChanged("terminal_revision_context_changed")
+        required_ci_attention.note_readable(item)
         item.last_verified_sha = head
         item.dispatch_status = "ready_for_review"
         item.status_note = f"PR #{item.pr_number} is ready for review."
@@ -2126,15 +2159,29 @@ class GithubVerificationService:
     async def _record_settled_note(
         self, db: AsyncSession, scope: TeamGithubScope, item: GithubWorkItem,
         revision: GithubAttemptScopeRevision, context: tuple, note: str, *, last_verified: str | None = None,
+        head: str | None = None, checks_readable: bool = False, reverify: bool = False,
     ) -> None:
         """Record why a settled revision was not promoted, only under the fence and only when it changes.
 
         A note written after an awaited read would otherwise overwrite the note of a new attempt that replaced
         the item meanwhile.
         """
-        if item.status_note == note and (last_verified is None or item.last_verified_sha == last_verified):
+        clear_signal = (
+            (checks_readable and item.checks_unavailable_since is not None)
+            or required_ci_attention.stale_for_head(item, head)
+        )
+        status_changed = reverify and item.dispatch_status != "verifying"
+        if (item.status_note == note and (last_verified is None or item.last_verified_sha == last_verified)
+                and not clear_signal and not status_changed):
             return
+        watched_head = item.verification_head_sha
         await self._fence_settled_context(db, scope, item, revision, context)
+        if item.verification_head_sha not in (watched_head, head):
+            raise TerminalRevisionContextChanged("terminal_revision_context_changed")
+        if checks_readable or required_ci_attention.stale_for_head(item, head):
+            required_ci_attention.note_readable(item)
+        if reverify:
+            item.dispatch_status = "verifying"
         if last_verified is not None:
             item.last_verified_sha = last_verified
         item.status_note = note
@@ -2541,6 +2588,8 @@ class GithubVerificationService:
             )
             await db.commit()
             return
+        if not await self._clear_stale_ci_signal(db, scope, item, head_sha):
+            return
         checks = await observe_tracked_checks(db, scope, item, client, head_sha, policy)
         signal = "check_runs"
         evidence_rows = self._diagnostic_check_evidence(checks)
@@ -2823,7 +2872,16 @@ class GithubVerificationService:
     async def _completion_head_is_current(self, db, scope, item, client, head_sha, *, revision=None):
         """Check remote identity again after fetching checks, before publishing a handoff."""
         current = await client.get_pull(scope.repo_owner, scope.repo_name, int(item.pr_number))
-        if self._classify_pull(current) != "open" or self._head_sha(current) != head_sha:
+        if self._classify_pull(current) != "open":
+            return False
+        current_head = self._head_sha(current)
+        if current_head != head_sha:
+            if required_ci_attention.stale_for_head(item, current_head):
+                try:
+                    await self._verify_settled_pull(scope, item, client, current)
+                except ValueError:
+                    return False
+                await self._clear_stale_ci_signal(db, scope, item, current_head)
             return False  # The next normal poll handles a changed or closed pull.
         return await self._validate_polled_pull_identity(db, scope, item, client, current,
             retry_status=item.dispatch_status, revision=revision)
@@ -2902,15 +2960,17 @@ class GithubVerificationService:
             )
             return
 
+        head_sha = self._head_sha(pull)
+        if not await self._clear_stale_ci_signal(db, scope, item, head_sha):
+            return
         if revision is not None and not await self._submitted_head_is_current(
             db,
             item,
             revision,
-            self._head_sha(pull),
+            head_sha,
         ):
             return
 
-        head_sha = self._head_sha(pull)
         if (
             item.verification_head_sha != head_sha
             or item.verification_started_at is None
@@ -3092,8 +3152,17 @@ class GithubVerificationService:
                 f"PR #{item.pr_number} was closed without being merged.",
             )
             return
+        current_head = self._head_sha(pull)
+        settled_snapshot = settled_began["row"] if settled_began is not None else None
+        if (current_head and settled_snapshot and settled_snapshot["status"] == "completed"
+                and settled_snapshot["submitted_head_sha"] != current_head):
+            settled = await self._settled_revision(db, item)
+            if settled is not None:
+                await self._promote_settled_revision(db, scope, item, client, settled, pull)
+                return
+        if not await self._clear_stale_ci_signal(db, scope, item, current_head):
+            return
         if item.issue_type == "code" and scope.merge_policy == "human":
-            current_head = self._head_sha(pull)
             if not current_head or current_head != item.last_verified_sha:
                 scoped_completion = item.active_scope_revision > 0
                 note = (
@@ -3164,8 +3233,10 @@ class GithubVerificationService:
                 if ci_context is not None and not await self._completion_head_is_current(
                         db, scope, item, client, current_head):
                     return
-                await github_ci_watch_service.observe(db, scope, item, current_head, checks,
+                observed = await github_ci_watch_service.observe(db, scope, item, current_head, checks,
                     effective_policy(item, scope), context=ci_context)
+                if observed is not None:
+                    required_ci_attention.note_readable(item)
             return
         if item.issue_type == "design" or scope.merge_policy != "auto":
             return
@@ -3213,7 +3284,6 @@ class GithubVerificationService:
                 scope=scope,
             )
             return
-        current_head = self._head_sha(pull)
         if not current_head or current_head != item.last_verified_sha:
             item.dispatch_status = "verifying"
             item.status_note = "Head changed since promotion; re-verifying before auto-merge."
@@ -3644,6 +3714,23 @@ class GithubVerificationService:
             return f"PR #{item.pr_number} is held for independent review. Hold label: {label}."
         return None
 
+    @staticmethod
+    async def _clear_stale_ci_signal(db, scope, item, head_sha):
+        """Discard an old head's check failure without treating the current checks as successful."""
+        if not required_ci_attention.stale_for_head(item, head_sha):
+            return True
+        watched_head = item.verification_head_sha
+        if not await claim_policy_context(db, item, policy_context(item)):
+            await db.refresh(scope)
+            return False
+        await db.refresh(item, ["checks_unavailable_since", "checks_unavailable_reason",
+                                "checks_unavailable_head_sha", "verification_head_sha"])
+        still_current = item.verification_head_sha in (watched_head, head_sha)
+        if still_current and required_ci_attention.stale_for_head(item, head_sha):
+            required_ci_attention.note_readable(item)
+        await db.commit()
+        return still_current
+
     async def _validate_polled_pull_identity(
         self,
         db: AsyncSession,
@@ -3840,6 +3927,7 @@ class GithubVerificationService:
                 return None
             checks = await observe_tracked_checks(db, scope, item, client, head, effective_policy(item, scope))
             status = await client.get_combined_status_for_ref(scope.repo_owner, scope.repo_name, head)
+            required_ci_attention.note_readable(item)
             if self._pending_merge_checks(checks, status, head):
                 return None
             # A finished red status is neither pending nor a check run; any status present must have succeeded.
@@ -4527,9 +4615,11 @@ class GithubVerificationService:
     ) -> bool:
         if not head_sha:
             return False
-        checks = await client.list_check_runs_for_ref(
-            scope.repo_owner, scope.repo_name, head_sha
-        )
+        try:
+            checks = await client.list_check_runs_for_ref(scope.repo_owner, scope.repo_name, head_sha)
+        except GithubCheckObservationError as exc:
+            exc.head_sha = head_sha
+            raise
         policy = effective_policy(item, scope) if item is not None else scope_policy(scope)
         if not checks or required_check_blockers(policy, checks, head_sha):
             return False

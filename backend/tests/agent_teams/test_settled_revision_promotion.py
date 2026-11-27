@@ -7,7 +7,7 @@ unheld PR was never promoted to ready_for_review and never auto-merged.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 
 import httpx
@@ -17,7 +17,9 @@ from sqlalchemy import select as _select
 from sqlalchemy import update
 
 from app.config import settings
-from app.models.database import GithubAttemptScopeRevision, GithubHeadReview
+from app.models.database import (
+    GithubAttemptScopeRevision, GithubHeadReview, GithubRequiredCheckWatch, GithubRevisionReview, MailTeamMember,
+)
 from app.services.github_approval_service import github_approval_service
 from app.services.github_verification_service import github_verification_service as service
 from tests.agent_teams.test_github_verification_service import (  # noqa: F401  (fixtures and helpers shared)
@@ -83,6 +85,80 @@ async def test_an_accepted_green_ready_unheld_item_is_promoted_and_auto_merged(d
     assert case.client.merge_calls == 1 and case.client.merge_head_shas == [HEAD]
     assert case.item.last_verified_sha == HEAD
     assert (case.revision.status, case.revision.completed_at) == ("completed", SETTLED_AT)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case_kind", ["accepted", "red", "withdrawn", "old_head", "former_verifier", "head_rejected"])
+async def test_settled_revision_review_can_supply_exact_head_acceptance(db, case_kind):
+    checks = GREEN
+    if case_kind == "red":
+        checks = [{"name": "ci", "status": "completed", "conclusion": "failure"}]
+    case = await settled_case(db, accepted_head=None, checks=checks)
+    case.revision.owner_slot_id = case.item.owner_slot_id
+    case.revision.owner_member_id = await db.scalar(
+        _select(MailTeamMember.id).where(MailTeamMember.team_slot_id == case.item.owner_slot_id)
+    )
+    slot, reviewer = await slot_member(db, case.scope, role="verifier", name="V2")
+    if case_kind == "former_verifier":
+        slot.role = "builder"
+    review_head = OTHER if case_kind == "old_head" else HEAD
+    watch = GithubRequiredCheckWatch(
+        work_item_id=case.item.id, dispatch_nonce=case.item.dispatch_nonce, scope_revision=case.revision.revision,
+        pr_number=case.item.pr_number, owner_slot_id=case.item.owner_slot_id, head_sha=review_head,
+        policy_digest="fixture", reviewer_member_id=reviewer.id, checks=[],
+        observed_at=SETTLED_AT, changed_at=SETTLED_AT,
+    )
+    db.add(watch)
+    await db.flush()
+    db.add(GithubRevisionReview(
+        work_item_id=case.item.id, revision_id=case.revision.id, watch_id=watch.id,
+        dispatch_nonce=case.item.dispatch_nonce, head_sha=review_head, reviewer_member_id=reviewer.id,
+        expected_lease_token_hash=case.revision.expected_lease_token_hash, verdict="accepted",
+        status="withdrawn" if case_kind == "withdrawn" else "consumed",
+        settled_by_member_id=case.item.ack_approver_member_id, summary="Reviewed the submitted revision",
+        evidence_url=EVIDENCE,
+    ))
+    if case_kind == "head_rejected":
+        db.add(GithubHeadReview(
+            work_item_id=case.item.id, dispatch_nonce=case.item.dispatch_nonce,
+            pr_number=case.item.pr_number, scope_revision=case.revision.revision, head_sha=HEAD,
+            reviewer_member_id=reviewer.id, verdict="changes_required",
+            summary="New blocking finding", evidence_url=EVIDENCE,
+        ))
+    await db.commit()
+    await case.tick()
+    if case_kind == "accepted":
+        assert case.item.dispatch_status == "merged", case.item.status_note
+        assert case.client.merge_head_shas == [HEAD]
+    else:
+        assert case.item.dispatch_status == "verifying"
+        assert case.client.merge_calls == 0
+        if case_kind == "red":
+            assert "required checks are not all green" in case.item.status_note
+        if case_kind == "head_rejected":
+            assert "Reviewer requires changes" in case.item.status_note
+    assert case.revision.status == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state,changed_head", [("verifying", False), ("verifying", True), ("ready_for_review", True)])
+async def test_settled_poll_clears_unreadable_ci_on_green_or_changed_head(db, state, changed_head):
+    head = OTHER if changed_head else HEAD
+    case = await settled_case(db, policy="human", pull_head=head, draft=True)
+    case.item.checks_unavailable_since = datetime.utcnow() - timedelta(minutes=20)
+    case.item.checks_unavailable_reason = "api_error"
+    case.item.checks_unavailable_head_sha = HEAD
+    case.item.dispatch_status = state
+    case.item.verification_head_sha = HEAD
+    await db.commit()
+    await case.tick()
+    assert case.item.checks_unavailable_since is None
+    assert case.item.checks_unavailable_reason is None
+    assert case.item.checks_unavailable_head_sha is None
+    assert case.item.dispatch_status == "verifying"
+    if changed_head:
+        assert "scope amendment" in case.item.status_note
+        assert case.revision.submitted_head_sha == HEAD
 
 
 @pytest.mark.asyncio

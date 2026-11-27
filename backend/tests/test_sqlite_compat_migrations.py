@@ -355,7 +355,7 @@ async def test_unreadable_ci_columns_preserve_existing_attempts_and_repeat_safel
     try:
         async with engine.connect() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            for name in ("checks_unavailable_since", "checks_unavailable_reason"):
+            for name in ("checks_unavailable_since", "checks_unavailable_reason", "checks_unavailable_head_sha"):
                 await conn.execute(text(f"ALTER TABLE github_work_items DROP COLUMN {name}"))
             await conn.execute(text(
                 "INSERT INTO github_work_items (id, scope_id, issue_number, issue_title, issue_url, github_updated_at, "
@@ -368,12 +368,13 @@ async def test_unreadable_ci_columns_preserve_existing_attempts_and_repeat_safel
             after = (await conn.execute(text("SELECT * FROM github_work_items"))).mappings().one()
             assert all(after[key] == value for key, value in before.items())
             assert after["checks_unavailable_since"] is None and after["checks_unavailable_reason"] is None
+            assert after["checks_unavailable_head_sha"] is None
             await conn.execute(text("UPDATE github_work_items SET checks_unavailable_since='2026-10-13 00:00:00', "
-                                    "checks_unavailable_reason='api_error' WHERE id=1"))
+                                    "checks_unavailable_reason='api_error', checks_unavailable_head_sha='head' WHERE id=1"))
             await _run_sqlite_compat_migrations(conn)
-            row = (await conn.execute(text("SELECT checks_unavailable_since, checks_unavailable_reason "
+            row = (await conn.execute(text("SELECT checks_unavailable_since, checks_unavailable_reason, checks_unavailable_head_sha "
                                            "FROM github_work_items WHERE id=1"))).one()
-            assert tuple(row) == ("2026-10-13 00:00:00", "api_error")
+            assert tuple(row) == ("2026-10-13 00:00:00", "api_error", "head")
     finally:
         await engine.dispose()
 

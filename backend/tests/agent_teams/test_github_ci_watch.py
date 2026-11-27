@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.database import Base
 import app.models.github_work_progress  # Register snapshot tables before isolated fixture create_all.
-from app.models.database import (AgentTeamPreset, AgentTeamSlot, GithubWorkItem, GithubWorkspace,
+from app.models.database import (AgentTeamPreset, AgentTeamSlot, GithubAttemptScopeRevision, GithubWorkItem, GithubWorkspace,
     MailAgentSession, MailMessage, MailTeamMember, TeamGithubScope)
 from app.models.schemas import FactoryDeliveryPolicy
 from app.services.github_ci_watch_service import GithubCIWatchService
@@ -162,6 +162,30 @@ async def test_registration_rejects_wrong_identity_attempt_or_head(db,monkeypatc
     if invalid=='hold':monkeypatch.setattr('app.services.github_ci_watch_service.hold_code',lambda:'hold')
     with pytest.raises((ValueError,PermissionError)):await svc.register(db,**args)
     assert (await db.execute(select(MailMessage))).scalars().all()==[]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settled_head", [HEAD, OTHER])
+async def test_registration_requires_new_amendment_for_changed_settled_head(db, monkeypatch, settled_head):
+    _, scope, item, members, _ = await seed(db)
+    svc = service(monkeypatch, [])
+    workspace = await db.scalar(select(GithubWorkspace).where(GithubWorkspace.leased_item_id == item.id))
+    item.active_scope_revision = 1
+    db.add(GithubAttemptScopeRevision(
+        work_item_id=item.id, dispatch_nonce=item.dispatch_nonce, revision=1,
+        owner_slot_id=item.owner_slot_id, owner_member_id=members[1].id, origin_kind="scope_amendment",
+        phase="implementation", execution_target="workspace", summary="Fixture",
+        allowed_paths=[], allowed_actions=[], allowed_commands=[], prohibited_actions=[], tool_fallbacks={},
+        baseline_head_sha=OTHER, baseline_tree_sha=OTHER, originating_escalation_reason="",
+        expected_workspace_id=workspace.id, expected_lease_token_hash="fixture",
+        max_failed_heads=1, status="completed", completed_at=datetime.utcnow(), submitted_head_sha=settled_head,
+    ))
+    await db.commit()
+    if settled_head == HEAD:
+        assert (await bind(svc, db, item, members))["head_sha"] == HEAD
+    else:
+        with pytest.raises(ValueError, match="settled_head_amendment_required"):
+            await bind(svc, db, item, members)
 
 
 @pytest.mark.asyncio

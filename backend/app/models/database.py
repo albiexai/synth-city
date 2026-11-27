@@ -449,6 +449,7 @@ class GithubWorkItem(Base):
     initial_paths_readiness: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     checks_unavailable_since: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     checks_unavailable_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    checks_unavailable_head_sha: Mapped[str | None] = mapped_column(String, nullable=True)
     auto_merged_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     active_scope_revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     attempt_phase: Mapped[str] = mapped_column(
@@ -1188,7 +1189,7 @@ class GithubAttemptScopeRevision(Base):
 
 
 class GithubRevisionReview(Base):
-    """Authenticated negative review fact; never independent acceptance authority."""
+    """Authenticated revision verdict bound to its watched PR head."""
 
     __tablename__ = "github_revision_reviews"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
