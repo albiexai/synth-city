@@ -211,7 +211,8 @@ async def _retro_rows(db, campaign: Campaign) -> tuple:
     watches = select(GithubRequiredCheckWatch.id).where(GithubRequiredCheckWatch.work_item_id.in_(items))
     reads = [
         select(GithubCheckRunHistory.repository, GithubCheckRunHistory.check_run_id, GithubCheckRunHistory.head_sha,
-               GithubCheckRunHistory.pr_number, GithubCheckRunHistory.check_name, GithubCheckRunHistory.required,
+               GithubCheckRunHistory.pr_number, GithubCheckRunHistory.check_name, GithubCheckRunHistory.app_slug,
+               GithubCheckRunHistory.required,
                GithubCheckRunHistory.job_created_at,
                GithubCheckRunHistory.started_at, GithubCheckRunHistory.completed_at)
         .where(GithubCheckRunHistory.scope_id.in_(scopes))

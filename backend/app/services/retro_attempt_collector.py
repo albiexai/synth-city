@@ -350,8 +350,10 @@ async def _collect_item(db, item: _ItemRow, out: TeamAttempts, period, item_key:
         for run in await _required_runs(db, item, repository, {(w.pr_number, w.head_sha) for w in mine["check_watch"]}):
             queued = run.job_created_at or run.started_at
             if queued is not None and run.completed_at is not None:
-                _place(out, period, attempt, "process", "required_check", f"{run.repository}:{run.check_name}",
-                       _naive(queued), _naive(run.completed_at))
+                # Keep the app separate from the name, which can contain punctuation.
+                app = f"[{run.app_slug}]" if run.app_slug else ""
+                actor = f"{run.repository}{app}:{run.check_name}"
+                _place(out, period, attempt, "process", "required_check", actor, _naive(queued), _naive(run.completed_at))
         for watch in mine["check_watch"]:
             for member, noticed, verdict in await _reviews(db, watch, mine["head_review"], mine["revision_review"]):
                 _place(out, period, attempt, "process", "review", f"member:{member}", noticed, verdict)

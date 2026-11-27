@@ -112,9 +112,12 @@ def rank_window(attempts: list[RankingAttempt], *, start: datetime, as_of: datet
     if len(named) != len(totals):
         reasons.add("actor_unavailable")
     coverage: Coverage = "unavailable"
-    if observed_items and included_groups:
-        coverage = "partial" if reasons or any(
-            group_coverage[group] != "full" for group in RANKED_GROUPS) else "full"
+    if not reasons and all(group_coverage[group] == "full" for group in RANKED_GROUPS):
+        coverage = "full"
+    elif observed_items and included_groups:
+        coverage = "partial"
+    if not observed_items and coverage != "full":
+        reasons.add("no_attempts_in_window")
     # Partial history needs recorded evidence before it can report a number.
     known_time = coverage == "full" or bool(totals)
     ordered = sorted(named, key=lambda key: (-totals[key], RANKED_GROUPS.index(key[0]), key[1], key[2]))
@@ -131,7 +134,7 @@ def rank_window(attempts: list[RankingAttempt], *, start: datetime, as_of: datet
         row.share >= MINIMUM_SHARE or isclose(row.share, MINIMUM_SHARE, rel_tol=1e-12))]
     return BottleneckWindow(
         window=window, label=label, started_at=_utc(start), as_of=_utc(as_of), coverage=coverage,
-        unknown_reasons=sorted(reasons | ({"no_attempts_in_window"} if not observed_items else set())),
+        unknown_reasons=sorted(reasons),
         items=len(observed_items) if known_time else None, credited_seconds=denominator if known_time else None,
         state="ranked" if ranked else ("below_thresholds" if coverage == "full" else "unknown"),
         stages=ranked, largest_observed=rows[0] if rows else None)

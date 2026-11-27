@@ -184,9 +184,10 @@ campaign it uses the campaign snapshot service and its short cache.
 
 - `bottlenecks.whole_campaign` is labelled **Whole campaign**. `bottlenecks.last_four_hours` is labelled
   **Last 4 hours**, with a start no earlier than the campaign start. Each includes the actual start and cutoff.
-- `stages` contains the waiting and process stages that meet both thresholds. Required checks and reviewers
-  are ranked separately by actor. Time uses the shared stage credits after clipping to the window. It excludes
-  active and unaccounted time. `share` is a fraction of recorded waiting and process credits.
+- `stages` contains the waiting and process stages that meet both thresholds. A required check is ranked
+  by repository, recorded app and name. Review is ranked per verifier. Time uses the shared stage credits
+  after clipping to the window. It excludes active and unaccounted time. `share` is a fraction of recorded
+  waiting and process credits.
 - `items` on a stage counts distinct issues with credited time. Retries do not increase that count. The
   thresholds are 5 issues and 10% inclusive. Each stage includes its median credited seconds per issue.
   A complete read with no qualifying stage has state `below_thresholds` and names the largest observed stage,
@@ -194,7 +195,7 @@ campaign it uses the campaign snapshot service and its short cache.
 - `coverage` and `unknown_reasons` describe the underlying evidence. Partial values describe recorded data.
   Both windows carry the campaign attribution gaps. Credited time for an unidentified actor contributes to
   the denominator and leaves actor coverage partial. Missing time is `null`. A partial read with no
-  qualifying stage has state `unknown`.
+  qualifying stage has state `unknown`. A fully recorded quiet window reports zero time and zero items.
 - The optional `previous_top` query parameter takes the exact top stage's `key` from the caller's last complete
   whole-campaign view. Use an empty string when that view had no qualifying stage. Omit it on the first visit.
   `new_since_last_visit` is `null` without a comparison or when current coverage is incomplete. The client

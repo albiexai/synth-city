@@ -93,7 +93,7 @@ def test_incomplete_evidence_has_unknown_or_lower_bound_results():
                       ["missing_process_recording"]).last_four_hours
     assert (absent.state, absent.items, absent.credited_seconds, absent.largest_observed) == (
         "unknown", None, None, None)
-    unobserved = rankings([]).last_four_hours
+    unobserved = rankings([], {"waiting": "unavailable", "process": "unavailable"}).last_four_hours
     assert (unobserved.coverage, unobserved.credited_seconds, unobserved.unknown_reasons) == (
         "unavailable", None, ["no_attempts_in_window"])
 
