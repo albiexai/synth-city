@@ -196,6 +196,20 @@ async def test_an_item_outside_the_campaign_adds_no_time(db, world):
     assert (went.items, went.attempts, went.total_seconds) == (2, 3, 300 * MIN)
 
 
+async def test_bottlenecks_use_campaign_members_and_carry_the_same_attribution_gaps(db, world):
+    await _two_items(db, world)
+    outside = await _item(db, world, 13, nonce="outside", launch=True)
+    await _dispatch(db, outside.id, 150, launch=outside.launch_id)
+    snapshot = await _build(db, world, [10, 11, 12])
+    whole, recent = snapshot.bottlenecks.whole_campaign, snapshot.bottlenecks.last_four_hours
+    assert whole.credited_seconds == recent.credited_seconds == 65 * MIN
+    assert whole.items == recent.items == 2
+    assert (whole.coverage, whole.state) == ("partial", "unknown")
+    assert "no_attempt_recorded" in whole.unknown_reasons
+    assert (whole.largest_observed.stage, whole.largest_observed.credited_seconds,
+            whole.largest_observed.items) == ("dispatch", 35 * MIN, 2)
+
+
 async def test_each_checks_wall_time_is_kept_beside_its_share(db, world):
     await _recording(db)
     a = await _item(db, world, 10, nonce="nonce-a", launch=True)
@@ -694,22 +708,24 @@ async def test_a_stored_v3_snapshot_without_the_section_reads_back_unchanged(db,
     snapshot = await _build(db, world, [10, 11, 12])
     old = snapshot.model_dump(mode="json")
     old.pop("time_went")
+    old.pop("bottlenecks")
     old["calculation_version"] = "campaign-snapshot-v3"
     campaign = await campaigns.current(db, world.team)
     db.add(CampaignSnapshot(campaign_id=campaign.id, version=1, calculation_version="campaign-snapshot-v3",
                             payload=old, created_by="operator"))
     await db.commit()
     frozen = await snapshots.freeze(db, campaign, FakeGithub(), actor=OPERATOR)
-    assert (frozen.time_went, frozen.calculation_version) == (None, "campaign-snapshot-v3")
+    assert (frozen.time_went, frozen.bottlenecks, frozen.calculation_version) == (None, None, "campaign-snapshot-v3")
     assert (await snapshots.latest(db, campaign.id)).payload == old
 
 
-async def test_a_new_freeze_stores_v4_with_the_section(db, world):
+async def test_a_new_freeze_stores_v5_with_both_sections(db, world):
     await _two_items(db, world)
     await _build(db, world, [10, 11, 12])
     campaign = await campaigns.current(db, world.team)
     labelled = [_issue("a1", number, state="closed") for number in (10, 11, 12)]
     frozen = await snapshots.freeze(db, campaign, FakeGithub(labelled={"a1": labelled}), actor=OPERATOR, as_of=AS_OF)
     stored = await snapshots.latest(db, campaign.id)
-    assert (stored.calculation_version, frozen.calculation_version) == ("campaign-snapshot-v4", "campaign-snapshot-v4")
+    assert (stored.calculation_version, frozen.calculation_version) == ("campaign-snapshot-v5", "campaign-snapshot-v5")
     assert stored.payload["time_went"]["total_seconds"] == 300 * MIN
+    assert stored.payload["bottlenecks"]["whole_campaign"]["credited_seconds"] == 65 * MIN

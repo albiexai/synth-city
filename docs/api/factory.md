@@ -178,6 +178,28 @@ Each row has the team (`null` after the team was retired), the selector, the sta
 - **Before recording.** A campaign gets `before_recording` instead of `no_snapshot` only when the recording marker exists and the campaign began before it. A missing snapshot alone never says it. `finished_before_recording` counts only finished campaigns that ended before the marker.
 - **Repository filter.** A campaign whose repositories are unknown is not kept by a `scope_id` filter. `hidden_unknown_repositories` counts the ones that the `status` filter would show. A live campaign covers exactly the repositories its team watches now, never an older snapshot's list: it stays under a repository that was added after its last snapshot, with an unknown count, and it lists none when the team watches none.
 
+`GET /api/v1/factory/campaigns/{campaign_id}/bottlenecks` returns the same read-only ranking input for
+the campaign page and Overview panel. It reads the latest frozen snapshot for a finished campaign. For a live
+campaign it uses the campaign snapshot service and its short cache.
+
+- `bottlenecks.whole_campaign` is labelled **Whole campaign**. `bottlenecks.last_four_hours` is labelled
+  **Last 4 hours**, with a start no earlier than the campaign start. Each includes the actual start and cutoff.
+- `stages` contains the waiting and process stages that meet both thresholds. Required checks and reviewers
+  are ranked separately by actor. Time uses the shared stage credits after clipping to the window. It excludes
+  active and unaccounted time. `share` is a fraction of recorded waiting and process credits.
+- `items` on a stage counts distinct issues with credited time. Retries do not increase that count. The
+  thresholds are 5 issues and 10% inclusive. Each stage includes its median credited seconds per issue.
+  A complete read with no qualifying stage has state `below_thresholds` and names the largest observed stage,
+  when one exists. That stage can have `small_sample` set.
+- `coverage` and `unknown_reasons` describe the underlying evidence. Partial values describe recorded data.
+  Both windows carry the campaign attribution gaps. Credited time for an unidentified actor contributes to
+  the denominator and leaves actor coverage partial. Missing time is `null`. A partial read with no
+  qualifying stage has state `unknown`.
+- The optional `previous_top` query parameter takes the exact top stage's `key` from the caller's last complete
+  whole-campaign view. Use an empty string when that view had no qualifying stage. Omit it on the first visit.
+  `new_since_last_visit` is `null` without a comparison or when current coverage is incomplete. The client
+  owns visit persistence and should keep it scoped to the campaign.
+
 The response also has `total`, `counts` (`live` and `finished`, before the `status` filter), `has_more` and `next_cursor`.
 
 ## Audit events and delivery metrics
