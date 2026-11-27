@@ -568,7 +568,7 @@ class AgentTeamSummaryService:
             next_actor_coverage_complete=complete and len(observations) == total, campaign=campaign)
 
     async def for_work_item(self, db, preset_id, work_item_id):
-        """Keep the item's and unbound blockers over the same team observation."""
+        """Keep this item's CI warnings and relevant blockers over the same team observation."""
         tracked_items = select(GithubWorkItem.id, GithubWorkItem.scope_id, GithubWorkItem.issue_number).join(
             TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id).where(
                 TeamGithubScope.preset_id == preset_id)
@@ -591,8 +591,13 @@ class AgentTeamSummaryService:
         def relevant(row):
             return (row.work_item_id or bindings.get((row.scope_id, row.issue_number))) in (None, work_item_id)
 
-        updates = {"attention": [row for row in result.attention if relevant(row)],
-                   "human_actions": [row for row in result.human_actions if relevant(row)]}
+        updates = {
+            "attention": [row for row in result.attention if relevant(row)],
+            "human_actions": [row for row in result.human_actions if relevant(row)],
+            "required_ci_unreadable": [
+                row for row in result.required_ci_unreadable if row.work_item_id == work_item_id
+            ],
+        }
         # Binding an issue to a work item may await after the team observation. Preserve its timestamp
         # and fail closed if the coverage expired or the hold changed while the bindings were read.
         current_hold = hold_code()

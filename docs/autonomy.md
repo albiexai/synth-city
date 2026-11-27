@@ -162,9 +162,22 @@ When the approved plan no longer fits the work, the owner can request a healthy 
 
 This rule applies to nonterminal, non-escalated initial implementation attempts
 with `active_scope_revision=0`. Scoped and diagnostic continuations retain their
-approved paths, commands and finite budgets. Completing one does not grant
-authority for another head. Work outside the approved plan requires a supported
-new approval.
+approved paths, commands and finite budgets. After an implementation revision
+is settled, the owner needs a fresh approved scope amendment and acknowledgement
+before making another correction on the same PR, even within the previous
+paths. The Leader's reviewer assignment returns
+`settled_head_amendment_required` for a different head under the old revision.
+Escalated attempts use the supported recovery route.
+
+For the unchanged settled head, a consumed accepted revision review from a
+current independent verifier supplies the exact-head acceptance. An active
+exact-head verdict takes precedence. The verifier's identity, fresh CI, hold,
+readiness and configured merge policy still apply.
+
+An unreadable CI warning is tied to the head whose check read failed. A verified
+new head discards the old warning, and repeated failures on the same head keep
+the original grace period. Clearing a warning does not mark CI successful.
+Work-item-scoped summaries show only that item's unreadable CI warning.
 
 ## Recovery and operator token
 

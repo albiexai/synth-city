@@ -628,6 +628,23 @@ async def test_team_ci_signal_has_safe_context_and_clears_without_authority_chan
 
 
 @pytest.mark.asyncio
+async def test_work_item_gate_keeps_only_its_own_unreadable_ci(db, monkeypatch):
+    team, _, (candidate, unrelated) = await seed(db, ("verifying", "verifying"))
+    unrelated.checks_unavailable_since = datetime.utcnow() - timedelta(minutes=20)
+    unrelated.checks_unavailable_reason = "api_error"
+    await db.commit()
+
+    summary, _ = service(monkeypatch)
+    whole = await summary.summary(db, team.id)
+    scoped = await summary.for_work_item(db, team.id, candidate.id)
+    blocked = await summary.for_work_item(db, team.id, unrelated.id)
+    assert not scoped.required_ci_unreadable
+    assert [row.work_item_id for row in blocked.required_ci_unreadable] == [unrelated.id]
+    assert blocked.required_ci_unreadable == whole.required_ci_unreadable
+    assert scoped.coverage_complete == whole.coverage_complete
+
+
+@pytest.mark.asyncio
 async def test_active_team_sums_all_unfinished_items_and_preserves_actors(db, monkeypatch):
     team, _, items = await seed(db, ("dispatched", "verifying", "merged", "completed"))
     summary, reads = service(monkeypatch, {

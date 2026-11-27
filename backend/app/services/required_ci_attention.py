@@ -34,15 +34,22 @@ def error_reason(error):
     return safe_reason(str(error))
 
 
-def note_unreadable(item, reason, *, now=None):
-    if item.checks_unavailable_since is None:
+def stale_for_head(item, head_sha):
+    return (bool(head_sha) and item.checks_unavailable_since is not None
+            and item.checks_unavailable_head_sha != head_sha)
+
+
+def note_unreadable(item, reason, *, head_sha, now=None):
+    if item.checks_unavailable_since is None or stale_for_head(item, head_sha):
         item.checks_unavailable_since = now or datetime.utcnow()
     item.checks_unavailable_reason = safe_reason(reason)
+    item.checks_unavailable_head_sha = head_sha
 
 
 def note_readable(item):
     item.checks_unavailable_since = None
     item.checks_unavailable_reason = None
+    item.checks_unavailable_head_sha = None
 
 
 def signal(item, *, now=None):
