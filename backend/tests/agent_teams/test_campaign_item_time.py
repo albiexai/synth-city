@@ -104,10 +104,10 @@ async def _snapshot(db, world, items, *, marker=MARKER, facts_from=FACTS_FROM, a
                                           cached=cached)
 
 
-async def _again(db, world, numbers, *, cached=False):
+async def _again(db, world, numbers, *, cached=False, as_of=AS_OF):
     labelled = [_issue("a1", number, state="closed") for number in numbers]
     return await snapshots.build_snapshot(db, await campaigns.current(db, world.team),
-                                          FakeGithub(labelled={"a1": labelled}), as_of=AS_OF, cached=cached)
+                                          FakeGithub(labelled={"a1": labelled}), as_of=as_of, cached=cached)
 
 
 async def _item(db, number):
@@ -326,6 +326,23 @@ async def test_a_merge_record_without_its_merge_time_is_unknown(db, world):
     assert "merge_time_not_recorded" in snapshot.item_time.unknown_reasons
 
 
+async def test_an_untimed_merge_recorded_after_the_cutoff_adds_no_item(db, world):
+    """With no merge time, the record time places the merge: one recorded after the cutoff is not counted."""
+    await _snapshot(db, world, [(10, 0, None, None)])
+    await _merge(db, world, await _item(db, 10), 10, 30, 10, timed=False)  # recorded now, after the cutoff
+    await db.commit()
+    assert (await _again(db, world, [10], as_of=_m(60))).item_time.items == 0
+
+
+async def test_a_design_only_delivery_adds_no_item(db, world):
+    """V1 revision review 115: an explicitly non-merge delivery is outside the item-time population."""
+    await _snapshot(db, world, [(10, 0, None, None)])
+    await _merge(db, world, await _item(db, 10), 10, 30, None, artifact="design:doc", source="design_artifact_accepted")
+    await db.commit()
+    snapshot = await _again(db, world, [10])
+    assert (snapshot.item_time.items, snapshot.item_time.unknown_reasons) == (0, [])
+
+
 async def test_a_legacy_automatic_merge_time_still_counts(db, world):
     await _snapshot(db, world, [(10, 10, None, None)])
     item = await db.get(GithubWorkItem, await _item(db, 10))
@@ -359,6 +376,19 @@ async def test_a_member_with_an_unknown_outcome_makes_the_section_partial(db, wo
     snapshot = await _snapshot(db, world, [(10, 0, 30, 10)], closed=(11,))
     assert (snapshot.item_time.coverage, snapshot.item_time.timed) == ("partial", 1)
     assert "delivery_history_missing" in snapshot.item_time.unknown_reasons
+
+
+async def test_a_read_gap_and_an_unknown_outcome_keep_both_reasons(db, world):
+    """V1 revision review 115: a repository read gap no longer hides the known missing delivery history."""
+    await _snapshot(db, world, [(10, 0, 30, 10)], closed=(11,))
+    labelled = [_issue("a1", 10, state="closed"), _issue("a1", 11, state="closed")]
+    snapshot = await snapshots.build_snapshot(db, await campaigns.current(db, world.team),
+                                              FakeGithub(labelled={"a1": labelled}, broken={"a2"}), as_of=AS_OF,
+                                              cached=False)
+    reasons = snapshot.item_time.unknown_reasons
+    assert "delivery_history_missing" in reasons
+    assert any("a2" in reason for reason in reasons)  # the membership read gap
+    assert snapshot.item_time.coverage == "partial"
 
 
 async def test_installing_the_coverage_marker_misses_the_cache(db, world):

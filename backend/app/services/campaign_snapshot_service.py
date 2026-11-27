@@ -230,7 +230,7 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
     metrics.append(await _rate_limited(db, coverage, started, as_of))
     # Missing delivery history the counts already know of makes item time partial too (V1 review 448).
     item_time = await _item_time(db, campaign, list(members), facts, coverage, as_of,
-                                 gaps if not known else ([reason] if unknown else []), label)
+                                 gaps + ([reason] if unknown else []), label)  # both kept (V1 review 115)
     return Snapshot(
         campaign_id=campaign.id, selector=campaign.selector, started_at=started, as_of=as_of,
         calculation_version=CALCULATION_VERSION, metrics=sorted(metrics, key=lambda sample: sample.name),
@@ -274,12 +274,11 @@ async def _item_time(db, campaign: Campaign, members: list[tuple[str, int]], fac
     rows: dict[str, list[tuple[float | None, list[str]]]] = {name: [] for name, _ in BANDS}
     rows["unknown"] = []
     for key in members:
-        delivered = [at for at in facts.delivered.get(key, ()) if began <= at <= as_of]
-        if not delivered:
-            continue  # not delivered in the campaign by the cutoff
         merges = [merge for merge in facts.merges.get(key, ()) if began <= merge[0] <= as_of]
-        if not merges:  # delivered, but no recorded merge time
-            rows["unknown"].append((None, ["merge_time_not_recorded"]))
+        if not merges:
+            # A PR merge GitHub gave no time is unknown; a non-merge delivery is outside this metric (V1 review 115).
+            if any(began <= at <= as_of for at in facts.untimed.get(key, ())):
+                rows["unknown"].append((None, ["merge_time_not_recorded"]))
             continue
         end = min(at for at, _, _ in merges)
         tied = [merge for merge in merges if merge[0] == end]
@@ -348,6 +347,7 @@ class _Deliveries:
     delivered: dict[tuple[str, int], list[datetime]] = field(default_factory=dict)
     # #1246: each sourced merge with its PR artifact and the item lifetime that recorded it
     merges: dict[tuple[str, int], list[tuple[datetime, str | None, str | None]]] = field(default_factory=dict)
+    untimed: dict[tuple[str, int], list[datetime]] = field(default_factory=dict)  # PR merges GitHub gave no time
     undelivered: dict[tuple[str, int], list[datetime]] = field(default_factory=dict)
     unidentified: bool = False  # a recorded delivery whose issue can't be derived
 
@@ -401,6 +401,8 @@ async def _deliveries(db, campaign: Campaign) -> _Deliveries:
         if delivered and row.fact_source == "github_pull_request_merged" and row.fact_time is not None:
             facts.merges.setdefault(_identity(f"{owner}/{name}", number), []).append(
                 (at, recorded.get("artifact") or None, row.item_context_key))
+        elif delivered and row.fact_source == "github_pull_request_merged":  # placed by its record time only
+            facts.untimed.setdefault(_identity(f"{owner}/{name}", number), []).append(at)
     legacy = (await db.execute(
         select(TeamGithubScope.repo_owner, TeamGithubScope.repo_name, GithubWorkItem.issue_number,
                GithubWorkItem.auto_merged_at, GithubWorkItem.id)
