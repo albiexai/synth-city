@@ -156,16 +156,18 @@ def _state(path: Path, uid: int, session_id: str, cwd: str, now: datetime,
         if last_timestamp is not None and timestamp < last_timestamp:
             return "unknown", "observation_invalid", None
         last_timestamp = timestamp
-        if kind == "system" and row.get("subtype") in _STATE_KEEPING_SYSTEM_SUBTYPES:
-            # A compaction record or a notice says nothing about the turn. Keep the state, the completion and
-            # observed_at as they are: a notice must not look like member activity, and the idle time must not
-            # move. A long compaction in a working turn can still reach the staleness rule below.
-            continue
-        if kind == "system" and row.get("subtype") != "turn_duration":
-            state, reason, terminal = "unknown", "native_event_unsupported", None
-            observed_at = timestamp
-            cursor = None
-            continue
+        if kind == "system":
+            subtype = row.get("subtype")
+            # Claude may append an away recap while the prompt is idle. It can keep a
+            # proven completion, but it cannot establish one or renew its activity time.
+            if (subtype in _STATE_KEEPING_SYSTEM_SUBTYPES
+                    or (subtype == "away_summary" and state == "idle" and terminal is not None)):
+                continue
+            if subtype != "turn_duration":
+                state, reason, terminal = "unknown", "native_event_unsupported", None
+                observed_at = timestamp
+                cursor = None
+                continue
         message = row.get("message")
         if kind == "user":
             if not isinstance(message, dict) or message.get("role") != "user":

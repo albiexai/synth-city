@@ -312,7 +312,7 @@ class AgentTeamSummaryService:
                 ):
                     continue
                 coverage.append(TeamSummaryCoverageReason(code="native_unknown", slot_id=entry.slot_id,
-                    activity_reason=reason if reason in _ACTIVITY_REASONS else None))
+                    activity_reason=reason if reason in _ACTIVITY_REASONS else "observation_unavailable"))
             native_states = {entry.slot_id: entry.state for entry in native.slots}
             waiting_input = [TeamWaitingInput(slot_id=entry.slot_id, reason=entry.waiting_input.reason)
                 for entry in native.slots if entry.waiting_input is not None]
@@ -634,7 +634,9 @@ class AgentTeamSummaryService:
         # team-wide completeness, so retain its fixed reason without any slot details.
         coverage = [row for row in result.coverage_reason if row.slot_id is None or visible(None, slot_id=row.slot_id)]
         if not coverage and result.coverage_reason:
-            coverage = [TeamSummaryCoverageReason(code=result.coverage_reason[0].code)]
+            code = result.coverage_reason[0].code
+            coverage = [TeamSummaryCoverageReason(code=code,
+                activity_reason="observation_unavailable" if code == "native_unknown" else None)]
         update = {
             "human_actions": [row for row in result.human_actions if visible(row.scope_id, row.work_item_id)],
             "attention": [row for row in result.attention if visible(row.scope_id, row.work_item_id)],
