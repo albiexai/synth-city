@@ -18,7 +18,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.database import GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace, TeamGithubScope
-from app.models.schemas import DEFAULT_PLAN_ESTIMATE_MINUTES
+from app.models.schemas import (
+    DEFAULT_EFFORT_EXTENSION_CAP_MINUTES, DEFAULT_EFFORT_EXTENSION_CAP_PERCENT, DEFAULT_PLAN_ESTIMATE_MINUTES,
+)
 from app.services import decision_wait_service as decision_waits
 from app.services.github_terminal_revision_service import TERMINAL_ITEMS
 
@@ -26,8 +28,6 @@ logger = logging.getLogger(__name__)
 
 # A single tick adds at most this much, so a missed monitor never books a long gap as work.
 MAX_TICK_SECONDS = 300
-EXTENSION_CAP_MINUTES = 30
-EXTENSION_CAP_PERCENT = 25
 _REASON_LIMIT = 500
 # An extension serves the working attempt and its review corrections: a PR under review is "verifying" (#1059).
 _EXTENDABLE_STATUSES = ("dispatched", "verifying")
@@ -106,9 +106,11 @@ class GithubEffortLimitService:
         return math.ceil(upper)
 
     @staticmethod
-    def extension_cap(limit_minutes: int) -> int:
-        """The most one Leader extension may add: the smaller of 30 minutes and 25 percent of the limit."""
-        return max(0, min(EXTENSION_CAP_MINUTES, limit_minutes * EXTENSION_CAP_PERCENT // 100))
+    def extension_cap(limit_minutes: int, scope=None) -> int:
+        """Bound one Leader extension by minutes and a percentage of the original limit."""
+        minutes = getattr(scope, "effort_extension_cap_minutes", DEFAULT_EFFORT_EXTENSION_CAP_MINUTES)
+        percent = getattr(scope, "effort_extension_cap_percent", DEFAULT_EFFORT_EXTENSION_CAP_PERCENT)
+        return max(0, min(minutes, limit_minutes * percent // 100))
 
     @staticmethod
     def ceiling_room(limit_minutes: int, extension_minutes: int, ceiling_minutes) -> int | None:
@@ -118,13 +120,15 @@ class GithubEffortLimitService:
         return None
 
     @classmethod
-    def extension_cap_for(cls, limit_minutes: int, ceiling_minutes, extension_minutes: int = 0) -> int:
+    def extension_cap_for(
+        cls, limit_minutes: int, ceiling_minutes, extension_minutes: int = 0, *, scope=None,
+    ) -> int:
         """The most the next extension may add (#968, #1101): the per-step cap, clamped to the room under the ceiling.
 
         The per-step cap comes from the original limit, so repeated steps never grow it. A ceiling that cannot be
         read leaves the per-step cap.
         """
-        cap = cls.extension_cap(limit_minutes)
+        cap = cls.extension_cap(limit_minutes, scope)
         room = cls.ceiling_room(limit_minutes, extension_minutes, ceiling_minutes)
         return cap if room is None else min(cap, room)
 
@@ -146,7 +150,7 @@ class GithubEffortLimitService:
             "extension_minutes": extension,
             "effective_limit_minutes": limit + extension,
             "ceiling_minutes": ceiling,
-            "extension_cap_minutes": cls.extension_cap_for(limit, ceiling, extension),
+            "extension_cap_minutes": cls.extension_cap_for(limit, ceiling, extension, scope=scope),
         }
 
     # -- ledger -----------------------------------------------------------------------------------------------------
@@ -478,7 +482,7 @@ class GithubEffortLimitService:
         scope = (await db.execute(select(TeamGithubScope).where(TeamGithubScope.id == item.scope_id)
                                   .execution_options(populate_existing=True))).scalar_one_or_none()
         ceiling = getattr(scope, "max_item_effort_minutes", None)
-        step_cap = self.extension_cap(limit)
+        step_cap = self.extension_cap(limit, scope)
         if used != expected:
             await db.rollback()
             raise self._total_changed(used)
