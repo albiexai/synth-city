@@ -7,6 +7,7 @@ import { anchor } from '@/features/factory/components/styles'
 import { useObservation } from '@/features/factory/reads'
 import type { WorkListResponse } from '@/types/factory'
 import type { AgentTeamPreset, AgentTeamSummary, TeamGithubScopeListResponse } from '@/types/agentTeams'
+import { DispatchPauseNotice } from './DispatchPauseNotice'
 import { autonomousLeaderSlotId } from './leaderSlot'
 import { SupervisorBindingDialog } from './SupervisorBindingDialog'
 import { SupervisorStatus } from './SupervisorStatus'
@@ -66,6 +67,7 @@ export function TeamHeader({
           </Button>
         </div>
       </div>
+      <DispatchPauseNotice pause={preset} />
       {preset.description && <p className="text-muted-foreground">{preset.description}</p>}
       <dl className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
         <div className="flex items-center gap-1">

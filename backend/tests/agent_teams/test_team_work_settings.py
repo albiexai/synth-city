@@ -1,13 +1,14 @@
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import event
+from sqlalchemy import event, select
 
 from app.config import settings
-from app.models.database import AgentTeamPreset
+from app.models.database import AgentTeamPreset, FactoryAuditEvent
 from app.models.schemas import AgentTeamPresetUpdate, TeamWorkSettings
 from app.services import factory_audit_service as audit
 from app.services.agent_team_service import agent_team_service
 from tests.agent_teams.test_github_workspace_api import OPERATOR_HEADERS, client, operator_token  # noqa: F401
+from tests.test_audit_via import SESSION_TOKEN, _session
 
 
 @pytest.mark.asyncio
@@ -179,3 +180,60 @@ async def test_work_setting_is_locked_before_mutation_and_through_audit(db, monk
     finally:
         event.remove(engine, "before_cursor_execute", observe_writer_claim)
     assert audit_calls == [{"mail_request_unanswered_seconds": 600}]
+
+
+
+@pytest.mark.asyncio
+async def test_dispatch_pause_is_a_director_action_and_records_history(client, db, tmp_path):
+    team = AgentTeamPreset(name="Drain", autonomy_enabled=True)
+    db.add(team)
+    await db.commit()
+    path = f"/api/v1/agent-teams/presets/{team.id}"
+    pause = {"paused": True, "reason": "Drain the queue"}
+    assert (await client.put(f"{path}/dispatch-pause", json=pause)).status_code == 401
+    await _session(db, tmp_path)
+    session = {"X-Synth-City-Session-Token": SESSION_TOKEN}
+    for headers in (session, {**OPERATOR_HEADERS, **session}):
+        refused = await client.put(f"{path}/dispatch-pause", json=pause, headers=headers)
+        assert refused.status_code == 403 and refused.json()["detail"]["code"] == "director_action_not_via_mail"
+    for invalid in ({"paused": True, "reason": "   "}, {"paused": "true", "reason": "Drain"}):
+        assert (await client.put(f"{path}/dispatch-pause", json=invalid, headers=OPERATOR_HEADERS)).status_code == 422
+
+    secret = "ghp_" + "a" * 36
+    pause["reason"] += f" ({secret})"
+    assert (await client.put(f"{path}/dispatch-pause", json=pause, headers=OPERATOR_HEADERS)).status_code == 200
+    assert (await client.put(f"{path}/dispatch-pause", json=pause, headers=OPERATOR_HEADERS)).status_code == 200
+    active = (await client.get(path)).json()
+    assert active["dispatch_paused"] is True and active["autonomy_enabled"] is True
+    assert active["dispatch_paused_by"] == "operator"
+    assert active["dispatch_pause_reason"].startswith("Drain the queue") and secret not in str(active)
+    resume = await client.put(f"{path}/dispatch-pause", json={"paused": False, "reason": "Drain complete"},
+                              headers=OPERATOR_HEADERS)
+    assert resume.status_code == 200
+    assert resume.json()["dispatch_paused"] is False and resume.json()["autonomy_enabled"] is True
+    assert resume.json()["dispatch_pause_reason"] is None and resume.json()["dispatch_paused_by"] is None
+    history = (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.source == "agent_team_service.set_dispatch_pause").order_by(FactoryAuditEvent.id))).all()
+    assert [(event.before_values, event.after_values) for event in history] == [
+        ({"dispatch_paused": False}, {"dispatch_paused": True}),
+        ({"dispatch_paused": True}, {"dispatch_paused": False}),
+    ]
+    assert all(event.actor_reference == "shared-operator-credential" for event in history)
+    assert [event.sanitized_reason for event in history] == [active["dispatch_pause_reason"], "Drain complete"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_pause_rolls_back_when_audit_write_fails(db, monkeypatch):
+    team = AgentTeamPreset(name="Audit unavailable")
+    db.add(team)
+    await db.commit()
+    team_id = team.id
+
+    async def fail(session, **kwargs):
+        await session.flush()
+        raise audit.AuditWriteError("injected audit error")
+
+    monkeypatch.setattr(audit, "record_event", fail)
+    with pytest.raises(audit.AuditWriteError):
+        await agent_team_service.set_dispatch_pause(db, team_id, paused=True, reason="Drain queue")
+    assert (await db.get(AgentTeamPreset, team_id, populate_existing=True)).dispatch_paused is False

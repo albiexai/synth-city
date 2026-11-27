@@ -2703,8 +2703,17 @@ class AgentTeamPresetResponse(CampaignPresetFields):
     created_at: datetime
     updated_at: datetime
     autonomy_enabled: bool = False
+    dispatch_paused: bool = False
+    dispatch_pause_reason: str | None = None
+    dispatch_paused_by: str | None = None
     leader_slot_id: Optional[int] = None
     slots: List[AgentTeamSlotResponse] = Field(default_factory=list)
+
+
+class AgentTeamDispatchPauseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+    paused: bool
+    reason: str = Field(min_length=1, max_length=500)
 
 
 class AgentTeamLeaderUpdateRequest(BaseModel):

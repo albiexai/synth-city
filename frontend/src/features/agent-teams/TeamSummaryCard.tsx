@@ -12,6 +12,7 @@ import { ACTION_TEXT, ATTENTION_TEXT, incompleteRequestText, teamCoverageReasonT
 import { blockedText, waitingText } from './supervisorText'
 import { parseReminders, reminderAge } from './reminderText'
 import { SupervisorStatus } from './SupervisorStatus'
+import { DispatchPauseNotice, type DispatchPauseState } from './DispatchPauseNotice'
 
 const HOLD_TEXT: Record<NonNullable<AgentTeamSummary['hold_code']>, string> = {
   hold: 'This team is on HOLD. Synth City admits no new work.',
@@ -61,7 +62,7 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 }
 
 // Display only: the card grants no approval, retry or merge action.
-export function TeamSummaryCard({ presetId, name, running, showChecked = true, compact = false, slotNames, query }: {
+export function TeamSummaryCard({ presetId, name, running, showChecked = true, compact = false, slotNames, query, dispatchPause }: {
   presetId: number
   // The Overview's Repository and Assigned-harness filter (#1142): the card then reads the same filtered summary.
   query?: string
@@ -74,6 +75,7 @@ export function TeamSummaryCard({ presetId, name, running, showChecked = true, c
   compact?: boolean
   // Member names by slot id, for the "waiting for input" row.
   slotNames?: Record<number, string>
+  dispatchPause?: DispatchPauseState
 }) {
   const state = useObservation<AgentTeamSummary>(`agent-teams/presets/${presetId}/summary${query ? `?${query}` : ''}`)
   const summary = state.data
@@ -104,6 +106,7 @@ export function TeamSummaryCard({ presetId, name, running, showChecked = true, c
           )}
         </h4>
       )}
+      {dispatchPause && <DispatchPauseNotice pause={dispatchPause} />}
       <ReadStatus state={state} />
       {summary && (
         <>
@@ -268,6 +271,7 @@ export function TeamSummaries({ teamId, onOverview = false, filterQuery = '', on
             presetId={preset.id}
             name={preset.name}
             running={preset.autonomy_enabled}
+            dispatchPause={preset}
             showChecked={!onOverview}
             compact={onOverview}
             query={filterQuery || undefined}

@@ -12,6 +12,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { fetchAgentMailTeam } from '@/features/agent-mail/api'
@@ -51,6 +52,7 @@ export function AutonomyPanel({
   loadError,
   onRefresh,
   onToggleAutonomy,
+  onSetDispatchPause,
 }: {
   preset: AgentTeamPreset
   scopes: TeamGithubScope[]
@@ -62,9 +64,13 @@ export function AutonomyPanel({
   loadError: string | null
   onRefresh: () => Promise<void>
   onToggleAutonomy: (enabled: boolean, operatorToken: string) => Promise<void>
+  onSetDispatchPause: (paused: boolean, reason: string, operatorToken: string) => Promise<void>
 }) {
   const enableTriggerRef = useRef<HTMLButtonElement | null>(null)
   const [toggleSaving, setToggleSaving] = useState(false)
+  const [pauseEditor, setPauseEditor] = useState(false)
+  const [pauseReason, setPauseReason] = useState('')
+  const [pauseSaving, setPauseSaving] = useState(false)
   const [enableConfirmOpen, setEnableConfirmOpen] = useState(false)
   const [enableWarnings, setEnableWarnings] = useState<string[]>([])
   const [gateOpen, setGateOpen] = useState(false)
@@ -142,6 +148,21 @@ export function AutonomyPanel({
     }
   }
 
+  const applyDispatchPause = async () => {
+    const reason = pauseReason.trim()
+    if (!reason || pauseSaving) return
+    setPauseSaving(true)
+    try {
+      await withOperatorToken((token) => onSetDispatchPause(!preset.dispatch_paused, reason, token))
+      setPauseEditor(false)
+      setPauseReason('')
+    } catch {
+      // Keep the reason available when the Director key dialog or save fails.
+    } finally {
+      setPauseSaving(false)
+    }
+  }
+
   const toggle = async (enabled: boolean) => {
     if (!enabled) {
       await applyToggle(false)
@@ -203,6 +224,30 @@ export function AutonomyPanel({
         </CardContent>
       </Card>
       {enableError && <p role="alert" className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">{enableError}</p>}
+      <Card>
+        <CardContent className="space-y-3 p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-sm text-muted-foreground">Pause new assignments while reviews, checks and merges continue.</p>
+            {!pauseEditor && <Button variant="outline" onClick={() => setPauseEditor(true)}>
+              {preset.dispatch_paused ? 'Resume new dispatch' : 'Pause new dispatch'}
+            </Button>}
+          </div>
+          {pauseEditor && (
+            <form className="space-y-2" onSubmit={(event) => { event.preventDefault(); void applyDispatchPause() }}>
+              <Label htmlFor="dispatch-pause-reason">Reason</Label>
+              <Input id="dispatch-pause-reason" maxLength={500} required disabled={pauseSaving}
+                value={pauseReason} onChange={(event) => setPauseReason(event.target.value)} />
+              <div className="flex flex-wrap gap-2">
+                <Button type="submit" disabled={pauseSaving || !pauseReason.trim()}>
+                  {preset.dispatch_paused ? 'Resume dispatch' : 'Pause dispatch'}
+                </Button>
+                <Button type="button" variant="outline" disabled={pauseSaving}
+                  onClick={() => { setPauseEditor(false); setPauseReason('') }}>Cancel</Button>
+              </div>
+            </form>
+          )}
+        </CardContent>
+      </Card>
 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>

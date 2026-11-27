@@ -9152,3 +9152,73 @@ async def test_a_prepared_item_that_holds_the_slot_still_starts_after_a_higher_i
     launched = []
     await _poll(db, scope, slots, labels, launched)  # 904 finds the slot held by 905's prepared attempt
     assert await _dispatched(db, scope) == [905]  # the holder is not locked out of its own reservation
+
+
+
+@pytest.mark.asyncio
+async def test_dispatch_pause_defers_ready_work_until_the_next_resumed_poll(db, monkeypatch):
+    from app.services.agent_team_service import agent_team_service
+
+    preset, slots, scope = await _team(db)
+    pending = await _pending_item(db, scope, 9153)
+    preset.autonomy_enabled = True
+    preset.dispatch_paused = True
+    await db.commit()
+    launcher = AsyncMock(return_value=_Launched())
+    monkeypatch.setattr(github_dispatch_service, "_send_dispatch_brief_to_slot", AsyncMock())
+
+    for _ in range(3):
+        await github_dispatch_service.dispatch_pending(db, scope, slots, launcher=launcher,
+            issue_labels_by_number={9153: ["area:backend"]})
+        await db.refresh(pending)
+        assert (pending.dispatch_status, pending.pending_reason) == ("pending", "dispatch_paused")
+    launcher.assert_not_awaited()
+    assert pending.owner_slot_id is None
+    assert await db.scalar(select(GithubWorkspace.id).where(GithubWorkspace.leased_item_id == pending.id)) is None
+
+    await agent_team_service.set_dispatch_pause(db, preset.id, paused=False, reason="Drain complete")
+    await db.refresh(pending)
+    assert (pending.dispatch_status, pending.pending_reason) == ("pending", None)
+    await github_dispatch_service.dispatch_pending(db, scope, slots, launcher=launcher,
+        issue_labels_by_number={9153: ["area:backend"]})
+    assert (pending.dispatch_status, pending.pending_reason) == ("dispatched", None)
+    launcher.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_pause_set_after_routing_fences_the_new_claim(db):
+    preset, slots, scope = await _team(db)
+    item = await _pending_item(db, scope, 9154)
+    preset.autonomy_enabled = True
+    await db.commit()
+    owner, method = await github_dispatch_service.route_item(
+        db, item, slots, ["area:backend"], leader_slot_id=preset.leader_slot_id)
+    preset.dispatch_paused = True
+    await db.commit()
+    assert not await github_dispatch_service._claim_dispatch_start(
+        db, scope, item, owner_slot_id=owner, routing_method=method, require_autonomy=True)
+    assert (item.dispatch_status, item.pending_reason, item.owner_slot_id) == ("pending", "dispatch_paused", None)
+
+
+
+@pytest.mark.asyncio
+async def test_dispatch_pause_after_a_committed_claim_keeps_that_start_in_flight(db, monkeypatch):
+    from app.services.agent_team_service import agent_team_service
+
+    preset, slots, scope = await _team(db)
+    preset.autonomy_enabled = True
+    item = await _pending_item(db, scope, 9155)
+    original = github_workspace_service.acquire
+
+    async def acquire(session, claim_scope, claimed):
+        assert claimed.dispatch_status == "dispatched"
+        await agent_team_service.set_dispatch_pause(session, preset.id, paused=True, reason="Drain jobs")
+        return await original(session, claim_scope, claimed)
+
+    monkeypatch.setattr(github_workspace_service, "acquire", acquire)
+    monkeypatch.setattr(github_dispatch_service, "_send_dispatch_brief_to_slot", AsyncMock())
+    launcher = AsyncMock(return_value=_Launched())
+    await github_dispatch_service.dispatch_pending(db, scope, slots, launcher=launcher,
+        issue_labels_by_number={9155: ["area:backend"]}, require_autonomy=True)
+    launcher.assert_awaited_once()
+    assert item.dispatch_status == "dispatched" and preset.dispatch_paused

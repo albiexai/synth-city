@@ -74,6 +74,7 @@ import {
   launchAgentTeam,
   planAgentTeamLaunch,
   reorderAgentTeamSlots,
+  setTeamDispatchPause,
   updateAgentTeamPreset,
   updateAgentTeamLeader,
   updateAgentTeamSlot,
@@ -1204,6 +1205,18 @@ export function AgentTeamsPage() {
     }
   }
 
+  const setDispatchPause = async (paused: boolean, reason: string, operatorToken: string) => {
+    if (!selectedPreset) return
+    try {
+      const updated = await setTeamDispatchPause(selectedPreset.id, paused, reason, operatorToken)
+      replacePreset(updated)
+      toast.success(paused ? 'Dispatch paused' : 'Dispatch resumed')
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Failed to change dispatch pause')
+      throw error
+    }
+  }
+
   const removeSlot = async (slot: AgentTeamSlot) => {
     try {
       const updated = await withOperatorToken((token) => deleteAgentTeamSlot(slot.id, token))
@@ -1491,6 +1504,7 @@ export function AgentTeamsPage() {
                     loadError={autonomyDataPresetId === selectedPreset.id ? autonomyLoadError : null}
                     onRefresh={refreshAutonomy}
                     onToggleAutonomy={toggleAutonomy}
+                    onSetDispatchPause={setDispatchPause}
                   />
                 </TabsContent>
               </Tabs>

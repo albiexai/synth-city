@@ -3219,10 +3219,12 @@ async def test_failed_check_dispatched_item_with_pr_is_reverified(db):
 
 
 @pytest.mark.asyncio
-async def test_auto_merge_success_sets_merged_and_budget_timestamp(db):
+@pytest.mark.parametrize("dispatch_paused", [False, True])
+async def test_auto_merge_success_sets_merged_and_budget_timestamp(db, dispatch_paused):
     scope = await _scope(db, merge_policy="auto", github_auth_mode="ambient")
     preset = await db.get(AgentTeamPreset, scope.preset_id)
     preset.autonomy_enabled = True
+    preset.dispatch_paused = dispatch_paused
     item = await _item(
         db,
         scope,
@@ -3230,6 +3232,14 @@ async def test_auto_merge_success_sets_merged_and_budget_timestamp(db):
         pr_number=5,
         last_verified_sha="sha",
     )
+    if dispatch_paused:
+        pending = await _item(db, scope, dispatch_status="pending", issue_number=2,
+            dispatch_head_ref=None, dispatch_base_ref=None, ack_approver_member_id=None)
+        slots = (await db.scalars(select(AgentTeamSlot).where(AgentTeamSlot.preset_id == preset.id))).all()
+        for _ in range(2):
+            await github_dispatch_service.dispatch_pending(db, scope, slots, launcher=AsyncMock())
+            await db.refresh(pending)
+            assert (pending.dispatch_status, pending.pending_reason) == ("pending", "dispatch_paused")
     client = _Client(
         check_runs=[{"name": "ci", "status": "completed", "conclusion": "success"}]
     )
@@ -3255,6 +3265,10 @@ async def test_auto_merge_success_sets_merged_and_budget_timestamp(db):
     assert client.merge_calls == 1
     client.create_issue_comment.assert_not_awaited()
     client.close_issue.assert_not_awaited()
+    if dispatch_paused:
+        await github_dispatch_service.dispatch_pending(db, scope, slots, launcher=AsyncMock())
+        await db.refresh(pending)
+        assert (pending.dispatch_status, pending.pending_reason) == ("pending", "dispatch_paused")
 
     await github_verification_service.process_scope(db, scope, client=client)
 
