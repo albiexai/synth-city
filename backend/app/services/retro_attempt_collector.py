@@ -1,7 +1,8 @@
 """#1417 (#1245 part 2): attempt windows and the waiting-on-someone and active collectors.
 
 Read-only. Each dispatch attempt of a team's items becomes an ``AttemptWindow`` and ``StageInterval``s for
-``retro_stage_engine.breakdown``. The process collectors are #1418, and the snapshot section is #1419.
+``retro_stage_engine.breakdown``: waiting on someone and active (#1417), and process (#1418). The snapshot section
+is #1419.
 
 The rules are the Supervisor's design answers on #1245 and the approved plan (2026-11-27):
 - An attempt is a ``work_lifecycle`` dispatched event, named by its launch key. Its window runs from the previous
@@ -16,6 +17,11 @@ The rules are the Supervisor's design answers on #1245 and the approved plan (20
 - Everything, attributed or not, is clipped to the campaign period ``[campaign_start, as_of]``; what lies wholly
   outside it is left out, and an attempt that ended before the campaign is not shown (V1 review 431).
 - A head is a (PR, SHA) pair; a changes-required verdict, on the PR or on a revision, ends at a different commit.
+- Process (#1418): each required check run on a watched head, per repository and check name, from its queue start
+  (Actions' job creation, else its start) to its completion. Review per verifier runs from the review notice the
+  watch delivered to that member to their first verdict on the head. The notice is the later of the reviewer's
+  binding and the checks' success, not an assignment time, which is not recorded. A missing notice, a verdict before
+  it, or a replaced reviewer without a verdict adds nothing; only the bound reviewer's unended review stays open.
 """
 from __future__ import annotations
 
@@ -31,9 +37,11 @@ from app.models.database import (
     GithubAttemptScopeRevision,
     GithubCheckRunHistory,
     GithubHeadReview,
+    GithubRequiredCheckRecipient,
     GithubRequiredCheckWatch,
     GithubRevisionReview,
     GithubWorkItem,
+    MailMessage,
     TeamGithubScope,
 )
 from app.services import factory_audit_service as audit
@@ -265,6 +273,15 @@ async def _collect_item(db, item: GithubWorkItem, out: TeamAttempts, period):
             following = [t for (_, sha), t in heads.items() if t > begun and sha != rejected]
             if following:
                 _place(out, period, attempt, "active", "building", "owner", begun, min(following))
+        # Process: required checks per check, and review per verifier (#1418)
+        for run in await _required_runs(db, item, {(w.pr_number, w.head_sha) for w in mine["check_watch"]}):
+            queued = run.job_created_at or run.started_at
+            if queued is not None and run.completed_at is not None:
+                _place(out, period, attempt, "process", "required_check", f"{run.repository}:{run.check_name}",
+                       _naive(queued), _naive(run.completed_at))
+        for watch in mine["check_watch"]:
+            for member, noticed, verdict in await _reviews(db, watch, mine["head_review"], mine["revision_review"]):
+                _place(out, period, attempt, "process", "review", f"member:{member}", noticed, verdict)
 
     # Waiting on someone, by who had to answer
     by_request = {r.id: r for r in requests}
@@ -285,6 +302,41 @@ async def _collect_item(db, item: GithubWorkItem, out: TeamAttempts, period):
         actor = (start.after_values or {}).get("awaited_role") or "unknown"
         _place(out, period, attempt, "waiting", family, actor, at, _end_of(start, family, ends))
     return attempts
+
+
+async def _required_runs(db, item: GithubWorkItem, pairs: set[tuple[int, str]]) -> list[GithubCheckRunHistory]:
+    """The required check runs of the watched (PR, SHA) pairs."""
+    if not pairs:
+        return []
+    runs = (await db.scalars(select(GithubCheckRunHistory).where(
+        GithubCheckRunHistory.scope_id == item.scope_id, GithubCheckRunHistory.required.is_(True),
+        GithubCheckRunHistory.head_sha.in_({sha for _, sha in pairs})))).all()
+    return [run for run in runs if (run.pr_number, run.head_sha) in pairs]
+
+
+async def _reviews(db, watch: GithubRequiredCheckWatch, head_reviews, revision_verdicts):
+    """Each verifier's (member, notice, first verdict at or after it) on a watch whose checks succeeded."""
+    if watch.completion_kind != "success":
+        return []
+    notices = (await db.execute(select(GithubRequiredCheckRecipient.member_id, MailMessage.created_at)
+                                .join(MailMessage, MailMessage.id == GithubRequiredCheckRecipient.message_id)
+                                .where(GithubRequiredCheckRecipient.watch_id == watch.id))).all()
+    verdicts: dict[int, list[datetime]] = defaultdict(list)
+    for review in head_reviews:
+        if review.dispatch_nonce == watch.dispatch_nonce and review.head_sha == watch.head_sha:
+            verdicts[review.reviewer_member_id].append(_naive(review.created_at))
+    for _, review in revision_verdicts:
+        if review.watch_id == watch.id:
+            verdicts[review.reviewer_member_id].append(_naive(review.created_at))
+    found = []
+    for member, noticed in notices:
+        noticed, own = _naive(noticed), verdicts.get(member, [])
+        if own:  # a verdict before the notice has no recorded start and leaves nothing open
+            if after := [t for t in own if t >= noticed]:
+                found.append((member, noticed, min(after)))
+        elif member == watch.reviewer_member_id:  # only the bound reviewer's unended review stays open
+            found.append((member, noticed, None))
+    return sorted(found, key=lambda review: (review[1], review[0]))
 
 
 async def _head_times(db, item: GithubWorkItem, pairs: set[tuple[int, str]]) -> dict[tuple[int, str], datetime]:
