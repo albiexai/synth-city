@@ -83,7 +83,8 @@ async def _fingerprint(db, campaign: Campaign) -> tuple:
     scopes = tuple((await db.execute(select(TeamGithubScope.id, TeamGithubScope.repo_owner, TeamGithubScope.repo_name)
                                      .join(FactoryContextKey, _lifetime(campaign.team_context_key))
                                      .order_by(TeamGithubScope.id))).all())
-    items = tuple((await db.execute(select(GithubWorkItem.id, GithubWorkItem.dispatch_status, GithubWorkItem.updated_at)
+    items = tuple((await db.execute(select(GithubWorkItem.id, GithubWorkItem.dispatch_status, GithubWorkItem.updated_at,
+                                           GithubWorkItem.auto_merged_at)
                                     .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
                                     .join(FactoryContextKey, _lifetime(campaign.team_context_key))
                                     .order_by(GithubWorkItem.id))).all())
@@ -140,7 +141,7 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
     complete = membership.complete
     facts = await _deliveries(db, campaign.team_context_key)
     members = {(m.repo, m.issue_number): m for m in membership.members}
-    delivered = {key: facts.delivered.get(key, []) for key in members}
+    delivered = {key: facts.delivered.get(_identity(*key), []) for key in members}
     # The cutoff (V1 review 6079984028): only facts recorded by ``as_of`` count. GitHub reports today's membership,
     # so a later departure, a later delivery of a member, or a read after the cutoff leaves it unknown.
     if observed > as_of:
@@ -157,7 +158,7 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
     # and so is every closed issue while a delivery can't be placed: it may be that issue's merge.
     closed = [key for key, m in members.items() if m.state == "closed" and key not in done]
     undelivered = [key for key in closed if not facts.unidentified
-                   and any(at <= as_of for at in facts.undelivered.get(key, ()))]
+                   and any(at <= as_of for at in facts.undelivered.get(_identity(*key), ()))]
     unknown = len(closed) - len(undelivered)
     reason = "delivery_identity_unknown" if facts.unidentified else "delivery_history_missing"
 
@@ -168,7 +169,7 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
     def delivery_sample(name: str, value: int) -> FactoryMetricSample:
         if not known or not unknown:
             return membership_sample(name, value)
-        if unknown == sum(1 for m in members.values() if m.state == "closed"):  # nothing known about any of them
+        if not merged and unknown == sum(1 for m in members.values() if m.state == "closed"):  # nothing known
             return _sample(name, "issue", None, len(members), source="github_membership", reasons=[reason],
                            coverage="unavailable", unknown=unknown)
         return _sample(name, "issue", value, len(members), source="github_membership", reasons=[reason],
@@ -198,16 +199,21 @@ class _Deliveries:
     unidentified: bool = False  # a recorded delivery whose issue can't be derived
 
 
+def _identity(repo: str, number: int) -> tuple[str, int]:
+    return repo.lower(), number  # GitHub's owner and repository names are case-insensitive
+
+
 async def _deliveries(db, key: str) -> _Deliveries:
     """Each issue's recorded delivery outcomes in the campaign team lifetime (#1395).
 
     A fact is read by the team, repository and issue it recorded (T05), so deleting the work item loses nothing. A row
-    recorded before that snapshot, without its team key or identity, falls back to its live item; another team
-    lifetime's facts never count. A legacy item's ``auto_merged_at`` is a merge. The time is the fact's own, or its
+    recorded before that snapshot, without its team key or identity, falls back to its live item, and a row without
+    its team key belongs here through its live item or scope; another team lifetime's facts never count. A legacy item's ``auto_merged_at`` is a merge. The time is the fact's own, or its
     record time when GitHub gave none.
     """
     lifetime = (select(GithubWorkItem.id).join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
                 .join(FactoryContextKey, _lifetime(key)))
+    scopes = select(TeamGithubScope.id).join(FactoryContextKey, _lifetime(key))
     rows = (await db.execute(
         select(FactoryAuditEvent.delivery_outcome, FactoryAuditEvent.fact_time, FactoryAuditEvent.occurred_at,
                FactoryAuditEvent.context_snapshot, GithubWorkItem.issue_number, TeamGithubScope.repo_owner,
@@ -216,7 +222,8 @@ async def _deliveries(db, key: str) -> _Deliveries:
         .outerjoin(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
         .where(FactoryAuditEvent.event_kind == "delivery_evidence",
                FactoryAuditEvent.delivery_outcome.in_(("delivered", "closed_without_delivery")),
-               or_(FactoryAuditEvent.team_context_key == key, FactoryAuditEvent.item_id.in_(lifetime))))).all()
+               or_(FactoryAuditEvent.team_context_key == key, FactoryAuditEvent.item_id.in_(lifetime),
+                   FactoryAuditEvent.scope_id.in_(scopes))))).all()
     facts = _Deliveries()
     for row in rows:
         recorded = row.context_snapshot or {}
@@ -228,7 +235,7 @@ async def _deliveries(db, key: str) -> _Deliveries:
             facts.unidentified = facts.unidentified or delivered
             continue
         outcomes = facts.delivered if delivered else facts.undelivered
-        outcomes.setdefault((f"{owner}/{name}", number), []).append(
+        outcomes.setdefault(_identity(f"{owner}/{name}", number), []).append(
             _naive_utc(row.fact_time or row.occurred_at))
     legacy = (await db.execute(
         select(TeamGithubScope.repo_owner, TeamGithubScope.repo_name, GithubWorkItem.issue_number,
@@ -237,7 +244,7 @@ async def _deliveries(db, key: str) -> _Deliveries:
         .join(FactoryContextKey, _lifetime(key))
         .where(GithubWorkItem.auto_merged_at.is_not(None)))).all()
     for row in legacy:
-        facts.delivered.setdefault((f"{row.repo_owner}/{row.repo_name}", row.issue_number), []).append(
+        facts.delivered.setdefault(_identity(f"{row.repo_owner}/{row.repo_name}", row.issue_number), []).append(
             _naive_utc(row.auto_merged_at))
     return facts
 
