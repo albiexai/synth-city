@@ -424,6 +424,8 @@ export interface DeliveryPolicyEvent {
 export interface DeliveryPolicyHistoryResponse { events: DeliveryPolicyEvent[] }
 
 export interface TeamGithubScopeSafetyBounds {
+  continuation_allowed_reasons?: string[] | null
+  verifier_roles?: string[] | null
   max_scope_amendments?: number
   max_scope_amendment_requests?: number
   max_amendment_added_paths?: number
@@ -517,7 +519,7 @@ export interface TeamGithubScopeUpdate extends TeamGithubScopeSafetyBounds {
   enabled?: boolean
 }
 
-export interface ScopeSettingDefinition { type?: string; minimum?: number; maximum?: number; default?: unknown }
+export interface ScopeSettingDefinition { type?: string; minimum?: number; maximum?: number; default?: unknown; choices?: string[]; default_head_roles?: string[] }
 export interface ScopeSettingChange { before: unknown; after: unknown }
 export interface ScopeSettingsHistoryEntry {
   event_id: number

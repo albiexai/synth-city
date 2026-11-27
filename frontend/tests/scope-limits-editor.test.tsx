@@ -33,6 +33,8 @@ const definitions = {
   max_scope_amendments: { type: 'integer', minimum: 0, maximum: 32, default: 3 },
   max_scope_amendment_requests: { type: 'integer', minimum: 0, maximum: 128, default: 8 },
   max_amendment_added_paths: { type: 'integer', minimum: 0, maximum: 256, default: 16 },
+  continuation_allowed_reasons: { choices: ['owner_offline', 'plan_blocked'] },
+  verifier_roles: { default_head_roles: ['verifier'] },
   max_companion_paths: { type: 'integer', minimum: 0, maximum: 128, default: 32 },
 }
 const entry = (id: number, changes: Record<string, { before: unknown; after: unknown }>, extra = {}) => ({
@@ -69,6 +71,27 @@ describe('the review hold and effort limit editors', () => {
     expect(within(section).getByText('120 minutes')).toBeInTheDocument()
     view.rerender(<RepositorySettings scope={{ ...scope, review_hold_label: null }} autonomyEnabled={false} refresh={vi.fn()} onRemoved={vi.fn()} />)
     expect(within(screen.getByRole('region', { name: 'Review hold and effort limit' })).getByText('No hold label')).toBeInTheDocument()
+  })
+
+  it('lets the Director tighten continuation reasons without confirmation', async () => {
+    const { user } = await openEditor()
+    await user.click(screen.getByLabelText('owner offline'))
+    expect(screen.queryByLabelText('Type safety_bounds to confirm')).toBeNull()
+    await user.click(save())
+    expect(updateTeamGithubScope).toHaveBeenCalledWith(2, { continuation_allowed_reasons: ['plan_blocked'] }, 'director-key')
+  })
+
+  it('requires confirmation to restore reasons and the wider default for named revision verdicts', async () => {
+    const { user } = await openEditor({ continuation_allowed_reasons: ['plan_blocked'], verifier_roles: ['verifier'] })
+    await user.click(screen.getByLabelText('owner offline'))
+    await user.click(screen.getByLabelText('Use default verifier rules'))
+    await user.click(save())
+    expect(updateTeamGithubScope).not.toHaveBeenCalled()
+    await user.type(screen.getByLabelText('Type safety_bounds to confirm'), 'safety_bounds')
+    await user.click(save())
+    expect(updateTeamGithubScope).toHaveBeenCalledWith(2, {
+      continuation_allowed_reasons: null, verifier_roles: null, confirm: 'safety_bounds',
+    }, 'director-key')
   })
 
   it('reads the ranges and the history from the server with the Director key', async () => {

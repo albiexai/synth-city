@@ -8,6 +8,7 @@ import subprocess
 import pytest
 import pytest_asyncio
 from sqlalchemy import event, select, update
+from sqlalchemy.sql.dml import Update
 
 from app.api.v1 import agent_mail
 from app.config import settings
@@ -899,6 +900,88 @@ async def record_changes(db, a, **overrides):
         evidence_url="https://github.com/o/approval/pull/5#pullrequestreview-123")
     args.update(overrides)
     return await record_revision_review(db, a.item, **args)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["admission", "approval", "activation"])
+@pytest.mark.parametrize("during_write", [False, True], ids=["before_read", "at_write"])
+async def test_tightened_continuation_reasons_are_enforced_at_each_grant(
+    db, healthy_attempt, monkeypatch, stage, during_write,
+):
+    a = healthy_attempt
+    a.item.pr_number = 5
+    await github_dispatch_service.escalate_without_notification(db, a.item, "plan_blocked")
+    monkeypatch.setattr(github_client, "get_recursive_tree", AsyncMock(return_value={}))
+
+    refusal = "stale_continuation_context" if during_write else "continuation_reason_not_allowed"
+
+    async def tighten():
+        reasons = ["retry_count_exhausted"]
+        if not during_write:
+            a.scope.continuation_allowed_reasons = reasons
+            await db.commit()
+            return
+        execute = db.execute
+        scope_id = a.scope.id
+
+        async def execute_with_policy_change(statement, *args, **kwargs):
+            if isinstance(statement, Update) and statement.table.name == GithubWorkItem.__tablename__:
+                await execute(update(TeamGithubScope).where(TeamGithubScope.id == scope_id)
+                    .values(continuation_allowed_reasons=reasons).execution_options(synchronize_session=False))
+            return await execute(statement, *args, **kwargs)
+
+        monkeypatch.setattr(db, "execute", execute_with_policy_change)
+
+    async def request():
+        return await github_approval_service.create_continuation_request(
+            db, a.item, a.scope, **amendment(a, ["src/base.py"]))
+
+    if stage == "admission":
+        await tighten()
+        with pytest.raises(GithubApprovalError, match=refusal):
+            await request()
+        return
+    revision, approval, _ = await request()
+    await github_approval_service.ensure_continuation_request_message(db, a.item, approval, revision)
+
+    async def approve():
+        return await github_approval_service.decide_continuation(
+            db, a.item, authenticated_leader_member_id=a.leader.id, decision="approved", reason="Reviewed",
+            request_id=approval.id)
+
+    if stage == "approval":
+        await tighten()
+        with pytest.raises(GithubApprovalError, match=refusal):
+            await approve()
+        return
+    await approve()
+    await github_approval_service.ensure_continuation_decision_message(db, a.item, approval, revision)
+    await github_approval_service.deliver_approved_continuation(db, a.item, approval, revision)
+    await tighten()
+    with pytest.raises(ValueError, match=refusal):
+        await github_dispatch_service.activate_continuation_revision(
+            db, a.item, a.scope, revision, authenticated_owner_member_id=a.owner.id,
+            authenticated_owner_slot_id=a.owner.team_slot_id, dispatch_nonce=a.item.dispatch_nonce,
+            lease_token=a.workspace.lease_token)
+
+
+@pytest.mark.asyncio
+async def test_explicit_verifier_roles_constrain_named_revision_verdicts(db, submitted_attempt):
+    from app.models.database import AgentTeamSlot
+
+    a = submitted_attempt
+    a.scope.verifier_roles = ["reviewer"]
+    await db.commit()
+    with pytest.raises(GithubApprovalError, match="current_independent_reviewer_required"):
+        await record_changes(db, a)
+    (await db.get(AgentTeamSlot, a.reviewer.team_slot_id)).role = "Reviewer"
+    await db.commit()
+    assert (await record_changes(db, a)).reviewer_member_id == a.reviewer.id
+    (await db.get(AgentTeamSlot, a.owner.team_slot_id)).role = "Reviewer"
+    a.watch.reviewer_member_id = a.owner.id
+    await db.commit()
+    with pytest.raises(GithubApprovalError, match="current_independent_reviewer_required"):
+        await record_changes(db, a, reviewer_member_id=a.owner.id)
 
 
 @pytest.mark.asyncio

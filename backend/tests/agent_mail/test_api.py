@@ -3818,3 +3818,42 @@ async def test_register_gates_and_binds_the_same_resolved_pane(client, monkeypat
     assert response.status_code == 200, response.text
     assert resolutions == ["detailed"]
     assert gated == [pane]
+
+
+@pytest.mark.asyncio
+async def test_dispatched_scope_categorical_safety_bounds_require_director_and_record_history(client, db, monkeypatch):
+    from app.api.v1 import agent_teams
+
+    monkeypatch.setattr(agent_teams, "_sync_github_jobs", AsyncMock())
+    item, _, tokens = await _dispatch_approval_fixture(db)
+    path = f"/api/v1/agent-teams/github-scopes/{item.scope_id}"
+
+    async def patch(**values):
+        return await client.patch(path, headers=DIRECTOR_HEADERS, json=values)
+
+    refused = await client.patch(path, headers={**DIRECTOR_HEADERS, "X-Synth-City-Session-Token": tokens[1]},
+                                 json={"verifier_roles": []})
+    assert refused.status_code == 403
+    assert (await patch(continuation_allowed_reasons=["invalid_reason"])).status_code == 422
+    assert (await patch(verifier_roles=["   "])).status_code == 422
+    refused = await patch(verifier_roles=["Reviewer"])
+    assert refused.status_code == 400
+    assert refused.json()["detail"]["confirm"] == "safety_bounds"
+
+    tight = await patch(continuation_allowed_reasons=[], verifier_roles=[" Verifier ", "verifier"])
+    assert tight.status_code == 200
+    assert tight.json()["continuation_allowed_reasons"] == []
+    assert tight.json()["verifier_roles"] == ["verifier"]
+    for field in ("continuation_allowed_reasons", "verifier_roles"):
+        refused = await patch(**{field: None})
+        assert refused.status_code == 400
+        assert set(refused.json()["detail"]["increases"]) == {field}
+    confirmed = await patch(continuation_allowed_reasons=None, verifier_roles=None, confirm="safety_bounds")
+    assert confirmed.status_code == 200
+    history = (await client.get(f"{path}/settings", headers=DIRECTOR_HEADERS)).json()["history"]
+    assert len(history) == 2
+    for field, restricted in (("continuation_allowed_reasons", []), ("verifier_roles", ["verifier"])):
+        assert [event["changes"][field] for event in history] == [
+            {"before": restricted, "after": None}, {"before": None, "after": restricted},
+        ]
+    assert all(event["via"] == "api" and event["actor_kind"] == "operator" for event in history)

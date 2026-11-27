@@ -300,6 +300,8 @@ class TeamGithubScope(Base):
     continuation_enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False
     )
+    continuation_allowed_reasons: Mapped[list[str] | None] = mapped_column(JSON(none_as_null=True))
+    verifier_roles: Mapped[list[str] | None] = mapped_column(JSON(none_as_null=True))
     max_continuation_revisions: Mapped[int] = mapped_column(
         Integer, default=6, nullable=False
     )

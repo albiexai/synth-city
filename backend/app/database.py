@@ -1009,6 +1009,9 @@ async def _run_sqlite_compat_migrations(conn) -> None:
     ):
         if scope_columns and column not in scope_columns:
             await conn.execute(text(f"ALTER TABLE team_github_scopes ADD COLUMN {column} INTEGER DEFAULT {default} NOT NULL"))
+    for column in ("continuation_allowed_reasons", "verifier_roles"):
+        if scope_columns and column not in scope_columns:
+            await conn.execute(text(f"ALTER TABLE team_github_scopes ADD COLUMN {column} JSON"))
     if scope_columns and "max_plan_estimate_minutes" not in scope_columns:
         await conn.execute(text("ALTER TABLE team_github_scopes ADD COLUMN max_plan_estimate_minutes INTEGER"))
     if scope_columns and "initial_paths_required" not in scope_columns:

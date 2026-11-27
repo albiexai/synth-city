@@ -47,8 +47,9 @@ from app.services.github_app_auth_service import (
 from app.services import decision_wait_service as decision_waits
 from app.services import required_ci_attention
 from app.services.github_approval_service import (
-    CONTINUABLE_ESCALATIONS,
     GithubApprovalError,
+    continuation_policy_matches,
+    continuation_reasons,
     github_approval_service,
 )
 from app.services.github_client import github_client
@@ -637,6 +638,11 @@ class GithubDispatchService:
         if item.pr_number is None:
             raise ValueError("continuation_pr_required")
 
+        await db.refresh(scope, attribute_names=["continuation_enabled", "continuation_allowed_reasons"])
+        if item.escalation_reason not in continuation_reasons(scope):
+            raise ValueError("continuation_reason_not_allowed")
+        policy_matches = continuation_policy_matches(scope)
+
         token = await github_approval_service.github_read_token(scope)
         pull = await github_client.get_pull(
             scope.repo_owner,
@@ -679,6 +685,7 @@ class GithubDispatchService:
                 GithubWorkItem.pr_number.is_not(None),
                 GithubWorkItem.escalation_reason
                 == revision.originating_escalation_reason,
+                policy_matches,
                 GithubWorkItem.active_scope_revision < revision.revision,
             )
             .values(
@@ -3502,7 +3509,7 @@ class GithubDispatchService:
                 item,
                 now=now,
             )
-            if item.escalation_reason not in CONTINUABLE_ESCALATIONS:
+            if item.escalation_reason not in continuation_reasons(scope):
                 self._log_recovery_monitor(
                     item,
                     revision=None,
@@ -3953,7 +3960,7 @@ class GithubDispatchService:
         return item.dispatch_status in _RELEASABLE_STATUSES and not (
             scope.continuation_enabled
             and item.dispatch_status == "escalated"
-            and item.escalation_reason in CONTINUABLE_ESCALATIONS
+            and item.escalation_reason in continuation_reasons(scope)
             and item.pr_number is not None
             and item.owner_slot_id is not None
             and item.dispatch_nonce is not None
