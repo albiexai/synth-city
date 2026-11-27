@@ -24,7 +24,7 @@ from app.services.github_dispatch_scheduler import github_dispatch_scheduler
 from app.services.github_dispatch_service import ESCALATION_REASONS
 from app.services.github_plan_refusal_service import current_plan_refusal_id
 from app.services.github_stopped_attempt_actor import StoppedAttemptStep, stopped_attempt_policy, stopped_attempt_step
-from app.services.github_work_item_projection import _load_work_item_authority, _work_item_response
+from app.services.github_work_item_projection import _load_work_item_authority, _work_item_response, work_item_path_comparison
 from app.services.providers import get_providers
 from app.services.work_item_states import ATTENTION_STATUSES, FINISHED_STATUSES
 
@@ -520,7 +520,8 @@ async def work_detail(db, item_id):
     if not rows:
         raise FactoryReadError("resource_not_found", 404)
     now = utc_now()
-    return wire.WorkDetailResponse(generated_at=now, work_item=(await work_projections(db, rows, now))[0])
+    return wire.WorkDetailResponse(generated_at=now, work_item=(await work_projections(db, rows, now))[0],
+        initial_path_comparison=work_item_path_comparison(rows[0][0]))
 
 
 async def repositories(db, filters, limit, cursor):

@@ -12,7 +12,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from app.models.api_model import format_utc_time
-from sqlalchemy import String, and_, cast, exists, func, or_, select, update
+from sqlalchemy import String, and_, cast, delete, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -39,6 +39,7 @@ from app.models.database import (
     FactoryAuditEvent,
     GithubApprovalRequest,
     GithubAttemptScopeRevision,
+    GithubMilestoneWait,
     GithubWorkItem,
     GithubWorkspace,
     MailAgentSession,
@@ -363,6 +364,7 @@ from app.services.github_work_item_projection import (
     _reload_work_item_response,
     _work_item_response,
     _work_item_status_note,
+    work_item_path_comparison,
 )
 from app.api.v1.factory_delivery import router as delivery_router
 from app.services.factory_delivery_policy import scope_policy
@@ -2898,7 +2900,11 @@ async def update_github_scope(
             if not compatible_checkout:
                 raise HTTPException(status_code=409, detail="scope_workspace_repository_mismatch")
         previously_enabled, previous_limit = scope.enabled, scope.max_concurrent_dispatched
+        previous_repository = (scope.repo_owner.lower(), scope.repo_name.lower())
         _apply_scope_create(scope, request, normalized_repo_path=proposed_repo_path)
+        if (scope.repo_owner.lower(), scope.repo_name.lower()) != previous_repository:
+            # #1337: a wait stores no repository. After a move it would name the new repository's issues.
+            await db.execute(delete(GithubMilestoneWait).where(GithubMilestoneWait.scope_id == scope.id))
         if scope.github_auth_mode == "app":
             if installation_id is not None:
                 scope.github_app_installation_id = installation_id
@@ -4219,21 +4225,23 @@ async def _named_reviewer_binding(db, item, scope, member_id):
     except ValueError:
         raise _not_reviewer() from None
     try:
-        return await read_current_named_review_attempt(db, context, watch, member_slot)
+        bound = await read_current_named_review_attempt(db, context, watch, member_slot)
     except GithubApprovalError:
         raise _binding_unavailable() from None
+    base = pull.get('base')
+    return bound, (sha, base.get('sha') if isinstance(base, dict) else None)
 
 
 @router.get('/github-work-items/{item_id}/review-binding', response_model=GithubReviewBindingResponse)
 async def get_github_review_binding(item_id: int, session: MailAgentSession | None = Depends(mail_session),
     db: AsyncSession = Depends(get_db)):
-    """#999: the binding a current reviewer needs to record a head or revision review, and nothing more.
+    """Read the binding and any current first-plan comparison for an authorized reviewer.
 
     Allowed: the team's current verifier (the same rule as head reviews), or the reviewer named on the item's
     required-check watch for the PR's exact current head, revision and policy. Everyone else is refused. The
     nonce is private: it is returned to the reviewer only and must never be published.
     """
-    from app.services.github_head_acceptance_service import _fresh_item, current_reviewer
+    from app.services.github_head_acceptance_service import current_reviewer
     if session is None:
         raise HTTPException(status_code=401, detail='session_token_required')
     require_session_slot(session)
@@ -4243,14 +4251,20 @@ async def get_github_review_binding(item_id: int, session: MailAgentSession | No
     scope = await db.get(TeamGithubScope, item.scope_id)
     if scope is None:
         raise _binding_unavailable()
+    observed_head_and_base = None
     if await current_reviewer(db, scope, item, session.member_id) == session.member_id:
-        fresh = await _fresh_item(db, item.id)
+        fresh = await db.get(GithubWorkItem, item_id, populate_existing=True)
     else:
-        fresh = await _named_reviewer_binding(db, item, scope, session.member_id)
-    if fresh is None or fresh.pr_number is None or not fresh.dispatch_nonce:
+        fresh, observed_head_and_base = await _named_reviewer_binding(db, item, scope, session.member_id)
+    if fresh is None or fresh.scope_id != scope.id or fresh.pr_number is None or not fresh.dispatch_nonce:
         raise _binding_unavailable()
+    comparison = work_item_path_comparison(fresh)
+    if (comparison is not None and observed_head_and_base is not None
+            and (comparison.head_sha, comparison.base_sha) != observed_head_and_base):
+        comparison = None
     return GithubReviewBindingResponse(work_item_id=item.id, pr_number=fresh.pr_number,
-        dispatch_nonce=fresh.dispatch_nonce, active_scope_revision=fresh.active_scope_revision)
+        dispatch_nonce=fresh.dispatch_nonce, active_scope_revision=fresh.active_scope_revision,
+        initial_path_comparison=comparison)
 
 
 @router.post('/github-work-items/{item_id}/head-reviews', response_model=GithubHeadReviewResponse)

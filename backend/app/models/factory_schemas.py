@@ -5,7 +5,7 @@ from typing import Annotated, Literal
 from pydantic import AfterValidator, ConfigDict, Field, model_validator
 from app.models.api_model import ApiModel as BaseModel
 from app.models.schemas import (
-    AgentStatus, RequiredCIUnreadableSignal, SupervisorObservation, UnansweredRequestReason, wait_label_from_reason,
+    AgentStatus, InitialPathComparison, RequiredCIUnreadableSignal, SupervisorObservation, UnansweredRequestReason, wait_label_from_reason,
 )
 
 
@@ -271,6 +271,40 @@ class WorkListResponse(FactoryEnvelope):
 
 class WorkDetailResponse(FactoryEnvelope):
     work_item: WorkProjection
+    initial_path_comparison: InitialPathComparison | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class WaitingIssue(FactoryModel):
+    """A ready issue whose milestone has no team. The wait stores no issue title.
+
+    `repository` is None when the repository of the wait cannot be proven from stored data (#1372 adds it).
+    """
+
+    repository: WorkRepository | None
+    issue_number: PositiveId
+    milestone: str
+    observed_at: Timestamp
+
+
+class DeferredIssue(FactoryModel):
+    """An issue whose work item ended because its milestone moved to another team."""
+
+    repository: WorkRepository
+    team: TeamReference
+    work_item_id: PositiveId
+    issue_number: PositiveId
+    issue_title: str
+    target_milestone: str | None
+    deferred_at: Timestamp
+    previous_branch: str | None
+
+
+class MilestoneStatesResponse(FactoryEnvelope):
+    filters: FactoryFilters
+    waiting: list[WaitingIssue]
+    waiting_truncated: bool
+    deferred: list[DeferredIssue]
+    deferred_truncated: bool
 
 
 class RepositoryListResponse(FactoryEnvelope):

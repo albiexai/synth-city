@@ -643,6 +643,12 @@ class GithubApprovalService:
     @classmethod
     def linked_initial_plan_paths(cls, root: MailMessage) -> list[str] | None:
         """Read the path authority of a request whose linked Mail fingerprint already matched."""
+        groups = cls.linked_initial_plan_path_groups(root)
+        return [*groups[0], *groups[1]] if groups is not None else None
+
+    @classmethod
+    def linked_initial_plan_path_groups(cls, root: MailMessage) -> tuple[list[str], list[str]] | None:
+        """Keep the named plan files separate from verified companions."""
         payload = root.payload or {}
         metadata = payload.get("plan_metadata")
         if not isinstance(metadata, dict) or not {"allowed_paths", "paths"}.intersection(metadata):
@@ -652,7 +658,7 @@ class GithubApprovalService:
             raise GithubApprovalError("allowed_paths_invalid", status_code=400)
         # Only the server-rendered companions presented to the Leader grant authority.
         companions = companion_paths.verified_companions(metadata, payload.get("summary"), root.body_markdown)
-        return [*paths, *(companions or [])]
+        return paths, companions or []
 
     @staticmethod
     def base_ref_matches(github_ref, dispatch_base_ref):

@@ -20,6 +20,7 @@ export function WorkDetailPage() {
     `factory/work-items/${encodeURIComponent(workItemId ?? "")}`,
   );
   const w = state.data?.work_item;
+  const comparison = state.data?.initial_path_comparison;
   const now = useNow();
   const title = w ? `#${w.item.issue_number} ${w.item.issue_title}` : null;
   return (
@@ -104,6 +105,31 @@ export function WorkDetailPage() {
               signal={w.item.required_ci_unreadable}
               pullRequest={w.item.pr_number}
             />
+          )}
+          {comparison && (
+            <section aria-label="First-plan path comparison" className={panel}>
+              <h3 className="font-semibold">First-plan path comparison</h3>
+              <p className="text-sm text-muted-foreground">
+                Compared head <code title={comparison.head_sha}>{comparison.head_sha.slice(0, 12)}</code>
+              </p>
+              <div className="grid gap-3 lg:grid-cols-3">
+                {([
+                  ["In scope", comparison.in_scope],
+                  ["Approved companions", comparison.approved_companions],
+                  ["Outside scope", comparison.outside_scope],
+                ] as const).map(([label, paths]) => (
+                  <div key={label} className="min-w-0 space-y-1">
+                    <h4 className="text-sm font-medium">{label}</h4>
+                    {paths.length ? (
+                      <ul className="space-y-1 break-all font-mono text-sm">
+                        {paths.map(path => <li key={path}>{path}</li>)}
+                      </ul>
+                    ) : <p className="text-sm text-muted-foreground">None</p>}
+                  </div>
+                ))}
+              </div>
+              {comparison.note && <p className="break-all font-mono text-sm">{comparison.note}</p>}
+            </section>
           )}
           <ContextLinks work={w} />
           {w.item.dispatch_status === "merged" ? (

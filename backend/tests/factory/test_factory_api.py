@@ -53,6 +53,32 @@ async def test_ci_signal_reaches_work_list_and_detail_with_safe_reason(factory_c
     assert cleared["required_ci_unreadable"] is None and cleared["checks_unavailable_since"] is None
 
 
+async def test_work_detail_only_projects_current_first_plan_comparison(factory_client, factory_store):
+    item_id = factory_store.ids.by_status["verifying"]
+    head, base = "a" * 40, "b" * 40
+    comparison = {"head_sha": head, "base_sha": base, "in_scope": ["src/in.py"],
+                  "approved_companions": ["tests/test_in.py"], "outside_scope": ["src/out.py"],
+                  "note": "initial_paths_out_of_scope: 'src/out.py'"}
+    assert "initial_path_comparison" not in await get_ok(factory_client, f"work-items/{item_id}")
+    async with factory_store.maker() as db:
+        item = await db.get(GithubWorkItem, item_id)
+        item.pr_number = 42
+        item.initial_paths_readiness = {"head": head, "base": base, "comparison": comparison, "private": PRIVATE}
+        item.verification_head_sha = head
+        await db.commit()
+        detail = await get_ok(factory_client, f"work-items/{item_id}")
+        assert detail["initial_path_comparison"] == comparison
+        assert PRIVATE not in json.dumps(detail)
+        listing = await get_ok(factory_client, "work-items", category="active", limit=100)
+        assert "initial_path_comparison" not in json.dumps(listing)
+        item.verification_head_sha = "c" * 40
+        await db.commit()
+        assert "initial_path_comparison" not in await get_ok(factory_client, f"work-items/{item_id}")
+        item.verification_head_sha, item.active_scope_revision = head, 1
+        await db.commit()
+        assert "initial_path_comparison" not in await get_ok(factory_client, f"work-items/{item_id}")
+
+
 async def test_only_defaulted_effort_limit_is_exposed_on_work_list_and_detail(factory_client, factory_store):
     defaulted = factory_store.ids.by_status["verifying"]
     estimated = factory_store.ids.by_status["dispatched"]
