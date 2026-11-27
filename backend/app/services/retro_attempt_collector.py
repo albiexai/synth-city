@@ -142,7 +142,12 @@ async def collect_team_attempts(db, preset_id: int, *, campaign_start: datetime,
     campaign_start, as_of = _naive(campaign_start), _naive(as_of)
     out, period = TeamAttempts(), (campaign_start, as_of)
     item_keys = aliased(FactoryContextKey)  # each item's lifetime key, bound in the same read as its identity
-    query = (select(GithubWorkItem, TeamGithubScope.repo_owner, TeamGithubScope.repo_name, item_keys.context_key)
+    # Scalar columns, never the entity: a session already holding the item would get its cached attributes back,
+    # pairing an old identity with a reused id's lifetime, and refreshing it would discard a caller's pending edit
+    # (V1 review 123). Columns are read as the row is now, and the caller's entities are left untouched.
+    query = (select(GithubWorkItem.id, GithubWorkItem.scope_id, GithubWorkItem.issue_number, GithubWorkItem.created_at,
+                    GithubWorkItem.dispatch_nonce, GithubWorkItem.launch_id, TeamGithubScope.repo_owner,
+                    TeamGithubScope.repo_name, item_keys.context_key)
              .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
              .outerjoin(item_keys, (item_keys.key_kind == "item") & (item_keys.numeric_id == GithubWorkItem.id)
                         & item_keys.retired_at.is_(None)))
@@ -153,7 +158,8 @@ async def collect_team_attempts(db, preset_id: int, *, campaign_start: datetime,
                            & FactoryContextKey.retired_at.is_(None))
     else:
         query = query.where(TeamGithubScope.preset_id == preset_id)
-    rows = (await db.execute(query.order_by(GithubWorkItem.id))).all()
+    rows = [(_ItemRow(r.id, r.scope_id, r.issue_number, r.created_at, r.dispatch_nonce, r.launch_id),
+             r.repo_owner, r.repo_name, r.context_key) for r in (await db.execute(query.order_by(GithubWorkItem.id))).all()]
     out.item_identity = {row[0].id: (f"{row[1]}/{row[2]}".lower(), row[0].issue_number) for row in rows}
     keys = {row[0].id: row[3] for row in rows}
     seen = {row[0].id: (row[0].scope_id, row[0].issue_number, row[0].created_at) for row in rows}
@@ -203,7 +209,18 @@ async def collect_team_attempts(db, preset_id: int, *, campaign_start: datetime,
     return out
 
 
-async def _collect_item(db, item: GithubWorkItem, out: TeamAttempts, period, item_key: str | None = None):
+@dataclass(frozen=True)
+class _ItemRow:
+    """The item fields the collector reads, as one row read them: no ORM entity is loaded or refreshed."""
+    id: int
+    scope_id: int
+    issue_number: int
+    created_at: datetime
+    dispatch_nonce: str | None
+    launch_id: int | None
+
+
+async def _collect_item(db, item: _ItemRow, out: TeamAttempts, period, item_key: str | None = None):
     campaign_start, as_of = period
     if item_key is None:
         return []
@@ -352,13 +369,13 @@ async def _collect_item(db, item: GithubWorkItem, out: TeamAttempts, period, ite
     return attempts
 
 
-async def _repository(db, item: GithubWorkItem) -> str | None:
+async def _repository(db, item: _ItemRow) -> str | None:
     """The scope's repository as the check history records it; history outlives its scope, whose id can be reused."""
     scope = await db.get(TeamGithubScope, item.scope_id)
     return f"{scope.repo_owner}/{scope.repo_name}".lower() if scope is not None else None
 
 
-async def _required_runs(db, item: GithubWorkItem, repository: str | None,
+async def _required_runs(db, item: _ItemRow, repository: str | None,
                          pairs: set[tuple[int, str]]) -> list[GithubCheckRunHistory]:
     """The required check runs of the watched (PR, SHA) pairs in the scope's own repository."""
     if not pairs or repository is None:
@@ -400,7 +417,7 @@ async def _reviews(db, watch: GithubRequiredCheckWatch, head_reviews, revision_v
     return sorted(found, key=lambda review: (review[1], review[0]))
 
 
-async def _head_times(db, item: GithubWorkItem, repository: str | None,
+async def _head_times(db, item: _ItemRow, repository: str | None,
                       pairs: set[tuple[int, str]]) -> dict[tuple[int, str], datetime]:
     """Each observed (PR, SHA) pair's first check run in the scope's repository; another PR's run is not that head."""
     if not pairs or repository is None:

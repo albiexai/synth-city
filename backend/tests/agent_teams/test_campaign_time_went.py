@@ -13,6 +13,7 @@ from itertools import count
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.models.database import (
     AgentTeamLaunch,
@@ -443,7 +444,9 @@ async def _race(db, world, monkeypatch, replace, *, keyed=False, again=None):
 
 async def _replaced_by_999(session, item, *, dispatch=True, request=False):
     item_id = item.id
-    session.expunge(item)
+    cached = await session.get(GithubWorkItem, item_id)  # the collector passes a read-only row, not this entity
+    if cached is not None:
+        session.expunge(cached)
     await session.execute(text("DELETE FROM github_work_items WHERE id = :i"), {"i": item_id})
     session.add(GithubWorkItem(id=item_id, scope_id=item.scope_id, issue_number=999, issue_title="R", issue_url="u/999",
                                github_updated_at=T0, dispatch_status="dispatched", created_at=CREATED,
@@ -498,6 +501,78 @@ async def test_a_row_replaced_during_the_first_key_read_is_dropped(db, world, mo
     _, went = await _race(db, world, monkeypatch, own_dispatch, again=_replaced_by_999)
     assert (went.attempts, went.total_seconds) == (0, None)
     assert "item_lifetime_changed_during_read" in went.unknown_reasons
+
+
+# V1 review 123: a session that already holds the item must still read the row as it is now
+async def _replace_elsewhere(db, item_id, scope_id, *, dispatch=True):
+    """Another connection replaces the row under the same numeric id (issue 999) and commits."""
+    other = async_sessionmaker(db.bind, expire_on_commit=False)()
+    try:
+        await other.execute(text("DELETE FROM github_work_items WHERE id = :i"), {"i": item_id})
+        other.add(GithubWorkItem(id=item_id, scope_id=scope_id, issue_number=999, issue_title="R", issue_url="u/999",
+                                 github_updated_at=T0, dispatch_status="dispatched", created_at=CREATED))
+        await other.flush()
+        if dispatch:
+            await _dispatch(other, item_id, 0, launch=0)
+        await other.commit()
+    finally:
+        await other.close()
+
+
+async def test_a_session_holding_the_item_reads_a_reused_id_as_unknown_not_its_time(db, world):
+    """V1's two-connection case: issue 10's entity stays cached here while issue 999 takes its id elsewhere."""
+    await _recording(db)
+    old = await _item(db, world, 10)
+    await _build(db, world, [10])
+    held = await db.get(GithubWorkItem, old.id)
+    await db.commit()  # the entity stays loaded (expire_on_commit=False)
+    await _replace_elsewhere(db, old.id, world.scopes["a1"])
+    snapshots.clear_cache()
+    went = (await _build(db, world, [10])).time_went
+    assert (went.attempts, went.items, went.unknown_items, went.total_seconds) == (0, 0, 1, None)
+    assert held.issue_number == 10  # the caller's entity is left as it was
+
+
+async def test_the_race_with_the_item_still_held_adds_no_time(db, world, monkeypatch):
+    """#1461's interleaving, with the replacement committed by another connection and nothing expunged."""
+    from app.services import retro_attempt_collector as collector
+
+    await _recording(db)
+    old = await _item(db, world, 10)
+    await _build(db, world, [10])
+    snapshots.clear_cache()
+    original, raced = collector._collect_item, []
+
+    async def interleaved(session, item, *args, **kwargs):
+        if not raced and item.id == old.id:
+            raced.append(True)
+            await _replace_elsewhere(session, old.id, world.scopes["a1"])
+        return await original(session, item, *args, **kwargs)
+
+    monkeypatch.setattr(collector, "_collect_item", interleaved)
+    went = (await _build(db, world, [10])).time_went
+    assert (went.attempts, went.total_seconds) == (0, None)
+
+
+async def test_a_pending_edit_survives_the_snapshot_read(db, world):
+    """V1's control: with autoflush off, as the app runs, a caller's pending edit and dirty state are untouched."""
+    await _recording(db)
+    old = await _item(db, world, 10)
+    await _dispatch(db, old.id, 0, launch=0)
+    await _build(db, world, [10])
+    caller = async_sessionmaker(db.bind, expire_on_commit=False, autoflush=False)()
+    try:
+        mine = await caller.get(GithubWorkItem, old.id)
+        mine.issue_title = "edited, not yet saved"
+        campaign = await campaigns.current(caller, world.team)
+        snapshots.clear_cache()
+        went = (await snapshots.build_snapshot(caller, campaign, FakeGithub(labelled={"a1": [_issue("a1", 10, "closed")]}),
+                                               as_of=AS_OF, cached=False)).time_went
+        assert (mine.issue_title, mine in caller.dirty) == ("edited, not yet saved", True)
+        assert went.total_seconds == 180 * MIN
+    finally:
+        await caller.rollback()
+        await caller.close()
 
 
 # The cache: inserts, updates and deletions with no audit event
