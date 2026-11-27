@@ -14,11 +14,12 @@ Each section links to the reference page that has the details. This page does no
 6. **Policies.** Set the delivery policy and the continuation policy. See [Delivery policy](#delivery-policy) and [Continuation policy](#continuation-policy).
 7. **Workspaces.** Register one dispatch workspace for each item that may run at the same time. See [Dispatch workspaces](#dispatch-workspaces).
 8. **Launch.** Launch the team and check that each member is ready.
-9. **Readiness.** Read the activation readiness of the scope. When it has no blockers, enable the scope.
-10. **Autonomy.** Turn autonomy on, with low concurrency. Watch the first item from plan to merge.
-11. **Ready labels.** Add the ready label to the first issues.
+9. **Readiness.** Read the activation readiness of the scope. Resolve every blocker.
+10. **Review.** Look at the other enabled scopes of the team, and at overlaps with other teams. Turning team autonomy on resumes every enabled scope of the team.
+11. **Autonomy.** Turn team autonomy on. Then enable the scope. Use low concurrency. Watch the first item from plan to merge.
+12. **Ready labels.** Add the ready label to the first issues.
 
-The guided setup on the [Repositories](/features/repositories) page does steps 4 to 8 for you, and it keeps the new scope disabled until you enable it. See [Turn it on](#turn-it-on).
+The guided setup on the [Repositories](/features/repositories) page does steps 4 to 8 for you. It saves the new scope disabled, and it keeps saving, launching and activating as separate, reviewed actions. See [Turn it on](#turn-it-on).
 
 ## Server settings
 
@@ -31,7 +32,7 @@ The backend reads `.env` from its working folder. Real environment variables ove
 | `OPERATOR_TOKEN` | empty | the output of `openssl rand -hex 32` | Protects every operator change. **Set it.** |
 | `GITHUB_TOKEN` | empty | a token with access to the repository | Polls issues, PRs and checks, and merges. Autonomy needs it. |
 | `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_BOT_LOGIN` | empty | — | Optional. Set all three to let the factory act as a GitHub App. A partial set is an error. |
-| `HOST`, `PORT` | `127.0.0.1`, `8000` | `127.0.0.1`, `8011` | `PORT` is the port that agents use to call back (the Mail shim and the git credential helper). The address that the backend listens on comes from the command that starts it (`--host`, `--port`). Keep it on localhost. |
+| `HOST`, `PORT` | the local loopback address, `8000` | the local loopback address, `8011` | `PORT` is the port that agents use to call back (the Mail shim and the git credential helper). The address that the backend listens on comes from the command that starts it (`--host`, `--port`). Keep it on localhost. |
 | `DATABASE_URL` | `sqlite+aiosqlite:///./synth_city.db` | a path in your state folder | The path is relative to the working folder. Use an absolute path on a factory. |
 | `HARNESS_AGENT_USER` | none | `agentuser` | The user whose `~/.claude` folder the Harnesses pages show as "global". Use it when the agents run as another user. |
 | `MAIL_CAPABILITY_TOKENS_REQUIRED` | `true` | `true` | Agents must prove their session for Agent Mail writes. This ties a session to its terminal pane, and it works on Linux only. |
@@ -197,7 +198,12 @@ A key that belongs to the other harness is refused with `Unsupported launch_opti
 | `prompt` | the last argument | the last argument | optional |
 
 ::: warning Unattended members
-Unattended members need the bypass options. Without them, a member stops at the first permission prompt and waits for no one. So the charter, the review hold and the verifier carry the safety, not the permission prompts of the harness.
+An unattended member must never wait for a person to answer a permission prompt. A member that stops at a prompt waits for no one.
+
+- **Claude Code:** set `skip_permissions`. It removes the permission prompts.
+- **Codex CLI:** you have two choices. `dangerously_bypass_approvals_and_sandbox` removes both the prompts and the sandbox. Or set `sandbox` and `approval_policy` instead. The sandbox limits what the member can touch, and the approval policy decides when Codex asks. Synth City passes both values to Codex and does not check them. Use the values that the Codex CLI help lists. Choose an approval policy that never asks, and a sandbox that still lets the member write in its workspace and reach GitHub.
+
+A sandbox that blocks a needed action stops the member, so test one item before you leave the team unattended. With the bypass, the charter, the review hold and the verifier carry the safety. With a sandbox, the sandbox carries part of it.
 :::
 
 ### Recommended charter practices
@@ -276,20 +282,21 @@ The delivery policy holds the rules of your project for "delivered". It makes Sy
 
 Change the policy with `PATCH /api/v1/agent-teams/github-scopes/{scope_id}/delivery-policy`. The body has `expected_revision`, `policy` and a `reason`. A stale revision returns 409. `GET …/delivery-policy/history` lists the latest 100 changes. A change reaches a running attempt only after `PATCH /api/v1/agent-teams/github-work-items/{item_id}/delivery-policy`. See the [Agent Teams API](/api/agent-teams#delivery-policy-fields-and-attempt-snapshots).
 
-- **`required_checks`.** Your CI can run many jobs. Name the ones that must pass. Other jobs, such as a slow nightly analysis, do not block a merge by themselves. Name each check exactly as GitHub shows it. A renamed CI job silently stops counting.
+- **`required_checks`.** Your CI can run many jobs. Name the ones that must pass. Other jobs, such as a slow nightly analysis, do not block a merge by themselves. Name each check exactly as GitHub shows it. Write each one as an object with `name` and `app_slug`, for example `{"name": "Unit tests", "app_slug": "github-actions"}`. If a required job is renamed on GitHub, its old name has no run. The policy then shows a missing check, and nothing merges until you update `required_checks` with the new name.
 - **`broad_checks: hosted`.** The full suites can take 10 to 20 minutes. With `hosted`, they run on CI while the verifier reviews, so builders do not wait for them.
 - **`accepted_base_update`.** While an item runs, other PRs merge into the base branch. Sometimes the builder needs one of them. This setting allows an integration update: the operator command `scripts/factory-maintenance.py integration-update` brings the workspace of the running item up to date with the base, after a checkpoint. The merged PR must be accepted and have every required check. The builder keeps its approval, lease and counters. With `disabled`, use GitHub's **Update branch** on the PR by hand. See the [Supervised Factory Playbook](/guide/supervised-factory-playbook).
 - **`owner_contact: native`.** A builder that is busy thinking is not nudged for being silent. Claude Code transcripts and Codex session files show its activity.
 
 ## Continuation policy
 
-An item can stop. Synth City then calls it **escalated**. CI can fail twice, a check can never appear, or the effort can run far over the plan. You have three ways to go on.
+An item can stop. Synth City then calls it **escalated**. CI can fail twice, a check can never appear, or the effort can run far over the plan. You have two supported ways to go on.
 
 | Option | What you keep or lose |
 |---|---|
 | Retry from the start | Possible only when the item has no PR. With a PR, the retry is refused (`pr_preserved`). |
-| Let the builder go on outside its plan | You lose the guarantee that every change was approved. |
 | **Continuation** | The same builder keeps the same branch, PR and workspace. It asks for a new, small, approved revision of the work item scope. |
+
+Letting a builder go on outside its approved plan is not a supported way. Work outside the plan needs a new approval: an amendment (healthy item), a continuation (escalated item) or a new issue.
 
 A continuation is possible when the item is escalated, has a PR, and stopped for one of these reasons: `retry_count_exhausted`, `plan_blocked`, `owner_idle_timeout`, `owner_offline`, `leader_offline`, `leader_ack_timeout`, `continuation_revision_exhausted` or `amendment_budget_exhausted`. The Leader approves the revision as it approved the first plan.
 
@@ -322,7 +329,7 @@ When a limit runs out, the item stays escalated. The Leader or the operator then
 | The item is healthy, and the builder needs one more file | **Amendment**: the Leader approves the extra files. | Nothing failed. The plan grows a little. Each attempt has fixed limits: 3 approved amendments, 8 requests and 16 added files. |
 | The item is escalated, and the next step is small and clear | **Continuation** | It keeps the branch, the PR and the review history. |
 | The work is a different or much bigger problem | **A new issue** | A new plan, a new review and honest counts. |
-| A review asks for corrections inside the approved files | **None of these.** The builder fixes and pushes. | The plan already covers it. |
+| A review asks for corrections inside the approved files | **None of these**, while the initial approval is active and the item is not escalated. The builder fixes and pushes to the same PR. | The plan already covers it. If a revision was submitted or settled, or the item is escalated, the builder waits for the route that the Leader gives before it edits. |
 
 See [Autonomous GitHub Dispatch](/autonomy) for the details.
 
@@ -346,7 +353,7 @@ Each item that runs at the same time needs its own folder: a dispatch workspace.
 - When you enable a scope, Synth City creates up to `max_concurrent_dispatched` workspaces, named `dispatch-1`, `dispatch-2` and so on, beside the primary checkout.
 - To add one by hand, call `POST /api/v1/agent-teams/github-scopes/{scope_id}/workspaces` with `{"path": "/home/agentuser/work/dispatch-1"}`. The path must be a direct sibling of the primary checkout. The checkout itself is refused.
 - With no workspace, the item stays pending (`queued_no_workspace`). The Work page shows the reason, and `GET …/workspaces/readiness` explains it.
-- The owner releases the workspace when the item is merged. If an item ends badly, the lease can stay. `POST …/workspaces/{workspace_id}/force-release` frees it. It needs the operator, `expected_leased_at` and a reason. It shows the unpushed work that it discards.
+- The owner releases the workspace when the item is merged. If an item ends badly, the lease can stay. `POST …/workspaces/{workspace_id}/force-release` frees it. It needs the operator credential and a JSON body with `force` set to `true`, `expected_leased_at` and a `reason`. It shows the unpushed work that it discards. See the [Agent Teams API](/api/agent-teams#activation-workspace-coordination-and-recovery-routes).
 
 When the controller and the agents run as different operating-system users, you need one `sudoers` rule and a `safe.directory` entry for each checkout. See [Installation](/guide/installation#separate-controller-and-agent-users) and the [Supervised Factory Playbook](/guide/supervised-factory-playbook).
 
@@ -354,7 +361,7 @@ When the controller and the agents run as different operating-system users, you 
 
 A supervisor is optional. It is recommended for teams that run without a person at the keyboard. The Leader is inside the team. It cannot restart a crashed member, upgrade the factory or notice that it is stuck itself. The Supervisor watches from outside. It checks in on a schedule, reads the state of the team and its Mail, and handles incidents. It can be a person or an agent. You then decide only what only you can decide: the roster, the models, the budget and the releases. See the [Factory Operating Model](/guide/operating-model).
 
-1. **Create an external actor.** Call `POST /api/v1/external/agent-mail/actors` with an `actor_key`, a `display_name` and a `kind`. The call works from the same machine only. The token is shown once. Keep it in a file that only that user can read. Calling it again with the same `actor_key` rotates the token.
+1. **Create an external actor.** Call `POST /api/v1/external/agent-mail/actors` with an `actor_key`, a `display_name` and a `kind`. The call works from the same machine only. When an operator token is configured, send it in the header `X-Synth-City-Operator-Token`. The call returns an actor token, and it shows that token once. The actor token is a different credential: the Supervisor sends it as a bearer token in later calls. Keep it in a file that only that user can read. Calling it again with the same `actor_key` rotates the token.
 2. **Bind the actor to the team.** Call `PUT /api/v1/agent-teams/presets/{preset_id}/supervisor` with `actor_id` and, if you want, `grace_seconds`. Or use **Edit** in the supervisor section of the team page. One team has one supervisor.
 3. **Check in.** The Supervisor calls `POST /api/v1/external/agent-mail/supervisor-checkin` with the `preset_id` and the time of its next check-in (`next_check_at`, at most 24 hours ahead). It gets the supervisor observation back. It reads its Mail with the supervisor inbox.
 
@@ -369,18 +376,20 @@ An item goes through these states. The Work page shows each one.
 | `pending` | The ready label is on. The issue waits for an eligible builder and a free workspace. |
 | `dispatched` | A builder has the item. It plans, the Leader approves, and it builds. |
 | `verifying` | The PR is open. Checks run, and a verifier reviews. |
-| `ready_for_review` | The checks and the review are done. Under Auto policy the backend merges next. Under Human policy a person merges. Design PRs wait in `awaiting_human_review`. |
+| `ready_for_review` | The PR is ready for the final gates. This state is not proof that a verifier accepted the head, and it does not mean a merge is near. Under Auto policy the backend merges only when the required checks succeeded on the exact head, a verifier accepted that head and no hold label is on. Under Human policy a person merges. Design PRs wait in `awaiting_human_review`. |
 | `merged` | The PR is merged. |
 | `escalated` | The item stopped and waits for a decision. |
 
 **What escalated means.** Nothing is lost. The branch, the PR and the workspace are kept. The Work page shows the reason. Common reasons: a budget ran out (`approval_rounds_exhausted`, `retry_count_exhausted`), the ready label was removed (`dispatch_label_removed`), the Leader did not answer in time (`leader_ack_timeout`), or the owner went quiet (`owner_idle_timeout`). The usual next steps are a continuation, a retry (only without a PR) or ending the item and filing a follow-up.
 
-Before you turn autonomy on:
+Before you turn autonomy on, follow these steps in this order:
 
-1. Read `GET /api/v1/agent-teams/github-scopes/{scope_id}/activation-readiness`. It must report no blockers: a bound Leader, one distinct owner for each slot, and a ready Agent Mail session for each member. Read `…/workspaces/readiness` too.
-2. Turn team autonomy on with `PATCH /api/v1/agent-teams/presets/{preset_id}` and `{"autonomy_enabled": true}`. It needs an enabled Leader slot.
-3. Enable the scope with `PATCH /api/v1/agent-teams/github-scopes/{scope_id}` and `{"enabled": true}`. Check that `last_polled_at` moves. The watcher polls a scope only when the scope is enabled and the team's autonomy is on.
-4. Start with low concurrency. Watch the first item from plan to PR, review and merge. Then raise the limit.
+1. **Save and launch.** Save the scope disabled. Launch the team, and check that each member is ready. Guided setup keeps saving, launching and activating as separate actions.
+2. **Read readiness.** Read `GET /api/v1/agent-teams/github-scopes/{scope_id}/activation-readiness`. It must report no blockers: a bound Leader, one distinct owner for each slot, and a ready Agent Mail session for each member. Read `…/workspaces/readiness` too.
+3. **Review the neighbors.** List the other enabled scopes of the team, and the scopes of other teams that watch the same repository with the same ready label. Turning team autonomy on resumes every enabled scope of the team. An overlap does not stop a dispatch, so acknowledge each one on purpose.
+4. **Turn team autonomy on.** Call `PATCH /api/v1/agent-teams/presets/{preset_id}` with `{"autonomy_enabled": true}`. It needs an enabled Leader slot.
+5. **Enable the scope.** Call `PATCH /api/v1/agent-teams/github-scopes/{scope_id}` with `{"enabled": true}`. Check that `last_polled_at` moves. The watcher polls a scope only when the scope is enabled and the team's autonomy is on.
+6. **Start small.** Use low concurrency. Watch the first item from plan to PR, review and merge. Then raise the limit.
 
 ## Steer a running campaign
 
@@ -435,7 +444,10 @@ scope:
   max_item_effort_minutes: 120
   enabled: false                 # on at launch
   delivery_policy:
-    required_checks: [Unit tests, Lint, End-to-end tests]
+    required_checks:
+      - {name: Unit tests, app_slug: github-actions}
+      - {name: Lint, app_slug: github-actions}
+      - {name: End-to-end tests, app_slug: github-actions}
     broad_checks: hosted
     accepted_base_update: merge
     owner_contact: native
