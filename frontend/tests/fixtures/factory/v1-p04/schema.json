@@ -3503,6 +3503,19 @@
                 }
               ]
             },
+            "owner_queue_position": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Owner Queue Position"
+            },
             "policy": {
               "$ref": "#/$defs/WorkPolicy"
             },
@@ -4597,6 +4610,19 @@
               "title": "Category",
               "type": "string"
             },
+            "owner_slot_id": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Owner Slot Id"
+            },
             "provider": {
               "anyOf": [
                 {
@@ -4718,6 +4744,19 @@
                   "type": "null"
                 }
               ]
+            },
+            "owner_queue_position": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Owner Queue Position"
             },
             "policy": {
               "$ref": "#/$defs/WorkPolicy"

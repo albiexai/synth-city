@@ -5,7 +5,7 @@ import { Pagination } from "./Pagination";
 import { ReadStatus } from "./ReadStatus";
 import { WorkTable } from "./WorkTable";
 
-export function WorkResults({ query = "" }: { query?: string }) {
+export function WorkResults({ query = "", showOwnerQueue = false }: { query?: string; showOwnerQueue?: boolean }) {
   const state = useCursorList<WorkProjection>(
     `factory/work-items${query ? `?${query}` : ""}`,
     "items",
@@ -54,8 +54,13 @@ export function WorkResults({ query = "" }: { query?: string }) {
       <ReadStatus state={state} />
       {state.data && (
         <>
+          {showOwnerQueue && (
+            <p className="text-sm text-muted-foreground">
+              Expected order, recomputed on each poll. Relabelling, priority changes and a free builder can change it.
+            </p>
+          )}
           {state.data.rows.length ? (
-            <WorkTable rows={state.data.rows} />
+            <WorkTable rows={state.data.rows} showOwnerQueue={showOwnerQueue} />
           ) : (
             <p>
               No work matches these filters. Clear filters to inspect the whole
