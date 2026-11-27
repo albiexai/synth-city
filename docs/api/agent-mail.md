@@ -176,6 +176,8 @@ Trusted same-machine tools use the external Agent Mail prefix:
 
 ```http
 POST /api/v1/external/agent-mail/actors
+POST /api/v1/external/agent-mail/supervisor-checkin
+GET /api/v1/external/agent-mail/supervisor-inbox
 GET /api/v1/external/agent-mail/members
 POST /api/v1/external/agent-mail/messages
 POST /api/v1/external/agent-mail/broadcasts
@@ -189,6 +191,8 @@ POST /api/v1/external/agent-mail/requests/{message_id}/ack
 ```
 
 Actor creation is loopback-only. External endpoints require a bearer token and are intended for Albiex Synth City's local trust boundary, not internet-facing automation.
+
+The bound Supervisor of a team uses `supervisor-checkin` and `supervisor-inbox`. A check-in has `preset_id`, `next_check_at` (a future time, at most 24 hours ahead) and an optional `note`. It returns the supervisor observation of the team. The inbox returns up to `limit` messages (default 50) for the bound actor, with lease values redacted. Any other actor gets 403 `supervisor_actor_not_bound`. A changed binding returns 409 `supervisor_binding_changed`, and another refused check-in returns 400 with its code. See [Teams](/features/agent-teams) for the binding.
 
 External broadcasts require `audience_type` and `audience_id`. Supported scoped audiences are `team_preset` (preset ID), `repository` (the `repo_id` from the members response), and `work_item` (GitHub work-item ID). For example:
 
