@@ -101,6 +101,9 @@ class StageRow(BaseModel):
     actor: str
     share_seconds: float  # its part of item time
     wall_seconds: float  # its own time, whatever else ran (Q2)
+    attempts: int = 0  # the attempts it was recorded in
+    coverage: str = "full"  # its group's recording coverage
+    basis: str | None = None  # e.g. waiting for dispatch from campaign membership, when ready time was not recorded
 
 
 class TimeWentSection(BaseModel):
@@ -111,6 +114,7 @@ class TimeWentSection(BaseModel):
     unattributed: int  # recorded evidence the collector could not place in an attempt
     total_seconds: float | None
     groups: dict[str, float | None]
+    group_coverage: dict[str, str] = {}  # per group: full, partial (a lower bound) or unavailable
     unaccounted_seconds: float | None
     overlap_seconds: float | None
     stages: list[StageRow]
@@ -184,7 +188,8 @@ async def _retro_rows(db, campaign: Campaign) -> tuple:
     watches = select(GithubRequiredCheckWatch.id).where(GithubRequiredCheckWatch.work_item_id.in_(items))
     reads = [
         select(GithubCheckRunHistory.repository, GithubCheckRunHistory.check_run_id, GithubCheckRunHistory.head_sha,
-               GithubCheckRunHistory.pr_number, GithubCheckRunHistory.required, GithubCheckRunHistory.job_created_at,
+               GithubCheckRunHistory.pr_number, GithubCheckRunHistory.check_name, GithubCheckRunHistory.required,
+               GithubCheckRunHistory.job_created_at,
                GithubCheckRunHistory.started_at, GithubCheckRunHistory.completed_at)
         .where(GithubCheckRunHistory.scope_id.in_(scopes))
         .order_by(GithubCheckRunHistory.repository, GithubCheckRunHistory.check_run_id),
@@ -327,8 +332,12 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
 
 async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], coverage, as_of: datetime,
                      gaps: list[str]) -> TimeWentSection:
-    """The campaign members' attempt time, split by the stage engine and summed; it reconciles with item time."""
-    from app.services.retro_attempt_collector import collect_team_attempts
+    """The campaign members' attempt time, split by the stage engine and summed; it reconciles with item time.
+
+    A member whose attempts come from two overlapping item lifetimes (two rows tracking one issue) is ambiguous and
+    unknown, never counted twice. Each group carries its recorder's coverage: a recorder not installed makes the group
+    unknown, one that began inside the measured windows makes it a lower bound (V1 review 118)."""
+    from app.services.retro_attempt_collector import FIRST_LABEL, collect_team_attempts
     from app.services.retro_stage_engine import GROUPS, breakdown
 
     started = _naive_utc(campaign.started_at)
@@ -338,13 +347,25 @@ async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], cov
                          .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
                          .join(FactoryContextKey, _lifetime(campaign.team_context_key)))).all()}
     wanted = set(members)
-    collected = await collect_team_attempts(db, campaign.preset_id, campaign_start=started, as_of=as_of)
-    attempts = [a for a in collected.attempts if member_items.get(a.item_id) in wanted]
+    collected = await collect_team_attempts(db, campaign.preset_id, campaign_start=started, as_of=as_of,
+                                            team_context_key=campaign.team_context_key)
+    by_member: dict[tuple[str, int], list] = {}
+    for attempt in collected.attempts:
+        if member_items.get(attempt.item_id) in wanted:
+            by_member.setdefault(member_items[attempt.item_id], []).append(attempt)
+    reasons = set(gaps)
+    attempts = []
+    for found in by_member.values():
+        if any(a.item_id != b.item_id and a.window.start < b.window.end and b.window.start < a.window.end
+               for a in found for b in found):
+            reasons.add("ambiguous_tracking")  # two lifetimes track one issue at once: neither is counted
+            continue
+        attempts.extend(found)
     lost = [u for u in collected.unattributed if u.item_id is None or member_items.get(u.item_id) in wanted]
     timed = {member_items[a.item_id] for a in attempts}
     groups = dict.fromkeys(GROUPS, 0.0)
     total = unaccounted = overlap = 0.0
-    stages: dict[tuple[str, str, str], list[float]] = {}
+    stages: dict[tuple[str, str, str], list] = {}
     for attempt in attempts:
         result = breakdown(attempt.window, attempt.intervals)
         total, unaccounted, overlap = (total + result.total_seconds, unaccounted + result.unaccounted_seconds,
@@ -352,25 +373,41 @@ async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], cov
         for group, seconds in result.groups.items():
             groups[group] += seconds
         for row in result.stages:
-            sums = stages.setdefault((row.group, row.stage, row.actor), [0.0, 0.0])
-            sums[0], sums[1] = sums[0] + row.share_seconds, sums[1] + row.wall_seconds
-    reasons = {u.reason for u in lost} | set(gaps)
+            sums = stages.setdefault((row.group, row.stage, row.actor), [0.0, 0.0, 0, False])
+            sums[0], sums[1], sums[2] = sums[0] + row.share_seconds, sums[1] + row.wall_seconds, sums[2] + 1
+            sums[3] = sums[3] or (row.stage == "dispatch" and attempt.window.start_label == FIRST_LABEL)
+    reasons |= {u.reason for u in lost}
     if len(timed) < len(wanted):
         reasons.add("no_attempt_recorded")
-    reasons |= {f"{c.measure}: {c.reason}" for c in coverage if c.measure in ("check_runs", "decision_waits")
-                and not c.covered}
-    if await audit.instrumentation_start(db) is None:
+    earliest = min((a.window.start for a in attempts), default=None)
+    marker = await audit.instrumentation_start(db)
+    if marker is None:
         reasons.add("no_forward_coverage_marker")
+    elif earliest is not None and _naive_utc(marker) > earliest:
+        reasons.add("dispatch_before_instrumentation")  # an earlier dispatch in the windows may be missing
+    recorders = {c.measure: c for c in coverage}
+    group_coverage = dict.fromkeys(GROUPS, "full")
+    for group, measure in (("process", "check_runs"), ("waiting", "decision_waits")):
+        entry = recorders.get(measure)
+        if entry is None or entry.started_at is None:
+            group_coverage[group] = "unavailable"
+            reasons.add(f"{measure}: {entry.reason if entry else 'recording_not_installed'}")
+        elif earliest is not None and _naive_utc(entry.started_at) > earliest:
+            group_coverage[group] = "partial"  # what was recorded is kept, as a lower bound
+            reasons.add(f"{measure}: recording_started_late")
     known = bool(attempts)
+    if not known:
+        group_coverage = dict.fromkeys(GROUPS, "unavailable")
     return TimeWentSection(
         items=len(timed), attempts=len(attempts), unknown_items=len(wanted) - len(timed), unattributed=len(lost),
-        total_seconds=total if known else None, groups={g: (v if known else None) for g, v in groups.items()},
-        unaccounted_seconds=unaccounted if known else None, overlap_seconds=overlap if known else None,
-        stages=[StageRow(group=g, stage=st, actor=a, share_seconds=v[0], wall_seconds=v[1])
+        total_seconds=total if known else None,
+        groups={g: (v if group_coverage[g] != "unavailable" else None) for g, v in groups.items()},  # all with none
+        group_coverage=group_coverage, unaccounted_seconds=unaccounted if known else None,
+        overlap_seconds=overlap if known else None,
+        stages=[StageRow(group=g, stage=st, actor=a, share_seconds=v[0], wall_seconds=v[1], attempts=v[2],
+                         coverage=group_coverage[g], basis=FIRST_LABEL if v[3] else None)
                 for (g, st, a), v in sorted(stages.items(), key=lambda kv: (GROUPS.index(kv[0][0]), kv[0][1:]))],
         coverage="unavailable" if not known else ("partial" if reasons else "full"), unknown_reasons=sorted(reasons))
-
-
 def _p85(values: list[float]) -> float:
     ordered = sorted(values)
     return ordered[math.ceil(0.85 * len(ordered)) - 1]

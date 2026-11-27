@@ -26,6 +26,7 @@ from app.models.database import (
     GithubWorkItem,
     MailMessage,
     MailTeamMember,
+    TeamGithubScope,
 )
 from app.services import campaign_record_service as campaigns
 from app.services import campaign_snapshot_service as snapshots
@@ -125,8 +126,8 @@ async def _review(db, item, nonce, watch, noticed, verdict):
     await db.flush()
 
 
-async def _recording(db, *, checks=True):
-    await _marker(db, MARKER)
+async def _recording(db, *, checks=True, marker=MARKER):
+    await _marker(db, marker)
     db.add(CampaignUpgradeCoverage(id=1, started_at=T0 - timedelta(days=3)))
     if checks:
         db.add(GithubCheckRunHistoryCoverage(id=1, started_at=T0 - timedelta(days=3)))
@@ -237,6 +238,124 @@ async def test_check_runs_recorded_too_late_make_the_section_partial(db, world):
     went = (await _build(db, world, [10])).time_went
     assert went.coverage == "partial"
     assert "check_runs: recording_not_installed" in went.unknown_reasons
+
+
+# V1 review 118
+async def test_a_member_tracked_by_two_rows_with_overlapping_attempts_is_ambiguous_not_doubled(db, world):
+    await _recording(db)
+    twin = TeamGithubScope(preset_id=world.team, repo_owner="O", repo_name="A1", repo_path="/twin", enabled=True)
+    db.add(twin)
+    await db.flush()
+    first = await _item(db, world, 10)
+    second = GithubWorkItem(scope_id=twin.id, issue_number=10, issue_title="I", issue_url="u/twin",
+                            github_updated_at=T0, dispatch_status="dispatched", created_at=CREATED)
+    db.add(second)
+    await db.flush()
+    for item in (first, second):
+        await _dispatch(db, item.id, 0, launch=0)
+    went = (await _build(db, world, [10])).time_went
+    assert (went.items, went.attempts, went.unknown_items, went.total_seconds) == (0, 0, 1, None)
+    assert "ambiguous_tracking" in went.unknown_reasons
+
+
+async def test_two_rows_tracking_one_issue_one_after_the_other_still_sum(db, world):
+    """A replaced tracking row whose window follows the first one's is not ambiguous: the windows don't overlap."""
+    await _recording(db)
+    twin = TeamGithubScope(preset_id=world.team, repo_owner="O", repo_name="A1", repo_path="/twin", enabled=True)
+    db.add(twin)
+    await db.flush()
+    first = await _item(db, world, 10)
+    await _dispatch(db, first.id, 0, launch=0)
+    await audit.record_event(
+        db, event_kind="work_lifecycle", source="test", occurred_at=_m(50), actor=audit.derive_actor(actor_kind="system"),
+        item_id=first.id, after_values={"dispatch_status": "failed"},
+        context_snapshot={"launch_attempt": audit.launch_attempt_key(first.id, 0)}, action_outcome="applied")
+    second = GithubWorkItem(scope_id=twin.id, issue_number=10, issue_title="I", issue_url="u/twin",
+                            github_updated_at=T0, dispatch_status="dispatched", created_at=_m(55))
+    db.add(second)
+    await db.flush()
+    await _dispatch(db, second.id, 60, launch=0)
+    went = (await _build(db, world, [10])).time_went
+    assert (went.items, went.attempts, went.total_seconds) == (1, 2, (50 + 125) * MIN)
+    assert "ambiguous_tracking" not in went.unknown_reasons
+
+
+async def test_a_replacement_teams_wait_stays_out_of_the_retired_campaign(db, world):
+    await _recording(db)
+    a = await _item(db, world, 10, nonce="nonce-a", launch=True)
+    await _dispatch(db, a.id, 0, launch=a.launch_id)
+    snapshot = await _build(db, world, [10])
+    campaign = await campaigns.current(db, world.team)
+    await db.execute(text("UPDATE factory_context_keys SET retired_at = :t WHERE key_kind = 'team' "
+                          "AND context_key = :k"), {"t": _m(30), "k": campaign.team_context_key})
+    await audit.record_event(  # the replacement team reuses the preset id under a new lifetime key
+        db, event_kind="mail_wait_started", source="test", occurred_at=_m(40), fact_time=_m(40),
+        actor=audit.derive_actor(actor_kind="system"), team_preset_id=world.team,
+        after_values={"owner_member_id": 999, "awaited_member_id": 60}, operation_id="mail_wait_started:message:9",
+        action_outcome="applied")
+    await db.commit()
+    snapshots.clear_cache()
+    went = (await snapshots.build_snapshot(db, campaign, FakeGithub(labelled={"a1": [_issue("a1", 10, "closed")]}),
+                                           as_of=AS_OF, cached=False)).time_went
+    assert snapshot.time_went.unattributed == 0
+    assert went.unattributed == 0
+    assert "no_open_attempt" not in went.unknown_reasons
+
+
+async def test_lifecycle_recording_that_starts_inside_the_window_is_partial(db, world):
+    await _recording(db, marker=_m(45))
+    a = await _item(db, world, 10, nonce="nonce-a", launch=True)
+    await _dispatch(db, a.id, 60, launch=a.launch_id)
+    went = (await _build(db, world, [10])).time_went
+    assert went.coverage == "partial"
+    assert "dispatch_before_instrumentation" in went.unknown_reasons
+    assert went.total_seconds == 180 * MIN  # the known contribution is kept
+
+
+async def test_without_a_check_run_recorder_process_time_is_unknown_not_zero(db, world):
+    await _recording(db, checks=False)
+    a = await _item(db, world, 10, nonce="nonce-a", launch=True)
+    await _dispatch(db, a.id, 30, launch=a.launch_id)
+    went = (await _build(db, world, [10])).time_went
+    assert (went.groups["process"], went.group_coverage["process"]) == (None, "unavailable")
+    assert (went.groups["waiting"], went.group_coverage["waiting"]) == (30 * MIN, "full")
+
+
+async def test_check_runs_recorded_late_make_process_time_a_lower_bound(db, world):
+    await _recording(db, checks=False)
+    db.add(GithubCheckRunHistoryCoverage(id=1, started_at=_m(5)))
+    a = await _item(db, world, 10, nonce="nonce-a", launch=True)
+    await _dispatch(db, a.id, 0, launch=a.launch_id)
+    await _watch(db, a, "nonce-a", "h1")
+    await _run(db, world, "h1", "e2e", 10, 20)
+    went = (await _build(db, world, [10])).time_went
+    assert (went.groups["process"], went.group_coverage["process"]) == (10 * MIN, "partial")  # a lower bound
+    assert "check_runs: recording_started_late" in went.unknown_reasons
+    (check,) = [row for row in went.stages if row.stage == "required_check"]
+    assert check.coverage == "partial"
+
+
+async def test_a_cached_read_after_a_check_name_change_matches_a_fresh_read(db, world):
+    await _two_items(db, world)
+    await _build(db, world, [10, 11, 12], cached=True)
+    await db.execute(text("UPDATE github_check_run_history SET check_name = 'renamed'"))
+    await db.commit()
+    cached = (await _build(db, world, [10, 11, 12], cached=True)).time_went
+    snapshots.clear_cache()
+    fresh = (await _build(db, world, [10, 11, 12])).time_went
+    assert cached == fresh
+    assert any(row.actor == "o/a1:renamed" for row in fresh.stages)
+
+
+async def test_stage_rows_carry_their_attempts_coverage_and_the_dispatch_basis(db, world):
+    await _two_items(db, world)
+    went = (await _build(db, world, [10, 11, 12])).time_went
+    rows = {(row.group, row.stage): row for row in went.stages}
+    dispatch = rows[("waiting", "dispatch")]
+    assert (dispatch.attempts, dispatch.basis, dispatch.coverage) == (
+        2, "from campaign membership; ready time not recorded", "full")
+    assert (rows[("process", "required_check")].attempts, rows[("process", "review")].attempts) == (1, 1)
+    assert went.group_coverage == {"waiting": "full", "process": "full", "active": "full"}
 
 
 # The cache: inserts, updates and deletions with no audit event

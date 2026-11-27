@@ -127,8 +127,12 @@ def _end_of(start: FactoryAuditEvent, family: str, ends: dict[str, datetime]) ->
     return ends.get(op.replace(f"{family}_wait_started", f"{family}_wait_ended", 1)) if op else None
 
 
-async def collect_team_attempts(db, preset_id: int, *, campaign_start: datetime, as_of: datetime) -> TeamAttempts:
-    """Every recorded attempt of the team's items, with its window and intervals, and what could not be attributed."""
+async def collect_team_attempts(db, preset_id: int, *, campaign_start: datetime, as_of: datetime,
+                                team_context_key: str | None = None) -> TeamAttempts:
+    """Every recorded attempt of the team's items, with its window and intervals, and what could not be attributed.
+
+    Team-wide waits are read from ``team_context_key``'s lifetime, the current team's by default: a campaign passes
+    its own, so a replacement team reusing the preset id never adds its waits to a retired campaign (#1419)."""
     campaign_start, as_of = _naive(campaign_start), _naive(as_of)
     out, period = TeamAttempts(), (campaign_start, as_of)
     items = (await db.scalars(select(GithubWorkItem).join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
@@ -136,7 +140,7 @@ async def collect_team_attempts(db, preset_id: int, *, campaign_start: datetime,
     every: list[CollectedAttempt] = []  # shown or not: who was open when a wait began (V1 review 434)
     for item in items:
         every += await _collect_item(db, item, out, period)
-    team_key = await audit.current_context_key(db, "team", preset_id)
+    team_key = team_context_key or await audit.current_context_key(db, "team", preset_id)
     events = (await db.scalars(select(FactoryAuditEvent).where(
         FactoryAuditEvent.team_context_key == team_key, FactoryAuditEvent.team_context_key.is_not(None),
         FactoryAuditEvent.event_kind.in_([f"{f}_wait_{s}" for f in TEAM_WAITS for s in ("started", "ended")]))
