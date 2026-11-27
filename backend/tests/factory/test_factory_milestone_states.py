@@ -21,10 +21,13 @@ async def get_states(client, **params):
     return response.json()
 
 
-async def add_wait(maker, scope_id, number, title, at=MOMENT):
+async def add_wait(maker, scope_id, number, title, at=MOMENT, *, repository=...):
     async with maker() as db:
+        if repository is ...:
+            scope = await db.get(TeamGithubScope, scope_id)
+            repository = f"{scope.repo_owner}/{scope.repo_name}"
         db.add(GithubMilestoneWait(scope_id=scope_id, issue_number=number,
-                                   milestone_title=title, github_updated_at=at))
+                                   milestone_title=title, github_updated_at=at, repository=repository))
         await db.commit()
 
 
@@ -67,6 +70,21 @@ async def test_a_wait_shows_once_for_a_repository_with_two_scopes(factory_client
 async def test_a_cleared_wait_does_not_show(factory_client, factory_store):
     await add_wait(factory_store.maker, factory_store.ids.scopes[0], 9002, None)
     assert (await get_states(factory_client))["waiting"] == []
+
+
+async def test_wait_links_and_grouping_use_the_stored_repository(factory_client, factory_store):
+    first, second = factory_store.ids.scopes[:2]
+    unknown = await idle_scope(factory_store.maker, 0, "unproven", factory_store.ids)
+    await add_wait(factory_store.maker, first, 9003, "First", repository="first/recorded")
+    await add_wait(factory_store.maker, second, 9003, "Second", repository="second/recorded")
+    await add_wait(factory_store.maker, unknown, 9003, "Unknown", repository=None)
+
+    rows = (await get_states(factory_client))["waiting"]
+    assert {row["milestone"]: row["repository"] and row["repository"]["display_name"] for row in rows} == {
+        "First": "first/recorded", "Second": "second/recorded", "Unknown": None,
+    }
+    [selected] = (await get_states(factory_client, scope_id=second))["waiting"]
+    assert selected["repository"]["github"] == {"owner": "second", "name": "recorded"}
 
 
 async def test_a_deferral_shows_with_its_milestone_and_branch(factory_client, factory_store):
@@ -297,11 +315,23 @@ async def test_a_later_item_with_another_number_does_not_hide_the_deferral(facto
 async def test_a_wait_whose_scope_identity_is_refused_shows_without_a_repository(factory_client, factory_store):
     bad_identity = await idle_scope(factory_store.maker, 0, "bad name!", factory_store.ids)
     good = factory_store.ids.scopes[0]
-    await add_wait(factory_store.maker, bad_identity, 9340, "v4.5")
+    await add_wait(factory_store.maker, bad_identity, 9340, "v4.5", repository=None)
     await add_wait(factory_store.maker, good, 9342, "v4.6")
     rows = (await get_states(factory_client))["waiting"]
     # The row stays in the list. It names no repository, because none can be proven.
     assert {r["issue_number"]: r["repository"] is None for r in rows} == {9340: True, 9342: False}
+
+
+@pytest.mark.parametrize("name", [".", ".."])
+async def test_a_dot_repository_produces_no_wait_or_deferral_link(factory_client, factory_store, name):
+    scope = factory_store.ids.scopes[0]
+    await add_wait(factory_store.maker, scope, 9345, "v4.5", repository=f"fixture/{name}")
+    item = await add_item(factory_store.maker, scope, 9346, url=f"https://github.com/fixture/{name}/issues/9346")
+    await defer(factory_store.maker, scope, item, "v4.5")
+
+    states = await get_states(factory_client)
+    assert [(row["issue_number"], row["repository"]) for row in states["waiting"]] == [(9345, None)]
+    assert states["deferred"] == []
 
 
 async def test_waits_that_are_not_waits_are_omitted_and_the_read_succeeds(factory_client, factory_store):
@@ -325,7 +355,7 @@ async def test_a_row_that_cannot_be_built_does_not_hide_a_valid_one_at_the_page_
 async def test_an_unlinked_wait_counts_toward_the_cut(factory_client, factory_store, monkeypatch):
     monkeypatch.setattr(milestone_state_service, "ROW_LIMIT", 1)
     bad_identity = await idle_scope(factory_store.maker, 0, "bad name!", factory_store.ids)
-    await add_wait(factory_store.maker, bad_identity, 9352, "v4.5", at=datetime(2026, 11, 26, 11, 0))
+    await add_wait(factory_store.maker, bad_identity, 9352, "v4.5", at=datetime(2026, 11, 26, 11, 0), repository=None)
     await add_wait(factory_store.maker, factory_store.ids.scopes[0], 9353, "v4.5")
     body = await get_states(factory_client)
     assert [(r["issue_number"], r["repository"] is None) for r in body["waiting"]] == [(9352, True)]
@@ -340,9 +370,9 @@ async def test_after_an_upgrade_the_waits_of_a_scope_that_changed_repository_sho
     """
     scope = await idle_scope(factory_store.maker, 0, "up-orig", factory_store.ids)
     await move_scope(factory_client, scope, repo_name="up-new")
-    await add_wait(factory_store.maker, scope, 9501, "v4.5", at=MOMENT)
+    await add_wait(factory_store.maker, scope, 9501, "v4.5", at=MOMENT, repository=None)
     # A GitHub clock ahead of the host gives a time after the change for a wait that is older than it.
-    await add_wait(factory_store.maker, scope, 9502, "v4.5", at=datetime.utcnow() + timedelta(minutes=5))
+    await add_wait(factory_store.maker, scope, 9502, "v4.5", at=datetime.utcnow() + timedelta(minutes=5), repository=None)
     rows = {r["issue_number"]: r["repository"] for r in (await get_states(factory_client))["waiting"]}
     assert rows == {9501: None, 9502: None}
 
@@ -391,7 +421,7 @@ async def test_an_unproven_wait_does_not_collapse_into_a_proven_wait_of_the_same
     old = await idle_scope(factory_store.maker, 0, "twin-old", factory_store.ids)
     current = await idle_scope(factory_store.maker, 1, "twin-new", factory_store.ids)
     await move_scope(factory_client, old, repo_name="twin-new")
-    await add_wait(factory_store.maker, old, 9741, "old milestone", at=MOMENT)
+    await add_wait(factory_store.maker, old, 9741, "old milestone", at=MOMENT, repository=None)
     await add_wait(factory_store.maker, current, 9741, "current milestone", at=MOMENT + timedelta(seconds=1))
     # Both scopes now name the repository fixture/twin-new. Only the second wait has a proven repository.
     rows = (await get_states(factory_client))["waiting"]
@@ -403,18 +433,20 @@ async def test_an_unproven_wait_does_not_collapse_into_a_proven_wait_of_the_same
 async def test_waits_of_two_scopes_with_the_same_refused_identity_stay_separate(factory_client, factory_store):
     first = await idle_scope(factory_store.maker, 0, "bad name!", factory_store.ids)
     second = await idle_scope(factory_store.maker, 1, "bad name!", factory_store.ids)
-    await add_wait(factory_store.maker, first, 9743, "first milestone", at=MOMENT)
-    await add_wait(factory_store.maker, second, 9743, "second milestone", at=MOMENT + timedelta(seconds=1))
+    await add_wait(factory_store.maker, first, 9743, "first milestone", at=MOMENT, repository=None)
+    await add_wait(factory_store.maker, second, 9743, "second milestone", at=MOMENT + timedelta(seconds=1), repository=None)
     rows = (await get_states(factory_client))["waiting"]
     assert sorted((r["milestone"], r["repository"]) for r in rows) == [("first milestone", None), ("second milestone", None)]
 
 
-async def test_two_proven_waits_of_the_same_repository_and_issue_still_show_once(factory_client, factory_store):
+async def test_two_stamps_that_differ_only_in_case_show_the_newest_wait(factory_client, factory_store):
     first = await idle_scope(factory_store.maker, 0, "pair", factory_store.ids)
     second = await idle_scope(factory_store.maker, 1, "pair", factory_store.ids)
-    await add_wait(factory_store.maker, first, 9742, "v4.5", at=MOMENT)
-    await add_wait(factory_store.maker, second, 9742, "v4.5", at=MOMENT + timedelta(seconds=1))
-    assert [r["issue_number"] for r in (await get_states(factory_client))["waiting"]] == [9742]
+    await add_wait(factory_store.maker, first, 9742, "v4.5", at=MOMENT, repository="Fixture/PAIR")
+    await add_wait(factory_store.maker, second, 9742, "v4.6", at=MOMENT + timedelta(seconds=1))
+    [row] = (await get_states(factory_client))["waiting"]
+    assert (row["issue_number"], row["milestone"], row["repository"]["display_name"]) == (
+        9742, "v4.6", "fixture/pair")
 
 
 @pytest.mark.parametrize("blank", ["  \t ", "\u00a0", "\u2003", "\u2028", " \u3000\n\u202f"])

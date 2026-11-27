@@ -237,7 +237,7 @@ async def _wait_issue_observations(db, scope, client, labeled):
     return observations | confirmed, confirmed
 
 
-async def _reconcile_milestone_waits(db, scope, routes, observed, confirmed, admitted):
+async def _reconcile_milestone_waits(db, scope, routes, observed, confirmed, admitted, repository):
     if not observed:
         return
     repository_scopes = {row.id: row for row in (await db.execute(
@@ -246,6 +246,7 @@ async def _reconcile_milestone_waits(db, scope, routes, observed, confirmed, adm
     )).all()}
     ready_labels = {row.dispatch_label for row in repository_scopes.values()}
     routed_titles = {title for title in routes.values() if title}
+    repository_key = repository.lower()
 
     waits = {}
     for record in (await db.scalars(select(GithubMilestoneWait).where(
@@ -266,8 +267,12 @@ async def _reconcile_milestone_waits(db, scope, routes, observed, confirmed, adm
     for number, issue in observed.items():
         updated_at = _parse_gh_ts(issue["updated_at"])
         records = waits.get(number, {})
+        # An unstamped legacy row can come from a previous repository. Its clock
+        # cannot make an observation of this repository stale.
+        current_records = {scope_id: record for scope_id, record in records.items()
+                           if record.repository and record.repository.lower() == repository_key}
         previous = prior_admissions.get(number)
-        if (any(record.github_updated_at > updated_at for record in records.values())
+        if (any(record.github_updated_at > updated_at for record in current_records.values())
                 or previous is not None and previous.github_updated_at > updated_at):
             continue
         labels = {label["name"] for label in issue.get("labels", [])}
@@ -284,19 +289,22 @@ async def _reconcile_milestone_waits(db, scope, routes, observed, confirmed, adm
             else:
                 # A newly configured route does not clear a wait until actual admission.
                 waiting_scopes = {scope_id for scope_id, record in records.items()
-                                  if record.milestone_title == title}
+                                  if record.milestone_title == title
+                                  and (record.repository is None or scope_id in current_records)}
         for scope_id in records.keys() | waiting_scopes:
             record = records.get(scope_id)
             waiting_title = title if scope_id in waiting_scopes else None
-            if (record is not None and record.github_updated_at == updated_at
+            if (scope_id in current_records and record.github_updated_at == updated_at
                     and number not in confirmed and number not in admitted):
                 continue
             if record is None:
                 db.add(GithubMilestoneWait(scope_id=scope_id, issue_number=number,
-                                          milestone_title=waiting_title, github_updated_at=updated_at))
+                                          milestone_title=waiting_title, github_updated_at=updated_at,
+                                          repository=repository))
             else:
                 record.milestone_title = waiting_title
                 record.github_updated_at = updated_at
+                record.repository = repository
 
 
 async def _admission_blocked(db, scope, number):
@@ -452,7 +460,8 @@ class GithubWatcherService:
             admission_candidates.add(number)
             if await self._upsert_item(db, scope, issue):
                 admitted.add(number)
-        await _reconcile_milestone_waits(db, scope, routes, wait_observations, confirmed_wait_issues, admitted)
+        await _reconcile_milestone_waits(db, scope, routes, wait_observations, confirmed_wait_issues, admitted,
+                                         repository=f"{polled_owner}/{polled_name}")
         # The admitted items are durable before any per-item completion runs: a later
         # rollback can then only discard that completion's own work, and the poll time
         # below is never written over upserts that were thrown away.
