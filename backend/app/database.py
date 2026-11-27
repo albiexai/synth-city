@@ -1053,6 +1053,8 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN ack_evidence_message_id INTEGER"))
     if work_item_columns and "dispatch_nonce" not in work_item_columns:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN dispatch_nonce VARCHAR"))
+    if work_item_columns and "dispatch_attempt" not in work_item_columns:
+        await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN dispatch_attempt INTEGER DEFAULT 0 NOT NULL"))
     if work_item_columns and "ack_enforcement_epoch" not in work_item_columns:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN ack_enforcement_epoch INTEGER"))
     if work_item_columns and "ack_approval_round" not in work_item_columns:

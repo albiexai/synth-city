@@ -866,9 +866,7 @@ async def test_prepare_attempt_commits_exact_identity_and_reuses_it(db, monkeypa
         base_ref=scope.base_ref,
     )
 
-    assert prepared.dispatch_head_ref == (
-        f"deck/slot-{slots[1].id}/issue-42-0123456789abcdef"
-    )
+    assert prepared.dispatch_head_ref == f"deck/slot-{slots[1].id}/issue-42-g1"
     assert calls == 1
     maker = async_sessionmaker(db.bind, expire_on_commit=False)
     async with maker() as second:
@@ -876,6 +874,7 @@ async def test_prepare_attempt_commits_exact_identity_and_reuses_it(db, monkeypa
         assert persisted.owner_slot_id == slots[1].id
         assert persisted.routing_method == "label"
         assert persisted.dispatch_nonce == "0123456789abcdef"
+        assert persisted.dispatch_attempt == 1
         assert persisted.dispatch_head_ref == prepared.dispatch_head_ref
         assert persisted.approval_round_count == 1
 
@@ -888,6 +887,37 @@ async def test_prepare_attempt_commits_exact_identity_and_reuses_it(db, monkeypa
     )
     assert reused == prepared
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_prepare_attempt_advances_generation_across_retries_and_milestone_returns(db):
+    _, slots, scope = await _team(db)
+    issue = dict(scope_id=scope.id, issue_number=42, issue_title="Returning issue",
+                 issue_url="u", github_updated_at=datetime.utcnow())
+    item = GithubWorkItem(**issue)
+    db.add(item)
+    await db.commit()
+    arguments = dict(owner_slot_id=slots[1].id, routing_method="label", base_ref=scope.base_ref)
+
+    first = await github_dispatch_service.prepare_attempt(db, item, **arguments)
+    await github_dispatch_service.reset_for_retry(db, item)
+    assert item.dispatch_attempt == 1
+    await db.commit()
+    retry = await github_dispatch_service.prepare_attempt(db, item, **arguments)
+    assert retry.dispatch_head_ref == f"deck/slot-{slots[1].id}/issue-42-g2"
+    assert retry.dispatch_nonce != first.dispatch_nonce
+
+    item.milestone_replaced_at = datetime.utcnow()
+    item.dispatch_status = "cancelled"
+    await db.flush()
+    replacement = GithubWorkItem(**issue)
+    db.add(replacement)
+    await db.commit()
+
+    returned = await github_dispatch_service.prepare_attempt(db, replacement, **arguments)
+    assert returned.dispatch_head_ref == f"deck/slot-{slots[1].id}/issue-42-g3"
+    assert replacement.dispatch_attempt == 3
+    assert item.dispatch_attempt == 2 and item.dispatch_head_ref == retry.dispatch_head_ref
 
 
 @pytest.mark.asyncio
