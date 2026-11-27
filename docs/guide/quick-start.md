@@ -41,7 +41,7 @@ The operator credential uses the existing per-tab flow, separately from GitHub p
 
 ## Identify the Backend Instance
 
-When you run Albiex Synth City on more than one machine, or expose it over a LAN or tailnet, set an instance name so each browser window clearly shows the backend it controls:
+The header shows the backend host's short name by default. Set `SYNTH_CITY_INSTANCE_NAME` on a shared or remote factory so each browser window clearly identifies the backend it controls.
 
 ```bash
 SYNTH_CITY_INSTANCE_NAME="Studio Mac" \
@@ -52,7 +52,7 @@ SYNTH_CITY_INSTANCE_ID="studio-mac" \
 
 Use a trusted network or tunnel when binding to all interfaces. Protected roster, autonomy and recovery controls require their documented credentials; safe reads remain observational. Local trust is not remote multi-user isolation. A Vite dev UI on another origin needs that exact origin in the JSON `CORS_ORIGINS` setting; Synth City’s production UI is same-origin.
 
-The instance name appears in the header, browser tab title, Agent Bridge terminal panes, and kill-session confirmations. Supported accents are `blue`, `green`, `purple`, `orange`, `red`, `pink`, `cyan`, and `slate`.
+The instance name appears in the header, Agent Bridge terminal panes, and kill-session confirmations. A configured name also appears in the browser tab title. Supported accents are `blue`, `green`, `purple`, `orange`, `red`, `pink`, `cyan`, and `slate`.
 
 ## Key pages
 

@@ -28,12 +28,10 @@ export function Header() {
   const summary = harnessSummary(providerStatuses);
   useInstanceDocumentTitle(instance);
 
+  const instanceName = instance?.name_configured ? instance.name : instance?.short_hostname;
   const instanceTitle = instance
-    ? [
-        `Albiex Synth City instance: ${instance.name}`,
-        `Hostname: ${instance.hostname}`,
-        `Opened from: ${typeof window === "undefined" ? "unknown" : window.location.host}`,
-      ].join("\n")
+    ? `Albiex Synth City instance: ${instanceName} (host ${instance.hostname})`
+      + (instance.name_configured ? "" : " (name not configured; set SYNTH_CITY_INSTANCE_NAME)")
     : undefined;
 
   if (providerStatuses.length === 0 && selectedProvider) {
@@ -62,11 +60,13 @@ export function Header() {
                 <Badge
                   variant="outline"
                   className={cn("min-w-0 gap-1 text-xs max-w-48 truncate", accentClasses.badge)}
+                  role="group"
+                  aria-label={instanceTitle}
                   title={instanceTitle}
                 >
-                  <Server className="h-3 w-3 shrink-0" />
+                  <Server className="h-3 w-3 shrink-0" aria-hidden="true" />
                   <span className={cn("h-2 w-2 rounded-full shrink-0", accentClasses.dot)} />
-                  <span className="truncate">{instance.name}</span>
+                  <span className="truncate">{instanceName}</span>
                 </Badge>
               )}
               {providerStatuses.length > 0 && (

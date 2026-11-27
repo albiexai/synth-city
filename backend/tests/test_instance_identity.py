@@ -33,7 +33,7 @@ def test_instance_identity_defaults_are_stable_and_non_sensitive(monkeypatch):
 
     identity = service.get_instance_identity()
 
-    assert identity.name == "This machine"
+    assert identity.name == "linux-box"
     assert identity.name_configured is False
     assert identity.hostname == "linux-box.local"
     assert identity.short_hostname == "linux-box"
@@ -129,5 +129,5 @@ def test_blank_name_counts_as_not_configured(monkeypatch):
 
     identity = service.get_instance_identity()
 
-    assert identity.name == "This machine"
+    assert identity.name == "linux-box"
     assert identity.name_configured is False
