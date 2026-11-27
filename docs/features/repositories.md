@@ -39,3 +39,15 @@ Open a repository in [Teams](/features/agent-teams) and select **Edit** in **Rev
 - **Effort ceiling (minutes).** The most active minutes one item can use. The dialog shows the server's range and default, and refuses a value outside the range or a number that is not whole.
 
 The dialog reads the history from the server and shows each change with its time, actor, reason and old and new value. A value that the server hides shows as "changed, value hidden". It needs the Director key to read and to save. A save sends only the fields that changed, with an optional reason, and the history reloads.
+
+## Required checks
+
+Open a repository in [Teams](/features/agent-teams) and select **Edit** in **Required checks**. The dialog edits the list of CI checks that must succeed on the exact head before a pull request can merge. The list is one field of the delivery policy. The other fields of the delivery policy are not in a dialog yet.
+
+- **A check** has a name and an app (the default is `github-actions`). The name and the app together are its identity. Add a check, remove it, or move it up or down.
+- **Rules of the server, shown before a save.** A name is required and has at most 200 characters. An app uses lowercase letters, digits and hyphens, and has at most 100 characters. The same name and app cannot appear twice. The list has at most 32 checks. The list cannot be empty while the broad checks run on hosted CI.
+- **Reason.** A reason is required. It is kept in the history with the new list.
+- **A save replaces the whole policy.** The dialog sends the current policy with only the list changed, and the revision that you started from. If the policy changed on the server after that, nothing is saved. The dialog says so, and you can discard your changes to see the current list.
+- **History.** The dialog reads the latest 100 changes of the delivery policy. It shows what each change added, removed or reordered, with the revision, the time, the reason and, for an attempt that took over the policy, the attempt.
+
+The dialog needs the Director key to read the history and to save.

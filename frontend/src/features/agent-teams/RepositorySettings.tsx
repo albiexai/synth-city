@@ -11,6 +11,7 @@ import {
   ContinuationPolicyDialog, ScopeDialog,
   type PolicyDialogState, type ScopeDialogState,
 } from './ScopeSettingsDialogs'
+import { RequiredChecksDialog } from './RequiredChecksDialog'
 import { ScopeLimitsDialog } from './ScopeLimitsDialog'
 import { authStatus } from './scopeAuthStatus'
 import { useScopeSettings } from './useScopeSettings'
@@ -58,6 +59,7 @@ export function RepositorySettings({ scope, autonomyEnabled, refresh, onRemoved 
   const [scopeDialog, setScopeDialog] = useState<ScopeDialogState>(null)
   const [policyDialog, setPolicyDialog] = useState<PolicyDialogState>(null)
   const [limitsOpen, setLimitsOpen] = useState(false)
+  const [checksOpen, setChecksOpen] = useState(false)
   const [scopeToRemove, setScopeToRemove] = useState<TeamGithubScope | null>(null)
   const [removalPending, setRemovalPending] = useState(false)
   const trigger = useRef<HTMLButtonElement | null>(null)
@@ -113,6 +115,26 @@ export function RepositorySettings({ scope, autonomyEnabled, refresh, onRemoved 
         <Row label="Effort ceiling per item">{scope.max_item_effort_minutes ?? 120} minutes</Row>
       </Section>
       <Section
+        title="Required checks"
+        editLabel={`Edit required checks for ${scope.repo_owner}/${scope.repo_name}`}
+        onEdit={(element) => { trigger.current = element; setChecksOpen(true) }}
+      >
+        <Row label="Must succeed to merge">
+          {!scope.delivery_policy
+            ? 'Not available from this server'
+            : scope.delivery_policy.required_checks.length === 0
+              ? 'None named. A head with no check runs is not green.'
+              : (
+                <ul className="space-y-1">
+                  {scope.delivery_policy.required_checks.map((check) => (
+                    <li key={`${check.name}\u0000${check.app_slug}`}><code>{check.name}</code> · {check.app_slug}</li>
+                  ))}
+                </ul>
+              )}
+        </Row>
+        {scope.delivery_policy_revision !== undefined && <Row label="Policy revision">{scope.delivery_policy_revision}</Row>}
+      </Section>
+      <Section
         title="Recovery"
         editLabel={`Edit recovery policy for ${scope.repo_owner}/${scope.repo_name}`}
         onEdit={(element) => { trigger.current = element; setPolicyDialog({ scope }) }}
@@ -155,6 +177,13 @@ export function RepositorySettings({ scope, autonomyEnabled, refresh, onRemoved 
         scope={scope}
         open={limitsOpen}
         onOpenChange={setLimitsOpen}
+        refresh={refresh}
+        onReturnFocus={() => trigger.current?.focus()}
+      />
+      <RequiredChecksDialog
+        scope={scope}
+        open={checksOpen}
+        onOpenChange={setChecksOpen}
         refresh={refresh}
         onReturnFocus={() => trigger.current?.focus()}
       />
