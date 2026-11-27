@@ -1696,6 +1696,29 @@
     "title": "synth_city_send_messageArguments",
     "type": "object"
   },
+  "synth_city_set_issue_difficulty": {
+    "properties": {
+      "difficulty": {
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "title": "Difficulty",
+        "type": "string"
+      },
+      "work_item_id": {
+        "title": "Work Item Id",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "work_item_id",
+      "difficulty"
+    ],
+    "title": "synth_city_set_issue_difficultyArguments",
+    "type": "object"
+  },
   "synth_city_settle_accepted_revision": {
     "properties": {
       "dispatch_nonce": {

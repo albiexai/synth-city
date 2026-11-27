@@ -2777,6 +2777,47 @@
           "title": "InitialPathComparison",
           "type": "object"
         },
+        "IssueDifficultyProvenance": {
+          "properties": {
+            "actor_reference": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Actor Reference"
+            },
+            "difficulty": {
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "title": "Difficulty",
+              "type": "string"
+            },
+            "source": {
+              "enum": [
+                "leader",
+                "director",
+                "supervisor",
+                "github"
+              ],
+              "title": "Source",
+              "type": "string"
+            }
+          },
+          "required": [
+            "difficulty",
+            "source",
+            "actor_reference"
+          ],
+          "title": "IssueDifficultyProvenance",
+          "type": "object"
+        },
         "LaunchPlanHint": {
           "additionalProperties": false,
           "properties": {
@@ -3096,6 +3137,17 @@
             "diagnostic_retry_count": {
               "title": "Diagnostic Retry Count",
               "type": "integer"
+            },
+            "difficulty_provenance": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/IssueDifficultyProvenance"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             },
             "dispatch_status": {
               "title": "Dispatch Status",
@@ -3881,6 +3933,47 @@
           "title": "GithubIdentity",
           "type": "object"
         },
+        "IssueDifficultyProvenance": {
+          "properties": {
+            "actor_reference": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Actor Reference"
+            },
+            "difficulty": {
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "title": "Difficulty",
+              "type": "string"
+            },
+            "source": {
+              "enum": [
+                "leader",
+                "director",
+                "supervisor",
+                "github"
+              ],
+              "title": "Source",
+              "type": "string"
+            }
+          },
+          "required": [
+            "difficulty",
+            "source",
+            "actor_reference"
+          ],
+          "title": "IssueDifficultyProvenance",
+          "type": "object"
+        },
         "LaunchPlanHint": {
           "additionalProperties": false,
           "properties": {
@@ -4200,6 +4293,17 @@
             "diagnostic_retry_count": {
               "title": "Diagnostic Retry Count",
               "type": "integer"
+            },
+            "difficulty_provenance": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/IssueDifficultyProvenance"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             },
             "dispatch_status": {
               "title": "Dispatch Status",

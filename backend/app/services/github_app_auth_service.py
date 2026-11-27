@@ -15,9 +15,10 @@ from app.services.github_offline import github_http_client
 
 _GITHUB_API = "https://api.github.com"
 
-GithubTokenPurpose = Literal["push", "pull_request"]
+GithubTokenPurpose = Literal["push", "pull_request", "issue_difficulty"]
 _TOKEN_PERMISSIONS: dict[GithubTokenPurpose, dict[str, str]] = {
     "push": {"contents": "write"},
+    "issue_difficulty": {"issues": "write"},
     "pull_request": {"contents": "read", "pull_requests": "write"},
 }
 

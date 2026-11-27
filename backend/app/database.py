@@ -1079,6 +1079,8 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN dispatch_priority INTEGER"))
     if work_item_columns and "issue_difficulty" not in work_item_columns:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN issue_difficulty VARCHAR"))
+    if work_item_columns and "issue_difficulty_provenance" not in work_item_columns:
+        await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN issue_difficulty_provenance JSON"))
     if work_item_columns and "status_note" not in work_item_columns:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN status_note VARCHAR"))
     if work_item_columns and "initial_paths_readiness" not in work_item_columns:
