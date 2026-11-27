@@ -69,7 +69,7 @@ function stubApi(catalogs: Partial<Record<AgentProviderId, ProviderOperations>>)
   }))
 }
 
-const statusWords = ['Not installed', 'Needs setup', 'Not checked yet', 'Ready'] as const
+const statusWords = ['Not found', 'Needs setup', 'Not checked yet', 'Ready'] as const
 
 function statusIn(text: string | null | undefined): string | null {
   return statusWords.find(word => text?.includes(word)) ?? null

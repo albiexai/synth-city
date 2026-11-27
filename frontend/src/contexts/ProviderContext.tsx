@@ -1,10 +1,11 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useProviders } from '@/hooks/useProviders'
-import type { AgentProviderId, AgentProviderStatus } from '@/types/providers'
+import type { AgentProviderId, AgentProviderStatus, ProviderInstallationSearch } from '@/types/providers'
 import { migrateBrowserStorage, PRODUCT_STORAGE_KEYS } from '@/lib/browserStorageMigration'
 
 interface ProviderContextValue {
   providers: AgentProviderStatus[]
+  installationSearch?: ProviderInstallationSearch
   loading: boolean
   error: string | null
   selectedProviderId: AgentProviderId
@@ -33,7 +34,7 @@ function readStoredProvider(): AgentProviderId {
 }
 
 export function ProviderProvider({ children }: { children: ReactNode }) {
-  const { providers, loading, error, refresh } = useProviders()
+  const { providers, installationSearch, loading, error, refresh } = useProviders()
   const [selectedProviderId, setSelectedProviderIdState] = useState<AgentProviderId>(readStoredProvider)
 
   useEffect(() => {
@@ -55,13 +56,14 @@ export function ProviderProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<ProviderContextValue>(() => ({
     providers,
+    installationSearch,
     loading,
     error,
     selectedProviderId,
     selectedProvider,
     setSelectedProviderId,
     refreshProviders: refresh,
-  }), [providers, loading, error, selectedProviderId, selectedProvider, setSelectedProviderId, refresh])
+  }), [providers, installationSearch, loading, error, selectedProviderId, selectedProvider, setSelectedProviderId, refresh])
 
   return (
     <ProviderContext.Provider value={value}>

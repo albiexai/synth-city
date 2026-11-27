@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.deps import apply_harness_scope
+from app.config import settings
 from app.database import get_db
 from app.models.provider_operations_schemas import ProviderOperations
 from app.services import provider_operations_service
@@ -21,11 +22,13 @@ from app.services.claude_install_version import UNKNOWN, read_installed_version
 from app.services.codex_history_service import CodexHistoryService
 from app.services.codex_usage_context_service import CodexUsageContextService
 from app.services.providers import get_provider, get_providers
+from app.services.providers.base import cli_search_path
 from app.services.providers.launch_options import build_provider_launch_options
 from app.services.runtime_environment import (
     agent_cli_warning_for_binaries,
     annotate_provider_statuses,
 )
+from app.utils.path_utils import controller_user_name
 
 router = APIRouter()
 
@@ -172,7 +175,16 @@ def list_providers():
     providers, environment = annotate_provider_statuses(
         provider.get_status() for provider in get_providers()
     )
-    return {"providers": [_with_scoped_version(p) for p in providers], "count": len(providers), "environment": environment}
+    return {
+        "providers": [_with_scoped_version(p) for p in providers],
+        "count": len(providers),
+        "environment": environment,
+        "installation_search": {
+            "controller_user": controller_user_name(),
+            "agent_user": (settings.harness_agent_user or "").strip() or None,
+            "path": cli_search_path(),
+        },
+    }
 
 
 @router.get("/providers/{provider_id}/status", dependencies=[Depends(apply_harness_scope)])

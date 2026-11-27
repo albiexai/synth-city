@@ -20,12 +20,11 @@ export function Header() {
   const status = useSystemStatus();
   const instance = status?.instance ?? null;
   const accentClasses = getInstanceAccentClasses(instance?.accent);
-  const { providers, selectedProviderId, selectedProvider } = useProviderContext();
-  const providerStatuses = providers
-    // /status carries the controller's Claude Code version; the registry is the one source of it (see withRegistryVersion).
-    .map((provider) => withRegistryVersion(status?.providers?.[provider.id] ?? provider, provider))
-    .filter((provider) => provider.installed || provider.id === selectedProviderId);
-  const summary = harnessSummary(providerStatuses);
+  const { providers, selectedProvider } = useProviderContext();
+  const summary = harnessSummary(providers.map(provider => withRegistryVersion({
+    ...provider,
+    version: status?.providers?.[provider.id]?.version ?? provider.version,
+  }, provider)), selectedProvider);
   useInstanceDocumentTitle(instance);
 
   const instanceName = instance?.name_configured ? instance.name : instance?.short_hostname;
@@ -33,10 +32,6 @@ export function Header() {
     ? `Albiex Synth City instance: ${instanceName} (host ${instance.hostname})`
       + (instance.name_configured ? "" : " (name not configured; set SYNTH_CITY_INSTANCE_NAME)")
     : undefined;
-
-  if (providerStatuses.length === 0 && selectedProvider) {
-    providerStatuses.push(withRegistryVersion(status?.providers?.[selectedProviderId] ?? selectedProvider, selectedProvider));
-  }
 
   return (
     <header className={cn("border-b border-t-4 bg-background", instance ? accentClasses.headerBorder : "border-t-transparent")}>
@@ -69,7 +64,7 @@ export function Header() {
                   <span className="truncate">{instanceName}</span>
                 </Badge>
               )}
-              {providerStatuses.length > 0 && (
+              {providers.length > 0 && (
                 <Link
                   to="/harnesses"
                   title={summary.title}

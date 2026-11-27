@@ -181,7 +181,7 @@ export function useProviders() {
   const { pathname, search } = useLocation()
   const scopeKey = registryScopeKey(pathname, search)
   // The registry is kept with the scope it was fetched under, so a registry for another user is never shown as this one's.
-  const [fetched, setFetched] = useState<{ scopeKey: string; providers: AgentProviderStatus[] }>({ scopeKey, providers: [] })
+  const [fetched, setFetched] = useState<{ scopeKey: string; providers: AgentProviderStatus[]; installationSearch?: ProvidersResponse['installation_search'] }>({ scopeKey, providers: [] })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const requests = useRef(0)
@@ -194,7 +194,7 @@ export function useProviders() {
       const data = await apiClient<ProvidersResponse>('providers')
       if (request !== requests.current) return // a newer request (another scope) superseded this one: its answer is stale
       updateNativeMetadata(data.providers)
-      setFetched({ scopeKey: fetchedFor, providers: data.providers })
+      setFetched({ scopeKey: fetchedFor, providers: data.providers, installationSearch: data.installation_search })
       setError(null)
     } catch (err) {
       if (request !== requests.current) return
@@ -218,7 +218,7 @@ export function useProviders() {
     [fetched, scopeKey],
   )
 
-  return { providers, loading, error, refresh }
+  return { providers, installationSearch: fetched.installationSearch, loading, error, refresh }
 }
 
 export async function fetchProviderDoctor(providerId: AgentProviderId): Promise<ProviderDoctorResponse> {

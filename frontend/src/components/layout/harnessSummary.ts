@@ -6,14 +6,14 @@ type HarnessStatus = {
 };
 
 /** One header badge for every harness, so the header keeps one row as harnesses are added. */
-export function harnessSummary(harnesses: HarnessStatus[]) {
-  const missing = harnesses.filter((harness) => !harness.installed).length;
+export function harnessSummary(harnesses: HarnessStatus[], selected?: Pick<HarnessStatus, "installed"> | null) {
+  const installed = harnesses.filter((harness) => harness.installed).length;
   const noun = harnesses.length === 1 ? "harness" : "harnesses";
   return {
-    label: missing ? `${missing} of ${harnesses.length} ${noun} missing` : `${harnesses.length} ${noun}`,
-    problem: missing > 0,
-    title: harnesses
-      .map((harness) => {
+    label: `${installed} installed`,
+    problem: selected?.installed === false,
+    title: [`${installed} of ${harnesses.length} supported ${noun} installed for this factory`,
+      ...harnesses.map((harness) => {
         // A chosen user's version (or its unknown message) is named whether or not the controller has a claude of its own.
         const scoped = scopedVersionBadge(harness);
         if (scoped) {
@@ -25,7 +25,7 @@ export function harnessSummary(harnesses: HarnessStatus[]) {
         return harness.installed
           ? `${harness.display_name} ${harness.version ? `v${harness.version}` : "installed"}`
           : `${harness.display_name} missing${harness.unavailable_reason ? `: ${harness.unavailable_reason}` : ""}`;
-      })
-      .join("\n"),
+      }),
+    ].join("\n"),
   };
 }

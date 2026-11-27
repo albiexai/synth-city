@@ -105,9 +105,16 @@ export interface RuntimeEnvironmentStatus {
   agent_cli_warning?: string | null
 }
 
+export interface ProviderInstallationSearch {
+  controller_user: string
+  agent_user: string | null
+  path: string
+}
+
 export interface ProvidersResponse {
   providers: AgentProviderStatus[]
   count: number
+  installation_search?: ProviderInstallationSearch
   environment?: RuntimeEnvironmentStatus
 }
 

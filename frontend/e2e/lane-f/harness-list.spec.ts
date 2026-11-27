@@ -1,4 +1,5 @@
 import type { Locator, Page } from '@playwright/test'
+import type { ProvidersResponse } from '../../src/types/providers'
 import { contrastFailures, useTheme, type Theme } from '../support/contrast'
 import { expect, test } from '../support/guard'
 import { expectKeyboardReachable } from '../support/keyboard'
@@ -132,5 +133,39 @@ for (const theme of ['light', 'dark'] as Theme[]) {
     await expect(page.getByRole('heading', { name: 'Harnesses', exact: true })).toBeVisible()
     const failures = await contrastFailures(page.locator('main'))
     expect(failures, JSON.stringify(failures)).toEqual([])
+  })
+}
+
+for (const width of [1280, 390]) {
+  test(`@active installed and supported harnesses agree at ${width} px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 })
+    const detected = new Set(['claude-code', 'codex-cli', 'pi-cli', 'muse-cli'])
+    await page.route('**/api/v1/providers', async route => {
+      const response = await route.fetch()
+      const registry: ProvidersResponse = await response.json()
+      registry.providers = registry.providers.map(provider => ({
+        ...provider,
+        installed: detected.has(provider.id),
+        unavailable_code: provider.id === 'copilot-cli' ? 'launcher_cli_missing' : null,
+      }))
+      await route.fulfill({ response, json: {
+        ...registry,
+        installation_search: { controller_user: 'fixture-controller', agent_user: 'fixture-agent', path: '/fixture/tools:/usr/bin' },
+      } })
+    })
+    await page.goto('/harnesses')
+    const main = page.getByRole('main')
+    await expect(main.getByText('4 installed · 7 supported', { exact: true })).toBeVisible()
+    const headerLink = page.locator('header a[href="/harnesses"]')
+    await expect(headerLink).toHaveText('4 installed')
+    await expect(headerLink).toHaveAttribute('title', /4 of 7 supported harnesses installed for this factory/)
+    await expect(card(page, 'claude-code').getByText('Installed', { exact: true })).toBeVisible()
+    await expect(card(page, 'opencode-cli').getByRole('heading', { name: /OpenCode.*Not found/ })).toBeVisible()
+    await expect(card(page, 'copilot-cli').getByRole('heading', { name: /Copilot CLI.*Found a launcher, CLI missing/ })).toBeVisible()
+    await main.getByText('Where Synth City looked', { exact: true }).click()
+    await expect(main.getByText('fixture-controller', { exact: true })).toBeVisible()
+    await expect(main.getByText('fixture-agent', { exact: true })).toBeVisible()
+    await expect(main.getByText('/fixture/tools:/usr/bin', { exact: true })).toBeVisible()
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(width)
   })
 }
