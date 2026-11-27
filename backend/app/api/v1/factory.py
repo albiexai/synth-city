@@ -23,6 +23,7 @@ from app.models.schemas import (
 )
 from app.services.github_client import github_client, GithubClientResponseError
 from app.services.github_app_auth_service import GithubAppAuthError, github_app_auth_service
+from app.services import factory_campaign_list_service as campaign_list_service
 from app.services import factory_projection_service as projections
 from app.services import milestone_state_service
 from app.utils.repo_utils import is_primary_github_checkout
@@ -366,6 +367,19 @@ async def repositories(
     db=Depends(read_snapshot),
 ):
     return await projections.repositories(db, selected, limit, cursor)
+
+
+@router.get("/campaigns", response_model=campaign_list_service.CampaignListResponse)
+async def campaigns(
+    selected: wire.FactoryFilters = Depends(filters),
+    status: str = Query("all"),
+    limit: int = Query(50, ge=1, le=100), cursor: str | None = Query(None),
+    db=Depends(read_snapshot),
+):
+    """#1252: the campaigns list. It reads the database and the snapshot cache only, never GitHub."""
+    await projections.validate_filters(db, selected)
+    return await campaign_list_service.campaign_list(
+        db, team_id=selected.team_id, scope_id=selected.scope_id, status=status, limit=limit, cursor=cursor)
 
 
 @router.get("/repositories/{scope_id}", response_model=wire.RepositoryDetailResponse)

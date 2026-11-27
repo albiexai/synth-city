@@ -1,5 +1,6 @@
 import { NavLink, Navigate, Outlet, useLocation } from 'react-router-dom'
 import { cn } from '@/lib/utils'
+import { RetrospectivesList } from './RetrospectivesList'
 
 // #1251: Insights replaces the Audit entry. Its tabs are Retrospectives (the default) and Audit log (the old Audit page).
 const TABS = [
@@ -30,9 +31,8 @@ export function InsightsPage() {
   )
 }
 
-/** The list of campaigns is a later issue (#1252). Until then the tab says what it will hold. */
 export function RetrospectivesTab() {
-  return <p className="text-sm text-muted-foreground">Campaign retrospectives will be listed here.</p>
+  return <RetrospectivesList />
 }
 
 function useQueryAndHash() {

@@ -14,7 +14,10 @@ import App from "../src/App";
 
 function openApp(url: string) {
   window.history.replaceState({}, "", url);
-  fixtureFetch(() => jsonResponse({ projects: [], rows: [], items: [], repositories: [], presets: [], providers: [] }));
+  fixtureFetch((path) => path === "factory/campaigns"
+    ? jsonResponse({ schema_version: 1, generated_at: "2026-11-27T00:00:00", campaigns: [], total: 0, counts: { live: 0, finished: 0 },
+      hidden_unknown_repositories: 0, finished_before_recording: 0, has_more: false, next_cursor: null })
+    : jsonResponse({ projects: [], rows: [], items: [], repositories: [], presets: [], providers: [] }));
   return render(<ThemeProvider><App /></ThemeProvider>);
 }
 const location = () => `${window.location.pathname}${window.location.search}${window.location.hash}`;
@@ -56,7 +59,7 @@ describe("the Insights page and its tabs", () => {
     expect(location()).toBe("/insights/retrospectives?team_id=2#top");
     expect(within(tabs()).getByRole("link", { name: "Retrospectives" })).toHaveAttribute("aria-current", "page");
     expect(within(tabs()).getByRole("link", { name: "Audit log" })).not.toHaveAttribute("aria-current");
-    expect(screen.getByText("Campaign retrospectives will be listed here.")).toBeInTheDocument();
+    expect(await screen.findByText("No campaigns yet. A team starts one for its backlog label or milestone.")).toBeInTheDocument();
   });
 
   it("shows the existing Audit page under the Audit log tab", async () => {
@@ -65,7 +68,7 @@ describe("the Insights page and its tabs", () => {
     expect(within(tabs()).getByRole("link", { name: "Audit log" })).toHaveAttribute("aria-current", "page");
     expect(within(tabs()).getByRole("link", { name: "Retrospectives" })).not.toHaveAttribute("aria-current");
     expect(screen.getByText("Audit page stub")).toBeInTheDocument();
-    expect(screen.queryByText("Campaign retrospectives will be listed here.")).not.toBeInTheDocument();
+    expect(screen.queryByText(/No campaigns yet/)).not.toBeInTheDocument();
   });
 
   it("has one Insights heading and an accessible tab row with two links", async () => {

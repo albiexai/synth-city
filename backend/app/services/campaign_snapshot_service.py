@@ -59,6 +59,16 @@ class MeasureCoverageEntry(BaseModel):
     reason: str | None = None
 
 
+class SnapshotRepository(BaseModel):
+    """#1252: one repository's issue count in the campaign. ``issues`` is None while its members are unknown."""
+
+    repo: str
+    issues: int | None
+    complete: bool
+    reason: str | None = None
+    cutoff_gaps: list[str] = []  # why the count is unknown although the read was complete
+
+
 class BandRow(BaseModel):
     band: str  # 0-100, 101-400, over-400, or unknown when the lines changed are not known
     items: int  # delivered members in the band
@@ -87,11 +97,20 @@ class Snapshot(BaseModel):
     calculation_version: str
     metrics: list[FactoryMetricSample]
     recorded_coverage: list[MeasureCoverageEntry]
+    # Added by #1252. A snapshot stored before it has no such field and reads as an empty list.
+    repositories: list[SnapshotRepository] = []
     item_time: ItemTimeSection | None = None  # additive (#1246): an older frozen payload reads back unchanged
 
 
 def clear_cache() -> None:
     _cache.clear()
+
+
+def cached_snapshot(campaign_id: int) -> Snapshot | None:
+    """The last snapshot built for the campaign in this process, or None. Builds nothing and reads no GitHub (#1252).
+    It may be older than the cache lifetime: its ``as_of`` says how old."""
+    hit = _cache.get(campaign_id)
+    return hit[2] if hit is not None else None
 
 
 def _sample(name: str, unit: str, value: float | None, sample_count: int, *, source: str,
@@ -235,7 +254,32 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
         campaign_id=campaign.id, selector=campaign.selector, started_at=started, as_of=as_of,
         calculation_version=CALCULATION_VERSION, metrics=sorted(metrics, key=lambda sample: sample.name),
         recorded_coverage=[MeasureCoverageEntry(measure=c.measure, started_at=c.started_at, covered=c.covered,
-                                                reason=c.reason) for c in coverage], item_time=item_time)
+                                                reason=c.reason) for c in coverage], item_time=item_time,
+        repositories=_repositories(membership, members, [gap for gap in gaps if gap in _CUTOFF_GAPS]))
+
+
+_CUTOFF_GAPS = ("membership_read_after_cutoff", "departure_after_cutoff", "delivery_after_cutoff")
+
+
+def _repositories(membership, members, cutoff: list[str]) -> list[SnapshotRepository]:
+    """Each repository once (the spelling is not case-sensitive) with its issue count, unknown while any read of it
+    is incomplete (#1252). The counts use the same members as ``issues_in_scope``. A gap at the cutoff leaves every
+    count unknown, as it does the total (V1 review 114): today's membership is not the membership at ``as_of``."""
+    per_repository: dict[str, int] = {}
+    for repo, _number in members:
+        per_repository[repo] = per_repository.get(repo, 0) + 1
+    rows: dict[str, SnapshotRepository] = {}
+    for coverage in membership.repositories:
+        key = coverage.repo.lower()
+        known = rows.get(key)
+        complete = coverage.complete and (known is None or known.complete)
+        reason = known.reason if known is not None and known.reason else coverage.reason
+        counted = complete and not cutoff
+        rows[key] = SnapshotRepository(repo=known.repo if known else coverage.repo,
+                                       issues=per_repository.get(key, 0) if counted else None,
+                                       complete=complete, reason=None if complete else reason,
+                                       cutoff_gaps=cutoff)
+    return list(rows.values())
 
 
 def _p85(values: list[float]) -> float:
