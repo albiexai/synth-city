@@ -23,7 +23,7 @@ from app.models.database import FactoryAuditEvent, FactoryContextKey
 # Allowlisted value keys for before/after snapshots. Values outside this
 # allowlist are dropped at write time.
 SAFE_VALUE_FIELDS = {
-    "status", "dispatch_status", "attempt_phase", "enabled", "autonomy_enabled",
+    "status", "dispatch_status", "attempt_phase", "enabled", "autonomy_enabled", "dispatch_paused",
     "reminder_count", "reminder_cap", "lease_held_seconds",
     "leader_slot_id", "owner_slot_id", "owner_member_id", "approval_round",
     "approval_round_count", "retry_count", "diagnostic_retry_count",
@@ -45,6 +45,8 @@ SAFE_VALUE_FIELDS = {
     "max_item_effort_minutes", "max_plan_estimate_minutes", "initial_paths_required", "review_hold_label", "github_auth_mode",
     "supervisor_actor_id", "supervisor_grace_seconds", "supervisor_status",
     "mail_request_unanswered_seconds", "github_team_idle_timeout_seconds", "github_publish_summaries_enabled",
+    "github_owner_idle_timeout_seconds", "github_nudge_grace_seconds",
+    "wake_followup_enabled", "wake_followup_delay_seconds",
     "origin_kind", "previous_scope_revision", "review_id", "reviewer_member_id",
     "head_sha", "verdict", "outcome",
     "target_milestone", "superseding_pr_number", "merge_commit_sha",

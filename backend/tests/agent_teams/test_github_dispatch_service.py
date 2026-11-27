@@ -866,9 +866,7 @@ async def test_prepare_attempt_commits_exact_identity_and_reuses_it(db, monkeypa
         base_ref=scope.base_ref,
     )
 
-    assert prepared.dispatch_head_ref == (
-        f"deck/slot-{slots[1].id}/issue-42-0123456789abcdef"
-    )
+    assert prepared.dispatch_head_ref == f"deck/slot-{slots[1].id}/issue-42-g1"
     assert calls == 1
     maker = async_sessionmaker(db.bind, expire_on_commit=False)
     async with maker() as second:
@@ -876,6 +874,7 @@ async def test_prepare_attempt_commits_exact_identity_and_reuses_it(db, monkeypa
         assert persisted.owner_slot_id == slots[1].id
         assert persisted.routing_method == "label"
         assert persisted.dispatch_nonce == "0123456789abcdef"
+        assert persisted.dispatch_attempt == 1
         assert persisted.dispatch_head_ref == prepared.dispatch_head_ref
         assert persisted.approval_round_count == 1
 
@@ -888,6 +887,65 @@ async def test_prepare_attempt_commits_exact_identity_and_reuses_it(db, monkeypa
     )
     assert reused == prepared
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_prepare_attempt_advances_generation_across_retries_and_milestone_returns(db):
+    _, slots, scope = await _team(db)
+    issue = dict(scope_id=scope.id, issue_number=42, issue_title="Returning issue",
+                 issue_url="u", github_updated_at=datetime.utcnow())
+    item = GithubWorkItem(**issue)
+    db.add(item)
+    await db.commit()
+    arguments = dict(owner_slot_id=slots[1].id, routing_method="label", base_ref=scope.base_ref)
+
+    first = await github_dispatch_service.prepare_attempt(db, item, **arguments)
+    await github_dispatch_service.reset_for_retry(db, item)
+    assert item.dispatch_attempt == 1
+    await db.commit()
+    retry = await github_dispatch_service.prepare_attempt(db, item, **arguments)
+    assert retry.dispatch_head_ref == f"deck/slot-{slots[1].id}/issue-42-g2"
+    assert retry.dispatch_nonce != first.dispatch_nonce
+
+    item.milestone_replaced_at = datetime.utcnow()
+    item.dispatch_status = "cancelled"
+    await db.flush()
+    replacement = GithubWorkItem(**issue)
+    db.add(replacement)
+    await db.commit()
+
+    returned = await github_dispatch_service.prepare_attempt(db, replacement, **arguments)
+    assert returned.dispatch_head_ref == f"deck/slot-{slots[1].id}/issue-42-g3"
+    assert replacement.dispatch_attempt == 3
+    assert item.dispatch_attempt == 2 and item.dispatch_head_ref == retry.dispatch_head_ref
+
+
+@pytest.mark.asyncio
+async def test_prepare_attempt_shares_generation_across_case_variant_repository_scopes(db):
+    preset, slots, scope = await _team(db)
+    other_scope = TeamGithubScope(
+        preset_id=preset.id,
+        repo_owner=scope.repo_owner.upper(),
+        repo_name=scope.repo_name.upper(),
+        repo_path=scope.repo_path,
+        base_ref=scope.base_ref,
+    )
+    db.add(other_scope)
+    await db.flush()
+    issue = dict(issue_number=42, issue_title="Same repository issue",
+                 issue_url="u", github_updated_at=datetime.utcnow())
+    first_item = GithubWorkItem(scope_id=scope.id, **issue)
+    second_item = GithubWorkItem(scope_id=other_scope.id, **issue)
+    db.add_all([first_item, second_item])
+    await db.commit()
+    arguments = dict(owner_slot_id=slots[1].id, routing_method="label", base_ref=scope.base_ref)
+
+    first = await github_dispatch_service.prepare_attempt(db, first_item, **arguments)
+    second = await github_dispatch_service.prepare_attempt(db, second_item, **arguments)
+
+    assert first.dispatch_head_ref == f"deck/slot-{slots[1].id}/issue-42-g1"
+    assert second.dispatch_head_ref == f"deck/slot-{slots[1].id}/issue-42-g2"
+    assert (first_item.dispatch_attempt, second_item.dispatch_attempt) == (1, 2)
 
 
 @pytest.mark.asyncio
@@ -4280,17 +4338,19 @@ async def test_release_reminder_delays_grow_and_failed_mail_rolls_back(db, monke
 
 
 @pytest.mark.asyncio
-async def test_release_reminder_backoff_grows_with_a_large_grace(db, monkeypatch):
-    _, slots, scope = await _team(db)
+@pytest.mark.parametrize(("team_grace", "delay"), [(None, 16000), (2000, 8000)])
+async def test_release_reminder_backoff_grows_with_a_large_grace(db, monkeypatch, team_grace, delay):
+    preset, slots, scope = await _team(db)
     await _create_registered_slot_member(db, slots[1])
     _, workspace = await _leased_item_for_reminder(
         db, scope, issue_number=975, dispatch_status="merged", owner_slot_id=slots[1].id)
     monkeypatch.setattr(settings, "github_nudge_grace_seconds", 4000)
+    preset.github_nudge_grace_seconds = team_grace
     workspace.lease_release_reminder_count = 2
-    workspace.lease_release_reminded_at = datetime.utcnow() - timedelta(seconds=4001)
+    workspace.lease_release_reminded_at = datetime.utcnow() - timedelta(seconds=delay - 60)
     await db.commit()
     assert await github_dispatch_service.remind_held_leases(db, scope) == 0
-    workspace.lease_release_reminded_at -= timedelta(seconds=16000)
+    workspace.lease_release_reminded_at -= timedelta(seconds=120)
     await db.commit()
     assert await github_dispatch_service.remind_held_leases(db, scope) == 1
 
@@ -4418,6 +4478,89 @@ async def test_continuation_monitor_nudges_once_then_escalates_without_reset(
             assert record.active_scope_revision == 1
     assert "t1" not in caplog.text
     assert "pytest -q" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("team_idle", "team_grace", "age", "nudge_age", "nudged", "escalated"), [
+    (None, None, 240, None, False, False),
+    (120, None, 240, None, True, False),
+    (None, None, 960, 90, False, False),
+    (None, 60, 960, 90, False, True),
+])
+async def test_continuation_monitor_uses_team_idle_and_grace(
+    db, monkeypatch, team_idle, team_grace, age, nudge_age, nudged, escalated,
+):
+    monkeypatch.setattr(settings, "github_owner_idle_timeout_seconds", 900)
+    monkeypatch.setattr(settings, "github_nudge_grace_seconds", 180)
+    preset, slots, scope = await _team(db)
+    preset.github_owner_idle_timeout_seconds = team_idle
+    preset.github_nudge_grace_seconds = team_grace
+    now = datetime.utcnow()
+    anchor = now - timedelta(seconds=age)
+    previous_nudge = None if nudge_age is None else now - timedelta(seconds=nudge_age)
+    item, _, revision, _ = await _active_continuation(
+        db, scope, slots[1], issue_number=943, activated_at=anchor, owner_contact_at=anchor)
+    item.continuation_nudged_at = previous_nudge
+    await db.commit()
+
+    await github_dispatch_service.monitor_continuation(db, scope, slots)
+
+    await db.refresh(item)
+    await db.refresh(revision)
+    assert (item.continuation_nudged_at != previous_nudge) is nudged
+    assert item.dispatch_status == ("escalated" if escalated else "dispatched")
+    assert item.escalation_reason == ("owner_idle_timeout" if escalated else None)
+    assert revision.status == ("superseded" if escalated else "active")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("team_override", [False, True])
+async def test_native_renewal_obeys_team_contact_window(db, monkeypatch, tmp_path, team_override):
+    from app.services import native_owner_contact as native
+    from tests.agent_teams.test_factory_delivery_policy import native_fixture
+
+    monkeypatch.setattr(settings, "github_owner_idle_timeout_seconds", 900)
+    monkeypatch.setattr(settings, "github_nudge_grace_seconds", 180)
+    scope, item, workspace, revision, *_ = await native_fixture(db, monkeypatch, tmp_path)
+    preset = await db.get(AgentTeamPreset, scope.preset_id)
+    if team_override:
+        preset.github_owner_idle_timeout_seconds = 60
+        preset.github_nudge_grace_seconds = 30
+    await db.commit()
+    contact = workspace.lease_last_owner_contact_at
+
+    renewed = await native.renew_native_owner_contact(db, scope, item, workspace, revision)
+
+    assert renewed == (not team_override)
+    await db.refresh(workspace)
+    assert (workspace.lease_last_owner_contact_at == contact) is team_override
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "seconds"), [
+    ("github_owner_idle_timeout_seconds", 600),
+    ("github_nudge_grace_seconds", 120),
+])
+async def test_native_renewal_refuses_changed_team_timer(db, monkeypatch, tmp_path, field, seconds):
+    from app.services import native_owner_contact as native
+    from tests.agent_teams.test_factory_delivery_policy import native_fixture
+
+    scope, item, workspace, revision, *_ = await native_fixture(db, monkeypatch, tmp_path)
+    contact = workspace.lease_last_owner_contact_at
+    preset_id = scope.preset_id
+    observe = native.activity.observe_private_team
+
+    async def change_timer(*args, **kwargs):
+        result = await observe(*args, **kwargs)
+        await db.execute(update(AgentTeamPreset).where(AgentTeamPreset.id == preset_id)
+                         .values(**{field: seconds}).execution_options(synchronize_session=False))
+        await db.commit()
+        return result
+
+    monkeypatch.setattr(native.activity, "observe_private_team", change_timer)
+    assert not await native.renew_native_owner_contact(db, scope, item, workspace, revision)
+    await db.refresh(workspace)
+    assert workspace.lease_last_owner_contact_at == contact
 
 
 @pytest.mark.asyncio
@@ -6235,9 +6378,12 @@ async def test_delivery_proven_by_report_not_only_receipt(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_brief_unread_escalates_after_delivery_retries_exhausted(db, monkeypatch):
+@pytest.mark.parametrize(("team_grace", "age", "escalated"), [(None, 185, True), (None, 90, False), (60, 90, True)])
+async def test_brief_unread_escalates_after_delivery_retries_exhausted(db, monkeypatch, team_grace, age, escalated):
     _isolate_agent_mail_nudges(monkeypatch)
     preset, slots, scope = await _team(db)
+    monkeypatch.setattr(settings, "github_nudge_grace_seconds", 180)
+    preset.github_nudge_grace_seconds = team_grace
     stale = datetime.utcnow() - timedelta(
         seconds=max(
             settings.github_owner_registration_grace_seconds,
@@ -6256,7 +6402,7 @@ async def test_brief_unread_escalates_after_delivery_retries_exhausted(db, monke
         dispatched_at=stale,
         updated_at=stale,
         brief_delivery_nudge_count=settings.github_brief_delivery_max_nudges,
-        brief_delivery_nudge_at=stale,
+        brief_delivery_nudge_at=datetime.utcnow() - timedelta(seconds=age),
     )
     db.add(item)
     await db.commit()
@@ -6270,8 +6416,8 @@ async def test_brief_unread_escalates_after_delivery_retries_exhausted(db, monke
     )
 
     await db.refresh(item)
-    assert item.dispatch_status == "escalated"
-    assert item.escalation_reason == "brief_unread"
+    assert item.dispatch_status == ("escalated" if escalated else "dispatched")
+    assert item.escalation_reason == ("brief_unread" if escalated else None)
 
 
 @pytest.mark.asyncio
@@ -6697,15 +6843,58 @@ async def test_retried_item_still_nudged_when_leader_never_acks_again(db):
 
 
 @pytest.mark.asyncio
-async def test_monitor_escalates_leader_ack_after_nudge_grace(db):
+async def test_leader_ack_write_refuses_changed_team_grace(db, monkeypatch):
+    from sqlalchemy.sql.dml import Update
+
     preset, slots, scope = await _team(db)
+    leader, owner = slots
+    old = datetime.utcnow() - timedelta(seconds=settings.github_leader_ack_timeout_seconds + 10)
+    item = GithubWorkItem(
+        scope_id=scope.id, issue_number=924, issue_title="Ack fixture", issue_url="u",
+        github_updated_at=old, dispatch_status="dispatched", owner_slot_id=owner.id, dispatched_at=old,
+    )
+    db.add(item)
+    await db.commit()
+    await _lease_for(db, scope, item, lease_last_owner_contact_at=old)
+    request = await _pending_initial_plan(db, item, slots, old)
+    monkeypatch.setattr(github_dispatch_service, "_leader_is_active", AsyncMock(return_value=False))
+    execute = db.execute
+    preset_id = preset.id
+    changed = False
+
+    async def race(statement, *args, **kwargs):
+        nonlocal changed
+        if not changed and isinstance(statement, Update) and statement.table.name == "github_work_items":
+            changed = True
+            await execute(update(AgentTeamPreset).where(AgentTeamPreset.id == preset_id)
+                          .values(github_nudge_grace_seconds=600).execution_options(synchronize_session=False))
+            await db.commit()
+        return await execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, "execute", race)
+    await github_dispatch_service._monitor_leader_ack(db, scope, item, leader, request)
+    await db.refresh(request)
+    await db.refresh(item)
+    assert changed
+    assert request.status == "pending" and request.leader_ack_reminded_at is None
+    assert request.leader_activity_extended_at is None
+    assert item.dispatch_status == "dispatched" and item.last_nudge_at is None
+    assert await db.scalar(select(func.count()).select_from(MailMessage)) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("team_grace", "age", "escalated"), [(None, 185, True), (None, 90, False), (60, 90, True)])
+async def test_monitor_escalates_leader_ack_after_nudge_grace(db, monkeypatch, team_grace, age, escalated):
+    monkeypatch.setattr(settings, "github_nudge_grace_seconds", 180)
+    preset, slots, scope = await _team(db)
+    preset.github_nudge_grace_seconds = team_grace
     architect, backend = slots[0], slots[1]
     old = datetime.utcnow() - timedelta(
         seconds=settings.github_leader_ack_timeout_seconds
         + settings.github_owner_registration_grace_seconds
         + 10
     )
-    nudged = datetime.utcnow() - timedelta(seconds=settings.github_nudge_grace_seconds + 5)
+    nudged = datetime.utcnow() - timedelta(seconds=age)
     item = GithubWorkItem(
         scope_id=scope.id,
         issue_number=921,
@@ -6727,10 +6916,10 @@ async def test_monitor_escalates_leader_ack_after_nudge_grace(db):
         db, scope, preset_slots=slots, wake_state_by_slot={architect.id: "wakeable", backend.id: "wakeable"}
     )
     await db.refresh(item)
-    assert item.dispatch_status == "escalated"
-    assert item.escalation_reason == "leader_ack_timeout"
+    assert item.dispatch_status == ("escalated" if escalated else "dispatched")
+    assert item.escalation_reason == ("leader_ack_timeout" if escalated else None)
     await db.refresh(request)
-    assert request.status == "superseded"
+    assert request.status == ("superseded" if escalated else "pending")
 
 
 @pytest.mark.asyncio
@@ -6837,12 +7026,18 @@ async def test_monitor_ack_timeout_uses_request_time_not_recent_activity(db):
 
 
 @pytest.mark.asyncio
-async def test_monitor_nudges_idle_owner_after_ack(db):
+@pytest.mark.parametrize(("team_idle", "attempt_idle", "age", "nudged"), [
+    (None, None, 930, True),
+    (None, None, 240, False),
+    (120, None, 240, True),
+    (120, 900, 240, False),
+])
+async def test_monitor_nudges_idle_owner_after_ack(db, monkeypatch, team_idle, attempt_idle, age, nudged):
+    monkeypatch.setattr(settings, "github_owner_idle_timeout_seconds", 900)
     preset, slots, scope = await _team(db)
+    preset.github_owner_idle_timeout_seconds = team_idle
     architect, backend = slots[0], slots[1]
-    old = datetime.utcnow() - timedelta(
-        seconds=settings.github_owner_idle_timeout_seconds + 30
-    )
+    old = datetime.utcnow() - timedelta(seconds=age)
     item = GithubWorkItem(
         scope_id=scope.id,
         issue_number=930,
@@ -6854,6 +7049,7 @@ async def test_monitor_nudges_idle_owner_after_ack(db):
         dispatched_at=old,
         updated_at=old,
         ack_received_at=old,
+        delivery_policy={"owner_idle_seconds": attempt_idle} if attempt_idle is not None else None,
     )
     db.add(item)
     await db.commit()
@@ -6864,8 +7060,30 @@ async def test_monitor_nudges_idle_owner_after_ack(db):
     )
     await db.refresh(item)
     assert item.dispatch_status == "dispatched"
-    assert item.last_nudge_at is not None
+    assert (item.last_nudge_at is not None) is nudged
     assert item.escalation_reason is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("team_idle", "code"), [(None, None), (120, "effort_extension_no_recent_activity")])
+async def test_effort_extension_freshness_uses_team_idle_window(db, monkeypatch, team_idle, code):
+    from app.services.github_effort_limit_service import effort_limit_service
+
+    monkeypatch.setattr(settings, "github_owner_idle_timeout_seconds", 900)
+    preset, slots, scope = await _team(db)
+    preset.github_owner_idle_timeout_seconds = team_idle
+    now = datetime.utcnow()
+    contact = now - timedelta(seconds=300)
+    item = GithubWorkItem(
+        scope_id=scope.id, issue_number=933, issue_title="Effort fixture", issue_url="u",
+        github_updated_at=now, dispatch_status="dispatched", owner_slot_id=slots[1].id,
+        ack_received_at=contact,
+    )
+    db.add(item)
+    await db.commit()
+    await _lease_for(db, scope, item, lease_last_owner_contact_at=contact)
+
+    assert await effort_limit_service._read_activity(db, item, scope, now) == (code, contact)
 
 
 @pytest.mark.asyncio
@@ -6901,13 +7119,23 @@ async def test_monitor_idle_owner_activity_resets_clock(db):
 
 
 @pytest.mark.asyncio
-async def test_monitor_escalates_idle_owner_after_nudge_grace(db):
+@pytest.mark.parametrize(("team_grace", "attempt_grace", "age", "escalated"), [
+    (None, None, 185, True),
+    (None, None, 90, False),
+    (60, None, 90, True),
+    (60, 180, 90, False),
+])
+async def test_monitor_escalates_idle_owner_after_nudge_grace(
+    db, monkeypatch, team_grace, attempt_grace, age, escalated,
+):
+    monkeypatch.setattr(settings, "github_nudge_grace_seconds", 180)
     preset, slots, scope = await _team(db)
+    preset.github_nudge_grace_seconds = team_grace
     architect, backend = slots[0], slots[1]
     old = datetime.utcnow() - timedelta(
         seconds=settings.github_owner_idle_timeout_seconds + 60
     )
-    nudged = datetime.utcnow() - timedelta(seconds=settings.github_nudge_grace_seconds + 5)
+    nudged = datetime.utcnow() - timedelta(seconds=age)
     item = GithubWorkItem(
         scope_id=scope.id,
         issue_number=932,
@@ -6920,6 +7148,7 @@ async def test_monitor_escalates_idle_owner_after_nudge_grace(db):
         ack_received_at=old,
         updated_at=old,
         last_nudge_at=nudged,
+        delivery_policy={"owner_nudge_grace_seconds": attempt_grace} if attempt_grace is not None else None,
     )
     db.add(item)
     await db.commit()
@@ -6929,8 +7158,8 @@ async def test_monitor_escalates_idle_owner_after_nudge_grace(db):
         db, scope, preset_slots=slots, wake_state_by_slot={architect.id: "wakeable", backend.id: "wakeable"}
     )
     await db.refresh(item)
-    assert item.dispatch_status == "escalated"
-    assert item.escalation_reason == "owner_idle_timeout"
+    assert item.dispatch_status == ("escalated" if escalated else "dispatched")
+    assert item.escalation_reason == ("owner_idle_timeout" if escalated else None)
 
 
 @pytest.mark.asyncio
@@ -8207,6 +8436,43 @@ async def test_stale_release_reminder_reservation_does_not_block_later_lease(db,
 
 
 @pytest.mark.asyncio
+async def test_release_reminder_refuses_changed_team_grace(db, monkeypatch):
+    from sqlalchemy.sql.dml import Update
+
+    preset, slots, scope = await _team(db)
+    preset.github_nudge_grace_seconds = 180
+    await _create_registered_slot_member(db, slots[1])
+    _, workspace = await _leased_item_for_reminder(
+        db, scope, issue_number=973, dispatch_status="merged", owner_slot_id=slots[1].id)
+    reminded_at = datetime.utcnow() - timedelta(seconds=300)
+    workspace.lease_release_reminder_count = 1
+    workspace.lease_release_reminded_at = reminded_at
+    await db.commit()
+    execute = db.execute
+    preset_id = preset.id
+    changed = False
+
+    async def race(statement, *args, **kwargs):
+        nonlocal changed
+        if (not changed and isinstance(statement, Update)
+                and statement.table.name == "github_workspaces"
+                and "lease_release_reminder_count" in statement.compile().params):
+            changed = True
+            await execute(update(AgentTeamPreset).where(AgentTeamPreset.id == preset_id)
+                          .values(github_nudge_grace_seconds=600).execution_options(synchronize_session=False))
+            await db.commit()
+        return await execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, "execute", race)
+    assert await github_dispatch_service.remind_held_leases(db, scope) == 0
+    await db.refresh(workspace)
+    assert changed
+    assert workspace.lease_release_reminder_count == 1
+    assert workspace.lease_release_reminded_at == reminded_at
+    assert await db.scalar(select(func.count()).select_from(MailMessage)) == 0
+
+
+@pytest.mark.asyncio
 async def test_release_reminder_cap_audit_failure_rolls_back_mail_and_count(db, monkeypatch):
     from app.services import factory_audit_service as audit
     _, slots, scope = await _team(db)
@@ -8944,3 +9210,73 @@ async def test_a_prepared_item_that_holds_the_slot_still_starts_after_a_higher_i
     launched = []
     await _poll(db, scope, slots, labels, launched)  # 904 finds the slot held by 905's prepared attempt
     assert await _dispatched(db, scope) == [905]  # the holder is not locked out of its own reservation
+
+
+
+@pytest.mark.asyncio
+async def test_dispatch_pause_defers_ready_work_until_the_next_resumed_poll(db, monkeypatch):
+    from app.services.agent_team_service import agent_team_service
+
+    preset, slots, scope = await _team(db)
+    pending = await _pending_item(db, scope, 9153)
+    preset.autonomy_enabled = True
+    preset.dispatch_paused = True
+    await db.commit()
+    launcher = AsyncMock(return_value=_Launched())
+    monkeypatch.setattr(github_dispatch_service, "_send_dispatch_brief_to_slot", AsyncMock())
+
+    for _ in range(3):
+        await github_dispatch_service.dispatch_pending(db, scope, slots, launcher=launcher,
+            issue_labels_by_number={9153: ["area:backend"]})
+        await db.refresh(pending)
+        assert (pending.dispatch_status, pending.pending_reason) == ("pending", "dispatch_paused")
+    launcher.assert_not_awaited()
+    assert pending.owner_slot_id is None
+    assert await db.scalar(select(GithubWorkspace.id).where(GithubWorkspace.leased_item_id == pending.id)) is None
+
+    await agent_team_service.set_dispatch_pause(db, preset.id, paused=False, reason="Drain complete")
+    await db.refresh(pending)
+    assert (pending.dispatch_status, pending.pending_reason) == ("pending", None)
+    await github_dispatch_service.dispatch_pending(db, scope, slots, launcher=launcher,
+        issue_labels_by_number={9153: ["area:backend"]})
+    assert (pending.dispatch_status, pending.pending_reason) == ("dispatched", None)
+    launcher.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_pause_set_after_routing_fences_the_new_claim(db):
+    preset, slots, scope = await _team(db)
+    item = await _pending_item(db, scope, 9154)
+    preset.autonomy_enabled = True
+    await db.commit()
+    owner, method = await github_dispatch_service.route_item(
+        db, item, slots, ["area:backend"], leader_slot_id=preset.leader_slot_id)
+    preset.dispatch_paused = True
+    await db.commit()
+    assert not await github_dispatch_service._claim_dispatch_start(
+        db, scope, item, owner_slot_id=owner, routing_method=method, require_autonomy=True)
+    assert (item.dispatch_status, item.pending_reason, item.owner_slot_id) == ("pending", "dispatch_paused", None)
+
+
+
+@pytest.mark.asyncio
+async def test_dispatch_pause_after_a_committed_claim_keeps_that_start_in_flight(db, monkeypatch):
+    from app.services.agent_team_service import agent_team_service
+
+    preset, slots, scope = await _team(db)
+    preset.autonomy_enabled = True
+    item = await _pending_item(db, scope, 9155)
+    original = github_workspace_service.acquire
+
+    async def acquire(session, claim_scope, claimed):
+        assert claimed.dispatch_status == "dispatched"
+        await agent_team_service.set_dispatch_pause(session, preset.id, paused=True, reason="Drain jobs")
+        return await original(session, claim_scope, claimed)
+
+    monkeypatch.setattr(github_workspace_service, "acquire", acquire)
+    monkeypatch.setattr(github_dispatch_service, "_send_dispatch_brief_to_slot", AsyncMock())
+    launcher = AsyncMock(return_value=_Launched())
+    await github_dispatch_service.dispatch_pending(db, scope, slots, launcher=launcher,
+        issue_labels_by_number={9155: ["area:backend"]}, require_autonomy=True)
+    launcher.assert_awaited_once()
+    assert item.dispatch_status == "dispatched" and preset.dispatch_paused

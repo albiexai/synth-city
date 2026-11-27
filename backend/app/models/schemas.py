@@ -2681,6 +2681,10 @@ class TeamWorkSettings(BaseModel):
     mail_request_unanswered_seconds: int | None = Field(default=None, strict=True, ge=60, le=86400)
     github_team_idle_timeout_seconds: int | None = Field(default=None, strict=True, ge=30, le=86400)
     github_publish_summaries_enabled: bool | None = Field(default=None, strict=True)
+    github_owner_idle_timeout_seconds: int | None = Field(default=None, strict=True, ge=60, le=86400)
+    github_nudge_grace_seconds: int | None = Field(default=None, strict=True, ge=30, le=3600)
+    wake_followup_enabled: bool | None = Field(default=None, strict=True)
+    wake_followup_delay_seconds: int | None = Field(default=None, strict=True, ge=30, le=3600)
 
 
 class AgentTeamPresetUpdate(CampaignPresetFields, TeamWorkSettings):
@@ -2699,8 +2703,17 @@ class AgentTeamPresetResponse(CampaignPresetFields):
     created_at: datetime
     updated_at: datetime
     autonomy_enabled: bool = False
+    dispatch_paused: bool = False
+    dispatch_pause_reason: str | None = None
+    dispatch_paused_by: str | None = None
     leader_slot_id: Optional[int] = None
     slots: List[AgentTeamSlotResponse] = Field(default_factory=list)
+
+
+class AgentTeamDispatchPauseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+    paused: bool
+    reason: str = Field(min_length=1, max_length=500)
 
 
 class AgentTeamLeaderUpdateRequest(BaseModel):
@@ -2907,7 +2920,7 @@ class TeamGithubScopeSettingsResponse(BaseModel):
 
 class TeamWorkSettingsResponse(BaseModel):
     overrides: TeamWorkSettings
-    defaults: TeamWorkSettings
+    defaults: dict[str, int | bool]
     history: list[ScopeSettingsHistoryEntry]
     next_before_id: int | None = None
 

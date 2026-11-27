@@ -76,6 +76,9 @@ export interface AgentTeamPreset {
   created_at: string
   updated_at: string
   autonomy_enabled: boolean
+  dispatch_paused?: boolean
+  dispatch_pause_reason?: string | null
+  dispatch_paused_by?: string | null
   leader_slot_id?: number | null
   slots: AgentTeamSlot[]
 }
@@ -157,6 +160,8 @@ export interface CampaignDecision { text: string; state: 'later' | 'now' | 'done
 // The progress of one team's campaign (#548, #587). Counts come from the server.
 export interface TeamCampaignSummary {
   backlog_state: 'available' | 'backlog unavailable'
+  backlog_observed_at?: string | null
+  backlog_stale?: boolean
   done_count: number
   /** The part of done_count merged into a branch other than the scope's base (#1106). */
   done_on_other_branch_count?: number
@@ -342,6 +347,10 @@ export interface TeamWorkSettings {
   mail_request_unanswered_seconds: number | null
   github_team_idle_timeout_seconds: number | null
   github_publish_summaries_enabled: boolean | null
+  github_owner_idle_timeout_seconds: number | null
+  github_nudge_grace_seconds: number | null
+  wake_followup_enabled: boolean | null
+  wake_followup_delay_seconds: number | null
 }
 
 export interface AgentTeamPresetUpdate extends Partial<TeamWorkSettings> {

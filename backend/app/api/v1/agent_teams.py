@@ -57,6 +57,7 @@ from app.models.schemas import (
     AgentTeamActivityResponse,
     AgentTeamCreateFromBridgeRequest,
     AgentTeamCreateFromMailRequest,
+    AgentTeamDispatchPauseRequest,
     AgentTeamLaunchPlan,
     AgentTeamLaunchRequest,
     AgentTeamLaunchResult,
@@ -122,6 +123,7 @@ from app.services.github_dispatch_service import (
     HandoffExternalEffectError,
     ResumeAttemptError,
     _item_identity,
+    dispatch_ref_contains_private_binding,
     github_dispatch_service,
 )
 from app.services.github_terminal_revision_service import TERMINAL_ITEMS
@@ -2602,6 +2604,22 @@ async def update_preset(
     return response
 
 
+@router.put("/presets/{preset_id}/dispatch-pause", response_model=AgentTeamPresetResponse,
+            dependencies=[Depends(require_director_action())])
+async def set_team_dispatch_pause(
+    preset_id: int,
+    request: AgentTeamDispatchPauseRequest,
+    db: AsyncSession = Depends(get_db),
+    write_context: dict = Depends(operator_write_context),
+):
+    try:
+        return await agent_team_service.set_dispatch_pause(
+            db, preset_id, paused=request.paused, reason=request.reason, actor=_write_actor(write_context),
+        )
+    except ValueError as exc:
+        raise _bad_request(exc) from exc
+
+
 @router.get("/presets/{preset_id}/work-settings", response_model=TeamWorkSettingsResponse)
 async def read_team_work_settings(
     preset_id: int,
@@ -3342,7 +3360,13 @@ async def list_github_work_items(
                 pending_revision=authority_by_item[item.id].pending_revision,
                 continuation_revision_count=authority_by_item[item.id].revision_count,
                 continuation_failed_head_count=authority_by_item[item.id].failed_head_count,
-            ).model_copy(update={"dispatch_nonce": None})  # unauthenticated read: the public generation names the dispatch
+            ).model_copy(update={
+                "dispatch_nonce": None,
+                "dispatch_head_ref": (
+                    None if dispatch_ref_contains_private_binding(item.dispatch_head_ref, item.dispatch_nonce)
+                    else item.dispatch_head_ref
+                ),
+            })
             for item, scope, workspace_path, _total in rows
         ],
         total=rows[0].total if rows else 0,

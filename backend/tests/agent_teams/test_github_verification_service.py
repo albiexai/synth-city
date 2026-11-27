@@ -1482,7 +1482,8 @@ async def test_base_ref_normalization_refuses_unsupported_values(db, base_ref):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("issue_type", "draft"), [("code", True), ("design", False)])
-async def test_pull_presentation_is_deterministic(db, issue_type, draft):
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_pull_presentation_is_deterministic_and_omits_private_binding(db, issue_type, draft, legacy):
     scope = await _scope(db)
     owner, _ = await _owner(db, scope)
     item = await _item(
@@ -1494,21 +1495,21 @@ async def test_pull_presentation_is_deterministic(db, issue_type, draft):
         issue_type=issue_type,
         dispatch_nonce="0123456789abcdef",
     )
-    head = "deck/slot-1/issue-42/0123456789abcdef"
+    head = f"deck/slot-1/issue-42-{'0123456789abcdef' if legacy else 'g1'}"
 
     assert github_verification_service.pull_title(item, owner) == (
         "[Owner] Make identity explicit (#42)"
     )
-    assert github_verification_service.pull_body(item, head_ref=head) == (
+    body = github_verification_service.pull_body(item, head_ref=head)
+    assert body == (
         "Closes #42\n\n"
         "Make identity explicit\n\n"
         "---\n"
         "Albiex Synth City provenance\n"
         f"- Work item: {item.id}\n"
-        f"- Owner slot: {owner.id}\n"
-        "- Dispatch nonce: 0123456789abcdef\n"
-        f"- Head ref: {head}"
-    )
+        f"- Owner slot: {owner.id}"
+    ) + ("" if legacy else f"\n- Head ref: {head}")
+    assert item.dispatch_nonce not in body
     assert github_verification_service.pull_is_draft(item) is draft
 
 
@@ -3219,10 +3220,12 @@ async def test_failed_check_dispatched_item_with_pr_is_reverified(db):
 
 
 @pytest.mark.asyncio
-async def test_auto_merge_success_sets_merged_and_budget_timestamp(db):
+@pytest.mark.parametrize("dispatch_paused", [False, True])
+async def test_auto_merge_success_sets_merged_and_budget_timestamp(db, dispatch_paused):
     scope = await _scope(db, merge_policy="auto", github_auth_mode="ambient")
     preset = await db.get(AgentTeamPreset, scope.preset_id)
     preset.autonomy_enabled = True
+    preset.dispatch_paused = dispatch_paused
     item = await _item(
         db,
         scope,
@@ -3230,6 +3233,14 @@ async def test_auto_merge_success_sets_merged_and_budget_timestamp(db):
         pr_number=5,
         last_verified_sha="sha",
     )
+    if dispatch_paused:
+        pending = await _item(db, scope, dispatch_status="pending", issue_number=2,
+            dispatch_head_ref=None, dispatch_base_ref=None, ack_approver_member_id=None)
+        slots = (await db.scalars(select(AgentTeamSlot).where(AgentTeamSlot.preset_id == preset.id))).all()
+        for _ in range(2):
+            await github_dispatch_service.dispatch_pending(db, scope, slots, launcher=AsyncMock())
+            await db.refresh(pending)
+            assert (pending.dispatch_status, pending.pending_reason) == ("pending", "dispatch_paused")
     client = _Client(
         check_runs=[{"name": "ci", "status": "completed", "conclusion": "success"}]
     )
@@ -3255,6 +3266,10 @@ async def test_auto_merge_success_sets_merged_and_budget_timestamp(db):
     assert client.merge_calls == 1
     client.create_issue_comment.assert_not_awaited()
     client.close_issue.assert_not_awaited()
+    if dispatch_paused:
+        await github_dispatch_service.dispatch_pending(db, scope, slots, launcher=AsyncMock())
+        await db.refresh(pending)
+        assert (pending.dispatch_status, pending.pending_reason) == ("pending", "dispatch_paused")
 
     await github_verification_service.process_scope(db, scope, client=client)
 

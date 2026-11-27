@@ -100,14 +100,17 @@ export function EditTeamPanel({
 }
 
 const timers = [
-  ['mail_request_unanswered_seconds', 'Unanswered Mail timeout', 60],
-  ['github_team_idle_timeout_seconds', 'Team idle timeout', 30],
+  ['mail_request_unanswered_seconds', 'Unanswered Mail timeout', 60, 86400],
+  ['github_team_idle_timeout_seconds', 'Team idle timeout', 30, 86400],
+  ['github_owner_idle_timeout_seconds', 'Owner idle timeout', 60, 86400],
+  ['github_nudge_grace_seconds', 'Nudge grace', 30, 3600],
+  ['wake_followup_delay_seconds', 'Wake follow-up delay', 30, 3600],
 ] as const
-const summarySetting = 'github_publish_summaries_enabled'
-const labels: Record<string, string> = {
-  ...Object.fromEntries(timers.map(([field, label]) => [field, label])),
-  [summarySetting]: 'Publish GitHub summaries',
-}
+const toggles = [
+  ['github_publish_summaries_enabled', 'Publish GitHub summaries'],
+  ['wake_followup_enabled', 'Wake follow-up'],
+] as const
+const labels = Object.fromEntries([...timers, ...toggles].map(([field, label]) => [field, label]))
 
 function settingText(value: unknown) {
   if (typeof value === 'boolean') return value ? 'On' : 'Off'
@@ -140,8 +143,6 @@ export function TeamWorkSettingsEditor({ load, save }: {
       In effect {settingText(data.overrides[key] ?? data.defaults[key])} · {data.overrides[key] == null ? 'Installation default' : 'Team override'}
     </span>
   )
-  const summaryValue = draft[summarySetting] === undefined ? data?.overrides[summarySetting] : draft[summarySetting]
-  const summaryLabel = labels[summarySetting]
   return (
     <section aria-label="Team work settings" className="space-y-3 border-t pt-4">
       <h4 className="text-sm font-semibold">Work settings</h4>
@@ -151,29 +152,34 @@ export function TeamWorkSettingsEditor({ load, save }: {
       ) : (
         <form className="space-y-3" onSubmit={(event) => { event.preventDefault(); void run(() => save(draft)) }}>
           <fieldset disabled={busy} className="grid gap-3 sm:grid-cols-2">
-            {timers.map(([key, label, minimum]) => (
+            {timers.map(([key, label, minimum, maximum]) => (
               <div key={key} className="grid gap-1">
                 <Label htmlFor={key}>{label} (seconds)</Label>
-                <Input id={key} type="number" min={minimum} max={86400}
+                <Input id={key} type="number" min={minimum} max={maximum}
                   placeholder={String(data.defaults[key])}
                   value={(draft[key] === undefined ? data.overrides[key] : draft[key]) ?? ''}
                   onChange={(event) => setDraft({ ...draft, [key]: event.target.value === '' ? null : event.target.valueAsNumber })} />
                 {effective(key)}
               </div>
             ))}
-            <div className="grid gap-1">
-              <Label htmlFor={summarySetting}>{summaryLabel}</Label>
-              <select id={summarySetting} className="h-9 rounded-md border bg-background px-2 text-sm"
-                value={summaryValue == null ? '' : String(summaryValue)}
-                onChange={(event) => setDraft({ ...draft, [summarySetting]: event.target.value === '' ? null : event.target.value === 'true' })}>
-                <option value="">Installation default</option>
-                <option value="true">On</option>
-                <option value="false">Off</option>
-              </select>
-              {effective(summarySetting)}
-            </div>
+            {toggles.map(([key, label]) => {
+              const value = draft[key] === undefined ? data.overrides[key] : draft[key]
+              return (
+                <div key={key} className="grid gap-1">
+                  <Label htmlFor={key}>{label}</Label>
+                  <select id={key} className="h-9 rounded-md border bg-background px-2 text-sm"
+                    value={value == null ? '' : String(value)}
+                    onChange={(event) => setDraft({ ...draft, [key]: event.target.value === '' ? null : event.target.value === 'true' })}>
+                    <option value="">Installation default</option>
+                    <option value="true">On</option>
+                    <option value="false">Off</option>
+                  </select>
+                  {effective(key)}
+                </div>
+              )
+            })}
           </fieldset>
-          <p className="text-xs text-muted-foreground">Clear a timeout to use the installation default.</p>
+          <p className="text-xs text-muted-foreground">Clear a delay or timeout to use the installation default.</p>
           <Button type="submit" disabled={busy || !Object.keys(draft).length}>Save work settings</Button>
           <details className="space-y-2 text-sm">
             <summary className="cursor-pointer font-medium">Work settings history</summary>

@@ -5,15 +5,17 @@ import enum
 import asyncio
 import hmac
 import logging
+import re
 import secrets
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 
-from sqlalchemy import String, and_, cast, exists, func, or_, select, update
+from sqlalchemy import String, and_, cast, exists, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.services.factory_delivery_policy import owner_contact_windows
 from app.models.database import (
     AgentPaneBinding,
     AgentTeamPreset,
@@ -74,15 +76,21 @@ _LAUNCH_FAILED_STATUSES = {
     "skipped_disabled",
 }
 _ATTEMPT_MARKERS = ("dispatch_nonce", "dispatch_head_ref", "dispatch_base_ref")
+_LEGACY_HEAD_REF = re.compile(r"deck/slot-[0-9]+/issue-[0-9]+-[0-9a-f]{16}")
 _START_IDENTITY_FIELDS = (
     "id", "scope_id", "dispatch_status", "owner_slot_id", "routing_method",
-    "dispatch_nonce", "dispatch_head_ref", "dispatch_base_ref", "dispatched_at",
+    "dispatch_nonce", "dispatch_attempt", "dispatch_head_ref", "dispatch_base_ref", "dispatched_at",
     "created_at", "handoff_state", "handoff_target_slot_id",
 )
 
 
 def _item_identity(item: GithubWorkItem) -> tuple:
     return tuple(getattr(item, field) for field in _START_IDENTITY_FIELDS)
+
+
+def dispatch_ref_contains_private_binding(ref: str | None, nonce: str | None) -> bool:
+    """Recognize legacy public refs even after the private binding changes."""
+    return bool(ref and ((nonce and nonce in ref) or _LEGACY_HEAD_REF.fullmatch(ref)))
 
 
 def _identity_value_clause(column, value):
@@ -193,6 +201,7 @@ def restored_escalation_reason(revision) -> str:
 
 PENDING_REASONS = frozenset(
     {
+        "dispatch_paused",
         "queued_repo_cap",
         "queued_low_memory",
         "queued_slot_busy",
@@ -338,16 +347,6 @@ def attempt_state(item: GithubWorkItem) -> AttemptState:
         f"base={markers[2] is not None} "
         f"round={item.approval_round_count} owner={item.owner_slot_id} "
         f"routing={item.routing_method!r}",
-    )
-
-
-def attempt_head_ref(item: GithubWorkItem, owner_slot_id: int, *, nonce: str | None = None) -> str:
-    nonce = nonce if nonce is not None else item.dispatch_nonce
-    if nonce is None:
-        raise PartiallyPreparedAttempt(item.id, "head requested before nonce mint")
-    return (
-        f"deck/slot-{owner_slot_id}/issue-{item.issue_number}-"
-        f"{nonce}"
     )
 
 
@@ -935,20 +934,30 @@ class GithubDispatchService:
         scope = await db.get(TeamGithubScope, item.scope_id)
         if scope is None:
             raise ValueError("Dispatch scope is missing")
+        # Allocate in the guarded writer statement so retries and replacement
+        # rows for this repository issue cannot reuse a published generation.
+        next_attempt = (
+            select(func.coalesce(func.max(GithubWorkItem.dispatch_attempt), 0) + 1)
+            .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
+            .where(
+                func.lower(TeamGithubScope.repo_owner) == scope.repo_owner.lower(),
+                func.lower(TeamGithubScope.repo_name) == scope.repo_name.lower(),
+                GithubWorkItem.issue_number == item.issue_number,
+            )
+            .correlate(None)
+            .scalar_subquery()
+        )
         values = dict(
             owner_slot_id=owner_slot_id, routing_method=routing_method, dispatch_nonce=nonce,
             delivery_policy=scope_policy(scope).model_dump(mode="json"),
             delivery_policy_revision=scope.delivery_policy_revision,
-            dispatch_head_ref=attempt_head_ref(item, owner_slot_id, nonce=nonce),
+            dispatch_attempt=next_attempt,
+            dispatch_head_ref=literal(f"deck/slot-{owner_slot_id}/issue-{item.issue_number}-g") + cast(next_attempt, String),
             dispatch_base_ref=base_ref, approval_round_count=1,
         )
-        if expected_identity is not None:
-            if not await self._update_current_item(db, item, expected_identity, **values):
-                return None
-        else:
-            for field, value in values.items():
-                setattr(item, field, value)
-            item.updated_at = datetime.utcnow()
+        identity = _item_identity(item) if expected_identity is None else expected_identity
+        if not await self._update_current_item(db, item, identity, **values):
+            return None
         await db.commit()
         return prepared_attempt_from_row(item)
 
@@ -1141,13 +1150,17 @@ class GithubDispatchService:
         if item.dispatch_status != "pending" or expected_identity != _item_identity(item):
             await db.commit()
             return False
+        preset = await db.get(AgentTeamPreset, preset_id, populate_existing=True)
+        if scope.preset_id == preset_id and preset is not None and preset.dispatch_paused:
+            item.pending_reason = "dispatch_paused"
+            await db.commit()
+            return False
         if (not await self._dispatch_authorized(db, scope, require_autonomy=require_autonomy)
             or scope.preset_id != preset_id or owner is None or not owner.enabled
             or owner.preset_id != preset_id):
             item.pending_reason = "leader_unavailable"
             await db.commit()
             return False
-        preset = await db.get(AgentTeamPreset, preset_id, populate_existing=True)
         if _ineligible_owner(owner, preset.leader_slot_id if preset else None):
             item.pending_reason = "no_eligible_owner"
             item.status_note = NO_ELIGIBLE_OWNER_NOTE
@@ -1258,6 +1271,19 @@ class GithubDispatchService:
         slots_by_id = {slot.id: slot for slot in preset_slots}
         preset = await db.get(AgentTeamPreset, scope.preset_id)
         leader = next((slot for slot in preset_slots if preset and slot.id == preset.leader_slot_id and slot.enabled), None)
+        if leader is not None:
+            await github_workspace_service.reclaim_stale(db, scope)
+            await self._advance_queued_handoffs(db, scope, require_autonomy=require_autonomy)
+        pause = select(AgentTeamPreset.id).where(
+            AgentTeamPreset.id == scope.preset_id, AgentTeamPreset.dispatch_paused.is_(True),
+        )
+        if await db.scalar(pause):
+            await db.execute(update(GithubWorkItem).where(
+                GithubWorkItem.scope_id == scope.id, GithubWorkItem.dispatch_status == "pending",
+                GithubWorkItem.pending_reason.is_distinct_from("dispatch_paused"), pause.exists(),
+            ).values(pending_reason="dispatch_paused", updated_at=datetime.utcnow()))
+            await db.commit()
+            return
         if leader is None:
             for item in (await db.execute(select(GithubWorkItem).where(
                 GithubWorkItem.scope_id == scope.id,
@@ -1266,9 +1292,6 @@ class GithubDispatchService:
                 await self._update_current_item(db, item, _item_identity(item), pending_reason="leader_unavailable")
             await db.commit()
             return
-        await github_workspace_service.reclaim_stale(db, scope)
-        await self._advance_queued_handoffs(db, scope, require_autonomy=require_autonomy)
-
         pending = (
             await db.execute(
                 select(GithubWorkItem).where(
@@ -3035,8 +3058,10 @@ class GithubDispatchService:
                 if anchor is None:
                     await self._nudge_owner_for_brief(db, item)
                     continue
+                preset = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
+                _, brief_grace = owner_contact_windows(preset)
                 if datetime.utcnow() - anchor <= timedelta(
-                    seconds=settings.github_nudge_grace_seconds
+                    seconds=brief_grace
                 ):
                     continue
                 if (
@@ -3053,19 +3078,19 @@ class GithubDispatchService:
                     continue
             from app.services.factory_delivery_policy import effective_policy
             from app.services.native_owner_contact import contact_context, refresh_contact_context, renew_native_owner_contact
-            policy = effective_policy(item, scope)
             workspace = await github_workspace_service.get_leased_workspace(db, item.id)
             expected_contact = contact_context(item, workspace)
             await renew_native_owner_contact(db, scope, item, workspace)
             if not await refresh_contact_context(db, item, workspace, None, expected_contact):
                 continue
-            policy = effective_policy(item, scope)
+            preset = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
+            idle_seconds, grace_seconds = owner_contact_windows(preset, effective_policy(item, scope))
             idle_anchor = max(value for value in (
                 item.updated_at or item.created_at,
                 workspace.lease_last_owner_contact_at if workspace is not None else None,
             ) if value is not None)
             idle_overdue = datetime.utcnow() - idle_anchor > timedelta(
-                seconds=policy.owner_idle_seconds or settings.github_owner_idle_timeout_seconds
+                seconds=idle_seconds
             )
             from app.services.owner_observation_pause import initial_recovery_grace
             idle_overdue = idle_overdue or await initial_recovery_grace(db, item, idle_anchor)
@@ -3074,7 +3099,7 @@ class GithubDispatchService:
             if item.last_nudge_at is None or item.last_nudge_at < idle_anchor:
                 await self._nudge_owner_for_progress(db, item)
             elif datetime.utcnow() - item.last_nudge_at > timedelta(
-                seconds=policy.owner_nudge_grace_seconds or settings.github_nudge_grace_seconds
+                seconds=grace_seconds
             ):
                 from app.services.owner_observation_pause import handle_observation_gap
                 if await handle_observation_gap(db, scope, item):
@@ -3157,12 +3182,6 @@ class GithubDispatchService:
                 )
             )
         ).scalars().all()
-        now = datetime.utcnow()
-        idle_timeout = timedelta(
-            seconds=settings.github_owner_idle_timeout_seconds
-        )
-        nudge_grace = timedelta(seconds=settings.github_nudge_grace_seconds)
-
         for item in items:
             revision = (
                 await db.execute(
@@ -3207,16 +3226,12 @@ class GithubDispatchService:
             workspace = await github_workspace_service.get_leased_workspace(db, item.id)
             from app.services.factory_delivery_policy import effective_policy
             from app.services.native_owner_contact import contact_context, refresh_contact_context, renew_native_owner_contact
-            policy = effective_policy(item, scope)
-            idle_timeout = timedelta(seconds=policy.owner_idle_seconds or settings.github_owner_idle_timeout_seconds)
-            nudge_grace = timedelta(seconds=policy.owner_nudge_grace_seconds or settings.github_nudge_grace_seconds)
             expected_contact = contact_context(item, workspace, revision)
             await renew_native_owner_contact(db, scope, item, workspace, revision)
             if not await refresh_contact_context(db, item, workspace, revision, expected_contact):
                 continue
-            policy = effective_policy(item, scope)
-            idle_timeout = timedelta(seconds=policy.owner_idle_seconds or settings.github_owner_idle_timeout_seconds)
-            nudge_grace = timedelta(seconds=policy.owner_nudge_grace_seconds or settings.github_nudge_grace_seconds)
+            preset = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
+            idle_seconds, grace_seconds = owner_contact_windows(preset, effective_policy(item, scope))
             now = datetime.utcnow()
             anchors = [
                 value
@@ -3239,7 +3254,7 @@ class GithubDispatchService:
                 continue
             anchor = max(anchors)
             elapsed = now - anchor
-            if elapsed <= idle_timeout:
+            if elapsed <= timedelta(seconds=idle_seconds):
                 continue
             if (
                 item.continuation_nudged_at is None
@@ -3275,7 +3290,7 @@ class GithubDispatchService:
                     action="nudge_owner",
                 )
                 continue
-            if now - item.continuation_nudged_at <= nudge_grace:
+            if now - item.continuation_nudged_at <= timedelta(seconds=grace_seconds):
                 continue
             from app.services.owner_observation_pause import handle_observation_gap
             if await handle_observation_gap(db, scope, item):
@@ -3836,7 +3851,11 @@ class GithubDispatchService:
             count = workspace.lease_release_reminder_count
             if count < 0 or count >= LEASE_RELEASE_REMINDER_CAP or not self.release_reminder_needed(scope, item):
                 continue
-            delay = max(settings.github_nudge_grace_seconds * (1, 1, 4, 15)[count],
+            preset = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
+            if preset is None:
+                continue
+            _, grace = owner_contact_windows(preset)
+            delay = max(grace * (1, 1, 4, 15)[count],
                         (0, 240, 900, 3600)[count])
             if (workspace.lease_release_reminded_at is not None
                 and now - workspace.lease_release_reminded_at < timedelta(seconds=delay)):
@@ -3878,7 +3897,9 @@ class GithubDispatchService:
                     TeamGithubScope.continuation_enabled == scope.continuation_enabled,
                     exists(select(AgentTeamPreset.id).where(
                         AgentTeamPreset.id == TeamGithubScope.preset_id,
+                        AgentTeamPreset.id == preset.id,
                         AgentTeamPreset.autonomy_enabled == autonomy,
+                        AgentTeamPreset.github_nudge_grace_seconds == preset.github_nudge_grace_seconds,
                     )),
                 )),
             ]
@@ -4058,7 +4079,7 @@ class GithubDispatchService:
         if elapsed < initial:
             return
         preset_fields = ("leader_slot_id", "supervisor_actor_id", "autonomy_enabled",
-                         "leader_ack_timeout_seconds", "leader_ack_max_wait_seconds")
+                         "leader_ack_timeout_seconds", "leader_ack_max_wait_seconds", "github_nudge_grace_seconds")
         expected_preset = tuple(getattr(preset, field) for field in preset_fields)
         expected_scope = (scope.enabled, scope.preset_id)
         expected_leader = (leader.enabled, leader.provider, dict(leader.launch_options or {}))
@@ -4120,9 +4141,10 @@ class GithubDispatchService:
         reminded = request.leader_ack_reminded_at
         if reminded is None and item.last_nudge_at is not None and item.last_nudge_at >= request.created_at:
             reminded = item.last_nudge_at  # A pre-upgrade reminder already spent its grace.
+        _, grace = owner_contact_windows(preset)
         if elapsed >= maximum or (reminded is not None and not active
                 and request.leader_activity_extended_at is None
-                and now - reminded > timedelta(seconds=settings.github_nudge_grace_seconds)):
+                and now - reminded > timedelta(seconds=grace)):
             await self.escalate(db, item, "leader_ack_timeout", initial_request=request)
             return
         conditions = (

@@ -94,7 +94,8 @@ def preset(s: Seeder, preset_id: int, name: str, description: str, *, autonomy: 
     s.insert(
         "agent_team_presets", id=preset_id, name=name, description=description,
         created_by="e2e-seed", created_at=at(days=20), updated_at=at(days=1),
-        autonomy_enabled=int(autonomy), leader_slot_id=leader_slot, supervisor_binding_version=0,
+        autonomy_enabled=int(autonomy), dispatch_paused=0,
+        leader_slot_id=leader_slot, supervisor_binding_version=0,
     )
 
 
@@ -160,7 +161,7 @@ def item(s: Seeder, item_id: int, scope_id: int, owner: str, repo: str, number: 
         last_nudge_at=None, retry_requested_at=None, brief_delivery_nudge_at=None,
         brief_delivery_nudge_count=None, brief_message_id=None,
         ack_approver_member_id=1 if owner_slot else None, ack_evidence_message_id=None,
-        dispatch_nonce=nonce, ack_enforcement_epoch=None,
+        dispatch_nonce=nonce, dispatch_attempt=0, ack_enforcement_epoch=None,
         ack_approval_round=1 if owner_slot else None,
         dispatch_head_ref=f"deck/slot-{owner_slot}/issue-{number}-{nonce}" if owner_slot else None,
         dispatch_base_ref="origin/main" if owner_slot else None,

@@ -331,13 +331,29 @@ describe('Progress', () => {
 
   const unavailable = { backlog_state: 'backlog unavailable', not_started_count: null, not_started_groups: [] } as const
 
+  it('shows the last successful observation time beside the available backlog counts once stale', async () => {
+    run({ backlog_observed_at: stamp, backlog_stale: true })
+    await open()
+    const card = screen.getByRole('article', { name: /Progress:/ })
+    const note = within(card).getByText(/backlog as of/i)
+    expect(note.querySelector('time')).toHaveAttribute('dateTime', stamp)
+    expect(within(card).getByText('of 12 done', { exact: false })).toBeInTheDocument()
+  })
+
+  it('omits the as-of note for a fresh observation', async () => {
+    run({ backlog_observed_at: stamp, backlog_stale: false })
+    await open()
+    expect(screen.queryByText(/backlog as of/i)).not.toBeInTheDocument()
+  })
+
   it('draws the bar over the known work when the backlog cannot be read, and says the backlog is unknown', async () => {
-    run(unavailable)
+    run({ ...unavailable, backlog_observed_at: stamp, backlog_stale: true })
     await open()
     const card = screen.getByRole('article', { name: /Progress:/ })
     // 6 done, 2 under way and 1 queued are known; the total is not guessed.
     expect(within(card).getByText('of 9 known items done', { exact: false })).toBeInTheDocument()
     expect(within(card).getByText('backlog unknown')).toBeInTheDocument()
+    expect(within(card).queryByText(/backlog as of/i)).not.toBeInTheDocument()
     const bar = within(card).getByRole('img')
     expect(bar).toHaveAttribute('aria-label', '6 done, 2 under way, 1 still to do, backlog unknown')
     // A dashed end marks the unknown remainder, so the bar never looks nearly complete.
@@ -585,4 +601,20 @@ describe('Overview filters', () => {
     expect(needsYouAlerts()).toHaveLength(0)
     expect(within(needsYouList()).getByRole('link', { name: /Open #47/ })).toBeInTheDocument()
   })
+})
+
+
+
+it('shows the paused intake reason and operator beside the running team on Overview', async () => {
+  serve({
+    presets: [{ ...preset(1, 'Release crew', true), dispatch_paused: true,
+      dispatch_pause_reason: 'Drain for checkpoint', dispatch_paused_by: 'operator' }],
+    summaries: { 1: summary() },
+    overview: overviewWith({}),
+  })
+  await open()
+  const card = screen.getByRole('region', { name: 'Team summary: Release crew' })
+  expect(within(card).getByText('Dispatch paused')).toBeInTheDocument()
+  expect(within(card).getByText(/Drain for checkpoint.*Set by Operator/)).toBeInTheDocument()
+  expect(within(card).getByText('Running')).toBeInTheDocument()
 })

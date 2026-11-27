@@ -529,9 +529,10 @@ def test_whole_tree_writers_stay_inside_declared_namespaces():
     assert forbidden == []
 
     dynamic_setattr = [write for write in writes if write.form == "setattr_unknown"]
-    assert len(dynamic_setattr) == 2
-    assert all(write.path.as_posix() == "services/github_dispatch_service.py"
-               for write in dynamic_setattr)
+    # Retry clears the attempt markers. Preparation uses the guarded SQL writer.
+    assert [write.path.as_posix() for write in dynamic_setattr] == [
+        "services/github_dispatch_service.py",
+    ]
 
     unrelated_dynamic_setattr = [
         write for write in writes if write.form == "setattr_other_unknown"

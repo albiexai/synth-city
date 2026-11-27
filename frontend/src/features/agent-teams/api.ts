@@ -100,6 +100,14 @@ export function updateAgentTeamPreset(
   })
 }
 
+export function setTeamDispatchPause(presetId: number, paused: boolean, reason: string, operatorToken: string) {
+  return apiClient<AgentTeamPreset>(`agent-teams/presets/${presetId}/dispatch-pause`, {
+    method: 'PUT',
+    headers: operatorHeaders(operatorToken),
+    body: JSON.stringify({ paused, reason }),
+  })
+}
+
 export function fetchTeamWorkSettings(presetId: number, operatorToken: string, beforeId?: number): Promise<TeamWorkSettingsResponse> {
   const query = beforeId == null ? '' : `?before_id=${beforeId}`
   return apiClient<TeamWorkSettingsResponse>(`agent-teams/presets/${presetId}/work-settings${query}`, {

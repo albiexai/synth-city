@@ -870,6 +870,13 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         ("mail_request_unanswered_seconds", "INTEGER"),
         ("github_team_idle_timeout_seconds", "INTEGER"),
         ("github_publish_summaries_enabled", "BOOLEAN"),
+        ("github_owner_idle_timeout_seconds", "INTEGER"),
+        ("github_nudge_grace_seconds", "INTEGER"),
+        ("wake_followup_enabled", "BOOLEAN"),
+        ("wake_followup_delay_seconds", "INTEGER"),
+        ("dispatch_paused", "BOOLEAN DEFAULT 0 NOT NULL"),
+        ("dispatch_pause_reason", "VARCHAR"),
+        ("dispatch_paused_by", "VARCHAR"),
         ("supervisor_actor_id", "INTEGER REFERENCES mail_external_actors(id) ON DELETE SET NULL"),
         ("supervisor_checked_at", "DATETIME"), ("supervisor_next_check_at", "DATETIME"),
         ("supervisor_note", "VARCHAR"), ("supervisor_grace_seconds", "INTEGER"),
@@ -1046,6 +1053,8 @@ async def _run_sqlite_compat_migrations(conn) -> None:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN ack_evidence_message_id INTEGER"))
     if work_item_columns and "dispatch_nonce" not in work_item_columns:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN dispatch_nonce VARCHAR"))
+    if work_item_columns and "dispatch_attempt" not in work_item_columns:
+        await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN dispatch_attempt INTEGER DEFAULT 0 NOT NULL"))
     if work_item_columns and "ack_enforcement_epoch" not in work_item_columns:
         await conn.execute(text("ALTER TABLE github_work_items ADD COLUMN ack_enforcement_epoch INTEGER"))
     if work_item_columns and "ack_approval_round" not in work_item_columns:

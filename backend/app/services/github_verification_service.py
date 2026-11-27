@@ -50,7 +50,9 @@ from app.services.github_ci_watch_service import github_ci_watch_service
 from app.services.github_terminal_revision_service import (
     TerminalRevisionContextChanged, complete_current_revision, lock_terminal_transition,
 )
-from app.services.github_dispatch_service import github_dispatch_service, restored_escalation_reason
+from app.services.github_dispatch_service import (
+    dispatch_ref_contains_private_binding, github_dispatch_service, restored_escalation_reason,
+)
 from app.services.github_rate_limit_service import GithubRateLimited
 from app.services.github_recovery_gate import (
     GithubRecoveryOnlyAttempt,
@@ -770,16 +772,17 @@ class GithubVerificationService:
 
     @staticmethod
     def pull_body(item: GithubWorkItem, *, head_ref: str) -> str:
-        return (
+        body = (
             f"Closes #{item.issue_number}\n\n"
             f"{item.issue_title}\n\n"
             "---\n"
             "Albiex Synth City provenance\n"
             f"- Work item: {item.id}\n"
-            f"- Owner slot: {item.owner_slot_id}\n"
-            f"- Dispatch nonce: {item.dispatch_nonce}\n"
-            f"- Head ref: {head_ref}"
+            f"- Owner slot: {item.owner_slot_id}"
         )
+        if not dispatch_ref_contains_private_binding(head_ref, item.dispatch_nonce):
+            body += f"\n- Head ref: {head_ref}"
+        return body
 
     @staticmethod
     def pull_is_draft(item: GithubWorkItem) -> bool:

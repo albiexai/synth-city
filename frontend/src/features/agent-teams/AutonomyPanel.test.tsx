@@ -89,6 +89,7 @@ function renderPanel(overrides: Partial<PanelProps> = {}) {
     loadError: null,
     onRefresh: vi.fn().mockResolvedValue(undefined),
     onToggleAutonomy: vi.fn().mockResolvedValue(undefined),
+    onSetDispatchPause: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   }
   return render(
