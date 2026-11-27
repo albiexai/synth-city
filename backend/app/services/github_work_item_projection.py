@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.database import GithubApprovalRequest, GithubAttemptScopeRevision, GithubWorkItem, GithubWorkspace, TeamGithubScope
 from app.models.schemas import GithubWorkItemResponse, InitialPathComparison
-from app.services.github_approval_service import CONTINUABLE_ESCALATIONS
+from app.services.github_approval_service import continuation_reasons
 from app.services.github_dispatch_difficulty import project_issue_difficulty
 from app.services.github_dispatch_service import HANDOFF_QUEUE_TTL, github_dispatch_service
 from app.services.github_effort_limit_service import effort_limit_service
@@ -78,7 +78,7 @@ def _work_item_response(
         continuation_block_code = None
     elif item.dispatch_status != "escalated":
         continuation_block_code = "continuation_not_escalated"
-    elif item.escalation_reason not in CONTINUABLE_ESCALATIONS:
+    elif item.escalation_reason not in continuation_reasons(scope):
         continuation_block_code = "continuation_reason_not_allowed"
     elif item.pr_number is None:
         continuation_block_code = "continuation_pr_required"

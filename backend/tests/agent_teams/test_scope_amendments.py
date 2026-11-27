@@ -897,6 +897,70 @@ async def record_changes(db, a, **overrides):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["admission", "approval", "activation"])
+async def test_tightened_continuation_reasons_are_enforced_at_each_grant(db, healthy_attempt, monkeypatch, stage):
+    a = healthy_attempt
+    a.item.pr_number = 5
+    await github_dispatch_service.escalate_without_notification(db, a.item, "plan_blocked")
+    monkeypatch.setattr(github_client, "get_recursive_tree", AsyncMock(return_value={}))
+
+    async def tighten():
+        a.scope.continuation_allowed_reasons = ["retry_count_exhausted"]
+        await db.commit()
+
+    async def request():
+        return await github_approval_service.create_continuation_request(
+            db, a.item, a.scope, **amendment(a, ["src/base.py"]))
+
+    if stage == "admission":
+        await tighten()
+        with pytest.raises(GithubApprovalError, match="continuation_reason_not_allowed"):
+            await request()
+        return
+    revision, approval, _ = await request()
+    await github_approval_service.ensure_continuation_request_message(db, a.item, approval, revision)
+
+    async def approve():
+        return await github_approval_service.decide_continuation(
+            db, a.item, authenticated_leader_member_id=a.leader.id, decision="approved", reason="Reviewed",
+            request_id=approval.id)
+
+    if stage == "approval":
+        await tighten()
+        with pytest.raises(GithubApprovalError, match="continuation_reason_not_allowed"):
+            await approve()
+        return
+    await approve()
+    await github_approval_service.ensure_continuation_decision_message(db, a.item, approval, revision)
+    await github_approval_service.deliver_approved_continuation(db, a.item, approval, revision)
+    await tighten()
+    with pytest.raises(ValueError, match="continuation_reason_not_allowed"):
+        await github_dispatch_service.activate_continuation_revision(
+            db, a.item, a.scope, revision, authenticated_owner_member_id=a.owner.id,
+            authenticated_owner_slot_id=a.owner.team_slot_id, dispatch_nonce=a.item.dispatch_nonce,
+            lease_token=a.workspace.lease_token)
+
+
+@pytest.mark.asyncio
+async def test_explicit_verifier_roles_constrain_named_revision_verdicts(db, submitted_attempt):
+    from app.models.database import AgentTeamSlot
+
+    a = submitted_attempt
+    a.scope.verifier_roles = ["reviewer"]
+    await db.commit()
+    with pytest.raises(GithubApprovalError, match="current_independent_reviewer_required"):
+        await record_changes(db, a)
+    (await db.get(AgentTeamSlot, a.reviewer.team_slot_id)).role = "Reviewer"
+    await db.commit()
+    assert (await record_changes(db, a)).reviewer_member_id == a.reviewer.id
+    (await db.get(AgentTeamSlot, a.owner.team_slot_id)).role = "Reviewer"
+    a.watch.reviewer_member_id = a.owner.id
+    await db.commit()
+    with pytest.raises(GithubApprovalError, match="current_independent_reviewer_required"):
+        await record_changes(db, a, reviewer_member_id=a.owner.id)
+
+
+@pytest.mark.asyncio
 async def test_current_independent_changes_required_needs_leader_settlement_and_fresh_amendment(db, submitted_attempt):
     from app.services.github_terminal_revision_service import end_submitted_revision
     a = submitted_attempt

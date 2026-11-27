@@ -1,6 +1,6 @@
 """Pydantic schemas for API models."""
 from datetime import datetime
-from typing import Annotated, Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional, get_args
 from pydantic import AfterValidator, BaseModel as PydanticBaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 from app.models.api_model import ApiModel as BaseModel, naive_utc_confirmation
 from app.config import settings
@@ -2872,7 +2872,29 @@ _ScopeAmendmentAddedPaths = Annotated[int, Field(strict=True, ge=0, le=256)]
 _ScopeCompanionPaths = Annotated[int, Field(strict=True, ge=0, le=128)]
 
 
+ContinuationReason = Literal[
+    "retry_count_exhausted", "plan_blocked", "owner_idle_timeout", "owner_offline",
+    "leader_offline", "leader_ack_timeout", "continuation_revision_exhausted",
+    "amendment_budget_exhausted",
+]
+CONTINUABLE_ESCALATIONS = frozenset(get_args(ContinuationReason))
+DEFAULT_HEAD_VERIFIER_ROLES = ("verifier",)
+ROLE_TRIM = " \t\r\n"
+_ROLE_CASE = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _normalize_verifier_role(role: str) -> str:
+    return role.strip(ROLE_TRIM).translate(_ROLE_CASE)
+
+
+_ContinuationReasons = Annotated[list[ContinuationReason], AfterValidator(lambda reasons: sorted(set(reasons)))]
+_VerifierRole = Annotated[str, AfterValidator(_normalize_verifier_role), Field(min_length=1, max_length=64)]
+_VerifierRoles = Annotated[list[_VerifierRole], Field(max_length=32), AfterValidator(lambda roles: sorted(set(roles)))]
+
+
 class TeamGithubScopeSafetyBounds(BaseModel):
+    continuation_allowed_reasons: _ContinuationReasons | None = None
+    verifier_roles: _VerifierRoles | None = None
     max_scope_amendments: _ScopeAmendmentCount = 3
     max_scope_amendment_requests: _ScopeAmendmentRequests = 8
     max_amendment_added_paths: _ScopeAmendmentAddedPaths = 16
@@ -2931,6 +2953,8 @@ class TeamGithubScopeUpdate(BaseModel):
     max_scope_amendment_requests: _ScopeAmendmentRequests | None = None
     max_amendment_added_paths: _ScopeAmendmentAddedPaths | None = None
     max_companion_paths: _ScopeCompanionPaths | None = None
+    continuation_allowed_reasons: _ContinuationReasons | None = None
+    verifier_roles: _VerifierRoles | None = None
     confirm: str | None = None
     base_ref: Optional[str] = None
     github_auth_mode: Optional[Literal["unknown", "ambient", "app"]] = None

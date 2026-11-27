@@ -22,12 +22,11 @@ from app.models.database import (
     MailTeamMember,
     TeamGithubScope,
 )
-from app.services.github_approval_service import GithubApprovalError, github_approval_service
+from app.models.schemas import DEFAULT_HEAD_VERIFIER_ROLES
+from app.services.github_approval_service import GithubApprovalError, github_approval_service, reviewer_role_matches
 from app.services.github_client import GithubClientResponseError, github_client
 
-VERIFIER_ROLE = "verifier"
 VERDICTS = frozenset({"accepted", "changes_required"})
-_ROLE_TRIM = " \t\r\n"
 
 
 def _short(sha) -> str:
@@ -42,7 +41,7 @@ async def _fresh_item(db, item_id: int):
 
 
 async def current_reviewer(db, scope: TeamGithubScope, item: GithubWorkItem, member_id) -> int | None:
-    """The member id if it is, now, the current member of an enabled verifier slot that is not the owner or Leader.
+    """The member id if it is, now, the current member of an enabled eligible slot independent of the owner and Leader.
 
     Every input is read with a column-level SELECT so a change committed by another connection is seen even when
     the session still holds the old ORM objects. Nothing here uses db.get or an entity query.
@@ -50,18 +49,21 @@ async def current_reviewer(db, scope: TeamGithubScope, item: GithubWorkItem, mem
     if not isinstance(member_id, int):
         return None
     fresh = await _fresh_item(db, item.id)
-    if fresh is None:
+    if fresh is None or fresh.scope_id != scope.id:
         return None
+    policy = (await db.execute(select(TeamGithubScope.verifier_roles).where(TeamGithubScope.id == scope.id))).one_or_none()
+    if policy is None:
+        return None
+    roles = DEFAULT_HEAD_VERIFIER_ROLES if policy.verifier_roles is None else policy.verifier_roles
     member = (await db.execute(select(MailTeamMember.id, MailTeamMember.team_preset_id, MailTeamMember.team_slot_id)
         .where(MailTeamMember.id == member_id))).one_or_none()
     if member is None or member.team_preset_id != scope.preset_id or member.team_slot_id is None:
         return None
-    slot = (await db.execute(select(AgentTeamSlot.id, AgentTeamSlot.preset_id, AgentTeamSlot.enabled, AgentTeamSlot.role)
-        .where(AgentTeamSlot.id == member.team_slot_id))).one_or_none()
+    slot = (await db.execute(select(AgentTeamSlot.id, AgentTeamSlot.preset_id, AgentTeamSlot.enabled)
+        .where(AgentTeamSlot.id == member.team_slot_id, reviewer_role_matches(roles)))).one_or_none()
     leader_slot_id = (await db.execute(select(AgentTeamPreset.leader_slot_id)
         .where(AgentTeamPreset.id == scope.preset_id))).scalar_one_or_none()
     if (slot is None or slot.preset_id != scope.preset_id or not slot.enabled
-            or (slot.role or "").strip(_ROLE_TRIM).lower() != VERIFIER_ROLE
             or slot.id == fresh.owner_slot_id or slot.id == leader_slot_id):
         return None
     current = (await db.execute(select(MailTeamMember.id).where(MailTeamMember.team_slot_id == slot.id)
@@ -118,6 +120,9 @@ async def record_head_review(db, item: GithubWorkItem, *, dispatch_nonce, head_s
     now = datetime.utcnow()
     await db.execute(update(GithubHeadReview).where(*where).values(status="superseded", ended_at=now)
                      .execution_options(synchronize_session=False))
+    if await current_reviewer(db, scope, item, reviewer_member_id) is None:
+        await db.rollback()
+        raise GithubApprovalError("current_independent_reviewer_required", status_code=403)
     fact = GithubHeadReview(work_item_id=item.id, dispatch_nonce=dispatch_nonce, pr_number=item.pr_number,
         head_sha=head_sha, scope_revision=item.active_scope_revision or 0, reviewer_member_id=reviewer_member_id,
         verdict=verdict, summary=summary.strip(), evidence_url=evidence_url)

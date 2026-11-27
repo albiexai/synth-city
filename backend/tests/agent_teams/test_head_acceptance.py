@@ -88,6 +88,20 @@ async def make_case(db, monkeypatch, *, labels=None, **item_values):
 
 
 @pytest.mark.asyncio
+async def test_scope_verifier_roles_change_head_eligibility_without_allowing_the_owner(db, monkeypatch):
+    case = await make_case(db, monkeypatch)
+    case.scope.verifier_roles = ["reviewer"]
+    _, reviewer = await slot_member(db, case.scope, role="Reviewer", name="R1")
+    with pytest.raises(GithubApprovalError, match="current_independent_reviewer_required"):
+        await case.record(HEAD_A)
+    assert (await case.record(HEAD_A, member=reviewer)).reviewer_member_id == reviewer.id
+    case.item.owner_slot_id = reviewer.team_slot_id
+    await db.commit()
+    with pytest.raises(GithubApprovalError, match="current_independent_reviewer_required"):
+        await case.record(HEAD_A, member=reviewer)
+
+
+@pytest.mark.asyncio
 async def test_green_checks_without_an_acceptance_do_not_auto_merge(db, monkeypatch):
     case = await make_case(db, monkeypatch)
     await case.tick()

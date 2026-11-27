@@ -39,6 +39,7 @@ SAFE_VALUE_FIELDS = {
     "max_continuation_failed_heads", "max_failed_heads_per_revision",
     "max_scope_paths", "max_scope_commands",
     "max_scope_amendments", "max_scope_amendment_requests", "max_amendment_added_paths", "max_companion_paths",
+    "continuation_allowed_reasons", "verifier_roles",
     # R05: every audited finite scope policy setting. Command hints and
     # templates are free text that can hold commands; they stay excluded.
     "max_approval_rounds", "max_concurrent_dispatched", "max_verification_retries",
@@ -201,6 +202,10 @@ def allowlist_values(values: dict[str, Any] | None) -> dict[str, Any] | None:
     for key, value in values.items():
         if key not in SAFE_VALUE_FIELDS or _SECRET_KEY.search(str(key)):
             continue
+        if key in {"continuation_allowed_reasons", "verifier_roles"} and isinstance(value, list):
+            if len(value) <= 32 and all(isinstance(entry, str) and len(entry) <= 64 for entry in value):
+                safe[key] = [sanitize_text(entry) for entry in value]
+            continue
         keep, projected = _safe_primitive(value)
         if keep:
             safe[key] = projected
@@ -223,9 +228,9 @@ def project_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
                 ]
             continue
         if key == "scope_changed_fields":
-            from app.models.schemas import TeamGithubScopeCreate
+            from app.models.schemas import TeamGithubScopeCreate, TeamGithubScopeSafetyBounds
 
-            fields = TeamGithubScopeCreate.model_fields
+            fields = TeamGithubScopeCreate.model_fields | TeamGithubScopeSafetyBounds.model_fields
             if isinstance(value, (list, tuple)) and len(value) <= len(fields):
                 safe[key] = sorted({name for name in value if isinstance(name, str) and name in fields})
             continue
