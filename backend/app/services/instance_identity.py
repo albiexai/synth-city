@@ -35,8 +35,6 @@ AUTO_ACCENTS: tuple[str, ...] = (
     "slate",
 )
 
-DEFAULT_INSTANCE_NAME = "This machine"
-
 _STARTED_AT = datetime.now(timezone.utc)
 _MAX_NAME_LENGTH = 64
 _MAX_ID_LENGTH = 64
@@ -109,7 +107,7 @@ def get_instance_identity() -> InstanceIdentity:
 
     return InstanceIdentity(
         id=_stable_id(hostname, os.getenv("SYNTH_CITY_INSTANCE_ID")),
-        name=_clean_name(raw_name, DEFAULT_INSTANCE_NAME),
+        name=_clean_name(raw_name, short_hostname),
         name_configured=bool(_remove_control_chars(raw_name or "")),
         hostname=hostname,
         short_hostname=short_hostname,

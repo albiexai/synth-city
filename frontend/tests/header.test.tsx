@@ -76,6 +76,27 @@ describe("Header", () => {
     expect(screen.queryByRole("button", { name: new RegExp(LABEL) })).not.toBeInTheDocument();
   });
 
+  it.each([
+    { configured: false, name: "This machine", displayed: "studio-mac" },
+    { configured: undefined, name: "This machine", displayed: "studio-mac" },
+    { configured: true, name: "Studio Mac", displayed: "Studio Mac" },
+  ])("identifies the backend host when name_configured is $configured", ({ configured, name, displayed }) => {
+    const hostname = "studio-mac.example";
+    mocks.status = {
+      ...statusWithWarning(null),
+      instance: { name, name_configured: configured, hostname, short_hostname: "studio-mac", accent: "blue" },
+    };
+    const hint = configured ? "" : " (name not configured; set SYNTH_CITY_INSTANCE_NAME)";
+    const label = `Albiex Synth City instance: ${displayed} (host ${hostname})${hint}`;
+
+    renderHeader();
+
+    const badge = screen.getByRole("group", { name: label });
+    expect(badge).toHaveTextContent(displayed);
+    expect(badge).toHaveAttribute("title", label);
+    expect(screen.queryByText("This machine")).not.toBeInTheDocument();
+  });
+
   describe("container warning", () => {
     beforeEach(() => {
       mocks.status = statusWithWarning(WARNING);
