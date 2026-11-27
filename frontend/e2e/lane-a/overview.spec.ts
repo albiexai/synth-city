@@ -70,7 +70,14 @@ for (const theme of ['light', 'dark'] as Theme[]) {
   })
 
   test(`@active the Progress card draws the full readable backlog in the ${theme} theme`, async ({ page }) => {
-    // The live duplicate-name Retired crew has one not-started issue (#652).
+    // The live duplicate-name Retired crew has one not-started issue (#652). It has no recorded campaign, and a team
+    // without one shows only while work is under way, queued or needs attention (#1415): record it as active here.
+    await page.route('**/api/v1/agent-teams/presets/*/summary*', async route => {
+      const response = await route.fetch()
+      const summary: AgentTeamSummary = await response.json()
+      if (summary.campaign) summary.campaign.campaign_status = 'active'
+      await route.fulfill({ response, json: summary })
+    })
     await useTheme(page, theme)
     await page.goto('/?team_id=4')
     const card = page.locator('main').getByRole('article', { name: /^Progress:/ })
@@ -120,6 +127,7 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 
       const response = await route.fetch()
       const summary: AgentTeamSummary = await response.json()
       if (summary.campaign) {
+        summary.campaign.campaign_status = 'active'  // the seeded teams have no campaign record (#1415)
         summary.campaign.done_count = finished.length
         summary.campaign.latest_done = finished.map((moment, index) => ({
           title: `Completed release task ${index + 1}`,

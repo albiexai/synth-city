@@ -391,3 +391,70 @@ async def test_priority_ranks_are_per_scope_with_oldest_issue_ties(db, monkeypat
     result = await summary.summary(db, team.id)
     assert [(item.repository, item.issue_number, item.dispatch_position) for item in result.campaign.dispatch_order] == [
         ("example/repo", 7, 1), ("example/repo", 8, 2), ("other/repo", 1, 1)]
+
+
+# #1415: the summary carries the team's recorded campaign status, so Overview never infers "finished" from counts
+async def _record_campaigns(db, team_id, statuses, *, key=None):
+    from app.models.database import Campaign
+    from app.services import factory_audit_service as audit
+
+    key = key or await audit.context_key_for(db, "team", team_id)
+    for index, status in enumerate(statuses):
+        db.add(Campaign(team_context_key=key, preset_id=team_id, selector="milestone:Campaign", status=status,
+                        started_at=START + timedelta(days=index), created_at=START + timedelta(days=index)))
+    await db.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("statuses", "expected"), [
+    ((), None), (("active",), "active"), (("finishing",), "finishing"), (("finished",), "finished"),
+    (("finished", "active"), "active"), (("finished", "finished"), "finished"),
+], ids=["no_record", "active", "finishing", "finished", "open_wins_over_finished", "two_finished"])
+async def test_the_summary_reports_the_recorded_campaign_status(db, monkeypatch, statuses, expected):
+    team, _scope, _items, summary = await fixed_campaign(db, monkeypatch)
+    await _record_campaigns(db, team.id, statuses)
+    assert (await summary.summary(db, team.id)).campaign.campaign_status == expected
+
+
+@pytest.mark.asyncio
+async def test_another_team_lifetimes_campaign_is_not_this_teams_status(db, monkeypatch):
+    from app.services import factory_audit_service as audit
+
+    team, _scope, _items, summary = await fixed_campaign(db, monkeypatch)
+    await audit.context_key_for(db, "team", team.id)  # the team's current lifetime exists, with no campaign of its own
+    await _record_campaigns(db, team.id, ("active",), key="team:an-earlier-lifetime")
+    assert (await summary.summary(db, team.id)).campaign.campaign_status is None
+
+
+@pytest.mark.asyncio
+async def test_a_team_outside_the_filter_reports_no_campaign_status(db, monkeypatch):
+    """A team the filter excludes has no campaign to show, so its open campaign mustn't bring its card back."""
+    team, _scope, _items, summary = await fixed_campaign(db, monkeypatch)
+    await _record_campaigns(db, team.id, ("active",))
+    assert (await summary.summary(db, team.id, provider="no-such-harness")).campaign.campaign_status is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("statuses", "status", "finished"), [
+    ((), None, 0), (("finished", "finished"), "finished", 2), (("finished", "active"), "active", 1),
+    (("finished", "finished", "finishing"), "finishing", 2),
+], ids=["none", "two_finishes", "finish_then_new_active", "two_finishes_then_finishing"])
+async def test_the_summary_counts_every_recorded_finish(db, monkeypatch, statuses, status, finished):
+    """The history line counts finished campaigns, not teams: a new campaign never hides an earlier finish (V1)."""
+    team, _scope, _items, summary = await fixed_campaign(db, monkeypatch)
+    await _record_campaigns(db, team.id, statuses)
+    campaign = (await summary.summary(db, team.id)).campaign
+    assert (campaign.campaign_status, campaign.finished_campaign_count) == (status, finished)
+
+
+@pytest.mark.asyncio
+async def test_finishes_of_another_lifetime_or_outside_the_filter_are_not_counted(db, monkeypatch):
+    from app.services import factory_audit_service as audit
+
+    team, _scope, _items, summary = await fixed_campaign(db, monkeypatch)
+    await audit.context_key_for(db, "team", team.id)
+    await _record_campaigns(db, team.id, ("finished",), key="team:an-earlier-lifetime")
+    assert (await summary.summary(db, team.id)).campaign.finished_campaign_count == 0
+    await _record_campaigns(db, team.id, ("finished",))
+    assert (await summary.summary(db, team.id)).campaign.finished_campaign_count == 1
+    assert (await summary.summary(db, team.id, provider="no-such-harness")).campaign.finished_campaign_count == 0

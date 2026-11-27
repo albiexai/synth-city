@@ -1,12 +1,20 @@
 import type { TeamCampaignSummary } from "@/types/agentTeams";
 
-export function campaignHasContent(campaign: TeamCampaignSummary | undefined) {
-  return Boolean(
-    campaign &&
-      (campaign.done_count + campaign.under_way_count + (campaign.attention_count ?? 0) + campaign.queued_count +
-        (campaign.not_started_count ?? 0) > 0 ||
-        campaign.decisions_ahead.length > 0),
-  );
+/** #1415: a team's Progress card shows while its recorded campaign is active or finishing. A finished campaign has
+ * no card. A team without a campaign record shows only while work is under way, queued or needs attention: done
+ * work, backlog or planned decisions alone never bring a card back, and "finished" is never inferred from counts. */
+export function campaignShown(campaign: TeamCampaignSummary | undefined) {
+  if (!campaign) return false;
+  if (campaign.campaign_status === "active" || campaign.campaign_status === "finishing") return true;
+  if (campaign.campaign_status === "finished") return false;
+  // The observed dispatch order is queued work too.
+  return campaign.under_way_count + campaign.queued_count + (campaign.attention_count ?? 0) > 0 ||
+    (campaign.dispatch_order?.length ?? 0) > 0;
+}
+
+/** How many of the team's campaigns have finished: each finish counts, whatever runs now (#1415). */
+export function finishedCampaigns(campaign: TeamCampaignSummary | undefined) {
+  return campaign?.finished_campaign_count ?? 0;
 }
 
 export function campaignBarLabel(c: TeamCampaignSummary) {

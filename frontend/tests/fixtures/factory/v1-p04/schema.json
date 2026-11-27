@@ -513,6 +513,23 @@
               "title": "Backlog State",
               "type": "string"
             },
+            "campaign_status": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "active",
+                    "finishing",
+                    "finished"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Campaign Status"
+            },
             "decisions_ahead": {
               "items": {
                 "$ref": "#/$defs/CampaignDecision"
@@ -536,6 +553,12 @@
               "default": 0,
               "minimum": 0,
               "title": "Done On Other Branch Count",
+              "type": "integer"
+            },
+            "finished_campaign_count": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Finished Campaign Count",
               "type": "integer"
             },
             "latest_done": {
