@@ -2,11 +2,13 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 from sqlalchemy import select
 
 from app.models.database import AgentTeamSlot, GithubWorkItem
 from app.services.agent_team_campaign_service import AgentTeamCampaignService
+from app.services.github_client import GithubClient
 from tests.agent_teams.test_agent_team_summary import Attention, seed, service
 
 
@@ -209,6 +211,36 @@ async def test_failed_refresh_keeps_success_until_the_hard_limit(db, monkeypatch
     recovered = (await summary.summary(db, team.id)).campaign
     assert recovered.backlog_state == "available" and recovered.not_started_count == 0
     assert recovered.backlog_observed_at == start + timedelta(seconds=390)
+
+
+@pytest.mark.asyncio
+async def test_pagination_refusal_logs_one_sanitized_reason_per_scope(db, monkeypatch, caplog):
+    _, scope, _, summary = await fixed_campaign(db, monkeypatch)
+    clock, _ = controlled_campaign(summary)
+    pagination_reads = []
+
+    def handler(request):
+        if request.url.path == "/repos/example/repo/issues/506":
+            return httpx.Response(200, json={
+                "number": 506, "html_url": "https://github.com/example/repo/issues/506",
+                "milestone": {"number": 7},
+            })
+        assert request.url.path == "/repos/example/repo/issues"
+        pagination_reads.append(request.url.path)
+        link = ("https://api.github.com/repos/example/repo/issues?milestone=7&state=all"
+                "&per_page=100&page=2&unexpected=private-cursor")
+        return httpx.Response(200, json=[], headers={"Link": f'<{link}>; rel="next"'})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                 base_url="https://api.github.com") as http:
+        client = GithubClient(http=http, token="private-test-token")
+        for elapsed in (0, 120, 240):
+            clock[0] = elapsed
+            await summary.campaign.refresh_scope(db, scope, client)
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "app.services.agent_team_campaign_service"]
+    assert len(pagination_reads) == 3
+    assert messages == [f"GitHub campaign pagination refused for scope {scope.id}: query changed"]
 
 
 @pytest.mark.asyncio

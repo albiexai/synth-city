@@ -70,11 +70,75 @@ async def test_campaign_client_reads_all_milestone_pages_and_closed_issues():
 
 
 @pytest.mark.asyncio
+async def test_campaign_client_reads_numeric_links_with_opaque_cursors():
+    requests = []
+
+    def handler(request):
+        path, params = request.url.path, request.url.params
+        requests.append(path)
+        if path == "/repos/o/r":
+            assert not params
+            return httpx.Response(200, json={"id": 12345, "full_name": "o/r"})
+
+        assert params["state"] == "all" and params["per_page"] == "100"
+        second = params.get("page") == "2"
+        assert path.startswith("/repositories/12345/" if second else "/repos/o/r/")
+        if second:
+            assert params["after"] == "opaque+cursor"
+        number = 2 if second else 1
+        tail = path.rsplit("/", 1)[1]
+        if tail == "issues":
+            assert params["milestone"] == "7"
+            data = [{"number": number, "title": "Issue", "state": "open", "labels": [],
+                     "html_url": f"https://github.com/o/r/issues/{number}", "milestone": {"number": 7}}]
+        else:
+            data = [{"number": number, "title": "Campaign"}]
+        query = "state=all&per_page=100" + ("&milestone=7" if tail == "issues" else "")
+        link = f"https://api.github.com/repositories/12345/{tail}?{query}&after=opaque%2Bcursor&page=2"
+        headers = {} if second else {"Link": f'<{link}>; rel="next"'}
+        return httpx.Response(200, json=data, headers=headers)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                 base_url="https://api.github.com") as http:
+        client = GithubClient(http=http, token="synthetic-test-key")
+        issues = await client.list_milestone_issues("o", "r", 7)
+        milestones = await client.list_milestones("o", "r")
+    assert [item["number"] for item in issues] == [1, 2]
+    assert [item["number"] for item in milestones] == [1, 2]
+    assert requests == ["/repos/o/r/issues", "/repos/o/r", "/repositories/12345/issues",
+                        "/repos/o/r/milestones", "/repositories/12345/milestones"]
+
+
+@pytest.mark.asyncio
+async def test_campaign_client_refuses_a_different_numeric_repository():
+    requests = []
+
+    def handler(request):
+        path = request.url.path
+        requests.append(path)
+        if path == "/repos/o/r":
+            return httpx.Response(200, json={"id": 12345, "full_name": "o/r"})
+        link = "https://api.github.com/repositories/54321/milestones?state=all&per_page=100&after=opaque&page=2"
+        return httpx.Response(200, json=[], headers={"Link": f'<{link}>; rel="next"'})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                 base_url="https://api.github.com") as http:
+        with pytest.raises(GithubClientResponseError, match="repository mismatch"):
+            await GithubClient(http=http).list_milestones("o", "r")
+    assert requests == ["/repos/o/r/milestones", "/repos/o/r"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("link", [
     "https://elsewhere.example/repos/o/r/milestones?state=all&per_page=100&page=2",
     "https://api.github.com/repos/other/r/milestones?state=all&per_page=100&page=2",
     "https://api.github.com/repos/o/r/milestones?state=open&per_page=100&page=2",
     "https://api.github.com/repos/o/r/milestones?state=all&per_page=100&page=0",
+    "https://api.github.com/repos/o/r/milestones?state=all&per_page=100&page=2&unexpected=yes",
+    "https://api.github.com/repos/o/r/milestones?state=all&per_page=100&page=2&after=",
+    "https://api.github.com/repos/o/r/milestones?state=all&per_page=100&page=2&after=a&after=b",
+    "https://api.github.com:443/repos/o/r/milestones?state=all&per_page=100&page=2",
+    "https://api.github.com/repos/o/r/milestones?state=all&per_page=100&page=2#fragment",
 ])
 async def test_campaign_client_rejects_unsafe_pagination_before_request(link):
     requests = []
@@ -98,18 +162,23 @@ async def test_campaign_client_rejects_wrong_milestone_issue():
 
 
 @pytest.mark.asyncio
-async def test_campaign_client_pagination_bound_never_returns_partial_backlog():
+@pytest.mark.parametrize(("repeat_page", "reason", "request_count"), [
+    (False, "bound exceeded", 10),
+    (True, "cycle detected", 2),
+])
+async def test_campaign_client_refuses_incomplete_traversal(repeat_page, reason, request_count):
     requests = []
     def handler(request):
         requests.append(request)
         page = int(request.url.params.get("page", "1"))
-        link = f'https://api.github.com/repos/o/r/milestones?state=all&per_page=100&page={page + 1}'
+        next_page = "02" if repeat_page and page == 2 else str(page + 1)
+        link = f"https://api.github.com/repos/o/r/milestones?state=all&per_page=100&page={next_page}"
         return httpx.Response(200, json=[{"number": page, "title": f"Campaign {page}"}],
                               headers={"Link": f'<{link}>; rel="next"'})
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://api.github.com") as http:
-        with pytest.raises(GithubClientResponseError, match="bound exceeded"):
+        with pytest.raises(GithubClientResponseError, match=reason):
             await GithubClient(http=http).list_milestones("o", "r")
-    assert len(requests) == 10
+    assert len(requests) == request_count
 
 
 @pytest.mark.asyncio

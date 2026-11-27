@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from urllib.parse import parse_qs, quote, urlsplit
+from time import monotonic
+from urllib.parse import parse_qs, quote, urljoin, urlsplit
 
 import httpx
 
@@ -30,6 +31,18 @@ _GIT_ENTRY_MODES = {
 
 class GithubClientResponseError(RuntimeError):
     """GitHub returned a response Albiex Synth City cannot safely interpret."""
+
+
+class GithubCampaignPaginationError(GithubClientResponseError):
+    """A campaign page was refused for a reason safe to log."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"GitHub campaign pagination refused: {reason}")
+
+
+_CAMPAIGN_REPOSITORY_ID_TTL = 300
+_CAMPAIGN_REPOSITORY_CACHE_LIMIT = 128
 
 
 # Explicit bound for shared GitHub list pagination. Exceeding it is an
@@ -57,6 +70,7 @@ class GithubClient:
     def __init__(self, http: httpx.AsyncClient | None = None, token: str | None = None):
         self._http = http
         self._token = token if token is not None else settings.github_token
+        self._campaign_repository_ids: dict[str, tuple[str, float]] = {}
 
     def _client(self) -> httpx.AsyncClient:
         client = self._http if self._http is not None else github_http_client(_GITHUB_API, settings)
@@ -238,21 +252,41 @@ class GithubClient:
             if self._http is None:
                 await client.aclose()
 
+    async def _campaign_repository_id(self, client: httpx.AsyncClient, endpoint: str) -> str:
+        cached = self._campaign_repository_ids.get(endpoint)
+        if cached is not None and cached[1] > monotonic():
+            return cached[0]
+        try:
+            response = await client.get(endpoint, headers=self._headers(), follow_redirects=False)
+            response.raise_for_status()
+            self._require_expected_response(response, endpoint=endpoint, label="campaign repository")
+            repository = self._json_object(response, "repository")
+        except (httpx.HTTPError, GithubClientResponseError) as exc:
+            raise GithubCampaignPaginationError("repository identity unavailable") from exc
+
+        repo_id, full_name = repository.get("id"), repository.get("full_name")
+        if (type(repo_id) is not int or repo_id < 1 or not isinstance(full_name, str)
+                or full_name.casefold() != endpoint.removeprefix("/repos/").casefold()):
+            raise GithubCampaignPaginationError("repository identity invalid")
+        cache = self._campaign_repository_ids
+        if endpoint not in cache and len(cache) >= _CAMPAIGN_REPOSITORY_CACHE_LIMIT:
+            cache.pop(next(iter(cache)))
+        cache[endpoint] = (str(repo_id), monotonic() + _CAMPAIGN_REPOSITORY_ID_TTL)
+        return str(repo_id)
+
     async def _campaign_list(self, endpoint: str, params: dict[str, str]) -> list[dict]:
         """Read complete campaign pages. Reject changed queries and unsafe links."""
         client = self._client()
-        values, seen_urls = [], set()
-        next_url, first = endpoint, True
+        repository_endpoint, tail = endpoint.rsplit("/", 1)
+        values, seen_pages = [], {("1", None)}
+        next_url, expected_path, request_params = endpoint, endpoint, params
         try:
             for _ in range(MAX_LIST_PAGES):
-                response = await client.get(next_url, params=params if first else None, headers=self._headers())
-                first = False
+                response = await client.get(next_url, params=request_params, headers=self._headers(),
+                                            follow_redirects=False)
+                request_params = None
                 response.raise_for_status()
-                self._require_expected_response(response, endpoint=endpoint, label="campaign list")
-                current_url = str(response.request.url)
-                if current_url in seen_urls:
-                    raise GithubClientResponseError("GitHub campaign pagination cycle detected")
-                seen_urls.add(current_url)
+                self._require_expected_response(response, endpoint=expected_path, label="campaign list")
                 body = self._json_list(response, "campaign list")
                 if not all(isinstance(value, dict) for value in body):
                     raise GithubClientResponseError("GitHub campaign list contained an invalid object")
@@ -260,21 +294,40 @@ class GithubClient:
                 link = response.links.get("next", {}).get("url")
                 if not link:
                     return values
-                candidate = response.request.url.join(link)
-                parsed = urlsplit(str(candidate))
+
+                # Validate before httpx can normalize an explicit default port.
+                try:
+                    candidate = urljoin(str(response.request.url), link)
+                    parsed = urlsplit(candidate)
+                except ValueError:
+                    raise GithubCampaignPaginationError("invalid URL") from None
+                if parsed.scheme != "https" or parsed.netloc.lower() != "api.github.com":
+                    raise GithubCampaignPaginationError("origin changed")
+                if "#" in link:
+                    raise GithubCampaignPaginationError("fragment present")
+
                 query = parse_qs(parsed.query, keep_blank_values=True)
-                page = query.get("page", [])
-                if (parsed.scheme != "https" or parsed.hostname != "api.github.com"
-                        or parsed.port is not None or parsed.username is not None or parsed.password is not None
-                        or parsed.path != endpoint or parsed.fragment
-                        or any(query.get(key) != [value] for key, value in params.items())
-                        or set(query) != set(params) | {"page"}
-                        or len(page) != 1 or not page[0].isdigit() or int(page[0]) < 1):
-                    raise GithubClientResponseError("Unsafe GitHub campaign pagination link")
-                next_url = str(candidate)
-                if next_url in seen_urls:
-                    raise GithubClientResponseError("GitHub campaign pagination cycle detected")
-            raise GithubClientResponseError("GitHub campaign pagination bound exceeded")
+                page, after = query.get("page", []), query.get("after", [])
+                if (any(query.get(key) != [value] for key, value in params.items())
+                        or query.keys() - params.keys() - {"page", "after"}
+                        or len(page) != 1 or re.fullmatch(r"0*[1-9][0-9]*", page[0]) is None
+                        or ("after" in query and (len(after) != 1 or not after[0]))):
+                    raise GithubCampaignPaginationError("query changed")
+
+                if parsed.path != endpoint:
+                    numeric = re.fullmatch(rf"/repositories/([1-9][0-9]*)/{re.escape(tail)}", parsed.path)
+                    if numeric is None:
+                        raise GithubCampaignPaginationError("path changed")
+                    repository_id = await self._campaign_repository_id(client, repository_endpoint)
+                    if numeric[1] != repository_id:
+                        raise GithubCampaignPaginationError("repository mismatch")
+
+                page_key = (page[0].lstrip("0"), after[0] if after else None)
+                if page_key in seen_pages:
+                    raise GithubCampaignPaginationError("cycle detected")
+                seen_pages.add(page_key)
+                next_url, expected_path = candidate, parsed.path
+            raise GithubCampaignPaginationError("bound exceeded")
         finally:
             if self._http is None:
                 await client.aclose()
