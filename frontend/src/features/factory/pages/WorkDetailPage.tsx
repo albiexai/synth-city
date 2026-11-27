@@ -6,7 +6,7 @@ import { GithubLink } from "../components/GithubLink";
 import { ProtectedRemedies } from "../components/ProtectedRemedies";
 import { RequiredCiNotice } from "../components/RequiredCiNotice";
 import { ReadStatus } from "../components/ReadStatus";
-import { PlanEstimate, ScopeEffortLimit } from "../components/ScopeEffortLimit";
+import { PlanEstimate, PlanRefusalNotice, ScopeEffortLimit } from "../components/ScopeEffortLimit";
 import { anchor, panel } from "../components/styles";
 import { Time } from "../components/Time";
 import { stateLabel } from "../filterHelpers";
@@ -55,6 +55,7 @@ export function WorkDetailPage() {
             </p>
             <ScopeEffortLimit minutes={w.item.scope_default_effort_limit_minutes} />
             <PlanEstimate estimate={w.item.plan_estimate_minutes} limit={w.item.plan_limit_minutes} />
+            <PlanRefusalNotice refusal={w.item.plan_refusal} />
             {w.waiting && (
               <p>
                 Waiting for {waitingActorLabel(w.waiting.actor)}

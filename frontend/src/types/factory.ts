@@ -189,7 +189,15 @@ export type SafeWorkItem = {
   scope_default_effort_limit_minutes?: number | null;
   plan_estimate_minutes?: number | null;
   plan_limit_minutes?: number | null;
+  plan_refusal?: PlanRefusal | null;
   updated_at: string;
+};
+
+export type PlanRefusal = {
+  code: "plan_estimate_exceeds_limit";
+  estimate_minutes: number;
+  limit_minutes: number;
+  split_suggestion: string;
 };
 
 export type SessionAssociation = {

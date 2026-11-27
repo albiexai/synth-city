@@ -58,6 +58,10 @@ def _minutes_text(value) -> str:
     return text(value)
 
 
+def plan_split_suggestion(limit_minutes: int) -> str:
+    return f"Split the issue into parts estimated at {limit_minutes} active minutes or less."
+
+
 class GithubEffortLimitService:
     @staticmethod
     def plan_estimate_limit(scope) -> int:
@@ -75,8 +79,7 @@ class GithubEffortLimitService:
             raise EffortLimitError(
                 "plan_estimate_exceeds_limit", status_code=400,
                 message=(f"The estimate exceeds this scope's {plan_limit}-minute plan limit "
-                         f"(max_plan_estimate_minutes). Split the issue into parts estimated "
-                         f"at {plan_limit} active minutes or less."),
+                         f"(max_plan_estimate_minutes). {plan_split_suggestion(plan_limit)}"),
             )
         return effort_limit
 

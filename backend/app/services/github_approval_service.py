@@ -42,6 +42,9 @@ from app.services.github_app_auth_service import (
     github_app_auth_service,
 )
 from app.services.github_client import GithubClientResponseError, github_client
+from app.services.github_plan_refusal_service import (
+    PLAN_LIMIT_REFUSAL, clear_plan_refusal, record_plan_refusal,
+)
 from app.services.github_recovery_gate import configured_recovery_only_attempt
 from app.services.sqlite_busy_retry import SqliteBusyExhausted, retry_when_busy
 
@@ -104,6 +107,10 @@ class GithubApprovalError(ValueError):
         self.detail = detail
         self.status_code = status_code
         super().__init__(detail)
+
+
+class GithubPlanRefusalRecorded(GithubApprovalError):
+    """The submitting API can commit this refusal without admitting a plan."""
 
 
 async def _record_decision_fact(
@@ -2268,6 +2275,22 @@ class GithubApprovalService:
             raise GithubApprovalError("owner_cannot_approve_own_work", status_code=409)
         return owner, leader
 
+    async def _claim_initial_plan_item(self, db, item, owner) -> None:
+        claim = await db.execute(
+            update(GithubWorkItem)
+            .where(
+                GithubWorkItem.id == item.id,
+                GithubWorkItem.dispatch_nonce == item.dispatch_nonce,
+                GithubWorkItem.approval_round_count == item.approval_round_count,
+                GithubWorkItem.owner_slot_id == owner.team_slot_id,
+                GithubWorkItem.dispatch_status != "escalated",
+            )
+            .values(updated_at=GithubWorkItem.updated_at)
+            .execution_options(synchronize_session=False)
+        )
+        if claim.rowcount != 1:
+            raise GithubApprovalError("stale_approval_context")
+
     async def create_initial_request(
         self,
         db: AsyncSession,
@@ -2294,20 +2317,7 @@ class GithubApprovalService:
             # Serialize the composing API before looking up pending/terminal
             # authority, including an already-linked replay. This also starts
             # SQLite's outer write transaction before any Mail savepoint.
-            claim = await db.execute(
-                update(GithubWorkItem)
-                .where(
-                    GithubWorkItem.id == item.id,
-                    GithubWorkItem.dispatch_nonce == item.dispatch_nonce,
-                    GithubWorkItem.approval_round_count == item.approval_round_count,
-                    GithubWorkItem.owner_slot_id == owner.team_slot_id,
-                    GithubWorkItem.dispatch_status != "escalated",
-                )
-                .values(updated_at=GithubWorkItem.updated_at)
-                .execution_options(synchronize_session=False)
-            )
-            if claim.rowcount != 1:
-                raise GithubApprovalError("stale_approval_context")
+            await self._claim_initial_plan_item(db, item, owner)
 
         request_fingerprint = self.initial_request_fingerprint(
             summary=summary,
@@ -2335,6 +2345,13 @@ class GithubApprovalService:
         )
         if terminal is not None and self._same_request(terminal, **identity):
             return terminal, False
+        pending_for_attempt = pending is not None and not self._attempt_identity_changed(
+            pending,
+            dispatch_nonce=item.dispatch_nonce,
+            approval_round=item.approval_round_count,
+            owner_member_id=owner.id,
+            leader_member_id=leader.id,
+        )
 
         # Exact replays return above. Apply the current settings before any new
         # request can change approval, Mail, or effort state.
@@ -2342,16 +2359,22 @@ class GithubApprovalService:
         try:
             effort_limit = effort_limit_service.initial_plan_limit(plan_metadata, effort_scope)
         except EffortLimitError as exc:
-            detail = {"code": exc.code, "message": str(exc)} if exc.code == "plan_estimate_exceeds_limit" else exc.code
-            raise GithubApprovalError(detail, status_code=exc.status_code) from exc
+            if exc.code != PLAN_LIMIT_REFUSAL:
+                raise GithubApprovalError(exc.code, status_code=exc.status_code) from exc
+            if commit:
+                await self._claim_initial_plan_item(db, item, owner)
+            await record_plan_refusal(
+                db, item, request_preflight.estimate_upper_bound(plan_metadata["estimate_active_minutes"]),
+                effort_limit_service.plan_estimate_limit(effort_scope),
+                already_admitted=pending_for_attempt or terminal is not None,
+            )
+            if commit:
+                await db.commit()
+            raise GithubPlanRefusalRecorded(
+                {"code": exc.code, "message": str(exc)}, status_code=exc.status_code,
+            ) from exc
 
-        if pending is not None and not self._attempt_identity_changed(
-            pending,
-            dispatch_nonce=item.dispatch_nonce,
-            approval_round=item.approval_round_count,
-            owner_member_id=owner.id,
-            leader_member_id=leader.id,
-        ):
+        if pending_for_attempt:
             raise GithubApprovalError("approval_request_already_pending")
         if terminal is not None:
             raise GithubApprovalError("approval_request_already_decided")
@@ -2421,6 +2444,7 @@ class GithubApprovalService:
         request = GithubApprovalRequest(work_item_id=work_item_id, **identity)
         db.add(request)
         try:
+            await clear_plan_refusal(db, work_item_id, identity["dispatch_nonce"])
             await decision_waits.record_wait_started(
                 db, request, source="github_approval_service.create_initial_request")
             if commit:

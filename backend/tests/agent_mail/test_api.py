@@ -19,6 +19,7 @@ from app.models.database import (
     AgentTeamSlot,
     GithubApprovalRequest,
     GithubAttemptScopeRevision,
+    GithubPlanRefusal,
     GithubWorkItem,
     GithubWorkspace,
     MailAgentSession,
@@ -43,6 +44,7 @@ from app.services.github_approval_service import (
 )
 from app.services.github_client import GithubCommitSnapshot, github_client
 from app.services.github_dispatch_service import github_dispatch_service
+from app.services.github_plan_refusal_service import MAX_REFUSALS_PER_ATTEMPT, current_plan_refusal_id
 from app.utils import peer_process
 
 
@@ -1845,6 +1847,121 @@ async def test_normalized_initial_request_derives_current_owner_and_leader(db):
     assert exc_info.value.status_code == 403
     assert exc_info.value.detail == "not_item_owner"
     assert (await db.execute(select(GithubApprovalRequest))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_refused_plan_limit_is_recorded_without_approval_then_cleared_on_admission(client, db, monkeypatch):
+    monkeypatch.setattr(settings, "mail_capability_tokens_required", True)
+    item, _members, tokens = await _dispatch_approval_fixture(db)
+    item_id, nonce = item.id, item.dispatch_nonce
+    scope = await db.get(TeamGithubScope, item.scope_id)
+    scope.max_plan_estimate_minutes = 45
+    scope.max_item_effort_minutes = 120
+    await db.commit()
+    headers = {"X-Synth-City-Session-Token": tokens[1]}
+    payload = {
+        "work_item_id": item_id, "dispatch_nonce": nonce, "summary": "A synthetic plan.",
+        "plan_metadata": {"estimate_active_minutes": {"low": 40, "high": 60.5}},
+    }
+    endpoint = "/api/v1/agent-mail/approval-requests"
+    current_refusal = select(current_plan_refusal_id()).where(GithubWorkItem.id == item_id)
+
+    preflight = await client.post("/api/v1/agent-mail/preflight-request", headers=headers,
+                                  json={**payload, "kind": "initial_plan"})
+    assert preflight.status_code == 200
+    assert any(problem["code"] == "plan_estimate_exceeds_limit" for problem in preflight.json()["problems"])
+    assert await db.scalar(select(GithubPlanRefusal.id)) is None
+
+    wrong_owner = await client.post(endpoint, headers={"X-Synth-City-Session-Token": tokens[0]}, json=payload)
+    assert wrong_owner.status_code == 403
+    assert await db.scalar(select(GithubPlanRefusal.id)) is None
+
+    response = await client.post(endpoint, headers=headers, json=payload)
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "plan_estimate_exceeds_limit"
+    await db.rollback()  # The HTTP refusal must already be durable.
+    refusal = await db.get(GithubPlanRefusal, await db.scalar(current_refusal))
+    assert (refusal.estimate_minutes, refusal.limit_minutes, refusal.dispatch_nonce) == (60.5, 45, nonce)
+    assert refusal.split_suggestion in response.json()["detail"]["message"]
+    assert await db.scalar(select(GithubApprovalRequest.id)) is None
+    assert await db.scalar(select(MailMessage.id)) is None
+    await db.refresh(item)
+    assert item.effort_estimate_minutes is None
+
+    for estimate in range(50, 50 + MAX_REFUSALS_PER_ATTEMPT + 1):
+        response = await client.post(endpoint, headers=headers, json={
+            **payload, "plan_metadata": {"estimate_active_minutes": estimate},
+        })
+        assert response.status_code == 400
+    history = list(await db.scalars(select(GithubPlanRefusal).order_by(GithubPlanRefusal.id)))
+    assert [r.estimate_minutes for r in history] == list(range(51, 51 + MAX_REFUSALS_PER_ATTEMPT))
+    assert await db.scalar(current_refusal) == history[-1].id
+
+    admitted = await client.post(endpoint, headers=headers, json={**payload, "plan_metadata": {}})
+    assert admitted.status_code == 200
+    assert admitted.json()["status"] == "pending"
+    assert await db.scalar(current_refusal) is None
+    kept = list(await db.scalars(select(GithubPlanRefusal).execution_options(populate_existing=True)))
+    assert len(kept) == MAX_REFUSALS_PER_ATTEMPT and all(row.cleared for row in kept)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approval_status", ["pending", "approved"])
+async def test_refused_plan_limit_keeps_history_hidden_when_plan_is_already_admitted(
+    client, db, monkeypatch, approval_status
+):
+    monkeypatch.setattr(settings, "mail_capability_tokens_required", True)
+    item, _members, tokens = await _dispatch_approval_fixture(db)
+    item_id, scope_id, nonce = item.id, item.scope_id, item.dispatch_nonce
+    scope = await db.get(TeamGithubScope, scope_id)
+    scope.max_plan_estimate_minutes = 45
+    scope.max_item_effort_minutes = 120
+    await db.commit()
+
+    owner_headers = {"X-Synth-City-Session-Token": tokens[1]}
+    endpoint = "/api/v1/agent-mail/approval-requests"
+    attempt = {"work_item_id": item_id, "dispatch_nonce": nonce}
+    admitted = await client.post(endpoint, headers=owner_headers, json={
+        **attempt, "summary": "Admit a bounded plan.",
+        "plan_metadata": {"estimate_active_minutes": 40},
+    })
+    assert admitted.status_code == 200
+    assert admitted.json()["status"] == "pending"
+    approval_id = admitted.json()["id"]
+    if approval_status == "approved":
+        decision = await client.post(
+            "/api/v1/agent-mail/decisions",
+            headers={"X-Synth-City-Session-Token": tokens[0]},
+            json={**attempt, "approval_request_id": approval_id,
+                  "decision": "approved", "reason": "The estimate fits the limit."},
+        )
+        assert decision.status_code == 200
+        assert decision.json()["decision"] == "approved"
+
+    refused = await client.post(endpoint, headers=owner_headers, json={
+        **attempt, "summary": "Submit a larger plan for the same attempt.",
+        "plan_metadata": {"estimate_active_minutes": 60},
+    })
+    assert refused.status_code == 400
+    assert refused.json()["detail"]["code"] == "plan_estimate_exceeds_limit"
+    await db.rollback()  # The refusal must survive the request transaction.
+
+    history = await db.execute(select(GithubPlanRefusal).where(GithubPlanRefusal.work_item_id == item_id))
+    refusal = history.scalar_one()
+    assert (refusal.dispatch_nonce, refusal.estimate_minutes, refusal.limit_minutes) == (nonce, 60, 45)
+    assert refusal.code == "plan_estimate_exceeds_limit"
+    assert refusal.cleared
+    assert await db.scalar(select(current_plan_refusal_id()).where(GithubWorkItem.id == item_id)) is None
+    approval = await db.get(GithubApprovalRequest, approval_id)
+    assert approval.status == approval_status
+
+    detail = await client.get(f"/api/v1/factory/work-items/{item_id}")
+    assert detail.status_code == 200
+    assert "plan_refusal" not in detail.json()["work_item"]["item"]
+    listing = await client.get("/api/v1/factory/work-items", params={"scope_id": scope_id})
+    assert listing.status_code == 200
+    row = next(row["item"] for row in listing.json()["items"] if row["item"]["id"] == item_id)
+    assert "plan_refusal" not in row
 
 
 @pytest.mark.asyncio

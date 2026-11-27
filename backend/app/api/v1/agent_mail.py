@@ -72,6 +72,7 @@ from app.services.github_effort_limit_service import effort_limit_service
 from app.services.mail_redaction import redact_lease_message, redact_lease_thread
 from app.services.github_approval_service import (
     GithubApprovalError,
+    GithubPlanRefusalRecorded,
     github_approval_service,
 )
 
@@ -450,6 +451,9 @@ async def _persist_initial_approval(
         response = _approval_response(approval)
         await db.commit()
         return response
+    except GithubPlanRefusalRecorded as exc:
+        await db.commit()
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     except GithubApprovalError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     except MailAuthorityError as exc:
