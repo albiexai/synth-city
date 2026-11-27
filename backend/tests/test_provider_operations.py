@@ -181,7 +181,7 @@ async def test_real_slot_sql_observation_is_bounded_read_only(tmp_path, monkeypa
                 statements.append(statement)
             result = await ops.scoped_session(db, "codex-cli", team.id, slot.id)
             assert result.state == "bound" and result.session_id == session.id
-            assert len(statements) == 5
+            assert len(statements) == 4
             assert all(s.lstrip().upper().startswith("SELECT") for s in statements)
             assert "synthetic-private" not in result.model_dump_json()
             assert not db.new and not db.dirty and not db.deleted
