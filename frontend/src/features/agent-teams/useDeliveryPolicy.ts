@@ -27,17 +27,13 @@ export const FIELD_LABELS: Record<PolicyField, string> = {
 type Confirmed = { revision: number; policy: DeliveryPolicy }
 /**
  * What the repository is known to hold, kept above both editors (V1 review 436). A save or a rejection in one editor
- * is a fact about the repository, so the other editor must see it before the repository read catches up.
+ * is a fact about the repository, so the other editor must see it before the repository read catches up. The settings
+ * of another repository mount again, so this state never crosses repositories.
  */
-export function useDeliveryRevisions(scopeId: number) {
-  const empty = { scopeId, confirmed: null as Confirmed | null, obsolete: 0 }
-  const [state, setState] = useState(empty)
-  const current = state.scopeId === scopeId ? state : empty
-  const setConfirmed = (update: (value: Confirmed | null) => Confirmed | null) =>
-    setState((previous) => { const base = previous.scopeId === scopeId ? previous : empty; return { ...base, confirmed: update(base.confirmed) } })
-  const setObsolete = (update: (value: number) => number) =>
-    setState((previous) => { const base = previous.scopeId === scopeId ? previous : empty; return { ...base, obsolete: update(base.obsolete) } })
-  return { confirmed: current.confirmed, obsolete: current.obsolete, setConfirmed, setObsolete }
+export function useDeliveryRevisions() {
+  const [confirmed, setConfirmed] = useState<Confirmed | null>(null)
+  const [obsolete, setObsolete] = useState(0)
+  return { confirmed, obsolete, setConfirmed, setObsolete }
 }
 export type DeliveryRevisions = ReturnType<typeof useDeliveryRevisions>
 

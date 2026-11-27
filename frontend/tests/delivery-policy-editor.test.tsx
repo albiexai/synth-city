@@ -387,17 +387,53 @@ describe('both delivery policy editors share what the repository is known to hol
     expect(field('Broad checks')).toBeDisabled()
   })
 
-  it('forgets a rejected revision when the settings show another repository', async () => {
-    vi.mocked(updateTeamGithubDeliveryPolicy).mockRejectedValueOnce(new ApiHttpError('delivery_policy_revision_changed', 409))
+  const other = { id: 3, repo_name: 'other', delivery_policy: policy({ owner_idle_seconds: 700, required_checks: [check('Other build')] }) } // repository B, also at revision 4
+  const openB = async (user: ReturnType<typeof userEvent.setup>, button: string) => {
+    await user.click(screen.getByRole('button', { name: `${button} for example/other` }))
+    await screen.findByText('History')
+    await flush()
+  }
+
+  it('does not send a draft from one repository to another that is at the same revision (V1 review 437)', async () => {
     const { user, rerender } = await openEditor()
+    await user.click(field('Caller inventory required'))
+    rerender(other)
+    await openB(user, 'Edit delivery policy')
+    expect(timer('Owner idle time')).toHaveValue('700')
+    expect(field('Caller inventory required')).not.toBeChecked()
+    expect(save()).toBeDisabled()
+    await user.keyboard('{Escape}')
+    await openB(user, 'Edit required checks')
+    expect(screen.getByLabelText('Check 1 name')).toHaveValue('Other build')
+  })
+
+  it('does not send a required checks draft to another repository either', async () => {
+    const { user, rerender } = await openEditor()
+    await openOther(user, 'Edit required checks')
+    await user.click(screen.getByRole('button', { name: 'Remove check 2' }))
+    rerender(other)
+    await openB(user, 'Edit required checks')
+    expect(screen.getByLabelText('Check 1 name')).toHaveValue('Other build')
+    expect(save()).toBeDisabled()
+  })
+
+  it('keeps the lock of repository B when a late answer from repository A arrives', async () => {
+    let finishA!: (value: { scope_id: number; revision: number; policy: DeliveryPolicy }) => void
+    vi.mocked(updateTeamGithubDeliveryPolicy).mockReturnValueOnce(new Promise((res) => { finishA = res }))
+      .mockRejectedValueOnce(new ApiHttpError('delivery_policy_revision_changed', 409))
+    const { user, rerender } = await openEditor()
+    await user.click(field('Caller inventory required'))
+    await type(user, field('Reason'), 'Slow')
+    await user.click(save())
+    rerender(other)
+    await openB(user, 'Edit delivery policy')
     await user.click(field('Caller inventory required'))
     await type(user, field('Reason'), 'Conflict')
     await user.click(save())
     await screen.findByText(/revision 4 is out of date/)
-    rerender({ id: 3 })
-    await openOther(user, 'Edit required checks')
-    expect(screen.getByLabelText('Check 1 name')).toBeEnabled()
-    expect(screen.queryByText(/is out of date/)).not.toBeInTheDocument()
+    await act(async () => finishA({ scope_id: 2, revision: 5, policy: policy({ caller_inventory_required: true }) }))
+    expect(screen.getByText(/revision 4 is out of date/)).toBeInTheDocument()
+    expect(field('Broad checks')).toBeDisabled()
   })
 
   it('keeps a draft in each dialog separate', async () => {
