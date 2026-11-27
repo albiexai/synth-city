@@ -1060,6 +1060,28 @@ async def test_pr2_base_migration_does_not_invent_historical_attempt_identity():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("table", "column"),
+    [("agent_team_slots", "capability_tier"), ("github_work_items", "issue_difficulty")],
+)
+async def test_difficulty_fields_are_added_to_legacy_tables(table, column):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, legacy_value VARCHAR)"))
+            await conn.execute(text(f"INSERT INTO {table} VALUES (1, 'preserved')"))
+
+            assert column not in await _sqlite_columns(conn, table)
+            for _ in range(2):
+                await _run_sqlite_compat_migrations(conn)
+            assert column in await _sqlite_columns(conn, table)
+            rows = await conn.execute(text(f"SELECT id, legacy_value, {column} FROM {table}"))
+            assert rows.all() == [(1, "preserved", None)]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_pr2_workspace_migration_adds_push_token_expiry_idempotently():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     try:

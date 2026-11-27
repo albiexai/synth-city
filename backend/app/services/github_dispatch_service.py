@@ -137,6 +137,21 @@ def _live_queued_handoffs(now: datetime):
     )
 
 
+def _eligible_handoff_target(target_id: int, preset_id: int):
+    return exists(select(AgentTeamSlot.id).where(
+        AgentTeamSlot.id == target_id,
+        AgentTeamSlot.preset_id == preset_id,
+        AgentTeamSlot.enabled.is_(True),
+        tier_allows_difficulty_sql(AgentTeamSlot.capability_tier, GithubWorkItem.issue_difficulty),
+    ).correlate(GithubWorkItem))
+
+
+def _require_handoff_tier(tier: str | None, difficulty: str | None) -> None:
+    if not tier_allows_difficulty(tier, difficulty):
+        code = "handoff_target_below_difficulty"
+        raise ResumeAttemptError(code, code)
+
+
 async def _lock_dispatch_team(db: AsyncSession, preset_id: int) -> None:
     # Close the read transaction before taking the SQLite writer / PostgreSQL row lock.
     await db.commit()
@@ -2498,9 +2513,23 @@ class GithubDispatchService:
                                                include_queued_handoffs=False)):
                 await db.commit()
                 continue
-            item.handoff_state = "pending"
-            item.handoff_expires_at = None
-            item.updated_at = now
+            promoted = await db.execute(
+                update(GithubWorkItem)
+                .where(
+                    GithubWorkItem.id == item_id,
+                    GithubWorkItem.scope_id == scope.id,
+                    GithubWorkItem.handoff_state == "queued",
+                    GithubWorkItem.handoff_target_slot_id == target_id,
+                    GithubWorkItem.handoff_expires_at > now,
+                    _eligible_handoff_target(target_id, preset_id),
+                )
+                .values(handoff_state="pending", handoff_expires_at=None, updated_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            if promoted.rowcount != 1:
+                await db.commit()
+                continue
+            await db.refresh(item)
             from app.services import factory_audit_service as audit
 
             notice_fields = await self._record_handoff_reassignment(
@@ -2589,6 +2618,7 @@ class GithubDispatchService:
                 "invalid_handoff_target",
                 "Handoff target must be an enabled slot in the same preset",
             )
+        _require_handoff_tier(target.capability_tier, item.issue_difficulty)
         busy = await self.slot_is_busy(db, target_slot_id, exclude_item_id=item.id)
         now = datetime.utcnow()
         if (busy and item.handoff_state == "queued" and item.handoff_target_slot_id == target_slot_id
@@ -2747,8 +2777,10 @@ class GithubDispatchService:
             ).scalar_one_or_none()
             if scope is None:
                 raise ValueError("handoff scope is unavailable")
-            if not target.enabled or target.preset_id != scope.preset_id:
+            target = await db.get(AgentTeamSlot, accepting_slot_id, populate_existing=True)
+            if target is None or not target.enabled or target.preset_id != scope.preset_id:
                 raise ValueError("handoff target is unavailable")
+            _require_handoff_tier(target.capability_tier, item.issue_difficulty)
             if await self.slot_is_busy(db, accepting_slot_id, exclude_item_id=item.id, include_queued_handoffs=False):
                 raise ResumeAttemptError("handoff_target_busy", "The handoff target has other work")
             active_revision = None
@@ -2785,13 +2817,18 @@ class GithubDispatchService:
                 )
             )
             now = datetime.utcnow()
+            pending_handoff = (
+                GithubWorkItem.id == item.id,
+                GithubWorkItem.scope_id == scope.id,
+                GithubWorkItem.owner_slot_id == old_owner_slot_id,
+                GithubWorkItem.handoff_state == "pending",
+                GithubWorkItem.handoff_target_slot_id == accepting_slot_id,
+            )
             item_update = (
                 update(GithubWorkItem)
                 .where(
-                    GithubWorkItem.id == item.id,
-                    GithubWorkItem.owner_slot_id == old_owner_slot_id,
-                    GithubWorkItem.handoff_state == "pending",
-                    GithubWorkItem.handoff_target_slot_id == accepting_slot_id,
+                    *pending_handoff,
+                    _eligible_handoff_target(accepting_slot_id, scope.preset_id),
                 )
                 .values(
                     owner_slot_id=accepting_slot_id,
@@ -2820,6 +2857,21 @@ class GithubDispatchService:
                     ),
                 )
             item_result = await db.execute(item_update)
+            if item_result.rowcount != 1:
+                current_tier = (await db.execute(
+                    select(AgentTeamSlot.capability_tier, GithubWorkItem.issue_difficulty)
+                    .select_from(GithubWorkItem)
+                    .join(AgentTeamSlot, AgentTeamSlot.id == accepting_slot_id)
+                    .where(
+                        *pending_handoff,
+                        AgentTeamSlot.preset_id == scope.preset_id,
+                        AgentTeamSlot.enabled.is_(True),
+                    )
+                )).one_or_none()
+                await db.rollback()
+                if current_tier is not None:
+                    _require_handoff_tier(*current_tier)
+                raise ValueError("handoff state changed before acceptance")
             workspace_result = await db.execute(
                 update(GithubWorkspace)
                 .where(
@@ -2917,10 +2969,7 @@ class GithubDispatchService:
                 if remaining_authority:
                     await db.rollback()
                     raise ValueError("handoff continuation authority changed")
-            if (
-                item_result.rowcount != 1
-                or workspace_result.rowcount != 1
-            ):
+            if workspace_result.rowcount != 1:
                 await db.rollback()
                 raise ValueError("handoff state changed before acceptance")
             if actor is not None:

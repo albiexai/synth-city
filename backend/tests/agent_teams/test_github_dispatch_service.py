@@ -44,6 +44,7 @@ from app.services.github_dispatch_service import (
     GithubAuthModeUnresolved,
     GithubDispatchService,
     PartiallyPreparedAttempt,
+    ResumeAttemptError,
     attempt_state,
     github_dispatch_service,
 )
@@ -7594,6 +7595,32 @@ async def test_dispatch_rechecks_authority_after_workspace_preparation(db, monke
 
 
 @pytest.mark.asyncio
+async def test_handoff_initiation_refuses_an_under_tier_target(db, monkeypatch):
+    _, (owner, target), scope = await _team(db)
+    target.capability_tier = "low"
+    item = GithubWorkItem(
+        scope_id=scope.id, issue_number=9020, issue_title="Handoff", issue_url="u",
+        github_updated_at=datetime.utcnow(), dispatch_status="dispatched",
+        owner_slot_id=owner.id, issue_difficulty="high",
+    )
+    db.add(item)
+    await db.commit()
+    notify = AsyncMock()
+    monkeypatch.setattr(github_dispatch_service, "_notify_handoff", notify)
+
+    with pytest.raises(ResumeAttemptError) as refusal:
+        await github_dispatch_service.initiate_handoff(
+            db, item, scope, initiating_slot_id=owner.id, target_slot_id=target.id,
+        )
+
+    assert refusal.value.block_code == "handoff_target_below_difficulty"
+    await db.refresh(item)
+    assert item.owner_slot_id == owner.id and item.handoff_state is None
+    assert item.handoff_target_slot_id is None
+    notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_busy_handoff_queues_without_inviting_acceptance(db, monkeypatch):
     _, slots, scope = await _team(db)
     current = GithubWorkItem(scope_id=scope.id, issue_number=9020, issue_title="Handoff", issue_url="u",
@@ -7622,7 +7649,7 @@ async def test_busy_handoff_queues_without_inviting_acceptance(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("target_state", ["busy", "disabled"])
+@pytest.mark.parametrize("target_state", ["busy", "disabled", "retiered"])
 async def test_queued_handoff_waits_for_unavailable_target(db, monkeypatch, target_state):
     _, (owner, target), scope = await _team(db)
     now = datetime.utcnow()
@@ -7638,15 +7665,29 @@ async def test_queued_handoff_waits_for_unavailable_target(db, monkeypatch, targ
             scope_id=scope.id, issue_number=9021, issue_title="Busy", issue_url="v",
             github_updated_at=now, dispatch_status="dispatched", owner_slot_id=target.id,
         ))
-    else:
+    elif target_state == "disabled":
         target.enabled = False
     await db.commit()
     notice = AsyncMock()
     monkeypatch.setattr(agent_mail_service, "send_direct_message", notice)
+    if target_state == "retiered":
+        queued.issue_difficulty = "high"
+        await db.commit()
+        slot_is_busy = github_dispatch_service.slot_is_busy
+
+        async def lower_tier_after_target_read(*args, **kwargs):
+            busy = await slot_is_busy(*args, **kwargs)
+            if kwargs.get("exclude_item_id") == queued.id:
+                target.capability_tier = "low"
+                await db.flush()
+            return busy
+
+        monkeypatch.setattr(github_dispatch_service, "slot_is_busy", lower_tier_after_target_read)
 
     await github_dispatch_service.dispatch_pending(db, scope, [owner, target])
 
     assert queued.handoff_state == "queued"
+    assert queued.owner_slot_id == owner.id
     assert queued.handoff_target_slot_id == target.id
     assert queued.handoff_expires_at == now + timedelta(minutes=30)
     notice.assert_not_awaited()
@@ -8150,6 +8191,55 @@ async def test_stale_queue_refusal_cannot_change_the_winning_owner(wal_dispatch_
         assert current.dispatch_status == "dispatched" and current.owner_slot_id == winner_owner
         assert current.pending_reason is None and current.dispatch_nonce is not None
     assert launcher.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["tier_before_acceptance", "difficulty_after_check"])
+async def test_handoff_acceptance_refuses_an_under_tier_target(db, monkeypatch, change):
+    _, (owner, target), scope = await _team(db)
+    owner_id, target_id = owner.id, target.id
+    target.capability_tier = "medium"
+    item = GithubWorkItem(
+        scope_id=scope.id, issue_number=9070, issue_title="Handoff", issue_url="u",
+        github_updated_at=datetime.utcnow(), dispatch_status="dispatched",
+        owner_slot_id=owner_id, handoff_state="pending", handoff_target_slot_id=target_id,
+        issue_difficulty="medium",
+    )
+    db.add(item)
+    await db.flush()
+    workspace = await _lease_for(db, scope, item, kind="dispatch", leased_owner_pid=4321)
+    lease_token = workspace.lease_token
+    if change == "tier_before_acceptance":
+        target.capability_tier = "low"
+        await db.commit()
+
+    async def snapshot(*_args):
+        if change == "difficulty_after_check":
+            item.issue_difficulty = "high"
+            await db.flush()
+        return {}
+
+    take_snapshot = AsyncMock(side_effect=snapshot)
+    revoke = AsyncMock()
+    identity = AsyncMock()
+    monkeypatch.setattr(github_workspace_service, "snapshot_worktree_config", take_snapshot)
+    monkeypatch.setattr(github_workspace_service, "revoke_push_token", revoke)
+    monkeypatch.setattr(github_workspace_service, "apply_slot_identity", identity)
+
+    with pytest.raises(ResumeAttemptError) as refusal:
+        await github_dispatch_service.accept_handoff(
+            db, item, target_id, accepting_pane_pid=1234, accepting_pane_proc_start="1",
+        )
+
+    assert refusal.value.block_code == "handoff_target_below_difficulty"
+    assert take_snapshot.await_count == (1 if change == "difficulty_after_check" else 0)
+    revoke.assert_not_awaited()
+    identity.assert_not_awaited()
+    await db.refresh(item)
+    await db.refresh(workspace)
+    assert item.owner_slot_id == owner_id and item.handoff_state == "pending"
+    assert item.handoff_target_slot_id == target_id
+    assert workspace.lease_token == lease_token and workspace.leased_owner_pid == 4321
 
 
 @pytest.mark.asyncio
@@ -8671,6 +8761,26 @@ async def test_dispatch_records_difficulty_refusal_before_acquiring_a_workspace(
     assert item.dispatch_status == "pending" and item.pending_reason == "difficulty_above_tier"
     assert item.issue_difficulty == "medium" and item.owner_slot_id is None
     acquire.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_untiered_slot_launches_a_high_difficulty_issue(db):
+    _, slots, scope = await _team(db)
+    owner = slots[1]
+    assert owner.capability_tier is None
+    item = await _pending_item(db, scope, 45)
+    launcher = AsyncMock(side_effect=_launch_ok)
+    labels = ["area:backend", "difficulty:high"]
+
+    await github_dispatch_service.dispatch_pending(
+        db, scope, slots, client=_LabelsClient(labels), launcher=launcher,
+        issue_labels_by_number={45: labels},
+    )
+
+    launcher.assert_awaited_once()
+    await db.refresh(item)
+    assert item.issue_difficulty == "high" and item.owner_slot_id == owner.id
+    assert item.dispatch_status == "dispatched" and item.pending_reason is None
 
 
 @pytest.mark.asyncio
