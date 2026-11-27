@@ -42,6 +42,8 @@ export interface SlotLaunchOptions {
   [key: string]: unknown
 }
 
+export type CapabilityTier = 'low' | 'medium' | 'high'
+
 export interface AgentTeamSlot {
   id: number
   preset_id: number
@@ -60,6 +62,7 @@ export interface AgentTeamSlot {
   launch_options: SlotLaunchOptions
   area_labels?: string[] | null
   expertise?: string | null
+  capability_tier?: CapabilityTier | null
   warnings?: string[]
   workspace_trust_status?: 'pending' | 'ready' | 'failed' | null
   enabled: boolean
@@ -314,6 +317,7 @@ export interface AgentTeamSlotInput {
   launch_options?: SlotLaunchOptions
   area_labels?: string[] | null
   expertise?: string | null
+  capability_tier?: CapabilityTier | null
   enabled?: boolean
   position?: number | null
 }
@@ -331,6 +335,7 @@ export interface AgentTeamSlotUpdate {
   launch_options?: SlotLaunchOptions
   area_labels?: string[] | null
   expertise?: string | null
+  capability_tier?: CapabilityTier | null
   enabled?: boolean
   position?: number
 }

@@ -22,8 +22,9 @@ from app.models.database import (
     TeamGithubScope,
 )
 from app.services.github_client import GithubClient, GithubClientResponseError, github_client
-from app.services.github_dispatch_service import github_dispatch_service
+from app.services.github_dispatch_difficulty import difficulty_from_labels
 from app.services.github_dispatch_priority import priority_from_labels
+from app.services.github_dispatch_service import github_dispatch_service
 from app.services.agent_team_campaign_service import agent_team_campaign_service
 from app.services.github_rate_limit_service import GithubRateLimited
 from app.services.github_terminal_revision_service import TERMINAL_ITEMS
@@ -529,6 +530,7 @@ class GithubWatcherService:
                     issue_type=issue_type,
                     dispatch_status="pending",
                     dispatch_priority=priority_from_labels(label_names),
+                    issue_difficulty=difficulty_from_labels(label_names),
                 )
             )
             return True
@@ -545,6 +547,7 @@ class GithubWatcherService:
         if existing.dispatch_status == "pending":
             existing.issue_type = issue_type
         existing.dispatch_priority = priority_from_labels(label_names)
+        existing.issue_difficulty = difficulty_from_labels(label_names)
         existing.github_updated_at = github_updated_at
         existing.issue_title = issue["title"]
         existing.updated_at = datetime.utcnow()

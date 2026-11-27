@@ -296,6 +296,7 @@ async def test_preset_autonomy_and_slot_routing_fields_round_trip(client, monkey
                     "repo_path": str(repo),
                     "area_labels": ["area:backend", "area:api", "area:backend"],
                     "expertise": "Owns the API",
+                    "capability_tier": "medium",
                 }
             ],
         },
@@ -306,6 +307,7 @@ async def test_preset_autonomy_and_slot_routing_fields_round_trip(client, monkey
     slot = preset["slots"][0]
     assert slot["area_labels"] == ["area:backend", "area:api"]
     assert slot["expertise"] == "Owns the API"
+    assert slot["capability_tier"] == "medium"
 
     leader = await client.put(
         f"/api/v1/agent-teams/presets/{preset['id']}/leader",
@@ -328,12 +330,21 @@ async def test_preset_autonomy_and_slot_routing_fields_round_trip(client, monkey
 
     response = await client.patch(
         f"/api/v1/agent-teams/slots/{slot['id']}",
-        json={"area_labels": ["area:frontend"], "expertise": "Owns UI"},
+        json={"area_labels": ["area:frontend"], "expertise": "Owns UI", "capability_tier": "low"},
     )
     assert response.status_code == 200
     updated_slot = response.json()["slots"][0]
     assert updated_slot["area_labels"] == ["area:frontend"]
     assert updated_slot["expertise"] == "Owns UI"
+    assert updated_slot["capability_tier"] == "low"
+    copy = await client.post(f"/api/v1/agent-teams/presets/{preset['id']}/duplicate",
+                             json={"name": "Autonomy team copy"})
+    assert copy.status_code == 200 and copy.json()["slots"][0]["capability_tier"] == "low"
+    path = f"/api/v1/agent-teams/slots/{slot['id']}"
+    assert (await client.patch(path, json={"capability_tier": "expert"})).status_code == 422
+    cleared = await client.patch(path, json={"capability_tier": None})
+    assert cleared.status_code == 200
+    assert cleared.json()["slots"][0]["capability_tier"] is None
 
 
 @pytest.mark.asyncio
