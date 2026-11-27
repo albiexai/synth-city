@@ -388,6 +388,87 @@ describe('Progress', () => {
     expect(screen.getByText('backlog unknown')).toBeInTheDocument()
   })
 
+  // #1415: a card shows while the team's recorded campaign is active or finishing; finished ones are one line.
+  const team = (id: number, name: string, over: Partial<TeamCampaignSummary>, extra: Partial<AgentTeamSummary> = {}) => ({
+    preset: preset(id, name, id === 1),
+    summary: summary({ preset_id: id, description: name, campaign: { ...campaign, ...over }, ...extra }),
+  })
+  const serveTeams = (teams: ReturnType<typeof team>[]) => {
+    const options = {
+      presets: teams.map(t => t.preset),
+      summaries: Object.fromEntries(teams.map(t => [t.preset.id, t.summary])) as Record<number, AgentTeamSummary>,
+      overview: overviewWith({}),
+    }
+    serve(options)
+    return options
+  }
+  const finishedOnly = { under_way_count: 0, under_way: [], queued_count: 0, queued: [], not_started_count: 0,
+    not_started_groups: [], decisions_ahead: [], campaign_status: 'finished' as const }
+
+  it('shows only the active campaign and one line for the finished ones', async () => {
+    serveTeams([team(1, 'synth-city-v4.4', { campaign_status: 'active' }), team(2, 'synth-city-v4.3', finishedOnly),
+      team(3, 'synth-city-v4.2', finishedOnly), team(4, 'major-release-v3', finishedOnly)])
+    await open()
+    expect(screen.getAllByRole('article', { name: /^Progress:/ })).toHaveLength(1)
+    expect(screen.getByRole('article', { name: /Progress: synth-city-v4.4/ })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: /^Progress/ })).toHaveTextContent('1 campaign')
+    expect(screen.getByRole('link', { name: '3 finished campaigns ›' })).toHaveAttribute('href', '/work?category=finished')
+  })
+
+  it("links one finished campaign to its team's finished work", async () => {
+    serveTeams([team(1, 'synth-city-v4.4', { campaign_status: 'active' }), team(2, 'synth-city-v4.3', finishedOnly)])
+    await open()
+    expect(screen.getByRole('link', { name: '1 finished campaign ›' }))
+      .toHaveAttribute('href', '/work?team_id=2&category=finished')
+  })
+
+  it('shows a started campaign even before it has work, and reads the status, never the counts', async () => {
+    serveTeams([team(1, 'synth-city-v4.4', { ...finishedOnly, done_count: 0, latest_done: [], campaign_status: 'finishing' }),
+      team(2, 'synth-city-v4.3', { campaign_status: 'finished' })])
+    await open()
+    expect(screen.getByRole('article', { name: /Progress: synth-city-v4.4/ })).toBeInTheDocument()
+    expect(screen.queryByRole('article', { name: /Progress: synth-city-v4.3/ })).not.toBeInTheDocument()
+  })
+
+  it('shows a team without a campaign record while it has work under way, but not for done work alone', async () => {
+    serveTeams([team(1, 'synth-city-v4.4', { campaign_status: null }),
+      team(2, 'old-team', { ...finishedOnly, campaign_status: null })])
+    await open()
+    expect(screen.getByRole('article', { name: /Progress: synth-city-v4.4/ })).toBeInTheDocument()
+    expect(screen.queryByRole('article', { name: /Progress: old-team/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: /finished campaign/ })).not.toBeInTheDocument()
+  })
+
+  it("keeps a finished team's attention item under Needs you without bringing its card back", async () => {
+    serveTeams([team(2, 'synth-city-v4.3', finishedOnly, { human_actions: [
+      { scope_id: 1, issue_number: 47, work_item_id: 9, kind: 'review_pr', state: 'requested', source: 'leader',
+        assessment_current: true, pull_request_number: 50 }] })])
+    await open()
+    expect(screen.getByRole('heading', { name: /^Needs you/ })).toBeInTheDocument()
+    expect(screen.queryByRole('article', { name: /^Progress:/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: '1 finished campaign ›' })).toBeInTheDocument()
+  })
+
+  it('removes a card on the next refresh after its campaign finishes, and shows it again when one starts', async () => {
+    vi.useFakeTimers()
+    try {
+      const options = serveTeams([team(1, 'synth-city-v4.4', { campaign_status: 'active' })])
+      await open()
+      expect(screen.getByRole('article', { name: /Progress: synth-city-v4.4/ })).toBeInTheDocument()
+      options.summaries[1] = team(1, 'synth-city-v4.4', finishedOnly).summary
+      await act(async () => { await vi.advanceTimersByTimeAsync(15000) })
+      await settle()
+      expect(screen.queryByRole('article', { name: /Progress: synth-city-v4.4/ })).not.toBeInTheDocument()
+      expect(screen.getByRole('link', { name: '1 finished campaign ›' })).toBeInTheDocument()
+      options.summaries[1] = team(1, 'synth-city-v4.4', { ...finishedOnly, campaign_status: 'active' }).summary
+      await act(async () => { await vi.advanceTimersByTimeAsync(15000) })
+      await settle()
+      expect(screen.getByRole('article', { name: /Progress: synth-city-v4.4/ })).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('omits a campaign with nothing to show', async () => {
     serve({ presets: [preset(1, 'A', true)], summaries: { 1: summary() }, overview: overviewWith({}) })
     await open()
@@ -410,7 +491,8 @@ describe('Overview filters', () => {
     ...preset(id, name, true),
     slots: providers.map((provider, index) => ({ id: id * 10 + index, display_name: `${name} ${index}`, provider }) as unknown as AgentTeamPreset['slots'][number]),
   })
-  const campaign = (done: number): TeamCampaignSummary => ({ ...emptyCampaign, done_count: done })
+  // An active campaign, so a team shows by its recorded status, not by done work alone (#1415).
+  const campaign = (done: number): TeamCampaignSummary => ({ ...emptyCampaign, done_count: done, campaign_status: 'active' })
   const everything = summary({ human_actions: [action(8, 47, 9), action(9, 937, 11)], campaign: campaign(3) })
 
   function serveFilters(

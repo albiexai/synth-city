@@ -3,7 +3,7 @@ import { formatServerTime } from "@/lib/serverTime";
 import type { AgentTeamPreset, AgentTeamSummary, CampaignUnderWayItem } from "@/types/agentTeams";
 import { RelativeTime } from "../RelativeTime";
 import { anchor } from "../styles";
-import { campaignHasContent } from "./campaign";
+import { campaignFinished, campaignShown } from "./campaign";
 import { CampaignBar } from "./CampaignBar";
 
 function parentLabel(url: string | null) {
@@ -201,10 +201,11 @@ export function CampaignProgress({
 }) {
   const cards = presets.flatMap((preset, index) => {
     const summary = summaries[index];
-    return summary && (campaignHasContent(summary.campaign) || (summary.campaign?.dispatch_order?.length ?? 0) > 0)
-      ? [{ preset, summary }] : [];
+    return summary && campaignShown(summary.campaign) ? [{ preset, summary }] : [];
   });
-  if (cards.length === 0) return null;
+  const finished = presets.filter((_, index) => campaignFinished(summaries[index]?.campaign ?? undefined));
+  if (cards.length === 0 && finished.length === 0) return null;
+  const history = finished.length === 1 ? `/work?team_id=${finished[0].id}&category=finished` : "/work?category=finished";
   return (
     <section aria-labelledby="progress-heading" className="space-y-2">
       <div className="flex items-baseline justify-between gap-3">
@@ -213,11 +214,20 @@ export function CampaignProgress({
         </h3>
         <Link className={anchor} to="/work">All work ›</Link>
       </div>
-      <div className="rounded-lg border bg-card">
-        {cards.map(({ preset, summary }) => (
-          <CampaignCard key={preset.id} preset={preset} summary={summary} />
-        ))}
-      </div>
+      {cards.length > 0 && (
+        <div className="rounded-lg border bg-card">
+          {cards.map(({ preset, summary }) => (
+            <CampaignCard key={preset.id} preset={preset} summary={summary} />
+          ))}
+        </div>
+      )}
+      {finished.length > 0 && (
+        <p className="text-sm">
+          <Link className={anchor} to={history}>
+            {finished.length} finished {finished.length === 1 ? "campaign" : "campaigns"} ›
+          </Link>
+        </p>
+      )}
     </section>
   );
 }

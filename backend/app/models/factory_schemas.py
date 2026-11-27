@@ -424,6 +424,9 @@ class TeamCampaignSummary(FactoryModel):
     not_started_count: int | None = Field(ge=0)
     not_started_groups: list[CampaignAreaGroup]
     decisions_ahead: list[CampaignDecision]
+    # The team's recorded campaign in its current lifetime: the open one, else the latest finished one, else None when
+    # there is no record (#1415). Overview reads it instead of inferring "finished" from the counts.
+    campaign_status: Literal["active", "finishing", "finished"] | None = None
 
 
 class TeamRequiredCIUnreadable(RequiredCIUnreadableSignal):

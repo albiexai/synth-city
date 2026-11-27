@@ -12,7 +12,7 @@ import time
 from sqlalchemy import select
 
 from app.config import settings
-from app.models.database import AgentTeamPreset, AgentTeamSlot, GithubWorkItem, TeamGithubScope
+from app.models.database import AgentTeamPreset, AgentTeamSlot, Campaign, GithubWorkItem, TeamGithubScope
 from app.models.factory_schemas import (
     CampaignAreaGroup, CampaignDecision, CampaignDispatchItem, CampaignDoneItem, CampaignQueuedItem,
     CampaignUnderWayItem, TeamCampaignSummary,
@@ -278,7 +278,18 @@ class AgentTeamCampaignService:
             dispatch_order=dispatch_order,
             not_started_count=sum(groups.values()) if available else None,
             not_started_groups=[CampaignAreaGroup(area=area, count=count) for area, count in sorted(groups.items())],
-            decisions_ahead=decisions)
+            decisions_ahead=decisions, campaign_status=await self._campaign_status(db, preset_id) if matches else None)
+
+    @staticmethod
+    async def _campaign_status(db, preset_id):
+        """The team lifetime's open campaign status, else ``finished`` when it has only finished ones (#1415)."""
+        from app.services import factory_audit_service as audit
+
+        key = await audit.current_context_key(db, "team", preset_id)
+        if key is None:
+            return None
+        statuses = set((await db.scalars(select(Campaign.status).where(Campaign.team_context_key == key))).all())
+        return next((status for status in ("active", "finishing", "finished") if status in statuses), None)
 
 
 agent_team_campaign_service = AgentTeamCampaignService()

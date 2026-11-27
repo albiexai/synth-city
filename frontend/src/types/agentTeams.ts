@@ -179,6 +179,8 @@ export interface TeamCampaignSummary {
   not_started_count: number | null
   not_started_groups: { area: string; count: number }[]
   decisions_ahead: CampaignDecision[]
+  /** The team's recorded campaign: open, else finished; null without a record. Older responses omit it (#1415). */
+  campaign_status?: 'active' | 'finishing' | 'finished' | null
 }
 
 // The status that the controller derives from the clock and the stored promise (#549).
