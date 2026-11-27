@@ -322,6 +322,18 @@ async def test_a_wait_whose_scope_identity_is_refused_shows_without_a_repository
     assert {r["issue_number"]: r["repository"] is None for r in rows} == {9340: True, 9342: False}
 
 
+@pytest.mark.parametrize("name", [".", ".."])
+async def test_a_dot_repository_produces_no_wait_or_deferral_link(factory_client, factory_store, name):
+    scope = factory_store.ids.scopes[0]
+    await add_wait(factory_store.maker, scope, 9345, "v4.5", repository=f"fixture/{name}")
+    item = await add_item(factory_store.maker, scope, 9346, url=f"https://github.com/fixture/{name}/issues/9346")
+    await defer(factory_store.maker, scope, item, "v4.5")
+
+    states = await get_states(factory_client)
+    assert [(row["issue_number"], row["repository"]) for row in states["waiting"]] == [(9345, None)]
+    assert states["deferred"] == []
+
+
 async def test_waits_that_are_not_waits_are_omitted_and_the_read_succeeds(factory_client, factory_store):
     good = factory_store.ids.scopes[0]
     await add_wait(factory_store.maker, good, 9341, "")
@@ -427,12 +439,14 @@ async def test_waits_of_two_scopes_with_the_same_refused_identity_stay_separate(
     assert sorted((r["milestone"], r["repository"]) for r in rows) == [("first milestone", None), ("second milestone", None)]
 
 
-async def test_two_proven_waits_of_the_same_repository_and_issue_still_show_once(factory_client, factory_store):
+async def test_two_stamps_that_differ_only_in_case_show_the_newest_wait(factory_client, factory_store):
     first = await idle_scope(factory_store.maker, 0, "pair", factory_store.ids)
     second = await idle_scope(factory_store.maker, 1, "pair", factory_store.ids)
-    await add_wait(factory_store.maker, first, 9742, "v4.5", at=MOMENT)
-    await add_wait(factory_store.maker, second, 9742, "v4.5", at=MOMENT + timedelta(seconds=1))
-    assert [r["issue_number"] for r in (await get_states(factory_client))["waiting"]] == [9742]
+    await add_wait(factory_store.maker, first, 9742, "v4.5", at=MOMENT, repository="Fixture/PAIR")
+    await add_wait(factory_store.maker, second, 9742, "v4.6", at=MOMENT + timedelta(seconds=1))
+    [row] = (await get_states(factory_client))["waiting"]
+    assert (row["issue_number"], row["milestone"], row["repository"]["display_name"]) == (
+        9742, "v4.6", "fixture/pair")
 
 
 @pytest.mark.parametrize("blank", ["  \t ", "\u00a0", "\u2003", "\u2028", " \u3000\n\u202f"])

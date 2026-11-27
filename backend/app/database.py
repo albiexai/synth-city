@@ -464,7 +464,7 @@ async def _sqlite_reconcile_historical_approvals(conn) -> bool:
 _APPROVAL_RECONCILIATION_MIGRATION = "pr1_historical_approval_reconciliation"
 
 
-async def _sqlite_compat_migration_pending(conn, name) -> bool:
+async def _sqlite_approval_reconciliation_pending(conn) -> bool:
     # Frozen bookkeeping name: existing applied rows must still prevent replay.
     await conn.execute(
         text(
@@ -477,19 +477,9 @@ async def _sqlite_compat_migration_pending(conn, name) -> bool:
             text(
                 "SELECT 1 FROM deck_compat_migrations WHERE name = :name"
             ),
-            {"name": name},
+            {"name": _APPROVAL_RECONCILIATION_MIGRATION},
         )
     ).first() is None
-
-
-async def _sqlite_record_compat_migration(conn, name) -> None:
-    await conn.execute(
-        text(
-            "INSERT OR IGNORE INTO deck_compat_migrations "
-            "(name, applied_at) VALUES (:name, CURRENT_TIMESTAMP)"
-        ),
-        {"name": name},
-    )
 
 
 async def _sqlite_has_unique_repo_id_index(conn) -> bool:
@@ -729,7 +719,6 @@ async def _sqlite_rebuild_agent_team_slots(conn, columns: set[str]) -> None:
     await conn.commit()
 
 
-_WAIT_REPOSITORY_MIGRATION = "milestone_wait_repository_stamp"
 _COMPLETE_REPOSITORY_NAME = re.compile(r"[A-Za-z0-9_.-]{1,100}")
 
 
@@ -749,26 +738,29 @@ def _scope_event_changes_repository(snapshot, before, after) -> bool:
 
 async def _sqlite_migrate_wait_repositories(conn) -> None:
     columns = await _sqlite_columns(conn, "github_milestone_waits")
-    if not columns:
-        return
-    if "repository" not in columns:
-        await conn.execute(text("ALTER TABLE github_milestone_waits ADD COLUMN repository VARCHAR"))
-    if not await _sqlite_compat_migration_pending(conn, _WAIT_REPOSITORY_MIGRATION):
+    if not columns or "repository" in columns:
         return
 
     from app.models.database import FactoryAuditEvent, GithubMilestoneWait, TeamGithubScope
 
-    unstamped_scopes = select(GithubMilestoneWait.scope_id).where(
-        GithubMilestoneWait.repository.is_(None)).distinct().subquery()
-    scopes = (await conn.execute(select(TeamGithubScope.id, TeamGithubScope.repo_owner, TeamGithubScope.repo_name)
-                                 .join(unstamped_scopes, TeamGithubScope.id == unstamped_scopes.c.scope_id))).all()
-    if scopes:
+    # The new column records completion. Roll its DDL back with the backfill
+    # if either step fails, including with SQLite's legacy transaction mode.
+    async with conn.begin_nested():
+        await conn.execute(text("ALTER TABLE github_milestone_waits ADD COLUMN repository VARCHAR"))
+        wait_scopes = select(GithubMilestoneWait.scope_id).distinct().subquery()
+        scopes = (await conn.execute(
+            select(TeamGithubScope.id, TeamGithubScope.repo_owner, TeamGithubScope.repo_name)
+            .join(wait_scopes, TeamGithubScope.id == wait_scopes.c.scope_id)
+        )).all()
+        if not scopes:
+            return
+
         from app.services.factory_projection_service import FactoryReadError, github_identity
 
         events = (await conn.execute(
             select(FactoryAuditEvent.scope_id, FactoryAuditEvent.context_snapshot, FactoryAuditEvent.before_values,
                    FactoryAuditEvent.after_values)
-            .join(unstamped_scopes, FactoryAuditEvent.scope_id == unstamped_scopes.c.scope_id)
+            .join(wait_scopes, FactoryAuditEvent.scope_id == wait_scopes.c.scope_id)
             .where(FactoryAuditEvent.event_kind == "policy_change",
                    FactoryAuditEvent.source == "agent_teams.update_github_scope",
                    FactoryAuditEvent.action_outcome == "applied")
@@ -788,12 +780,11 @@ async def _sqlite_migrate_wait_repositories(conn) -> None:
         if stamps:
             await conn.execute(text("UPDATE github_milestone_waits SET repository = :repository "
                                     "WHERE scope_id = :scope_id AND repository IS NULL"), stamps)
-    await _sqlite_record_compat_migration(conn, _WAIT_REPOSITORY_MIGRATION)
 
 
 async def _run_sqlite_compat_migrations(conn) -> None:
     reconcile_historical_approvals = (
-        await _sqlite_compat_migration_pending(conn, _APPROVAL_RECONCILIATION_MIGRATION)
+        await _sqlite_approval_reconciliation_pending(conn)
     )
     columns = await _sqlite_columns(conn, "mail_team_members")
     if columns:
@@ -1352,7 +1343,13 @@ async def _run_sqlite_compat_migrations(conn) -> None:
     if reconcile_historical_approvals:
         reconciliation_complete = await _sqlite_reconcile_historical_approvals(conn)
         if reconciliation_complete:
-            await _sqlite_record_compat_migration(conn, _APPROVAL_RECONCILIATION_MIGRATION)
+            await conn.execute(
+                text(
+                    "INSERT OR IGNORE INTO deck_compat_migrations "
+                    "(name, applied_at) VALUES (:name, CURRENT_TIMESTAMP)"
+                ),
+                {"name": _APPROVAL_RECONCILIATION_MIGRATION},
+            )
     if {"pr_number", "retry_requested_at"} <= work_item_columns:
         await conn.execute(
             text(

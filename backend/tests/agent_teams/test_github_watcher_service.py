@@ -557,6 +557,22 @@ async def test_fresh_poll_stamps_unproven_wait_using_current_repository(db, lega
 
 
 @pytest.mark.asyncio
+async def test_a_new_route_does_not_keep_a_wait_from_another_repository(db):
+    scope = await _make_scope(db, milestone="V1")
+    issue = _milestone_issue(scope, "V9")
+    db.add(GithubMilestoneWait(scope_id=scope.id, issue_number=issue["number"], milestone_title="V9",
+                               github_updated_at=datetime(2026, 7, 3), repository="other/repo"))
+    await db.commit()
+    await _make_scope(db, preset_name="Destination", milestone="V9")
+
+    await github_watcher_service.poll_scope(db, scope, _FakeClient(labeled=[issue]))
+
+    assert await db.scalar(select(GithubWorkItem)) is None
+    record = await db.scalar(select(GithubMilestoneWait))
+    assert (record.repository, record.milestone_title) == (f"{scope.repo_owner}/{scope.repo_name}", None)
+
+
+@pytest.mark.asyncio
 async def test_milestone_wait_for_moved_issue_belongs_only_to_departed_scope(db):
     home = await _make_scope(db, milestone="V1")
     sibling = await _make_scope(db, preset_name="Sibling", milestone="V2")

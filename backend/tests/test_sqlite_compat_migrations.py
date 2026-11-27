@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
@@ -16,6 +16,7 @@ from app.database import (
     _run_sqlite_compat_migrations,
     _sqlite_agent_team_slots_has_unique_preset_repo_index,
     _sqlite_columns,
+    _sqlite_migrate_wait_repositories,
     _sqlite_rebuild_agent_team_slots,
 )
 from app.models.database import AgentTeamPreset, FactoryAuditEvent, GithubMilestoneWait, GithubWorkItem, TeamGithubScope
@@ -62,6 +63,19 @@ async def test_milestone_wait_upgrade_stamps_only_provable_repositories():
             if "repository" in await _sqlite_columns(conn, "github_milestone_waits"):
                 await conn.execute(text("ALTER TABLE github_milestone_waits DROP COLUMN repository"))
             await conn.commit()
+
+            def interrupt_backfill(_conn, _cursor, statement, _params, _context, _many):
+                if statement.startswith("UPDATE github_milestone_waits SET repository"):
+                    raise RuntimeError("wait backfill interrupted")
+
+            event.listen(conn.sync_connection, "before_cursor_execute", interrupt_backfill)
+            try:
+                with pytest.raises(RuntimeError, match="wait backfill interrupted"):
+                    await _sqlite_migrate_wait_repositories(conn)
+            finally:
+                event.remove(conn.sync_connection, "before_cursor_execute", interrupt_backfill)
+            await conn.rollback()
+            assert "repository" not in await _sqlite_columns(conn, "github_milestone_waits")
 
             await _run_sqlite_compat_migrations(conn)
             read = text("SELECT scope_id, issue_number, milestone_title, github_updated_at, repository "
