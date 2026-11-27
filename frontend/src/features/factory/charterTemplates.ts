@@ -21,7 +21,7 @@ export type CharterTemplateValues = Partial<Record<CharterPlaceholder, string>>
 
 export const CHARTER_TEMPLATES: Record<CharterRole, string> = { leader, builder, reviewer }
 
-/** The documented plan-size limit in active minutes, until #1114a adds a configured limit. */
+/** The documented plan-size limit in active minutes. A scope that states its own limit overrides it. */
 export const DEFAULT_PLAN_SIZE_LIMIT = 60
 
 const PLACEHOLDER_PATTERN = /\{\{([a-z_]+)\}\}/g
@@ -53,10 +53,20 @@ export function appendTemplate(existing: string, template: string): string {
   return `${existing}${gap}${template}`
 }
 
-/** The documented default, clamped to the scope's max_item_effort_minutes when that is a lower positive integer. */
-export function planSizeLimit(maxItemEffortMinutes?: number | null): number {
+function positiveInteger(value?: number | null): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0
+}
+
+/**
+ * The scope's own plan limit (max_plan_estimate_minutes) when it states one, never above its item ceiling.
+ * Without it, the documented default, clamped to the scope's max_item_effort_minutes when that is lower.
+ */
+export function planSizeLimit(maxItemEffortMinutes?: number | null, maxPlanEstimateMinutes?: number | null): number {
   const cap = maxItemEffortMinutes
-  if (typeof cap === 'number' && Number.isInteger(cap) && cap > 0 && cap < DEFAULT_PLAN_SIZE_LIMIT) return cap
+  if (positiveInteger(maxPlanEstimateMinutes)) {
+    return positiveInteger(cap) && cap < maxPlanEstimateMinutes ? cap : maxPlanEstimateMinutes
+  }
+  if (positiveInteger(cap) && cap < DEFAULT_PLAN_SIZE_LIMIT) return cap
   return DEFAULT_PLAN_SIZE_LIMIT
 }
 
@@ -78,6 +88,7 @@ export interface CharterScopeInput {
   reviewHoldLabel?: string | null
   areaLabels?: string[] | null
   maxItemEffortMinutes?: number | null
+  maxPlanEstimateMinutes?: number | null
   supervisor?: BoundSupervisor | null
 }
 
@@ -94,7 +105,7 @@ function releaseBranch(baseRef?: string | null): string | undefined {
 
 /** Template values from a scope's own settings. Anything the scope does not state is left out. */
 export function charterTemplateValues(input: CharterScopeInput): CharterTemplateValues {
-  const values: CharterTemplateValues = { plan_size_limit: String(planSizeLimit(input.maxItemEffortMinutes)) }
+  const values: CharterTemplateValues = { plan_size_limit: String(planSizeLimit(input.maxItemEffortMinutes, input.maxPlanEstimateMinutes)) }
   const entries: [CharterPlaceholder, string | undefined][] = [
     ['release_branch', releaseBranch(input.baseRef)],
     ['ready_label', clean(input.dispatchLabel)],

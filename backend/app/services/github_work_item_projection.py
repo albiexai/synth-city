@@ -14,6 +14,7 @@ from app.models.database import GithubApprovalRequest, GithubAttemptScopeRevisio
 from app.models.schemas import GithubWorkItemResponse
 from app.services.github_approval_service import CONTINUABLE_ESCALATIONS
 from app.services.github_dispatch_service import HANDOFF_QUEUE_TTL, github_dispatch_service
+from app.services.github_effort_limit_service import effort_limit_service
 from app.services.github_rate_limit_service import github_rate_limit_service
 from app.services.github_workspace_readiness import work_item_workspace_wait_reason
 from app.services import required_ci_attention
@@ -115,6 +116,10 @@ def _work_item_response(
         required_ci_unreadable=required_ci_attention.signal(item),
         scope_default_effort_limit_minutes=(
             item.effort_limit_minutes if item.effort_estimate_minutes is None else None
+        ),
+        plan_estimate_minutes=item.effort_estimate_minutes,
+        plan_limit_minutes=(
+            effort_limit_service.plan_estimate_limit(scope) if item.effort_estimate_minutes is not None else None
         ),
         auto_merged_at=item.auto_merged_at,
         active_scope_revision=item.active_scope_revision,
