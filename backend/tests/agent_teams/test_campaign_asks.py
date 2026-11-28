@@ -732,6 +732,23 @@ async def test_two_versions_one_second_apart_stay_unchanged_whenever_the_check_r
     assert (listed.stale, listed.metrics_unchanged) == (True, True)
 
 
+async def test_build_snapshot_gives_the_builder_a_membership_only_when_it_was_given_one(db, team, monkeypatch):
+    """V1 verdict 485: callers and test doubles of ``_build`` take five arguments; an ask passes its observation too."""
+    calls = []
+
+    async def build(*args):
+        calls.append(args)
+        return snapshots.Snapshot(campaign_id=team.campaign.id, selector=team.campaign.selector, started_at=T0,
+                                  as_of=CUTOFF, calculation_version=snapshots.CALCULATION_VERSION, metrics=[],
+                                  recorded_coverage=[])
+
+    monkeypatch.setattr(snapshots, "_build", build)
+    await snapshots.build_snapshot(db, team.campaign, _client(), as_of=CUTOFF, observed_at=CUTOFF, cached=False)
+    observed = object()
+    await snapshots.build_snapshot(db, team.campaign, _client(), as_of=CUTOFF, observed_at=CUTOFF, membership=observed)
+    assert [len(args) for args in calls] == [5, 6] and calls[1][5] is observed
+
+
 async def test_a_recompute_whose_observation_is_later_than_the_cutoff_leaves_the_membership_unknown(db, team):
     await snapshots.freeze(db, team.campaign, _client(), actor=SYSTEM, as_of=CUTOFF)
     await snapshots.recompute(db, team.campaign, _client(), actor=OPERATOR, as_of=CUTOFF,

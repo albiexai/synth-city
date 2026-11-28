@@ -335,7 +335,8 @@ async def build_snapshot(db, campaign: Campaign, client, *, as_of: datetime | No
             if earlier_key == key or current_live_read:
                 # The recorder's pending windows are not records: its coverage is read again on every hit.
                 return await _refresh_rate_limited(db, campaign, hit)
-    snapshot = await _build(db, campaign, client, as_of, observed, membership)
+    snapshot = await (_build(db, campaign, client, as_of, observed) if membership is None
+                      else _build(db, campaign, client, as_of, observed, membership))
     if cached:
         _cache[campaign.id] = (_clock() + CACHE_SECONDS, key, snapshot)
     return snapshot
