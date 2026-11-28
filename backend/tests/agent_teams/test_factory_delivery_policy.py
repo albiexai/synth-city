@@ -819,6 +819,34 @@ async def test_current_expired_wait_survives_a_failed_read_and_then_pauses(db, m
     assert record.status == "paused" and item.escalation_reason == pause.REASON
 
 
+@pytest.mark.parametrize("initial", [False, True], ids=["continuation", "initial"])
+@pytest.mark.asyncio
+async def test_idle_escalation_retires_current_expired_observation_wait(db, monkeypatch, tmp_path, initial):
+    from app.services import owner_observation_pause as pause
+
+    scope, item, _, _, slot, _, _, observed = await observation_fixture(db, monkeypatch, tmp_path, initial)
+    assert await pause.handle_observation_gap(db, scope, item)
+    record = (await db.scalars(select(GithubOwnerObservationPause))).one()
+    assert record.status == "waiting"
+    record.deadline = datetime.utcnow() - timedelta(seconds=1)
+    observed.state = "idle"
+    observed.reason = "native_turn_completed"
+    await db.commit()
+
+    if initial:
+        await github_dispatch_service.monitor_dispatched(db, scope, [slot], wake_state_by_slot={slot.id: "ready"})
+    else:
+        await github_dispatch_service.monitor_continuation(db, scope, [slot])
+    await db.commit()
+    await db.refresh(record)
+
+    assert item.dispatch_status == "escalated" and item.escalation_reason == "owner_idle_timeout"
+    assert record.wait_key == pause.observation_wait_key(item)
+    assert record.status == "ended" and record.paused_at is None
+    event = await db.scalar(select(FactoryAuditEvent).where(FactoryAuditEvent.event_kind == "observation_wait_ended"))
+    assert event.action_outcome == "expired"
+
+
 @pytest.mark.asyncio
 async def test_expired_observation_wait_cleanup_respects_scope_and_revision(db):
     from app.services import owner_observation_pause as pause
