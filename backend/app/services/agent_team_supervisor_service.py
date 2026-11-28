@@ -391,12 +391,29 @@ def _is_issue_milestone_notice(root) -> bool:
             and type(payload["supervisor_actor_id"]) is int and payload["supervisor_actor_id"] > 0)
 
 
+CAMPAIGN_ASK_NOTICE_KEYS = frozenset({
+    "kind", "campaign_id", "snapshot_version_id", "snapshot_version", "calculation_version", "role", "agent_key",
+    "request_token", "supervisor_actor_id"})
+
+
+def _is_campaign_ask_notice(root) -> bool:
+    """#1260: the Director's ask of the Supervisor about a campaign; the reply is a message in its thread.
+    ``root`` can be a stored message or its response, so the check reads only fields that both have."""
+    payload = root.payload
+    return (root.sender_type == "system" and root.sender_member_id is None and root.sender_actor_id is None
+            and root.recipient_member_id is None and isinstance(payload, dict)
+            and set(payload) == CAMPAIGN_ASK_NOTICE_KEYS and payload["kind"] == "campaign_ask"
+            and payload["role"] == "supervisor" and type(payload["supervisor_actor_id"]) is int
+            and payload["supervisor_actor_id"] > 0)
+
+
 def is_supervisor_message(root) -> bool:
     return (root.kind == "message" and root.audience_type == "team_preset"
             and (root.sender_member_id is not None or _is_native_wait_notice(root)
                  or _is_leader_ack_wait_notice(root) or _is_auto_merge_not_fired_notice(root)
                  or _is_effort_ceiling_notice(root) or _is_operations_finding_notice(root) or _is_wake_followup_notice(root)
-                 or _is_provider_refusal_notice(root) or _is_issue_milestone_notice(root))
+                 or _is_provider_refusal_notice(root) or _is_issue_milestone_notice(root)
+                 or _is_campaign_ask_notice(root))
             and root.thread_root_id is None
             and isinstance(root.payload, dict) and "supervisor_actor_id" in root.payload)
 

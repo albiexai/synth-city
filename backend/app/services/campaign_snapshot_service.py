@@ -24,8 +24,12 @@ recorded attempt is unknown, never zero time.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from statistics import median
@@ -61,6 +65,7 @@ from app.services.retro_bottleneck_service import (
     CampaignBottleneckResponse, CampaignBottlenecks, RankingAttempt, build_bottlenecks,
 )
 
+FINAL, ASK = "final", "ask"  # #1260: the purpose of a stored version
 # v2 (#1395): missing delivery history is unknown; v3 (#1246): item time; v4 (#1419): where the time went
 CALCULATION_VERSION = "campaign-snapshot-v6"  # v5 (#1257): bottleneck windows; v6 (#1453): flow
 SMALL_SAMPLE = 5
@@ -212,14 +217,36 @@ def _lifetime(key: str):
             & (FactoryContextKey.context_key == key) & FactoryContextKey.retired_at.is_(None))
 
 
-async def _fingerprint(db, campaign: Campaign) -> tuple:
+async def _team_events(db, campaign: Campaign):
+    """The newest audit event that this team lifetime's measures can read (#1260 V1 review 128). The events are
+    placed as ``_deliveries``, ``_markers`` and the pull facts place them: by the lifetime key, or, without a key,
+    by a surviving reference to the lifetime's items, scopes or team. Another team's events never match."""
+    key = campaign.team_context_key
+    items = (select(GithubWorkItem.id).join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
+             .join(FactoryContextKey, _lifetime(key)))
+    scopes = select(TeamGithubScope.id).join(FactoryContextKey, _lifetime(key))
+    team = select(FactoryContextKey.numeric_id).where(
+        FactoryContextKey.key_kind == "team", FactoryContextKey.context_key == key, FactoryContextKey.retired_at.is_(None))
+    item_keys = select(FactoryContextKey.context_key).where(
+        FactoryContextKey.key_kind == "item", FactoryContextKey.numeric_id.in_(items))
+    return await db.scalar(select(func.max(FactoryAuditEvent.id)).where(or_(
+        FactoryAuditEvent.team_context_key == key, FactoryAuditEvent.item_context_key.in_(item_keys),
+        FactoryAuditEvent.team_context_key.is_(None) & or_(
+            FactoryAuditEvent.item_id.in_(items), FactoryAuditEvent.scope_id.in_(scopes),
+            FactoryAuditEvent.team_preset_id.in_(team)))))
+
+
+async def _fingerprint(db, campaign: Campaign, *, scoped: bool = False) -> tuple:
     """Everything the membership measures read from the database: any new or changed record misses the cache.
     The rate-limit measure is read again on every hit instead, with its windows, gaps and the recorder's state.
 
     The team lifetime's own repositories and work items are compared row by row (V1 review 6079984028): a newly
     watched repository, or a status change that leaves every maximum as it was, misses too.
+
+    ``scoped`` (#1260) reads the audit events of this team lifetime only, for the identity of an ask version: another
+    team's event never makes this campaign's ask stale. The cache keeps the global mark.
     """
-    events = await db.scalar(select(func.max(FactoryAuditEvent.id)))
+    events = await (_team_events(db, campaign) if scoped else db.scalar(select(func.max(FactoryAuditEvent.id))))
     scopes = tuple((await db.execute(select(TeamGithubScope.id, TeamGithubScope.repo_owner, TeamGithubScope.repo_name)
                                      .join(FactoryContextKey, _lifetime(campaign.team_context_key))
                                      .order_by(TeamGithubScope.id))).all())
@@ -285,13 +312,16 @@ async def _retro_rows(db, campaign: Campaign) -> tuple:
 
 
 async def build_snapshot(db, campaign: Campaign, client, *, as_of: datetime | None = None, observed_at: datetime | None = None,
-                         cached: bool = True) -> Snapshot:
+                         cached: bool = True, membership=None) -> Snapshot:
     """The campaign's snapshot up to ``as_of``; served from the cache while no record it reads has changed.
 
     Omit ``as_of`` for a current read that can reuse a fresh, matching live cutoff.
     ``observed_at`` is when the caller reads GitHub, ``as_of`` by default. GitHub reports the membership as it is
     then, so a read after the cutoff leaves the historical membership unknown (V1 review 6079984028).
+    ``membership`` is a read that the caller already made (#1260): the snapshot is built from that one observation,
+    never from a second read, and is not cached.
     """
+    cached = cached and membership is None
     live_read = as_of is None and observed_at is None
     as_of = _naive_utc(as_of if as_of is not None else datetime.now(UTC))
     observed = _naive_utc(observed_at) if observed_at is not None else as_of
@@ -305,7 +335,8 @@ async def build_snapshot(db, campaign: Campaign, client, *, as_of: datetime | No
             if earlier_key == key or current_live_read:
                 # The recorder's pending windows are not records: its coverage is read again on every hit.
                 return await _refresh_rate_limited(db, campaign, hit)
-    snapshot = await _build(db, campaign, client, as_of, observed)
+    snapshot = await (_build(db, campaign, client, as_of, observed) if membership is None
+                      else _build(db, campaign, client, as_of, observed, membership))
     if cached:
         _cache[campaign.id] = (_clock() + CACHE_SECONDS, key, snapshot)
     return snapshot
@@ -326,9 +357,10 @@ async def _refresh_rate_limited(db, campaign: Campaign, hit: tuple) -> Snapshot:
     return refreshed
 
 
-async def _build(db, campaign: Campaign, client, as_of: datetime, observed: datetime) -> Snapshot:
+async def _build(db, campaign: Campaign, client, as_of: datetime, observed: datetime, membership=None) -> Snapshot:
     started = _naive_utc(campaign.started_at)
-    membership = await campaigns.members(db, campaign, client)
+    if membership is None:
+        membership = await campaigns.members(db, campaign, client)
     gaps = [f"{repository.reason}: {repository.repo}" for repository in membership.repositories
             if not repository.complete]
     if membership.unavailable:
@@ -789,7 +821,8 @@ async def _rate_limited(db, coverage, started: datetime, as_of: datetime) -> Fac
 
 # Frozen snapshots
 async def latest(db, campaign_id: int) -> CampaignSnapshot | None:
-    return await db.scalar(select(CampaignSnapshot).where(CampaignSnapshot.campaign_id == campaign_id)
+    return await db.scalar(select(CampaignSnapshot).where(CampaignSnapshot.campaign_id == campaign_id,
+                                                          CampaignSnapshot.purpose == FINAL)
                            .order_by(CampaignSnapshot.version.desc()).limit(1))
 
 
@@ -872,3 +905,180 @@ async def recompute(db, campaign: Campaign, client, *, actor: dict, as_of: datet
         except IntegrityError:  # another recompute took this version
             await db.rollback()
     raise campaigns.CampaignError("campaign_snapshot_version_conflict")
+
+
+# #1260: the version that a Mail ask pins. An ask row is as immutable as a final one. Its version is negative (-1, -2,
+# ...), so freeze (version 1) and recompute (the next final) never see it, and ``latest`` reads final rows only.
+def _membership_part(membership) -> tuple:
+    """What the membership observation says: the repositories read and whether completely, each member with its
+    state (a closed issue is another measurement), and the departures."""
+    return (membership.unavailable or "",
+            tuple(sorted((r.repo.lower(), r.complete, r.reason or "") for r in membership.repositories)),
+            tuple(sorted((_identity(m.repo, m.issue_number), m.state) for m in membership.members)),
+            tuple(sorted((_identity(d.repo, d.issue_number), d.outcome, d.destination, d.reason or "",
+                          _naive_utc(d.at).isoformat()) for d in membership.departures)))
+
+
+def _rate_part(sample) -> tuple:
+    """The measure's value, samples and coverage, and why it is unknown. A reason may start with the measured window
+    (``START/END: text``): the end moves with the clock, so only the text counts."""
+    reasons = (re.sub(r"^\d{4}-\d\d-\d\dT[0-9:.]+/\d{4}-\d\d-\d\dT[0-9:.]+: ", "", reason) for reason in sample.unknown_reasons)
+    return (sample.value, sample.sample_count, sample.coverage, tuple(sorted(reasons)))
+
+
+async def _rate_sample(db, campaign: Campaign) -> FactoryMetricSample:
+    """The rate-limit measure now: recorded windows, gaps, the coverage start and the recorder's pending state all
+    show in it, with no audit event (V1 review 129)."""
+    return await _rate_limited(db, await upgrade.recorded_coverage(db, campaign), _naive_utc(campaign.started_at),
+                               datetime.now(UTC).replace(tzinfo=None))
+
+
+async def _identity_of(db, campaign: Campaign, membership, rate: tuple) -> str:
+    """The identity of the records that a snapshot reads (V1 reviews 128 and 129): this team lifetime's database
+    records, the one membership observation, and the rate-limit evidence. Nothing here reads GitHub."""
+    records = await _fingerprint(db, campaign, scoped=True)
+    return hashlib.sha256(repr((records, _membership_part(membership), rate)).encode()).hexdigest()
+
+
+async def _live_identity(db, campaign: Campaign, client) -> tuple[str | None, str | None]:
+    """The identity of the campaign's records now, and why it cannot be told. A membership that cannot be read
+    completely gives no identity."""
+    if client is None:
+        return None, "membership_not_read"
+    membership = await campaigns.members(db, campaign, client)
+    if not membership.complete:
+        return None, membership.unavailable or "membership_incomplete"
+    return await _identity_of(db, campaign, membership, _rate_part(await _rate_sample(db, campaign))), None
+
+
+async def record_fingerprint(db, campaign: Campaign, client=None) -> str | None:
+    """The hash of what the snapshot reads, or None when the live membership cannot be read. No clock."""
+    return (await _live_identity(db, campaign, client))[0]
+
+
+async def _ask_row(db, campaign_id: int, fingerprint: str) -> CampaignSnapshot | None:
+    return await db.scalar(select(CampaignSnapshot).where(
+        CampaignSnapshot.campaign_id == campaign_id, CampaignSnapshot.purpose == ASK,
+        CampaignSnapshot.fingerprint == fingerprint, CampaignSnapshot.calculation_version == CALCULATION_VERSION))
+
+
+async def ask_version(db, campaign: Campaign, client) -> CampaignSnapshot:
+    """The ask version for the campaign's records now: the stored one for the same records, else a new one.
+
+    GitHub is read once. That one membership observation gives the identity and builds the snapshot, so the stored
+    payload and its identity cannot disagree. When the observation is not complete, the new version is stored with an
+    ``incomplete`` fingerprint that no later read matches: the ask reads as stale, never as current.
+    Flushes and leaves the commit to the caller, so a failed Mail send rolls the new row back with it.
+    """
+    campaign_id = campaign.id
+    membership = await campaigns.members(db, campaign, client)
+    fingerprint = None
+    if membership.complete:
+        fingerprint = await _identity_of(db, campaign, membership, _rate_part(await _rate_sample(db, campaign)))
+        found = await _ask_row(db, campaign_id, fingerprint)
+        if found is not None:
+            return found
+    snapshot = await build_snapshot(db, campaign, client, as_of=datetime.now(UTC).replace(tzinfo=None), cached=False,
+                                    membership=membership)
+    payload = snapshot.model_dump(mode="json")
+    stored = f"incomplete:{uuid.uuid4().hex}"
+    if fingerprint is not None:
+        # The identity of what was built: the same observation, the rate-limit measure in the payload.
+        rate = next(m for m in snapshot.metrics if m.name == "rate_limited_seconds")
+        stored = await _identity_of(db, campaign, membership, _rate_part(rate))
+    for _attempt in range(_RECOMPUTE_ATTEMPTS):
+        lowest = await db.scalar(select(func.min(CampaignSnapshot.version)).where(
+            CampaignSnapshot.campaign_id == campaign_id)) or 0
+        row = CampaignSnapshot(campaign_id=campaign_id, version=min(lowest, 0) - 1, calculation_version=CALCULATION_VERSION,
+                               payload=payload, created_by="operator", purpose=ASK, fingerprint=stored)
+        try:
+            async with db.begin_nested():
+                db.add(row)
+                await db.flush()
+            return row
+        except IntegrityError:  # another ask took this version, or stored the same records first
+            found = await _ask_row(db, campaign_id, stored)
+            if found is not None:
+                return found
+    raise campaigns.CampaignError("campaign_snapshot_version_conflict")
+
+
+async def current_version(db, campaign: Campaign, client=None) -> tuple[CampaignSnapshot | None, str | None]:
+    """The campaign's current version and, when it cannot be told, why not. A frozen campaign's current version is
+    its latest final row; a finished campaign without one is unknown (``final_version_missing``). A live campaign's
+    is the ask row for its records and membership now, or None while no ask holds them."""
+    final = await latest(db, campaign.id)
+    if final is not None:
+        return final, None
+    if campaign.status == "finished":
+        return None, "final_version_missing"
+    if await audit.current_context_key(db, "team", campaign.preset_id) != campaign.team_context_key:
+        return None, "team_lifetime_ended"
+    fingerprint, reason = await _live_identity(db, campaign, client)
+    if fingerprint is None:
+        return None, reason
+    return await _ask_row(db, campaign.id, fingerprint), None
+
+
+_STAMP = r"\d{4}-\d\d-\d\dT[0-9:.]+"
+# The two texts that ``_coverage`` writes with the calculation cutoff as the end of the window.
+_GENERATED_REASON = re.compile(rf"^({_STAMP})/({_STAMP}): (no forward-coverage marker is installed|before instrumentation start)$")
+_CUTOFF = "<cutoff>"
+
+
+def _same_instant(text: str, other: str | None) -> bool:
+    try:
+        return other is not None and datetime.fromisoformat(text) == datetime.fromisoformat(other)
+    except ValueError:
+        return False
+
+
+def _comparable(value, as_of: str | None, later_marker: bool, path: tuple = ()):
+    """The payload as the comparison reads it: without the times that the calculation generates from its cutoff
+    (V1 review 130). Those are every ``as_of`` key, the end of a coverage window in a generated unknown-reason text
+    when it is the cutoff, and the start of the rolling four-hour bottleneck window (the cutoff minus four hours).
+    Every time that was recorded is kept, also when it equals the cutoff."""
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if key == "as_of" or (path == ("bottlenecks", "last_four_hours") and key == "started_at"):
+                continue
+            if key == "unknown_reasons" and isinstance(item, list):
+                out[key] = [_generated_reason(text, as_of, later_marker) for text in item]
+            else:
+                out[key] = _comparable(item, as_of, later_marker, path + (key,))
+        return out
+    if isinstance(value, list):
+        return [_comparable(item, as_of, later_marker, path) for item in value]
+    return value
+
+
+def _generated_reason(text, as_of: str | None, later_marker: bool):
+    found = _GENERATED_REASON.match(text) if isinstance(text, str) else None
+    if found is None or not _same_instant(found[2], as_of):
+        return text
+    # "before instrumentation start" has this form only when the recording marker is later than the cutoff. When a
+    # marker equals the cutoff, the end is that recorded marker: it stays.
+    if found[3] == "no forward-coverage marker is installed" or later_marker:
+        return f"{found[1]}/{_CUTOFF}: {found[3]}"
+    return text
+
+
+def metrics_digest(payload: dict) -> str:
+    """Whether two versions say the same: every reported measurement, with its counts and coverage. That is the
+    metrics, the repository counts and the item time, time went, bottleneck and flow sections, and the calculation.
+    Version metadata (ids) and the times generated from the cutoff are not compared; recorded times are."""
+    as_of = payload.get("as_of")
+    # The generated coverage-window text comes from the rate-limit recorder alone (``_rate_limited``), so only its
+    # start decides how the text reads. Any other recorder's start is a recorded fact and is compared as it is
+    # (V1 review 131).
+    started = next((entry.get("started_at") for entry in payload.get("recorded_coverage") or []
+                    if entry.get("measure") == "rate_limit_windows"), None)
+    try:
+        cutoff = datetime.fromisoformat(as_of) if as_of else None
+        later_marker = cutoff is not None and started is not None and datetime.fromisoformat(started) > cutoff
+    except ValueError:
+        later_marker = False
+    body = _comparable(payload, as_of, later_marker)
+    body.pop("campaign_id", None)
+    return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()

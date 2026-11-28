@@ -1311,6 +1311,24 @@ class AgentMailService:
             ensure_ascii=False,
         ).encode("utf-8")
 
+    @staticmethod
+    def _expected_payload(request: MailMessageCreate, resolves_request_id: int | None, asked_version: int | None):
+        payload = dict(request.payload or {})
+        if resolves_request_id is not None:
+            payload[RESOLVES_REQUEST_KEY] = resolves_request_id
+        if asked_version is not None:
+            payload["snapshot_version_id"] = asked_version
+        return payload or None
+
+    async def _campaign_ask_version(self, db: AsyncSession, request: MailMessageCreate) -> int | None:
+        """#1260: the version id that a reply in a Director ask's thread must store, taken from the validated root."""
+        if request.thread_root_id is None or request.kind not in ("answer", "message"):
+            return None
+        asked = await db.get(MailMessage, request.thread_root_id)
+        if asked is None or not self._is_director_campaign_ask(asked):
+            return None
+        return asked.payload.get("snapshot_version_id")
+
     async def _same_delivery(
         self,
         db: AsyncSession,
@@ -1340,8 +1358,7 @@ class AgentMailService:
             "decision": request.decision,
             "kind": request.kind,
             # The exact answer target is part of the operation: a replay through another target differs.
-            "payload": ({**(request.payload or {}), RESOLVES_REQUEST_KEY: resolves_request_id}
-                        if resolves_request_id is not None else request.payload or None),
+            "payload": self._expected_payload(request, resolves_request_id, await self._campaign_ask_version(db, request)),
             "recipient_member_id": request.recipient_member_id,
             "sender_actor_id": sender_actor_id,
             "sender_type": sender_type,
@@ -1560,6 +1577,9 @@ class AgentMailService:
         payload = dict(request.payload or {})
         if resolves_request_id is not None:
             payload[RESOLVES_REQUEST_KEY] = resolves_request_id
+        asked_version = await self._campaign_ask_version(db, request)
+        if asked_version is not None:
+            payload["snapshot_version_id"] = asked_version  # the sender cannot name another one
         linked_item = None
         if request.kind == "context_request" and "work_item_id" in payload:
             linked_item = await self._validate_linked_context_request(
@@ -2751,9 +2771,18 @@ class AgentMailService:
             if member_id is not None and member_id != request.sender_member_id
         }
         reaches_actor = row.sender_actor_id is not None and row.sender_actor_id != sender_actor_id
-        if not participants and not reaches_actor:
+        if not participants and not reaches_actor and not self._is_director_campaign_ask(row):
             raise ValueError("a reply would reach nobody")
         return participants
+
+    @staticmethod
+    def _is_director_campaign_ask(root: MailMessage) -> bool:
+        """#1260: the Director's ask of an agent is a system request with no member or actor sender. Its answer has
+        nobody to reach: the page reads it from the thread. The check is exact, so no other root gains this."""
+        payload = root.payload
+        return (root.sender_type == "system" and root.sender_member_id is None and root.sender_actor_id is None
+                and isinstance(payload, dict) and payload.get("kind") == "campaign_ask"
+                and (root.delivery_key or "").startswith("campaign-ask:"))
 
     async def require_member_thread(self, db: AsyncSession, message_id: int, member_id: int) -> None:
         message = await db.get(MailMessage, message_id)

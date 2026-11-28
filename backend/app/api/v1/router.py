@@ -19,6 +19,7 @@ from .context import router as context_router
 from .plans import router as plans_router
 from .agent_mail import router as agent_mail_router
 from .agent_teams import router as agent_teams_router
+from .campaign_asks import router as campaign_asks_router
 from .campaigns import router as campaigns_router
 from .operations import router as operations_router
 from .factory import router as factory_router
@@ -81,6 +82,7 @@ router.include_router(plans_router, tags=["Plans"], dependencies=SCOPED)
 router.include_router(agent_mail_router, prefix="/agent-mail", tags=["Agent Mail"])
 router.include_router(agent_teams_router, prefix="/agent-teams", tags=["Agent Teams"])
 router.include_router(campaigns_router, prefix="/agent-teams", tags=["Agent Teams"])
+router.include_router(campaign_asks_router, prefix="/agent-teams", tags=["Agent Teams"])
 router.include_router(operations_router)
 router.include_router(factory_router, prefix="/factory", tags=["Factory"])
 router.include_router(github_coordination_router, prefix="/agent-teams", tags=["Agent Teams"])
