@@ -13,8 +13,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.database import Base, configure_sqlite_connection
 from app.models.database import (
-    AgentPaneBinding, AgentTeamPreset, AgentTeamSlot, GithubAttemptScopeRevision,
-    GithubDeliveryPolicyEvent, GithubWorkItem, GithubWorkspace, MailAgentSession,
+    AgentPaneBinding, AgentTeamPreset, AgentTeamSlot, FactoryAuditEvent, GithubAttemptScopeRevision,
+    GithubDeliveryPolicyEvent, GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace, MailAgentSession,
     MailPaneLifecycle, MailTeamMember, TeamGithubScope,
 )
 from app.models.schemas import FactoryDeliveryPolicy
@@ -244,6 +244,10 @@ async def test_native_contact_renews_from_slot_path_with_dispatch_lease(db, monk
         item.active_scope_revision = 0
         item.dispatched_at = item.continuation_activated_at
         item.ack_received_at = item.dispatched_at
+    waits = [GithubOwnerObservationPause(work_item_id=item.id, wait_key=status, authority_sha256="fixture",
+                                        status=status, deadline=datetime.utcnow() + timedelta(minutes=1))
+             for status in ("waiting", "paused")]
+    db.add_all(waits)
     await db.commit()
     protected = {row.__tablename__: {column.name: getattr(row, column.name) for column in row.__table__.columns
                                      if column.name != "lease_last_owner_contact_at"}
@@ -251,6 +255,11 @@ async def test_native_contact_renews_from_slot_path_with_dispatch_lease(db, monk
     before = workspace.lease_last_owner_contact_at
     assert await native.renew_native_owner_contact(db, scope, item, workspace, None if initial else revision)
     assert workspace.lease_last_owner_contact_at > before
+    for wait in waits:
+        await db.refresh(wait)
+    assert [wait.status for wait in waits] == ["ended", "paused"]
+    event = await db.scalar(select(FactoryAuditEvent).where(FactoryAuditEvent.event_kind == "observation_wait_ended"))
+    assert event.action_outcome == "contact_renewed"
     assert protected == {row.__tablename__: {column.name: getattr(row, column.name) for column in row.__table__.columns
                                             if column.name != "lease_last_owner_contact_at"}
                          for row in (item, workspace, revision)}
@@ -744,6 +753,30 @@ async def test_both_monitors_preserve_approval_through_bounded_observation_wait_
     assert (item.dispatch_nonce, item.active_scope_revision, item.retry_count, revision.status,
             revision.acknowledged_at, revision.allowed_commands, revision.failed_head_count, workspace.lease_token) == protected
     assert record.notice_status == "sent"
+
+
+@pytest.mark.parametrize("initial", [False, True])
+@pytest.mark.asyncio
+async def test_monitors_end_expired_waits_that_never_become_paused(db, monkeypatch, tmp_path, initial):
+    from app.services import owner_observation_pause as pause
+
+    scope, item, workspace, _revision, slot, *_ = await observation_fixture(db, monkeypatch, tmp_path, initial)
+    assert await pause.handle_observation_gap(db, scope, item)
+    record = (await db.scalars(select(GithubOwnerObservationPause))).one()
+    record.deadline = datetime.utcnow() - timedelta(seconds=1)
+    workspace.lease_last_owner_contact_at = datetime.utcnow()
+    await db.commit()
+
+    if initial:
+        await github_dispatch_service.monitor_dispatched(db, scope, [slot], wake_state_by_slot={slot.id: "ready"})
+    else:
+        await github_dispatch_service.monitor_continuation(db, scope, [slot])
+    await db.commit()
+    await db.refresh(record)
+    assert record.status == "ended" and record.paused_at is None
+    assert item.dispatch_status == "dispatched"
+    event = await db.scalar(select(FactoryAuditEvent).where(FactoryAuditEvent.event_kind == "observation_wait_ended"))
+    assert event.action_outcome == "expired"
 
 
 @pytest.mark.parametrize("change", ["stale_session", "new_generation", "dead", "idle", "mismatch", "unapproved", "policy_disabled"])

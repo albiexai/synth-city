@@ -320,6 +320,28 @@ def test_codex_native_parser_is_preserved(native, event, expected):
     assert result[0] == expected
 
 
+@pytest.mark.parametrize("event", ["error", "task_complete"])
+def test_codex_usage_limit_survives_turn_cleanup_until_a_new_turn(native, event):
+    now = native["now"]
+    session_id = str(uuid4())
+    error = {"codex_error_info": "usage_limit_exceeded"}
+    payload = {"type": event, **(error if event == "error" else {"error": error})}
+    rows = [
+        {"type": "session_meta", "payload": {"id": session_id, "cwd": str(native["cwd"])}},
+        {"type": "event_msg", "payload": payload, "timestamp": (now - timedelta(seconds=3)).isoformat()},
+        {"type": "event_msg", "payload": {"type": "task_complete"},
+         "timestamp": (now - timedelta(seconds=2)).isoformat()},
+    ]
+    path = native["log"]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    args = (path, session_id, str(native["cwd"]), now, now - timedelta(seconds=10))
+    assert activity._native_state(*args) == ("unknown", activity.PROVIDER_USAGE_LIMIT, now - timedelta(seconds=3))
+    with path.open("a") as stream:
+        stream.write(json.dumps({"type": "event_msg", "payload": {"type": "task_started"},
+                                 "timestamp": (now - timedelta(seconds=1)).isoformat()}) + "\n")
+    assert activity._native_state(*args)[:2] == ("working", "native_turn_started")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("invalid", [None, "closed", "no_capability", "observed", "retired", "provider", "old_member"])
 async def test_pi_inputs_require_current_authenticated_live_mail_binding(db, native, invalid):

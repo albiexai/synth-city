@@ -233,6 +233,16 @@ async def test_an_unended_wait_runs_to_the_cutoff(db):
     assert ("waiting", "decision", "leader", 10, 30) in _spans(attempt)
 
 
+@pytest.mark.parametrize("end", [20, None])
+async def test_provider_block_is_a_process_interval_for_its_launch(db, end):
+    team, (item,) = await _team(db)
+    await _dispatch(db, item, 1, _at(0), current_nonce="nonce-a")
+    await _wait(db, "provider", "episode", _at(10), _at(end) if end else None, item=item,
+                after={"provider": "codex-cli"}, snapshot={"launch_attempt": _key(item, 1)})
+    (attempt,) = (await _collect(db, team, as_of=30)).attempts
+    assert ("process", "provider_blocked", "codex-cli", 10, end or 30) in _spans(attempt)
+
+
 async def test_a_review_verdict_to_the_next_head_is_building(db):
     team, (item,) = await _team(db)
     await _dispatch(db, item, 1, _at(0), current_nonce="nonce-a")
