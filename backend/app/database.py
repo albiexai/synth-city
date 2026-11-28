@@ -782,6 +782,20 @@ async def _sqlite_migrate_wait_repositories(conn) -> None:
                                     "WHERE scope_id = :scope_id AND repository IS NULL"), stamps)
 
 
+async def _sqlite_migrate_snapshot_versions(conn) -> None:
+    """#1260: a snapshot version has a purpose (every earlier row is final) and the fingerprint of its records."""
+    columns = await _sqlite_columns(conn, "campaign_snapshots")
+    if not columns:
+        return
+    if "purpose" not in columns:
+        await conn.execute(text("ALTER TABLE campaign_snapshots ADD COLUMN purpose VARCHAR DEFAULT 'final' NOT NULL"))
+    if "fingerprint" not in columns:
+        await conn.execute(text("ALTER TABLE campaign_snapshots ADD COLUMN fingerprint VARCHAR"))
+    await conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uix_campaign_snapshots_ask ON campaign_snapshots"
+        " (campaign_id, fingerprint, calculation_version) WHERE purpose = 'ask'"))
+
+
 async def _run_sqlite_compat_migrations(conn) -> None:
     reconcile_historical_approvals = (
         await _sqlite_approval_reconciliation_pending(conn)
@@ -1404,6 +1418,7 @@ async def _run_sqlite_compat_migrations(conn) -> None:
 
         await install_forward_coverage(conn)
     await _sqlite_migrate_wait_repositories(conn)
+    await _sqlite_migrate_snapshot_versions(conn)
     await conn.commit()
 
 

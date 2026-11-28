@@ -2751,9 +2751,18 @@ class AgentMailService:
             if member_id is not None and member_id != request.sender_member_id
         }
         reaches_actor = row.sender_actor_id is not None and row.sender_actor_id != sender_actor_id
-        if not participants and not reaches_actor:
+        if not participants and not reaches_actor and not self._is_director_campaign_ask(row):
             raise ValueError("a reply would reach nobody")
         return participants
+
+    @staticmethod
+    def _is_director_campaign_ask(root: MailMessage) -> bool:
+        """#1260: the Director's ask of an agent is a system request with no member or actor sender. Its answer has
+        nobody to reach: the page reads it from the thread. The check is exact, so no other root gains this."""
+        payload = root.payload
+        return (root.sender_type == "system" and root.sender_member_id is None and root.sender_actor_id is None
+                and isinstance(payload, dict) and payload.get("kind") == "campaign_ask"
+                and (root.delivery_key or "").startswith("campaign-ask:"))
 
     async def require_member_thread(self, db: AsyncSession, message_id: int, member_id: int) -> None:
         message = await db.get(MailMessage, message_id)

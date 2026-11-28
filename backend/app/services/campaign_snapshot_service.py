@@ -17,6 +17,7 @@ with at least 85% of times at or below it). Fewer than five timed items is a sma
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import time
 from dataclasses import dataclass, field
@@ -43,6 +44,7 @@ from app.services import factory_audit_service as audit
 from app.services.factory_metrics_service import _coverage, _naive_utc
 from app.services.github_rate_limit_history import campaign_rate_limit_time
 
+FINAL, ASK = "final", "ask"  # #1260: the purpose of a stored version
 CALCULATION_VERSION = "campaign-snapshot-v3"  # v2 (#1395): missing delivery history is unknown; v3 (#1246): item time
 SMALL_SAMPLE = 5
 BANDS = (("0-100", 100), ("101-400", 400), ("over-400", None))  # by lines changed, upper bound inclusive
@@ -480,7 +482,8 @@ async def _rate_limited(db, coverage, started: datetime, as_of: datetime) -> Fac
 
 # Frozen snapshots
 async def latest(db, campaign_id: int) -> CampaignSnapshot | None:
-    return await db.scalar(select(CampaignSnapshot).where(CampaignSnapshot.campaign_id == campaign_id)
+    return await db.scalar(select(CampaignSnapshot).where(CampaignSnapshot.campaign_id == campaign_id,
+                                                          CampaignSnapshot.purpose == FINAL)
                            .order_by(CampaignSnapshot.version.desc()).limit(1))
 
 
@@ -542,3 +545,63 @@ async def recompute(db, campaign: Campaign, client, *, actor: dict, as_of: datet
         except IntegrityError:  # another recompute took this version
             await db.rollback()
     raise campaigns.CampaignError("campaign_snapshot_version_conflict")
+
+
+# #1260: the version that a Mail ask pins. An ask row is as immutable as a final one. Its version is negative (-1, -2,
+# ...), so freeze (version 1) and recompute (the next final) never see it, and ``latest`` reads final rows only.
+async def record_fingerprint(db, campaign: Campaign) -> str:
+    """The hash of the records that the snapshot reads. It reads the database only: no clock, no GitHub."""
+    return hashlib.sha256(repr(await _fingerprint(db, campaign)).encode()).hexdigest()
+
+
+async def _ask_row(db, campaign_id: int, fingerprint: str) -> CampaignSnapshot | None:
+    return await db.scalar(select(CampaignSnapshot).where(
+        CampaignSnapshot.campaign_id == campaign_id, CampaignSnapshot.purpose == ASK,
+        CampaignSnapshot.fingerprint == fingerprint, CampaignSnapshot.calculation_version == CALCULATION_VERSION))
+
+
+async def ask_version(db, campaign: Campaign, client) -> CampaignSnapshot:
+    """The ask version for the campaign's records now: the stored one for the same records, else a new one.
+
+    Flushes and leaves the commit to the caller, so a failed Mail send rolls the new row back with it.
+    """
+    campaign_id = campaign.id
+    fingerprint = await record_fingerprint(db, campaign)
+    found = await _ask_row(db, campaign_id, fingerprint)
+    if found is not None:
+        return found
+    snapshot = await build_snapshot(db, campaign, client, as_of=datetime.now(UTC).replace(tzinfo=None), cached=False)
+    payload = snapshot.model_dump(mode="json")
+    for _attempt in range(_RECOMPUTE_ATTEMPTS):
+        lowest = await db.scalar(select(func.min(CampaignSnapshot.version)).where(
+            CampaignSnapshot.campaign_id == campaign_id)) or 0
+        row = CampaignSnapshot(campaign_id=campaign_id, version=min(lowest, 0) - 1, calculation_version=CALCULATION_VERSION,
+                               payload=payload, created_by="operator", purpose=ASK, fingerprint=fingerprint)
+        try:
+            async with db.begin_nested():
+                db.add(row)
+                await db.flush()
+            return row
+        except IntegrityError:  # another ask took this version, or stored the same records first
+            found = await _ask_row(db, campaign_id, fingerprint)
+            if found is not None:
+                return found
+    raise campaigns.CampaignError("campaign_snapshot_version_conflict")
+
+
+async def current_version(db, campaign: Campaign) -> tuple[CampaignSnapshot | None, str | None]:
+    """The campaign's current version and, when it cannot be told, why not. A frozen campaign's current version is
+    its latest final row. A live campaign's is the ask row for its records now, or None while no ask holds them."""
+    final = await latest(db, campaign.id)
+    if final is not None:
+        return final, None
+    if await audit.current_context_key(db, "team", campaign.preset_id) != campaign.team_context_key:
+        return None, "team_lifetime_ended"
+    return await _ask_row(db, campaign.id, await record_fingerprint(db, campaign)), None
+
+
+def metrics_digest(payload: dict) -> str:
+    """Whether two versions say the same: the metrics' values, coverage and unknowns, and the calculation."""
+    rows = sorted((m.get("name"), m.get("value"), m.get("coverage"), m.get("unknown_count"),
+                   tuple(m.get("unknown_reasons") or ())) for m in payload.get("metrics") or [])
+    return hashlib.sha256(repr((payload.get("calculation_version"), rows)).encode()).hexdigest()

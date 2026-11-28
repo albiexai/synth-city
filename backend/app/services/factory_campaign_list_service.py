@@ -123,7 +123,8 @@ async def _latest_frozen(db, ids: list[int]) -> dict[int, CampaignSnapshot]:
     found: dict[int, CampaignSnapshot] = {}
     if not ids:
         return found
-    rows = await db.scalars(select(CampaignSnapshot).where(CampaignSnapshot.campaign_id.in_(ids))
+    rows = await db.scalars(select(CampaignSnapshot).where(CampaignSnapshot.campaign_id.in_(ids),
+                                                            CampaignSnapshot.purpose == snapshots.FINAL)
                             .order_by(CampaignSnapshot.version.desc()))
     for row in rows:
         found.setdefault(row.campaign_id, row)

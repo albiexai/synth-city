@@ -33,6 +33,8 @@ PAUSE_STARTED, PAUSE_ENDED = "pause_wait_started", "pause_wait_ended"
 ITEM_TERMINAL_REASON = "The work item reached a terminal state."
 # The Mail root of a structured request carries this delivery key; its decision wait already counts it.
 STRUCTURED_REQUEST_KEY = "github-approval:"
+# #1260: a campaign ask is the Director's question about a finished measure, not a wait of the factory on a decision.
+CAMPAIGN_ASK_KEY = "campaign-ask:"
 
 
 def wait_operation(kind: str, request_id: int) -> str:
@@ -101,7 +103,8 @@ async def _once(db: AsyncSession, operation_id: str, *, item_key: str | None = N
 
 async def record_mail_wait_started(db: AsyncSession, message: MailMessage, *, source: str) -> None:
     """A pending Mail request waits on its recipient, unless it is the Mail side of a structured request."""
-    if message.request_status != "pending" or (message.delivery_key or "").startswith(STRUCTURED_REQUEST_KEY):
+    if message.request_status != "pending" or (message.delivery_key or "").startswith(
+            (STRUCTURED_REQUEST_KEY, CAMPAIGN_ASK_KEY)):
         return
     await db.flush()
     operation_id = f"{MAIL_STARTED}:message:{message.id}"

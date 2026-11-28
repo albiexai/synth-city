@@ -194,6 +194,31 @@ The metrics window's samples have no calculation version.
 
 Until #1395 merges, a delivery whose local work item was deleted, or an older item with only an automatic-merge time and no delivery record, may read as not delivered.
 
+### Asking an agent about a campaign
+
+The Director can ask the Leader, the Supervisor (when the team has a binding) or a verifier about a campaign. Each role gets its own question, so the answers add up and do not overlap:
+
+| Role | Question |
+|---|---|
+| Leader | Coordination and flow: the queue, the assignments, the decisions, and what held items up. |
+| Supervisor | The factory and the process: hand merges, quotas and rate limits, merge gates, effects across teams. |
+| Verifier | Quality and rework: what was wrong in submissions, why items needed more rounds, and what would have prevented it. |
+
+The Director can add one question of their own. The routes need the operator token. A Mail session is refused.
+- `POST /api/v1/agent-teams/campaigns/{campaign_id}/asks` sends the ask. The body has `role` (`leader`, `supervisor` or `verifier`), `member_id` (the verifier's Mail member), an optional `director_question` and `acknowledge_verifier_warning`.
+- `GET /api/v1/agent-teams/campaigns/{campaign_id}/asks` lists the asks with their replies. It writes nothing.
+- `POST /api/v1/agent-teams/campaigns/{campaign_id}/asks/{request_id}/lesson` records an answered ask's diagnosis as a lesson, once.
+
+**The version.** An ask names one snapshot version, by id. For a live campaign, the ask stores a new version with purpose `ask` and a negative number (-1, -2, ...), or reuses the one stored for the same records. For a frozen campaign, it uses the latest final version and stores nothing. The freeze and the Director's recompute keep their numbers 1, 2, 3, and read final versions only. The request and its reply carry the same version id.
+
+**The request and the reply.** The request is an Agent Mail message. The Leader and a verifier get a context request. The Supervisor gets a team notice that it reads in its inbox. The reply is the answer in the request's thread. It is stored in Mail, so reading the asks never writes. The first reply from the asked agent closes the request.
+
+**One open request per agent per campaign.** A second ask of the same agent is refused with `campaign_ask_open` until the first is answered. Two callers at once cannot both succeed: the Mail delivery key `campaign-ask:{campaign}:{agent}:{n}` is unique. Asks add no waits on a decision.
+
+**A verifier takes time from review.** In a live campaign, review is often the busiest lane. The ask is refused with `campaign_ask_verifier_warning` until `acknowledge_verifier_warning` is `true`. A frozen campaign needs no acknowledgement.
+
+**Stale.** An ask is stale when the current version id differs from the one it names. For a frozen campaign, the current version is the latest final one, so a Director's recompute makes it stale. For a live campaign, the current version is the stored one for the records now; with none, the ask is stale. `version_changed` says the ids differ. `metrics_unchanged` is detail only: it is `true` when the numbers are the same in the newer version, and it never hides staleness. A reading that cannot be made (a version stored before records were fingerprinted, or a team that no longer exists) is `unknown` with `unknown_reason`, and `stale` is empty.
+
 ### Claude Code cost
 
 The Claude Code reader adds up each member's token use and its API-equivalent cost over a campaign window. It reads the agents' own session files.

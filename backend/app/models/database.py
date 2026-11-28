@@ -1312,7 +1312,12 @@ class CampaignSnapshot(Base):
     adds the next version; no path updates or deletes one."""
 
     __tablename__ = "campaign_snapshots"
-    __table_args__ = (UniqueConstraint("campaign_id", "version", name="uq_campaign_snapshots_version"),)
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "version", name="uq_campaign_snapshots_version"),
+        # #1260: at most one ask version per campaign, record state and calculation.
+        Index("uix_campaign_snapshots_ask", "campaign_id", "fingerprint", "calculation_version", unique=True,
+              sqlite_where=text("purpose = 'ask'"), postgresql_where=text("purpose = 'ask'")),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     campaign_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
@@ -1321,6 +1326,11 @@ class CampaignSnapshot(Base):
     payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     created_by: Mapped[str] = mapped_column(String, nullable=False)  # the recorded actor kind
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    # #1260: ``final`` rows are the freeze and the Director's recomputes (versions 1, 2, ...). An ``ask`` row pins the
+    # numbers that a Mail ask was made from, with a negative version (-1, -2, ...) so the final numbering never moves.
+    purpose: Mapped[str] = mapped_column(String, default="final", server_default="final", nullable=False)
+    # The hash of the records that the snapshot read; NULL on a final row and on a row from before this column.
+    fingerprint: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class CampaignUpgradeCoverage(Base):
