@@ -63,14 +63,24 @@ def fresh_cache():
     snapshots.clear_cache()
 
 
+async def _record_merge_fixture(db, item_id, *, observed_at, fact_time, artifact, source="github_pull_request_merged",
+                                launch_attempt=None):
+    """Seed a merged delivery with an observation time independent of when pytest runs."""
+    snapshot = {"artifact": artifact, "artifact_version": "b" * 40, "fact_source": "github_pull_request_merged",
+                "attempt": launch_attempt or f"item:{item_id}:launch:None:revision:None"}
+    if launch_attempt is not None:
+        snapshot["launch_attempt"] = launch_attempt
+    await audit.record_event(
+        db, event_kind="delivery_evidence", source=source, occurred_at=observed_at, fact_time=fact_time,
+        fact_source="github_pull_request_merged", actor=SYSTEM, item_id=item_id, action_outcome="applied",
+        delivery_outcome="delivered", completion_kind="merged_code", context_snapshot=snapshot)
+
+
 async def _deliver(db, item_id, at):
     """The merge fact the delivery recorder writes, at ``at``."""
     item = await db.get(GithubWorkItem, item_id)
     item.dispatch_status = "merged"
-    await audit.record_delivery_fact(
-        db, item_id=item_id, delivery_outcome="delivered", completion_kind="merged_code",
-        fact_source="github_pull_request_merged", fact_time=at, artifact=f"pr:{item_id}",
-        attempt=f"item:{item_id}:launch:None:revision:None", snapshot={"artifact_version": "b" * 40})
+    await _record_merge_fixture(db, item_id, observed_at=at, fact_time=at, artifact=f"pr:{item_id}")
     await db.commit()
 
 
@@ -897,10 +907,9 @@ async def test_friction_uses_scoped_merge_path_waits_and_errors_through_the_cuto
         await audit.record_event(db, event_kind="owner_status_report", source="test", occurred_at=when,
                                  actor=actor, item_id=item_id, action_outcome="rejected")
     merged_at = T0 + timedelta(seconds=120)
-    await audit.record_delivery_fact(
-        db, item_id=item.id, delivery_outcome="delivered", completion_kind="merged_code",
-        fact_source="github_pull_request_merged", fact_time=merged_at, artifact="o/a1/pull/101",
-        attempt=audit.launch_attempt_key(item.id, launch.id), launch_attempt=audit.launch_attempt_key(item.id, launch.id))
+    await _record_merge_fixture(
+        db, item.id, observed_at=merged_at, fact_time=merged_at, artifact="o/a1/pull/101",
+        launch_attempt=audit.launch_attempt_key(item.id, launch.id))
     fact = await audit.record_event(
         db, event_kind=audit.PULL_FACTS_KIND, source="test", occurred_at=merged_at, fact_time=merged_at, actor=SYSTEM,
         scope_id=world.scopes["a1"], context_snapshot={"artifact": "o/a1/pull/101"},
@@ -973,13 +982,19 @@ async def test_ci_friction_are_additive_to_older_frozen_snapshots(db, world):
 
 
 @pytest.mark.parametrize("recorded_merge_time", [True, False])
-async def test_friction_reconciles_the_automatic_merge_fallback_by_pr_and_item(db, world, recorded_merge_time):
+async def test_friction_reconciles_the_automatic_merge_fallback_by_pr_and_item(
+        db, world, recorded_merge_time, monkeypatch):
+    class AuditClockAfterCutoff(datetime):
+        @classmethod
+        def utcnow(cls):
+            return AS_OF + timedelta(days=1)
+
+    monkeypatch.setattr(audit, "datetime", AuditClockAfterCutoff)
     campaign = await _ci_campaign(db, world)
     item = await db.get(GithubWorkItem, world.items["a1", 1])
     when = T0 + timedelta(minutes=2)
-    await audit.record_delivery_fact(
-        db, item_id=item.id, delivery_outcome="delivered", completion_kind="merged_code",
-        fact_source="github_pull_request_merged", fact_time=when if recorded_merge_time else None,
+    await _record_merge_fixture(
+        db, item.id, observed_at=when, fact_time=when if recorded_merge_time else None,
         artifact="o/a1/pull/101", source=audit.AUTOMATIC_MERGE_SOURCE)
     await audit.record_event(
         db, event_kind=audit.PULL_FACTS_KIND, source="test", occurred_at=when, fact_time=when,
