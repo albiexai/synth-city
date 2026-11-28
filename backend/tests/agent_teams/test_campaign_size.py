@@ -584,11 +584,11 @@ async def test_a_stored_v6_snapshot_without_the_section_reads_back_unchanged(db,
     assert (await snapshots.latest(db, campaign.id)).payload == old
 
 
-async def test_a_new_freeze_stores_v7_with_the_section(db, world):
+async def test_a_new_freeze_stores_v8_with_the_section(db, world):
     await _size(db, world, [(10, 60, {})])
     campaign = await campaigns.current(db, world.team)
     frozen = await snapshots.freeze(db, campaign, FakeGithub(labelled={"a1": [_issue("a1", 10, state="closed")]}),
                                     actor=OPERATOR, as_of=AS_OF)
     stored = await snapshots.latest(db, campaign.id)
-    assert (stored.calculation_version, frozen.calculation_version) == ("campaign-snapshot-v7",) * 2
+    assert (stored.calculation_version, frozen.calculation_version) == ("campaign-snapshot-v8",) * 2
     assert stored.payload["size"]["prs_merged"] == 1

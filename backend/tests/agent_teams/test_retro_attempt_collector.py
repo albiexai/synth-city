@@ -304,7 +304,7 @@ async def test_unrecorded_provider_launch_makes_retrospective_process_coverage_p
     campaign = SimpleNamespace(preset_id=team.id, started_at=_at(-10), team_context_key=None)
     coverage = [MeasureCoverageEntry(measure=measure, started_at=_at(-20), covered=True)
                 for measure in ("check_runs", "decision_waits")]
-    section, _rankings = await _time_went(db, campaign, [("example/repo", item.issue_number)], coverage, _at(30), [])
+    section, *_ = await _time_went(db, campaign, [("example/repo", item.issue_number)], coverage, _at(30), [])
     assert section.group_coverage["process"] == "partial"
     assert "process: unattributed_evidence" in section.unknown_reasons
 
