@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from app.models.database import (
     AgentTeamSlot,
@@ -452,6 +452,58 @@ async def test_a_broadcast_reaches_the_team_only_by_a_receipt_at_or_before_the_c
                 received=AS_OF + after)
     size = await _size(db, world, [(10, 60, {})])
     assert size.mail_messages == counted
+
+
+async def _ask(db, campaign_id, minutes, asked, *, reply=True):
+    """A campaign ask (#1260): a context request to ``asked`` and, with ``reply``, its answer in the thread."""
+    root = MailMessage(kind="context_request", sender_type="director", recipient_member_id=asked, body_markdown="q",
+                       created_at=_m(minutes), payload={"kind": "campaign_ask", "campaign_id": campaign_id})
+    db.add(root)
+    await db.flush()
+    db.add(MailReceipt(message_id=root.id, member_id=asked, created_at=_m(minutes)))
+    if reply:
+        db.add(MailMessage(kind="answer", sender_type="member", sender_member_id=asked, thread_root_id=root.id,
+                           body_markdown="a", created_at=_m(minutes + 5)))
+    await db.flush()
+
+
+async def test_the_campaigns_own_asks_and_replies_are_not_counted_but_another_campaigns_are(db, world):
+    """Supervisor decision (31485): asking about a campaign must not change the Mail it measures."""
+    leader = await _member(db, world.team, "leader", "leader")
+    await _size(db, world, [(10, 60, {})])
+    campaign = await campaigns.current(db, world.team)
+    await _ask(db, campaign.id, 30, leader)
+    await _ask(db, campaign.id + 1000, 50, leader)  # another campaign's ask is ordinary team Mail
+    db.add(MailMessage(kind="message", sender_type="system", recipient_member_id=leader, body_markdown="n",
+                       created_at=_m(70), payload={"kind": "campaign_notice", "campaign_id": campaign.id}))  # no ask
+    await db.commit()
+    size = (await snapshots.build_snapshot(db, campaign, FakeGithub(labelled={"a1": [_issue("a1", 10, state="closed")]}),
+                                           as_of=AS_OF, cached=False)).size
+    assert size.mail_messages == 3
+    assert {row.role: row.messages for row in size.mail_by_role} == {"director": 1, "leader": 1, "system": 1}
+    assert size.mail_excludes == "campaign_asks_and_replies"
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+async def test_an_ask_and_its_answer_leave_the_version_and_the_size_unchanged(db, world, scoped):
+    leader = await _member(db, world.team, "leader", "leader")
+    builder = await _member(db, world.team, "builder", "implementer")
+    await _mail(db, 20, sender=leader)
+    first = await _size(db, world, [(10, 60, {})])
+    campaign = await campaigns.current(db, world.team)
+    before = await snapshots._fingerprint(db, campaign, scoped=scoped)
+    await _ask(db, campaign.id, 30, leader, reply=False)
+    await db.commit()
+    assert await snapshots._fingerprint(db, campaign, scoped=scoped) == before
+    message = (await db.scalars(select(MailMessage.id).where(MailMessage.kind == "context_request"))).one()
+    db.add(MailMessage(kind="answer", sender_type="member", sender_member_id=leader, thread_root_id=message,
+                       body_markdown="a", created_at=_m(40)))
+    db.add(MailReceipt(message_id=message, member_id=builder, created_at=_m(45)))  # another member gets the ask
+    await db.commit()
+    assert await snapshots._fingerprint(db, campaign, scoped=scoped) == before
+    snapshots.clear_cache()
+    assert (await snapshots.build_snapshot(db, campaign, FakeGithub(labelled={"a1": [_issue("a1", 10, state="closed")]}),
+                                           as_of=AS_OF, cached=False)).size == first
 
 
 # The cache
