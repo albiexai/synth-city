@@ -350,6 +350,70 @@ export type CampaignRow = {
   // ``as_of`` is the cutoff that the counts describe. ``frozen_at`` is when a frozen version was stored.
   source: { kind: "frozen" | "live"; as_of: string; frozen_at?: string | null } | null;
 };
+// #1256: GET /factory/campaigns/{id}/health. A number that is not recorded is null with a reason, never 0.
+export type HealthCoverage = "full" | "partial" | "unavailable";
+export type HealthItemTimeBand = {
+  band: string;
+  items: number;
+  timed: number;
+  median_seconds: number | null;
+  p85_seconds: number | null;
+  small_sample: boolean;
+  coverage: string;
+  unknown_reasons: string[];
+};
+export type HealthItemTime = {
+  items: number;
+  timed: number;
+  coverage: string;
+  unknown_reasons: string[];
+  bands: HealthItemTimeBand[];
+};
+export type HealthCost = {
+  value_usd: number | null;
+  coverage: HealthCoverage;
+  members_total: number | null;
+  members_known: number | null;
+  unknown_members: { member: string; reason: string }[];
+  prices_as_of: string | null;
+  reasons: string[];
+};
+export type HealthBottleneckStage = {
+  key: string;
+  group: "waiting" | "process";
+  stage: string;
+  actor: string;
+  credited_seconds: number;
+  share: number;
+  items: number;
+  median_seconds: number;
+  small_sample: boolean;
+  coverage: HealthCoverage;
+};
+export type HealthBottleneckWindow = {
+  window: "whole_campaign" | "last_four_hours";
+  label: string;
+  started_at: string;
+  as_of: string;
+  coverage: HealthCoverage;
+  unknown_reasons: string[];
+  items: number | null;
+  credited_seconds: number | null;
+  state: "ranked" | "below_thresholds" | "unknown";
+  stages: HealthBottleneckStage[];
+  largest_observed: HealthBottleneckStage | null;
+};
+export type CampaignHealthResponse = {
+  schema_version: 1;
+  campaign_id: number;
+  source: "live" | "frozen" | "unavailable";
+  as_of: string | null;
+  item_time: HealthItemTime | null;
+  item_time_reason: string | null;
+  cost: HealthCost;
+  bottleneck: HealthBottleneckWindow | null;
+  bottleneck_reason: string | null;
+};
 export type CampaignListResponse = {
   schema_version: 1;
   generated_at: string;

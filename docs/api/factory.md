@@ -36,6 +36,7 @@ All paths below begin with `/api/v1/factory`. These GET routes read local factor
 | GET `/repositories` | Paginated repository scopes with intake, poll and overlap observations |
 | GET `/repositories/{scope_id}` | One repository scope observation |
 | GET `/campaigns` | Paginated campaigns with their repositories and recorded issue counts (see [Campaigns list](#campaigns-list)) |
+| GET `/campaigns/{campaign_id}/health` | Item time, cost and the last-four-hours bottleneck for the Overview health block (see [Campaign health](#campaign-health)) |
 
 ## Filters and pagination
 
@@ -198,6 +199,16 @@ campaign it uses the campaign snapshot service and its short cache.
   qualifying stage has state `unknown`. A fully recorded quiet window reports zero time and zero items.
 - The optional `previous_top` query parameter takes the exact top stage's `key` from the caller's last complete
   whole-campaign view. Use an empty string when that view had no qualifying stage. Omit it on the first visit.
+
+### Campaign health
+
+`GET /api/v1/factory/campaigns/{campaign_id}/health` returns what the Overview campaign health block shows. It is read only and applies nothing. A finished campaign reads its latest frozen snapshot and builds nothing. A live campaign uses the campaign snapshot service and its short cache, as the bottleneck route does.
+
+- `source` is `live`, `frozen` or `unavailable` (a finished campaign with no snapshot). `as_of` is the cutoff that the numbers describe.
+- `item_time` is the snapshot's item time by size band: for each band, the delivered items, the timed items, the median and the p85 in seconds, `small_sample`, `coverage` and `unknown_reasons`. When it is missing, `item_time` is `null` and `item_time_reason` says why (`no_snapshot` or `snapshot_without_item_time`).
+- `bottleneck` is the `last_four_hours` window of the ranking, with the window label, its start and cutoff, and its stages. When it is missing, `bottleneck` is `null` and `bottleneck_reason` says why.
+- `cost` is the API-equivalent cost so far, with what it covers: `value_usd`, `coverage` (`full`, `partial` or `unavailable`), `members_total`, `members_known`, `unknown_members` (a member and a reason each), `prices_as_of` and `reasons`. Unknown is never zero: `value_usd` is `null` when nothing can be said.
+- **The cost section (for #1250).** The route reads an optional `cost` section of the snapshot payload and passes it through in that shape. No snapshot has the section yet, so the route returns `value_usd: null`, `coverage: unavailable` and `reasons: ["cost_not_recorded"]`. When the cost headline adds a `cost` section to the snapshot with those fields, the Overview block shows the value, a partial badge and "covers N of M members" with no change to the route or the block. A section that does not fit the shape reads `cost_section_invalid`.
   `new_since_last_visit` is `null` without a comparison or when current coverage is incomplete. The client
   owns visit persistence and should keep it scoped to the campaign.
 

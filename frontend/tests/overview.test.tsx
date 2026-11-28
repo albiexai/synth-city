@@ -750,3 +750,66 @@ it('shows the paused intake reason and operator beside the running team on Overv
   expect(within(card).getByText(/Drain for checkpoint.*Set by Operator/)).toBeInTheDocument()
   expect(within(card).getByText('Running')).toBeInTheDocument()
 })
+
+// #1256: the campaign health block reads each live campaign's health after the overview loaded.
+describe('Campaign health on the Progress card', () => {
+  const live = { ...emptyCampaign, campaign_status: 'active' as const, done_count: 3 }
+  const health = {
+    schema_version: 1, campaign_id: 41, source: 'live', as_of: stamp,
+    item_time: { items: 5, timed: 5, coverage: 'full', unknown_reasons: [], bands: [
+      { band: '0-100', items: 5, timed: 5, median_seconds: 2280, p85_seconds: 4260, small_sample: false, coverage: 'full',
+        unknown_reasons: [] }] },
+    item_time_reason: null,
+    cost: { value_usd: null, coverage: 'unavailable', members_total: null, members_known: null, unknown_members: [],
+      prices_as_of: null, reasons: ['cost_not_recorded'] },
+    bottleneck: { window: 'last_four_hours', label: 'Last 4 hours', started_at: stamp, as_of: stamp, coverage: 'full',
+      unknown_reasons: [], items: 6, credited_seconds: 3600, state: 'ranked', stages: [{
+        key: 'k', group: 'waiting', stage: 'decision', actor: 'the Leader', credited_seconds: 3600, share: 0.5, items: 6,
+        median_seconds: 600, small_sample: false, coverage: 'full' }], largest_observed: null },
+    bottleneck_reason: null,
+  }
+  const serveHealth = (campaignRows: unknown[], healthResponse: () => Response) =>
+    fixtureFetch((path, query) => {
+      if (path === 'factory/overview') return jsonResponse(overviewWith({}))
+      if (path === 'agent-teams/presets') return jsonResponse({ presets: [preset(1, 'v4.4', true)] })
+      if (/^agent-teams\/presets\/1\/summary$/.test(path)) return jsonResponse(summary({ campaign: live }))
+      if (path === 'factory/campaigns') {
+        expect(query.get('status')).toBe('live')
+        return jsonResponse({ campaigns: campaignRows })
+      }
+      if (path === 'factory/campaigns/41/health') return healthResponse()
+      if (path === 'factory/work-items') return jsonResponse({ ...work.empty.response })
+      return jsonResponse({ rows: [], items: [], repositories: [], total: 0, has_more: false, generated_at: stamp })
+    })
+
+  it('reads the live campaign of the team and shows its health block with the working link', async () => {
+    const { requests } = serveHealth([{ id: 41, team: { id: 1, name: 'v4.4' }, status: 'active' }],
+      () => jsonResponse(health))
+    await open()
+    const block = within(screen.getByRole('group', { name: 'Campaign health' }))
+    expect(block.getByText('38 min')).toBeInTheDocument()
+    expect(block.getByText('Waiting for the Leader')).toBeInTheDocument()
+    expect(block.getByRole('link', { name: /Live retrospective/ })).toHaveAttribute(
+      'href', '/insights/retrospectives?team_id=1&status=live')
+    expect(requests.filter(r => r.path === 'factory/campaigns/41/health')).toHaveLength(1)
+    // The card keeps its counts.
+    expect(screen.getByRole('article', { name: /Progress: / })).toHaveTextContent('Your decisions ahead')
+  })
+
+  it('shows no health block for a team with no live campaign, and asks for no health read', async () => {
+    const { requests } = serveHealth([], () => jsonResponse(health))
+    await open()
+    expect(screen.queryByRole('group', { name: 'Campaign health' })).not.toBeInTheDocument()
+    expect(requests.some(r => r.path.endsWith('/health'))).toBe(false)
+    expect(screen.getByRole('article', { name: /Progress: / })).toBeInTheDocument()
+  })
+
+  it('says the health could not be read when its read fails, and keeps the rest of the card', async () => {
+    serveHealth([{ id: 41, team: { id: 1, name: 'v4.4' }, status: 'active' }],
+      () => jsonResponse({ detail: 'gone' }, 404))
+    await open()
+    const block = within(screen.getByRole('group', { name: 'Campaign health' }))
+    expect(block.getByRole('note')).toHaveTextContent('could not be read')
+    expect(screen.getByRole('article', { name: /Progress: / })).toHaveTextContent('Your decisions ahead')
+  })
+})

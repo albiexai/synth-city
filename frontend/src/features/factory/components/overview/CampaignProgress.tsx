@@ -6,6 +6,12 @@ import { anchor } from "../styles";
 import { workLink } from "../../filterHelpers";
 import { campaignShown, finishedCampaigns } from "./campaign";
 import { CampaignBar } from "./CampaignBar";
+import { CampaignHealth } from "./CampaignHealth";
+import type { CampaignHealthResponse } from "@/types/factory";
+import type { ReadState } from "../../reads";
+
+/** A team's live campaign and the read of its health (#1256). A card without one shows no health block. */
+export type CampaignHealthRead = { campaignId: number; state: ReadState<CampaignHealthResponse> };
 
 function parentLabel(url: string | null) {
   const match = url ? /\/issues\/(\d+)\/?$/.exec(url) : null;
@@ -37,7 +43,7 @@ function More({ count, to }: { count: number; to: string }) {
   );
 }
 
-function CampaignCard({ preset, summary }: { preset: AgentTeamPreset; summary: AgentTeamSummary }) {
+function CampaignCard({ preset, summary, health }: { preset: AgentTeamPreset; summary: AgentTeamSummary; health?: CampaignHealthRead }) {
   const c = summary.campaign!;
   const notStarted = c.not_started_count ?? 0;
   // Escalated or failed items need attention (#1129); older responses omit the count.
@@ -165,6 +171,7 @@ function CampaignCard({ preset, summary }: { preset: AgentTeamPreset; summary: A
           </ol>
         </div>
       )}
+      {health && <CampaignHealth teamId={preset.id} campaignId={health.campaignId} state={health.state} />}
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-dashed pt-3 text-sm">
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-muted-foreground">Your decisions ahead:</span>
@@ -196,9 +203,11 @@ function CampaignCard({ preset, summary }: { preset: AgentTeamPreset; summary: A
 export function CampaignProgress({
   presets,
   summaries,
+  health,
 }: {
   presets: AgentTeamPreset[];
   summaries: (AgentTeamSummary | null)[];
+  health?: Record<number, CampaignHealthRead>;
 }) {
   const cards = presets.flatMap((preset, index) => {
     const summary = summaries[index];
@@ -227,7 +236,7 @@ export function CampaignProgress({
       {cards.length > 0 && (
         <div className="rounded-lg border bg-card">
           {cards.map(({ preset, summary }) => (
-            <CampaignCard key={preset.id} preset={preset} summary={summary} />
+            <CampaignCard key={preset.id} preset={preset} summary={summary} health={health?.[preset.id]} />
           ))}
         </div>
       )}

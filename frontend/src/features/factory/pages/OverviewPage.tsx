@@ -2,9 +2,9 @@ import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { TeamSummaries } from "@/features/agent-teams/TeamSummaryCard";
 import type { AgentTeamPresetListResponse, AgentTeamSummary } from "@/types/agentTeams";
-import type { OverviewResponse, RepositoryListResponse } from "@/types/factory";
+import type { CampaignHealthResponse, CampaignListResponse, OverviewResponse, RepositoryListResponse } from "@/types/factory";
 import { ActiveWork } from "../components/overview/ActiveWork";
-import { CampaignProgress } from "../components/overview/CampaignProgress";
+import { CampaignProgress, type CampaignHealthRead } from "../components/overview/CampaignProgress";
 import { NeedsYou } from "../components/overview/NeedsYou";
 import { OperationsFindings } from "../components/OperationsFindings";
 import { needsYouRows } from "../components/overview/needsYou";
@@ -67,6 +67,22 @@ export function OverviewPage() {
   );
   const needsReads = needsFilter ? needsStates : states;
   const summaries = needsReads.map((item) => item.data);
+  // #1256: each team's live campaign (a read of recorded data only) and the health of each. They are read only
+  // after the overview itself loaded, so a failing overview stays one request. A failed or missing list adds no
+  // block, so the card keeps working as it did.
+  const liveList = useObservation<CampaignListResponse>(state.data ? "factory/campaigns?status=live&limit=100" : null);
+  const liveByTeam = new Map<number, number>();
+  for (const row of liveList.data?.campaigns ?? []) {
+    if (row.team && !liveByTeam.has(row.team.id)) liveByTeam.set(row.team.id, row.id);
+  }
+  const liveTeams = matching.filter((preset) => liveByTeam.has(preset.id));
+  const healthReads = useObservations<CampaignHealthResponse>(
+    liveTeams.map((preset) => `factory/campaigns/${liveByTeam.get(preset.id)}/health`),
+  );
+  const health: Record<number, CampaignHealthRead> = {};
+  liveTeams.forEach((preset, index) => {
+    health[preset.id] = { campaignId: liveByTeam.get(preset.id)!, state: healthReads.states[index] };
+  });
   const rows = needsYouRows(matching, summaries);
   const summariesLoading =
     presetList.data === null || needsReads.some((item) => item.data === null && item.error === null);
@@ -104,7 +120,7 @@ export function OverviewPage() {
             </p>
           )}
           {!(needsFailed && rows.length === 0) && <NeedsYou rows={rows} loading={summariesLoading} />}
-          <CampaignProgress presets={matching} summaries={summaries} />
+          <CampaignProgress presets={matching} summaries={summaries} health={health} />
           <StatusTiles counts={state.data.counts} params={params} />
           {(!needsFilter || ready) && (
             <TeamSummaries
