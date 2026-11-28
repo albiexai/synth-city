@@ -2884,6 +2884,7 @@ class CampaignAskView(BaseModel):
     created_at: datetime
     referenced_version_id: int
     referenced_version: int
+    page_link: str  # the campaign page at the referenced version: /insights/retrospectives/{id}?version={version id}
     calculation_version: str
     current_version_id: int | None
     version_changed: bool | None

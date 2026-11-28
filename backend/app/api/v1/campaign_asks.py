@@ -32,7 +32,7 @@ def _refused(error: asks.AskError) -> HTTPException:
 
 @router.get("/campaigns/{campaign_id}/asks", response_model=list[CampaignAskView])
 async def list_campaign_asks(campaign_id: int, db: AsyncSession = Depends(get_db)):
-    return await asks.list_asks(db, await _campaign(db, campaign_id))
+    return await asks.list_asks(db, await _campaign(db, campaign_id), github_client)
 
 
 @router.post("/campaigns/{campaign_id}/asks", response_model=CampaignAskView, status_code=201,
@@ -60,6 +60,6 @@ async def record_campaign_ask_lesson(campaign_id: int, request_id: int, request:
     campaign = await _campaign(db, campaign_id)
     actor = audit.derive_actor(actor_kind="operator", via=context["via"], session_id=context.get("session_id"))
     try:
-        return await asks.record_lesson(db, campaign, request_id, text=request.text, actor=actor)
+        return await asks.record_lesson(db, campaign, request_id, text=request.text, actor=actor, client=github_client)
     except asks.AskError as error:
         raise _refused(error) from None

@@ -106,9 +106,12 @@ async def _thread(db, request: MailMessage) -> list[MailMessage]:
 
 
 def _valid_reply(request: MailMessage, thread: list[MailMessage]) -> MailMessage | None:
-    """The first reply that the asked agent made: a member's answer, or the bound Supervisor's message."""
+    """The first reply that the asked agent made: a member's answer, or the bound Supervisor's message. Mail stores
+    the request's version id on the reply when it saves it (V1 review 128); a reply without it is not counted."""
     payload = request.payload
     for message in thread:
+        if (message.payload or {}).get("snapshot_version_id") != payload["snapshot_version_id"]:
+            continue
         if payload["role"] == "supervisor":
             if message.sender_actor_id == payload["supervisor_actor_id"] and message.kind == "message" \
                     and (message.payload or {}).get("kind") != "campaign_ask_lesson":
@@ -122,16 +125,50 @@ def _key_number(request: MailMessage) -> int:
     return int((request.delivery_key or "").rsplit(":", 1)[-1])
 
 
+def _seconds(value) -> str:
+    return "unknown" if value is None else f"{round(value)} s"
+
+
+def _review_lines(payload: dict) -> list[str]:
+    """The recorded review and rework measures of a snapshot, each with its sample count and coverage. Review time is
+    the time went in the review stage; rework is the attempts beyond the first for each item. Nothing recorded is
+    unknown, never zero."""
+    went = payload.get("time_went")
+    if not went:
+        return ["- Review time: not recorded in this version", "- Rework: not recorded in this version"]
+    stages = [row for row in went.get("stages") or [] if row.get("stage") == "review"]
+    coverage = (went.get("group_coverage") or {}).get("process") or went.get("coverage")
+    if stages:
+        share = sum(row.get("share_seconds") or 0 for row in stages)
+        wall = sum(row.get("wall_seconds") or 0 for row in stages)
+        samples = sum(row.get("attempts") or 0 for row in stages)
+        lines = [f"- Review time: {_seconds(share)} of item time, {_seconds(wall)} of its own time "
+                 f"(coverage {coverage}, {samples} samples)"]
+    else:
+        lines = [f"- Review time: unknown, no review recorded (coverage {coverage}, 0 samples)"]
+    items, attempts = went.get("items") or 0, went.get("attempts") or 0
+    if attempts:
+        lines.append(f"- Rework: {max(attempts - items, 0)} attempts beyond the first, {attempts} attempts over "
+                     f"{items} items (coverage {went.get('coverage')}, {went.get('unknown_items')} items unknown)")
+    else:
+        lines.append(f"- Rework: unknown, no attempt recorded (coverage {went.get('coverage')}, 0 samples)")
+    return lines
+
+
 def _numbers(payload: dict, role: str) -> str:
-    metrics = payload.get("metrics") or []
-    first = ("review", "rework") if role == "verifier" else ()
-    metrics = sorted(metrics, key=lambda m: not any(word in str(m.get("name")) for word in first))
     lines = []
-    for metric in metrics:
-        value = "unknown" if metric.get("value") is None else f"{metric['value']} {metric.get('unit') or ''}".strip()
+    if role == "verifier":  # the review and rework numbers first
+        lines += _review_lines(payload)
+    for metric in payload.get("metrics") or []:
+        value = "unknown" if metric.get("value") is None else f"{metric['value']} {metric.get('counting_unit') or ''}".strip()
         lines.append(f"- {metric.get('name')}: {value} (coverage {metric.get('coverage')}, "
                      f"{metric.get('sample_count')} samples)")
     return "\n".join(lines) or "- No numbers are recorded yet."
+
+
+def page_link(campaign_id: int, version_id: int) -> str:
+    """The campaign page at the version: the immutable id travels with the link (the UI reads ``version``)."""
+    return f"/insights/retrospectives/{campaign_id}?version={version_id}"
 
 
 async def create_ask(db, campaign: Campaign, *, role: str, member_id: int | None, client, actor: dict,
@@ -169,7 +206,7 @@ async def create_ask(db, campaign: Campaign, *, role: str, member_id: int | None
                "agent_key": agent_key, "request_token": uuid.uuid4().hex}
     body = (f"**Campaign {campaign_id}: a question for you ({role}).**\n\n"
             f"Snapshot version {version.id}, calculated up to {version.payload.get('as_of')}. "
-            f"Page: /insights/retrospectives/{campaign_id}\n\n**Key numbers**\n{_numbers(version.payload, role)}\n\n"
+            f"Page: {page_link(campaign_id, version.id)}\n\n**Key numbers**\n{_numbers(version.payload, role)}\n\n"
             f"**Question**\n{ROLE_QUESTIONS[role]}")
     if director_question:
         body += f"\n\n**The Director also asks**\n{director_question}"
@@ -202,16 +239,17 @@ async def create_ask(db, campaign: Campaign, *, role: str, member_id: int | None
             await agent_mail_service.auto_nudge_members(db, {asked_member})
         except Exception:  # a missed wakeup never undoes the ask
             logger.warning("campaign ask %s: the wakeup failed", sent_id, exc_info=True)
-    return (await _views(db, campaign, [await db.get(MailMessage, sent_id)]))[0]
+    return (await _views(db, campaign, [await db.get(MailMessage, sent_id)], client))[0]
 
 
-async def list_asks(db, campaign: Campaign) -> list[CampaignAskView]:
-    """Reads only: a reply is already stored in Mail, so nothing is synchronized."""
-    return await _views(db, campaign, list((await db.scalars(_requests(campaign.id))).all()))
+async def list_asks(db, campaign: Campaign, client=None) -> list[CampaignAskView]:
+    """Stores nothing: a reply is already in Mail. A live campaign's current version needs its membership, read from
+    GitHub when there is an ask to compare; without a client that reading is unknown, never current."""
+    return await _views(db, campaign, list((await db.scalars(_requests(campaign.id))).all()), client)
 
 
-async def _views(db, campaign: Campaign, requests: list[MailMessage]) -> list[CampaignAskView]:
-    current, current_reason = await snapshots.current_version(db, campaign)
+async def _views(db, campaign: Campaign, requests: list[MailMessage], client=None) -> list[CampaignAskView]:
+    current, current_reason = (await snapshots.current_version(db, campaign, client)) if requests else (None, None)
     views = []
     for request in requests:
         payload = request.payload
@@ -231,13 +269,14 @@ async def _views(db, campaign: Campaign, requests: list[MailMessage]) -> list[Ca
             agent_label=payload["agent_key"] if referenced is None else await _label(db, payload),
             status="answered" if reply is not None else "open", director_question=question,
             created_at=request.created_at, referenced_version_id=payload["snapshot_version_id"],
+            page_link=page_link(campaign.id, payload["snapshot_version_id"]),
             referenced_version=payload["snapshot_version"], calculation_version=payload["calculation_version"],
             current_version_id=None if unknown or current is None else current.id,
             version_changed=changed, stale=changed, metrics_unchanged=same,
             state="unknown" if unknown else "known", unknown_reason=unknown,
             reply=None if reply is None else CampaignAskReply(
                 id=reply.id, body=reply.body_markdown, created_at=reply.created_at,
-                snapshot_version_id=payload["snapshot_version_id"]),
+                snapshot_version_id=reply.payload["snapshot_version_id"]),
             lesson=None if lesson is None else CampaignAskLesson(
                 id=lesson.id, text=lesson.body_markdown, created_at=lesson.created_at,
                 snapshot_version_id=payload["snapshot_version_id"])))
@@ -253,7 +292,7 @@ async def _label(db, payload: dict) -> str:
     return member.display_name if member is not None else payload["agent_key"]
 
 
-async def record_lesson(db, campaign: Campaign, request_id: int, *, text: str, actor: dict) -> CampaignAskView:
+async def record_lesson(db, campaign: Campaign, request_id: int, *, text: str, actor: dict, client=None) -> CampaignAskView:
     """Record the Director's diagnosis from an answered ask, once. It is a message in the ask's thread."""
     campaign_id = campaign.id
     request = await db.get(MailMessage, request_id)
@@ -277,5 +316,5 @@ async def record_lesson(db, campaign: Campaign, request_id: int, *, text: str, a
     except IntegrityError:
         await db.rollback()
         raise AskError("campaign_ask_lesson_recorded", "A lesson is already recorded for this ask.") from None
-    return next(view for view in await list_asks(db, campaign) if view.id == request_id)
+    return next(view for view in await list_asks(db, campaign, client) if view.id == request_id)
 

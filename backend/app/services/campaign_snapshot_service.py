@@ -25,8 +25,10 @@ recorded attempt is unknown, never zero time.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from statistics import median
@@ -214,14 +216,36 @@ def _lifetime(key: str):
             & (FactoryContextKey.context_key == key) & FactoryContextKey.retired_at.is_(None))
 
 
-async def _fingerprint(db, campaign: Campaign) -> tuple:
+async def _team_events(db, campaign: Campaign):
+    """The newest audit event that this team lifetime's measures can read (#1260 V1 review 128). The events are
+    placed as ``_deliveries``, ``_markers`` and the pull facts place them: by the lifetime key, or, without a key,
+    by a surviving reference to the lifetime's items, scopes or team. Another team's events never match."""
+    key = campaign.team_context_key
+    items = (select(GithubWorkItem.id).join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
+             .join(FactoryContextKey, _lifetime(key)))
+    scopes = select(TeamGithubScope.id).join(FactoryContextKey, _lifetime(key))
+    team = select(FactoryContextKey.numeric_id).where(
+        FactoryContextKey.key_kind == "team", FactoryContextKey.context_key == key, FactoryContextKey.retired_at.is_(None))
+    item_keys = select(FactoryContextKey.context_key).where(
+        FactoryContextKey.key_kind == "item", FactoryContextKey.numeric_id.in_(items))
+    return await db.scalar(select(func.max(FactoryAuditEvent.id)).where(or_(
+        FactoryAuditEvent.team_context_key == key, FactoryAuditEvent.item_context_key.in_(item_keys),
+        FactoryAuditEvent.team_context_key.is_(None) & or_(
+            FactoryAuditEvent.item_id.in_(items), FactoryAuditEvent.scope_id.in_(scopes),
+            FactoryAuditEvent.team_preset_id.in_(team)))))
+
+
+async def _fingerprint(db, campaign: Campaign, *, scoped: bool = False) -> tuple:
     """Everything the membership measures read from the database: any new or changed record misses the cache.
     The rate-limit measure is read again on every hit instead, with its windows, gaps and the recorder's state.
 
     The team lifetime's own repositories and work items are compared row by row (V1 review 6079984028): a newly
     watched repository, or a status change that leaves every maximum as it was, misses too.
+
+    ``scoped`` (#1260) reads the audit events of this team lifetime only, for the identity of an ask version: another
+    team's event never makes this campaign's ask stale. The cache keeps the global mark.
     """
-    events = await db.scalar(select(func.max(FactoryAuditEvent.id)))
+    events = await (_team_events(db, campaign) if scoped else db.scalar(select(func.max(FactoryAuditEvent.id))))
     scopes = tuple((await db.execute(select(TeamGithubScope.id, TeamGithubScope.repo_owner, TeamGithubScope.repo_name)
                                      .join(FactoryContextKey, _lifetime(campaign.team_context_key))
                                      .order_by(TeamGithubScope.id))).all())
@@ -879,9 +903,24 @@ async def recompute(db, campaign: Campaign, client, *, actor: dict, as_of: datet
 
 # #1260: the version that a Mail ask pins. An ask row is as immutable as a final one. Its version is negative (-1, -2,
 # ...), so freeze (version 1) and recompute (the next final) never see it, and ``latest`` reads final rows only.
-async def record_fingerprint(db, campaign: Campaign) -> str:
-    """The hash of the records that the snapshot reads. It reads the database only: no clock, no GitHub."""
-    return hashlib.sha256(repr(await _fingerprint(db, campaign)).encode()).hexdigest()
+async def _live_identity(db, campaign: Campaign, client) -> tuple[str | None, str | None]:
+    """The identity of the campaign's records now, and why it cannot be told (V1 review 128). It joins the database
+    records of this team lifetime (``_fingerprint``, scoped) and the live membership: the issues GitHub reports with
+    the campaign's selector in each repository. A membership that cannot be read completely gives no identity."""
+    if client is None:
+        return None, "membership_not_read"
+    membership = await campaigns.members(db, campaign, client)
+    if not membership.complete:
+        return None, membership.unavailable or "membership_incomplete"
+    issues = sorted({_identity(m.repo, m.issue_number) for m in membership.members})
+    repositories = sorted(r.repo.lower() for r in membership.repositories)
+    records = await _fingerprint(db, campaign, scoped=True)
+    return hashlib.sha256(repr((records, repositories, issues)).encode()).hexdigest(), None
+
+
+async def record_fingerprint(db, campaign: Campaign, client=None) -> str | None:
+    """The hash of what the snapshot reads, or None when the live membership cannot be read. No clock."""
+    return (await _live_identity(db, campaign, client))[0]
 
 
 async def _ask_row(db, campaign_id: int, fingerprint: str) -> CampaignSnapshot | None:
@@ -893,45 +932,66 @@ async def _ask_row(db, campaign_id: int, fingerprint: str) -> CampaignSnapshot |
 async def ask_version(db, campaign: Campaign, client) -> CampaignSnapshot:
     """The ask version for the campaign's records now: the stored one for the same records, else a new one.
 
+    The live membership is read before a version is reused. When it cannot be read completely, the new version is
+    stored with an ``incomplete`` fingerprint that no later read matches: the ask reads as stale, never as current.
     Flushes and leaves the commit to the caller, so a failed Mail send rolls the new row back with it.
     """
     campaign_id = campaign.id
-    fingerprint = await record_fingerprint(db, campaign)
-    found = await _ask_row(db, campaign_id, fingerprint)
-    if found is not None:
-        return found
+    fingerprint, _reason = await _live_identity(db, campaign, client)
+    if fingerprint is not None:
+        found = await _ask_row(db, campaign_id, fingerprint)
+        if found is not None:
+            return found
     snapshot = await build_snapshot(db, campaign, client, as_of=datetime.now(UTC).replace(tzinfo=None), cached=False)
     payload = snapshot.model_dump(mode="json")
+    stored = fingerprint if fingerprint is not None else f"incomplete:{uuid.uuid4().hex}"
     for _attempt in range(_RECOMPUTE_ATTEMPTS):
         lowest = await db.scalar(select(func.min(CampaignSnapshot.version)).where(
             CampaignSnapshot.campaign_id == campaign_id)) or 0
         row = CampaignSnapshot(campaign_id=campaign_id, version=min(lowest, 0) - 1, calculation_version=CALCULATION_VERSION,
-                               payload=payload, created_by="operator", purpose=ASK, fingerprint=fingerprint)
+                               payload=payload, created_by="operator", purpose=ASK, fingerprint=stored)
         try:
             async with db.begin_nested():
                 db.add(row)
                 await db.flush()
             return row
         except IntegrityError:  # another ask took this version, or stored the same records first
-            found = await _ask_row(db, campaign_id, fingerprint)
+            found = await _ask_row(db, campaign_id, stored)
             if found is not None:
                 return found
     raise campaigns.CampaignError("campaign_snapshot_version_conflict")
 
 
-async def current_version(db, campaign: Campaign) -> tuple[CampaignSnapshot | None, str | None]:
+async def current_version(db, campaign: Campaign, client=None) -> tuple[CampaignSnapshot | None, str | None]:
     """The campaign's current version and, when it cannot be told, why not. A frozen campaign's current version is
-    its latest final row. A live campaign's is the ask row for its records now, or None while no ask holds them."""
+    its latest final row; a finished campaign without one is unknown (``final_version_missing``). A live campaign's
+    is the ask row for its records and membership now, or None while no ask holds them."""
     final = await latest(db, campaign.id)
     if final is not None:
         return final, None
+    if campaign.status == "finished":
+        return None, "final_version_missing"
     if await audit.current_context_key(db, "team", campaign.preset_id) != campaign.team_context_key:
         return None, "team_lifetime_ended"
-    return await _ask_row(db, campaign.id, await record_fingerprint(db, campaign)), None
+    fingerprint, reason = await _live_identity(db, campaign, client)
+    if fingerprint is None:
+        return None, reason
+    return await _ask_row(db, campaign.id, fingerprint), None
+
+
+def _without_times(value):
+    """The payload without the cutoff it was calculated at: every ``as_of`` key, at any depth."""
+    if isinstance(value, dict):
+        return {k: _without_times(v) for k, v in value.items() if k != "as_of"}
+    if isinstance(value, list):
+        return [_without_times(v) for v in value]
+    return value
 
 
 def metrics_digest(payload: dict) -> str:
-    """Whether two versions say the same: the metrics' values, coverage and unknowns, and the calculation."""
-    rows = sorted((m.get("name"), m.get("value"), m.get("coverage"), m.get("unknown_count"),
-                   tuple(m.get("unknown_reasons") or ())) for m in payload.get("metrics") or [])
-    return hashlib.sha256(repr((payload.get("calculation_version"), rows)).encode()).hexdigest()
+    """Whether two versions say the same: every reported measurement, with its counts and coverage. That is the
+    metrics, the repository counts and the item time, time went, bottleneck and flow sections, and the calculation.
+    Version metadata (ids, the cutoff) is not compared."""
+    body = _without_times(payload)
+    body.pop("campaign_id", None)
+    return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
