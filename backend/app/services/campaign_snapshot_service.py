@@ -726,6 +726,8 @@ async def _size(db, campaign: Campaign, members: list[tuple[str, int]], facts: _
     merged: dict[str, datetime] = {}  # each PR once, at its earliest merge in the campaign
     unknown_prs, reasons = 0, set(gaps)
     untimed: set[str] = set()  # PRs merged at no recorded time, unknown unless also merged at a known one
+    # V1 review 480: a known merge time places a PR before the campaign window is applied, wherever it falls
+    dated = {artifact.lower() for merges in facts.merges.values() for _, artifact, _ in merges if artifact}
     for key in members:
         merges = [merge for merge in facts.merges.get(key, ()) if began <= merge[0] <= as_of]
         named = [(at, artifact.lower()) for at, artifact, _ in merges if artifact]
@@ -736,17 +738,19 @@ async def _size(db, campaign: Campaign, members: list[tuple[str, int]], facts: _
             reasons.add(why)
         recorded = [artifact for at, artifact in facts.untimed_prs.get(key, ()) if began <= at <= as_of]
         untimed |= {artifact.lower() for artifact in recorded if artifact}  # V1 review 478: even beside a known merge
-        if not merges and recorded and not all(recorded):  # no PR to reconcile: unknown only where none is known
+        if not facts.merges.get(key) and recorded and not all(recorded):  # no PR: unknown where none is known
             unknown_prs, why = unknown_prs + 1, "merge_time_not_recorded"
             reasons.add(why)
-    if hidden := untimed - merged.keys():
+    if hidden := untimed - dated:
         unknown_prs += len(hidden)
         reasons.add("merge_time_not_recorded")
     lines, files = await _pr_sizes(db, campaign, merged, facts_from)
-    if membership != "full":  # V1 review 478: unread members' PRs are missing from the measures too
+    # V1 review 478: zero only for a complete, empty population; a lower bound while some members are unread
+    prs_coverage = membership if membership != "full" else ("partial" if unknown_prs or set(gaps) else "full")
+    if prs_coverage != "full":  # V1 reviews 478, 480: the PRs not counted are missing from the measures too
         lines, files = (measure.model_copy(update={
             "coverage": "partial" if measure.items else "unavailable",
-            "unknown_reasons": sorted(set(measure.unknown_reasons) | set(gaps))}) for measure in (lines, files))
+            "unknown_reasons": sorted(set(measure.unknown_reasons) | reasons)}) for measure in (lines, files))
     reasons |= set(lines.unknown_reasons) | set(files.unknown_reasons)
     live = await audit.current_context_key(db, "team", campaign.preset_id) == campaign.team_context_key
     if live:
@@ -757,8 +761,6 @@ async def _size(db, campaign: Campaign, members: list[tuple[str, int]], facts: _
         team_size, by_role = None, None
         reasons.add("team_retired")
     label = "unavailable" if membership == "unavailable" else ("partial" if reasons else "full")
-    # V1 review 478: zero only for a complete, empty population; a lower bound while some members are unread
-    prs_coverage = membership if membership != "full" else ("partial" if unknown_prs or set(gaps) else "full")
     return SizeSection(prs_merged=None if membership == "unavailable" else len(merged), prs_coverage=prs_coverage,
                        unknown_prs=unknown_prs, lines=lines, files=files, team_size=team_size,
                        mail_messages=sum(row.messages for row in by_role) if by_role is not None else None,
@@ -829,10 +831,15 @@ async def _mail_by_role(db, preset_id: int, began: datetime, as_of: datetime) ->
 async def _size_rows(db, campaign: Campaign) -> tuple:
     """#1454: what the size section reads that changes without an audit event: the number and newest id of the team's
     messages (a member joining or leaving, or a new receipt, changes the number), each of those messages' senders with
-    the role or actor kind it is counted by, inside the team or not (V1 review 478), and the team's slots."""
+    the role or actor kind it is counted by, inside the team or not (V1 review 478), each received message's earliest
+    receipt by a current member (V1 review 480), and the team's slots."""
     team = select(MailTeamMember.id).where(MailTeamMember.team_preset_id == campaign.preset_id)
     mail = tuple((await db.execute(select(func.count(MailMessage.id), func.max(MailMessage.id))
                                    .where(_team_mail(team)))).one())
+    # V1 review 480: each received message's earliest receipt by a current member decides it at any cutoff
+    receipts = tuple((await db.execute(
+        select(MailReceipt.message_id, func.min(MailReceipt.created_at)).where(MailReceipt.member_id.in_(team))
+        .group_by(MailReceipt.message_id).order_by(MailReceipt.message_id))).all())
     sender = aliased(MailTeamMember)
     senders = tuple((await db.execute(
         select(MailMessage.sender_member_id, sender.role, MailMessage.sender_actor_id, MailExternalActor.kind).distinct()
@@ -841,7 +848,7 @@ async def _size_rows(db, campaign: Campaign) -> tuple:
         .where(_team_mail(team)).order_by(MailMessage.sender_member_id, MailMessage.sender_actor_id))).all())
     slots = tuple((await db.scalars(select(AgentTeamSlot.id).where(AgentTeamSlot.preset_id == campaign.preset_id)
                                     .order_by(AgentTeamSlot.id))).all())
-    return mail, senders, slots
+    return mail, receipts, senders, slots
 
 
 async def _first_dispatch(db, live: dict, lifetime: str | None, marker: datetime | None, began: datetime,
