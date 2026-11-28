@@ -9,6 +9,8 @@ delivered to one (a receipt, so a broadcast counts only where it reached the tea
 """
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from sqlalchemy import text
 
@@ -68,25 +70,29 @@ async def _pr(db, world, item_id, number, minutes, *, pr=None, additions=30, del
             action_outcome="applied", operation_id=f"pull_facts:{name}")
 
 
-async def _size(db, world, items, *, facts_from=FACTS_FROM, cached=False):
-    """``items``: (issue number, merge minutes or None, keyword arguments for ``_pr``)."""
+async def _size(db, world, items, *, facts_from=FACTS_FROM, cached=False, as_of=AS_OF):
+    """``items``: (issue number, merge minutes or None, keyword arguments for ``_pr``); a repeated number is another
+    delivery on the same issue."""
     await _marker(db)
     if facts_from is not None:
         db.add(CampaignUpgradeCoverage(id=1, started_at=facts_from))
-    labelled = []
+    labelled, created = [], {}
     for number, merged, kwargs in items:
-        labelled.append(_issue("a1", number, state="closed"))
-        item = GithubWorkItem(scope_id=world.scopes["a1"], issue_number=number, issue_title="I", issue_url=f"u/{number}",
-                              github_updated_at=T0, dispatch_status="merged", created_at=CREATED)
-        db.add(item)
-        await db.flush()
-        await _dispatch(db, item.id, 0)
+        item = created.get(number)
+        if item is None:
+            labelled.append(_issue("a1", number, state="closed"))
+            item = created[number] = GithubWorkItem(
+                scope_id=world.scopes["a1"], issue_number=number, issue_title="I", issue_url=f"u/{number}",
+                github_updated_at=T0, dispatch_status="merged", created_at=CREATED)
+            db.add(item)
+            await db.flush()
+            await _dispatch(db, item.id, 0)
         if merged is not None:
             await _pr(db, world, item.id, number, merged, **kwargs)
     await db.commit()
     campaign = await campaigns.current(db, world.team) or await campaigns.start(
         db, world.team, "label:v4.4", started_at=T0, actor=OPERATOR)
-    return (await snapshots.build_snapshot(db, campaign, FakeGithub(labelled={"a1": labelled}), as_of=AS_OF,
+    return (await snapshots.build_snapshot(db, campaign, FakeGithub(labelled={"a1": labelled}), as_of=as_of,
                                            cached=cached)).size
 
 
@@ -107,15 +113,16 @@ async def _member(db, preset, key, role):
 
 
 async def _mail(db, minutes, *, sender=None, actor=None, recipient=None, kind="member", audience=(None, None),
-                receipts=()):
-    """A message; ``receipts`` are the members it was delivered to (a direct recipient gets one too, as in Mail)."""
+                receipts=(), received=None):
+    """A message; ``receipts`` are the members it was delivered to (a direct recipient gets one too, as in Mail), at
+    ``received`` (default: when it was sent)."""
     message = MailMessage(sender_member_id=sender, sender_actor_id=actor, recipient_member_id=recipient,
                           sender_type=kind, body_markdown="m", created_at=_m(minutes), audience_type=audience[0],
                           audience_id=audience[1], kind="broadcast" if recipient is None and receipts else "message")
     db.add(message)
     await db.flush()
     for member in {*receipts, *([recipient] if recipient is not None else [])}:
-        db.add(MailReceipt(message_id=message.id, member_id=member))
+        db.add(MailReceipt(message_id=message.id, member_id=member, created_at=received or _m(minutes)))
     await db.flush()
     return message.id
 
@@ -132,7 +139,8 @@ async def test_prs_are_counted_once_each_with_lines_and_files_median_and_largest
 
 
 @pytest.mark.parametrize(("kwargs", "reason"), [({"artifact": False}, "artifact_not_recorded"),
-                                                ({"timed": False}, "merge_time_not_recorded")])
+                                                ({"timed": False}, "merge_time_not_recorded"),
+                                                ({"timed": False, "artifact": False}, "merge_time_not_recorded")])
 async def test_a_merge_without_its_pr_or_time_is_an_unknown_pr(db, world, kwargs, reason):
     size = await _size(db, world, [(10, 60, {}), (11, 70, kwargs)])
     assert (size.prs_merged, size.unknown_prs, size.coverage) == (1, 1, "partial")
@@ -187,14 +195,57 @@ async def test_a_pr_merged_twice_is_measured_at_its_earliest_merge(db, world):
     assert size.lines.unknown_reasons == ["merged_before_pull_facts_recording"]
 
 
+async def test_an_untimed_merge_of_another_pr_on_a_measured_issue_is_an_unknown_pr(db, world):
+    """V1 review 478: issue 10 merged PR 15 at a known time and PR 16 at none; PR 16 must not vanish."""
+    size = await _size(db, world, [(10, 60, {"pr": 15}), (10, 70, {"pr": 16, "timed": False, "facts": False})])
+    assert (size.prs_merged, size.unknown_prs, size.prs_coverage, size.coverage) == (1, 1, "partial", "partial")
+    assert "merge_time_not_recorded" in size.unknown_reasons
+
+
+async def test_untimed_records_of_a_known_pr_are_not_unknown_and_one_untimed_pr_counts_once(db, world):
+    size = await _size(db, world, [(10, 60, {"pr": 15}),
+                                   (10, 70, {"pr": 15, "timed": False, "facts": False}),  # the same PR again
+                                   (10, 72, {"artifact": False, "timed": False}),  # no PR, beside a known one
+                                   (11, 75, {"pr": 15, "timed": False, "facts": False,  # PR 15 also delivered 11,
+                                             "name": "O/A1/pull/15"}),  # in another case
+                                   (12, 80, {"pr": 16, "timed": False, "facts": False}),
+                                   (13, 90, {"pr": 16, "timed": False, "facts": False})])  # one PR, two issues
+    assert (size.prs_merged, size.unknown_prs) == (1, 1)
+
+
+async def test_an_untimed_merge_recorded_after_the_cutoff_is_not_an_unknown_pr(db, world):
+    """With no merge time, the record time places the merge, as for item time."""
+    size = await _size(db, world, [(10, 60, {"pr": 15}), (11, 70, {"pr": 16, "timed": False, "facts": False})],
+                       as_of=_m(100))  # recorded now, after the cutoff
+    assert (size.prs_merged, size.unknown_prs) == (1, 0)
+    assert "merge_time_not_recorded" not in size.unknown_reasons
+
+
 @pytest.mark.parametrize(("broken", "coverage"), [({"a2"}, "partial"), ({"a1", "a2"}, "unavailable")])
 async def test_a_membership_read_gap_makes_the_size_partial_or_unavailable(db, world, broken, coverage):
     await _size(db, world, [(10, 60, {})])
     snapshot = await snapshots.build_snapshot(db, await campaigns.current(db, world.team),
                                               FakeGithub(labelled={"a1": [_issue("a1", 10, state="closed")]},
                                                          broken=broken), as_of=AS_OF, cached=False)
-    assert snapshot.size.coverage == coverage
-    assert any("a2" in reason for reason in snapshot.size.unknown_reasons)
+    size = snapshot.size
+    assert size.coverage == coverage
+    assert any("a2" in reason for reason in size.unknown_reasons)
+    # V1 review 478: the PR count is a lower bound or unknown, never a full zero, and so are lines and files
+    assert (size.prs_merged, size.prs_coverage) == ((1, "partial") if coverage == "partial" else (None, "unavailable"))
+    for measure in (size.lines, size.files):
+        assert measure.coverage == coverage
+        assert any("a2" in reason for reason in measure.unknown_reasons)
+
+
+async def test_a_fully_read_empty_campaign_has_zero_prs_with_full_coverage(db, world):
+    size = await _size(db, world, [])
+    assert (size.prs_merged, size.prs_coverage, size.lines.items, size.lines.coverage) == (0, "full", 0, "full")
+
+
+async def test_a_closed_issue_without_delivery_history_makes_the_pr_count_a_lower_bound(db, world):
+    size = await _size(db, world, [(10, 60, {}), (11, None, {})])
+    assert (size.prs_merged, size.unknown_prs, size.prs_coverage) == (1, 0, "partial")
+    assert "delivery_history_missing" in size.unknown_reasons
 
 
 # Team size, and model and member changes
@@ -300,14 +351,34 @@ async def test_a_broadcast_counts_once_where_it_reached_a_team_member_and_not_me
     assert {row.role: row.messages for row in size.mail_by_role} == {"supervisor": 1, "system": 4, "director": 1}
 
 
+@pytest.mark.parametrize(("after", "counted"), [(timedelta(0), 1), (timedelta(seconds=1), 0)])
+async def test_a_broadcast_reaches_the_team_only_by_a_receipt_at_or_before_the_cutoff(db, world, after, counted):
+    leader = await _member(db, world.team, "leader", "leader")
+    await _mail(db, 30, kind="system", audience=("team_preset", str(world.team)), receipts=[leader],
+                received=AS_OF + after)
+    size = await _size(db, world, [(10, 60, {})])
+    assert size.mail_messages == counted
+
+
 # The cache
-@pytest.mark.parametrize("change", ["message", "receipt", "slot", "role"])
+@pytest.mark.parametrize("change", ["message", "receipt", "slot", "role", "outside_role", "actor_kind"])
 async def test_a_new_message_receipt_slot_or_role_misses_the_cache(db, world, change):
     leader = await _member(db, world.team, "leader", "leader")
     undelivered = await _mail(db, 30, kind="system", audience=("team_preset", str(world.team)))
+    await _mail(db, 20, kind="system", recipient=leader)  # system already counts: a receipt adds no new sender
+    stranger = await _member(db, world.other, "stranger", "leader")
+    await _mail(db, 40, sender=stranger, recipient=leader)  # V1 review 478: inbound from another team
+    supervisor = MailExternalActor(actor_key="sup", display_name="Supervisor", kind="supervisor", token_hash="h")
+    db.add(supervisor)
+    await db.flush()
+    await _mail(db, 50, actor=supervisor.id, recipient=leader, kind="external_actor")
     first = await _size(db, world, [(10, 60, {})], cached=True)
-    if change == "message":
-        await _mail(db, 30, sender=leader)
+    if change == "outside_role":
+        await db.execute(text("UPDATE mail_team_members SET role = 'verifier' WHERE id = :id"), {"id": stranger})
+    elif change == "actor_kind":
+        await db.execute(text("UPDATE mail_external_actors SET kind = 'operator' WHERE id = :id"), {"id": supervisor.id})
+    elif change == "message":  # from a sender already counted, so only the message count changes
+        await _mail(db, 45, sender=stranger, recipient=leader)
     elif change == "receipt":  # an existing broadcast reaches the team: no new message row
         db.add(MailReceipt(message_id=undelivered, member_id=leader))
     elif change == "slot":
@@ -324,6 +395,10 @@ async def test_a_new_message_receipt_slot_or_role_misses_the_cache(db, world, ch
                                             FakeGithub(labelled={"a1": [_issue("a1", 10, state="closed")]}),
                                             as_of=AS_OF, cached=True)).size
     assert again != first
+    snapshots.clear_cache()
+    assert again == (await snapshots.build_snapshot(db, await campaigns.current(db, world.team),
+                                                    FakeGithub(labelled={"a1": [_issue("a1", 10, state="closed")]}),
+                                                    as_of=AS_OF, cached=False)).size  # the cached read is the fresh one
 
 
 # Frozen snapshots
