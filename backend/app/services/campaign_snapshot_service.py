@@ -62,9 +62,12 @@ from app.services import factory_audit_service as audit
 from app.services.factory_metrics_service import _coverage, _naive_utc
 from app.services.github_check_observation import ACTIONS_APP_ID
 from app.services.github_rate_limit_history import campaign_rate_limit_time
+from app.services.retro_bottleneck_service import (
+    CampaignBottleneckResponse, CampaignBottlenecks, RankingAttempt, build_bottlenecks,
+)
 
-# v4 (#1419): where the time went; v5 (#1247): CI and friction
-CALCULATION_VERSION = "campaign-snapshot-v5"
+# v5 (#1257): bottleneck windows; v6 (#1247): CI and friction
+CALCULATION_VERSION = "campaign-snapshot-v6"
 SMALL_SAMPLE = 5
 BANDS = (("0-100", 100), ("101-400", 400), ("over-400", None))  # by lines changed, upper bound inclusive
 CACHE_SECONDS = 30.0  # the Overview panel polls
@@ -198,6 +201,7 @@ class Snapshot(BaseModel):
     repositories: list[SnapshotRepository] = []
     item_time: ItemTimeSection | None = None  # additive (#1246): an older frozen payload reads back unchanged
     time_went: TimeWentSection | None = None  # additive (#1419)
+    bottlenecks: CampaignBottlenecks | None = None
     ci: CiSection | None = None  # additive (#1247)
     friction: FrictionSection | None = None
 
@@ -265,8 +269,8 @@ async def _retro_rows(db, campaign: Campaign) -> tuple:
     watches = select(GithubRequiredCheckWatch.id).where(GithubRequiredCheckWatch.work_item_id.in_(items))
     reads = [
         select(GithubCheckRunHistory.repository, GithubCheckRunHistory.check_run_id, GithubCheckRunHistory.head_sha,
-               GithubCheckRunHistory.pr_number, GithubCheckRunHistory.check_name, GithubCheckRunHistory.required,
-               GithubCheckRunHistory.scope_id, GithubCheckRunHistory.app_id, GithubCheckRunHistory.app_slug,
+               GithubCheckRunHistory.pr_number, GithubCheckRunHistory.check_name, GithubCheckRunHistory.app_slug,
+               GithubCheckRunHistory.required, GithubCheckRunHistory.scope_id, GithubCheckRunHistory.app_id,
                GithubCheckRunHistory.conclusion, GithubCheckRunHistory.observed_at, GithubCheckRunHistory.job_created_at,
                GithubCheckRunHistory.started_at, GithubCheckRunHistory.completed_at)
         .where(GithubCheckRunHistory.scope_id.in_(scopes))
@@ -303,21 +307,27 @@ async def _retro_rows(db, campaign: Campaign) -> tuple:
     return tuple(rows)
 
 
-async def build_snapshot(db, campaign: Campaign, client, *, as_of: datetime, observed_at: datetime | None = None,
+async def build_snapshot(db, campaign: Campaign, client, *, as_of: datetime | None = None, observed_at: datetime | None = None,
                          cached: bool = True) -> Snapshot:
     """The campaign's snapshot up to ``as_of``; served from the cache while no record it reads has changed.
 
+    Omit ``as_of`` for a current read that can reuse a fresh, matching live cutoff.
     ``observed_at`` is when the caller reads GitHub, ``as_of`` by default. GitHub reports the membership as it is
     then, so a read after the cutoff leaves the historical membership unknown (V1 review 6079984028).
     """
-    as_of = _naive_utc(as_of)
+    live_read = as_of is None and observed_at is None
+    as_of = _naive_utc(as_of if as_of is not None else datetime.now(UTC))
     observed = _naive_utc(observed_at) if observed_at is not None else as_of
     if cached:
         key = (await _fingerprint(db, campaign), as_of, observed)
         hit = _cache.get(campaign.id)
-        if hit is not None and hit[0] > _clock() and hit[1] == key:
-            # The recorder's pending windows are not records: its coverage is read again on every hit.
-            return await _refresh_rate_limited(db, campaign, hit)
+        if hit is not None and hit[0] > _clock():
+            earlier_key = hit[1]
+            current_live_read = (live_read and earlier_key[0] == key[0] and earlier_key[1] == earlier_key[2]
+                                 and 0 <= (as_of - hit[2].as_of).total_seconds() < CACHE_SECONDS)
+            if earlier_key == key or current_live_read:
+                # The recorder's pending windows are not records: its coverage is read again on every hit.
+                return await _refresh_rate_limited(db, campaign, hit)
     snapshot = await _build(db, campaign, client, as_of, observed)
     if cached:
         _cache[campaign.id] = (_clock() + CACHE_SECONDS, key, snapshot)
@@ -401,7 +411,8 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
     # Missing delivery history the counts already know of makes item time partial too (V1 review 448).
     item_time = await _item_time(db, campaign, list(members), facts, coverage, as_of,
                                  gaps + ([reason] if unknown else []), label)  # both kept (V1 review 115)
-    time_went, wait_durations, required_spans = await _time_went(db, campaign, list(members), coverage, as_of, gaps)
+    time_went, bottlenecks, wait_durations, required_spans = await _time_went(
+        db, campaign, list(members), coverage, as_of, gaps)
     ci = await _ci_measures(db, campaign, members, facts, coverage, as_of, gaps, time_went, required_spans)
     friction = await _friction_measures(db, campaign, members, facts, coverage, as_of, gaps,
                                         [reason] if unknown else [], time_went, wait_durations, rate_limit)
@@ -410,7 +421,7 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
         calculation_version=CALCULATION_VERSION, metrics=sorted(metrics, key=lambda sample: sample.name),
         recorded_coverage=[MeasureCoverageEntry(measure=c.measure, started_at=c.started_at, covered=c.covered,
                                                 reason=c.reason) for c in coverage], item_time=item_time,
-        time_went=time_went, ci=ci, friction=friction,
+        time_went=time_went, bottlenecks=bottlenecks, ci=ci, friction=friction,
         repositories=_repositories(membership, members, [gap for gap in gaps if gap in _CUTOFF_GAPS]))
 
 
@@ -445,7 +456,7 @@ _LOST_GROUP = {source: "waiting" for source in ("dispatch", "decision", "effort"
 
 
 async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], coverage, as_of: datetime,
-                     gaps: list[str]) -> tuple[TimeWentSection, list[float], int]:
+                     gaps: list[str]) -> tuple[TimeWentSection, CampaignBottlenecks, list[float], int]:
     """The campaign members' attempt time, split by the stage engine and summed; it reconciles with item time.
 
     A member whose attempts come from two overlapping item lifetimes (two rows tracking one issue) is ambiguous and
@@ -480,6 +491,7 @@ async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], cov
     groups = dict.fromkeys(GROUPS, 0.0)
     total = unaccounted = overlap = 0.0
     stages: dict[tuple[str, str, str], list] = {}
+    ranking_attempts = []
     wait_durations: list[float] = []
     required_spans = 0
     for attempt in attempts:
@@ -487,6 +499,7 @@ async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], cov
                               if span.group == "waiting" and span.stage != "dispatch")
         required_spans += sum(span.stage == "required_check" for span in attempt.intervals)
         result = breakdown(attempt.window, attempt.intervals)
+        ranking_attempts.append(RankingAttempt(member_items[attempt.item_id], attempt.window, attempt.intervals, result))
         total, unaccounted, overlap = (total + result.total_seconds, unaccounted + result.unaccounted_seconds,
                                        overlap + result.overlap_seconds)
         for group, seconds in result.groups.items():
@@ -522,7 +535,7 @@ async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], cov
     known = bool(attempts)
     if not known:
         group_coverage = dict.fromkeys(GROUPS, "unavailable")
-    time_went = TimeWentSection(
+    section = TimeWentSection(
         items=len(timed), attempts=len(attempts), unknown_items=len(wanted) - len(timed), unattributed=len(lost),
         total_seconds=total if known else None,
         groups={g: (v if group_coverage[g] != "unavailable" else None) for g, v in groups.items()},  # all with none
@@ -532,7 +545,11 @@ async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], cov
                          coverage=group_coverage[g], basis=FIRST_LABEL if v[3] else None)
                 for (g, st, a), v in sorted(stages.items(), key=lambda kv: (GROUPS.index(kv[0][0]), kv[0][1:]))],
         coverage="unavailable" if not known else ("partial" if reasons else "full"), unknown_reasons=sorted(reasons))
-    return time_went, wait_durations, required_spans
+    rankings = build_bottlenecks(ranking_attempts, start=started, as_of=as_of,
+                                 group_coverage=group_coverage, unknown_reasons=section.unknown_reasons)
+    return section, rankings, wait_durations, required_spans
+
+
 def _p85(values: list[float]) -> float:
     ordered = sorted(values)
     return ordered[math.ceil(0.85 * len(ordered)) - 1]
@@ -1043,6 +1060,27 @@ async def _friction_measures(db, campaign, members, facts, coverage, as_of, gaps
 async def latest(db, campaign_id: int) -> CampaignSnapshot | None:
     return await db.scalar(select(CampaignSnapshot).where(CampaignSnapshot.campaign_id == campaign_id)
                            .order_by(CampaignSnapshot.version.desc()).limit(1))
+
+
+async def read_bottlenecks(db, campaign: Campaign, client, *, previous_top: str | None) -> CampaignBottleneckResponse:
+    if campaign.status == "finished":
+        stored = await latest(db, campaign.id)
+        snapshot = Snapshot.model_validate(stored.payload) if stored is not None else None
+        source = "frozen" if stored is not None else "unavailable"
+    else:
+        snapshot = await build_snapshot(db, campaign, client)
+        source = "live"
+
+    rankings = snapshot.bottlenecks if snapshot is not None else None
+    if rankings is None:
+        start = snapshot.started_at if snapshot is not None else campaign.started_at
+        end = snapshot.as_of if snapshot is not None else campaign.finished_at or start
+        reason = "snapshot_without_bottlenecks" if snapshot is not None else "no_snapshot"
+        rankings = build_bottlenecks([], start=_naive_utc(start), as_of=_naive_utc(end),
+                                     group_coverage={"waiting": "unavailable", "process": "unavailable"},
+                                     unknown_reasons=[reason])
+    return CampaignBottleneckResponse(campaign_id=campaign.id, source=source,
+                                      bottlenecks=rankings.with_previous_top(previous_top))
 
 
 async def _first(db, campaign_id: int) -> CampaignSnapshot | None:
