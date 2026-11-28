@@ -2840,6 +2840,62 @@ class CampaignStartUpdate(BaseModel):
     expected_started_at: datetime
 
 
+class CampaignAskCreate(BaseModel):
+    """#1260: the Director's ask of one agent about a campaign (design §6)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["leader", "supervisor", "verifier"]
+    member_id: int | None = Field(default=None, gt=0)  # the verifier slot's member
+    director_question: str | None = Field(default=None, max_length=2000)
+    acknowledge_verifier_warning: bool = False
+
+
+class CampaignAskLessonCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=2000)
+
+
+class CampaignAskReply(BaseModel):
+    id: int
+    body: str
+    created_at: datetime
+    snapshot_version_id: int  # the version of the request that this reply answers
+
+
+class CampaignAskLesson(BaseModel):
+    id: int
+    text: str
+    created_at: datetime
+    snapshot_version_id: int
+
+
+class CampaignAskView(BaseModel):
+    """One ask: its request, its reply and whether the numbers have moved since. State lives in Mail."""
+
+    id: int  # the Mail request's id
+    campaign_id: int
+    role: Literal["leader", "supervisor", "verifier"]
+    agent_key: str
+    agent_label: str
+    status: Literal["open", "answered"]
+    director_question: str | None
+    created_at: datetime
+    referenced_version_id: int
+    referenced_version: int
+    page_link: str  # the campaign page at the referenced version: /insights/retrospectives/{id}?version={version id}
+    calculation_version: str
+    current_version_id: int | None
+    version_changed: bool | None
+    stale: bool | None  # None: unknown, see unknown_reason
+    metrics_unchanged: bool | None  # detail only: it never changes ``stale``
+    state: Literal["known", "unknown"]
+    unknown_reason: str | None = None
+    reply: CampaignAskReply | None = None
+    lesson: CampaignAskLesson | None = None
+
+
 class TeamGithubDeliveryPolicyUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
