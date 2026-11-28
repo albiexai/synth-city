@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, exists, or_, select, update
 
 from app.models.database import (
     AgentPaneBinding, AgentTeamSlot, GithubApprovalRequest, GithubAttemptScopeRevision,
@@ -16,6 +16,7 @@ from app.models.database import (
 )
 from app.services import agent_activity_service as activity
 from app.services import decision_wait_service as decision_waits
+from app.services import factory_audit_service as audit
 from app.services.factory_delivery_policy import effective_policy
 from app.services.github_approval_service import github_approval_service
 from app.services.agent_mail_service import MCP_HEARTBEAT_TTL_SECONDS
@@ -29,6 +30,63 @@ _GAPS = {"observation_unavailable", "observation_incomplete", "native_log_unavai
 
 def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def observation_wait_key(item):
+    nudge = item.continuation_nudged_at if item.active_scope_revision else item.last_nudge_at
+    return _digest([item.id, item.dispatch_nonce, item.active_scope_revision, nudge]) if nudge else None
+
+
+def blocking_observation_wait(item, now):
+    record = GithubOwnerObservationPause
+    return exists(select(record.id).where(
+        record.work_item_id == item.id,
+        or_(record.status == "paused", and_(record.status == "waiting",
+            record.wait_key == observation_wait_key(item), record.deadline > now)),
+    ))
+
+
+async def _end_waiting(db, *conditions, now, outcome):
+    record = GithubOwnerObservationPause
+    ended = (await db.execute(update(record).where(
+        record.status == "waiting", *conditions,
+    ).values(status="ended").returning(record.id, record.work_item_id))).all()
+    for pause_id, item_id in ended:
+        await audit.record_event(
+            db, event_kind="observation_wait_ended", source="owner_observation_pause._end_waiting",
+            occurred_at=now, actor=audit.derive_actor(actor_kind="system"), item_id=item_id,
+            operation_id=f"observation_wait_ended:{pause_id}", action_outcome=outcome,
+            before_values={"status": "waiting"}, after_values={"status": "ended", "wait_pause_id": pause_id},
+        )
+
+
+async def end_waiting_after_contact(db, item_id, now):
+    """Use only after a fenced owner-contact update in the same transaction."""
+    await _end_waiting(db, GithubOwnerObservationPause.work_item_id == item_id,
+                       now=now, outcome="contact_renewed")
+
+
+async def expire_waiting_observations(db, scope_id, *item_filters, now):
+    """Retire superseded waits while the current wait can still become an operator pause."""
+    record = GithubOwnerObservationPause
+    work = GithubWorkItem
+    expired = and_(record.status == "waiting", record.deadline <= now)
+    items = (await db.execute(select(
+        work.id, work.dispatch_status, work.dispatch_nonce, work.active_scope_revision,
+        work.last_nudge_at, work.continuation_nudged_at,
+    ).where(work.scope_id == scope_id, *item_filters, exists(select(record.id).where(
+        record.work_item_id == work.id, expired,
+    ))))).all()
+    for item in items:
+        key = observation_wait_key(item) if item.dispatch_status == "dispatched" else None
+        same_context = exists(select(work.id).where(
+            work.id == item.id, work.scope_id == scope_id, *item_filters,
+            work.dispatch_status == item.dispatch_status, work.dispatch_nonce == item.dispatch_nonce,
+            work.active_scope_revision == item.active_scope_revision, work.last_nudge_at == item.last_nudge_at,
+            work.continuation_nudged_at == item.continuation_nudged_at,
+        ))
+        await _end_waiting(db, record.work_item_id == item.id, record.deadline <= now,
+                           record.wait_key != key, same_context, now=datetime.utcnow(), outcome="expired")
 
 
 def _values(row, omitted=()):
@@ -249,10 +307,9 @@ async def handle_observation_gap(db, scope, item):
             raise ValueError("observation_pause_context_changed")
         if not gap:
             return False
-        nudge = item.continuation_nudged_at if item.active_scope_revision else item.last_nudge_at
-        if nudge is None:
+        key = observation_wait_key(item)
+        if key is None:
             raise ValueError("observation_pause_nudge_missing")
-        key = _digest([item.id, item.dispatch_nonce, item.active_scope_revision, nudge])
         record = await db.scalar(select(GithubOwnerObservationPause).where(GithubOwnerObservationPause.wait_key == key))
         now = datetime.utcnow()
         if record is None:

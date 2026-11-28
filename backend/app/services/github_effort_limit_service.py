@@ -10,17 +10,18 @@ from __future__ import annotations
 import logging
 import math
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import exists, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models.database import GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace, TeamGithubScope
+from app.models.database import AgentTeamSlot, GithubWorkItem, GithubWorkspace, TeamGithubScope
 from app.models.schemas import (
     DEFAULT_EFFORT_EXTENSION_CAP_MINUTES, DEFAULT_EFFORT_EXTENSION_CAP_PERCENT, DEFAULT_PLAN_ESTIMATE_MINUTES,
 )
+from app.services import agent_activity_service as activity
 from app.services import decision_wait_service as decision_waits
 from app.services.github_terminal_revision_service import TERMINAL_ITEMS
 
@@ -157,17 +158,59 @@ class GithubEffortLimitService:
 
     async def tick_scope(self, db: AsyncSession, scope, *, now: datetime | None = None) -> None:
         """Advance the ledger of every limited item of a scope. One failing item never stops the others."""
-        ids = (await db.execute(select(GithubWorkItem.id).where(
-            GithubWorkItem.scope_id == scope.id, GithubWorkItem.effort_limit_minutes.is_not(None),
-        ))).scalars().all()
-        for item_id in ids:
+        items = (await db.execute(
+            select(GithubWorkItem.id, GithubWorkItem.dispatch_status, AgentTeamSlot.provider)
+            .outerjoin(AgentTeamSlot, AgentTeamSlot.id == GithubWorkItem.owner_slot_id)
+            .where(GithubWorkItem.scope_id == scope.id, GithubWorkItem.effort_limit_minutes.is_not(None))
+        )).all()
+        observations = None
+        if any(row.provider == "codex-cli" and row.dispatch_status not in TERMINAL_ITEMS for row in items):
             try:
-                await self.tick_item(db, item_id, now=now)
+                async with db.begin_nested():
+                    observations = await activity.observe_poll_team(db, scope.preset_id, timeout=2, source="effort_ledger")
+            except Exception as exc:  # a failed advisory read leaves the rest of the poll usable
+                observations = None
+                logger.warning("effort_provider_observation_failed scope_id=%s error_type=%s",
+                               scope.id, type(exc).__name__)
+        for row in items:
+            try:
+                await self.tick_item(db, row.id, now=now, provider_observations=observations)
             except Exception as exc:  # advisory accounting must never break the monitor
-                logger.warning("effort_ledger_tick_failed work_item_id=%s error_type=%s", item_id, type(exc).__name__)
+                logger.warning("effort_ledger_tick_failed work_item_id=%s error_type=%s", row.id, type(exc).__name__)
+
+    async def _provider_blocked(self, db, item, observed, now):
+        lease = None
+        if item.dispatch_status not in TERMINAL_ITEMS:
+            lease = (await db.execute(
+                select(GithubWorkspace.leased_at, GithubWorkspace.leased_owner_pid, GithubWorkspace.leased_owner_proc_start)
+                .join(TeamGithubScope, TeamGithubScope.id == GithubWorkspace.scope_id)
+                .join(AgentTeamSlot, AgentTeamSlot.preset_id == TeamGithubScope.preset_id)
+                .where(GithubWorkspace.leased_item_id == item.id, GithubWorkspace.scope_id == item.scope_id,
+                       GithubWorkspace.enabled.is_(True), GithubWorkspace.lease_token.is_not(None),
+                       GithubWorkspace.leased_owner_pid.is_not(None),
+                       GithubWorkspace.leased_owner_proc_start.is_not(None),
+                       AgentTeamSlot.id == item.owner_slot_id, AgentTeamSlot.enabled.is_(True),
+                       AgentTeamSlot.provider == "codex-cli")
+            )).one_or_none()
+
+        blocked_at = recovered_at = None
+        if (lease and lease.leased_at and observed and observed.binding_identity
+                and observed.observed_at and observed.observed_at.tzinfo):
+            when = observed.observed_at.astimezone(UTC).replace(tzinfo=None)
+            if (observed.pane_lifetime == (lease.leased_owner_pid, lease.leased_owner_proc_start)
+                    and lease.leased_at <= when <= now
+                    and (item.dispatched_at is None or item.dispatched_at <= when)):
+                if (observed.reason == activity.PROVIDER_USAGE_LIMIT
+                        and item.dispatch_status == "dispatched" and item.ack_received_at is not None):
+                    blocked_at = when
+                elif observed.state in ("working", "idle"):
+                    recovered_at = when
+        return await decision_waits.reconcile_provider_wait(
+            db, item, lease_at=lease.leased_at if lease else None,
+            blocked_at=blocked_at, recovered_at=recovered_at, now=now)
 
     async def tick_item(self, db: AsyncSession, item_id: int, *, now: datetime | None = None,
-                        seen_last_tick=_UNSET) -> str:
+                        seen_last_tick=_UNSET, provider_observations=None) -> str:
         """Advance one item's ledger; the result is skipped, reset, started, counted or lost.
 
         The update is a compare-and-swap on the last tick the caller read, so two ticks can never both count the
@@ -184,59 +227,54 @@ class GithubEffortLimitService:
                 await db.commit()
         if item is None or item.effort_limit_minutes is None:
             return "skipped"
+        from app.services.owner_observation_pause import blocking_observation_wait
+
         last = item.effort_last_tick_at if seen_last_tick is _UNSET else seen_last_tick
-        paused = exists(select(GithubOwnerObservationPause.id).where(
-            GithubOwnerObservationPause.work_item_id == item.id,
-            GithubOwnerObservationPause.status.in_(("waiting", "paused"))))
-        working = (item.dispatch_status == "dispatched" and item.ack_received_at is not None
-                   and not await db.scalar(select(paused)))
-        guards = [GithubWorkItem.id == item.id, GithubWorkItem.dispatch_nonce == item.dispatch_nonce]
         try:
             async with _keep_loaded(db):
-                if not working:
-                    if last is not None:
-                        async with db.begin_nested():
-                            await db.execute(update(GithubWorkItem).where(
-                                *guards, GithubWorkItem.effort_last_tick_at == last,
-                            ).values(effort_last_tick_at=None).execution_options(synchronize_session=False))
-                        await db.commit()
-                    return "reset"
-                if last is None:
-                    async with db.begin_nested():
-                        started = await db.execute(update(GithubWorkItem).where(
-                            *guards, GithubWorkItem.dispatch_status == "dispatched",
-                            GithubWorkItem.effort_last_tick_at.is_(None),
-                        ).values(effort_last_tick_at=now).execution_options(synchronize_session=False))
-                    await db.commit()
-                    return "started" if started.rowcount == 1 else "lost"
-                if item.ack_received_at is not None and item.ack_received_at > last:
-                    # Re-acknowledged since the last tick: the item left work and came back (an escalation and a
-                    # continuation, say), so the span between the two working ticks is not one working span. Restart
-                    # the clock and book nothing. A round trip that leaves no trace on the row stays an
-                    # approximation, bounded by one tick gap (at most MAX_TICK_SECONDS).
-                    async with db.begin_nested():
-                        restarted = await db.execute(update(GithubWorkItem).where(
-                            *guards, GithubWorkItem.dispatch_status == "dispatched",
-                            GithubWorkItem.effort_last_tick_at == last,
-                        ).values(effort_last_tick_at=now).execution_options(synchronize_session=False))
-                    await db.commit()
-                    return "started" if restarted.rowcount == 1 else "lost"
-                gap = max(0, min(int((now - last).total_seconds()), MAX_TICK_SECONDS))
                 async with db.begin_nested():
-                    counted = await db.execute(update(GithubWorkItem).where(
-                        *guards, GithubWorkItem.dispatch_status == "dispatched",
+                    # Serialize the evidence and ledger so concurrent polls can't open duplicate
+                    # provider intervals or count through a recorded stall.
+                    locked = await db.execute(update(GithubWorkItem).where(
+                        GithubWorkItem.id == item.id, GithubWorkItem.dispatch_nonce == item.dispatch_nonce,
+                        GithubWorkItem.dispatch_status == item.dispatch_status,
+                        GithubWorkItem.ack_received_at == item.ack_received_at,
+                        GithubWorkItem.owner_slot_id == item.owner_slot_id,
+                        GithubWorkItem.active_scope_revision == item.active_scope_revision,
+                        GithubWorkItem.last_nudge_at == item.last_nudge_at,
+                        GithubWorkItem.continuation_nudged_at == item.continuation_nudged_at,
+                        GithubWorkItem.effort_limit_minutes == item.effort_limit_minutes,
                         GithubWorkItem.effort_last_tick_at == last,
-                    ).values(effort_elapsed_seconds=GithubWorkItem.effort_elapsed_seconds + gap,
-                             effort_last_tick_at=now).execution_options(synchronize_session=False))
+                    ).values(effort_last_tick_at=GithubWorkItem.effort_last_tick_at)
+                        .execution_options(synchronize_session=False))
+                    result = "lost"
+                    if locked.rowcount == 1:
+                        observed = (provider_observations or {}).get(item.owner_slot_id)
+                        provider_blocked = await self._provider_blocked(db, item, observed, now)
+                        working = (item.dispatch_status == "dispatched" and item.ack_received_at is not None
+                                   and not provider_blocked and not await db.scalar(select(
+                                       blocking_observation_wait(item, now))))
+                        gap = 0
+                        if not working:
+                            result = "reset"
+                        elif last is None or item.ack_received_at > last:
+                            # A restart or another acknowledgement opens a fresh working span.
+                            result = "started"
+                        else:
+                            result = "counted"
+                            gap = max(0, min(int((now - last).total_seconds()), MAX_TICK_SECONDS))
+                        await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == item.id).values(
+                            effort_elapsed_seconds=GithubWorkItem.effort_elapsed_seconds + gap,
+                            effort_last_tick_at=now if working else None,
+                        ).execution_options(synchronize_session=False))
                 await db.commit()
         except OperationalError:
             return "lost"  # another writer won the race: this tick counts nothing
-        if counted.rowcount != 1:
-            return "lost"
-        async with _keep_loaded(db):
-            await db.refresh(item)
-            await self._notify_at_limit(db, item, now=now)
-        return "counted"
+        if result == "counted":
+            async with _keep_loaded(db):
+                await db.refresh(item)
+                await self._notify_at_limit(db, item, now=now)
+        return result
 
     async def _notify_at_limit(self, db: AsyncSession, item: GithubWorkItem, *, now: datetime) -> None:
         limit = item.effort_limit_minutes + item.effort_extension_minutes
@@ -402,13 +440,15 @@ class GithubEffortLimitService:
     async def _read_activity(self, db: AsyncSession, item: GithubWorkItem, scope, now: datetime):
         """Why an extension must be refused for want of recent owner activity, as ``(code, contact)``.
 
-        ``code`` is ``None`` when the attempt is acknowledged, no observation pause is waiting or paused, and the
+        ``code`` is ``None`` when the attempt is acknowledged, no current observation wait or pause blocks it, and the
         leased workspace shows owner contact within the owner idle window (the window the idle monitor uses: the
         attempt delivery policy's, then the team's, then the installation's). ``contact`` is the contact time read.
         """
         if item.ack_received_at is None:
             return "effort_extension_not_acknowledged", None
-        if await db.scalar(select(self._pause_exists(item.id))):
+        from app.services.owner_observation_pause import blocking_observation_wait
+
+        if await db.scalar(select(blocking_observation_wait(item, now))):
             return "effort_extension_paused", None
         contact = await db.scalar(select(GithubWorkspace.lease_last_owner_contact_at).where(
             GithubWorkspace.leased_item_id == item.id))
@@ -421,12 +461,6 @@ class GithubEffortLimitService:
         if contact is None or now - contact > window:
             return "effort_extension_no_recent_activity", contact
         return None, contact
-
-    @staticmethod
-    def _pause_exists(item_id: int):
-        return exists(select(GithubOwnerObservationPause.id).where(
-            GithubOwnerObservationPause.work_item_id == item_id,
-            GithubOwnerObservationPause.status.in_(("waiting", "paused"))))
 
     async def extend(self, db: AsyncSession, *, work_item_id: int, dispatch_nonce: str, leader_member_id: int,
                      minutes, reason, expected_extension_minutes=None, evidence=None,
@@ -514,11 +548,13 @@ class GithubEffortLimitService:
         # The writer is held, so nothing can change between the read above and this update; the update still
         # repeats every check (acknowledged, no pause, the same owner contact) so the decision never rests on a
         # read alone.
+        from app.services.owner_observation_pause import blocking_observation_wait
+
         result = await db.execute(update(GithubWorkItem).where(
             GithubWorkItem.id == work_item_id, GithubWorkItem.dispatch_nonce == dispatch_nonce,
             GithubWorkItem.dispatch_status.in_(_EXTENDABLE_STATUSES), GithubWorkItem.effort_limit_minutes.is_not(None),
             GithubWorkItem.effort_extension_minutes == expected, GithubWorkItem.ack_received_at.is_not(None),
-            ~self._pause_exists(work_item_id),
+            ~blocking_observation_wait(item, now),
             exists(select(GithubWorkspace.id).where(
                 GithubWorkspace.leased_item_id == work_item_id,
                 GithubWorkspace.lease_last_owner_contact_at == contact)),

@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Iterable
+from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +30,7 @@ CEILING_STARTED, CEILING_ENDED = "ceiling_wait_started", "ceiling_wait_ended"
 # held stage, or at a recorded observation pause, keyed by the pause id.
 HOLD_STARTED, HOLD_ENDED = "hold_wait_started", "hold_wait_ended"
 PAUSE_STARTED, PAUSE_ENDED = "pause_wait_started", "pause_wait_ended"
+PROVIDER_STARTED, PROVIDER_ENDED = "provider_wait_started", "provider_wait_ended"
 # The reason complete_current_revision gives a revision it supersedes in an item's terminal transition.
 ITEM_TERMINAL_REASON = "The work item reached a terminal state."
 # The Mail root of a structured request carries this delivery key; its decision wait already counts it.
@@ -343,6 +345,45 @@ async def record_pause_wait_ended(
     """End a pause wait. ``actor`` is exactly the one the resume supplied; none is unknown, never assumed."""
     await _end_operator_wait(db, PAUSE_STARTED, PAUSE_ENDED, f"pause:{pause_id}", item_id=item_id,
                              outcome=outcome, ended_at=ended_at, source=source, actor=actor, evidence=evidence)
+
+
+async def reconcile_provider_wait(
+    db: AsyncSession, item, *, lease_at: datetime | None, blocked_at: datetime | None,
+    recovered_at: datetime | None, now: datetime,
+) -> bool:
+    """Reconcile one provider interval under the effort ledger's item writer lock."""
+    item_key = await audit.current_context_key(db, "item", item.id)
+    latest = None if item_key is None else await db.scalar(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.item_context_key == item_key,
+        FactoryAuditEvent.event_kind.in_((PROVIDER_STARTED, PROVIDER_ENDED)),
+    ).order_by(FactoryAuditEvent.id.desc()).limit(1))
+    launch = audit.launch_attempt_key(item.id, item.launch_id)
+    source = "github_effort_limit_service.tick_item"
+    actor = audit.derive_actor(actor_kind="scheduler", scheduler="github_effort_limit_service")
+    if latest is not None and latest.event_kind == PROVIDER_STARTED:
+        same_owner = (lease_at is not None and latest.fact_time >= lease_at
+                      and (latest.context_snapshot or {}).get("launch_attempt") == launch
+                      and (latest.after_values or {}).get("owner_slot_id") == item.owner_slot_id)
+        if same_owner and (recovered_at is None or recovered_at <= latest.fact_time):
+            return True
+        outcome = "provider_recovered" if same_owner else "owner_attempt_ended"
+        await audit.record_event(
+            db, event_kind=PROVIDER_ENDED, source=source, occurred_at=now,
+            fact_source="owner_native_activity", fact_time=recovered_at if same_owner else now,
+            item_id=item.id, actor=actor, action_outcome=outcome,
+            context_snapshot={"launch_attempt": (latest.context_snapshot or {}).get("launch_attempt")},
+            operation_id=latest.operation_id.replace(PROVIDER_STARTED, PROVIDER_ENDED, 1),
+        )
+    if blocked_at is None:
+        return False
+    await audit.record_event(
+        db, event_kind=PROVIDER_STARTED, source=source, occurred_at=now,
+        fact_source="owner_native_activity", fact_time=blocked_at, item_id=item.id, actor=actor,
+        context_snapshot={"launch_attempt": launch}, action_outcome="provider_usage_limit",
+        after_values={"provider": "codex-cli", "owner_slot_id": item.owner_slot_id},
+        operation_id=f"{PROVIDER_STARTED}:{uuid4()}",
+    )
+    return True
 
 
 async def reconcile_operator_waits(db: AsyncSession, *, scope_id: int, now: datetime) -> bool:

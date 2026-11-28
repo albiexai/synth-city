@@ -1208,6 +1208,9 @@ class GithubWorkspaceService:
             .execution_options(synchronize_session=False)
         )
         if result.rowcount:
+            from app.services.owner_observation_pause import end_waiting_after_contact
+
+            await end_waiting_after_contact(db, item_id, now)
             await db.commit()
 
     async def reclaim_stale(self, db: AsyncSession, scope: TeamGithubScope) -> int:

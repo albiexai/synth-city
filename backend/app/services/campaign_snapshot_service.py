@@ -456,7 +456,8 @@ def _repositories(membership, members, cutoff: list[str]) -> list[SnapshotReposi
 
 _LOST_GROUP = {source: "waiting" for source in ("dispatch", "decision", "effort", "ceiling", "hold", "pause", "mail",
                                                  "input")} | {
-    source: "process" for source in ("required_check", "review", "check_watch", "head_review", "revision_review")} | {
+    source: "process" for source in ("required_check", "review", "check_watch", "head_review", "revision_review",
+                                     "provider", "provider_blocked")} | {
     source: "active" for source in ("planning", "building", "approval_request")}
 
 

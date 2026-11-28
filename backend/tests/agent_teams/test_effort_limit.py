@@ -6,7 +6,7 @@ fail-safe. These tests use a file-backed SQLite database so two connections can 
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -15,18 +15,21 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.agent_mail import _persist_initial_approval
+from app.api.v1.agent_teams import report_dispatch_status
 from app.config import settings
 from app.database import Base
 from app.models.database import (
-    AgentTeamPreset, FactoryAuditEvent, GithubApprovalRequest, GithubOwnerObservationPause, GithubWorkItem, GithubWorkspace,
-    MailAgentSession, MailMessage, TeamGithubScope,
+    AgentTeamLaunch, AgentTeamPreset, FactoryAuditEvent, GithubApprovalRequest, GithubOwnerObservationPause,
+    GithubWorkItem, GithubWorkspace, MailAgentSession, MailMessage, TeamGithubScope,
 )
-from app.models.schemas import MailApprovalRequestCreate
+from app.models.schemas import DispatchStatusReport, MailApprovalRequestCreate
+from app.services import agent_activity_service as activity
 from app.services.agent_mail_service import agent_mail_service
 from app.services.github_approval_service import GithubApprovalError, github_approval_service
 from app.services.github_effort_limit_service import (
     EffortLimitError, effort_limit_service as service,
 )
+from app.services.owner_observation_pause import observation_wait_key
 from tests.agent_mail.test_api import _dispatch_approval_fixture
 
 T0 = datetime(2026, 11, 16, 5, 0, 0)
@@ -55,7 +58,8 @@ async def fx(tmp_path, monkeypatch):
                                lease_last_owner_contact_at=T0 - timedelta(minutes=1)))
         await db.commit()
         data = SimpleNamespace(maker=maker, item_id=item.id, nonce=item.dispatch_nonce, scope_id=item.scope_id,
-                               leader=members[0].id, owner=members[1].id)
+                               leader=members[0].id, leader_slot=members[0].team_slot_id,
+                               owner=members[1].id, owner_slot=item.owner_slot_id)
     yield data
     await engine.dispose()
 
@@ -84,13 +88,33 @@ async def _notices(fx, kind="github_effort_limit_reached"):
         return [row for row in rows if (row.payload or {}).get("kind") == kind]
 
 
-async def _tick(fx, at):
+async def _tick(fx, at, *, observed=None):
     async with fx.maker() as db:
-        return await service.tick_item(db, fx.item_id, now=at)
+        observations = {fx.owner_slot: observed} if observed is not None else None
+        return await service.tick_item(db, fx.item_id, now=at, provider_observations=observations)
 
 
 async def _limited(fx, limit=60, **extra):
     await _set(fx, effort_estimate_minutes=limit, effort_limit_minutes=limit, **extra)
+
+
+async def _bind_codex_lease(fx, leased_at):
+    async with fx.maker() as db:
+        workspace = await db.scalar(select(GithubWorkspace).where(GithubWorkspace.leased_item_id == fx.item_id))
+        workspace.leased_at = leased_at
+        workspace.leased_owner_pid, workspace.leased_owner_proc_start = 1001, "start-1"
+        await db.commit()
+
+
+def _codex_evidence(at, state="unknown", reason=activity.PROVIDER_USAGE_LIMIT, *, pid=1001):
+    return activity.PrivateActivity(state, reason, at.replace(tzinfo=UTC), "native", None,
+                                    binding_identity="bound", pane_lifetime=(pid, "start-1"))
+
+
+async def _provider_events(db):
+    return (await db.scalars(select(FactoryAuditEvent).where(
+        FactoryAuditEvent.event_kind.in_(("provider_wait_started", "provider_wait_ended")),
+    ).order_by(FactoryAuditEvent.id))).all()
 
 
 # --- estimate and ceiling -----------------------------------------------------------------------------------------
@@ -435,15 +459,115 @@ async def test_an_unacknowledged_attempt_is_not_working(fx):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["waiting", "paused"])
 async def test_an_observation_pause_stops_counting(fx, status):
-    await _limited(fx)
+    await _limited(fx, last_nudge_at=T0)
     await _tick(fx, T0)
     async with fx.maker() as db:
-        db.add(GithubOwnerObservationPause(work_item_id=fx.item_id, wait_key="w", authority_sha256="x",
+        item = await _item(fx, db)
+        db.add(GithubOwnerObservationPause(work_item_id=item.id, wait_key=observation_wait_key(item), authority_sha256="x",
                                            status=status, deadline=T0 + timedelta(hours=1)))
         await db.commit()
     assert await _tick(fx, T0 + timedelta(seconds=60)) == "reset"
     async with fx.maker() as db:
         assert (await _item(fx, db)).effort_elapsed_seconds == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("recovery_state", "recovery_reason"), [
+    ("working", "native_turn_started"), ("idle", "native_turn_completed"),
+])
+async def test_codex_usage_limit_suspends_effort_until_the_bound_owner_recovers(
+    fx, monkeypatch, recovery_state, recovery_reason,
+):
+    await _limited(fx, dispatched_at=T0 - timedelta(minutes=10))
+    await _bind_codex_lease(fx, T0 - timedelta(minutes=30))
+
+    seen = None
+    async def observe(*_args, **_kwargs):
+        return {fx.owner_slot: seen} if seen is not None else None
+
+    monkeypatch.setattr(activity, "observe_poll_team", observe)
+
+    async def poll(at):
+        async with fx.maker() as db:
+            await service.tick_scope(db, await db.get(TeamGithubScope, fx.scope_id), now=at)
+
+    await poll(T0)
+    await poll(T0 + timedelta(seconds=60))
+    stalled = T0 + timedelta(seconds=70)
+    seen = _codex_evidence(stalled)
+    await poll(stalled + timedelta(seconds=20))
+    await poll(stalled + timedelta(hours=1))
+    seen = _codex_evidence(stalled - timedelta(seconds=1), recovery_state, recovery_reason)
+    await poll(stalled + timedelta(hours=1, seconds=10))
+    seen = None
+    await poll(stalled + timedelta(hours=2))
+    async with fx.maker() as db:
+        item = await _item(fx, db)
+        assert (item.effort_elapsed_seconds, item.effort_last_tick_at) == (60, None)
+
+    recovered = stalled + timedelta(hours=3)
+    seen = _codex_evidence(recovered, recovery_state, recovery_reason)
+    await poll(recovered + timedelta(seconds=10))
+    await poll(recovered + timedelta(seconds=40))
+    async with fx.maker() as db:
+        assert (await _item(fx, db)).effort_elapsed_seconds == 90
+        assert [(row.action_outcome, row.fact_time) for row in await _provider_events(db)] == [
+            ("provider_usage_limit", stalled), ("provider_recovered", recovered),
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["before_lease", "before_dispatch", "other_binding", "unacknowledged"])
+async def test_provider_usage_limit_requires_evidence_from_the_acked_attempt(fx, invalid):
+    lease_at = T0 - timedelta(minutes=3)
+    dispatched_at = T0 - timedelta(minutes=2)
+    evidence_at = T0 + timedelta(seconds=10)
+    if invalid == "before_lease":
+        dispatched_at = lease_at - timedelta(seconds=2)
+        evidence_at = lease_at - timedelta(seconds=1)
+    elif invalid == "before_dispatch":
+        evidence_at = dispatched_at - timedelta(seconds=1)
+    ack_at = None if invalid == "unacknowledged" else T0 - timedelta(minutes=1)
+    await _limited(fx, dispatched_at=dispatched_at, ack_received_at=ack_at)
+    await _bind_codex_lease(fx, lease_at)
+
+    await _tick(fx, T0)
+    observed = _codex_evidence(evidence_at, pid=9000 if invalid == "other_binding" else 1001)
+    result = await _tick(fx, T0 + timedelta(seconds=30), observed=observed)
+    assert result == ("reset" if invalid == "unacknowledged" else "counted")
+    async with fx.maker() as db:
+        assert not await _provider_events(db)
+        assert (await _item(fx, db)).effort_elapsed_seconds == (0 if invalid == "unacknowledged" else 30)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["launch", "owner", "lease"])
+async def test_provider_interval_ends_when_the_owner_attempt_changes(fx, change):
+    await _limited(fx, dispatched_at=T0 - timedelta(minutes=3))
+    await _bind_codex_lease(fx, T0 - timedelta(minutes=3))
+    assert await _tick(fx, T0, observed=_codex_evidence(T0)) == "reset"
+    ended_at = T0 + timedelta(minutes=2)
+    async with fx.maker() as db:
+        item = await _item(fx, db)
+        if change == "launch":
+            scope = await db.get(TeamGithubScope, item.scope_id)
+            launch = AgentTeamLaunch(preset_id=scope.preset_id, plan_hash="fixture-plan")
+            db.add(launch)
+            await db.flush()
+            item.launch_id = launch.id
+        elif change == "owner":
+            item.owner_slot_id = fx.leader_slot
+        else:
+            workspace = await db.scalar(select(GithubWorkspace).where(GithubWorkspace.leased_item_id == item.id))
+            workspace.leased_at = ended_at - timedelta(seconds=1)
+            workspace.lease_token = "replacement-lease"
+        await db.commit()
+
+    assert await _tick(fx, ended_at) == "started"
+    async with fx.maker() as db:
+        started, ended = await _provider_events(db)
+        assert (ended.action_outcome, ended.fact_time) == ("owner_attempt_ended", ended_at)
+        assert ended.context_snapshot["launch_attempt"] == started.context_snapshot["launch_attempt"]
 
 
 @pytest.mark.asyncio
@@ -475,6 +599,35 @@ async def test_a_stale_tick_loses_the_compare_and_swap(fx):
         assert await service.tick_item(first, fx.item_id, now=T0 + timedelta(seconds=60), seen_last_tick=seen) == "lost"
     async with fx.maker() as db:
         assert (await _item(fx, db)).effort_elapsed_seconds == 60
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["last_nudge_at", "owner_slot_id", "ack_received_at"])
+async def test_effort_tick_rejects_owner_context_changes_before_the_write(fx, monkeypatch, field):
+    await _limited(fx)
+    await _tick(fx, T0)
+    tick_at = T0 + timedelta(seconds=60)
+    changed = fx.leader_slot if field == "owner_slot_id" else tick_at
+    async with fx.maker() as db:
+        execute = db.execute
+        interleaved = False
+
+        async def change_before_compare(statement, *args, **kwargs):
+            nonlocal interleaved
+            if statement.is_update and not interleaved:
+                interleaved = True
+                # Inject the new database state immediately before the compare-and-swap,
+                # while the tick still holds its original ORM snapshot.
+                await execute(update(GithubWorkItem).where(GithubWorkItem.id == fx.item_id)
+                              .values({getattr(GithubWorkItem, field): changed})
+                              .execution_options(synchronize_session=False))
+            return await execute(statement, *args, **kwargs)
+
+        monkeypatch.setattr(db, "execute", change_before_compare)
+        assert await service.tick_item(db, fx.item_id, now=tick_at) == "lost"
+        item = await _item(fx, db)
+        assert interleaved and getattr(item, field) == changed
+        assert (item.effort_elapsed_seconds, item.effort_last_tick_at) == (0, T0)
 
 
 # --- notices ------------------------------------------------------------------------------------------------------
@@ -545,11 +698,11 @@ def test_the_extension_cap_is_the_smaller_of_30_minutes_and_25_percent(limit, ca
 
 
 async def _extend(fx, minutes=15, *, leader=None, nonce=None, reason="healthy", expected=0,
-                  evidence="tests pass; two files left"):
+                  evidence="tests pass; two files left", now=T0):
     async with fx.maker() as db:
         return await service.extend(db, work_item_id=fx.item_id, dispatch_nonce=nonce or fx.nonce,
                                     leader_member_id=leader or fx.leader, minutes=minutes, reason=reason,
-                                    expected_extension_minutes=expected, evidence=evidence, now=T0)
+                                    expected_extension_minutes=expected, evidence=evidence, now=now)
 
 
 async def _code(coro):
@@ -981,12 +1134,59 @@ async def test_an_extension_is_refused_without_an_acknowledged_attempt(fx):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["waiting", "paused"])
 async def test_an_extension_is_refused_during_an_observation_pause(fx, status):
-    await _limited(fx)
+    await _limited(fx, last_nudge_at=T0)
     async with fx.maker() as db:
-        db.add(GithubOwnerObservationPause(work_item_id=fx.item_id, wait_key="w", authority_sha256="x", status=status,
+        item = await _item(fx, db)
+        db.add(GithubOwnerObservationPause(work_item_id=item.id, wait_key=observation_wait_key(item),
+                                           authority_sha256="x", status=status,
                                            deadline=T0 + timedelta(hours=1)))
         await db.commit()
     await _refused_with(fx, "effort_extension_paused")
+
+
+@pytest.mark.asyncio
+async def test_progress_after_a_new_nudge_ends_prior_waits_and_allows_extension(fx):
+    now = datetime.utcnow()
+    await _limited(fx, last_nudge_at=now - timedelta(seconds=10))
+    async with fx.maker() as db:
+        item = await _item(fx, db)
+        old = GithubOwnerObservationPause(work_item_id=item.id, wait_key=observation_wait_key(item),
+                                          authority_sha256="old", deadline=now + timedelta(seconds=50))
+        db.add(old)
+        item.last_nudge_at = now
+        current = GithubOwnerObservationPause(work_item_id=item.id, wait_key=observation_wait_key(item),
+                                              authority_sha256="current", deadline=now + timedelta(seconds=60))
+        db.add(current)
+        await db.commit()
+        session = await db.scalar(select(MailAgentSession).where(MailAgentSession.member_id == fx.owner))
+        await report_dispatch_status(DispatchStatusReport(work_item_id=item.id, status="in_progress",
+                                                           lease_token="fixture-lease"), session=session, db=db)
+        for row in (old, current):
+            await db.refresh(row)
+            assert row.status == "ended"
+        events = (await db.scalars(select(FactoryAuditEvent).where(
+            FactoryAuditEvent.event_kind == "observation_wait_ended",
+        ).order_by(FactoryAuditEvent.id))).all()
+        assert {row.after_values["wait_pause_id"]: row.action_outcome for row in events} == {
+            old.id: "contact_renewed", current.id: "contact_renewed",
+        }
+    assert (await _extend(fx, now=datetime.utcnow()))["extension_minutes"] == 15
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expiration", ["superseded_nudge", "deadline"])
+async def test_stale_wait_does_not_block_an_extension(fx, expiration):
+    await _limited(fx, last_nudge_at=T0)
+    async with fx.maker() as db:
+        item = await _item(fx, db)
+        changed_nudge = expiration == "superseded_nudge"
+        db.add(GithubOwnerObservationPause(work_item_id=item.id, wait_key=observation_wait_key(item),
+                                           authority_sha256="fixture", deadline=(
+                                               T0 + timedelta(minutes=1) if changed_nudge else T0)))
+        if changed_nudge:
+            item.last_nudge_at = T0 + timedelta(seconds=1)
+        await db.commit()
+    assert (await _extend(fx, now=T0 + timedelta(seconds=2)))["extension_minutes"] == 15
 
 
 @pytest.mark.asyncio
