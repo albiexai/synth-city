@@ -19,6 +19,7 @@ from app.models.database import (
     AgentTeamSlot,
     CampaignSnapshot,
     FactoryAuditEvent,
+    GithubCheckRunHistoryCoverage,
     GithubRateLimitHistoryCoverage,
     GithubRateLimitWindow,
     GithubWorkItem,
@@ -616,11 +617,13 @@ async def test_an_ask_makes_a_new_version_exactly_when_a_fresh_snapshot_differs(
 
 
 # V1 review 130: times generated from the cutoff are not compared; recorded times are
-def _payload(cutoff, *, marker=None, reason=None, window_start=None, recorded=None):
+def _payload(cutoff, *, marker=None, reason=None, window_start=None, recorded=None, others=()):
     """A snapshot payload as the comparison reads it, with the generated and the recorded times set by the caller."""
     iso = lambda value: value.isoformat()  # noqa: E731
     coverage = [{"measure": "rate_limit_windows", "started_at": iso(marker) if marker else None, "covered": True,
                  "reason": None}]
+    coverage += [{"measure": name, "started_at": iso(started), "covered": True, "reason": None}
+                 for name, started in others]  # the other recorders: each start is a recorded fact
     return {"campaign_id": 1, "as_of": iso(cutoff), "metrics": [{
                 "name": "rate_limited_seconds", "value": None, "coverage": "unavailable", "sample_count": 0,
                 "unknown_reasons": [reason(cutoff) if callable(reason) else reason or "recording_not_installed"]}],
@@ -686,6 +689,47 @@ def test_a_recorded_time_that_equals_the_cutoff_is_still_compared_when_it_moves(
     assert _digest(note(cut)) != _digest(note(next_cut))
     # the same recorded time at both cutoffs is no change
     assert _digest(_payload(cut, marker=T0, recorded=T0)) == _digest(_payload(next_cut, marker=T0, recorded=T0))
+
+
+@pytest.mark.parametrize("offset", [-1, 0, 1, 2])
+def test_another_recorders_start_at_a_cutoff_does_not_change_how_the_rate_limit_text_reads(offset):
+    """V1 review 131: two versions one second apart, the rate-limit recorder started after both, the check-run
+    recorder started at the same moment in both. Only the rate-limit recorder decides how its text reads."""
+    first, second = T0 + timedelta(days=10), T0 + timedelta(days=10, seconds=1)
+    check_runs = first + timedelta(seconds=offset)  # one second before, at the first, at the second, one after the second
+    rate_start = T0 + timedelta(days=20)
+    reason = lambda cut: f"{T0.isoformat()}/{cut.isoformat()}: before instrumentation start"  # noqa: E731
+    one = _payload(first, marker=rate_start, reason=reason, others=[("check_runs", check_runs)])
+    two = _payload(second, marker=rate_start, reason=reason, others=[("check_runs", check_runs)])
+    assert _digest(one) == _digest(two)
+    # the check-run start is a recorded fact: when it differs between the versions, the measurements differ
+    moved = _payload(second, marker=rate_start, reason=reason, others=[("check_runs", check_runs + timedelta(hours=1))])
+    assert _digest(one) != _digest(moved)
+
+
+def test_a_rate_limit_start_at_a_cutoff_is_a_recorded_fact_and_the_same_start_in_both_versions_is_no_change():
+    first, second = T0 + timedelta(days=10), T0 + timedelta(days=10, seconds=1)
+    partial = lambda cut: f"{T0.isoformat()}/{first.isoformat()}: before instrumentation start"  # noqa: E731
+    one = _payload(first, marker=first, reason=partial)
+    two = _payload(second, marker=first, reason=partial)  # the same recorded start (the first cutoff) in both
+    assert _digest(one) == _digest(two)
+    assert _digest(one) != _digest(_payload(second, marker=second, reason=lambda cut: f"{T0.isoformat()}/{second.isoformat()}: "
+                                            "before instrumentation start"))  # a different start is a change
+
+
+@pytest.mark.parametrize("offset", [-1, 0, 1, 2])
+async def test_two_versions_one_second_apart_stay_unchanged_whenever_the_check_run_recorder_started(db, team, offset):
+    """V1 review 131 end to end: the rate-limit recorder started after both cutoffs, so its measure is unavailable in
+    both. The check-run recorder started one second before, at, or after the cutoffs."""
+    first, second = CUTOFF, CUTOFF + timedelta(seconds=1)
+    db.add(GithubRateLimitHistoryCoverage(id=1, started_at=CUTOFF + timedelta(days=5)))
+    db.add(GithubCheckRunHistoryCoverage(id=1, started_at=first + timedelta(seconds=offset)))
+    await db.commit()
+    await snapshots.freeze(db, team.campaign, _client(), actor=SYSTEM, as_of=first)
+    await _ask(db, team)
+    await snapshots.recompute(db, team.campaign, _client(), actor=OPERATOR, as_of=second, observed_at=second)
+    listed = (await _list(db, team))[0]
+    assert (listed.stale, listed.metrics_unchanged) == (True, True)
 
 
 async def test_a_recompute_whose_observation_is_later_than_the_cutoff_leaves_the_membership_unknown(db, team):

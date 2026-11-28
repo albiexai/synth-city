@@ -1068,11 +1068,14 @@ def metrics_digest(payload: dict) -> str:
     metrics, the repository counts and the item time, time went, bottleneck and flow sections, and the calculation.
     Version metadata (ids) and the times generated from the cutoff are not compared; recorded times are."""
     as_of = payload.get("as_of")
-    markers = [entry.get("started_at") for entry in payload.get("recorded_coverage") or [] if entry.get("started_at")]
+    # The generated coverage-window text comes from the rate-limit recorder alone (``_rate_limited``), so only its
+    # start decides how the text reads. Any other recorder's start is a recorded fact and is compared as it is
+    # (V1 review 131).
+    started = next((entry.get("started_at") for entry in payload.get("recorded_coverage") or []
+                    if entry.get("measure") == "rate_limit_windows"), None)
     try:
         cutoff = datetime.fromisoformat(as_of) if as_of else None
-        later_marker = cutoff is not None and any(datetime.fromisoformat(m) > cutoff for m in markers) and not any(
-            datetime.fromisoformat(m) == cutoff for m in markers)
+        later_marker = cutoff is not None and started is not None and datetime.fromisoformat(started) > cutoff
     except ValueError:
         later_marker = False
     body = _comparable(payload, as_of, later_marker)
