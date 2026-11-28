@@ -67,10 +67,26 @@ async def end_waiting_after_contact(db, item_id, now):
 
 
 async def expire_waiting_observations(db, scope_id, *item_filters, now):
-    """Retire expired waits after the monitor has had a chance to promote them."""
-    item_ids = select(GithubWorkItem.id).where(GithubWorkItem.scope_id == scope_id, *item_filters)
-    await _end_waiting(db, GithubOwnerObservationPause.work_item_id.in_(item_ids),
-                       GithubOwnerObservationPause.deadline <= now, now=datetime.utcnow(), outcome="expired")
+    """Retire superseded waits while the current wait can still become an operator pause."""
+    record = GithubOwnerObservationPause
+    work = GithubWorkItem
+    expired = and_(record.status == "waiting", record.deadline <= now)
+    items = (await db.execute(select(
+        work.id, work.dispatch_status, work.dispatch_nonce, work.active_scope_revision,
+        work.last_nudge_at, work.continuation_nudged_at,
+    ).where(work.scope_id == scope_id, *item_filters, exists(select(record.id).where(
+        record.work_item_id == work.id, expired,
+    ))))).all()
+    for item in items:
+        key = observation_wait_key(item) if item.dispatch_status == "dispatched" else None
+        same_context = exists(select(work.id).where(
+            work.id == item.id, work.scope_id == scope_id, *item_filters,
+            work.dispatch_status == item.dispatch_status, work.dispatch_nonce == item.dispatch_nonce,
+            work.active_scope_revision == item.active_scope_revision, work.last_nudge_at == item.last_nudge_at,
+            work.continuation_nudged_at == item.continuation_nudged_at,
+        ))
+        await _end_waiting(db, record.work_item_id == item.id, record.deadline <= now,
+                           record.wait_key != key, same_context, now=datetime.utcnow(), outcome="expired")
 
 
 def _values(row, omitted=()):

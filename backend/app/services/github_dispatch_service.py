@@ -3148,6 +3148,7 @@ class GithubDispatchService:
         from app.services.github_effort_limit_service import effort_limit_service
         from app.services.owner_observation_pause import expire_waiting_observations
 
+        scope_id = scope.id
         observed_before = datetime.utcnow()
         await effort_limit_service.tick_scope(db, scope)
         # #1338: close the operator waits (holds, pauses) that ended without a release, for every item of the scope.
@@ -3165,7 +3166,7 @@ class GithubDispatchService:
             key=lambda slot: slot.position,
         )
         if not enabled:
-            await expire_waiting_observations(db, scope.id, GithubWorkItem.active_scope_revision == 0,
+            await expire_waiting_observations(db, scope_id, GithubWorkItem.active_scope_revision == 0,
                                               now=observed_before)
             return
         preset = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
@@ -3261,7 +3262,7 @@ class GithubDispatchService:
                 if await handle_observation_gap(db, scope, item):
                     continue
                 await self.escalate(db, item, "owner_idle_timeout")
-        await expire_waiting_observations(db, scope.id, GithubWorkItem.active_scope_revision == 0,
+        await expire_waiting_observations(db, scope_id, GithubWorkItem.active_scope_revision == 0,
                                           now=observed_before)
         await db.commit()
 
@@ -3330,6 +3331,7 @@ class GithubDispatchService:
     ) -> None:
         from app.services.owner_observation_pause import expire_waiting_observations
 
+        scope_id = scope.id
         observed_before = datetime.utcnow()
         enabled_slot_ids = {slot.id for slot in preset_slots if slot.enabled}
         item_filters = (
@@ -3477,7 +3479,7 @@ class GithubDispatchService:
                 elapsed_seconds=elapsed.total_seconds(),
                 action="escalate_idle",
             )
-        await expire_waiting_observations(db, scope.id, *item_filters, now=observed_before)
+        await expire_waiting_observations(db, scope_id, *item_filters, now=observed_before)
 
     async def monitor_recovery(
         self,

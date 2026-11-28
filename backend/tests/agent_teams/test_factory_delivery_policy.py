@@ -763,8 +763,13 @@ async def test_monitors_end_expired_waits_that_never_become_paused(db, monkeypat
     scope, item, workspace, _revision, slot, *_ = await observation_fixture(db, monkeypatch, tmp_path, initial)
     assert await pause.handle_observation_gap(db, scope, item)
     record = (await db.scalars(select(GithubOwnerObservationPause))).one()
-    record.deadline = datetime.utcnow() - timedelta(seconds=1)
-    workspace.lease_last_owner_contact_at = datetime.utcnow()
+    now = datetime.utcnow()
+    record.deadline = now - timedelta(seconds=1)
+    if initial:
+        item.last_nudge_at = now
+    else:
+        item.continuation_nudged_at = now
+    workspace.lease_last_owner_contact_at = now
     await db.commit()
 
     if initial:
@@ -777,6 +782,67 @@ async def test_monitors_end_expired_waits_that_never_become_paused(db, monkeypat
     assert item.dispatch_status == "dispatched"
     event = await db.scalar(select(FactoryAuditEvent).where(FactoryAuditEvent.event_kind == "observation_wait_ended"))
     assert event.action_outcome == "expired"
+
+
+@pytest.mark.parametrize("initial", [False, True])
+@pytest.mark.asyncio
+async def test_current_expired_wait_survives_a_failed_read_and_then_pauses(db, monkeypatch, tmp_path, initial):
+    from app.services import owner_observation_pause as pause
+
+    scope, item, _workspace, _revision, slot, *_ = await observation_fixture(db, monkeypatch, tmp_path, initial)
+
+    async def poll():
+        if initial:
+            await github_dispatch_service.monitor_dispatched(db, scope, [slot], wake_state_by_slot={slot.id: "ready"})
+        else:
+            await github_dispatch_service.monitor_continuation(db, scope, [slot])
+
+    await poll()
+    record = (await db.scalars(select(GithubOwnerObservationPause))).one()
+    record.deadline = datetime.utcnow() - timedelta(seconds=1)
+    await db.commit()
+
+    observe = native.activity.observe_poll_team
+    async def fail_gap_observation(*args, **kwargs):
+        if kwargs.get("source") == "owner_observation_gap":
+            raise OSError("fixture: observation read failed")
+        return await observe(*args, **kwargs)
+
+    with monkeypatch.context() as failed:
+        failed.setattr(native.activity, "observe_poll_team", fail_gap_observation)
+        await poll()
+        await db.refresh(record)
+        assert record.status == "waiting" and item.dispatch_status == "dispatched"
+
+    await poll()
+    await db.refresh(record)
+    assert record.status == "paused" and item.escalation_reason == pause.REASON
+
+
+@pytest.mark.asyncio
+async def test_expired_observation_wait_cleanup_respects_scope_and_revision(db):
+    from app.services import owner_observation_pause as pause
+
+    scope, scoped_initial = await scope_and_item(db, "initial", dispatch_status="verifying")
+    _, outside_scope = await scope_and_item(db, "outside", dispatch_status="verifying")
+    scoped_continuation = GithubWorkItem(
+        scope_id=scope.id, issue_number=2, issue_title="Continuation", issue_url="https://example.test/2",
+        github_updated_at=datetime.utcnow(), dispatch_status="verifying", active_scope_revision=1,
+    )
+    db.add(scoped_continuation)
+    await db.flush()
+    now = datetime.utcnow()
+    records = [GithubOwnerObservationPause(work_item_id=item.id, wait_key=f"fixture-{item.id}",
+                                          authority_sha256="fixture", deadline=now - timedelta(seconds=1))
+               for item in (scoped_initial, outside_scope, scoped_continuation)]
+    db.add_all(records)
+    await db.commit()
+
+    await pause.expire_waiting_observations(db, scope.id, GithubWorkItem.active_scope_revision == 0, now=now)
+    await db.commit()
+    for record in records:
+        await db.refresh(record)
+    assert [record.status for record in records] == ["ended", "waiting", "waiting"]
 
 
 @pytest.mark.parametrize("change", ["stale_session", "new_generation", "dead", "idle", "mismatch", "unapproved", "policy_disabled"])

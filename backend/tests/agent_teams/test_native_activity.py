@@ -1,12 +1,14 @@
 """Native observation fixtures. No harness, credentials or live database."""
 import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
 from app.services import agent_activity_service as activity
 from app.services import pi_activity_service as pi
+from app.services.wake_followup_service import wake_followup_service
 from app.models.database import (
     AgentPaneBinding, AgentTeamPreset, AgentTeamSlot, MailAgentSession,
     MailPaneLifecycle, MailTeamMember,
@@ -328,18 +330,27 @@ def test_codex_usage_limit_survives_turn_cleanup_until_a_new_turn(native, event)
     payload = {"type": event, **(error if event == "error" else {"error": error})}
     rows = [
         {"type": "session_meta", "payload": {"id": session_id, "cwd": str(native["cwd"])}},
-        {"type": "event_msg", "payload": payload, "timestamp": (now - timedelta(seconds=3)).isoformat()},
+        {"type": "event_msg", "payload": payload, "timestamp": (now - timedelta(seconds=5)).isoformat()},
         {"type": "event_msg", "payload": {"type": "task_complete"},
-         "timestamp": (now - timedelta(seconds=2)).isoformat()},
+         "timestamp": (now - timedelta(seconds=4)).isoformat()},
     ]
     path = native["log"]
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     args = (path, session_id, str(native["cwd"]), now, now - timedelta(seconds=10))
-    assert activity._native_state(*args) == ("unknown", activity.PROVIDER_USAGE_LIMIT, now - timedelta(seconds=3))
+    state, reason, at = activity._native_state(*args)
+    assert (state, reason, at) == ("unknown", activity.PROVIDER_USAGE_LIMIT, now - timedelta(seconds=5))
+    wake_at = now.replace(tzinfo=None)
+    assert not wake_followup_service._known_idle_before(SimpleNamespace(activity_state=state, idle_since=at), wake_at)
     with path.open("a") as stream:
         stream.write(json.dumps({"type": "event_msg", "payload": {"type": "task_started"},
-                                 "timestamp": (now - timedelta(seconds=1)).isoformat()}) + "\n")
+                                 "timestamp": (now - timedelta(seconds=3)).isoformat()}) + "\n")
     assert activity._native_state(*args)[:2] == ("working", "native_turn_started")
+    with path.open("a") as stream:
+        stream.write(json.dumps({"type": "event_msg", "payload": {"type": "task_complete"},
+                                 "timestamp": (now - timedelta(seconds=2)).isoformat()}) + "\n")
+    state, reason, at = activity._native_state(*args)
+    assert reason == "native_turn_completed"
+    assert wake_followup_service._known_idle_before(SimpleNamespace(activity_state=state, idle_since=at), wake_at)
 
 
 @pytest.mark.asyncio

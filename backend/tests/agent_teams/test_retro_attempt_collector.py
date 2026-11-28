@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from itertools import count
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
@@ -30,6 +31,7 @@ from app.models.database import (
     TeamGithubScope,
 )
 from app.services import factory_audit_service as audit
+from app.services.campaign_snapshot_service import MeasureCoverageEntry, _time_went
 from app.services.decision_wait_service import record_wait_ended, record_wait_started
 from app.services.github_dispatch_service import observe_work_lifecycle
 from app.services.retro_attempt_collector import collect_team_attempts
@@ -275,6 +277,36 @@ async def test_a_second_attempt_starts_where_the_first_ended(db):
         _at(60), _at(60), _at(90), None)
     assert ("active", "planning", "owner", 0, 10) in _spans(first)
     assert ("active", "planning", "owner", 60, 70) in _spans(second)
+
+
+async def test_provider_interval_uses_its_launch_and_closes_at_the_attempt_boundary(db):
+    team, item = await _redispatched(db)
+    await _wait(db, "provider", "overlap", _at(50), _at(70), item=item,
+                after={"provider": "codex-cli"}, snapshot={"launch_attempt": _key(item, 1)})
+    await _wait(db, "provider", "after", _at(65), _at(80), item=item,
+                after={"provider": "codex-cli"}, snapshot={"launch_attempt": _key(item, 1)})
+    result = await _collect(db, team, as_of=90)
+    first, second = result.attempts
+    assert ("process", "provider_blocked", "codex-cli", 50, 60) in _spans(first)
+    assert all(row.stage != "provider_blocked" for row in second.intervals)
+    assert not result.unattributed
+
+
+async def test_unrecorded_provider_launch_makes_retrospective_process_coverage_partial(db):
+    team, (item,) = await _team(db)
+    await _dispatch(db, item, 1, _at(0), current_nonce="nonce-a")
+    await _wait(db, "provider", "unrecorded", _at(10), _at(20), item=item,
+                after={"provider": "codex-cli"}, snapshot={"launch_attempt": _key(item, 2)})
+    result = await _collect(db, team, as_of=30)
+    assert _lost(result) == [("provider", "attempt_not_recorded")]
+    assert all(row.stage != "provider_blocked" for row in result.attempts[0].intervals)
+
+    campaign = SimpleNamespace(preset_id=team.id, started_at=_at(-10), team_context_key=None)
+    coverage = [MeasureCoverageEntry(measure=measure, started_at=_at(-20), covered=True)
+                for measure in ("check_runs", "decision_waits")]
+    section, _rankings = await _time_went(db, campaign, [("example/repo", item.issue_number)], coverage, _at(30), [])
+    assert section.group_coverage["process"] == "partial"
+    assert "process: unattributed_evidence" in section.unknown_reasons
 
 
 @pytest.mark.parametrize(("evidence", "expected"), [(True, []), (False, [("head_review", "attempt_unproven")] * 2)])

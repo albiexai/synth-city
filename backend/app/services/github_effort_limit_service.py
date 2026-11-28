@@ -254,7 +254,7 @@ class GithubEffortLimitService:
                         working = (item.dispatch_status == "dispatched" and item.ack_received_at is not None
                                    and not provider_blocked and not await db.scalar(select(
                                        blocking_observation_wait(item, now))))
-                        values = {"effort_last_tick_at": now if working else None}
+                        gap = 0
                         if not working:
                             result = "reset"
                         elif last is None or item.ack_received_at > last:
@@ -263,9 +263,10 @@ class GithubEffortLimitService:
                         else:
                             result = "counted"
                             gap = max(0, min(int((now - last).total_seconds()), MAX_TICK_SECONDS))
-                            values["effort_elapsed_seconds"] = GithubWorkItem.effort_elapsed_seconds + gap
-                        await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == item.id)
-                                         .values(**values).execution_options(synchronize_session=False))
+                        await db.execute(update(GithubWorkItem).where(GithubWorkItem.id == item.id).values(
+                            effort_elapsed_seconds=GithubWorkItem.effort_elapsed_seconds + gap,
+                            effort_last_tick_at=now if working else None,
+                        ).execution_options(synchronize_session=False))
                 await db.commit()
         except OperationalError:
             return "lost"  # another writer won the race: this tick counts nothing
