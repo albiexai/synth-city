@@ -161,6 +161,7 @@ class FlowSection(BaseModel):
     unknown_merges: int  # PR merges GitHub gave no time: never placed in a week
     weeks: list[WeekRow]
     markers: list[ChangeMarker]
+    marker_coverage: str  # partial when audit recording began after the campaign start, or isn't marked
     coverage: str
     unknown_reasons: list[str]
 
@@ -372,7 +373,7 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
     coverage = await upgrade.recorded_coverage(db, campaign)
     metrics.append(await _rate_limited(db, coverage, started, as_of))
     # Missing delivery history the counts already know of makes item time partial too (V1 review 448).
-    spans: list[tuple[datetime | None, datetime | None]] = []
+    spans: list[tuple[datetime | None, datetime | None, list[str]]] = []
     item_time = await _item_time(db, campaign, list(members), facts, coverage, as_of,
                                  gaps + ([reason] if unknown else []), label, spans)  # both kept (V1 review 115)
     time_went = await _time_went(db, campaign, list(members), coverage, as_of, gaps)
@@ -512,7 +513,8 @@ async def _item_time(db, campaign: Campaign, members: list[tuple[str, int]], fac
                      as_of: datetime, gaps: list[str], membership: str,
                      spans: list | None = None) -> ItemTimeSection:
     """Each member delivered by the cutoff, from its evidenced first dispatch to its earliest merge, by size band.
-    ``spans`` receives each merged member's (first dispatch or None, first merge or None when GitHub gave no time)."""
+    ``spans`` receives each merged member's (first dispatch or None, first merge or None when GitHub gave no time,
+    why the start is unknown)."""
     marker = await audit.instrumentation_start(db)
     marker = marker and _naive_utc(marker)
     facts_entry = next(c for c in coverage if c.measure == "pull_request_facts")
@@ -543,7 +545,7 @@ async def _item_time(db, campaign: Campaign, members: list[tuple[str, int]], fac
             if any(began <= at <= as_of for at in facts.untimed.get(key, ())):
                 rows["unknown"].append((None, ["merge_time_not_recorded"]))
                 if spans is not None:
-                    spans.append((None, None))
+                    spans.append((None, None, []))
             continue
         end = min(at for at, _, _ in merges)
         tied = [merge for merge in merges if merge[0] == end]
@@ -571,7 +573,7 @@ async def _item_time(db, campaign: Campaign, members: list[tuple[str, int]], fac
         rows[band].append(((end - start).total_seconds() if start is not None else None,
                            reasons + ([why] if why else [])))
         if spans is not None:
-            spans.append((start, end))
+            spans.append((start, end, reasons))
     bands = []
     for band, entries in rows.items():
         times = [seconds for seconds, _ in entries if seconds is not None]
@@ -599,7 +601,7 @@ _MARKER_SOURCES = ("agent_teams.update_github_scope", "agent_teams.update_github
 async def _flow(db, campaign: Campaign, spans: list, as_of: datetime, gaps: list[str], membership: str) -> FlowSection:
     """Merges per UTC ISO week, each member once in its first merge's week, and before-and-after at each marker."""
     began = _naive_utc(campaign.started_at)
-    ends = [end for _, end in spans if end is not None]
+    ends = [end for _, end, _ in spans if end is not None]
     unknown_merges = len(spans) - len(ends)
     weeks, monday = [], (began - timedelta(days=began.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     while monday <= as_of:
@@ -607,7 +609,7 @@ async def _flow(db, campaign: Campaign, spans: list, as_of: datetime, gaps: list
         weeks.append(WeekRow(week_start=monday.date(), merges=sum(monday <= end < following for end in ends),
                              partial=began > monday or as_of < following))
         monday = following
-    timed = [(start, end) for start, end in spans if start is not None and end is not None]
+    timed = [(start, end) for start, end, _ in spans if start is not None and end is not None]
     markers = []
     for at, source, fields in await _markers(db, campaign, began, as_of):
         before = [(end - start).total_seconds() for start, end in timed if end < at]
@@ -615,10 +617,18 @@ async def _flow(db, campaign: Campaign, spans: list, as_of: datetime, gaps: list
         markers.append(ChangeMarker(at=at, source=source, fields=fields, before=_side(before), after=_side(after),
                                     straddling=sum(start < at <= end for start, end in timed),
                                     unknown=len(spans) - len(timed)))
-    reasons = sorted(set(gaps) | ({"merge_time_not_recorded"} if unknown_merges else set()))
+    # Changes before audit recording began are unknown, so the marker list is only complete from its start on
+    # (V2 review 473); and an item whose time is unknown leaves the comparison incomplete with its reason.
+    recording = await audit.instrumentation_start(db)
+    recording = recording and _naive_utc(recording)
+    marker_gap = ("no_forward_coverage_marker" if recording is None
+                  else "change_markers_before_audit_recording" if recording > began else None)
+    reasons = sorted(set(gaps) | ({"merge_time_not_recorded"} if unknown_merges else set())
+                     | {why for start, _, whys in spans if start is None for why in whys}
+                     | ({marker_gap} if marker_gap else set()))
     label = "unavailable" if membership == "unavailable" else ("partial" if reasons else "full")
-    return FlowSection(merges=len(ends), unknown_merges=unknown_merges, weeks=weeks, markers=markers, coverage=label,
-                       unknown_reasons=reasons)
+    return FlowSection(merges=len(ends), unknown_merges=unknown_merges, weeks=weeks, markers=markers,
+                       marker_coverage="partial" if marker_gap else "full", coverage=label, unknown_reasons=reasons)
 
 
 def _side(seconds: list[float]) -> MarkerSide:

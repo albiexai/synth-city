@@ -65,9 +65,13 @@ async def _policy(db, world, minutes, *, source=SETTINGS, outcome="applied", tea
         action_outcome=outcome, operation_id=f"policy:{source}:{minutes}:{outcome}")
 
 
-async def _flow(db, world, items, *, cached=False, as_of=AS_OF):
-    """``items``: (issue number, dispatch minutes or None, merge minutes (one or a tuple) or None, timed)."""
-    await _marker(db)
+async def _flow(db, world, items, *, cached=False, as_of=AS_OF, marker=True):
+    """``items``: (issue number, dispatch minutes or None, merge minutes (one or a tuple) or None, timed).
+    ``marker``: the forward-coverage marker before the campaign (True), at a given time, or not installed (None)."""
+    if marker is True:
+        await _marker(db)
+    elif marker is not None:
+        await _marker(db, marker)
     db.add(CampaignUpgradeCoverage(id=1, started_at=FACTS_FROM))
     labelled = []
     for number, dispatched, merged, timed in items:
@@ -99,6 +103,7 @@ async def test_merges_are_counted_per_utc_iso_week_with_the_edge_weeks_partial(d
     assert _weeks(snapshot) == [(date(2026, 11, 16), 1, True), (date(2026, 11, 23), 2, False),
                                 (date(2026, 11, 30), 1, True)]
     assert (snapshot.flow.merges, snapshot.flow.unknown_merges, snapshot.flow.coverage) == (4, 0, "full")
+    assert (snapshot.flow.marker_coverage, snapshot.flow.unknown_reasons) == ("full", [])
 
 
 async def test_a_member_merged_twice_counts_once_in_its_first_merge_week(db, world):
@@ -127,6 +132,27 @@ async def test_a_membership_read_gap_makes_throughput_partial_or_unavailable(db,
                                                          broken=broken), as_of=AS_OF, cached=False)
     assert snapshot.flow.coverage == coverage
     assert any("a2" in reason for reason in snapshot.flow.unknown_reasons)
+
+
+# V2 review 473: unknown inputs are never complete
+async def test_an_item_time_unknown_start_makes_the_flow_partial_with_its_reason(db, world):
+    await _policy(db, world, 1000)
+    flow = (await _flow(db, world, [(10, 0, 60, True), (11, None, 1300, True)])).flow
+    assert (flow.coverage, flow.unknown_reasons, flow.markers[0].unknown) == ("partial", ["dispatch_not_recorded"], 1)
+
+
+async def test_without_the_coverage_marker_the_markers_are_partial(db, world):
+    """Changes before audit recording began are unknown, so an empty or short marker list is not complete."""
+    await _policy(db, world, 1000)
+    flow = (await _flow(db, world, [(10, 0, 60, True)], marker=None)).flow
+    assert (flow.marker_coverage, flow.coverage) == ("partial", "partial")
+    assert "no_forward_coverage_marker" in flow.unknown_reasons
+
+
+async def test_a_coverage_marker_after_the_campaign_start_leaves_the_markers_partial(db, world):
+    flow = (await _flow(db, world, [(10, 0, 60, True)], marker=_m(10))).flow
+    assert (flow.marker_coverage, flow.coverage) == ("partial", "partial")
+    assert "change_markers_before_audit_recording" in flow.unknown_reasons
 
 
 # Change markers
@@ -176,14 +202,16 @@ async def test_a_marker_stores_field_names_never_their_values(db, world):
 
 # Before and after
 async def test_only_items_wholly_on_one_side_are_compared(db, world):
-    """Marker at 1000: two before, one straddling, two after (one dispatched exactly at it), one start unknown."""
+    """Marker at 1000: two before, two straddling (one merged exactly at it), two after (one dispatched exactly at
+    it), one start unknown."""
     await _policy(db, world, 1000)
     flow = (await _flow(db, world, [(10, 0, 100, True), (11, 0, 120, True), (12, 900, 1100, True),
-                                    (13, 1000, 1060, True), (14, 1200, 1500, True), (15, None, 1300, True)])).flow
+                                    (13, 1000, 1060, True), (14, 1200, 1500, True), (15, None, 1300, True),
+                                    (16, 0, 1000, True)])).flow
     (marker,) = flow.markers
     assert (marker.before.items, marker.before.median_seconds) == (2, 110 * MIN)
     assert (marker.after.items, marker.after.median_seconds) == (2, 180 * MIN)
-    assert (marker.straddling, marker.unknown) == (1, 1)
+    assert (marker.straddling, marker.unknown) == (2, 1)
 
 
 @pytest.mark.parametrize(("n", "small"), [(4, True), (5, False)])
