@@ -966,7 +966,7 @@ async def test_ci_friction_are_additive_to_older_frozen_snapshots(db, world):
     new = await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False)
     assert new.ci.item_time_share.value is None
     assert new.friction.decision_waits.value is None and new.friction.agent_errors.value is None
-    old = new.model_dump(exclude={"ci", "friction", "bottlenecks"})
+    old = new.model_dump(exclude={"ci", "friction", "bottlenecks", "flow"})
     old["calculation_version"] = "campaign-snapshot-v4"
     restored = snapshots.Snapshot.model_validate(old)
     assert restored.ci is None and restored.friction is None
