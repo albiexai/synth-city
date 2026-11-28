@@ -17,15 +17,18 @@ from app.database import get_db
 from app.api.v1.deps import operator_audit_actor, operator_write_context, require_operator
 from app.config import settings
 from app.models import factory_schemas as wire
+from app.models.database import Campaign
 from app.models.schemas import (
     FactoryReviewAcceptanceDeclaration, SetupPreflightRequest, SetupPreflightResponse,
     SetupPreflightCheck,
 )
 from app.services.github_client import github_client, GithubClientResponseError
 from app.services.github_app_auth_service import GithubAppAuthError, github_app_auth_service
+from app.services import campaign_snapshot_service as campaign_snapshots
 from app.services import factory_campaign_list_service as campaign_list_service
 from app.services import factory_projection_service as projections
 from app.services import milestone_state_service
+from app.services.retro_bottleneck_service import CampaignBottleneckResponse
 from app.utils.repo_utils import is_primary_github_checkout
 
 
@@ -380,6 +383,20 @@ async def campaigns(
     await projections.validate_filters(db, selected)
     return await campaign_list_service.campaign_list(
         db, team_id=selected.team_id, scope_id=selected.scope_id, status=status, limit=limit, cursor=cursor)
+
+
+@router.get("/campaigns/{campaign_id}/bottlenecks", response_model=CampaignBottleneckResponse)
+async def campaign_bottlenecks(
+    campaign_id: int,
+    previous_top: str | None = Query(None, pattern=r"^(?:[a-f0-9]{64})?$"),
+    db=Depends(read_snapshot),
+):
+    if not 0 < campaign_id < 2**63:
+        raise projections.FactoryReadError("invalid_filter", 422)
+    campaign = await db.get(Campaign, campaign_id)
+    if campaign is None:
+        raise projections.FactoryReadError("resource_not_found", 404)
+    return await campaign_snapshots.read_bottlenecks(db, campaign, github_client, previous_top=previous_top)
 
 
 @router.get("/repositories/{scope_id}", response_model=wire.RepositoryDetailResponse)

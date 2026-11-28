@@ -243,25 +243,25 @@ async def test_a_new_marker_misses_the_cache(db, world):
 
 
 # Frozen snapshots
-async def test_a_stored_v4_snapshot_without_the_section_reads_back_unchanged(db, world):
+async def test_a_stored_v5_snapshot_without_the_section_reads_back_unchanged(db, world):
     snapshot = await _flow(db, world, [(10, 0, 100, True)])
     old = snapshot.model_dump(mode="json")
     old.pop("flow")
-    old["calculation_version"] = "campaign-snapshot-v4"
+    old["calculation_version"] = "campaign-snapshot-v5"
     campaign = await campaigns.current(db, world.team)
-    db.add(CampaignSnapshot(campaign_id=campaign.id, version=1, calculation_version="campaign-snapshot-v4",
+    db.add(CampaignSnapshot(campaign_id=campaign.id, version=1, calculation_version="campaign-snapshot-v5",
                             payload=old, created_by="operator"))
     await db.commit()
     frozen = await snapshots.freeze(db, campaign, FakeGithub(), actor=OPERATOR)
-    assert (frozen.flow, frozen.calculation_version) == (None, "campaign-snapshot-v4")
+    assert (frozen.flow, frozen.calculation_version) == (None, "campaign-snapshot-v5")
     assert (await snapshots.latest(db, campaign.id)).payload == old
 
 
-async def test_a_new_freeze_stores_v5_with_the_section(db, world):
+async def test_a_new_freeze_stores_v6_with_the_section(db, world):
     await _flow(db, world, [(10, 0, 100, True)])
     campaign = await campaigns.current(db, world.team)
     frozen = await snapshots.freeze(db, campaign, FakeGithub(labelled={"a1": [_issue("a1", 10, state="closed")]}),
                                     actor=OPERATOR, as_of=AS_OF)
     stored = await snapshots.latest(db, campaign.id)
-    assert (stored.calculation_version, frozen.calculation_version) == ("campaign-snapshot-v5",) * 2
+    assert (stored.calculation_version, frozen.calculation_version) == ("campaign-snapshot-v6",) * 2
     assert stored.payload["flow"]["merges"] == 1
