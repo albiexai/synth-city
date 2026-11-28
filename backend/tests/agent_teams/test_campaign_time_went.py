@@ -769,13 +769,13 @@ async def test_a_stored_v3_snapshot_without_the_section_reads_back_unchanged(db,
     assert (await snapshots.latest(db, campaign.id)).payload == old
 
 
-async def test_a_new_freeze_stores_v5_with_both_sections(db, world):
+async def test_a_new_freeze_stores_the_current_version_with_both_sections(db, world):
     await _two_items(db, world)
     await _build(db, world, [10, 11, 12])
     campaign = await campaigns.current(db, world.team)
     labelled = [_issue("a1", number, state="closed") for number in (10, 11, 12)]
     frozen = await snapshots.freeze(db, campaign, FakeGithub(labelled={"a1": labelled}), actor=OPERATOR, as_of=AS_OF)
     stored = await snapshots.latest(db, campaign.id)
-    assert (stored.calculation_version, frozen.calculation_version) == ("campaign-snapshot-v5", "campaign-snapshot-v5")
+    assert (stored.calculation_version, frozen.calculation_version) == (snapshots.CALCULATION_VERSION,) * 2
     assert stored.payload["time_went"]["total_seconds"] == 300 * MIN
     assert stored.payload["bottlenecks"]["whole_campaign"]["credited_seconds"] == 65 * MIN
