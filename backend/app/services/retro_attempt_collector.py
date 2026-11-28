@@ -76,6 +76,7 @@ class CollectedAttempt:
     intervals: list[StageInterval] = field(default_factory=list)
     owner_member_id: int | None = None
     opened_at: datetime | None = None  # the window's start before the campaign clip, for lookups at a wait's start
+    placed_required_runs: set[tuple[str, int]] = field(default_factory=set)
 
 
 @dataclass
@@ -348,12 +349,18 @@ async def _collect_item(db, item: _ItemRow, out: TeamAttempts, period, item_key:
                 _place(out, period, attempt, "active", "building", "owner", begun, min(following))
         # Process: required checks per check, and review per verifier (#1418)
         for run in await _required_runs(db, item, repository, {(w.pr_number, w.head_sha) for w in mine["check_watch"]}):
-            queued = run.job_created_at or run.started_at
-            if queued is not None and run.completed_at is not None:
-                # Keep the app separate from the name, which can contain punctuation.
-                app = f"[{run.app_slug}]" if run.app_slug else ""
-                actor = f"{run.repository}{app}:{run.check_name}"
-                _place(out, period, attempt, "process", "required_check", actor, _naive(queued), _naive(run.completed_at))
+            queued, ended = _naive(run.job_created_at or run.started_at), _naive(run.completed_at)
+            if queued is None or ended is None:
+                continue
+            # Keep the app separate from the name, which can contain punctuation.
+            app = f"[{run.app_slug}]" if run.app_slug else ""
+            actor = f"{run.repository}{app}:{run.check_name}"
+            before = len(attempt.intervals)
+            _place(out, period, attempt, "process", "required_check", actor, queued, ended)
+            if (len(attempt.intervals) > before
+                    or queued == ended and attempt.window.start <= queued <= attempt.window.end):
+                # Zero-length runs are evidenced at a point and add no interval to the stage engine.
+                attempt.placed_required_runs.add((run.repository.lower(), run.check_run_id))
         for watch in mine["check_watch"]:
             for member, noticed, verdict in await _reviews(db, watch, mine["head_review"], mine["revision_review"]):
                 _place(out, period, attempt, "process", "review", f"member:{member}", noticed, verdict)

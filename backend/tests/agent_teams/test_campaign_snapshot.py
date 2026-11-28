@@ -871,7 +871,8 @@ async def test_ci_unknowns_and_queue_load_use_only_observed_overlapping_prs(db, 
     assert partial.ci.item_time_share.value is None
 
 
-async def test_friction_uses_scoped_merge_path_waits_and_errors_through_the_cutoff(db, world):
+async def test_friction_uses_scoped_merge_path_waits_and_errors_through_the_cutoff(db, world, monkeypatch):
+    from app.services import retro_attempt_collector
     campaign = await _ci_campaign(db, world)
     item = await db.get(GithubWorkItem, world.items["a1", 1])
     launch = AgentTeamLaunch(preset_id=world.team, plan_hash="fixture-1247")
@@ -915,6 +916,29 @@ async def test_friction_uses_scoped_merge_path_waits_and_errors_through_the_cuto
     single_member = FakeGithub(labelled={"a1": [_issue("a1", 1)]})
     share = await snapshots.build_snapshot(db, campaign, single_member, as_of=AS_OF, cached=False)
     assert share.ci.item_time_share.value == pytest.approx(30 / 120)
+
+    collect = retro_attempt_collector.collect_team_attempts
+
+    async def replace_placed_identity(*args, **kwargs):
+        collected = await collect(*args, **kwargs)
+        (attempt,) = (a for a in collected.attempts if a.item_id == item.id)
+        attempt.placed_required_runs.remove(("o/a1", 1))
+        attempt.placed_required_runs.add(("o/a1", 999))
+        return collected
+
+    with monkeypatch.context() as patch:
+        patch.setattr(retro_attempt_collector, "collect_team_attempts", replace_placed_identity)
+        missing_identity = await snapshots.build_snapshot(db, campaign, single_member, as_of=AS_OF, cached=False)
+    assert missing_identity.ci.item_time_share.value is None
+    assert "required_checks_not_reconciled_with_attempt_intervals" in missing_identity.ci.item_time_share.unknown_reasons
+
+    db.add(_ci_run(world, 4, name="Zero-duration check", queued=50, started=50, completed=50))
+    await db.commit()
+    with_zero_duration = await snapshots.build_snapshot(db, campaign, single_member, as_of=AS_OF, cached=False)
+    assert with_zero_duration.ci.item_time_share.value == pytest.approx(30 / 120)
+    zero_duration = next(r for r in with_zero_duration.ci.required_checks if r.check_name == "Zero-duration check")
+    assert zero_duration.median_seconds.value == 0 and zero_duration.median_seconds.sample_count == 1
+
     db.add(_ci_run(world, 3, head="b" * 40, completed=70))
     await db.commit()
     unwatched = await snapshots.build_snapshot(db, campaign, single_member, as_of=AS_OF, cached=False)
@@ -946,3 +970,69 @@ async def test_ci_friction_are_additive_to_older_frozen_snapshots(db, world):
     old["calculation_version"] = "campaign-snapshot-v4"
     restored = snapshots.Snapshot.model_validate(old)
     assert restored.ci is None and restored.friction is None
+
+
+@pytest.mark.parametrize("recorded_merge_time", [True, False])
+async def test_friction_reconciles_the_automatic_merge_fallback_by_pr_and_item(db, world, recorded_merge_time):
+    campaign = await _ci_campaign(db, world)
+    item = await db.get(GithubWorkItem, world.items["a1", 1])
+    when = T0 + timedelta(minutes=2)
+    await audit.record_delivery_fact(
+        db, item_id=item.id, delivery_outcome="delivered", completion_kind="merged_code",
+        fact_source="github_pull_request_merged", fact_time=when if recorded_merge_time else None,
+        artifact="o/a1/pull/101", source=audit.AUTOMATIC_MERGE_SOURCE)
+    await audit.record_event(
+        db, event_kind=audit.PULL_FACTS_KIND, source="test", occurred_at=when, fact_time=when,
+        actor=SYSTEM, scope_id=world.scopes["a1"], context_snapshot={"artifact": "o/a1/pull/101"},
+        after_values={"merge_path": "automatic"})
+    item.auto_merged_at = when + timedelta(microseconds=1)
+    await db.commit()
+    client = FakeGithub(labelled={"a1": [_issue("a1", 1, state="closed")]})
+    result = await snapshots.build_snapshot(db, campaign, client, as_of=AS_OF, cached=False)
+    count = result.friction.hand_merges
+    assert (count.value, count.sample_count, count.unknown_count, count.coverage) == (0, 1, 0, "full")
+
+    item.pr_number = 999  # the current row cannot bind its fallback to this recorded PR any more
+    await db.commit()
+    result = await snapshots.build_snapshot(db, campaign, client, as_of=AS_OF, cached=False)
+    assert result.friction.hand_merges.value is None
+    assert "merge_path_unknown" in result.friction.hand_merges.unknown_reasons
+
+
+async def test_ci_groups_a_missing_app_id_only_when_the_slug_is_unambiguous(db, world):
+    campaign = await _ci_campaign(db, world)
+    first = _ci_run(world, 11, app="buildbot", outcome="failure", queued=None)
+    first.app_id = None
+    db.add_all([first, _ci_run(world, 12, app="buildbot", queued=None, started=41, completed=50)])
+    await db.commit()
+    client = FakeGithub(labelled={"a1": [_issue("a1", 1)]})
+    result = await snapshots.build_snapshot(db, campaign, client, as_of=AS_OF, cached=False)
+    (outcome,) = result.ci.check_outcomes
+    assert (outcome.app_id, outcome.reruns.value, outcome.flaky_heads.value) == (404, 1, 1)
+    assert outcome.flaky_heads.coverage == "full"
+
+    other_app = _ci_run(world, 13, app="buildbot", head="b" * 40, queued=None, completed=80)
+    other_app.app_id = 505
+    db.add(other_app)
+    await db.commit()
+    ambiguous = await snapshots.build_snapshot(db, campaign, client, as_of=AS_OF, cached=False)
+    assert {row.app_id for row in ambiguous.ci.check_outcomes} == {404, 505}
+    assert all(row.flaky_heads.value is None for row in ambiguous.ci.check_outcomes)
+    assert "check_app_identity_ambiguous" in ambiguous.ci.observed_checks.unknown_reasons
+
+
+async def test_campaign_ci_counts_a_shared_pr_once_when_all_its_issues_are_members(db, world):
+    campaign = await _ci_campaign(db, world)
+    second = await db.get(GithubWorkItem, world.items["a1", 2])
+    second.pr_number = 101
+    db.add(_ci_run(world, 20))
+    await db.commit()
+    result = await snapshots.build_snapshot(db, campaign, _client(), as_of=AS_OF, cached=False)
+    assert (result.ci.observed_checks.value, result.ci.observed_checks.sample_count) == (1, 1)
+    assert result.ci.required_checks[0].median_seconds.sample_count == 1
+
+    mixed = FakeGithub(labelled={"a1": [_issue("a1", 1)]})
+    uncertain = await snapshots.build_snapshot(db, campaign, mixed, as_of=AS_OF, cached=False)
+    assert uncertain.ci.observed_checks.value is None
+    assert "check_attribution_missing" in uncertain.ci.observed_checks.unknown_reasons
+    assert uncertain.ci.required_checks == []

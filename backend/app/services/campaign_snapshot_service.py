@@ -411,9 +411,9 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
     # Missing delivery history the counts already know of makes item time partial too (V1 review 448).
     item_time = await _item_time(db, campaign, list(members), facts, coverage, as_of,
                                  gaps + ([reason] if unknown else []), label)  # both kept (V1 review 115)
-    time_went, bottlenecks, wait_durations, required_spans = await _time_went(
+    time_went, bottlenecks, wait_durations, placed_required_runs = await _time_went(
         db, campaign, list(members), coverage, as_of, gaps)
-    ci = await _ci_measures(db, campaign, members, facts, coverage, as_of, gaps, time_went, required_spans)
+    ci = await _ci_measures(db, campaign, members, facts, coverage, as_of, gaps, time_went, placed_required_runs)
     friction = await _friction_measures(db, campaign, members, facts, coverage, as_of, gaps,
                                         [reason] if unknown else [], time_went, wait_durations, rate_limit)
     return Snapshot(
@@ -456,7 +456,7 @@ _LOST_GROUP = {source: "waiting" for source in ("dispatch", "decision", "effort"
 
 
 async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], coverage, as_of: datetime,
-                     gaps: list[str]) -> tuple[TimeWentSection, CampaignBottlenecks, list[float], int]:
+                     gaps: list[str]) -> tuple[TimeWentSection, CampaignBottlenecks, list[float], Counter[tuple[str, int]]]:
     """The campaign members' attempt time, split by the stage engine and summed; it reconciles with item time.
 
     A member whose attempts come from two overlapping item lifetimes (two rows tracking one issue) is ambiguous and
@@ -493,11 +493,11 @@ async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], cov
     stages: dict[tuple[str, str, str], list] = {}
     ranking_attempts = []
     wait_durations: list[float] = []
-    required_spans = 0
+    placed_required_runs: Counter[tuple[str, int]] = Counter()
     for attempt in attempts:
         wait_durations.extend((span.end - span.start).total_seconds() for span in attempt.intervals
                               if span.group == "waiting" and span.stage != "dispatch")
-        required_spans += sum(span.stage == "required_check" for span in attempt.intervals)
+        placed_required_runs.update(attempt.placed_required_runs)
         result = breakdown(attempt.window, attempt.intervals)
         ranking_attempts.append(RankingAttempt(member_items[attempt.item_id], attempt.window, attempt.intervals, result))
         total, unaccounted, overlap = (total + result.total_seconds, unaccounted + result.unaccounted_seconds,
@@ -547,7 +547,7 @@ async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], cov
         coverage="unavailable" if not known else ("partial" if reasons else "full"), unknown_reasons=sorted(reasons))
     rankings = build_bottlenecks(ranking_attempts, start=started, as_of=as_of,
                                  group_coverage=group_coverage, unknown_reasons=section.unknown_reasons)
-    return section, rankings, wait_durations, required_spans
+    return section, rankings, wait_durations, placed_required_runs
 
 
 def _p85(values: list[float]) -> float:
@@ -654,6 +654,15 @@ async def _first_dispatch(db, live: dict, lifetime: str | None, marker: datetime
     return (_naive_utc(first), []) if first is not None else (None, ["dispatch_not_recorded"])
 
 
+@dataclass(frozen=True)
+class _MergeEvidence:
+    observed_at: datetime
+    fact_time: datetime | None
+    artifact: str | None
+    item_context_key: str | None
+    fallback: bool = False
+
+
 @dataclass
 class _Deliveries:
     delivered: dict[tuple[str, int], list[datetime]] = field(default_factory=dict)
@@ -662,6 +671,7 @@ class _Deliveries:
     untimed: dict[tuple[str, int], list[datetime]] = field(default_factory=dict)  # PR merges GitHub gave no time
     undelivered: dict[tuple[str, int], list[datetime]] = field(default_factory=dict)
     unidentified: bool = False  # a recorded delivery whose issue can't be derived
+    merge_evidence: dict[tuple[str, int], list[_MergeEvidence]] = field(default_factory=dict)
 
 
 def _identity(repo: str, number: int) -> tuple[str, int]:
@@ -708,24 +718,33 @@ async def _deliveries(db, campaign: Campaign) -> _Deliveries:
             facts.unidentified = facts.unidentified or delivered
             continue
         outcomes = facts.delivered if delivered else facts.undelivered
-        at = _naive_utc(row.fact_time or row.occurred_at)
-        outcomes.setdefault(_identity(f"{owner}/{name}", number), []).append(at)
-        if delivered and row.fact_source == "github_pull_request_merged" and row.fact_time is not None:
-            facts.merges.setdefault(_identity(f"{owner}/{name}", number), []).append(
-                (at, recorded.get("artifact") or None, row.item_context_key))
-        elif delivered and row.fact_source == "github_pull_request_merged":  # placed by its record time only
-            facts.untimed.setdefault(_identity(f"{owner}/{name}", number), []).append(at)
+        member = _identity(f"{owner}/{name}", number)
+        observed_at = _naive_utc(row.occurred_at)
+        fact_time = _naive_utc(row.fact_time) if row.fact_time is not None else None
+        at = fact_time or observed_at
+        outcomes.setdefault(member, []).append(at)
+        if delivered and row.fact_source == "github_pull_request_merged":
+            artifact = recorded.get("artifact") or None
+            evidence = _MergeEvidence(observed_at, fact_time, artifact, row.item_context_key)
+            facts.merge_evidence.setdefault(member, []).append(evidence)
+            if fact_time is not None:
+                facts.merges.setdefault(member, []).append((at, artifact, row.item_context_key))
+            else:
+                facts.untimed.setdefault(member, []).append(at)
     legacy = (await db.execute(
         select(TeamGithubScope.repo_owner, TeamGithubScope.repo_name, GithubWorkItem.issue_number,
-               GithubWorkItem.auto_merged_at, GithubWorkItem.id)
+               GithubWorkItem.auto_merged_at, GithubWorkItem.id, GithubWorkItem.pr_number)
         .join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
         .join(FactoryContextKey, _lifetime(key))
         .where(GithubWorkItem.auto_merged_at.is_not(None)))).all()
     for row in legacy:
-        key = _identity(f"{row.repo_owner}/{row.repo_name}", row.issue_number)
-        facts.delivered.setdefault(key, []).append(_naive_utc(row.auto_merged_at))
-        facts.merges.setdefault(key, []).append(
-            (_naive_utc(row.auto_merged_at), None, await audit.current_context_key(db, "item", row.id)))
+        member = _identity(f"{row.repo_owner}/{row.repo_name}", row.issue_number)
+        at = _naive_utc(row.auto_merged_at)
+        item_key = await audit.current_context_key(db, "item", row.id)
+        artifact = f"{member[0]}/pull/{row.pr_number}" if row.pr_number is not None else None
+        facts.delivered.setdefault(member, []).append(at)
+        facts.merges.setdefault(member, []).append((at, None, item_key))
+        facts.merge_evidence.setdefault(member, []).append(_MergeEvidence(at, at, artifact, item_key, fallback=True))
     return facts
 
 
@@ -817,7 +836,7 @@ async def _campaign_checks(db, campaign: Campaign, members, facts: _Deliveries,
         matching = not candidates.isdisjoint(members)
         if run.observed_at > as_of or (run.completed_at is not None and run.completed_at > as_of):
             future_process_evidence |= matching and run.required
-        elif len(candidates) == 1 and matching and run.check_name and (run.app_id is not None or run.app_slug):
+        elif matching and candidates.issubset(members) and run.check_name and (run.app_id is not None or run.app_slug):
             runs.append(run)
         elif matching or run.pr_number is None:
             unknown += 1
@@ -920,15 +939,27 @@ def _queue_under_load(runs: list[Row], gaps: list[str]) -> QueueLoadSection:
 
 
 async def _ci_measures(db, campaign, members, facts, coverage, as_of, gaps, time_went: TimeWentSection,
-                       required_spans: int) -> CiSection:
+                       placed_required_runs: Counter[tuple[str, int]]) -> CiSection:
     runs, unknown, future_process_evidence = await _campaign_checks(
         db, campaign, members, facts, _naive_utc(campaign.started_at), as_of)
     check_gaps = gaps + _recording_gaps(coverage, "check_runs") + (["check_attribution_missing"] if unknown else [])
-    groups: dict[tuple[str, str, int | None, str | None], list[Row]] = defaultdict(list)
+    ids_by_slug: dict[tuple[str, str], set[int]] = defaultdict(set)
     for run in runs:
-        if run.check_name:
-            app_slug = run.app_slug if run.app_id is None else None
-            groups[run.repository.lower(), run.check_name, run.app_id, app_slug].append(run)
+        if run.app_slug and run.app_id is not None:
+            ids_by_slug[run.repository.lower(), run.app_slug].add(run.app_id)
+    groups: dict[tuple[str, str, int | None, str | None], list[Row]] = defaultdict(list)
+    ambiguous_apps = 0
+    for run in runs:
+        repo, app_id = run.repository.lower(), run.app_id
+        if app_id is None:
+            candidates = ids_by_slug.get((repo, run.app_slug), set())
+            if len(candidates) > 1:
+                ambiguous_apps += 1
+                continue
+            app_id = next(iter(candidates), None)
+        groups[repo, run.check_name, app_id, run.app_slug if app_id is None else None].append(run)
+    if ambiguous_apps:
+        check_gaps.append("check_app_identity_ambiguous")
     required: list[CheckMeasureRow] = []
     optional: list[CheckMeasureRow] = []
     outcomes = []
@@ -950,7 +981,8 @@ async def _ci_measures(db, campaign, members, facts, coverage, as_of, gaps, time
         share_gaps.add("required_check_evidence_after_cutoff")
     if any(row.median_seconds.unknown_count for row in required):
         share_gaps.add("required_check_runtime_not_recorded")
-    if required_spans != sum(run.required for run in runs):
+    required_runs = Counter((run.repository.lower(), run.check_run_id) for run in runs if run.required)
+    if placed_required_runs != required_runs:
         share_gaps.add("required_checks_not_reconciled_with_attempt_intervals")
     total = time_went.total_seconds
     share = None
@@ -958,7 +990,7 @@ async def _ci_measures(db, campaign, members, facts, coverage, as_of, gaps, time
         share = sum(row.share_seconds for row in time_went.stages if row.stage == "required_check") / total
     return CiSection(
         observed_checks=_retro_population_sample("observed_checks", "check_run", len(runs), len(runs),
-                                                 "github_check_run_history", check_gaps, missing=unknown),
+                                                 "github_check_run_history", check_gaps, missing=unknown + ambiguous_apps),
         required_checks=required, non_required_checks=optional, check_outcomes=outcomes, slowest_required_check=slowest,
         item_time_share=_sample("ci_item_time_share", "fraction", share, time_went.items, source="campaign_time_went",
                                 reasons=sorted(share_gaps) if share_gaps else
@@ -967,6 +999,41 @@ async def _ci_measures(db, campaign, members, facts, coverage, as_of, gaps, time
                                           "partial" if time_went.coverage == "partial" else "unavailable"),
                                 unknown=time_went.unknown_items or None),
         queue_under_load=_queue_under_load(runs, check_gaps))
+
+
+def _friction_prs(members, facts: _Deliveries, began: datetime, as_of: datetime) -> tuple[dict[tuple[str, int], str], int]:
+    """Use a fallback only with a recorded PR of the same issue and item lifetime."""
+    merges = {}
+    unknown = int(facts.unidentified)
+    for member in members:
+        entries = []
+        for event in facts.merge_evidence.get(member, ()):
+            if event.observed_at <= as_of:
+                pull = _pull_identity(event.artifact)
+                entries.append((event, pull if pull and pull[0] == member[0] else None))
+        audited = {(pull, e.item_context_key) for e, pull in entries
+                   if not e.fallback and pull and e.item_context_key}
+        timed = {(pull, e.item_context_key) for e, pull in entries
+                 if not e.fallback and e.fact_time is not None and pull and e.item_context_key}
+        fallback_times = {(pull, e.item_context_key): e.fact_time for e, pull in entries if e.fallback}
+        for event, pull in entries:
+            bound = (pull, event.item_context_key)
+            when = event.fact_time
+            if event.fallback:
+                if bound not in audited and began <= event.observed_at <= as_of:
+                    unknown += 1
+                continue
+            if when is None:
+                if bound in timed:
+                    continue
+                if bound in audited:
+                    when = fallback_times.get(bound)
+            if when is None or pull is None:
+                if began <= (when or event.observed_at) <= as_of:
+                    unknown += 1
+            elif began <= when <= as_of:
+                merges[pull] = f"{pull[0]}/pull/{pull[1]}"
+    return merges, unknown
 
 
 _BLOCKING_AUDIT_OUTCOMES = ("rejected", "refused", "blocked", "error", "failed")
@@ -1004,17 +1071,7 @@ async def _friction_measures(db, campaign, members, facts, coverage, as_of, gaps
                 error_count += _identity(f"{owner}/{name}", issue) in members
             else:
                 error_unknown += 1
-    merges = {}
-    unknown = int(facts.unidentified)
-    for member in members:
-        unknown += sum(began <= at <= as_of for at in facts.untimed.get(member, ()))
-        for when, artifact, _ in facts.merges.get(member, ()):
-            if began <= when <= as_of:
-                identity = _pull_identity(artifact)
-                if identity is not None and identity[0] == member[0]:
-                    merges[identity] = artifact
-                else:
-                    unknown += 1
+    merges, unknown = _friction_prs(members, facts, began, as_of)
     outside = []
     classified = 0
     for identity, artifact in sorted(merges.items()):
