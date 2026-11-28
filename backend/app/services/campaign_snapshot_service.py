@@ -1019,19 +1019,62 @@ async def current_version(db, campaign: Campaign, client=None) -> tuple[Campaign
     return await _ask_row(db, campaign.id, fingerprint), None
 
 
-def _without_times(value):
-    """The payload without the cutoff it was calculated at: every ``as_of`` key, at any depth."""
+_STAMP = r"\d{4}-\d\d-\d\dT[0-9:.]+"
+# The two texts that ``_coverage`` writes with the calculation cutoff as the end of the window.
+_GENERATED_REASON = re.compile(rf"^({_STAMP})/({_STAMP}): (no forward-coverage marker is installed|before instrumentation start)$")
+_CUTOFF = "<cutoff>"
+
+
+def _same_instant(text: str, other: str | None) -> bool:
+    try:
+        return other is not None and datetime.fromisoformat(text) == datetime.fromisoformat(other)
+    except ValueError:
+        return False
+
+
+def _comparable(value, as_of: str | None, later_marker: bool, path: tuple = ()):
+    """The payload as the comparison reads it: without the times that the calculation generates from its cutoff
+    (V1 review 130). Those are every ``as_of`` key, the end of a coverage window in a generated unknown-reason text
+    when it is the cutoff, and the start of the rolling four-hour bottleneck window (the cutoff minus four hours).
+    Every time that was recorded is kept, also when it equals the cutoff."""
     if isinstance(value, dict):
-        return {k: _without_times(v) for k, v in value.items() if k != "as_of"}
+        out = {}
+        for key, item in value.items():
+            if key == "as_of" or (path == ("bottlenecks", "last_four_hours") and key == "started_at"):
+                continue
+            if key == "unknown_reasons" and isinstance(item, list):
+                out[key] = [_generated_reason(text, as_of, later_marker) for text in item]
+            else:
+                out[key] = _comparable(item, as_of, later_marker, path + (key,))
+        return out
     if isinstance(value, list):
-        return [_without_times(v) for v in value]
+        return [_comparable(item, as_of, later_marker, path) for item in value]
     return value
+
+
+def _generated_reason(text, as_of: str | None, later_marker: bool):
+    found = _GENERATED_REASON.match(text) if isinstance(text, str) else None
+    if found is None or not _same_instant(found[2], as_of):
+        return text
+    # "before instrumentation start" has this form only when the recording marker is later than the cutoff. When a
+    # marker equals the cutoff, the end is that recorded marker: it stays.
+    if found[3] == "no forward-coverage marker is installed" or later_marker:
+        return f"{found[1]}/{_CUTOFF}: {found[3]}"
+    return text
 
 
 def metrics_digest(payload: dict) -> str:
     """Whether two versions say the same: every reported measurement, with its counts and coverage. That is the
     metrics, the repository counts and the item time, time went, bottleneck and flow sections, and the calculation.
-    Version metadata (ids, the cutoff) is not compared."""
-    body = _without_times(payload)
+    Version metadata (ids) and the times generated from the cutoff are not compared; recorded times are."""
+    as_of = payload.get("as_of")
+    markers = [entry.get("started_at") for entry in payload.get("recorded_coverage") or [] if entry.get("started_at")]
+    try:
+        cutoff = datetime.fromisoformat(as_of) if as_of else None
+        later_marker = cutoff is not None and any(datetime.fromisoformat(m) > cutoff for m in markers) and not any(
+            datetime.fromisoformat(m) == cutoff for m in markers)
+    except ValueError:
+        later_marker = False
+    body = _comparable(payload, as_of, later_marker)
     body.pop("campaign_id", None)
     return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()

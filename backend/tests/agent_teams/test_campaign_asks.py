@@ -45,6 +45,7 @@ from tests.agent_teams.test_campaign_snapshot import _client, fresh_cache  # noq
 
 pytestmark = pytest.mark.asyncio
 T0 = datetime(2026, 11, 20, 9, 0, 0)
+CUTOFF = T0 + timedelta(days=10)  # fixed: a test never reads the wall clock for a cutoff
 OPERATOR = audit.derive_actor(actor_kind="operator")
 SYSTEM = audit.derive_actor(actor_kind="system")
 mail = AgentMailService()
@@ -358,11 +359,11 @@ async def test_an_ask_is_current_until_the_records_change_then_stale_by_version_
 async def test_a_new_frozen_version_is_stale_and_metrics_unchanged_is_detail_only(db, team):
     await snapshots.freeze(db, team.campaign, _client(), actor=SYSTEM, as_of=T0 + timedelta(days=10))
     await _ask(db, team)
-    await snapshots.recompute(db, team.campaign, _client(), actor=OPERATOR, as_of=T0 + timedelta(days=10))
+    await snapshots.recompute(db, team.campaign, _client(), actor=OPERATOR, as_of=CUTOFF, observed_at=CUTOFF)
     same = (await _list(db, team))[0]
     assert (same.stale, same.version_changed, same.metrics_unchanged) == (True, True, True)  # same numbers, still stale
     await snapshots.recompute(db, team.campaign, FakeGithub(labelled={"a1": [_issue("a1", 1)]}), actor=OPERATOR,
-                              as_of=T0 + timedelta(days=10))
+                              as_of=CUTOFF, observed_at=CUTOFF)
     changed = (await _list(db, team))[0]
     assert (changed.stale, changed.metrics_unchanged) == (True, False)
 
@@ -492,7 +493,7 @@ async def test_metrics_unchanged_compares_the_repository_counts_too(db, team):
     await _ask(db, team)
     moved = FakeGithub(labelled={"a1": [_issue("a1", 1)], "a2": [_issue("a2", 3, state="closed"),
                                                                  _issue("a2", 2, state="closed")]})
-    await snapshots.recompute(db, team.campaign, moved, actor=OPERATOR, as_of=T0 + timedelta(days=10))
+    await snapshots.recompute(db, team.campaign, moved, actor=OPERATOR, as_of=CUTOFF, observed_at=CUTOFF)
     first, second = (await db.scalars(select(CampaignSnapshot).order_by(CampaignSnapshot.version))).all()
     scope = lambda row: next(m for m in row.payload["metrics"] if m["name"] == "issues_in_scope")  # noqa: E731
     assert scope(first)["value"] == scope(second)["value"] == 3  # the totals match
@@ -612,6 +613,88 @@ async def test_an_ask_makes_a_new_version_exactly_when_a_fresh_snapshot_differs(
     assert differs is moves  # the table says which inputs a fresh snapshot sees
     second = await _ask(db, team, "supervisor", client=github)
     assert (second.referenced_version_id != first.referenced_version_id) is moves
+
+
+# V1 review 130: times generated from the cutoff are not compared; recorded times are
+def _payload(cutoff, *, marker=None, reason=None, window_start=None, recorded=None):
+    """A snapshot payload as the comparison reads it, with the generated and the recorded times set by the caller."""
+    iso = lambda value: value.isoformat()  # noqa: E731
+    coverage = [{"measure": "rate_limit_windows", "started_at": iso(marker) if marker else None, "covered": True,
+                 "reason": None}]
+    return {"campaign_id": 1, "as_of": iso(cutoff), "metrics": [{
+                "name": "rate_limited_seconds", "value": None, "coverage": "unavailable", "sample_count": 0,
+                "unknown_reasons": [reason(cutoff) if callable(reason) else reason or "recording_not_installed"]}],
+            "recorded_coverage": coverage,
+            "bottlenecks": {"last_four_hours": {"started_at": iso(window_start or cutoff - timedelta(hours=4)),
+                                                "as_of": iso(cutoff), "unknown_reasons": []}},
+            "flow": {"markers": [{"at": iso(recorded or T0)}]}}
+
+
+def _digest(payload):
+    return snapshots.metrics_digest(payload)
+
+
+@pytest.mark.parametrize("recorder", [False, True])
+async def test_a_freeze_with_no_new_record_leaves_the_measurements_unchanged_but_the_ask_stale(db, team, recorder):
+    if recorder:
+        await _recording(db)
+    view = await _ask(db, team)
+    asked = await db.get(CampaignSnapshot, view.referenced_version_id)
+    later = datetime.fromisoformat(asked.payload["as_of"]) + timedelta(seconds=1)
+    await snapshots.freeze(db, team.campaign, _client(), actor=SYSTEM, as_of=later)
+    listed = (await _list(db, team))[0]
+    assert (listed.stale, listed.version_changed, listed.metrics_unchanged) == (True, True, True)
+
+
+def test_the_end_of_a_generated_coverage_window_is_not_compared():
+    first, second = T0 + timedelta(days=10), T0 + timedelta(days=10, seconds=1)
+    unmarked = lambda cut: f"{T0.isoformat()}/{cut.isoformat()}: no forward-coverage marker is installed"  # noqa: E731
+    assert _digest(_payload(first, reason=unmarked)) == _digest(_payload(second, reason=unmarked))
+    # the unavailable form: the recording marker is later than the cutoff
+    late = T0 + timedelta(days=20)
+    after = lambda cut: f"{T0.isoformat()}/{cut.isoformat()}: before instrumentation start"  # noqa: E731
+    assert _digest(_payload(first, marker=late, reason=after)) == _digest(_payload(second, marker=late, reason=after))
+
+
+def test_the_start_of_the_rolling_four_hour_window_is_not_compared_and_the_campaign_start_is():
+    first, second = T0 + timedelta(days=10), T0 + timedelta(days=10, seconds=1)
+    assert _digest(_payload(first)) == _digest(_payload(second))  # as_of minus four hours moves with the cutoff
+    other = _payload(first)
+    other["started_at"], other["bottlenecks"]["whole_campaign"] = T0.isoformat(), {"started_at": T0.isoformat()}
+    moved = _payload(first)
+    moved["started_at"], moved["bottlenecks"]["whole_campaign"] = (T0 + timedelta(days=1)).isoformat(), {
+        "started_at": (T0 + timedelta(days=1)).isoformat()}
+    assert _digest(other) != _digest(moved)  # a recorded start is compared
+
+
+def test_a_recorded_time_that_equals_the_cutoff_is_still_compared_when_it_moves():
+    """A recorded time that equals the cutoff in both versions, and moves with the cutoff, is a real change."""
+    cut, next_cut = T0 + timedelta(days=10), T0 + timedelta(days=10, seconds=1)
+    # a recorded coverage start that equals the cutoff, then moves
+    assert _digest(_payload(cut, marker=cut)) != _digest(_payload(next_cut, marker=next_cut))
+    # a partial-form reason whose marker equals the cutoff: the text is a recorded fact and is kept
+    partial = lambda end: lambda cutoff: f"{T0.isoformat()}/{end.isoformat()}: before instrumentation start"  # noqa: E731
+    assert _digest(_payload(cut, marker=cut, reason=partial(cut))) != _digest(
+        _payload(next_cut, marker=next_cut, reason=partial(next_cut)))
+    # a recorded time elsewhere that equals the cutoff, then moves
+    assert _digest(_payload(cut, recorded=cut)) != _digest(_payload(next_cut, recorded=next_cut))
+    # a time in another string is never rewritten
+    def note(cutoff):
+        payload = _payload(cutoff)
+        payload["metrics"][0]["unknown_reasons"] = [f"recorded at {cutoff.isoformat()}"]
+        return payload
+    assert _digest(note(cut)) != _digest(note(next_cut))
+    # the same recorded time at both cutoffs is no change
+    assert _digest(_payload(cut, marker=T0, recorded=T0)) == _digest(_payload(next_cut, marker=T0, recorded=T0))
+
+
+async def test_a_recompute_whose_observation_is_later_than_the_cutoff_leaves_the_membership_unknown(db, team):
+    await snapshots.freeze(db, team.campaign, _client(), actor=SYSTEM, as_of=CUTOFF)
+    await snapshots.recompute(db, team.campaign, _client(), actor=OPERATOR, as_of=CUTOFF,
+                              observed_at=CUTOFF + timedelta(days=3))
+    final = await snapshots.latest(db, team.campaign.id)
+    scope = _measure(final, "issues_in_scope")
+    assert scope["value"] is None and "membership_read_after_cutoff" in " ".join(scope["unknown_reasons"])
 
 
 # Wait counts and the lesson
