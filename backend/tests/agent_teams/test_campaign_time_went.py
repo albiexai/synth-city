@@ -12,7 +12,7 @@ from datetime import timedelta
 from itertools import count
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.models.database import (
@@ -105,9 +105,9 @@ async def _watch(db, item, nonce, sha, *, completion=None, reviewer=None):
     return watch
 
 
-async def _run(db, world, sha, name, queued, done):
+async def _run(db, world, sha, name, queued, done, *, app_slug=None):
     db.add(GithubCheckRunHistory(repository="o/a1", check_run_id=next(RUNS), head_sha=sha,
-                                 scope_id=world.scopes["a1"], pr_number=5, check_name=name, required=True,
+                                 scope_id=world.scopes["a1"], pr_number=5, check_name=name, app_slug=app_slug, required=True,
                                  job_created_at=_m(queued), started_at=_m(queued), completed_at=_m(done),
                                  observed_at=_m(done)))
     await db.flush()
@@ -136,14 +136,14 @@ async def _recording(db, *, checks=True, marker=MARKER):
     await db.flush()
 
 
-async def _build(db, world, numbers, *, cached=False):
+async def _build(db, world, numbers, *, cached=False, as_of=AS_OF):
     labelled = [_issue("a1", number, state="closed") for number in numbers]
     campaign = await campaigns.current(db, world.team)
     if campaign is None:
         await db.commit()
         campaign = await campaigns.start(db, world.team, "label:v4.4", started_at=T0, actor=OPERATOR)
     await db.commit()
-    return await snapshots.build_snapshot(db, campaign, FakeGithub(labelled={"a1": labelled}), as_of=AS_OF,
+    return await snapshots.build_snapshot(db, campaign, FakeGithub(labelled={"a1": labelled}), as_of=as_of,
                                           cached=cached)
 
 
@@ -194,6 +194,70 @@ async def test_an_item_outside_the_campaign_adds_no_time(db, world):
     await _dispatch(db, outside.id, 0, launch=outside.launch_id)
     went = (await _build(db, world, [10, 11, 12])).time_went
     assert (went.items, went.attempts, went.total_seconds) == (2, 3, 300 * MIN)
+
+
+async def test_bottlenecks_use_campaign_members_and_carry_the_same_attribution_gaps(db, world):
+    await _two_items(db, world)
+    outside = await _item(db, world, 13, nonce="outside", launch=True)
+    await _dispatch(db, outside.id, 150, launch=outside.launch_id)
+    snapshot = await _build(db, world, [10, 11, 12])
+    whole, recent = snapshot.bottlenecks.whole_campaign, snapshot.bottlenecks.last_four_hours
+    assert whole.credited_seconds == recent.credited_seconds == 65 * MIN
+    assert whole.items == recent.items == 2
+    assert (whole.coverage, whole.state) == ("partial", "unknown")
+    assert "no_attempt_recorded" in whole.unknown_reasons
+    assert (whole.largest_observed.stage, whole.largest_observed.credited_seconds,
+            whole.largest_observed.items) == ("dispatch", 35 * MIN, 2)
+
+
+async def _checked_items(db, world, app_slugs, *, queued=10, done=70, merged_at=90):
+    await _recording(db)
+    numbers = list(range(10, 10 + len(app_slugs)))
+    for number, app_slug in zip(numbers, app_slugs, strict=True):
+        nonce, head = f"nonce-{number}", f"head-{number}"
+        item = await _item(db, world, number, nonce=nonce, launch=True)
+        await _dispatch(db, item.id, 0, launch=item.launch_id)
+        await _watch(db, item, nonce, head)
+        await _run(db, world, head, "verify", queued, done, app_slug=app_slug)
+        await _merged(db, item, merged_at, launch=item.launch_id)
+    return numbers
+
+
+async def test_same_named_required_checks_keep_app_identity_in_credits_and_cache(db, world):
+    numbers = await _checked_items(db, world, ["github-actions"] * 3 + ["other-app"] * 2)
+    snapshot = await _build(db, world, numbers, cached=True)
+    whole = snapshot.bottlenecks.whole_campaign
+    assert (whole.state, whole.credited_seconds, whole.stages) == ("below_thresholds", 18_000, [])
+    assert (whole.largest_observed.actor, whole.largest_observed.items) == ("o/a1[github-actions]:verify", 3)
+    assert [(row.actor, row.share_seconds) for row in snapshot.time_went.stages] == [
+        ("o/a1[github-actions]:verify", 10_800), ("o/a1[other-app]:verify", 7_200)]
+
+    await db.execute(update(GithubCheckRunHistory).where(GithubCheckRunHistory.app_slug == "other-app")
+                     .values(app_slug="github-actions"))
+    await db.commit()
+    refreshed = await _build(db, world, numbers, cached=True)
+    rows = refreshed.bottlenecks.whole_campaign.stages
+    assert [(row.actor, row.items, row.credited_seconds) for row in rows] == [
+        ("o/a1[github-actions]:verify", 5, 18_000)]
+
+
+async def test_complete_history_gives_known_zero_in_quiet_recent_window(db, world):
+    numbers = await _checked_items(db, world, ["github-actions"] * 5)
+    snapshot = await _build(db, world, numbers, as_of=_m(480))
+    assert snapshot.bottlenecks.whole_campaign.stages[0].items == 5
+    recent = snapshot.bottlenecks.last_four_hours
+    assert (recent.coverage, recent.state, recent.items, recent.credited_seconds) == (
+        "full", "below_thresholds", 0, 0)
+    assert (recent.stages, recent.largest_observed, recent.unknown_reasons) == ([], None, [])
+
+
+async def test_snapshot_recalculates_clipped_attempt_credits_for_recent_window(db, world):
+    numbers = await _checked_items(db, world, ["github-actions"] * 5, queued=0, done=600, merged_at=600)
+    snapshot = await _build(db, world, numbers, as_of=_m(600))
+    whole, recent = snapshot.bottlenecks.whole_campaign, snapshot.bottlenecks.last_four_hours
+    assert whole.credited_seconds == whole.stages[0].credited_seconds == 180_000
+    assert recent.credited_seconds == recent.stages[0].credited_seconds == 72_000
+    assert recent.stages[0].items == 5
 
 
 async def test_each_checks_wall_time_is_kept_beside_its_share(db, world):
@@ -694,22 +758,24 @@ async def test_a_stored_v3_snapshot_without_the_section_reads_back_unchanged(db,
     snapshot = await _build(db, world, [10, 11, 12])
     old = snapshot.model_dump(mode="json")
     old.pop("time_went")
+    old.pop("bottlenecks")
     old["calculation_version"] = "campaign-snapshot-v3"
     campaign = await campaigns.current(db, world.team)
     db.add(CampaignSnapshot(campaign_id=campaign.id, version=1, calculation_version="campaign-snapshot-v3",
                             payload=old, created_by="operator"))
     await db.commit()
     frozen = await snapshots.freeze(db, campaign, FakeGithub(), actor=OPERATOR)
-    assert (frozen.time_went, frozen.calculation_version) == (None, "campaign-snapshot-v3")
+    assert (frozen.time_went, frozen.bottlenecks, frozen.calculation_version) == (None, None, "campaign-snapshot-v3")
     assert (await snapshots.latest(db, campaign.id)).payload == old
 
 
-async def test_a_new_freeze_stores_v4_with_the_section(db, world):
+async def test_a_new_freeze_stores_v5_with_both_sections(db, world):
     await _two_items(db, world)
     await _build(db, world, [10, 11, 12])
     campaign = await campaigns.current(db, world.team)
     labelled = [_issue("a1", number, state="closed") for number in (10, 11, 12)]
     frozen = await snapshots.freeze(db, campaign, FakeGithub(labelled={"a1": labelled}), actor=OPERATOR, as_of=AS_OF)
     stored = await snapshots.latest(db, campaign.id)
-    assert (stored.calculation_version, frozen.calculation_version) == ("campaign-snapshot-v4", "campaign-snapshot-v4")
+    assert (stored.calculation_version, frozen.calculation_version) == ("campaign-snapshot-v5", "campaign-snapshot-v5")
     assert stored.payload["time_went"]["total_seconds"] == 300 * MIN
+    assert stored.payload["bottlenecks"]["whole_campaign"]["credited_seconds"] == 65 * MIN
