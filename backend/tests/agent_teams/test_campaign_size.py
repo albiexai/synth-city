@@ -158,8 +158,8 @@ async def test_a_merge_without_its_pr_or_time_is_an_unknown_pr(db, world, kwargs
 
 
 async def test_a_merge_outside_the_campaign_is_not_counted(db, world):
-    size = await _size(db, world, [(10, -60, {}), (11, 60, {})])
-    assert (size.prs_merged, size.lines.items) == (1, 1)
+    size = await _size(db, world, [(10, -60, {}), (11, 60, {}), (12, -30, {"artifact": False})])  # nor one without
+    assert (size.prs_merged, size.unknown_prs, size.lines.items) == (1, 0, 1)  # its PR, placed by its own time
 
 
 @pytest.mark.parametrize(("case", "reason"), [("missing", "pull_request_facts_missing"),
@@ -251,6 +251,25 @@ async def test_a_campaign_pr_dated_only_by_another_tracked_issue_is_merged_and_m
                                    (20, 60, {"pr": 15, "member": False, "name": "O/A1/pull/15"})])  # in any case
     assert (size.prs_merged, size.unknown_prs, size.prs_coverage) == (1, 0, "full")
     assert (size.lines.items, size.lines.median, size.files.largest, size.lines.coverage) == (1, 40, 4, "full")
+
+
+@pytest.mark.parametrize(("other", "facts_from", "expected"), [
+    (-60, FACTS_FROM, (0, 0)),  # merged before the campaign
+    (15, _m(30), (1, 0)),  # merged before size recording began
+    (45, _m(30), (1, 1))])  # merged while it was recorded
+async def test_a_dated_campaign_merge_is_placed_at_its_prs_earliest_known_merge(db, world, other, facts_from, expected):
+    """V1 review 486: issue 10 merged PR 15 at +60; issue 20, outside the campaign, dates it earlier."""
+    size = await _size(db, world, [(10, 60, {"pr": 15}), (20, other, {"pr": 15, "member": False, "facts": False})],
+                       facts_from=facts_from)
+    assert (size.prs_merged, size.lines.items) == expected
+    if expected == (1, 0):
+        assert size.lines.unknown_reasons == ["merged_before_pull_facts_recording"]
+
+
+async def test_a_campaign_merge_dated_after_the_cutoff_counts_at_an_earlier_merge_in_the_campaign(db, world):
+    after = int((AS_OF - T0).total_seconds() // 60) + 60  # an hour after the cutoff
+    size = await _size(db, world, [(10, after, {"pr": 15, "facts": False}), (20, 60, {"pr": 15, "member": False})])
+    assert (size.prs_merged, size.lines.items) == (1, 1)
 
 
 async def test_a_pr_dated_twice_by_other_issues_is_placed_at_its_earliest_merge(db, world):

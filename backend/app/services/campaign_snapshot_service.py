@@ -734,9 +734,12 @@ async def _size(db, campaign: Campaign, members: list[tuple[str, int]], facts: _
     unresolved: set[tuple] = set()  # each merge no record ties to a known PR, once, with its reason
     for key in members:
         recorded = facts.merges.get(key, ())
-        for at, artifact, item_key in (merge for merge in recorded if began <= merge[0] <= as_of):
-            if artifact:
-                merged[artifact.lower()] = min(merged.get(artifact.lower(), at), at)
+        for at, artifact, item_key in recorded:
+            if artifact:  # V1 review 486: at its PR's earliest known merge, as an untimed record is, then the window
+                if began <= (placed := dated[artifact.lower()]) <= as_of:
+                    merged[artifact.lower()] = placed
+            elif not began <= at <= as_of:
+                continue  # a merge without its PR has only its own time
             elif (key, at) in facts.fallback:  # V1 review 483: an item's auto-merge is its lifetime's sourced merge
                 if not any(name and k == item_key for _, name, k in recorded):
                     unresolved.add((key, at, "artifact_not_recorded"))
