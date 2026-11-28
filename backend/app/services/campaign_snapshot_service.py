@@ -51,6 +51,7 @@ from app.models.database import (
     GithubWorkItem,
     MailExternalActor,
     MailMessage,
+    MailReceipt,
     MailTeamMember,
     TeamGithubScope,
 )
@@ -193,7 +194,8 @@ class SizeSection(BaseModel):
     lines: SizeMeasure  # additions plus deletions per merged PR, from its R2 facts
     files: SizeMeasure  # changed files per merged PR
     team_size: int | None
-    team_size_basis: str = "current"  # slots keep no history: today's count, not the count at the cutoff
+    # Slots keep no history: today's configured slots, disabled ones included; not active members, not the cutoff's
+    team_size_basis: str = "current_configured_slots_including_disabled"
     model_changes: int | None = None  # unknown until slot changes are recorded (#1455), never zero
     member_changes: int | None = None
     changes_reason: str = "slot_history_not_recorded"
@@ -782,8 +784,17 @@ async def _pr_sizes(db, campaign: Campaign, merged: dict[str, datetime],
         unknown_reasons=sorted(set(missing[name]))) for name in ("lines", "files"))
 
 
+def _team_mail(team):
+    """A message is the team's when a team member sent it or it reached one: a receipt, which every delivered message
+    has (direct, thread and broadcast alike), so a broadcast counts once and only where its audience held the team."""
+    return or_(MailMessage.sender_member_id.in_(team), MailMessage.recipient_member_id.in_(team),
+               select(MailReceipt.id).where(MailReceipt.message_id == MailMessage.id,
+                                            MailReceipt.member_id.in_(team)).exists())
+
+
 async def _mail_by_role(db, preset_id: int, began: datetime, as_of: datetime) -> list[MailRoleCount]:
-    """Messages in the campaign sent by or to the team's members, by the sender's role. Mail is team-wide."""
+    """Messages in the campaign sent by or delivered to the team's members, by the sender's role (a sender with no
+    member or actor row by its sender type, such as system or director). Mail is team-wide."""
     team = select(MailTeamMember.id).where(MailTeamMember.team_preset_id == preset_id)
     sender = aliased(MailTeamMember)
     counts: dict[str, int] = {}
@@ -791,23 +802,22 @@ async def _mail_by_role(db, preset_id: int, began: datetime, as_of: datetime) ->
             select(MailMessage.sender_type, sender.role, MailExternalActor.kind)
             .outerjoin(sender, sender.id == MailMessage.sender_member_id)
             .outerjoin(MailExternalActor, MailExternalActor.id == MailMessage.sender_actor_id)
-            .where(MailMessage.created_at >= began, MailMessage.created_at <= as_of,
-                   or_(MailMessage.sender_member_id.in_(team), MailMessage.recipient_member_id.in_(team))))).all():
-        name = (actor_kind or "unknown") if kind == "external_actor" else "system" if kind == "system" else (
-            role or "unknown")
+            .where(MailMessage.created_at >= began, MailMessage.created_at <= as_of, _team_mail(team)))).all():
+        name = (actor_kind or "unknown") if kind == "external_actor" else (role or "unknown") if kind == "member" else (
+            kind or "unknown")
         counts[name] = counts.get(name, 0) + 1
     return [MailRoleCount(role=name, messages=n) for name, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
 
 
 async def _size_rows(db, campaign: Campaign) -> tuple:
     """#1454: what the size section reads that changes without an audit event: the team's members and their roles,
-    the number and newest id of their messages, and the team's slots."""
+    the number and newest id of their messages (a new receipt changes the number), and the team's slots."""
     team = select(MailTeamMember.id).where(MailTeamMember.team_preset_id == campaign.preset_id)
     members = tuple((await db.execute(select(MailTeamMember.id, MailTeamMember.role)
                                       .where(MailTeamMember.team_preset_id == campaign.preset_id)
                                       .order_by(MailTeamMember.id))).all())
-    mail = tuple((await db.execute(select(func.count(MailMessage.id), func.max(MailMessage.id)).where(
-        or_(MailMessage.sender_member_id.in_(team), MailMessage.recipient_member_id.in_(team))))).one())
+    mail = tuple((await db.execute(select(func.count(MailMessage.id), func.max(MailMessage.id))
+                                   .where(_team_mail(team)))).one())
     slots = tuple((await db.scalars(select(AgentTeamSlot.id).where(AgentTeamSlot.preset_id == campaign.preset_id)
                                     .order_by(AgentTeamSlot.id))).all())
     return members, mail, slots
