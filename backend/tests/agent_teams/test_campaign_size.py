@@ -53,7 +53,7 @@ def fresh_cache():
 
 
 async def _pr(db, world, item_id, number, minutes, *, pr=None, additions=30, deletions=10, files=4, facts=True,
-              timed=True, artifact=True, name=None, recorded=None):
+              timed=True, artifact=True, name=None, recorded=None, item_key=None):
     """A sourced merge of PR ``pr`` (default: the issue number) and, when ``facts``, the R2 facts the watcher records.
     It is recorded at ``recorded`` (default: the merge minutes), never the runner's clock (V1 review 480): an untimed
     merge is placed by its record time."""
@@ -62,7 +62,7 @@ async def _pr(db, world, item_id, number, minutes, *, pr=None, additions=30, del
     event = await audit.record_delivery_fact(
         db, item_id=item_id, delivery_outcome="delivered", completion_kind="merged_code",
         fact_source="github_pull_request_merged", fact_time=_m(minutes) if timed else None, artifact=name,
-        attempt=f"item:{item_id}:launch:1:revision:{minutes}:{name}")
+        attempt=f"item:{item_id}:launch:1:revision:{minutes}:{name}", item_context_key=item_key)
     event.occurred_at = recorded or _m(minutes)
     await db.flush()
     if facts and artifact:
@@ -76,22 +76,28 @@ async def _pr(db, world, item_id, number, minutes, *, pr=None, additions=30, del
 
 async def _size(db, world, items, *, facts_from=FACTS_FROM, cached=False, as_of=AS_OF):
     """``items``: (issue number, merge minutes or None, keyword arguments for ``_pr``); a repeated number is another
-    delivery on the same issue."""
+    delivery on the same issue. ``member=False`` tracks the issue outside the campaign; ``legacy=True`` records the
+    merge as the item's ``auto_merged_at`` fallback instead."""
     await _marker(db)
     if facts_from is not None:
         db.add(CampaignUpgradeCoverage(id=1, started_at=facts_from))
     labelled, created = [], {}
     for number, merged, kwargs in items:
+        kwargs = dict(kwargs)
+        member, legacy = kwargs.pop("member", True), kwargs.pop("legacy", False)
         item = created.get(number)
         if item is None:
-            labelled.append(_issue("a1", number, state="closed"))
+            if member:
+                labelled.append(_issue("a1", number, state="closed"))
             item = created[number] = GithubWorkItem(
                 scope_id=world.scopes["a1"], issue_number=number, issue_title="I", issue_url=f"u/{number}",
                 github_updated_at=T0, dispatch_status="merged", created_at=CREATED)
             db.add(item)
             await db.flush()
             await _dispatch(db, item.id, 0)
-        if merged is not None:
+        if merged is not None and legacy:
+            item.auto_merged_at = _m(merged)
+        elif merged is not None:
             await _pr(db, world, item.id, number, merged, **kwargs)
     await db.commit()
     campaign = await campaigns.current(db, world.team) or await campaigns.start(
@@ -218,12 +224,14 @@ async def test_an_untimed_merge_of_another_pr_on_a_measured_issue_is_an_unknown_
 async def test_untimed_records_of_a_known_pr_are_not_unknown_and_one_untimed_pr_counts_once(db, world):
     size = await _size(db, world, [(10, 60, {"pr": 15}),
                                    (10, 70, {"pr": 15, "timed": False, "facts": False}),  # the same PR again
-                                   (10, 72, {"artifact": False, "timed": False}),  # no PR, beside a known one
+                                   (10, 72, {"artifact": False, "timed": False}),  # no PR: unknown even beside a
                                    (11, 75, {"pr": 15, "timed": False, "facts": False,  # PR 15 also delivered 11,
                                              "name": "O/A1/pull/15"}),  # in another case
                                    (12, 80, {"pr": 16, "timed": False, "facts": False}),
-                                   (13, 90, {"pr": 16, "timed": False, "facts": False})])  # one PR, two issues
-    assert (size.prs_merged, size.unknown_prs) == (1, 1)
+                                   (12, 85, {"artifact": False, "timed": False}),  # another merge without a PR
+                                   (13, 90, {"pr": 16, "timed": False, "facts": False,  # one PR, two issues,
+                                             "name": "O/A1/pull/16"})])  # in two cases
+    assert (size.prs_merged, size.unknown_prs) == (1, 3)  # the two without a PR (V1 review 483), and PR 16 once
 
 
 async def test_an_untimed_record_of_a_pr_merged_outside_the_campaign_is_neither_merged_nor_unknown(db, world):
@@ -232,11 +240,51 @@ async def test_an_untimed_record_of_a_pr_merged_outside_the_campaign_is_neither_
     size = await _size(db, world, [(10, -60, {"pr": 15}),  # merged an hour before the campaign
                                    (11, 70, {"pr": 15, "timed": False, "facts": False}),
                                    (12, after, {"pr": 16}),  # merged after the cutoff
-                                   (13, 80, {"pr": 16, "timed": False, "facts": False}),
-                                   (14, -60, {"pr": 17}),  # its issue's merge is dated, so an undated record
-                                   (14, 90, {"artifact": False, "timed": False})])  # without a PR is that one
+                                   (13, 80, {"pr": 16, "timed": False, "facts": False})])
     assert (size.prs_merged, size.unknown_prs) == (0, 0)
     assert "merge_time_not_recorded" not in size.unknown_reasons
+
+
+async def test_a_campaign_pr_dated_only_by_another_tracked_issue_is_merged_and_measured(db, world):
+    """V1 review 483: issue 10 names PR 15 with no merge time; issue 20, outside the campaign, dates and sizes it."""
+    size = await _size(db, world, [(10, 70, {"pr": 15, "timed": False, "facts": False}),
+                                   (20, 60, {"pr": 15, "member": False, "name": "O/A1/pull/15"})])  # in any case
+    assert (size.prs_merged, size.unknown_prs, size.prs_coverage) == (1, 0, "full")
+    assert (size.lines.items, size.lines.median, size.files.largest, size.lines.coverage) == (1, 40, 4, "full")
+
+
+async def test_a_pr_dated_twice_by_other_issues_is_placed_at_its_earliest_merge(db, world):
+    size = await _size(db, world, [(10, 70, {"pr": 15, "timed": False, "facts": False}),
+                                   (20, -60, {"pr": 15, "member": False}),  # before the campaign: outside it
+                                   (21, 60, {"pr": 15, "member": False, "facts": False})])
+    assert (size.prs_merged, size.unknown_prs) == (0, 0)
+
+
+async def test_an_undated_merge_recorded_before_the_campaign_is_not_an_unknown_pr(db, world):
+    size = await _size(db, world, [(10, 60, {"pr": 15}),
+                                   (11, -30, {"pr": 16, "timed": False, "facts": False, "recorded": _m(-30)})])
+    assert (size.prs_merged, size.unknown_prs) == (1, 0)
+
+
+async def test_a_merge_without_its_pr_beside_a_named_one_is_unknown_unless_a_record_links_them(db, world):
+    """V1 review 483: a shared issue is no link. A same-time record of the merge, or the item's own auto-merge beside
+    that item lifetime's sourced merge, is."""
+    size = await _size(db, world, [(10, 60, {"pr": 15}), (10, 90, {"artifact": False})])  # two attempts
+    assert (size.prs_merged, size.unknown_prs, size.prs_coverage) == (1, 1, "partial")
+    assert (size.lines.items, size.lines.coverage) == (1, "partial")
+    assert "artifact_not_recorded" in size.lines.unknown_reasons
+
+
+async def test_a_same_time_record_or_the_items_own_auto_merge_is_the_named_merge(db, world):
+    size = await _size(db, world, [(10, 60, {"pr": 15}), (10, 60, {"artifact": False}),  # one merge, two records
+                                   (11, 70, {"pr": 16}), (11, 75, {"legacy": True})])  # auto-merge, same item
+    assert (size.prs_merged, size.unknown_prs, size.prs_coverage) == (2, 0, "full")
+
+
+async def test_an_auto_merge_beside_another_item_lifetimes_merge_is_unknown(db, world):
+    size = await _size(db, world, [(11, 70, {"pr": 16, "item_key": "item:earlier-lifetime"}),
+                                   (11, 75, {"legacy": True})])
+    assert (size.prs_merged, size.unknown_prs) == (1, 1)
 
 
 async def test_an_untimed_merge_recorded_after_the_cutoff_is_not_an_unknown_pr(db, world):

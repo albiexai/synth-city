@@ -724,26 +724,35 @@ async def _size(db, campaign: Campaign, members: list[tuple[str, int]], facts: _
     facts_entry = next(c for c in coverage if c.measure == "pull_request_facts")
     facts_from = facts_entry.started_at and _naive_utc(facts_entry.started_at)
     merged: dict[str, datetime] = {}  # each PR once, at its earliest merge in the campaign
-    unknown_prs, reasons = 0, set(gaps)
-    untimed: set[str] = set()  # PRs merged at no recorded time, unknown unless also merged at a known one
-    # V1 review 480: a known merge time places a PR before the campaign window is applied, wherever it falls
-    dated = {artifact.lower() for merges in facts.merges.values() for _, artifact, _ in merges if artifact}
+    reasons = set(gaps)
+    # V1 reviews 480, 483: each PR's earliest known merge time from any tracked issue of the team lifetime places it,
+    # before the campaign window is applied
+    dated: dict[str, datetime] = {}
+    for at, artifact, _ in (merge for merges in facts.merges.values() for merge in merges):
+        if artifact:
+            dated[artifact.lower()] = min(dated.get(artifact.lower(), at), at)
+    unresolved: set[tuple] = set()  # each merge no record ties to a known PR, once, with its reason
     for key in members:
-        merges = [merge for merge in facts.merges.get(key, ()) if began <= merge[0] <= as_of]
-        named = [(at, artifact.lower()) for at, artifact, _ in merges if artifact]
-        for at, artifact in named:
-            merged[artifact] = min(merged.get(artifact, at), at)
-        if merges and not named:
-            unknown_prs, why = unknown_prs + 1, "artifact_not_recorded"
-            reasons.add(why)
-        recorded = [artifact for at, artifact in facts.untimed_prs.get(key, ()) if began <= at <= as_of]
-        untimed |= {artifact.lower() for artifact in recorded if artifact}  # V1 review 478: even beside a known merge
-        if not facts.merges.get(key) and recorded and not all(recorded):  # no PR: unknown where none is known
-            unknown_prs, why = unknown_prs + 1, "merge_time_not_recorded"
-            reasons.add(why)
-    if hidden := untimed - dated:
-        unknown_prs += len(hidden)
-        reasons.add("merge_time_not_recorded")
+        recorded = facts.merges.get(key, ())
+        for at, artifact, item_key in (merge for merge in recorded if began <= merge[0] <= as_of):
+            if artifact:
+                merged[artifact.lower()] = min(merged.get(artifact.lower(), at), at)
+            elif (key, at) in facts.fallback:  # V1 review 483: an item's auto-merge is its lifetime's sourced merge
+                if not any(name and k == item_key for _, name, k in recorded):
+                    unresolved.add((key, at, "artifact_not_recorded"))
+            elif not any(name and t == at for t, name, _ in recorded):  # a shared issue is no link; one time is
+                unresolved.add((key, at, "artifact_not_recorded"))
+        for at, artifact in facts.untimed_prs.get(key, ()):
+            if at > as_of:
+                continue  # recorded after the cutoff
+            if artifact and (placed := dated.get(artifact.lower())) is not None:
+                if began <= placed <= as_of:  # the earliest anywhere, so no merge here is earlier
+                    merged[artifact.lower()] = placed
+            elif at >= began:  # dated nowhere: its record time places it, unknown (V1 review 478: even beside a known
+                unresolved.add((artifact.lower(), None, "merge_time_not_recorded") if artifact  # merge), once per PR
+                               else (key, at, "merge_time_not_recorded"))
+    unknown_prs = len(unresolved)
+    reasons |= {why for *_, why in unresolved}
     lines, files = await _pr_sizes(db, campaign, merged, facts_from)
     # V1 review 478: zero only for a complete, empty population; a lower bound while some members are unread
     prs_coverage = membership if membership != "full" else ("partial" if unknown_prs or set(gaps) else "full")
@@ -878,6 +887,7 @@ class _Deliveries:
     untimed: dict[tuple[str, int], list[datetime]] = field(default_factory=dict)  # PR merges GitHub gave no time
     # #1454: each untimed merge's record time and PR artifact
     untimed_prs: dict[tuple[str, int], list[tuple[datetime, str | None]]] = field(default_factory=dict)
+    fallback: set[tuple[tuple[str, int], datetime]] = field(default_factory=set)  # #1454: merges from auto_merged_at
     undelivered: dict[tuple[str, int], list[datetime]] = field(default_factory=dict)
     unidentified: bool = False  # a recorded delivery whose issue can't be derived
 
@@ -946,6 +956,7 @@ async def _deliveries(db, campaign: Campaign) -> _Deliveries:
         facts.delivered.setdefault(key, []).append(_naive_utc(row.auto_merged_at))
         facts.merges.setdefault(key, []).append(
             (_naive_utc(row.auto_merged_at), None, await audit.current_context_key(db, "item", row.id)))
+        facts.fallback.add((key, _naive_utc(row.auto_merged_at)))
     return facts
 
 
