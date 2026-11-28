@@ -14,6 +14,13 @@ the merge, between the later of campaign start and item creation and the merge, 
 forward-coverage marker is at or before that window's start, so no earlier dispatch in it can be missing; the first
 recorded event never stands in for that (V1 review 448). The median is the middle value; p85 is the nearest rank (the smallest time
 with at least 85% of times at or below it). Fewer than five timed items is a small sample, shown with its value and n.
+
+#1419 (#1245 part 4) adds "where the time went". Its item time is Q1's, recorded on #1245: per attempt, from waiting
+for dispatch to the merge, or ``as_of`` while open, and before the first attempt from campaign membership. That
+differs from #1246's dispatch-to-merge median. One item's attempt windows are contiguous (each starts where the last
+ended), so their sum is the item's campaign time; the stage engine splits each into waiting on someone, process,
+active and an explicit unaccounted remainder, so the stages plus unaccounted equal item time. A member with no
+recorded attempt is unknown, never zero time.
 """
 from __future__ import annotations
 
@@ -21,7 +28,7 @@ import hashlib
 import math
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from statistics import median
 
 from pydantic import BaseModel
@@ -34,7 +41,15 @@ from app.models.database import (
     CampaignSnapshot,
     FactoryAuditEvent,
     FactoryContextKey,
+    GithubApprovalRequest,
+    GithubAttemptScopeRevision,
+    GithubCheckRunHistory,
+    GithubHeadReview,
+    GithubRequiredCheckRecipient,
+    GithubRequiredCheckWatch,
+    GithubRevisionReview,
     GithubWorkItem,
+    MailMessage,
     TeamGithubScope,
 )
 from app.models.schemas import FactoryMetricSample
@@ -43,9 +58,13 @@ from app.services import campaign_upgrade_service as upgrade
 from app.services import factory_audit_service as audit
 from app.services.factory_metrics_service import _coverage, _naive_utc
 from app.services.github_rate_limit_history import campaign_rate_limit_time
+from app.services.retro_bottleneck_service import (
+    CampaignBottleneckResponse, CampaignBottlenecks, RankingAttempt, build_bottlenecks,
+)
 
 FINAL, ASK = "final", "ask"  # #1260: the purpose of a stored version
-CALCULATION_VERSION = "campaign-snapshot-v3"  # v2 (#1395): missing delivery history is unknown; v3 (#1246): item time
+# v2 (#1395): missing delivery history is unknown; v3 (#1246): item time; v4 (#1419): where the time went
+CALCULATION_VERSION = "campaign-snapshot-v6"  # v5 (#1257): bottleneck windows; v6 (#1453): flow
 SMALL_SAMPLE = 5
 BANDS = (("0-100", 100), ("101-400", 400), ("over-400", None))  # by lines changed, upper bound inclusive
 CACHE_SECONDS = 30.0  # the Overview panel polls
@@ -91,6 +110,67 @@ class ItemTimeSection(BaseModel):
     bands: list[BandRow]
 
 
+class StageRow(BaseModel):
+    group: str
+    stage: str
+    actor: str
+    share_seconds: float  # its part of item time
+    wall_seconds: float  # its own time, whatever else ran (Q2)
+    attempts: int = 0  # the attempts it was recorded in
+    coverage: str = "full"  # its group's recording coverage
+    basis: str | None = None  # e.g. waiting for dispatch from campaign membership, when ready time was not recorded
+
+
+class TimeWentSection(BaseModel):
+    """#1419: where the campaign's item time went. Absent in snapshots frozen before v4."""
+    items: int  # campaign members with at least one attempt
+    attempts: int
+    unknown_items: int  # members with no recorded attempt: unknown, never zero time
+    unattributed: int  # recorded evidence the collector could not place in an attempt
+    total_seconds: float | None
+    groups: dict[str, float | None]
+    group_coverage: dict[str, str] = {}  # per group: full, partial (a lower bound) or unavailable
+    unaccounted_seconds: float | None
+    overlap_seconds: float | None
+    stages: list[StageRow]
+    coverage: str
+    unknown_reasons: list[str]
+
+
+class WeekRow(BaseModel):
+    week_start: date  # the Monday of a UTC ISO week
+    merges: int
+    partial: bool  # the campaign start or the cutoff falls inside the week
+
+
+class MarkerSide(BaseModel):
+    items: int  # timed items wholly on this side of the marker
+    median_seconds: float | None
+    small_sample: bool
+
+
+class ChangeMarker(BaseModel):
+    """An applied configuration change, with the item time on each side of it. Never a verdict (design §8)."""
+    at: datetime
+    source: str
+    fields: list[str]  # the changed field names, never their values
+    before: MarkerSide  # dispatched and merged before the marker
+    after: MarkerSide  # dispatched at or after it
+    straddling: int  # dispatched before it, merged at or after it: excluded (design answer Q3)
+    unknown: int  # merged in the campaign with an unknown item time: excluded
+
+
+class FlowSection(BaseModel):
+    """#1453: merges per week and the change markers. Absent in snapshots frozen before v5."""
+    merges: int  # members whose first merge in the campaign has a time
+    unknown_merges: int  # PR merges GitHub gave no time: never placed in a week
+    weeks: list[WeekRow]
+    markers: list[ChangeMarker]
+    marker_coverage: str  # partial when audit recording began after the campaign start, or isn't marked
+    coverage: str
+    unknown_reasons: list[str]
+
+
 class Snapshot(BaseModel):
     campaign_id: int
     selector: str
@@ -102,6 +182,9 @@ class Snapshot(BaseModel):
     # Added by #1252. A snapshot stored before it has no such field and reads as an empty list.
     repositories: list[SnapshotRepository] = []
     item_time: ItemTimeSection | None = None  # additive (#1246): an older frozen payload reads back unchanged
+    time_went: TimeWentSection | None = None  # additive (#1419)
+    bottlenecks: CampaignBottlenecks | None = None
+    flow: FlowSection | None = None  # additive (#1453)
 
 
 def clear_cache() -> None:
@@ -153,24 +236,77 @@ async def _fingerprint(db, campaign: Campaign) -> tuple:
     # #1246: installing the lifecycle coverage marker changes item time without any new event (V1 review 448).
     lifecycle = await audit.instrumentation_start(db)
     return (campaign.id, campaign.team_context_key, campaign.selector, campaign.status, campaign.started_at,
-            campaign.finished_at, live, events, scopes, items, markers, lifecycle)
+            campaign.finished_at, live, events, scopes, items, markers, lifecycle, await _retro_rows(db, campaign))
 
 
-async def build_snapshot(db, campaign: Campaign, client, *, as_of: datetime, observed_at: datetime | None = None,
+async def _retro_rows(db, campaign: Campaign) -> tuple:
+    """#1419: every row "where the time went" reads that can change without an audit event, with its mutable fields,
+    so an insert, update or deletion misses the cache (row by row, as for scopes and items above)."""
+    items = (select(GithubWorkItem.id).join(TeamGithubScope, TeamGithubScope.id == GithubWorkItem.scope_id)
+             .join(FactoryContextKey, _lifetime(campaign.team_context_key)))
+    scopes = select(TeamGithubScope.id).join(FactoryContextKey, _lifetime(campaign.team_context_key))
+    watches = select(GithubRequiredCheckWatch.id).where(GithubRequiredCheckWatch.work_item_id.in_(items))
+    reads = [
+        select(GithubCheckRunHistory.repository, GithubCheckRunHistory.check_run_id, GithubCheckRunHistory.head_sha,
+               GithubCheckRunHistory.pr_number, GithubCheckRunHistory.check_name, GithubCheckRunHistory.app_slug,
+               GithubCheckRunHistory.required,
+               GithubCheckRunHistory.job_created_at,
+               GithubCheckRunHistory.started_at, GithubCheckRunHistory.completed_at)
+        .where(GithubCheckRunHistory.scope_id.in_(scopes))
+        .order_by(GithubCheckRunHistory.repository, GithubCheckRunHistory.check_run_id),
+        select(GithubHeadReview.id, GithubHeadReview.verdict, GithubHeadReview.status, GithubHeadReview.created_at,
+               GithubHeadReview.ended_at, GithubHeadReview.head_sha, GithubHeadReview.pr_number,
+               GithubHeadReview.scope_revision, GithubHeadReview.reviewer_member_id)
+        .where(GithubHeadReview.work_item_id.in_(items)).order_by(GithubHeadReview.id),
+        select(GithubRevisionReview.id, GithubRevisionReview.verdict, GithubRevisionReview.status,
+               GithubRevisionReview.created_at, GithubRevisionReview.ended_at, GithubRevisionReview.watch_id,
+               GithubRevisionReview.revision_id, GithubRevisionReview.reviewer_member_id)
+        .where(GithubRevisionReview.work_item_id.in_(items)).order_by(GithubRevisionReview.id),
+        select(GithubRequiredCheckWatch.id, GithubRequiredCheckWatch.head_sha, GithubRequiredCheckWatch.pr_number,
+               GithubRequiredCheckWatch.reviewer_member_id, GithubRequiredCheckWatch.completion_kind,
+               GithubRequiredCheckWatch.changed_at, GithubRequiredCheckWatch.completed_at,
+               GithubRequiredCheckWatch.scope_revision)
+        .where(GithubRequiredCheckWatch.work_item_id.in_(items)).order_by(GithubRequiredCheckWatch.id),
+        select(GithubRequiredCheckRecipient.id, GithubRequiredCheckRecipient.watch_id,
+               GithubRequiredCheckRecipient.member_id, GithubRequiredCheckRecipient.message_id,
+               MailMessage.recipient_member_id, MailMessage.delivery_key, MailMessage.created_at)
+        .outerjoin(MailMessage, MailMessage.id == GithubRequiredCheckRecipient.message_id)
+        .where(GithubRequiredCheckRecipient.watch_id.in_(watches)).order_by(GithubRequiredCheckRecipient.id),
+        select(GithubApprovalRequest.id, GithubApprovalRequest.request_kind, GithubApprovalRequest.status,
+               GithubApprovalRequest.created_at, GithubApprovalRequest.decided_at,
+               GithubApprovalRequest.owner_member_id)
+        .where(GithubApprovalRequest.work_item_id.in_(items)).order_by(GithubApprovalRequest.id),
+        select(GithubAttemptScopeRevision.id, GithubAttemptScopeRevision.dispatch_nonce,
+               GithubAttemptScopeRevision.owner_member_id)
+        .where(GithubAttemptScopeRevision.work_item_id.in_(items)).order_by(GithubAttemptScopeRevision.id),
+    ]
+    rows = []
+    for read in reads:
+        rows.append(tuple((await db.execute(read)).all()))
+    return tuple(rows)
+
+
+async def build_snapshot(db, campaign: Campaign, client, *, as_of: datetime | None = None, observed_at: datetime | None = None,
                          cached: bool = True) -> Snapshot:
     """The campaign's snapshot up to ``as_of``; served from the cache while no record it reads has changed.
 
+    Omit ``as_of`` for a current read that can reuse a fresh, matching live cutoff.
     ``observed_at`` is when the caller reads GitHub, ``as_of`` by default. GitHub reports the membership as it is
     then, so a read after the cutoff leaves the historical membership unknown (V1 review 6079984028).
     """
-    as_of = _naive_utc(as_of)
+    live_read = as_of is None and observed_at is None
+    as_of = _naive_utc(as_of if as_of is not None else datetime.now(UTC))
     observed = _naive_utc(observed_at) if observed_at is not None else as_of
     if cached:
         key = (await _fingerprint(db, campaign), as_of, observed)
         hit = _cache.get(campaign.id)
-        if hit is not None and hit[0] > _clock() and hit[1] == key:
-            # The recorder's pending windows are not records: its coverage is read again on every hit.
-            return await _refresh_rate_limited(db, campaign, hit)
+        if hit is not None and hit[0] > _clock():
+            earlier_key = hit[1]
+            current_live_read = (live_read and earlier_key[0] == key[0] and earlier_key[1] == earlier_key[2]
+                                 and 0 <= (as_of - hit[2].as_of).total_seconds() < CACHE_SECONDS)
+            if earlier_key == key or current_live_read:
+                # The recorder's pending windows are not records: its coverage is read again on every hit.
+                return await _refresh_rate_limited(db, campaign, hit)
     snapshot = await _build(db, campaign, client, as_of, observed)
     if cached:
         _cache[campaign.id] = (_clock() + CACHE_SECONDS, key, snapshot)
@@ -250,13 +386,17 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
     coverage = await upgrade.recorded_coverage(db, campaign)
     metrics.append(await _rate_limited(db, coverage, started, as_of))
     # Missing delivery history the counts already know of makes item time partial too (V1 review 448).
+    spans: list[tuple[datetime | None, datetime | None, list[str]]] = []
     item_time = await _item_time(db, campaign, list(members), facts, coverage, as_of,
-                                 gaps + ([reason] if unknown else []), label)  # both kept (V1 review 115)
+                                 gaps + ([reason] if unknown else []), label, spans)  # both kept (V1 review 115)
+    time_went, bottlenecks = await _time_went(db, campaign, list(members), coverage, as_of, gaps)
+    flow = await _flow(db, campaign, spans, as_of, gaps + ([reason] if unknown else []), label)
     return Snapshot(
         campaign_id=campaign.id, selector=campaign.selector, started_at=started, as_of=as_of,
         calculation_version=CALCULATION_VERSION, metrics=sorted(metrics, key=lambda sample: sample.name),
         recorded_coverage=[MeasureCoverageEntry(measure=c.measure, started_at=c.started_at, covered=c.covered,
                                                 reason=c.reason) for c in coverage], item_time=item_time,
+        time_went=time_went, bottlenecks=bottlenecks, flow=flow,
         repositories=_repositories(membership, members, [gap for gap in gaps if gap in _CUTOFF_GAPS]))
 
 
@@ -284,6 +424,102 @@ def _repositories(membership, members, cutoff: list[str]) -> list[SnapshotReposi
     return list(rows.values())
 
 
+_LOST_GROUP = {source: "waiting" for source in ("dispatch", "decision", "effort", "ceiling", "hold", "pause", "mail",
+                                                 "input")} | {
+    source: "process" for source in ("required_check", "review", "check_watch", "head_review", "revision_review")} | {
+    source: "active" for source in ("planning", "building", "approval_request")}
+
+
+async def _time_went(db, campaign: Campaign, members: list[tuple[str, int]], coverage, as_of: datetime,
+                     gaps: list[str]) -> tuple[TimeWentSection, CampaignBottlenecks]:
+    """The campaign members' attempt time, split by the stage engine and summed; it reconciles with item time.
+
+    A member whose attempts come from two overlapping item lifetimes (two rows tracking one issue) is ambiguous and
+    unknown, never counted twice. Each group carries its recorder's coverage: a recorder not installed makes the group
+    unknown, one that began inside the measured windows makes it a lower bound (V1 review 118)."""
+    from app.services.retro_attempt_collector import FIRST_LABEL, collect_team_attempts
+    from app.services.retro_stage_engine import GROUPS, breakdown
+
+    started = _naive_utc(campaign.started_at)
+    wanted = set(members)
+    collected = await collect_team_attempts(db, campaign.preset_id, campaign_start=started, as_of=as_of,
+                                            team_context_key=campaign.team_context_key)
+    # Members come from the collector's own lifetime-bound item read, never a separate one (V1 review 119).
+    member_items = collected.item_identity
+    by_member: dict[tuple[str, int], list] = {}
+    for attempt in collected.attempts:
+        if member_items.get(attempt.item_id) in wanted:
+            by_member.setdefault(member_items[attempt.item_id], []).append(attempt)
+    reasons = set(gaps)
+    attempts = []
+    for found in by_member.values():
+        if any(a.item_id != b.item_id and min(a.window.end, b.window.end) > max(a.window.start, b.window.start)
+               for a in found for b in found):  # a shared positive duration, not a zero-length window
+            reasons.add("ambiguous_tracking")  # two lifetimes track one issue at once: neither is counted
+            continue
+        attempts.extend(found)
+    lost = [u for u in collected.unattributed if u.item_id is None or member_items.get(u.item_id) in wanted]
+    unstable = {member_items[i] for i in collected.unstable_items if member_items.get(i) in wanted}
+    if unstable:  # their lifetime changed during the read: unknown, never another lifetime's time (V1 review 121)
+        reasons.add("item_lifetime_changed_during_read")
+    timed = {member_items[a.item_id] for a in attempts}
+    groups = dict.fromkeys(GROUPS, 0.0)
+    total = unaccounted = overlap = 0.0
+    stages: dict[tuple[str, str, str], list] = {}
+    ranking_attempts = []
+    for attempt in attempts:
+        result = breakdown(attempt.window, attempt.intervals)
+        ranking_attempts.append(RankingAttempt(member_items[attempt.item_id], attempt.window, attempt.intervals, result))
+        total, unaccounted, overlap = (total + result.total_seconds, unaccounted + result.unaccounted_seconds,
+                                       overlap + result.overlap_seconds)
+        for group, seconds in result.groups.items():
+            groups[group] += seconds
+        for row in result.stages:
+            sums = stages.setdefault((row.group, row.stage, row.actor), [0.0, 0.0, 0, False])
+            sums[0], sums[1], sums[2] = sums[0] + row.share_seconds, sums[1] + row.wall_seconds, sums[2] + 1
+            sums[3] = sums[3] or (row.stage == "dispatch" and attempt.window.start_label == FIRST_LABEL)
+    reasons |= {u.reason for u in lost}
+    if wanted - set(by_member) - unstable:  # members with no recorded attempt; ambiguous or unstable ones say so
+        reasons.add("no_attempt_recorded")
+    earliest = min((a.window.start for a in attempts), default=None)
+    marker = await audit.instrumentation_start(db)
+    if marker is None:
+        reasons.add("no_forward_coverage_marker")
+    elif earliest is not None and _naive_utc(marker) > earliest:
+        reasons.add("dispatch_before_instrumentation")  # an earlier dispatch in the windows may be missing
+    recorders = {c.measure: c for c in coverage}
+    group_coverage = dict.fromkeys(GROUPS, "full")
+    for group, measure in (("process", "check_runs"), ("waiting", "decision_waits")):
+        entry = recorders.get(measure)
+        if entry is None or entry.started_at is None:
+            group_coverage[group] = "unavailable"
+            reasons.add(f"{measure}: {entry.reason if entry else 'recording_not_installed'}")
+        elif earliest is not None and _naive_utc(entry.started_at) > earliest:
+            group_coverage[group] = "partial"  # what was recorded is kept, as a lower bound
+            reasons.add(f"{measure}: recording_started_late")
+    # Evidence the collector couldn't place makes the group it would have fed a lower bound (V1 review 119).
+    for group in sorted({_LOST_GROUP[u.source] for u in lost if u.source in _LOST_GROUP}):
+        if group_coverage[group] == "full":
+            group_coverage[group] = "partial"
+        reasons.add(f"{group}: unattributed_evidence")
+    known = bool(attempts)
+    if not known:
+        group_coverage = dict.fromkeys(GROUPS, "unavailable")
+    section = TimeWentSection(
+        items=len(timed), attempts=len(attempts), unknown_items=len(wanted) - len(timed), unattributed=len(lost),
+        total_seconds=total if known else None,
+        groups={g: (v if group_coverage[g] != "unavailable" else None) for g, v in groups.items()},  # all with none
+        group_coverage=group_coverage, unaccounted_seconds=unaccounted if known else None,
+        overlap_seconds=overlap if known else None,
+        stages=[StageRow(group=g, stage=st, actor=a, share_seconds=v[0], wall_seconds=v[1], attempts=v[2],
+                         coverage=group_coverage[g], basis=FIRST_LABEL if v[3] else None)
+                for (g, st, a), v in sorted(stages.items(), key=lambda kv: (GROUPS.index(kv[0][0]), kv[0][1:]))],
+        coverage="unavailable" if not known else ("partial" if reasons else "full"), unknown_reasons=sorted(reasons))
+    rankings = build_bottlenecks(ranking_attempts, start=started, as_of=as_of,
+                                 group_coverage=group_coverage, unknown_reasons=section.unknown_reasons)
+    return section, rankings
+
+
 def _p85(values: list[float]) -> float:
     ordered = sorted(values)
     return ordered[math.ceil(0.85 * len(ordered)) - 1]
@@ -294,8 +530,11 @@ def _band_of(lines: int) -> str:
 
 
 async def _item_time(db, campaign: Campaign, members: list[tuple[str, int]], facts: _Deliveries, coverage,
-                     as_of: datetime, gaps: list[str], membership: str) -> ItemTimeSection:
-    """Each member delivered by the cutoff, from its evidenced first dispatch to its earliest merge, by size band."""
+                     as_of: datetime, gaps: list[str], membership: str,
+                     spans: list | None = None) -> ItemTimeSection:
+    """Each member delivered by the cutoff, from its evidenced first dispatch to its earliest merge, by size band.
+    ``spans`` receives each merged member's (first dispatch or None, first merge or None when GitHub gave no time,
+    why the start is unknown)."""
     marker = await audit.instrumentation_start(db)
     marker = marker and _naive_utc(marker)
     facts_entry = next(c for c in coverage if c.measure == "pull_request_facts")
@@ -325,6 +564,8 @@ async def _item_time(db, campaign: Campaign, members: list[tuple[str, int]], fac
             # A PR merge GitHub gave no time is unknown; a non-merge delivery is outside this metric (V1 review 115).
             if any(began <= at <= as_of for at in facts.untimed.get(key, ())):
                 rows["unknown"].append((None, ["merge_time_not_recorded"]))
+                if spans is not None:
+                    spans.append((None, None, []))
             continue
         end = min(at for at, _, _ in merges)
         tied = [merge for merge in merges if merge[0] == end]
@@ -351,6 +592,8 @@ async def _item_time(db, campaign: Campaign, members: list[tuple[str, int]], fac
             band, why = _band_of(size[0] + size[1]), None
         rows[band].append(((end - start).total_seconds() if start is not None else None,
                            reasons + ([why] if why else [])))
+        if spans is not None:
+            spans.append((start, end, reasons))
     bands = []
     for band, entries in rows.items():
         times = [seconds for seconds, _ in entries if seconds is not None]
@@ -367,6 +610,72 @@ async def _item_time(db, campaign: Campaign, members: list[tuple[str, int]], fac
     label = "full" if complete and items else ("unavailable" if not timed or membership == "unavailable"
                                                else "partial")
     return ItemTimeSection(items=items, timed=timed, coverage=label, unknown_reasons=reasons, bands=bands)
+
+
+# #1453: the configuration sources of ``policy_change`` (the Supervisor's answers on #1246). The Supervisor's clock and
+# registration transitions share the kind but are not settings, and a dispatch pause is an operator intervention.
+_MARKER_SOURCES = ("agent_teams.update_github_scope", "agent_teams.update_github_scope_continuation_policy",
+                   "agent_team_service.update_preset", "agent_team_service.update_work_settings")
+
+
+async def _flow(db, campaign: Campaign, spans: list, as_of: datetime, gaps: list[str], membership: str) -> FlowSection:
+    """Merges per UTC ISO week, each member once in its first merge's week, and before-and-after at each marker."""
+    began = _naive_utc(campaign.started_at)
+    ends = [end for _, end, _ in spans if end is not None]
+    unknown_merges = len(spans) - len(ends)
+    weeks, monday = [], (began - timedelta(days=began.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    while monday <= as_of:
+        following = monday + timedelta(days=7)
+        weeks.append(WeekRow(week_start=monday.date(), merges=sum(monday <= end < following for end in ends),
+                             partial=began > monday or as_of < following))
+        monday = following
+    timed = [(start, end) for start, end, _ in spans if start is not None and end is not None]
+    markers = []
+    for at, source, fields in await _markers(db, campaign, began, as_of):
+        before = [(end - start).total_seconds() for start, end in timed if end < at]
+        after = [(end - start).total_seconds() for start, end in timed if start >= at]
+        markers.append(ChangeMarker(at=at, source=source, fields=fields, before=_side(before), after=_side(after),
+                                    straddling=sum(start < at <= end for start, end in timed),
+                                    unknown=len(spans) - len(timed)))
+    # Changes before audit recording began are unknown, so the marker list is only complete from its start on
+    # (V2 review 473); and an item whose time is unknown leaves the comparison incomplete with its reason.
+    recording = await audit.instrumentation_start(db)
+    recording = recording and _naive_utc(recording)
+    marker_gap = ("no_forward_coverage_marker" if recording is None
+                  else "change_markers_before_audit_recording" if recording > began else None)
+    reasons = sorted(set(gaps) | ({"merge_time_not_recorded"} if unknown_merges else set())
+                     | {why for start, _, whys in spans if start is None for why in whys}
+                     | ({marker_gap} if marker_gap else set()))
+    label = "unavailable" if membership == "unavailable" else ("partial" if reasons else "full")
+    return FlowSection(merges=len(ends), unknown_merges=unknown_merges, weeks=weeks, markers=markers,
+                       marker_coverage="partial" if marker_gap else "full", coverage=label, unknown_reasons=reasons)
+
+
+def _side(seconds: list[float]) -> MarkerSide:
+    return MarkerSide(items=len(seconds), median_seconds=median(seconds) if seconds else None,
+                      small_sample=0 < len(seconds) < SMALL_SAMPLE)
+
+
+async def _markers(db, campaign: Campaign, began: datetime, as_of: datetime) -> list[tuple[datetime, str, list[str]]]:
+    """The team lifetime's applied configuration changes in the campaign, with the names of the fields they changed.
+    A save that changed nothing is not a change."""
+    found = []
+    for row in (await db.execute(
+            select(FactoryAuditEvent.occurred_at, FactoryAuditEvent.source, FactoryAuditEvent.context_snapshot,
+                   FactoryAuditEvent.before_values, FactoryAuditEvent.after_values)
+            .where(FactoryAuditEvent.event_kind == "policy_change", FactoryAuditEvent.action_outcome == "applied",
+                   FactoryAuditEvent.source.in_(_MARKER_SOURCES),
+                   FactoryAuditEvent.team_context_key == campaign.team_context_key)
+            .order_by(FactoryAuditEvent.occurred_at, FactoryAuditEvent.id))).all():
+        at = _naive_utc(row.occurred_at)
+        if not began <= at <= as_of:
+            continue
+        named = (row.context_snapshot or {}).get("scope_changed_fields")
+        before, after = row.before_values or {}, row.after_values or {}
+        fields = sorted(named) if named is not None else sorted(k for k in after if before.get(k) != after.get(k))
+        if fields:
+            found.append((at, row.source, fields))
+    return found
 
 
 async def _first_dispatch(db, live: dict, lifetime: str | None, marker: datetime | None, began: datetime,
@@ -485,6 +794,27 @@ async def latest(db, campaign_id: int) -> CampaignSnapshot | None:
     return await db.scalar(select(CampaignSnapshot).where(CampaignSnapshot.campaign_id == campaign_id,
                                                           CampaignSnapshot.purpose == FINAL)
                            .order_by(CampaignSnapshot.version.desc()).limit(1))
+
+
+async def read_bottlenecks(db, campaign: Campaign, client, *, previous_top: str | None) -> CampaignBottleneckResponse:
+    if campaign.status == "finished":
+        stored = await latest(db, campaign.id)
+        snapshot = Snapshot.model_validate(stored.payload) if stored is not None else None
+        source = "frozen" if stored is not None else "unavailable"
+    else:
+        snapshot = await build_snapshot(db, campaign, client)
+        source = "live"
+
+    rankings = snapshot.bottlenecks if snapshot is not None else None
+    if rankings is None:
+        start = snapshot.started_at if snapshot is not None else campaign.started_at
+        end = snapshot.as_of if snapshot is not None else campaign.finished_at or start
+        reason = "snapshot_without_bottlenecks" if snapshot is not None else "no_snapshot"
+        rankings = build_bottlenecks([], start=_naive_utc(start), as_of=_naive_utc(end),
+                                     group_coverage={"waiting": "unavailable", "process": "unavailable"},
+                                     unknown_reasons=[reason])
+    return CampaignBottleneckResponse(campaign_id=campaign.id, source=source,
+                                      bottlenecks=rankings.with_previous_top(previous_top))
 
 
 async def _first(db, campaign_id: int) -> CampaignSnapshot | None:

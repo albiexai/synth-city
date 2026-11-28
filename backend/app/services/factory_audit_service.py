@@ -71,7 +71,7 @@ SAFE_SNAPSHOT_FIELDS = {
     "github_auth_mode", "configured_provider", "observed_runtime_provider",
     "repo_owner", "repo_name", "scope_created_at", "scope_updated_at",
     "team_created_at", "team_display_name", "slot_display_name",
-    "issue_number", "pr_number", "issue_type", "artifact", "fact_source",
+    "issue_number", "pr_number", "issue_type", "artifact", "fact_source", "external_actor_id",
     "event_time_labels", "scope_changed_fields",
     # #945: the session token on an operator write was not usable, so the write is unattributed (a flag, never the token).
     "session_invalid",

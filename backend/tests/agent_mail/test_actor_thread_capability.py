@@ -475,8 +475,8 @@ async def test_6h_recovery_reuses_the_tab_key_and_keeps_its_own_threads(client, 
     """6h positive half -- re-provisioning must ROTATE, not replace, the identity.
 
     The tab's durable identity is the actor_key, not the token (spec:802-807).
-    create_actor selects on actor_key: a hit rotates token_hash on the same row,
-    a miss INSERTs a new row with a new id (external_agent_mail_service.py:88-105).
+    The Director-authorized POST rotates an active key on the same row.
+    A fresh key creates a new identity.
     So a 401 recovery that mints a fresh key silently abandons every thread the
     tab created, because the ownership guard then sees a different actor.
 
