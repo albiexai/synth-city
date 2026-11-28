@@ -118,6 +118,36 @@ describe('the Overview campaign health block (#1256)', () => {
     expect(block.getByText(/8% of waiting and process time · 3 items · small sample/)).toBeInTheDocument()
   })
 
+  it('does not say "none above the thresholds" when the ranking is unknown (V1 review 489)', () => {
+    const largest = stage({ group: 'process', stage: 'required_check', actor: 'e2e', share: 0.3, items: 1, small_sample: true })
+    const block = within(show(read(health({
+      bottleneck: window({ state: 'unknown', coverage: 'partial', unknown_reasons: ['actor_unavailable'], stages: [],
+        largest_observed: largest }),
+    })))!)
+    expect(block.getByText('Ranking unknown')).toBeInTheDocument()
+    expect(block.getByText('Largest observed so far: Required check: e2e')).toBeInTheDocument()
+    expect(block.queryByText(/None above the thresholds/)).toBeNull()
+    expect(block.getByText(/Last 4 hours · partial · the actor is not known/)).toBeInTheDocument()
+    // The complete-window control still says it.
+    cleanup()
+    const control = within(show(read(health({
+      bottleneck: window({ state: 'below_thresholds', stages: [], largest_observed: largest }),
+    })))!)
+    expect(control.getByText('None above the thresholds')).toBeInTheDocument()
+  })
+
+  it('keeps the recorded member coverage next to an unknown dollar total (V1 review 489)', () => {
+    const cost = { value_usd: null, coverage: 'unavailable' as const, members_total: 2, members_known: 0,
+      unknown_members: [{ member: 'B3', reason: 'harness_not_read' }, { member: 'B4', reason: 'binding_unverified' }],
+      prices_as_of: '2026-11-15', reasons: ['member_unknown'] }
+    const block = within(show(read(health({ cost })))!)
+    expect(block.getByText(/member unknown/)).toHaveTextContent('unknown')
+    expect(block.getByText(/covers 0 of 2 members · prices as of 2026-11-15/)).toBeInTheDocument()
+    expect(block.getByText(/B3 unknown: its harness is not read yet/)).toBeInTheDocument()
+    expect(block.getByText(/B4 unknown: binding unverified/)).toBeInTheDocument()
+    expect(block.queryByText(/≈/)).toBeNull()  // the amount stays unknown
+  })
+
   it('labels a small sample and a partial window', () => {
     const state = read(health({
       item_time: { items: 3, timed: 3, coverage: 'partial', unknown_reasons: ['delivery_history_missing'], bands: [

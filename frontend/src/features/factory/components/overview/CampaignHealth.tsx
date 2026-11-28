@@ -90,28 +90,41 @@ const money = (value: number) =>
     maximumFractionDigits: value >= 100 ? 0 : 2,
   }).format(value);
 
-function Cost({ cost }: { cost: HealthCost }) {
-  if (cost.value_usd === null) return <Unknown reasons={cost.reasons} />;
+/** What the cost covers, shown with the amount or without it: coverage is recorded even when the total is unknown. */
+function CostCoverage({ cost }: { cost: HealthCost }) {
   const covers =
     cost.members_total !== null && cost.members_known !== null
       ? `covers ${cost.members_known} of ${cost.members_total} members`
       : null;
+  const line = [covers, cost.prices_as_of && `prices as of ${cost.prices_as_of}`].filter(Boolean).join(" · ");
+  return (
+    <>
+      {line && <span className="block text-xs text-muted-foreground">{line}</span>}
+      {cost.unknown_members.map((member) => (
+        <span key={member.member} className="block text-xs text-muted-foreground wrap-anywhere">
+          {member.member} unknown: {reasonText(member.reason)}
+        </span>
+      ))}
+    </>
+  );
+}
+
+function Cost({ cost }: { cost: HealthCost }) {
+  if (cost.value_usd === null) {
+    return (
+      <>
+        <Unknown reasons={cost.reasons} />
+        <CostCoverage cost={cost} />
+      </>
+    );
+  }
   return (
     <>
       <strong className="text-base">≈ {money(cost.value_usd)}</strong>{" "}
       {cost.coverage !== "full" && (
         <span className="rounded border px-1.5 text-xs font-medium">{cost.coverage}</span>
       )}
-      {(covers || cost.prices_as_of) && (
-        <span className="block text-xs text-muted-foreground">
-          {[covers, cost.prices_as_of && `prices as of ${cost.prices_as_of}`].filter(Boolean).join(" · ")}
-        </span>
-      )}
-      {cost.unknown_members.map((member) => (
-        <span key={member.member} className="block text-xs text-muted-foreground wrap-anywhere">
-          {member.member} unknown: {reasonText(member.reason)}
-        </span>
-      ))}
+      <CostCoverage cost={cost} />
     </>
   );
 }
@@ -133,6 +146,12 @@ function Bottleneck({ data }: { data: CampaignHealthResponse }) {
     <>
       {top ? (
         <strong className="text-base wrap-anywhere">{stageLabel(top)}</strong>
+      ) : window.state === "unknown" ? (
+        // An unknown ranking is not a negative result: it never says that no stage qualified (V1 review 489).
+        <span className="wrap-anywhere">
+          <strong className="text-base">Ranking unknown</strong>
+          {shown && <span className="block text-xs text-muted-foreground">Largest observed so far: {stageLabel(shown)}</span>}
+        </span>
       ) : (
         <span className="wrap-anywhere">
           <strong className="text-base">None above the thresholds</strong>

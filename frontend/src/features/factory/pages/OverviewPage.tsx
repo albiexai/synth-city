@@ -67,21 +67,24 @@ export function OverviewPage() {
   );
   const needsReads = needsFilter ? needsStates : states;
   const summaries = needsReads.map((item) => item.data);
-  // #1256: each team's live campaign (a read of recorded data only) and the health of each. They are read only
-  // after the overview itself loaded, so a failing overview stays one request. A failed or missing list adds no
-  // block, so the card keeps working as it did.
-  const liveList = useObservation<CampaignListResponse>(state.data ? "factory/campaigns?status=live&limit=100" : null);
+  // #1256: each displayed team's live campaign (a read of recorded data only) and the health of each. One list read
+  // for each team, so a team past the first global page keeps its block (V1 review 489). They are read only after the
+  // overview itself loaded, so a failing overview stays one request. A failed or missing list adds no block.
+  const { states: liveStates, refresh: refreshLive } = useObservations<CampaignListResponse>(
+    state.data ? matching.map((preset) => `factory/campaigns?status=live&team_id=${preset.id}&limit=5`) : [],
+  );
   const liveByTeam = new Map<number, number>();
-  for (const row of liveList.data?.campaigns ?? []) {
-    if (row.team && !liveByTeam.has(row.team.id)) liveByTeam.set(row.team.id, row.id);
-  }
+  matching.forEach((preset, index) => {
+    const row = liveStates[index]?.data?.campaigns?.find((campaign) => campaign.team?.id === preset.id);
+    if (row) liveByTeam.set(preset.id, row.id);
+  });
   const liveTeams = matching.filter((preset) => liveByTeam.has(preset.id));
-  const healthReads = useObservations<CampaignHealthResponse>(
+  const { states: healthStates, refresh: refreshHealth } = useObservations<CampaignHealthResponse>(
     liveTeams.map((preset) => `factory/campaigns/${liveByTeam.get(preset.id)}/health`),
   );
   const health: Record<number, CampaignHealthRead> = {};
   liveTeams.forEach((preset, index) => {
-    health[preset.id] = { campaignId: liveByTeam.get(preset.id)!, state: healthReads.states[index] };
+    health[preset.id] = { campaignId: liveByTeam.get(preset.id)!, state: healthStates[index] };
   });
   const rows = needsYouRows(matching, summaries);
   const summariesLoading =
@@ -102,7 +105,7 @@ export function OverviewPage() {
         </div>
         <Button
           variant="outline"
-          onClick={() => void Promise.all([state.refresh(), presetList.refresh(), refreshSummaries(), refreshNeeds()])}
+          onClick={() => void Promise.all([state.refresh(), presetList.refresh(), refreshSummaries(), refreshNeeds(), refreshLive(), refreshHealth()])}
         >
           Refresh
         </Button>

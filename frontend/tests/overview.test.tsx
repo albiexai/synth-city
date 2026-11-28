@@ -774,7 +774,9 @@ describe('Campaign health on the Progress card', () => {
       if (path === 'agent-teams/presets') return jsonResponse({ presets: [preset(1, 'v4.4', true)] })
       if (/^agent-teams\/presets\/1\/summary$/.test(path)) return jsonResponse(summary({ campaign: live }))
       if (path === 'factory/campaigns') {
+        // One read for each displayed team, so a team beyond the first global page is still found.
         expect(query.get('status')).toBe('live')
+        expect(query.get('team_id')).toBe('1')
         return jsonResponse({ campaigns: campaignRows })
       }
       if (path === 'factory/campaigns/41/health') return healthResponse()
@@ -794,6 +796,31 @@ describe('Campaign health on the Progress card', () => {
     expect(requests.filter(r => r.path === 'factory/campaigns/41/health')).toHaveLength(1)
     // The card keeps its counts.
     expect(screen.getByRole('article', { name: /Progress: / })).toHaveTextContent('Your decisions ahead')
+  })
+
+  it('asks for each displayed team on its own, so a team past the first global page keeps its block (V1 review 489)', async () => {
+    const { requests } = serveHealth([{ id: 41, team: { id: 1, name: 'v4.4' }, status: 'active' }],
+      () => jsonResponse(health))
+    await open()
+    const lists = requests.filter(r => r.path === 'factory/campaigns')
+    expect(lists).toHaveLength(1)
+    expect(lists[0].query.get('team_id')).toBe('1')
+    expect(screen.getByRole('group', { name: 'Campaign health' })).toBeInTheDocument()
+  })
+
+  it('reads the live campaign and the health again when Refresh is pressed after a failed health read (V1 review 489)', async () => {
+    let broken = true
+    const { requests } = serveHealth([{ id: 41, team: { id: 1, name: 'v4.4' }, status: 'active' }],
+      () => (broken ? jsonResponse({ detail: 'gone' }, 404) : jsonResponse(health)))
+    await open()
+    expect(within(screen.getByRole('group', { name: 'Campaign health' })).getByRole('note')).toHaveTextContent('could not be read')
+    const before = requests.filter(r => r.path === 'factory/campaigns/41/health').length
+    broken = false
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await settle()
+    await settle()
+    expect(requests.filter(r => r.path === 'factory/campaigns/41/health').length).toBeGreaterThan(before)
+    expect(within(screen.getByRole('group', { name: 'Campaign health' })).getByText('38 min')).toBeInTheDocument()
   })
 
   it('shows no health block for a team with no live campaign, and asks for no health read', async () => {
