@@ -35,11 +35,12 @@ from datetime import UTC, date, datetime, timedelta
 from statistics import median
 
 from pydantic import BaseModel
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 
 from app.models.database import (
+    AgentTeamSlot,
     Campaign,
     CampaignSnapshot,
     FactoryAuditEvent,
@@ -52,7 +53,10 @@ from app.models.database import (
     GithubRequiredCheckWatch,
     GithubRevisionReview,
     GithubWorkItem,
+    MailExternalActor,
     MailMessage,
+    MailReceipt,
+    MailTeamMember,
     TeamGithubScope,
 )
 from app.models.schemas import FactoryMetricSample
@@ -67,7 +71,7 @@ from app.services.retro_bottleneck_service import (
 
 FINAL, ASK = "final", "ask"  # #1260: the purpose of a stored version
 # v2 (#1395): missing delivery history is unknown; v3 (#1246): item time; v4 (#1419): where the time went
-CALCULATION_VERSION = "campaign-snapshot-v6"  # v5 (#1257): bottleneck windows; v6 (#1453): flow
+CALCULATION_VERSION = "campaign-snapshot-v7"  # v5 (#1257): bottleneck windows; v6 (#1453): flow; v7 (#1454): size
 SMALL_SAMPLE = 5
 BANDS = (("0-100", 100), ("101-400", 400), ("over-400", None))  # by lines changed, upper bound inclusive
 CACHE_SECONDS = 30.0  # the Overview panel polls
@@ -174,6 +178,42 @@ class FlowSection(BaseModel):
     unknown_reasons: list[str]
 
 
+class SizeMeasure(BaseModel):
+    items: int  # merged PRs with a known value
+    median: float | None
+    largest: int | None
+    unknown: int  # merged PRs whose value is unknown, with the reasons
+    coverage: str
+    unknown_reasons: list[str]
+
+
+class MailRoleCount(BaseModel):
+    role: str  # the sender's slot role, an external actor's kind, system, or unknown
+    messages: int
+
+
+class SizeSection(BaseModel):
+    """#1454: the campaign's size. Absent in snapshots frozen before v7."""
+    prs_merged: int | None  # distinct merged PRs of the members' sourced merges in the campaign; None if unreadable
+    prs_coverage: str  # full: exact; partial: an observed lower bound; unavailable: no member could be read
+    unknown_prs: int  # members' merges whose PR or time is unknown
+    lines: SizeMeasure  # additions plus deletions per merged PR, from its R2 facts
+    files: SizeMeasure  # changed files per merged PR
+    team_size: int | None
+    # Slots keep no history: today's configured slots, disabled ones included; not active members, not the cutoff's
+    team_size_basis: str = "current_configured_slots_including_disabled"
+    model_changes: int | None = None  # unknown until slot changes are recorded (#1455), never zero
+    member_changes: int | None = None
+    changes_reason: str = "slot_history_not_recorded"
+    mail_messages: int | None
+    mail_by_role: list[MailRoleCount]
+    mail_scope: str = "team"  # Agent Mail belongs to members, so it is team-wide, never per repository
+    # Supervisor decision (#1454): campaign asks and their replies aren't counted, so an ask never changes its version
+    mail_excludes: str = "campaign_asks_and_replies"
+    coverage: str
+    unknown_reasons: list[str]
+
+
 class Snapshot(BaseModel):
     campaign_id: int
     selector: str
@@ -188,6 +228,7 @@ class Snapshot(BaseModel):
     time_went: TimeWentSection | None = None  # additive (#1419)
     bottlenecks: CampaignBottlenecks | None = None
     flow: FlowSection | None = None  # additive (#1453)
+    size: SizeSection | None = None  # additive (#1454)
 
 
 def clear_cache() -> None:
@@ -261,7 +302,8 @@ async def _fingerprint(db, campaign: Campaign, *, scoped: bool = False) -> tuple
     # #1246: installing the lifecycle coverage marker changes item time without any new event (V1 review 448).
     lifecycle = await audit.instrumentation_start(db)
     return (campaign.id, campaign.team_context_key, campaign.selector, campaign.status, campaign.started_at,
-            campaign.finished_at, live, events, scopes, items, markers, lifecycle, await _retro_rows(db, campaign))
+            campaign.finished_at, live, events, scopes, items, markers, lifecycle, await _retro_rows(db, campaign),
+            await _size_rows(db, campaign))
 
 
 async def _retro_rows(db, campaign: Campaign) -> tuple:
@@ -421,12 +463,13 @@ async def _build(db, campaign: Campaign, client, as_of: datetime, observed: date
                                  gaps + ([reason] if unknown else []), label, spans)  # both kept (V1 review 115)
     time_went, bottlenecks = await _time_went(db, campaign, list(members), coverage, as_of, gaps)
     flow = await _flow(db, campaign, spans, as_of, gaps + ([reason] if unknown else []), label)
+    size = await _size(db, campaign, list(members), facts, coverage, as_of, gaps + ([reason] if unknown else []), label)
     return Snapshot(
         campaign_id=campaign.id, selector=campaign.selector, started_at=started, as_of=as_of,
         calculation_version=CALCULATION_VERSION, metrics=sorted(metrics, key=lambda sample: sample.name),
         recorded_coverage=[MeasureCoverageEntry(measure=c.measure, started_at=c.started_at, covered=c.covered,
                                                 reason=c.reason) for c in coverage], item_time=item_time,
-        time_went=time_went, bottlenecks=bottlenecks, flow=flow,
+        time_went=time_went, bottlenecks=bottlenecks, flow=flow, size=size,
         repositories=_repositories(membership, members, [gap for gap in gaps if gap in _CUTOFF_GAPS]))
 
 
@@ -709,6 +752,165 @@ async def _markers(db, campaign: Campaign, began: datetime, as_of: datetime) -> 
     return found
 
 
+async def _size(db, campaign: Campaign, members: list[tuple[str, int]], facts: _Deliveries, coverage,
+                as_of: datetime, gaps: list[str], membership: str) -> SizeSection:
+    """PRs merged, lines and files per merged PR, team size and team-wide Agent Mail by sender role (#1454)."""
+    began = _naive_utc(campaign.started_at)
+    facts_entry = next(c for c in coverage if c.measure == "pull_request_facts")
+    facts_from = facts_entry.started_at and _naive_utc(facts_entry.started_at)
+    merged: dict[str, datetime] = {}  # each PR once, at its earliest merge in the campaign
+    reasons = set(gaps)
+    # V1 reviews 480, 483: each PR's earliest known merge time from any tracked issue of the team lifetime places it,
+    # before the campaign window is applied
+    dated: dict[str, datetime] = {}
+    for at, artifact, _ in (merge for merges in facts.merges.values() for merge in merges):
+        if artifact:
+            dated[artifact.lower()] = min(dated.get(artifact.lower(), at), at)
+    unresolved: set[tuple] = set()  # each merge no record ties to a known PR, once, with its reason
+    for key in members:
+        recorded = facts.merges.get(key, ())
+        for at, artifact, item_key in recorded:
+            if artifact:  # V1 review 486: at its PR's earliest known merge, as an untimed record is, then the window
+                if began <= (placed := dated[artifact.lower()]) <= as_of:
+                    merged[artifact.lower()] = placed
+            elif not began <= at <= as_of:
+                continue  # a merge without its PR has only its own time
+            elif (key, at) in facts.fallback:  # V1 review 483: an item's auto-merge is its lifetime's sourced merge
+                if not any(name and k == item_key for _, name, k in recorded):
+                    unresolved.add((key, at, "artifact_not_recorded"))
+            elif not any(name and t == at for t, name, _ in recorded):  # a shared issue is no link; one time is
+                unresolved.add((key, at, "artifact_not_recorded"))
+        for at, artifact in facts.untimed_prs.get(key, ()):
+            if at > as_of:
+                continue  # recorded after the cutoff
+            if artifact and (placed := dated.get(artifact.lower())) is not None:
+                if began <= placed <= as_of:  # the earliest anywhere, so no merge here is earlier
+                    merged[artifact.lower()] = placed
+            elif at >= began:  # dated nowhere: its record time places it, unknown (V1 review 478: even beside a known
+                unresolved.add((artifact.lower(), None, "merge_time_not_recorded") if artifact  # merge), once per PR
+                               else (key, at, "merge_time_not_recorded"))
+    unknown_prs = len(unresolved)
+    reasons |= {why for *_, why in unresolved}
+    lines, files = await _pr_sizes(db, campaign, merged, facts_from)
+    # V1 review 478: zero only for a complete, empty population; a lower bound while some members are unread
+    prs_coverage = membership if membership != "full" else ("partial" if unknown_prs or set(gaps) else "full")
+    if prs_coverage != "full":  # V1 reviews 478, 480: the PRs not counted are missing from the measures too
+        lines, files = (measure.model_copy(update={
+            "coverage": "partial" if measure.items else "unavailable",
+            "unknown_reasons": sorted(set(measure.unknown_reasons) | reasons)}) for measure in (lines, files))
+    reasons |= set(lines.unknown_reasons) | set(files.unknown_reasons)
+    live = await audit.current_context_key(db, "team", campaign.preset_id) == campaign.team_context_key
+    if live:
+        team_size = await db.scalar(select(func.count()).select_from(AgentTeamSlot)
+                                    .where(AgentTeamSlot.preset_id == campaign.preset_id))
+        by_role = await _mail_by_role(db, campaign.preset_id, campaign.id, began, as_of)
+    else:  # a replacement team may reuse the preset id: its slots and members are not this campaign's
+        team_size, by_role = None, None
+        reasons.add("team_retired")
+    label = "unavailable" if membership == "unavailable" else ("partial" if reasons else "full")
+    return SizeSection(prs_merged=None if membership == "unavailable" else len(merged), prs_coverage=prs_coverage,
+                       unknown_prs=unknown_prs, lines=lines, files=files, team_size=team_size,
+                       mail_messages=sum(row.messages for row in by_role) if by_role is not None else None,
+                       mail_by_role=by_role or [], coverage=label, unknown_reasons=sorted(reasons))
+
+
+async def _pr_sizes(db, campaign: Campaign, merged: dict[str, datetime],
+                    facts_from: datetime | None) -> tuple[SizeMeasure, SizeMeasure]:
+    """Each merged PR's lines and files from its R2 facts; one without complete facts is unknown, with item time's
+    reason names."""
+    recorded: dict[str, dict] = {}
+    for row in (await db.execute(select(FactoryAuditEvent.context_snapshot, FactoryAuditEvent.after_values).where(
+            FactoryAuditEvent.event_kind == audit.PULL_FACTS_KIND,
+            FactoryAuditEvent.team_context_key == campaign.team_context_key))).all():
+        recorded.setdefault(str((row.context_snapshot or {}).get("artifact") or "").lower(), row.after_values or {})
+    values: dict[str, list[int]] = {"lines": [], "files": []}
+    missing: dict[str, list[str]] = {"lines": [], "files": []}
+    for artifact, at in merged.items():
+        facts = recorded.get(artifact)
+        why = ("pull_facts_recording_not_installed" if facts_from is None
+               else "merged_before_pull_facts_recording" if at < facts_from
+               else "pull_request_facts_missing" if facts is None else None)
+        if why is None:
+            additions, deletions = facts.get("additions"), facts.get("deletions")
+            measured = {"lines": additions + deletions if None not in (additions, deletions) else None,
+                        "files": facts.get("changed_files")}
+        for name in ("lines", "files"):
+            value = None if why else measured[name]
+            if value is None:
+                missing[name].append(why or "pull_request_facts_incomplete")
+            else:
+                values[name].append(value)
+    return tuple(SizeMeasure(
+        items=len(values[name]), median=median(values[name]) if values[name] else None,
+        largest=max(values[name]) if values[name] else None, unknown=len(missing[name]),
+        coverage="full" if not missing[name] else ("partial" if values[name] else "unavailable"),
+        unknown_reasons=sorted(set(missing[name]))) for name in ("lines", "files"))
+
+
+def _not_an_ask(campaign_id: int):
+    """Neither one of the campaign's own asks (#1260) nor a message in an ask's thread: asking about a campaign must
+    not change the Mail it measures (Supervisor decision, #1454)."""
+    asks = select(MailMessage.id).where(MailMessage.payload["kind"].as_string() == "campaign_ask",
+                                        MailMessage.payload["campaign_id"].as_integer() == campaign_id)
+    return and_(MailMessage.id.not_in(asks), or_(MailMessage.thread_root_id.is_(None),
+                                                 MailMessage.thread_root_id.not_in(asks)))
+
+
+def _team_mail(team, campaign_id: int, as_of: datetime | None = None):
+    """A message is the team's when a team member sent it or it reached one: a receipt, which every delivered message
+    has (direct, thread and broadcast alike), so a broadcast counts once and only where its audience held the team.
+    With ``as_of``, only a receipt by the cutoff is delivery (V1 review 478). The campaign's own asks never count."""
+    delivered = [MailReceipt.message_id == MailMessage.id, MailReceipt.member_id.in_(team)]
+    if as_of is not None:
+        delivered.append(MailReceipt.created_at <= as_of)
+    return and_(or_(MailMessage.sender_member_id.in_(team), MailMessage.recipient_member_id.in_(team),
+                    select(MailReceipt.id).where(*delivered).exists()), _not_an_ask(campaign_id))
+
+
+async def _mail_by_role(db, preset_id: int, campaign_id: int, began: datetime,
+                        as_of: datetime) -> list[MailRoleCount]:
+    """Messages in the campaign sent by or delivered to the team's members, by the sender's role (a sender with no
+    member or actor row by its sender type, such as system or director). Mail is team-wide."""
+    team = select(MailTeamMember.id).where(MailTeamMember.team_preset_id == preset_id)
+    sender = aliased(MailTeamMember)
+    counts: dict[str, int] = {}
+    for kind, role, actor_kind in (await db.execute(
+            select(MailMessage.sender_type, sender.role, MailExternalActor.kind)
+            .outerjoin(sender, sender.id == MailMessage.sender_member_id)
+            .outerjoin(MailExternalActor, MailExternalActor.id == MailMessage.sender_actor_id)
+            .where(MailMessage.created_at >= began, MailMessage.created_at <= as_of, _team_mail(team, campaign_id, as_of)))).all():
+        name = (actor_kind or "unknown") if kind == "external_actor" else (role or "unknown") if kind == "member" else (
+            kind or "unknown")
+        counts[name] = counts.get(name, 0) + 1
+    return [MailRoleCount(role=name, messages=n) for name, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
+async def _size_rows(db, campaign: Campaign) -> tuple:
+    """#1454: what the size section reads that changes without an audit event: the number and newest id of the team's
+    messages (a member joining or leaving, or a new receipt, changes the number), each of those messages' senders with
+    the role or actor kind it is counted by, inside the team or not (V1 review 478), each received message's earliest
+    receipt by a current member (V1 review 480), and the team's slots; never the campaign's own asks."""
+    team = select(MailTeamMember.id).where(MailTeamMember.team_preset_id == campaign.preset_id)
+    mail = tuple((await db.execute(select(func.count(MailMessage.id), func.max(MailMessage.id))
+                                   .where(_team_mail(team, campaign.id)))).one())
+    # V1 review 480: each received message's earliest receipt by a current member decides it at any cutoff
+    receipts = tuple((await db.execute(
+        select(MailReceipt.message_id, func.min(MailReceipt.created_at))
+        .join(MailMessage, MailMessage.id == MailReceipt.message_id)
+        .where(MailReceipt.member_id.in_(team), _not_an_ask(campaign.id))
+        .group_by(MailReceipt.message_id).order_by(MailReceipt.message_id))).all())
+    sender = aliased(MailTeamMember)
+    senders = tuple((await db.execute(
+        select(MailMessage.sender_member_id, sender.role, MailMessage.sender_actor_id, MailExternalActor.kind).distinct()
+        .outerjoin(sender, sender.id == MailMessage.sender_member_id)
+        .outerjoin(MailExternalActor, MailExternalActor.id == MailMessage.sender_actor_id)
+        .where(_team_mail(team, campaign.id))
+        .order_by(MailMessage.sender_member_id, MailMessage.sender_actor_id))).all())
+    slots = tuple((await db.scalars(select(AgentTeamSlot.id).where(AgentTeamSlot.preset_id == campaign.preset_id)
+                                    .order_by(AgentTeamSlot.id))).all())
+    return mail, receipts, senders, slots
+
+
 async def _first_dispatch(db, live: dict, lifetime: str | None, marker: datetime | None, began: datetime,
                           end: datetime) -> tuple[datetime | None, list[str]]:
     """The first dispatch in the campaign of the lifetime that merged, only where the coverage marker spans the whole
@@ -734,6 +936,9 @@ class _Deliveries:
     # #1246: each sourced merge with its PR artifact and the item lifetime that recorded it
     merges: dict[tuple[str, int], list[tuple[datetime, str | None, str | None]]] = field(default_factory=dict)
     untimed: dict[tuple[str, int], list[datetime]] = field(default_factory=dict)  # PR merges GitHub gave no time
+    # #1454: each untimed merge's record time and PR artifact
+    untimed_prs: dict[tuple[str, int], list[tuple[datetime, str | None]]] = field(default_factory=dict)
+    fallback: set[tuple[tuple[str, int], datetime]] = field(default_factory=set)  # #1454: merges from auto_merged_at
     undelivered: dict[tuple[str, int], list[datetime]] = field(default_factory=dict)
     unidentified: bool = False  # a recorded delivery whose issue can't be derived
 
@@ -789,6 +994,8 @@ async def _deliveries(db, campaign: Campaign) -> _Deliveries:
                 (at, recorded.get("artifact") or None, row.item_context_key))
         elif delivered and row.fact_source == "github_pull_request_merged":  # placed by its record time only
             facts.untimed.setdefault(_identity(f"{owner}/{name}", number), []).append(at)
+            facts.untimed_prs.setdefault(_identity(f"{owner}/{name}", number), []).append(
+                (at, recorded.get("artifact") or None))
     legacy = (await db.execute(
         select(TeamGithubScope.repo_owner, TeamGithubScope.repo_name, GithubWorkItem.issue_number,
                GithubWorkItem.auto_merged_at, GithubWorkItem.id)
@@ -800,6 +1007,7 @@ async def _deliveries(db, campaign: Campaign) -> _Deliveries:
         facts.delivered.setdefault(key, []).append(_naive_utc(row.auto_merged_at))
         facts.merges.setdefault(key, []).append(
             (_naive_utc(row.auto_merged_at), None, await audit.current_context_key(db, "item", row.id)))
+        facts.fallback.add((key, _naive_utc(row.auto_merged_at)))
     return facts
 
 
