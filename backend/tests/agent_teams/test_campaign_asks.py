@@ -19,6 +19,8 @@ from app.models.database import (
     AgentTeamSlot,
     CampaignSnapshot,
     FactoryAuditEvent,
+    GithubRateLimitHistoryCoverage,
+    GithubRateLimitWindow,
     GithubWorkItem,
     MailExternalActor,
     MailMessage,
@@ -31,6 +33,7 @@ from app.services import campaign_record_service as campaigns
 from app.services import campaign_snapshot_service as snapshots
 from app.services import factory_audit_service as audit
 from app.services.agent_mail_service import AgentMailService
+from app.services.github_client import GithubClientResponseError
 from app.services.external_agent_mail_service import external_agent_mail_service
 from tests.agent_teams.test_campaign_record import (  # noqa: F401  (fixtures)
     FakeGithub,
@@ -504,6 +507,111 @@ async def test_a_finished_campaign_with_no_final_version_is_unknown_with_a_reaso
     listed = (await _list(db, team))[0]
     assert (listed.state, listed.stale, listed.current_version_id) == ("unknown", None, None)
     assert listed.unknown_reason == "final_version_missing" and listed.id == view.id
+
+
+# V1 review 129: the version identity covers every input of the snapshot, from one membership observation
+def _measure(row, name):
+    return next(m for m in row.payload["metrics"] if m["name"] == name)
+
+
+async def _recording(db):
+    db.add(GithubRateLimitHistoryCoverage(id=1, started_at=T0 - timedelta(days=1)))
+    await db.commit()
+
+
+async def _rate_window(db):
+    start = T0 + timedelta(days=1)
+    db.add(GithubRateLimitWindow(source="core", window_reset_at=start + timedelta(hours=1),
+                                 reset_at=start + timedelta(hours=1), started_at=start))
+    await db.commit()
+
+
+class Flapping(FakeGithub):
+    """GitHub that answers with ``plans[n]`` on its n-th read of repository a1 (the last plan repeats)."""
+
+    def __init__(self, plans, **kwargs):
+        super().__init__(**kwargs)
+        self.plans, self.reads = plans, 0
+
+    async def list_label_issues(self, owner, repo, label):
+        if repo != "a1":
+            return await super().list_label_issues(owner, repo, label)
+        plan = self.plans[min(self.reads, len(self.plans) - 1)]
+        self.reads += 1
+        if plan == "broken":
+            raise GithubClientResponseError("unreadable")
+        return [i for i in plan if label in {x["name"] for x in i["labels"]}]
+
+
+async def test_a_labelled_issue_that_closes_makes_a_new_version(db, team):
+    first = await _ask(db, team)
+    closed = _client()
+    closed.labelled["a1"][0]["state"] = "closed"  # the same repository, number and label: only the state moved
+    assert (await _list(db, team, closed))[0].stale is True
+    second = await _ask(db, team, "supervisor", client=closed)
+    assert second.referenced_version_id != first.referenced_version_id
+    before = await db.get(CampaignSnapshot, first.referenced_version_id)
+    after = await db.get(CampaignSnapshot, second.referenced_version_id)
+    assert _measure(before, "closed_without_delivery") != _measure(after, "closed_without_delivery")
+    assert (await _ask(db, team, "verifier", team.v1, client=closed, acknowledge_verifier_warning=True)
+            ).referenced_version_id == second.referenced_version_id  # and unchanged records reuse it
+
+
+async def test_a_recorded_rate_limit_window_makes_a_new_version(db, team):
+    await _recording(db)
+    first = await _ask(db, team)
+    assert _measure(await db.get(CampaignSnapshot, first.referenced_version_id), "rate_limited_seconds")["value"] == 0
+    await _rate_window(db)  # no audit event: the recorder wrote it
+    assert (await _list(db, team))[0].stale is True
+    second = await _ask(db, team, "supervisor")
+    assert second.referenced_version_id != first.referenced_version_id
+    assert _measure(await db.get(CampaignSnapshot, second.referenced_version_id), "rate_limited_seconds")["value"] == 3600
+
+
+async def test_the_payload_and_its_identity_come_from_one_membership_observation(db, team):
+    small = [_issue("a1", 1)]
+    big = [_issue("a1", 1), _issue("a1", 5), _issue("a1", 6)]
+    github = Flapping([small, big, small], labelled={"a2": [_issue("a2", 3, state="closed")]})
+    first = await _ask(db, team, client=github)  # one read: the first answer
+    row = await db.get(CampaignSnapshot, first.referenced_version_id)
+    assert _measure(row, "issues_in_scope")["value"] == 2 and github.reads == 1 + 1  # the view reads once more
+    again = await _ask(db, team, "supervisor", client=github)  # membership is back at the first answer
+    assert again.referenced_version_id == first.referenced_version_id  # the stored payload says what the identity says
+    assert _measure(await db.get(CampaignSnapshot, again.referenced_version_id), "issues_in_scope")["value"] == 2
+
+
+async def test_an_incomplete_observation_is_never_stored_as_complete(db, team):
+    github = Flapping(["broken", [_issue("a1", 1)]], labelled={"a2": [_issue("a2", 3, state="closed")]})
+    first = await _ask(db, team, client=github)
+    row = await db.get(CampaignSnapshot, first.referenced_version_id)
+    assert row.fingerprint.startswith("incomplete:") and _measure(row, "issues_in_scope")["coverage"] != "full"
+    later = await _ask(db, team, "supervisor", client=github)  # the next read is complete: a new, complete version
+    assert later.referenced_version_id != first.referenced_version_id
+    assert not (await db.get(CampaignSnapshot, later.referenced_version_id)).fingerprint.startswith("incomplete:")
+
+
+@pytest.mark.parametrize("change,moves", [("closed", True), ("rate_window", True), ("new_issue", True),
+                                          ("other_team_event", False)])
+async def test_an_ask_makes_a_new_version_exactly_when_a_fresh_snapshot_differs(db, team, change, moves):
+    await _recording(db)
+    github = _client()
+    first = await _ask(db, team, client=github)
+    cutoff = T0 + timedelta(days=10)
+    before = await snapshots.build_snapshot(db, team.campaign, github, as_of=cutoff, cached=False)
+    if change == "closed":
+        github.labelled["a1"][0]["state"] = "closed"
+    elif change == "rate_window":
+        await _rate_window(db)
+    elif change == "new_issue":
+        github.labelled["a1"].append(_issue("a1", 4))
+    else:
+        await _audit_event(db, team.world.other, await audit.current_context_key(db, "team", team.world.other))
+    after = await snapshots.build_snapshot(db, team.campaign, github, as_of=cutoff, cached=False)
+    differs = snapshots.metrics_digest(before.model_dump(mode="json")) != snapshots.metrics_digest(
+        after.model_dump(mode="json"))
+    assert differs is moves  # the table says which inputs a fresh snapshot sees
+    second = await _ask(db, team, "supervisor", client=github)
+    assert (second.referenced_version_id != first.referenced_version_id) is moves
 
 
 # Wait counts and the lesson

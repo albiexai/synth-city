@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -311,13 +312,16 @@ async def _retro_rows(db, campaign: Campaign) -> tuple:
 
 
 async def build_snapshot(db, campaign: Campaign, client, *, as_of: datetime | None = None, observed_at: datetime | None = None,
-                         cached: bool = True) -> Snapshot:
+                         cached: bool = True, membership=None) -> Snapshot:
     """The campaign's snapshot up to ``as_of``; served from the cache while no record it reads has changed.
 
     Omit ``as_of`` for a current read that can reuse a fresh, matching live cutoff.
     ``observed_at`` is when the caller reads GitHub, ``as_of`` by default. GitHub reports the membership as it is
     then, so a read after the cutoff leaves the historical membership unknown (V1 review 6079984028).
+    ``membership`` is a read that the caller already made (#1260): the snapshot is built from that one observation,
+    never from a second read, and is not cached.
     """
+    cached = cached and membership is None
     live_read = as_of is None and observed_at is None
     as_of = _naive_utc(as_of if as_of is not None else datetime.now(UTC))
     observed = _naive_utc(observed_at) if observed_at is not None else as_of
@@ -331,7 +335,7 @@ async def build_snapshot(db, campaign: Campaign, client, *, as_of: datetime | No
             if earlier_key == key or current_live_read:
                 # The recorder's pending windows are not records: its coverage is read again on every hit.
                 return await _refresh_rate_limited(db, campaign, hit)
-    snapshot = await _build(db, campaign, client, as_of, observed)
+    snapshot = await _build(db, campaign, client, as_of, observed, membership)
     if cached:
         _cache[campaign.id] = (_clock() + CACHE_SECONDS, key, snapshot)
     return snapshot
@@ -352,9 +356,10 @@ async def _refresh_rate_limited(db, campaign: Campaign, hit: tuple) -> Snapshot:
     return refreshed
 
 
-async def _build(db, campaign: Campaign, client, as_of: datetime, observed: datetime) -> Snapshot:
+async def _build(db, campaign: Campaign, client, as_of: datetime, observed: datetime, membership=None) -> Snapshot:
     started = _naive_utc(campaign.started_at)
-    membership = await campaigns.members(db, campaign, client)
+    if membership is None:
+        membership = await campaigns.members(db, campaign, client)
     gaps = [f"{repository.reason}: {repository.repo}" for repository in membership.repositories
             if not repository.complete]
     if membership.unavailable:
@@ -903,19 +908,46 @@ async def recompute(db, campaign: Campaign, client, *, actor: dict, as_of: datet
 
 # #1260: the version that a Mail ask pins. An ask row is as immutable as a final one. Its version is negative (-1, -2,
 # ...), so freeze (version 1) and recompute (the next final) never see it, and ``latest`` reads final rows only.
+def _membership_part(membership) -> tuple:
+    """What the membership observation says: the repositories read and whether completely, each member with its
+    state (a closed issue is another measurement), and the departures."""
+    return (membership.unavailable or "",
+            tuple(sorted((r.repo.lower(), r.complete, r.reason or "") for r in membership.repositories)),
+            tuple(sorted((_identity(m.repo, m.issue_number), m.state) for m in membership.members)),
+            tuple(sorted((_identity(d.repo, d.issue_number), d.outcome, d.destination, d.reason or "",
+                          _naive_utc(d.at).isoformat()) for d in membership.departures)))
+
+
+def _rate_part(sample) -> tuple:
+    """The measure's value, samples and coverage, and why it is unknown. A reason may start with the measured window
+    (``START/END: text``): the end moves with the clock, so only the text counts."""
+    reasons = (re.sub(r"^\d{4}-\d\d-\d\dT[0-9:.]+/\d{4}-\d\d-\d\dT[0-9:.]+: ", "", reason) for reason in sample.unknown_reasons)
+    return (sample.value, sample.sample_count, sample.coverage, tuple(sorted(reasons)))
+
+
+async def _rate_sample(db, campaign: Campaign) -> FactoryMetricSample:
+    """The rate-limit measure now: recorded windows, gaps, the coverage start and the recorder's pending state all
+    show in it, with no audit event (V1 review 129)."""
+    return await _rate_limited(db, await upgrade.recorded_coverage(db, campaign), _naive_utc(campaign.started_at),
+                               datetime.now(UTC).replace(tzinfo=None))
+
+
+async def _identity_of(db, campaign: Campaign, membership, rate: tuple) -> str:
+    """The identity of the records that a snapshot reads (V1 reviews 128 and 129): this team lifetime's database
+    records, the one membership observation, and the rate-limit evidence. Nothing here reads GitHub."""
+    records = await _fingerprint(db, campaign, scoped=True)
+    return hashlib.sha256(repr((records, _membership_part(membership), rate)).encode()).hexdigest()
+
+
 async def _live_identity(db, campaign: Campaign, client) -> tuple[str | None, str | None]:
-    """The identity of the campaign's records now, and why it cannot be told (V1 review 128). It joins the database
-    records of this team lifetime (``_fingerprint``, scoped) and the live membership: the issues GitHub reports with
-    the campaign's selector in each repository. A membership that cannot be read completely gives no identity."""
+    """The identity of the campaign's records now, and why it cannot be told. A membership that cannot be read
+    completely gives no identity."""
     if client is None:
         return None, "membership_not_read"
     membership = await campaigns.members(db, campaign, client)
     if not membership.complete:
         return None, membership.unavailable or "membership_incomplete"
-    issues = sorted({_identity(m.repo, m.issue_number) for m in membership.members})
-    repositories = sorted(r.repo.lower() for r in membership.repositories)
-    records = await _fingerprint(db, campaign, scoped=True)
-    return hashlib.sha256(repr((records, repositories, issues)).encode()).hexdigest(), None
+    return await _identity_of(db, campaign, membership, _rate_part(await _rate_sample(db, campaign))), None
 
 
 async def record_fingerprint(db, campaign: Campaign, client=None) -> str | None:
@@ -932,19 +964,27 @@ async def _ask_row(db, campaign_id: int, fingerprint: str) -> CampaignSnapshot |
 async def ask_version(db, campaign: Campaign, client) -> CampaignSnapshot:
     """The ask version for the campaign's records now: the stored one for the same records, else a new one.
 
-    The live membership is read before a version is reused. When it cannot be read completely, the new version is
-    stored with an ``incomplete`` fingerprint that no later read matches: the ask reads as stale, never as current.
+    GitHub is read once. That one membership observation gives the identity and builds the snapshot, so the stored
+    payload and its identity cannot disagree. When the observation is not complete, the new version is stored with an
+    ``incomplete`` fingerprint that no later read matches: the ask reads as stale, never as current.
     Flushes and leaves the commit to the caller, so a failed Mail send rolls the new row back with it.
     """
     campaign_id = campaign.id
-    fingerprint, _reason = await _live_identity(db, campaign, client)
-    if fingerprint is not None:
+    membership = await campaigns.members(db, campaign, client)
+    fingerprint = None
+    if membership.complete:
+        fingerprint = await _identity_of(db, campaign, membership, _rate_part(await _rate_sample(db, campaign)))
         found = await _ask_row(db, campaign_id, fingerprint)
         if found is not None:
             return found
-    snapshot = await build_snapshot(db, campaign, client, as_of=datetime.now(UTC).replace(tzinfo=None), cached=False)
+    snapshot = await build_snapshot(db, campaign, client, as_of=datetime.now(UTC).replace(tzinfo=None), cached=False,
+                                    membership=membership)
     payload = snapshot.model_dump(mode="json")
-    stored = fingerprint if fingerprint is not None else f"incomplete:{uuid.uuid4().hex}"
+    stored = f"incomplete:{uuid.uuid4().hex}"
+    if fingerprint is not None:
+        # The identity of what was built: the same observation, the rate-limit measure in the payload.
+        rate = next(m for m in snapshot.metrics if m.name == "rate_limited_seconds")
+        stored = await _identity_of(db, campaign, membership, _rate_part(rate))
     for _attempt in range(_RECOMPUTE_ATTEMPTS):
         lowest = await db.scalar(select(func.min(CampaignSnapshot.version)).where(
             CampaignSnapshot.campaign_id == campaign_id)) or 0
