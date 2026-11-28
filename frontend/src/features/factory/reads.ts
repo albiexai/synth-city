@@ -15,8 +15,10 @@ const POLL_MS = 5000;
 // #1173: a team summary changes slowly and can take about 2 s to build, so it is read less often.
 const SUMMARY_POLL_MS = 15000;
 const SUMMARY_ENDPOINT = /^agent-teams\/presets\/\d+\/summary(\?|$)/;
+// #1256: a campaign's health builds on a snapshot with a short cache, so it is read as slowly as a summary.
+const HEALTH_ENDPOINT = /^factory\/campaigns\/\d+\/health$/;
 function isSummaryEndpoint(endpoint: string) {
-  return SUMMARY_ENDPOINT.test(endpoint);
+  return SUMMARY_ENDPOINT.test(endpoint) || HEALTH_ENDPOINT.test(endpoint);
 }
 const RETRY_MS = [5000, 10000, 30000, 60000];
 // The request will fail again until the URL or the server data changes.
