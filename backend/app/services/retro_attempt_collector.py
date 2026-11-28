@@ -52,7 +52,7 @@ from app.services import factory_audit_service as audit
 from app.services.retro_stage_engine import AttemptWindow, StageInterval
 
 FIRST_LABEL = "from campaign membership; ready time not recorded"
-ITEM_WAITS = ("decision", "effort", "ceiling", "hold", "pause")
+ITEM_WAITS = ("decision", "effort", "ceiling", "hold", "pause", "provider")
 TEAM_WAITS = ("mail", "input")
 
 
@@ -366,7 +366,7 @@ async def _collect_item(db, item: _ItemRow, out: TeamAttempts, period, item_key:
         if family in ("decision", "hold"):
             request = by_request.get(start.request_id)
             attempt, reason = mapped(request.dispatch_nonce) if request else (None, "request_not_recorded")
-        elif family == "ceiling":
+        elif family in ("ceiling", "provider"):
             attempt, reason = by_key.get((start.context_snapshot or {}).get("launch_attempt")), "attempt_not_recorded"
         else:
             attempt = next((a for a in attempts if a.opened_at <= at < a.window.end), None)
@@ -374,8 +374,13 @@ async def _collect_item(db, item: _ItemRow, out: TeamAttempts, period, item_key:
         if attempt is None:
             _lose(out, period, family, item.id, at, _end_of(start, family, ends), reason)
             continue
-        actor = (start.after_values or {}).get("awaited_role") or "unknown"
-        _place(out, period, attempt, "waiting", family, actor, at, _end_of(start, family, ends))
+        values = start.after_values or {}
+        end = _end_of(start, family, ends)
+        if family == "provider":
+            _place(out, period, attempt, "process", "provider_blocked", values.get("provider") or "unknown",
+                   at, min(end or attempt.window.end, attempt.window.end))
+        else:
+            _place(out, period, attempt, "waiting", family, values.get("awaited_role") or "unknown", at, end)
     return attempts
 
 

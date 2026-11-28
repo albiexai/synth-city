@@ -248,6 +248,9 @@ async def renew_native_owner_contact(db: AsyncSession, scope: TeamGithubScope,
     ).execution_options(synchronize_session=False))
     if result.rowcount != 1:
         return False
+    from app.services.owner_observation_pause import end_waiting_after_contact
+
+    await end_waiting_after_contact(db, item.id, contact_at)
     await db.commit()
     await db.refresh(workspace)
     await db.refresh(item)

@@ -2,9 +2,9 @@ import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { TeamSummaries } from "@/features/agent-teams/TeamSummaryCard";
 import type { AgentTeamPresetListResponse, AgentTeamSummary } from "@/types/agentTeams";
-import type { OverviewResponse, RepositoryListResponse } from "@/types/factory";
+import type { CampaignHealthResponse, CampaignListResponse, OverviewResponse, RepositoryListResponse } from "@/types/factory";
 import { ActiveWork } from "../components/overview/ActiveWork";
-import { CampaignProgress } from "../components/overview/CampaignProgress";
+import { CampaignProgress, type CampaignHealthRead } from "../components/overview/CampaignProgress";
 import { NeedsYou } from "../components/overview/NeedsYou";
 import { OperationsFindings } from "../components/OperationsFindings";
 import { needsYouRows } from "../components/overview/needsYou";
@@ -67,6 +67,25 @@ export function OverviewPage() {
   );
   const needsReads = needsFilter ? needsStates : states;
   const summaries = needsReads.map((item) => item.data);
+  // #1256: each displayed team's live campaign (a read of recorded data only) and the health of each. One list read
+  // for each team, so a team past the first global page keeps its block (V1 review 489). They are read only after the
+  // overview itself loaded, so a failing overview stays one request. A failed or missing list adds no block.
+  const { states: liveStates, refresh: refreshLive } = useObservations<CampaignListResponse>(
+    state.data ? matching.map((preset) => `factory/campaigns?status=live&team_id=${preset.id}&limit=5`) : [],
+  );
+  const liveByTeam = new Map<number, number>();
+  matching.forEach((preset, index) => {
+    const row = liveStates[index]?.data?.campaigns?.find((campaign) => campaign.team?.id === preset.id);
+    if (row) liveByTeam.set(preset.id, row.id);
+  });
+  const liveTeams = matching.filter((preset) => liveByTeam.has(preset.id));
+  const { states: healthStates, refresh: refreshHealth } = useObservations<CampaignHealthResponse>(
+    liveTeams.map((preset) => `factory/campaigns/${liveByTeam.get(preset.id)}/health`),
+  );
+  const health: Record<number, CampaignHealthRead> = {};
+  liveTeams.forEach((preset, index) => {
+    health[preset.id] = { campaignId: liveByTeam.get(preset.id)!, state: healthStates[index] };
+  });
   const rows = needsYouRows(matching, summaries);
   const summariesLoading =
     presetList.data === null || needsReads.some((item) => item.data === null && item.error === null);
@@ -86,7 +105,7 @@ export function OverviewPage() {
         </div>
         <Button
           variant="outline"
-          onClick={() => void Promise.all([state.refresh(), presetList.refresh(), refreshSummaries(), refreshNeeds()])}
+          onClick={() => void Promise.all([state.refresh(), presetList.refresh(), refreshSummaries(), refreshNeeds(), refreshLive(), refreshHealth()])}
         >
           Refresh
         </Button>
@@ -104,7 +123,7 @@ export function OverviewPage() {
             </p>
           )}
           {!(needsFailed && rows.length === 0) && <NeedsYou rows={rows} loading={summariesLoading} />}
-          <CampaignProgress presets={matching} summaries={summaries} />
+          <CampaignProgress presets={matching} summaries={summaries} health={health} />
           <StatusTiles counts={state.data.counts} params={params} />
           {(!needsFilter || ready) && (
             <TeamSummaries

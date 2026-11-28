@@ -24,6 +24,7 @@ from app.models.schemas import (
 )
 from app.services.github_client import github_client, GithubClientResponseError
 from app.services.github_app_auth_service import GithubAppAuthError, github_app_auth_service
+from app.services import campaign_health_service
 from app.services import campaign_snapshot_service as campaign_snapshots
 from app.services import factory_campaign_list_service as campaign_list_service
 from app.services import factory_projection_service as projections
@@ -397,6 +398,17 @@ async def campaign_bottlenecks(
     if campaign is None:
         raise projections.FactoryReadError("resource_not_found", 404)
     return await campaign_snapshots.read_bottlenecks(db, campaign, github_client, previous_top=previous_top)
+
+
+@router.get("/campaigns/{campaign_id}/health", response_model=campaign_health_service.CampaignHealthResponse)
+async def campaign_health(campaign_id: int, db=Depends(read_snapshot)):
+    """#1256: item time, cost and the last-four-hours bottleneck for the Overview health block. Read only."""
+    if not 0 < campaign_id < 2**63:
+        raise projections.FactoryReadError("invalid_filter", 422)
+    campaign = await db.get(Campaign, campaign_id)
+    if campaign is None:
+        raise projections.FactoryReadError("resource_not_found", 404)
+    return await campaign_health_service.campaign_health(db, campaign, github_client)
 
 
 @router.get("/repositories/{scope_id}", response_model=wire.RepositoryDetailResponse)

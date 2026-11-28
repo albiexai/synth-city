@@ -271,6 +271,12 @@ When the Leader approves an initial plan without an estimate, the item's base ef
 
 The effort monitor sends its usual advisory notice at the limit. A defaulted limit uses all room under an unchanged repository scope ceiling. A ceiling increase can create room for an extension under the usual Leader rules.
 
+When the bound Codex owner reports a usage-limit error, the effort monitor suspends its clock. It records a provider-blocked interval in the attempt's retrospective process time. The interval remains open if a later observation is unavailable. New native turn evidence from the bound owner closes the interval and starts a fresh effort span.
+
+Codex activity is reported as `unknown` with reason `provider_usage_limit` during the block. Automatic wake follow-ups require known idle evidence. Usual wake follow-up rules apply when a later turn completes successfully and supplies that evidence.
+
+Lease-bound owner progress and native contact renewal end all pending observation waits for the item with a `contact_renewed` outcome. An expired wait ends with an `expired` outcome after a new nudge supersedes it or the item leaves the dispatched state. The monitor can still promote a current expired wait once it confirms the observation gap. Only the current unexpired wait and an active operator pause can block a Leader extension on observation grounds. Resuming an active pause requires the operator.
+
 - `POST /api/v1/agent-mail/effort-extensions` takes a Mail session of the item's current Leader. The body has `work_item_id`, `dispatch_nonce`, `minutes` (a whole number, at most the step cap), `expected_extension_minutes` (the extension total the Leader saw), `reason` and `evidence`. The MCP tool is `synth_city_extend_effort_limit`.
 - A refusal's `detail` is one code: `effort_extension_stale`, `not_item_leader`, `extension_reason_required`, `extension_evidence_required`, `expected_extension_minutes_required`, `effort_limit_not_set`, `extension_exceeds_cap`, `effort_extension_total_changed`, `extension_exceeds_ceiling`, `effort_extension_not_acknowledged`, `effort_extension_paused` or `effort_extension_no_recent_activity`.
 - At approval an estimate over the ceiling is refused with `effort_estimate_exceeds_ceiling`, and an unreadable estimate with `effort_estimate_invalid`.

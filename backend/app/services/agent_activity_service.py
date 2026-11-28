@@ -49,6 +49,7 @@ _TAIL_BYTES = 1_048_576
 # A long Codex turn can push its task_started out of the tail (#1201). Read earlier chunks up to this bound.
 _MAX_HISTORY_BYTES = 8 * _TAIL_BYTES
 _CODEX_TURN_BOUNDARIES = {"task_started", "task_complete", "turn_aborted", "error"}
+PROVIDER_USAGE_LIMIT = "provider_usage_limit"
 _MAX_PROCESS_DESCRIPTORS = 256
 _WORK_FRESHNESS_SECONDS = 180
 _STOPPED_STATES = {"T", "t", "Z", "X", "x"}
@@ -412,7 +413,8 @@ def _native_state(path: Path, session_id: str, cwd: str, now: datetime, started_
         record = json.loads(line)
         if record.get("type") != "event_msg":
             continue
-        event = record.get("payload", {}).get("type")
+        payload = record.get("payload", {})
+        event = payload.get("type")
         if event not in {"task_started", "task_complete", "turn_aborted", "error",
                          "token_count", "item_completed"}:
             continue
@@ -426,8 +428,16 @@ def _native_state(path: Path, session_id: str, cwd: str, now: datetime, started_
         if timestamp < started_at:
             state, reason = "unknown", "native_event_before_process"
             continue
+        error = payload if event == "error" else payload.get("error")
         if event == "task_started":
             state, reason = "working", "native_turn_started"
+        elif (event in ("error", "task_complete") and isinstance(error, dict)
+              and error.get("codex_error_info") == "usage_limit_exceeded"):
+            state, reason = "unknown", PROVIDER_USAGE_LIMIT
+        elif reason == PROVIDER_USAGE_LIMIT:
+            # Codex can emit a turn boundary while cleaning up a failed turn.
+            # A new turn supplies evidence that its harness has resumed.
+            continue
         elif event == "task_complete":
             state, reason = "idle", "native_turn_completed"
         elif event in {"turn_aborted", "error"}:
@@ -964,6 +974,7 @@ class PrivateActivity:
     cursor: str | None = None
     current_settlement_id: str | None = None
     binding_identity: str | None = None
+    pane_lifetime: tuple[int, str] | None = None
 
 
 def private_binding_identity(provider: str, pane_pid: int, pane_start: str, cwd: str,
@@ -990,6 +1001,7 @@ async def observe_private_team(
             captured.append(metadata)
             identity = None
             binding_identity = None
+            pane_lifetime = None
             if metadata.get("session_id") and metadata.get("pane_pid"):
                 identity = hashlib.sha256(json.dumps({key: metadata.get(key) for key in (
                     "provider", "session_id", "pane_pid", "pane_start", "native_pid", "native_start",
@@ -998,6 +1010,7 @@ async def observe_private_team(
                             if binding.pane_pid == metadata["pane_pid"] and binding.pane_start == metadata["pane_start"]
                             and binding.native_pid == metadata.get("native_pid")]
                 if matching:
+                    pane_lifetime = (metadata["pane_pid"], metadata["pane_start"])
                     binding_identity = private_binding_identity(
                         entry[1], metadata["pane_pid"], metadata["pane_start"], matching[0].cwd,
                         metadata.get("native_pid"), metadata.get("native_start"))
@@ -1009,7 +1022,7 @@ async def observe_private_team(
                                                identity, metadata.get("event_id") if settled else None,
                                                metadata.get("event_id"),
                                                metadata.get("current_settlement_id") if observed.state == "idle" else None,
-                                               binding_identity)
+                                               binding_identity, pane_lifetime)
         return values
 
     if max_input_rows is None:

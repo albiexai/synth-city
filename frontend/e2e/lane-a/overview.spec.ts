@@ -99,6 +99,72 @@ for (const theme of ['light', 'dark'] as Theme[]) {
   })
 }
 
+// #1256: the campaign health block. The offline seed records no campaign, so the list and the health reads are
+// answered here. The block shows item time, the unknown cost with its reason and the labelled four-hour window, and its
+// link goes to a page that exists (the Retrospectives list).
+const HEALTH = {
+  schema_version: 1, campaign_id: 41, source: 'live', as_of: new Date().toISOString(),
+  item_time: { items: 41, timed: 41, coverage: 'full', unknown_reasons: [], bands: [
+    { band: '0-100', items: 41, timed: 41, median_seconds: 2280, p85_seconds: 4260, small_sample: false, coverage: 'full', unknown_reasons: [] },
+    { band: 'over-400', items: 3, timed: 3, median_seconds: 9000, p85_seconds: 12000, small_sample: true, coverage: 'partial', unknown_reasons: [] }] },
+  item_time_reason: null,
+  cost: { value_usd: null, coverage: 'unavailable', members_total: null, members_known: null, unknown_members: [], prices_as_of: null, reasons: ['cost_not_recorded'] },
+  bottleneck: { window: 'last_four_hours', label: 'Last 4 hours', started_at: new Date().toISOString(), as_of: new Date().toISOString(),
+    coverage: 'full', unknown_reasons: [], items: 9, credited_seconds: 8700, state: 'ranked', stages: [{
+      key: 'k', group: 'waiting', stage: 'decision', actor: 'the Leader with a long responsible name that must wrap on a phone',
+      credited_seconds: 5400, share: 0.62, items: 9, median_seconds: 600, small_sample: false, coverage: 'full' }], largest_observed: null },
+  bottleneck_reason: null,
+}
+
+for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
+  for (const theme of ['light', 'dark'] as Theme[]) {
+    test(`@active the campaign health block fits, reads and links at ${viewport.width}px in the ${theme} theme`, async ({ page }) => {
+      await page.setViewportSize(viewport)
+      await useTheme(page, theme)
+      const presets: { presets: { id: number; name: string }[] } = await (await page.request.get('/api/v1/agent-teams/presets')).json()
+      const team = presets.presets.find(preset => preset.name === 'Release crew')!
+      await page.route('**/api/v1/agent-teams/presets/*/summary*', async route => {
+        const response = await route.fetch()
+        const summary: AgentTeamSummary = await response.json()
+        if (summary.campaign) summary.campaign.campaign_status = 'active'
+        await route.fulfill({ response, json: summary })
+      })
+      const row = {
+        id: 41, team: { id: team.id, name: team.name }, selector: 'label:health-check', status: 'active',
+        started_at: new Date().toISOString(), finished_at: null,
+        merged: { value: 3, reason: null }, in_scope: { value: 5, reason: null }, repositories: [],
+        repositories_unknown_reason: 'no_snapshot', source: null,
+      }
+      await page.route('**/api/v1/factory/campaigns?*', route => route.fulfill({ json: {
+        schema_version: 1, generated_at: new Date().toISOString(), campaigns: [row], total: 1,
+        counts: { live: 1, finished: 0 }, hidden_unknown_repositories: 0, finished_before_recording: 0,
+        has_more: false, next_cursor: null } }))
+      await page.route('**/api/v1/factory/campaigns/41/health', route => route.fulfill({ json: HEALTH }))
+      await page.goto('/')
+      const card = page.locator('main').getByRole('article', { name: /^Progress:/ }).filter({ hasText: 'Release crew' })
+      const block = card.getByRole('group', { name: 'Campaign health' })
+      await expect(block).toBeVisible()
+      await expect(block.getByText('38 min')).toBeVisible()
+      await expect(block.getByText(/over-400 lines .* small sample/)).toBeVisible()
+      await expect(block.getByText(/the cost is not recorded yet/)).toBeVisible()
+      await expect(block.getByText(/^Waiting for the Leader with a long responsible name/)).toBeVisible()
+      await expect(block.getByText(/^Last 4 hours/)).toBeVisible()
+      // The card keeps its counts and the block fits the card, also on a phone.
+      await expect(card.getByRole('heading', { name: /^Done/ })).toBeVisible()
+      const fits = await block.evaluate(element => element.scrollWidth <= element.clientWidth + 1)
+      expect(fits, 'the health block does not scroll sideways').toBe(true)
+      const page_fits = await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1)
+      expect(page_fits, 'the page does not scroll sideways').toBe(true)
+      expect(await contrastFailures(block)).toEqual([])
+      if (process.env.E2E_SHOT_DIR) await card.screenshot({ path: `${process.env.E2E_SHOT_DIR}/health-${viewport.width}-${theme}.png` })
+      // The link works: it opens the Retrospectives list for this team's live campaigns.
+      await block.getByRole('link', { name: /Live retrospective/ }).click()
+      await expect(page).toHaveURL(new RegExp(`/insights/retrospectives\\?team_id=${team.id}&status=live`))
+      await expect(page.getByRole('main').getByText('health-check').first()).toBeVisible()
+    })
+  }
+}
+
 test('@active no empty section shows a filter message when no filter is set', async ({ page }) => {
   await page.goto('/')
   await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible()

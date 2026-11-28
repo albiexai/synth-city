@@ -3146,7 +3146,10 @@ class GithubDispatchService:
     ) -> None:
         # #938: advance the advisory effort ledger of this scope's limited items; it never ends or expires work.
         from app.services.github_effort_limit_service import effort_limit_service
+        from app.services.owner_observation_pause import expire_waiting_observations
 
+        scope_id = scope.id
+        observed_before = datetime.utcnow()
         await effort_limit_service.tick_scope(db, scope)
         # #1338: close the operator waits (holds, pauses) that ended without a release, for every item of the scope.
         from app.services import decision_wait_service as decision_waits
@@ -3163,6 +3166,8 @@ class GithubDispatchService:
             key=lambda slot: slot.position,
         )
         if not enabled:
+            await expire_waiting_observations(db, scope_id, GithubWorkItem.active_scope_revision == 0,
+                                              now=observed_before)
             return
         preset = await db.get(AgentTeamPreset, scope.preset_id, populate_existing=True)
         leader = next((slot for slot in enabled if preset is not None
@@ -3257,6 +3262,8 @@ class GithubDispatchService:
                 if await handle_observation_gap(db, scope, item):
                     continue
                 await self.escalate(db, item, "owner_idle_timeout")
+        await expire_waiting_observations(db, scope_id, GithubWorkItem.active_scope_revision == 0,
+                                          now=observed_before)
         await db.commit()
 
     @staticmethod
@@ -3322,15 +3329,22 @@ class GithubDispatchService:
         preset_slots: list[AgentTeamSlot],
         recovery_only_attempt: GithubRecoveryOnlyAttempt | None = None,
     ) -> None:
+        from app.services.owner_observation_pause import expire_waiting_observations
+
+        scope_id = scope.id
+        observed_before = datetime.utcnow()
         enabled_slot_ids = {slot.id for slot in preset_slots if slot.enabled}
+        item_filters = (
+            GithubWorkItem.active_scope_revision > 0,
+            *(recovery_only_attempt.item_filters() if recovery_only_attempt else ()),
+        )
         items = (
             await db.execute(
                 select(GithubWorkItem).where(
                     GithubWorkItem.scope_id == scope.id,
                     GithubWorkItem.dispatch_status == "dispatched",
                     GithubWorkItem.pr_number.is_not(None),
-                    GithubWorkItem.active_scope_revision > 0,
-                    *(recovery_only_attempt.item_filters() if recovery_only_attempt else ()),
+                    *item_filters,
                 )
             )
         ).scalars().all()
@@ -3465,6 +3479,7 @@ class GithubDispatchService:
                 elapsed_seconds=elapsed.total_seconds(),
                 action="escalate_idle",
             )
+        await expire_waiting_observations(db, scope_id, *item_filters, now=observed_before)
 
     async def monitor_recovery(
         self,
